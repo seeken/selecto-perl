@@ -15,6 +15,10 @@ sub count   { my ($class) = @_; return $class->new('count'); }
 sub sum     { my ($class, $field) = @_; return $class->new('sum', $class->field($field)); }
 sub min     { my ($class, $field) = @_; return $class->new('min', $class->field($field)); }
 sub max     { my ($class, $field) = @_; return $class->new('max', $class->field($field)); }
+sub datetime_format {
+    my ($class, $field, $format) = @_;
+    return $class->new('datetime_format', $class->field($field), "$format");
+}
 sub is_null { my ($class, $field) = @_; return $class->new('is_null', $class->field($field)); }
 sub not_null { my ($class, $field) = @_; return $class->new('not_null', $class->field($field)); }
 

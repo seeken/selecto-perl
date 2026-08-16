@@ -14,12 +14,13 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     default_selected required_selected required_filters required_order_by required_group_by
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions extensions columns custom_columns
-    jsonb_schemas subfilters window_functions pagination retarget redact_fields
+    jsonb_schemas subfilters window_functions pagination retarget redact_fields components
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(source_table primary_key fields columns associations);
 my %ASSOCIATION = map { $_ => 1 } qw(queryable owner_key related_key cardinality);
 my %JOIN = map { $_ => 1 } qw(type);
+my %COMPONENTS = map { $_ => 1 } qw(query_params);
 
 sub new {
     my ($class, %args) = @_;
@@ -39,6 +40,7 @@ sub new {
         table        => _identifier($args{table}, 'table'),
         fields       => $fields,
         associations => \%associations,
+        components   => _normalize_components($args{components}),
     }, $class;
     my $fingerprint_value = {
         name => $self->{name},
@@ -48,6 +50,7 @@ sub new {
             map { $_ => $self->{associations}{$_}->fingerprint_value } sort keys %associations
         },
     };
+    $fingerprint_value->{components} = $self->{components} if keys %{$self->{components}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
     $self->{fingerprint} = 'sha256:' . sha256_hex($json);
     return $self;
@@ -82,6 +85,7 @@ sub parse {
         table => $raw->{source}{table},
         fields => $raw->{source}{fields},
         associations => $raw->{associations} // {},
+        components => $raw->{components},
     );
 }
 
@@ -130,6 +134,7 @@ sub _parse_canonical {
         table => $source->{source_table},
         fields => _canonical_fields($source),
         associations => \%associations,
+        components => $raw->{components},
     );
     $domain->{contract} = dclone($raw);
     return $domain;
@@ -187,6 +192,23 @@ sub _normalize_fields {
     return \%fields;
 }
 
+sub _normalize_components {
+    my ($value) = @_;
+    return {} unless defined $value;
+    _object($value, 'components');
+    _reject_unknown($value, \%COMPONENTS, 'components');
+    my %components;
+    if (exists $value->{query_params}) {
+        my $query_params = $value->{query_params};
+        my $boolean = JSON::PP::is_bool($query_params)
+            || (!ref($query_params) && "$query_params" =~ /\A(?:0|1)\z/);
+        Selecto::Error->throw('invalid_domain', 'components query_params must be a boolean')
+            unless $boolean;
+        $components{query_params} = $query_params ? 1 : 0;
+    }
+    return \%components;
+}
+
 sub _reject_unknown {
     my ($value, $allowed, $location) = @_;
     my @unknown = sort grep { !$allowed->{$_} } keys %$value;
@@ -228,6 +250,7 @@ sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract})
 sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
 sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
 sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
+sub components   { return dclone($_[0]->{components} // {}); }
 
 package Selecto::Domain::Association;
 

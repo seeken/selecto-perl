@@ -14,9 +14,11 @@ protocol 1 and certification specification 2.0.0.
 - strict simplified and canonical schema-v1 JSON domain parsing;
 - validated root and one-hop relationship field resolution;
 - deterministic SHA-256 domain fingerprints;
+- canonical component policy metadata, including domain-selected private URL
+  state for compatible exploration UIs;
 - copy-on-write select, filter, group, order, limit, and offset queries;
-- field, literal, comparison, null, membership, conjunction, and aggregate
-  expressions;
+- field, literal, comparison, null, membership, conjunction, aggregate, and
+  governed date/time format expressions;
 - PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
 - DBI execution with stable columns and normalized PostgreSQL values;
 - a versioned `Selecto::Adapter` contract, generic `Selecto::Statement`, and
@@ -80,6 +82,12 @@ my $query = $engine->query
 
 my $result = $engine->all($query);
 ```
+
+`order_by` may be repeated to build a stable multi-column order. For governed
+date/time projection or grouping, use an allowlisted expression such as
+`Selecto::Expression->datetime_format('occurred_on', 'month')` consistently in
+`select`, `group_by`, or `order_by`; arbitrary database format strings are not
+accepted.
 
 ## Database adapters
 

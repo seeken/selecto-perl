@@ -66,10 +66,12 @@ sub compile {
     $sql .= ' ' . join(' ', @joins) if @joins;
     $sql .= ' WHERE ' . $self->_compile_expression($domain, $query->predicate, \@params) if $query->predicate;
     my $groups = $query->groups;
-    $sql .= ' GROUP BY ' . join(', ', map { $self->_field_sql($domain, $_) } @$groups) if @$groups;
+    $sql .= ' GROUP BY ' . join(', ', map {
+        $self->_compile_expression($domain, $_, \@params)
+    } @$groups) if @$groups;
     my $orders = $query->orders;
     $sql .= ' ORDER BY ' . join(', ', map {
-        $self->_field_sql($domain, $_->[0]) . ' ' . uc($_->[1])
+        $self->_compile_expression($domain, $_->[0], \@params) . ' ' . uc($_->[1])
     } @$orders) if @$orders;
     $sql .= ' LIMIT ' . $query->limit_value if defined $query->limit_value;
     $sql .= ' OFFSET ' . $query->offset_value if defined $query->offset_value;
@@ -166,6 +168,31 @@ sub _compile_expression {
         return join(' AND ', map { '(' . $self->_compile_expression($domain, $_, $params) . ')' } @$expressions);
     }
     return 'COUNT(*)' if $kind eq 'count';
+    if ($kind eq 'datetime_format') {
+        my %formats = (
+            day => 'YYYY-MM-DD',
+            day_hour => 'YYYY-MM-DD HH24',
+            week => 'IYYY-IW',
+            month => 'YYYY-MM',
+            quarter => 'YYYY-"Q"Q',
+            year => 'YYYY',
+            month_of_year => 'MM',
+            day_of_month => 'DD',
+            day_of_week => 'ID',
+            hour => 'HH24',
+        );
+        my ($field, $format) = @$arguments;
+        Selecto::Error->throw('invalid_query', 'datetime format field must be a governed field')
+            unless blessed($field) && $field->isa('Selecto::Expression') && $field->kind eq 'field';
+        Selecto::Error->throw('invalid_query', 'datetime format is not available')
+            unless exists $formats{$format};
+        my ($path) = @{$field->arguments};
+        my $resolved = $domain->resolve($path);
+        Selecto::Error->throw('invalid_query', 'datetime format requires a date or time field')
+            unless $resolved->{type} =~ /(?:date|time)/i;
+        return 'TO_CHAR(' . $self->_compile_expression($domain, $field, $params) .
+            ", '" . $formats{$format} . "')";
+    }
     if ($kind eq 'sum' || $kind eq 'min' || $kind eq 'max') {
         return uc($kind) . '(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')';
     }
@@ -185,8 +212,8 @@ sub _referenced_associations {
     my ($self, $query) = @_;
     my @expressions = (@{$query->selections});
     push @expressions, $query->predicate if $query->predicate;
-    push @expressions, map { Selecto::Expression->field($_) } @{$query->groups};
-    push @expressions, map { Selecto::Expression->field($_->[0]) } @{$query->orders};
+    push @expressions, @{$query->groups};
+    push @expressions, map { $_->[0] } @{$query->orders};
     my %names;
     $names{$_} = 1 for map { $self->_expression_associations($_) } @expressions;
     return sort keys %names;

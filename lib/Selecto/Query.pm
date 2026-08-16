@@ -38,7 +38,9 @@ sub where {
 sub group_by {
     my ($self, @fields) = @_;
     @fields = @{$fields[0]} if @fields == 1 && ref($fields[0]) eq 'ARRAY';
-    return $self->_copy(groups => [map { "$_" } @fields]);
+    return $self->_copy(groups => [map {
+        blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
+    } @fields]);
 }
 
 sub order_by {
@@ -46,7 +48,9 @@ sub order_by {
     $direction = defined($direction) ? lc("$direction") : 'asc';
     Selecto::Error->throw('invalid_query', 'order direction must be asc or desc')
         unless $direction eq 'asc' || $direction eq 'desc';
-    return $self->_copy(orders => [@{$self->{orders}}, ["$field", $direction]]);
+    my $expression = blessed($field) && $field->isa('Selecto::Expression')
+        ? $field : Selecto::Expression->field($field);
+    return $self->_copy(orders => [@{$self->{orders}}, [$expression, $direction]]);
 }
 
 sub limit  { my ($self, $value) = @_; return $self->_copy(limit_value  => _nonnegative($value, 'limit')); }
@@ -81,4 +85,3 @@ sub limit_value  { return $_[0]->{limit_value}; }
 sub offset_value { return $_[0]->{offset_value}; }
 
 1;
-

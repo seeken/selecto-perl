@@ -48,11 +48,23 @@ my $canonical = Selecto::Domain->parse(JSON::PP->new->encode({
     },
     joins => { person => { type => 'inner' } },
     writes => { version => 1 },
+    components => { query_params => JSON::PP::false },
 }), strict => 1);
 is($canonical->table, 'orders', 'canonical source table is parsed');
 is($canonical->resolve('person.name')->{type}, 'string', 'canonical association fields resolve');
 is($canonical->associations->{person}->join_type, 'inner', 'join metadata is applied');
 is($canonical->writes->{version}, 1, 'canonical write metadata remains available to governed consumers');
+is($canonical->components->{query_params}, 0, 'canonical component URL-state policy is retained');
+
+my $bad_components = eval {
+    Selecto::Domain->new(
+        name => 'Bad components', table => 'bad_components', fields => { id => 'integer' },
+        components => { query_params => 'sometimes' },
+    );
+    1;
+};
+ok(!$bad_components, 'component URL-state policy requires a boolean');
+is($@->code, 'invalid_domain', 'invalid component policy fails through the domain boundary');
 
 eval { $canonical->resolve('person.secret') };
 $error = $@;
