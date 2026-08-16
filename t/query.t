@@ -67,6 +67,64 @@ like($dated_statement->sql,
     qr/ORDER BY TO_CHAR\("s0"\."occurred_on", 'YYYY-MM'\) ASC, "s0"\."name" DESC/,
     'ordered query intent retains multiple expressions and directions');
 
+my $numeric_domain = Selecto::Domain->new(
+    name => 'Inventory',
+    table => 'inventory',
+    fields => { category => 'string', quantity => 'integer', active => 'boolean' },
+);
+my $numeric_engine = Selecto::Engine->new(domain => $numeric_domain, adapter => $adapter);
+my $quantity_bucket = Selecto::Expression->bucket('quantity', {
+    kind => 'numeric_ranges',
+    ranges => [
+        { minimum => 0, maximum => 9, label => '0-9' },
+        { minimum => 10, maximum => undef, label => '10+' },
+    ],
+});
+my $bucket_statement = $numeric_engine->compile(
+    $numeric_engine->query->select(
+        $quantity_bucket->as('quantity_band'),
+        Selecto::Expression->avg('quantity')->as('average_quantity'),
+        Selecto::Expression->count_distinct('quantity')->as('distinct_quantities'),
+        Selecto::Expression->count_bucket('quantity', 0, 9)->as('low_quantity'),
+        Selecto::Expression->true_count('active')->as('active_count'),
+    )->group_by($quantity_bucket)
+);
+like($bucket_statement->sql, qr/CASE WHEN "s0"\."quantity" >= \$1 AND "s0"\."quantity" <= \$2 THEN \$3/,
+    'governed numeric range bucket compiles as a CASE expression');
+like($bucket_statement->sql, qr/AVG\("s0"\."quantity"\)/, 'average aggregate compiles');
+like($bucket_statement->sql, qr/COUNT\(DISTINCT "s0"\."quantity"\)/,
+    'count-distinct aggregate compiles');
+like($bucket_statement->sql, qr/COUNT\(CASE WHEN "s0"\."quantity" >= \$7 AND "s0"\."quantity" <= \$8 THEN 1 END\)/,
+    'numeric measure bucket compiles as a governed conditional count');
+like($bucket_statement->sql, qr/COUNT\(CASE WHEN "s0"\."active" = TRUE THEN 1 END\)/,
+    'boolean true-count aggregate compiles');
+is_deeply([@{$bucket_statement->params}[0 .. 5]], [0, 9, '0-9', 10, '10+', 'Other'],
+    'bucket boundaries and labels remain bound values');
+is scalar(@{$bucket_statement->params}), 8,
+    'an identical grouped bucket reuses its compiled selection placeholders';
+
+my $age_bucket = Selecto::Expression->bucket('occurred_on', {
+    kind => 'elapsed_days_ranges',
+    ranges => [{ minimum => 0, maximum => 30, label => '0-30' }],
+});
+my $age_statement = $dated_engine->compile(
+    $dated_engine->query->select(
+        $age_bucket->as('age_band'),
+        Selecto::Expression->count_bucket('occurred_on', 0, 30, 'elapsed_days')->as('recent_count'),
+    )->group_by($age_bucket)
+);
+like($age_statement->sql, qr/CURRENT_DATE - DATE\("s0"\."occurred_on"\)/,
+    'elapsed-day buckets remain a governed temporal expression');
+
+my $bad_bucket = eval {
+    $numeric_engine->compile($numeric_engine->query->select(
+        Selecto::Expression->bucket('quantity', { kind => 'raw_sql', ranges => [] })
+    ));
+    1;
+};
+ok(!$bad_bucket, 'arbitrary bucket kinds fail closed');
+is($@->code, 'invalid_query', 'rejected bucket kind uses the governed query error');
+
 my $bad_format = eval {
     $dated_engine->compile($dated_engine->query->select(
         Selecto::Expression->datetime_format('occurred_on', q{YYYY'); DROP TABLE events; --})

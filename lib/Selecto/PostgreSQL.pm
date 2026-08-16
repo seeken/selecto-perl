@@ -59,7 +59,14 @@ sub compile {
             ' ON ' . $self->quote_identifier('s0') . '.' . $self->quote_identifier($association->owner_key) .
             ' = ' . $self->quote_identifier($self->_join_alias($name)) . '.' . $self->quote_identifier($association->related_key);
     }
-    my @selection_sql = map { $self->_compile_selection($domain, $_, \@params) } @$selections;
+    my %compiled_selections;
+    my @selection_sql = map {
+        my $expression_sql = $self->_compile_expression($domain, $_, \@params);
+        $compiled_selections{_expression_key($_)} //= $expression_sql;
+        defined($_->alias_name)
+            ? $expression_sql . ' AS ' . $self->quote_identifier($_->alias_name)
+            : $expression_sql
+    } @$selections;
     my @columns = map { $self->_selection_name($_) } @$selections;
     my $sql = 'SELECT ' . join(', ', @selection_sql) .
         ' FROM ' . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier('s0');
@@ -67,7 +74,10 @@ sub compile {
     $sql .= ' WHERE ' . $self->_compile_expression($domain, $query->predicate, \@params) if $query->predicate;
     my $groups = $query->groups;
     $sql .= ' GROUP BY ' . join(', ', map {
-        $self->_compile_expression($domain, $_, \@params)
+        my $key = _expression_key($_);
+        exists($compiled_selections{$key})
+            ? $compiled_selections{$key}
+            : $self->_compile_expression($domain, $_, \@params)
     } @$groups) if @$groups;
     my $orders = $query->orders;
     $sql .= ' ORDER BY ' . join(', ', map {
@@ -126,6 +136,25 @@ sub _compile_selection {
         : $sql;
 }
 
+sub _expression_key {
+    my ($expression) = @_;
+    return _value_key($expression);
+}
+
+sub _value_key {
+    my ($value) = @_;
+    return 'u' unless defined $value;
+    if (blessed($value) && $value->isa('Selecto::Expression')) {
+        return 'e:' . $value->kind . ':' . _value_key($value->arguments);
+    }
+    return 'a:[' . join(',', map { _value_key($_) } @$value) . ']'
+        if ref($value) eq 'ARRAY';
+    return 'h:{' . join(',', map { _value_key($_) . '=' . _value_key($value->{$_}) } sort keys %$value) . '}'
+        if ref($value) eq 'HASH';
+    return 's:' . length("$value") . ':' . "$value" unless ref($value);
+    return 'r:' . ref($value);
+}
+
 sub _selection_name {
     my ($self, $expression) = @_;
     return $expression->alias_name if defined $expression->alias_name;
@@ -176,6 +205,21 @@ sub _compile_expression {
         return join(' AND ', map { '(' . $self->_compile_expression($domain, $_, $params) . ')' } @$expressions);
     }
     return 'COUNT(*)' if $kind eq 'count';
+    return 'COUNT(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
+        if $kind eq 'count_field';
+    return 'COUNT(DISTINCT ' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
+        if $kind eq 'count_distinct';
+    if ($kind eq 'true_count' || $kind eq 'false_count') {
+        my $value = $kind eq 'true_count' ? 'TRUE' : 'FALSE';
+        return 'COUNT(CASE WHEN ' . $self->_compile_expression($domain, $arguments->[0], $params) .
+            " = $value THEN 1 END)";
+    }
+    if ($kind eq 'count_bucket') {
+        return $self->_compile_count_bucket($domain, $arguments->[0], $arguments->[1], $params);
+    }
+    if ($kind eq 'bucket') {
+        return $self->_compile_bucket($domain, $arguments->[0], $arguments->[1], $params);
+    }
     if ($kind eq 'datetime_format') {
         my %formats = (
             day => 'YYYY-MM-DD',
@@ -201,10 +245,139 @@ sub _compile_expression {
         return 'TO_CHAR(' . $self->_compile_expression($domain, $field, $params) .
             ", '" . $formats{$format} . "')";
     }
-    if ($kind eq 'sum' || $kind eq 'min' || $kind eq 'max') {
+    if ($kind eq 'avg' || $kind eq 'sum' || $kind eq 'min' || $kind eq 'max') {
         return uc($kind) . '(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')';
     }
+    if ($kind eq 'sum_zero') {
+        return 'SUM(COALESCE(' . $self->_compile_expression($domain, $arguments->[0], $params) . ', 0))';
+    }
     Selecto::Error->throw('invalid_query', "unsupported expression $kind");
+}
+
+sub _compile_count_bucket {
+    my ($self, $domain, $field, $specification, $params) = @_;
+    Selecto::Error->throw('invalid_query', 'bucket count specification must be an object')
+        unless ref($specification) eq 'HASH';
+    my $mode = $specification->{mode} // 'numeric';
+    Selecto::Error->throw('invalid_query', 'bucket count mode is not available')
+        unless $mode eq 'numeric' || $mode eq 'elapsed_days';
+    my $field_sql = $self->_compile_expression($domain, $field, $params);
+    my $value_sql = $mode eq 'elapsed_days'
+        ? "CURRENT_DATE - DATE($field_sql)"
+        : $field_sql;
+    my ($minimum, $maximum) = @{$specification}{qw(minimum maximum)};
+    Selecto::Error->throw('invalid_query', 'bucket count requires at least one boundary')
+        unless defined($minimum) || defined($maximum);
+    Selecto::Error->throw('invalid_query', 'bucket count boundaries must be integers')
+        if (defined($minimum) && "$minimum" !~ /\A\d+\z/)
+        || (defined($maximum) && "$maximum" !~ /\A\d+\z/);
+    my @predicates;
+    if (defined($minimum)) {
+        push @$params, int($minimum);
+        push @predicates, $value_sql . ' >= ' . $self->placeholder(scalar @$params);
+    }
+    if (defined($maximum)) {
+        push @$params, int($maximum);
+        push @predicates, $value_sql . ' <= ' . $self->placeholder(scalar @$params);
+    }
+    return 'COUNT(CASE WHEN ' . join(' AND ', @predicates) . ' THEN 1 END)';
+}
+
+sub _compile_bucket {
+    my ($self, $domain, $field, $specification, $params) = @_;
+    Selecto::Error->throw('invalid_query', 'bucket specification must be an object')
+        unless ref($specification) eq 'HASH';
+    my $kind = $specification->{kind} // '';
+    my $field_sql = $self->_compile_expression($domain, $field, $params);
+    my ($path) = @{$field->arguments};
+    my $resolved = $domain->resolve($path);
+
+    if ($kind eq 'numeric_increment' || $kind eq 'year_increment') {
+        Selecto::Error->throw('invalid_query', 'bucket increment must be a positive integer')
+            unless defined($specification->{increment})
+            && "$specification->{increment}" =~ /\A[1-9]\d*\z/;
+        Selecto::Error->throw('invalid_query', 'numeric buckets require a numeric field')
+            if $kind eq 'numeric_increment' && $resolved->{type} !~ /(?:int|decimal|number|numeric|float|double|real)/i;
+        Selecto::Error->throw('invalid_query', 'year buckets require a date or time field')
+            if $kind eq 'year_increment' && $resolved->{type} !~ /(?:date|time)/i;
+        my $value_sql = $kind eq 'year_increment' ? "EXTRACT(YEAR FROM $field_sql)" : $field_sql;
+        my $increment = int($specification->{increment});
+        my $start = "CAST(FLOOR(CAST($value_sql AS NUMERIC) / $increment) AS BIGINT) * $increment";
+        return "CASE WHEN $field_sql IS NULL THEN 'Other' ELSE CAST(($start) AS TEXT) || '-' || " .
+            'CAST(((' . $start . ') + ' . ($increment - 1) . ') AS TEXT) END';
+    }
+
+    if ($kind eq 'text_prefix') {
+        Selecto::Error->throw('invalid_query', 'text prefix bucket requires a text field')
+            unless $resolved->{type} =~ /(?:string|text|char|citext)/i;
+        my $length = $specification->{prefix_length} // 2;
+        Selecto::Error->throw('invalid_query', 'text prefix length must be between 1 and 10')
+            unless "$length" =~ /\A\d+\z/ && $length >= 1 && $length <= 10;
+        my $normalized = "BTRIM(COALESCE(CAST($field_sql AS TEXT), ''))";
+        if ($specification->{exclude_articles}) {
+            $normalized = "REGEXP_REPLACE($normalized, '^(a|an|the)([[:space:]]+|$)', '', 'i')";
+        }
+        $normalized = "LOWER($normalized)" unless exists($specification->{ignore_case}) && !$specification->{ignore_case};
+        return "CASE WHEN $normalized = '' THEN 'Other' ELSE UPPER(LEFT($normalized, " . int($length) . ')) END';
+    }
+
+    my %range_kinds = map { $_ => 1 } qw(
+        numeric_ranges elapsed_days_ranges date_relative_ranges year_ranges
+    );
+    Selecto::Error->throw('invalid_query', 'bucket kind is not available') unless $range_kinds{$kind};
+    Selecto::Error->throw('invalid_query', 'numeric buckets require a numeric field')
+        if $kind eq 'numeric_ranges' && $resolved->{type} !~ /(?:int|decimal|number|numeric|float|double|real)/i;
+    Selecto::Error->throw('invalid_query', 'temporal buckets require a date or time field')
+        if $kind ne 'numeric_ranges' && $resolved->{type} !~ /(?:date|time)/i;
+    my $ranges = $specification->{ranges};
+    Selecto::Error->throw('invalid_query', 'bucket ranges must be a non-empty array')
+        unless ref($ranges) eq 'ARRAY' && @$ranges;
+    my $value_sql = $kind eq 'elapsed_days_ranges' ? "CURRENT_DATE - DATE($field_sql)"
+        : $kind eq 'year_ranges' ? "EXTRACT(YEAR FROM $field_sql)"
+        : $kind eq 'date_relative_ranges' ? "DATE($field_sql)"
+        : $field_sql;
+    my @clauses;
+    for my $range (@$ranges) {
+        Selecto::Error->throw('invalid_query', 'bucket range must be an object')
+            unless ref($range) eq 'HASH';
+        my ($minimum, $maximum, $label) = @{$range}{qw(minimum maximum label)};
+        Selecto::Error->throw('invalid_query', 'bucket range label is required')
+            unless defined($label) && !ref($label) && length("$label") <= 80;
+        my $predicate;
+        if ($kind eq 'date_relative_ranges' && defined($minimum) && "$minimum" =~ /\A(?:today|yesterday|tomorrow)\z/) {
+            Selecto::Error->throw('invalid_query', 'date keyword bucket boundaries must match')
+                unless defined($maximum) && "$maximum" eq "$minimum";
+            $predicate = $minimum eq 'today' ? "$value_sql = CURRENT_DATE"
+                : $minimum eq 'yesterday' ? "$value_sql = CURRENT_DATE - INTERVAL '1 day'"
+                : "$value_sql = CURRENT_DATE + INTERVAL '1 day'";
+        } else {
+            Selecto::Error->throw('invalid_query', 'bucket range requires at least one boundary')
+                unless defined($minimum) || defined($maximum);
+            Selecto::Error->throw('invalid_query', 'bucket range boundaries must be integers')
+                if (defined($minimum) && "$minimum" !~ /\A\d+\z/)
+                || (defined($maximum) && "$maximum" !~ /\A\d+\z/);
+            my @predicates;
+            if (defined($minimum)) {
+                push @$params, int($minimum);
+                my $marker = $self->placeholder(scalar @$params);
+                push @predicates, $kind eq 'date_relative_ranges'
+                    ? "$value_sql <= CURRENT_DATE - ($marker * INTERVAL '1 day')"
+                    : "$value_sql >= $marker";
+            }
+            if (defined($maximum)) {
+                push @$params, int($maximum);
+                my $marker = $self->placeholder(scalar @$params);
+                push @predicates, $kind eq 'date_relative_ranges'
+                    ? "$value_sql >= CURRENT_DATE - ($marker * INTERVAL '1 day')"
+                    : "$value_sql <= $marker";
+            }
+            $predicate = join(' AND ', @predicates);
+        }
+        push @$params, "$label";
+        push @clauses, 'WHEN ' . $predicate . ' THEN ' . $self->placeholder(scalar @$params);
+    }
+    push @$params, 'Other';
+    return 'CASE ' . join(' ', @clauses) . ' ELSE ' . $self->placeholder(scalar @$params) . ' END';
 }
 
 sub _field_sql {

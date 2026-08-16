@@ -12,9 +12,27 @@ sub new {
 sub field   { my ($class, $name) = @_; return $class->new('field', "$name"); }
 sub literal { my ($class, $value) = @_; return $class->new('literal', $value); }
 sub count   { my ($class) = @_; return $class->new('count'); }
+sub count_field { my ($class, $field) = @_; return $class->new('count_field', $class->field($field)); }
+sub count_distinct { my ($class, $field) = @_; return $class->new('count_distinct', $class->field($field)); }
+sub avg     { my ($class, $field) = @_; return $class->new('avg', $class->field($field)); }
 sub sum     { my ($class, $field) = @_; return $class->new('sum', $class->field($field)); }
+sub sum_zero { my ($class, $field) = @_; return $class->new('sum_zero', $class->field($field)); }
 sub min     { my ($class, $field) = @_; return $class->new('min', $class->field($field)); }
 sub max     { my ($class, $field) = @_; return $class->new('max', $class->field($field)); }
+sub true_count { my ($class, $field) = @_; return $class->new('true_count', $class->field($field)); }
+sub false_count { my ($class, $field) = @_; return $class->new('false_count', $class->field($field)); }
+sub bucket {
+    my ($class, $field, $specification) = @_;
+    return $class->new('bucket', $class->field($field), $specification);
+}
+sub count_bucket {
+    my ($class, $field, $minimum, $maximum, $mode) = @_;
+    return $class->new(
+        'count_bucket',
+        $class->field($field),
+        { minimum => $minimum, maximum => $maximum, mode => $mode // 'numeric' },
+    );
+}
 sub datetime_format {
     my ($class, $field, $format) = @_;
     return $class->new('datetime_format', $class->field($field), "$format");
