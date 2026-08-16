@@ -13,8 +13,8 @@ use URI::Escape qw(uri_unescape);
 use Selecto;
 
 our $PROTOCOL_VERSION = 1;
-our $SPECIFICATION = '2.1.0';
-our @QUERY_CASES = map { sprintf('Q%03d', $_) } 1 .. 20;
+our $SPECIFICATION = '2.2.0';
+our @QUERY_CASES = map { sprintf('Q%03d', $_) } 1 .. 25;
 our @WRITE_CASES = map { sprintf('W%03d', $_) } 0 .. 6;
 our @DOMAIN_CASES = map { sprintf('D%03d', $_) } 1 .. 8;
 our @ACTION_VARIANT_CASES = map { sprintf('D%03d', $_) } 38 .. 40;
@@ -323,6 +323,41 @@ sub _run_query {
     elsif ($case_id eq 'Q018') { $engine = $self->{orders_engine}; $query = $engine->query->select($x->min('total')->as('minimum_total'), $x->max('total')->as('maximum_total')); }
     elsif ($case_id eq 'Q019') { $engine = $self->{orders_engine}; $query = $engine->query->select($x->count->as('order_count'))->where($x->eq('state', 'missing')); }
     elsif ($case_id eq 'Q020') { $query = $query->select('id', 'score')->where($x->not_null('score'))->order_by('score')->order_by('id'); }
+    elsif ($case_id eq 'Q021') {
+        $engine = $self->{orders_engine};
+        $query = $engine->query
+            ->select($x->field('id')->as('order_id'), $x->field('person.name')->as('person_name'), $x->field('total'))
+            ->where($x->all($x->eq('state', 'open'), $x->all($x->eq('person.active', 1), $x->gte('total', '12.5'))))
+            ->order_by('total')->order_by('id');
+    }
+    elsif ($case_id eq 'Q022') {
+        $engine = $self->{orders_engine};
+        $query = $engine->query
+            ->select($x->field('person.name')->as('person_name'), $x->field('state'), $x->count->as('order_count'), $x->sum('total')->as('total_amount'))
+            ->where($x->all($x->not_null('person.id'), $x->gte('total', '7.5')))
+            ->group_by('person.name', 'state')->order_by('person.name')->order_by('state');
+    }
+    elsif ($case_id eq 'Q023') {
+        $engine = $self->{orders_engine};
+        $query = $engine->query
+            ->select($x->field('person.active')->as('active'), $x->field('state'), $x->count->as('order_count'), $x->sum('total')->as('total_amount'))
+            ->where($x->not_null('person.id'))
+            ->group_by('person.active', 'state')->order_by('person.active')->order_by('state')
+            ->limit(2)->offset(1);
+    }
+    elsif ($case_id eq 'Q024') {
+        $engine = $self->{orders_engine};
+        $query = $engine->query
+            ->select($x->min('total')->as('minimum_total'), $x->max('total')->as('maximum_total'), $x->sum('total')->as('total_amount'), $x->count->as('order_count'))
+            ->where($x->all($x->in('state', 'open', 'closed'), $x->eq('person.active', 1)));
+    }
+    elsif ($case_id eq 'Q025') {
+        $engine = $self->{orders_engine};
+        $query = $engine->query
+            ->select($x->field('id')->as('order_id'), $x->field('person.name')->as('person_name'), $x->field('state'), $x->field('total'))
+            ->where($x->all($x->not_null('person.id'), $x->gt('total', '7')))
+            ->order_by('person.name')->order_by('total')->order_by('id')->limit(3)->offset(1);
+    }
 
     my $statement = $engine->compile($query);
     return [$engine->all($query), $statement->to_hash];
