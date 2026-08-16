@@ -23,8 +23,21 @@ sub is_null { my ($class, $field) = @_; return $class->new('is_null', $class->fi
 sub not_null { my ($class, $field) = @_; return $class->new('not_null', $class->field($field)); }
 
 sub eq  { my ($class, $field, $value) = @_; return $class->_binary('eq',  $field, $value); }
+sub ne  { my ($class, $field, $value) = @_; return $class->_binary('ne',  $field, $value); }
 sub gt  { my ($class, $field, $value) = @_; return $class->_binary('gt',  $field, $value); }
 sub gte { my ($class, $field, $value) = @_; return $class->_binary('gte', $field, $value); }
+sub lt  { my ($class, $field, $value) = @_; return $class->_binary('lt',  $field, $value); }
+sub lte { my ($class, $field, $value) = @_; return $class->_binary('lte', $field, $value); }
+
+sub between {
+    my ($class, $field, $start, $end) = @_;
+    return $class->new(
+        'between',
+        $class->field($field),
+        $class->literal($start),
+        $class->literal($end),
+    );
+}
 
 sub in {
     my ($class, $field, @values) = @_;

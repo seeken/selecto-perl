@@ -148,10 +148,18 @@ sub _compile_expression {
         push @$params, $arguments->[0];
         return $self->placeholder(scalar @$params);
     }
-    if ($kind eq 'eq' || $kind eq 'gt' || $kind eq 'gte') {
-        my $operator = { eq => '=', gt => '>', gte => '>=' }->{$kind};
+    if ($kind eq 'eq' || $kind eq 'ne' || $kind eq 'gt' || $kind eq 'gte'
+        || $kind eq 'lt' || $kind eq 'lte') {
+        my $operator = {
+            eq => '=', ne => '<>', gt => '>', gte => '>=', lt => '<', lte => '<=',
+        }->{$kind};
         return $self->_compile_expression($domain, $arguments->[0], $params) . " $operator " .
             $self->_compile_expression($domain, $arguments->[1], $params);
+    }
+    if ($kind eq 'between') {
+        return $self->_compile_expression($domain, $arguments->[0], $params) . ' BETWEEN ' .
+            $self->_compile_expression($domain, $arguments->[1], $params) . ' AND ' .
+            $self->_compile_expression($domain, $arguments->[2], $params);
     }
     return $self->_compile_expression($domain, $arguments->[0], $params) . ' IS NULL' if $kind eq 'is_null';
     return $self->_compile_expression($domain, $arguments->[0], $params) . ' IS NOT NULL' if $kind eq 'not_null';

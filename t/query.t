@@ -16,6 +16,24 @@ like($statement->sql, qr/"s0"\."name" = \$1/, 'predicate is compiled with a Post
 unlike($statement->sql, qr/O'Brien/, 'value is not interpolated into SQL');
 is_deeply($statement->params, [q{O'Brien}], 'value is carried separately');
 
+my $comparisons = $engine->query
+    ->select('name')
+    ->where(Selecto::Expression->all([
+        Selecto::Expression->ne('name', 'Retired'),
+        Selecto::Expression->lt('id', 100),
+        Selecto::Expression->lte('id', 99),
+        Selecto::Expression->between('id', 10, 20),
+    ]));
+my $comparison_statement = $engine->compile($comparisons);
+like($comparison_statement->sql, qr/"s0"\."name" <> \$1/, 'not-equal comparison is governed');
+like($comparison_statement->sql, qr/"s0"\."id" < \$2/, 'less-than comparison is governed');
+like($comparison_statement->sql, qr/"s0"\."id" <= \$3/,
+    'less-than-or-equal comparison is governed');
+like($comparison_statement->sql, qr/"s0"\."id" BETWEEN \$4 AND \$5/,
+    'between comparison is governed');
+is_deeply($comparison_statement->params, ['Retired', 100, 99, 10, 20],
+    'all comparison values remain bound separately');
+
 my $join_engine = Selecto::Engine->new(domain => TestSelecto::orders_domain(), adapter => $adapter);
 my $grouped = $join_engine->query->select(
     Selecto::Expression->field('person.name')->as('person_name'),

@@ -87,7 +87,8 @@ my $result = $engine->all($query);
 date/time projection or grouping, use an allowlisted expression such as
 `Selecto::Expression->datetime_format('occurred_on', 'month')` consistently in
 `select`, `group_by`, or `order_by`; arbitrary database format strings are not
-accepted.
+accepted. Portable comparison intents include `eq`, `ne`, `gt`, `gte`, `lt`,
+`lte`, and `between`; their values compile as adapter-bound parameters.
 
 ## Database adapters
 
