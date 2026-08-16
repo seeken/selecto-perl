@@ -18,7 +18,7 @@ sub run_request {
 
 my $base = {
     protocol_version => 1,
-    certification_spec => '1.2.0',
+    certification_spec => '2.0.0',
     target => {
         key => 'perl_postgresql', implementation => 'selecto_perl', runtime => 'perl',
         backend => 'postgresql', connection_env => 'SELECTO_CERT_PERL_POSTGRESQL_URL',

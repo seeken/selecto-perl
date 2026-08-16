@@ -2,6 +2,7 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
+use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Selecto;
 
@@ -66,6 +67,10 @@ eval { Selecto::Action->plan($domain, { action => 'archive' }) };
 $error = $@;
 is($error->code, 'action_scope_mismatch', 'row action requires a concrete target');
 
+eval { Selecto::Action->plan($domain, { action => 'archive', target => 7, inputs => { state => 'open' } }) };
+$error = $@;
+is($error->code, 'unknown_action_input', 'undeclared action inputs fail closed');
+
 my $bulk = Selecto::Action->plan(
     $domain,
     { action => 'bulk_archive', target => { ids => ['2', '3'] } },
@@ -82,5 +87,133 @@ eval {
 };
 $error = $@;
 is($error->code, 'invalid_action_target', 'duplicate bulk targets fail closed');
+
+my $variant_contract = $domain->contract;
+$variant_contract->{source}{fields} = [qw(
+    id state documents_complete checked_in_at medical_form_received follow_up_note priority
+)];
+$variant_contract->{source}{columns} = {
+    id => { type => 'integer' }, state => { type => 'string' },
+    documents_complete => { type => 'boolean' }, checked_in_at => { type => 'utc_datetime' },
+    medical_form_received => { type => 'boolean' }, follow_up_note => { type => 'string' },
+    priority => { type => 'integer' },
+};
+$variant_contract->{writes}{fields} = {
+    map { $_ => { updatable => JSON::PP::true } }
+        qw(state checked_in_at medical_form_received follow_up_note priority)
+};
+$variant_contract->{actions}{check_in_camper} = {
+    type => 'transition', scope => 'row',
+    transition => { field => 'state', from => 'done', to => 'archived' },
+    inputs => {
+        checked_in_at => { type => 'utc_datetime', required => JSON::PP::false, default => ['system', 'now'] },
+        documents_complete => { type => 'boolean', required => JSON::PP::true, discriminator => JSON::PP::true },
+        follow_up_note => { type => 'string', required => JSON::PP::false },
+    },
+    variants => [
+        {
+            id => 'standard_check_in', when => { documents_complete => JSON::PP::true },
+            execution => {
+                kind => 'updato', operation => 'update',
+                set => { state => 'archived', checked_in_at => ['input', 'checked_in_at'] },
+            },
+        },
+        {
+            id => 'missing_documents', when => { documents_complete => JSON::PP::false },
+            inputs => {
+                missing_documents => { type => 'collection', min_items => 1 },
+                follow_up_note => { type => 'string', required => JSON::PP::true },
+            },
+            execution => {
+                kind => 'updato', operation => 'update',
+                set => {
+                    state => 'archived', medical_form_received => JSON::PP::false,
+                    follow_up_note => ['input', 'follow_up_note'],
+                },
+                collection_patches => {
+                    missing_documents => {
+                        from_input => 'missing_documents',
+                        target => ['relationship', 'registration_missing_documents'],
+                        strategy => 'patch', identity => 'id', order_field => 'position',
+                    },
+                },
+            },
+        },
+    ],
+};
+$variant_contract->{actions}{archive_by_case} = {
+    type => 'transition', scope => 'row',
+    transition => { field => 'state', from => 'done', to => 'archived' },
+    inputs => {
+        reason => { type => 'string', required => JSON::PP::true },
+        urgent => { type => 'boolean', required => JSON::PP::true },
+    },
+    execution => {
+        kind => 'updato', operation => 'update',
+        cases => [
+            { id => 'urgent', when => { urgent => JSON::PP::true }, set => { state => 'archived', priority => 99 } },
+            { id => 'ordinary', when => { urgent => JSON::PP::false }, set => { state => 'archived' } },
+        ],
+    },
+};
+my $variant_domain = Selecto::Domain->parse($variant_contract, strict => 1);
+
+my $standard = Selecto::Action->plan($variant_domain, {
+    action => 'check_in_camper', target => 42, inputs => { documents_complete => 'true' },
+});
+is($standard->variant, 'standard_check_in', 'normalized boolean selects the standard variant');
+is_deeply(
+    $standard->inputs,
+    { checked_in_at => ['system', 'now'], documents_complete => JSON::PP::true },
+    'planner materializes defaults and normalized inputs',
+);
+is_deeply(
+    $standard->changes,
+    { checked_in_at => ['system', 'now'], state => 'archived' },
+    'input references resolve inside variant changes',
+);
+
+my $missing = Selecto::Action->plan($variant_domain, {
+    action => 'check_in_camper', target => 42,
+    inputs => {
+        documents_complete => JSON::PP::false,
+        follow_up_note => 'Guardian will bring the waiver.',
+        missing_documents => [
+            { op => 'add', client_id => 'tmp-waiver', position => 1, document_type => 'waiver' },
+            { op => 'reorder', id => 17, position => 2 },
+        ],
+    },
+});
+is($missing->variant, 'missing_documents', 'false discriminator selects the collection variant');
+is_deeply(
+    $missing->collection_patches->{missing_documents},
+    {
+        target => ['relationship', 'registration_missing_documents'], strategy => 'patch',
+        identity => 'id', order_field => 'position',
+        entries => [
+            { op => 'add', client_id => 'tmp-waiver', position => 1, document_type => 'waiver' },
+            { op => 'reorder', id => 17, position => 2 },
+        ],
+    },
+    'selected variant binds collection patch metadata to normalized entries',
+);
+
+my $urgent = Selecto::Action->plan($variant_domain, {
+    action => 'archive_by_case', target => 7, inputs => { reason => 'certification', urgent => 'true' },
+});
+my $ordinary = Selecto::Action->plan($variant_domain, {
+    action => 'archive_by_case', target => 7, inputs => { reason => 'certification', urgent => 'false' },
+});
+is($urgent->execution_case, 'urgent', 'urgent execution case is explicit in the public plan');
+is_deeply($urgent->changes, { state => 'archived', priority => 99 }, 'urgent case adds governed priority');
+is_deeply($ordinary->changes, { state => 'archived' }, 'ordinary case keeps its narrower governed assignment');
+
+eval {
+    Selecto::Action->plan($variant_domain, {
+        action => 'check_in_camper', target => 42, inputs => { documents_complete => 'not-a-boolean' },
+    });
+};
+$error = $@;
+is($error->code, 'invalid_action_input', 'invalid discriminators fail closed before variant selection');
 
 done_testing;

@@ -7,7 +7,7 @@ HTTP-neutral: DBI supplies the execution boundary, while routes, ORMs, and UI
 code remain in consumer applications.
 
 This is an alpha library. Its current compatibility target is observation
-protocol 1 and certification specification 1.2.0.
+protocol 1 and certification specification 2.0.0.
 
 ## Current surface
 
@@ -134,6 +134,7 @@ do not supply arbitrary operations or assignments:
 my $plan = Selecto::Action->plan($domain, {
     action => 'archive',
     target => 42,
+    inputs => { reason => 'completed', urgent => 'false' },
 });
 
 my $preview_decision = Selecto::Action->authorize(
@@ -144,11 +145,13 @@ my $preview_decision = Selecto::Action->authorize(
 ```
 
 Row and concrete selected-ID bulk targets have exact cardinality. Transitions
-add source-state preconditions. Missing resolvers and hidden or disabled policy
-decisions fail closed in both preview and execute phases. The library currently
-returns the governed plan; applying it through a host execution adapter and
-issuing or consuming opaque authorization grants remain separate future
-boundaries.
+add source-state preconditions. Input declarations normalize booleans and
+defaults before deterministic variant or execution-case selection; selected
+variants can bind collection-patch metadata and input-backed assignments into
+the returned plan. Missing resolvers and hidden or disabled policy decisions
+fail closed in both preview and execute phases. Applying the plan through a host
+execution adapter and issuing or consuming opaque authorization grants remain
+separate future boundaries.
 
 ## Verification
 
@@ -168,12 +171,13 @@ SELECTO_CERT_PERL_POSTGRESQL_URL='postgres://...' \
 ```
 
 Certification is controlled differential evidence for the enumerated query,
-write, and domain-action cases. Action certification currently covers planning,
-target scope, transition preconditions, and capability decisions. It does not
-yet certify opaque authorization grants, host action execution adapters, audit
-delivery, or replay resistance. The broader certificate is not proof of
-arbitrary schemas, SQL, data, driver settings, concurrency, security, or
-performance.
+write, `domain_actions`, and `action_variants` cases. Action certification
+covers planning, target scope, transition preconditions, capability decisions,
+normalized variant selection, collection-patch binding, and execution-case
+assignments. It does not yet certify opaque authorization grants, host action
+execution adapters, audit delivery, or replay resistance. The broader
+certificate is not proof of arbitrary schemas, SQL, data, driver settings,
+concurrency, security, or performance.
 
 ## Explicitly deferred
 

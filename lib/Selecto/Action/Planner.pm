@@ -3,6 +3,7 @@ package Selecto::Action::Planner;
 use 5.034;
 use strict;
 use warnings;
+use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Action::Plan ();
@@ -22,7 +23,9 @@ sub plan {
     Selecto::Error->throw('invalid_action_intent', 'action is not exposed by this domain contract', { action => $action_id })
         unless ref($action) eq 'HASH';
 
-    my $execution = $action->{execution};
+    my ($inputs, $variant, $execution) = _select_variant($action, $intent->{inputs});
+    my ($execution_case, $selected_execution) = _select_execution_case($execution, $inputs);
+    $execution = $selected_execution;
     _object($execution, 'action execution');
     Selecto::Error->throw('unsupported_action_executor', 'action execution must use the updato executor')
         unless _id($execution->{kind}) eq 'updato';
@@ -35,9 +38,10 @@ sub plan {
     Selecto::Error->throw('action_operation_not_enabled', 'action operation is not enabled by the write contract')
         unless ref($operation_spec) eq 'HASH' && $operation_spec->{enabled};
 
-    my $changes = dclone($execution->{set} // {});
+    my $changes = _resolve_template($execution->{set} // {}, $inputs);
     _object($changes, 'action changes');
     _validate_changes($writes, $changes, $operation);
+    my $collection_patches = _collection_patches($execution, $inputs);
 
     my ($scope, $filters, $expected, $target) = _target($contract, $action, $operation_spec, $intent->{target});
     my ($transition, $preconditions) = _transition($writes, $action, $changes);
@@ -58,7 +62,205 @@ sub plan {
         expected_cardinality => $expected,
         transition           => $transition,
         preconditions        => $preconditions,
+        inputs               => $inputs,
+        variant              => $variant,
+        execution_case       => $execution_case,
+        collection_patches   => $collection_patches,
     );
+}
+
+sub _select_variant {
+    my ($action, $submitted) = @_;
+    $submitted //= {};
+    _object($submitted, 'action inputs');
+
+    my $base_specs = _input_specs($action->{inputs});
+    my $base_inputs = _normalize_inputs($base_specs, $submitted, 1);
+    my $variants = $action->{variants};
+    return (_normalize_inputs($base_specs, $submitted, 0), undef, $action->{execution})
+        unless defined $variants;
+    Selecto::Error->throw('invalid_action_variants', 'action variants must be a non-empty list')
+        unless ref($variants) eq 'ARRAY' && @$variants;
+
+    my @matches = grep { _condition_matches($_->{when}, $base_inputs) } @$variants;
+    Selecto::Error->throw('action_variant_not_found', 'normalized action inputs do not select an action variant')
+        unless @matches;
+    Selecto::Error->throw('ambiguous_action_variant', 'normalized action inputs select multiple action variants')
+        unless @matches == 1;
+
+    my $variant = $matches[0];
+    _object($variant, 'action variant');
+    my $variant_id = _id($variant->{id});
+    Selecto::Error->throw('invalid_action_variant', 'action variant must include an id') if $variant_id eq '';
+    my $specs = { %$base_specs, %{_input_specs($variant->{inputs})} };
+    my $inputs = _normalize_inputs($specs, $submitted, 0);
+    return ($inputs, $variant_id, $variant->{execution} // $action->{execution});
+}
+
+sub _select_execution_case {
+    my ($execution, $inputs) = @_;
+    _object($execution, 'action execution');
+    my $cases = $execution->{cases};
+    return (undef, dclone($execution)) unless defined $cases;
+    Selecto::Error->throw('invalid_action_execution_cases', 'action execution cases must be a non-empty list')
+        unless ref($cases) eq 'ARRAY' && @$cases;
+
+    my @matches = grep { _condition_matches($_->{when}, $inputs) } @$cases;
+    Selecto::Error->throw('action_execution_case_not_found', 'normalized action inputs do not select an execution case')
+        unless @matches;
+    Selecto::Error->throw('ambiguous_action_execution_case', 'normalized action inputs select multiple execution cases')
+        unless @matches == 1;
+
+    my $index;
+    for my $candidate (0 .. $#$cases) {
+        if ($cases->[$candidate] == $matches[0]) {
+            $index = $candidate;
+            last;
+        }
+    }
+    my $selected = dclone($execution);
+    delete $selected->{cases};
+    my $case = dclone($matches[0]);
+    delete $case->{when};
+    $selected->{$_} = $case->{$_} for keys %$case;
+    return (defined($matches[0]{id}) ? _id($matches[0]{id}) : $index, $selected);
+}
+
+sub _input_specs {
+    my ($value) = @_;
+    return {} unless defined $value;
+    return dclone($value) if ref($value) eq 'HASH';
+    if (ref($value) eq 'ARRAY') {
+        my %specs;
+        for my $spec (@$value) {
+            _object($spec, 'action input specification');
+            my $id = _id($spec->{id});
+            Selecto::Error->throw('invalid_action_input', 'action input specification must include an id') if $id eq '';
+            my $copy = dclone($spec);
+            delete $copy->{id};
+            $specs{$id} = $copy;
+        }
+        return \%specs;
+    }
+    Selecto::Error->throw('invalid_action_inputs', 'action input specifications must be an object or list');
+}
+
+sub _normalize_inputs {
+    my ($specs, $submitted, $allow_unknown) = @_;
+    _object($specs, 'action input specifications');
+    _object($submitted, 'action inputs');
+    unless ($allow_unknown) {
+        my @unknown = sort grep { !exists $specs->{$_} } keys %$submitted;
+        Selecto::Error->throw('unknown_action_input', 'action inputs contain undeclared fields', { fields => \@unknown })
+            if @unknown;
+    }
+
+    my %normalized;
+    for my $id (sort keys %$specs) {
+        my $spec = $specs->{$id};
+        _object($spec, 'action input specification');
+        if (exists $submitted->{$id}) {
+            $normalized{$id} = _normalize_input_value($submitted->{$id}, $spec, $id);
+        } elsif (exists $spec->{default}) {
+            $normalized{$id} = _resolve_default($spec->{default});
+        } elsif ($spec->{required}) {
+            Selecto::Error->throw('missing_action_input', 'required action input is missing', { input => $id });
+        }
+    }
+    return \%normalized;
+}
+
+sub _normalize_input_value {
+    my ($value, $spec, $id) = @_;
+    my $type = _id($spec->{type});
+    if ($type eq 'boolean') {
+        return JSON::PP::true if !ref($value) && "$value" =~ /\A(?:true|1)\z/i;
+        return JSON::PP::false if !ref($value) && "$value" =~ /\A(?:false|0)\z/i;
+        if (JSON::PP::is_bool($value)) {
+            return $value ? JSON::PP::true : JSON::PP::false;
+        }
+        Selecto::Error->throw('invalid_action_input', 'boolean action input is invalid', { input => $id });
+    }
+    if ($type eq 'collection') {
+        Selecto::Error->throw('invalid_action_input', 'collection action input must be a list', { input => $id })
+            unless ref($value) eq 'ARRAY';
+        my $minimum = defined($spec->{min_items}) ? int($spec->{min_items}) : 0;
+        Selecto::Error->throw('invalid_action_input', 'collection action input has too few entries', { input => $id })
+            if @$value < $minimum;
+        return dclone($value);
+    }
+    return dclone($value) if ref($value);
+    return $value;
+}
+
+sub _resolve_default {
+    my ($value) = @_;
+    return _resolve_template($value, {});
+}
+
+sub _condition_matches {
+    my ($condition, $inputs) = @_;
+    _object($condition, 'action selection condition');
+    for my $field (keys %$condition) {
+        return 0 unless exists $inputs->{$field};
+        return 0 unless _same_value($inputs->{$field}, $condition->{$field});
+    }
+    return 1;
+}
+
+sub _same_value {
+    my ($left, $right) = @_;
+    return JSON::PP->new->canonical(1)->allow_nonref(1)->encode($left)
+        eq JSON::PP->new->canonical(1)->allow_nonref(1)->encode($right);
+}
+
+sub _resolve_template {
+    my ($value, $inputs) = @_;
+    if (ref($value) eq 'ARRAY') {
+        if (@$value == 2 && _id($value->[0]) eq 'input') {
+            my $id = _id($value->[1]);
+            Selecto::Error->throw('missing_action_input', 'action execution references a missing input', { input => $id })
+                unless exists $inputs->{$id};
+            return _clone($inputs->{$id});
+        }
+        return [map { _resolve_template($_, $inputs) } @$value];
+    }
+    if (ref($value) eq 'HASH') {
+        return { map { $_ => _resolve_template($value->{$_}, $inputs) } keys %$value };
+    }
+    return $value;
+}
+
+sub _collection_patches {
+    my ($execution, $inputs) = @_;
+    my $specs = $execution->{collection_patches};
+    return {} unless defined $specs;
+    _object($specs, 'action collection patches');
+    my %patches;
+    for my $id (sort keys %$specs) {
+        my $spec = $specs->{$id};
+        _object($spec, 'action collection patch');
+        my $input_id = _id($spec->{from_input}) || $id;
+        Selecto::Error->throw('missing_action_input', 'collection patch references a missing input', { input => $input_id })
+            unless exists $inputs->{$input_id};
+        my $entries = $inputs->{$input_id};
+        Selecto::Error->throw('invalid_action_collection_patch', 'collection patch input must be a list')
+            unless ref($entries) eq 'ARRAY';
+        for my $entry (@$entries) {
+            Selecto::Error->throw('invalid_action_collection_patch', 'collection patch entries must be objects')
+                unless ref($entry) eq 'HASH';
+            Selecto::Error->throw('invalid_action_collection_patch', 'collection patch entry must include an operation')
+                if _id($entry->{op}) eq '';
+        }
+        $patches{$id} = {
+            target      => dclone($spec->{target}),
+            strategy    => _id($spec->{strategy}),
+            identity    => _id($spec->{identity}),
+            order_field => _id($spec->{order_field}),
+            entries     => dclone($entries),
+        };
+    }
+    return \%patches;
 }
 
 sub _contract {
@@ -157,6 +359,11 @@ sub _target_value {
     my ($value) = @_;
     return int($value) if defined($value) && !ref($value) && "$value" =~ /\A-?\d+\z/;
     return $value;
+}
+
+sub _clone {
+    my ($value) = @_;
+    return ref($value) ? dclone($value) : $value;
 }
 
 sub _object {

@@ -13,10 +13,11 @@ use URI::Escape qw(uri_unescape);
 use Selecto;
 
 our $PROTOCOL_VERSION = 1;
-our $SPECIFICATION = '1.2.0';
+our $SPECIFICATION = '2.0.0';
 our @QUERY_CASES = map { sprintf('Q%03d', $_) } 1 .. 20;
 our @WRITE_CASES = map { sprintf('W%03d', $_) } 0 .. 6;
 our @DOMAIN_CASES = map { sprintf('D%03d', $_) } 1 .. 8;
+our @ACTION_VARIANT_CASES = map { sprintf('D%03d', $_) } 38 .. 40;
 
 sub run {
     my ($class, @argv) = @_;
@@ -47,7 +48,11 @@ sub run {
         protocol_version => $PROTOCOL_VERSION,
         certification_spec => $SPECIFICATION,
         target => $target->{key},
-        capabilities => _json_booleans({ %{$suite->adapter->write_capabilities}, domain_actions => 1 }),
+        capabilities => _json_booleans({
+            %{$suite->adapter->write_capabilities},
+            domain_actions => 1,
+            action_variants => 1,
+        }),
         metadata => _metadata($dbh),
         observations => \@observations,
     };
@@ -84,7 +89,7 @@ sub read_request {
         die "case id must be a string\n" if ref($case->{id}) || $case->{id} eq '';
         die "case title must be a string\n" if ref($case->{title});
         die "case profile must be a string\n" if ref($case->{profile});
-        die "case kind is invalid\n" unless $case->{kind} =~ /\A(?:static|domain|query|write)\z/;
+        die "case kind is invalid\n" unless $case->{kind} =~ /\A(?:static|bounded|domain|query|write)\z/;
         die "case requires must be an array\n" unless ref($case->{requires}) eq 'ARRAY';
         die "duplicate case ids\n" if $seen{$case->{id}}++;
     }
@@ -206,6 +211,8 @@ sub new {
     $self->{people_engine} = Selecto::Engine->new(domain => $self->_people_domain, adapter => $self->{adapter});
     $self->{orders_engine} = Selecto::Engine->new(domain => $self->_orders_domain, adapter => $self->{adapter});
     $self->{action_domain} = Selecto::Domain->parse($self->_action_contract, strict => 1);
+    $self->{action_variant_domain} = Selecto::Domain->parse($self->_action_variant_contract, strict => 1);
+    $self->{action_execution_case_domain} = Selecto::Domain->parse($self->_action_execution_case_contract, strict => 1);
     return $self;
 }
 
@@ -235,6 +242,8 @@ sub run_case {
     return $self->_write_capability_contract if $case_id eq 'W000';
     return $self->_run_write($case_id) if grep { $_ eq $case_id } @Selecto::Certification::WRITE_CASES;
     return $self->_run_domain_action($case_id) if grep { $_ eq $case_id } @Selecto::Certification::DOMAIN_CASES;
+    return $self->_run_action_variant($case_id)
+        if grep { $_ eq $case_id } @Selecto::Certification::ACTION_VARIANT_CASES;
     Selecto::Error->throw('unsupported_case', "unsupported certification case $case_id");
 }
 
@@ -528,6 +537,61 @@ sub _archive_plan {
     return Selecto::Action->plan($self->{action_domain}, { action => 'archive', target => 7 });
 }
 
+sub _run_action_variant {
+    my ($self, $case_id) = @_;
+    if ($case_id eq 'D038') {
+        my $plan = Selecto::Action->plan($self->{action_variant_domain}, {
+            action => 'check_in_camper',
+            target => { id => 42 },
+            inputs => { documents_complete => 'true' },
+        });
+        return [{
+            variant => $plan->variant,
+            inputs => $plan->inputs,
+            changes => $plan->changes,
+        }, { api => 'Selecto::Action->plan', source => 'public_action_planner' }];
+    }
+    if ($case_id eq 'D039') {
+        my $plan = Selecto::Action->plan($self->{action_variant_domain}, {
+            action => 'check_in_camper',
+            target => { id => 42 },
+            inputs => {
+                documents_complete => JSON::PP::false,
+                follow_up_note => 'Guardian will bring the waiver.',
+                missing_documents => [
+                    {
+                        op => 'add', client_id => 'tmp-waiver', position => 1,
+                        document_type => 'waiver', note => 'Needs signature',
+                    },
+                    { op => 'reorder', id => 17, position => 2 },
+                ],
+            },
+        });
+        my $patch = $plan->collection_patches->{missing_documents};
+        return [{
+            variant => $plan->variant,
+            target => $patch->{target},
+            strategy => $patch->{strategy},
+            identity => $patch->{identity},
+            order_field => $patch->{order_field},
+            operations => [map { $_->{op} } @{$patch->{entries}}],
+        }, { api => 'Selecto::Action->plan', source => 'public_action_planner' }];
+    }
+    if ($case_id eq 'D040') {
+        my %plans = map {
+            my $label = $_;
+            my $urgent = $label eq 'urgent' ? JSON::PP::true : JSON::PP::false;
+            my $plan = Selecto::Action->plan($self->{action_execution_case_domain}, {
+                action => 'archive', target => 7,
+                inputs => { reason => 'certification', urgent => $urgent },
+            });
+            ($label => $plan->changes);
+        } qw(urgent ordinary);
+        return [\%plans, { api => 'Selecto::Action->plan', source => 'public_action_planner' }];
+    }
+    Selecto::Error->throw('unsupported_case', "unsupported action variant case $case_id");
+}
+
 sub _action_plan_error {
     my ($self, $domain, $intent) = @_;
     my $ok = eval { Selecto::Action->plan($domain, $intent); 1 };
@@ -589,6 +653,147 @@ sub _action_contract {
         capabilities => {
             'work_items.archive' => { operations => ['action', 'update'], action => 'archive' },
         },
+    };
+}
+
+sub _action_variant_contract {
+    return {
+        schema_version => 1,
+        name => 'Certification Action Variants',
+        source => {
+            source_table => 'selecto_cert_action_variants', primary_key => 'id',
+            fields => [qw(
+                id status documents_complete checked_in_at medical_form_received follow_up_note
+            )],
+            columns => {
+                id => { type => 'integer' }, status => { type => 'string' },
+                documents_complete => { type => 'boolean' }, checked_in_at => { type => 'utc_datetime' },
+                medical_form_received => { type => 'boolean' }, follow_up_note => { type => 'string' },
+            },
+            associations => {},
+        },
+        schemas => {}, joins => {},
+        writes => {
+            operations => { update => { enabled => JSON::PP::true, require_filter => JSON::PP::true } },
+            fields => {
+                status => { updatable => JSON::PP::true },
+                checked_in_at => { updatable => JSON::PP::true },
+                medical_form_received => { updatable => JSON::PP::true },
+                follow_up_note => { updatable => JSON::PP::true },
+            },
+            transitions => { status => { registered => ['checked_in'], checked_in => [] } },
+            relationships => {
+                registration_missing_documents => {
+                    writable => JSON::PP::true, cardinality => 'many',
+                    allowed_ops => [qw(insert update delete)], ownership => 'owned',
+                    foreign_key => 'camp_registration_id',
+                },
+            },
+        },
+        actions => {
+            check_in_camper => {
+                type => 'transition', scope => 'row',
+                transition => { field => 'status', from => 'registered', to => 'checked_in' },
+                inputs => {
+                    checked_in_at => {
+                        type => 'utc_datetime', required => JSON::PP::false,
+                        default => ['system', 'now'],
+                    },
+                    documents_complete => {
+                        type => 'boolean', required => JSON::PP::true,
+                        discriminator => JSON::PP::true,
+                    },
+                    follow_up_note => { type => 'string', required => JSON::PP::false },
+                },
+                variants => [
+                    {
+                        id => 'standard_check_in',
+                        when => { documents_complete => JSON::PP::true },
+                        execution => {
+                            kind => 'updato', operation => 'update',
+                            set => {
+                                status => 'checked_in',
+                                checked_in_at => ['input', 'checked_in_at'],
+                            },
+                        },
+                    },
+                    {
+                        id => 'missing_documents',
+                        when => { documents_complete => JSON::PP::false },
+                        inputs => {
+                            missing_documents => {
+                                type => 'collection', representation => 'patch', min_items => 1,
+                            },
+                            follow_up_note => { type => 'string', required => JSON::PP::true },
+                        },
+                        execution => {
+                            kind => 'updato', operation => 'update',
+                            set => {
+                                status => 'checked_in', medical_form_received => JSON::PP::false,
+                                follow_up_note => ['input', 'follow_up_note'],
+                            },
+                            collection_patches => {
+                                missing_documents => {
+                                    from_input => 'missing_documents',
+                                    target => ['relationship', 'registration_missing_documents'],
+                                    strategy => 'patch', identity => 'id', order_field => 'position',
+                                },
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+        capabilities => {},
+    };
+}
+
+sub _action_execution_case_contract {
+    return {
+        schema_version => 1,
+        name => 'Certification Action Execution Cases',
+        source => {
+            source_table => 'selecto_cert_action_cases', primary_key => 'id',
+            fields => [qw(id state priority)],
+            columns => {
+                id => { type => 'integer' }, state => { type => 'string' },
+                priority => { type => 'integer' },
+            },
+            associations => {},
+        },
+        schemas => {}, joins => {},
+        writes => {
+            operations => { update => { enabled => JSON::PP::true, require_filter => JSON::PP::true } },
+            fields => {
+                state => { updatable => JSON::PP::true },
+                priority => { updatable => JSON::PP::true },
+            },
+            transitions => { state => { done => ['archived'], archived => [] } },
+        },
+        actions => {
+            archive => {
+                type => 'transition', scope => 'row',
+                transition => { field => 'state', from => 'done', to => 'archived' },
+                inputs => {
+                    reason => { type => 'string', required => JSON::PP::true },
+                    urgent => { type => 'boolean', required => JSON::PP::true },
+                },
+                execution => {
+                    kind => 'updato', operation => 'update',
+                    cases => [
+                        {
+                            id => 'urgent', when => { urgent => JSON::PP::true },
+                            set => { state => 'archived', priority => 99 },
+                        },
+                        {
+                            id => 'ordinary', when => { urgent => JSON::PP::false },
+                            set => { state => 'archived' },
+                        },
+                    ],
+                },
+            },
+        },
+        capabilities => {},
     };
 }
 
