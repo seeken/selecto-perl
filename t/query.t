@@ -8,6 +8,22 @@ use TestSelecto;
 my $dbh = TestSelecto::DBH->new;
 my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
 my $engine = Selecto::Engine->new(domain => TestSelecto::people_domain(), adapter => $adapter);
+ok(!$engine->query->can('from'), 'query API has no root-level from operation');
+eval { Selecto::Query->new(from => 'other_people') };
+is($@->code, 'invalid_query', 'query constructor rejects a root override');
+
+my $other_domain = Selecto::Domain->new(
+    name => 'Archived people',
+    table => 'archived_people',
+    fields => { id => 'integer', name => 'string' },
+);
+my $other_engine = Selecto::Engine->new(domain => $other_domain, adapter => $adapter);
+my $rootless_query = Selecto::Query->new->select('id');
+like($engine->compile($rootless_query)->sql, qr/FROM "people" AS "s0"/,
+    'compiler reads the first root from its domain');
+like($other_engine->compile($rootless_query)->sql, qr/FROM "archived_people" AS "s0"/,
+    'the same query intent takes a different root from a different domain');
+
 my $base = $engine->query->select('id', 'name');
 my $filtered = $base->where(Selecto::Expression->eq('name', q{O'Brien}));
 ok(!defined($base->predicate), 'query builder leaves the original query unchanged');

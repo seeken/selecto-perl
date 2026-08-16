@@ -9,6 +9,9 @@
 - Database implementations must inherit `Selecto::Adapter`, return
   `Selecto::Statement` objects, and register by a stable lowercase name. Keep
   dialect SQL and result normalization inside the concrete adapter.
+- The domain owns the root relation. Query objects must not expose or accept a
+  `from` override; engines pass the domain and query intent to adapters
+  separately, and adapters render the root from the domain.
 - Certification observations must exercise public Selecto APIs. The central
   harness owns expected values and certification verdicts.
 - Keep credentials and connection strings out of errors, JSON output, fixtures,

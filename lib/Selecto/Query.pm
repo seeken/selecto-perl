@@ -9,6 +9,15 @@ use Selecto::Expression ();
 
 sub new {
     my ($class, %args) = @_;
+    my %allowed = map { $_ => 1 } qw(
+        selections predicate groups orders limit_value offset_value
+    );
+    my @unknown = sort grep { !$allowed{$_} } keys %args;
+    Selecto::Error->throw(
+        'invalid_query',
+        'query state contains unsupported keys',
+        { keys => \@unknown },
+    ) if @unknown;
     return bless {
         selections  => [@{$args{selections} // []}],
         predicate   => $args{predicate},
