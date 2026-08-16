@@ -1,9 +1,10 @@
 # selecto-perl
 
 `selecto-perl` is the native Perl implementation of Selecto's governed domain,
-immutable query, PostgreSQL adapter, and portable write contracts. The core is
-framework-neutral: DBI supplies the execution boundary, while web frameworks,
-ORMs, and UI code remain in consumer applications.
+immutable query, database-adapter, and portable write contracts. Mojolicious
+supplies a small object foundation and named adapter registry. The core remains
+HTTP-neutral: DBI supplies the execution boundary, while routes, ORMs, and UI
+code remain in consumer applications.
 
 This is an alpha library. Its current compatibility target is observation
 protocol 1 and certification specification 1.1.0.
@@ -18,20 +19,24 @@ protocol 1 and certification specification 1.1.0.
   expressions;
 - PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
 - DBI execution with stable columns and normalized PostgreSQL values;
+- a versioned `Selecto::Adapter` contract, generic `Selecto::Statement`, and
+  runtime adapter registry for independently packaged database support;
 - portable insert, update, upsert, delete, expected-cardinality, and atomic
   batch writes;
 - adapter capability reporting and an observation-protocol runner for central
   backend certification.
 
-It does not contain HTTP, PSGI, ORM, or UI compatibility code.
+It does not contain HTTP routes, ORM, or UI compatibility code.
 
 ## Install for development
 
-Perl 5.34 or newer is required. PostgreSQL execution and certification require
-`DBD::Pg`; compilation and the unit suite do not open a database.
+Perl 5.34 or newer and Mojolicious 9.40 or newer are required. PostgreSQL
+execution and certification additionally require `DBD::Pg`; the base
+distribution can be installed for another adapter without that driver.
 
 ```sh
 cpanm --installdeps .
+cpanm DBD::Pg # only when using the PostgreSQL adapter
 perl Makefile.PL
 make test
 ```
@@ -57,7 +62,7 @@ my $dbh = DBI->connect($dsn, undef, undef, {
 });
 my $engine = Selecto::Engine->new(
     domain  => $domain,
-    adapter => Selecto::PostgreSQL->new(dbh => $dbh),
+    adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
 );
 
 my $query = $engine->query
@@ -73,6 +78,29 @@ my $query = $engine->query
 
 my $result = $engine->all($query);
 ```
+
+## Database adapters
+
+Applications select a registered adapter by stable name. They do not need to
+construct a dialect class directly:
+
+```perl
+my $adapter = Selecto->adapter($database_name => (dbh => $dbh));
+my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+```
+
+An additional database implementation subclasses `Selecto::Adapter`,
+implements the seven required compile/execution methods, returns generic
+`Selecto::Statement` values, and registers its package:
+
+```perl
+Selecto::Adapter::Registry->default
+    ->register(sqlite => 'Selecto::SQLite');
+```
+
+`Selecto->available_adapters` exposes the names currently registered. This
+release registers only `postgresql`; the contract and registry are the stable
+extension seam, not a claim that other dialects already work.
 
 Application values never enter the SQL string. The compiler emits placeholders
 and carries values separately in the statement's `params` array.
@@ -122,8 +150,7 @@ concurrency, security, or performance.
   JSON rowsets, full-text search, and streaming;
 - deeper-than-one-hop relationships;
 - nested portable write graphs and adapter-independent mutation expressions;
-- non-PostgreSQL adapters;
+- concrete non-PostgreSQL adapters (the registration contract is implemented);
 - framework-specific integration beyond the DBI handle boundary.
 
 Deferred capabilities fail closed instead of falling back to raw SQL.
-

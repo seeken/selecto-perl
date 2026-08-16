@@ -12,7 +12,9 @@ sub new {
     my ($class, %args) = @_;
     Selecto::Error->throw('invalid_domain', 'engine requires a domain')
         unless blessed($args{domain}) && $args{domain}->isa('Selecto::Domain');
-    Selecto::Error->throw('invalid_adapter', 'engine requires an adapter') unless blessed($args{adapter});
+    Selecto::Error->throw('invalid_adapter', 'engine requires a Selecto database adapter')
+        unless blessed($args{adapter}) && $args{adapter}->isa('Selecto::Adapter');
+    $args{adapter}->assert_contract;
     return bless { domain => $args{domain}, adapter => $args{adapter} }, $class;
 }
 
@@ -25,4 +27,3 @@ sub execute_write { my ($self, $command) = @_; return $self->{adapter}->execute_
 sub execute_batch { my ($self, $batch) = @_; return $self->{adapter}->execute_batch($batch); }
 
 1;
-

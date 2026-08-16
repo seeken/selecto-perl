@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install --yes cpanminus libpq-dev && cpanm --installdeps .
+        run: sudo apt-get update && sudo apt-get install --yes cpanminus libpq-dev && cpanm --installdeps . && cpanm DBD::Pg
       - name: Verify distribution
         env:
           SELECTO_PERL_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/selecto_perl_test

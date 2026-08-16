@@ -10,10 +10,11 @@ my $dbh = TestSelecto::DBH->new({
     types => ['int4', 'numeric', 'bool'],
 });
 my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
-my $statement = Selecto::PostgreSQL::Statement->new(
+my $statement = Selecto::Statement->new(
     sql => 'SELECT id, score, active FROM people',
     params => [],
     columns => ['id', 'score', 'active'],
+    adapter_name => 'postgresql',
 );
 is_deeply($adapter->execute_query($statement), {
     columns => ['id', 'score', 'active'],
@@ -25,6 +26,7 @@ is($adapter->placeholder(2), '$2', 'PostgreSQL placeholder numbering is explicit
 is($adapter->normalize_type('timestamptz'), 'utc_datetime', 'adapter type normalization is portable');
 ok($adapter->supports('transactions'), 'transactions are declared supported');
 ok(!$adapter->supports('cte'), 'deferred capability is declared unsupported');
+isa_ok($adapter, 'Selecto::Adapter', 'PostgreSQL implements the database-neutral adapter contract');
+is($statement->adapter_name, 'postgresql', 'generic statement records its compiling adapter');
 
 done_testing;
-

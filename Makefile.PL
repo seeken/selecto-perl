@@ -13,9 +13,9 @@ WriteMakefile(
     EXE_FILES        => ['bin/selecto-certify'],
     PREREQ_PM        => {
         'DBI'         => '1.643',
-        'DBD::Pg'     => '3.016',
         'Digest::SHA' => 0,
         'JSON::PP'    => '4.06',
+        'Mojolicious' => '9.40',
         'Scalar::Util'=> 0,
         'URI::Escape' => 0,
     },
@@ -33,5 +33,11 @@ WriteMakefile(
             },
         },
         x_license => 'O-Saasy',
+        optional_features => {
+            postgresql => {
+                description => 'PostgreSQL execution and certification',
+                prereqs => { runtime => { requires => { 'DBD::Pg' => '3.016' } } },
+            },
+        },
     },
 );

@@ -4,15 +4,25 @@ use 5.034;
 use strict;
 use warnings;
 
-our $VERSION = '0.1.0_01';
+our $VERSION = '0.2.0_01';
 
+use Selecto::Adapter ();
+use Selecto::Adapter::Registry ();
 use Selecto::Domain ();
 use Selecto::Engine ();
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::PostgreSQL ();
 use Selecto::Query ();
+use Selecto::Statement ();
 use Selecto::Write ();
+
+sub adapter {
+    my ($class, $name, %args) = @_;
+    return Selecto::Adapter::Registry->default->build($name, %args);
+}
+
+sub available_adapters { return Selecto::Adapter::Registry->default->names; }
 
 1;
 
@@ -27,7 +37,7 @@ Selecto - governed domain, query, and portable write contracts for Perl
   use Selecto;
 
   my $domain = Selecto::Domain->parse($json, strict => 1);
-  my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
+  my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
   my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
 
   my $query = $engine->query
@@ -40,9 +50,9 @@ Selecto - governed domain, query, and portable write contracts for Perl
 
 =head1 DESCRIPTION
 
-Selecto is a native, framework-neutral Perl implementation of Selecto's strict
-domain, immutable query, PostgreSQL compilation/execution, and portable write
-boundaries. It does not delegate Selecto semantics to an ORM or web framework.
+Selecto is a native, HTTP-neutral Perl implementation of Selecto's strict
+domain, immutable query, database-adapter, and portable write boundaries.
+Mojolicious supplies the lightweight object foundation and adapter registry;
+it does not own query semantics or database execution.
 
 =cut
-

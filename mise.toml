@@ -3,13 +3,12 @@ perl = "5.40.2"
 
 [tasks.test]
 description = "Run the native Perl unit suite"
-run = "prove -lr t"
+run = "script/with-local-deps prove -lr t"
 
 [tasks.build]
 description = "Build the CPAN-style distribution metadata"
-run = "perl Makefile.PL && make"
+run = "script/with-local-deps sh -c 'perl Makefile.PL && make'"
 
 [tasks.verify]
 description = "Run syntax checks, tests, and distribution build"
-run = "perl -Ilib -c bin/selecto-certify && prove -lr t && perl Makefile.PL && make test"
-
+run = "script/with-local-deps sh -c 'perl -Ilib -c bin/selecto-certify && prove -lr t && perl Makefile.PL && make test'"

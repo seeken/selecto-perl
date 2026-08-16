@@ -1,11 +1,10 @@
 package Selecto::PostgreSQL;
 
-use 5.034;
-use strict;
-use warnings;
+use Mojo::Base 'Selecto::Adapter';
 use Scalar::Util qw(blessed looks_like_number);
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::Statement ();
 use Selecto::Write ();
 
 our @FEATURE_INVENTORY = qw(
@@ -14,14 +13,6 @@ our @FEATURE_INVENTORY = qw(
 );
 our %WRITE_CAPABILITIES = map { $_ => 1 } qw(insert update upsert delete transactions atomic_batch);
 
-sub new {
-    my ($class, %args) = @_;
-    Selecto::Error->throw('invalid_adapter', 'PostgreSQL adapter requires a DBI-compatible handle')
-        unless blessed($args{dbh});
-    return bless { dbh => $args{dbh} }, $class;
-}
-
-sub dbh     { return $_[0]->{dbh}; }
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
 sub feature_inventory { return [@FEATURE_INVENTORY]; }
@@ -49,31 +40,6 @@ sub normalize_type {
 sub supports {
     my ($self, $feature) = @_;
     return "$feature" eq 'transactions' || "$feature" eq 'returning' ? 1 : 0;
-}
-
-sub capability {
-    my ($self, $feature) = @_;
-    return { supported => $self->supports($feature) ? 1 : 0 };
-}
-
-sub normalize_execution_result {
-    my ($self, $result) = @_;
-    return {
-        status => 'ok',
-        columns => [map { "$_" } @{$result->{columns} // []}],
-        rows => [map { [@$_] } @{$result->{rows} // []}],
-    };
-}
-
-sub normalize_error {
-    my ($self, $error) = @_;
-    return $error if blessed($error) && $error->isa('Selecto::Error');
-    my $cause = blessed($error) ? ref($error) : 'database_error';
-    return Selecto::Error->new(
-        code => 'query_error',
-        message => 'Execution failed',
-        details => { cause => $cause },
-    );
 }
 
 sub compile {
@@ -107,7 +73,12 @@ sub compile {
     } @$orders) if @$orders;
     $sql .= ' LIMIT ' . $query->limit_value if defined $query->limit_value;
     $sql .= ' OFFSET ' . $query->offset_value if defined $query->offset_value;
-    return Selecto::PostgreSQL::Statement->new(sql => $sql, params => \@params, columns => \@columns);
+    return Selecto::Statement->new(
+        sql => $sql,
+        params => \@params,
+        columns => \@columns,
+        adapter_name => $self->name,
+    );
 }
 
 sub execute_query {
@@ -373,22 +344,6 @@ sub _checked_identifier {
 
 package Selecto::PostgreSQL::Statement;
 
-use 5.034;
-use strict;
-use warnings;
-
-sub new {
-    my ($class, %args) = @_;
-    return bless {
-        sql => "$args{sql}",
-        params => [@{$args{params} // []}],
-        columns => [@{$args{columns} // []}],
-    }, $class;
-}
-
-sub sql     { return $_[0]->{sql}; }
-sub params  { return [@{$_[0]->{params}}]; }
-sub columns { return [@{$_[0]->{columns}}]; }
-sub to_hash { return { sql => $_[0]->{sql}, params => [@{$_[0]->{params}}], aliases => [@{$_[0]->{columns}}] }; }
+use Mojo::Base 'Selecto::Statement';
 
 1;

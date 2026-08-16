@@ -199,7 +199,7 @@ use Selecto;
 sub new {
     my ($class, %args) = @_;
     my $self = bless { dbh => $args{dbh} }, $class;
-    $self->{adapter} = Selecto::PostgreSQL->new(dbh => $self->{dbh});
+    $self->{adapter} = Selecto->adapter(postgresql => (dbh => $self->{dbh}));
     $self->_setup_fixtures;
     $self->{people_engine} = Selecto::Engine->new(domain => $self->_people_domain, adapter => $self->{adapter});
     $self->{orders_engine} = Selecto::Engine->new(domain => $self->_orders_domain, adapter => $self->{adapter});

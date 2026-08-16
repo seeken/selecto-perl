@@ -21,7 +21,7 @@ $dbh->do(q{INSERT INTO selecto_perl_test_items VALUES (1, 'baseline')});
 my $domain = Selecto::Domain->new(
     name => 'Items', table => 'selecto_perl_test_items', fields => { id => 'integer', name => 'string' },
 );
-my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
 my $result = $engine->all($engine->query->select('id', 'name')->order_by('id'));
 is_deeply($result, { columns => ['id', 'name'], rows => [[1, 'baseline']] }, 'public query API executes through DBD::Pg');
 
@@ -39,4 +39,3 @@ is($dbh->selectrow_array('SELECT count(*) FROM selecto_perl_test_items'), 1, 'fa
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_items');
 $dbh->disconnect;
 done_testing;
-
