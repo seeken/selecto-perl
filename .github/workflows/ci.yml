@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: selecto_perl_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d selecto_perl_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install --yes cpanminus libpq-dev && cpanm --installdeps .
+      - name: Verify distribution
+        env:
+          SELECTO_PERL_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/selecto_perl_test
+        run: perl Makefile.PL && make test

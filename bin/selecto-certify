@@ -1,0 +1,17 @@
+#!/usr/bin/env perl
+
+use 5.034;
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use Selecto::Certification ();
+
+my $ok = eval { Selecto::Certification->run(@ARGV); 1 };
+if (!$ok) {
+    my $error = $@;
+    $error =~ s/\s+\z//;
+    warn "selecto-certify: $error\n";
+    exit 1;
+}
+

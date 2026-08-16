@@ -1,0 +1,15 @@
+[tools]
+perl = "5.40.2"
+
+[tasks.test]
+description = "Run the native Perl unit suite"
+run = "prove -lr t"
+
+[tasks.build]
+description = "Build the CPAN-style distribution metadata"
+run = "perl Makefile.PL && make"
+
+[tasks.verify]
+description = "Run syntax checks, tests, and distribution build"
+run = "perl -Ilib -c bin/selecto-certify && prove -lr t && perl Makefile.PL && make test"
+
