@@ -8,6 +8,7 @@ our $VERSION = '0.2.0_01';
 
 use Selecto::Adapter ();
 use Selecto::Adapter::Registry ();
+use Selecto::Action ();
 use Selecto::Domain ();
 use Selecto::Engine ();
 use Selecto::Error ();

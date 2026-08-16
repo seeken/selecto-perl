@@ -17,6 +17,7 @@ WriteMakefile(
         'JSON::PP'    => '4.06',
         'Mojolicious' => '9.40',
         'Scalar::Util'=> 0,
+        'Storable'    => 0,
         'URI::Escape' => 0,
     },
     TEST_REQUIRES => {

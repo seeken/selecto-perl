@@ -7,7 +7,7 @@ HTTP-neutral: DBI supplies the execution boundary, while routes, ORMs, and UI
 code remain in consumer applications.
 
 This is an alpha library. Its current compatibility target is observation
-protocol 1 and certification specification 1.1.0.
+protocol 1 and certification specification 1.2.0.
 
 ## Current surface
 
@@ -23,6 +23,8 @@ protocol 1 and certification specification 1.1.0.
   runtime adapter registry for independently packaged database support;
 - portable insert, update, upsert, delete, expected-cardinality, and atomic
   batch writes;
+- governed row and selected-id bulk action planning with explicit transition
+  preconditions and fail-closed preview/execute capability decisions;
 - adapter capability reporting and an observation-protocol runner for central
   backend certification.
 
@@ -123,6 +125,31 @@ Update and delete predicates are deliberately limited to equality in protocol
 1. Identifiers are validated separately from bound values. Each write and every
 batch executes transactionally; an expected-cardinality mismatch rolls back.
 
+## Governed actions
+
+Actions project a declared domain action into a constrained write plan; callers
+do not supply arbitrary operations or assignments:
+
+```perl
+my $plan = Selecto::Action->plan($domain, {
+    action => 'archive',
+    target => 42,
+});
+
+my $preview_decision = Selecto::Action->authorize(
+    $plan,
+    'preview',
+    resolver => sub ($request) { return 'enabled' },
+);
+```
+
+Row and concrete selected-ID bulk targets have exact cardinality. Transitions
+add source-state preconditions. Missing resolvers and hidden or disabled policy
+decisions fail closed in both preview and execute phases. The library currently
+returns the governed plan; applying it through a host execution adapter and
+issuing or consuming opaque authorization grants remain separate future
+boundaries.
+
 ## Verification
 
 ```sh
@@ -140,9 +167,13 @@ SELECTO_CERT_PERL_POSTGRESQL_URL='postgres://...' \
   mise exec -- mix selecto.certify --targets perl_postgresql,elixir_postgresql
 ```
 
-Certification is controlled live differential evidence for the 37 enumerated
-cases. It is not proof of arbitrary schemas, SQL, data, driver settings,
-concurrency, security, or performance.
+Certification is controlled differential evidence for the enumerated query,
+write, and domain-action cases. Action certification currently covers planning,
+target scope, transition preconditions, and capability decisions. It does not
+yet certify opaque authorization grants, host action execution adapters, audit
+delivery, or replay resistance. The broader certificate is not proof of
+arbitrary schemas, SQL, data, driver settings, concurrency, security, or
+performance.
 
 ## Explicitly deferred
 

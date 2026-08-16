@@ -52,10 +52,10 @@ my $canonical = Selecto::Domain->parse(JSON::PP->new->encode({
 is($canonical->table, 'orders', 'canonical source table is parsed');
 is($canonical->resolve('person.name')->{type}, 'string', 'canonical association fields resolve');
 is($canonical->associations->{person}->join_type, 'inner', 'join metadata is applied');
+is($canonical->writes->{version}, 1, 'canonical write metadata remains available to governed consumers');
 
 eval { $canonical->resolve('person.secret') };
 $error = $@;
 is($error->code, 'unknown_field', 'fields outside the contract are rejected');
 
 done_testing;
-

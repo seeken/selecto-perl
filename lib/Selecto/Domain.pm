@@ -6,6 +6,7 @@ use warnings;
 use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 use Scalar::Util qw(blessed);
+use Storable qw(dclone);
 use Selecto::Error ();
 
 my %TOP_LEVEL = map { $_ => 1 } qw(
@@ -124,12 +125,14 @@ sub _parse_canonical {
 
     _required_key($raw, 'name', 'domain');
     _required_key($source, 'source_table', 'source');
-    return $class->new(
+    my $domain = $class->new(
         name => $raw->{name},
         table => $source->{source_table},
         fields => _canonical_fields($source),
         associations => \%associations,
     );
+    $domain->{contract} = dclone($raw);
+    return $domain;
 }
 
 sub _canonical_fields {
@@ -221,6 +224,10 @@ sub table        { return $_[0]->{table}; }
 sub fields       { return { %{$_[0]->{fields}} }; }
 sub associations { return { %{$_[0]->{associations}} }; }
 sub fingerprint  { return $_[0]->{fingerprint}; }
+sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
+sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
+sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
+sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
 
 package Selecto::Domain::Association;
 
@@ -269,4 +276,3 @@ sub related_key { return $_[0]->{related_key}; }
 sub join_type   { return $_[0]->{join_type}; }
 
 1;
-

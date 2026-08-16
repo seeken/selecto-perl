@@ -13,9 +13,10 @@ use URI::Escape qw(uri_unescape);
 use Selecto;
 
 our $PROTOCOL_VERSION = 1;
-our $SPECIFICATION = '1.1.0';
+our $SPECIFICATION = '1.2.0';
 our @QUERY_CASES = map { sprintf('Q%03d', $_) } 1 .. 20;
 our @WRITE_CASES = map { sprintf('W%03d', $_) } 0 .. 6;
+our @DOMAIN_CASES = map { sprintf('D%03d', $_) } 1 .. 8;
 
 sub run {
     my ($class, @argv) = @_;
@@ -46,7 +47,7 @@ sub run {
         protocol_version => $PROTOCOL_VERSION,
         certification_spec => $SPECIFICATION,
         target => $target->{key},
-        capabilities => _json_booleans($suite->adapter->write_capabilities),
+        capabilities => _json_booleans({ %{$suite->adapter->write_capabilities}, domain_actions => 1 }),
         metadata => _metadata($dbh),
         observations => \@observations,
     };
@@ -83,7 +84,7 @@ sub read_request {
         die "case id must be a string\n" if ref($case->{id}) || $case->{id} eq '';
         die "case title must be a string\n" if ref($case->{title});
         die "case profile must be a string\n" if ref($case->{profile});
-        die "case kind is invalid\n" unless $case->{kind} =~ /\A(?:static|query|write)\z/;
+        die "case kind is invalid\n" unless $case->{kind} =~ /\A(?:static|domain|query|write)\z/;
         die "case requires must be an array\n" unless ref($case->{requires}) eq 'ARRAY';
         die "duplicate case ids\n" if $seen{$case->{id}}++;
     }
@@ -194,6 +195,7 @@ use strict;
 use warnings;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
+use Storable qw(dclone);
 use Selecto;
 
 sub new {
@@ -203,6 +205,7 @@ sub new {
     $self->_setup_fixtures;
     $self->{people_engine} = Selecto::Engine->new(domain => $self->_people_domain, adapter => $self->{adapter});
     $self->{orders_engine} = Selecto::Engine->new(domain => $self->_orders_domain, adapter => $self->{adapter});
+    $self->{action_domain} = Selecto::Domain->parse($self->_action_contract, strict => 1);
     return $self;
 }
 
@@ -231,6 +234,7 @@ sub run_case {
     return $self->_run_query($case_id) if grep { $_ eq $case_id } @Selecto::Certification::QUERY_CASES;
     return $self->_write_capability_contract if $case_id eq 'W000';
     return $self->_run_write($case_id) if grep { $_ eq $case_id } @Selecto::Certification::WRITE_CASES;
+    return $self->_run_domain_action($case_id) if grep { $_ eq $case_id } @Selecto::Certification::DOMAIN_CASES;
     Selecto::Error->throw('unsupported_case', "unsupported certification case $case_id");
 }
 
@@ -420,6 +424,172 @@ sub _write_state {
     my ($self) = @_;
     my $rows = $self->{dbh}->selectall_arrayref('SELECT id, external_id, name FROM selecto_cert_writes ORDER BY id');
     return [map { [int($_->[0]), $_->[1], $_->[2]] } @$rows];
+}
+
+sub _run_domain_action {
+    my ($self, $case_id) = @_;
+    if ($case_id eq 'D001') {
+        my $plan = $self->_archive_plan;
+        return [{
+            action => $plan->action, type => $plan->type, operation => $plan->operation,
+            scope => $plan->scope, capability => $plan->capability, target => $plan->target,
+            filters => $plan->filters, changes => $plan->changes,
+            expected_cardinality => $plan->expected_cardinality,
+        }, { api => 'Selecto::Action->plan' }];
+    }
+    if ($case_id eq 'D002') {
+        my $plan = $self->_archive_plan;
+        my $preconditions = $plan->preconditions;
+        Selecto::Error->throw('unexpected_action_preconditions', 'expected one transition precondition')
+            unless @$preconditions == 1;
+        return [$preconditions->[0], { api => 'Selecto::Action->plan' }];
+    }
+    if ($case_id eq 'D003') {
+        my @attempts = (
+            ['unknown_action', { action => 'does_not_exist', target => 7 }],
+            ['missing_target', { action => 'archive' }],
+        );
+        return [[map {
+            +{ attempt => $_->[0], code => $self->_action_plan_error($self->{action_domain}, $_->[1]) }
+        } @attempts], { fail_closed => JSON::PP::true }];
+    }
+    if ($case_id eq 'D004') {
+        my $plan = Selecto::Action->plan($self->_bulk_action_domain, {
+            action => 'bulk_archive', target => { ids => [2, 3] },
+        });
+        return [{
+            action => $plan->action, operation => $plan->operation, scope => $plan->scope,
+            target => $plan->target, filters => $plan->filters, changes => $plan->changes,
+            expected_cardinality => $plan->expected_cardinality,
+        }, { api => 'Selecto::Action->plan' }];
+    }
+    if ($case_id eq 'D005') {
+        my $domain = $self->_bulk_action_domain;
+        my @attempts = (
+            ['empty', { action => 'bulk_archive', target => { ids => [] } }],
+            ['duplicate', { action => 'bulk_archive', target => { ids => [2, 2] } }],
+        );
+        return [[map {
+            +{ attempt => $_->[0], code => $self->_action_plan_error($domain, $_->[1]) }
+        } @attempts], { fail_closed => JSON::PP::true }];
+    }
+    if ($case_id eq 'D006') {
+        my $plan = $self->_archive_plan;
+        my @results = map {
+            my $phase = $_;
+            my $error = $self->_action_authorization_error($plan, $phase);
+            +{
+                capability => $error->{capability}, code => $error->{code}, phase => $error->{phase},
+                status => $error->{status},
+            }
+        } qw(preview execute);
+        return [\@results, { fail_closed => JSON::PP::true }];
+    }
+    if ($case_id eq 'D007') {
+        my $plan = $self->_archive_plan;
+        my @results;
+        for my $phase (qw(preview execute)) {
+            for my $decision (qw(disabled hidden)) {
+                my $error = $self->_action_authorization_error(
+                    $plan,
+                    $phase,
+                    resolver => sub { return $decision },
+                );
+                push @results, {
+                    phase => $phase, decision => $decision, status => 'denied',
+                    capability => $error->{capability},
+                };
+            }
+        }
+        return [\@results, { fail_closed => JSON::PP::true }];
+    }
+    if ($case_id eq 'D008') {
+        my $plan = $self->_archive_plan;
+        my @results = map {
+            my $phase = $_;
+            my $decision = Selecto::Action->authorize(
+                $plan,
+                $phase,
+                resolver => sub { return 'enabled' },
+            );
+            my $request = Selecto::Action->capability_request($plan, $phase);
+            +{
+                decision => { status => $decision->{status}, capability => $decision->{capability} },
+                request => { map { $_ => $request->{$_} } qw(phase capability action operation scope target filters) },
+            }
+        } qw(preview execute);
+        return [\@results, { api => 'Selecto::Action->authorize' }];
+    }
+    Selecto::Error->throw('unsupported_case', "unsupported domain action case $case_id");
+}
+
+sub _archive_plan {
+    my ($self) = @_;
+    return Selecto::Action->plan($self->{action_domain}, { action => 'archive', target => 7 });
+}
+
+sub _action_plan_error {
+    my ($self, $domain, $intent) = @_;
+    my $ok = eval { Selecto::Action->plan($domain, $intent); 1 };
+    Selecto::Error->throw('expected_error', 'expected action planning to fail') if $ok;
+    my $error = $@;
+    die $error unless blessed($error) && $error->isa('Selecto::Error');
+    return $error->code;
+}
+
+sub _action_authorization_error {
+    my ($self, $plan, $phase, %options) = @_;
+    my $ok = eval { Selecto::Action->authorize($plan, $phase, %options); 1 };
+    Selecto::Error->throw('expected_error', 'expected action authorization to fail') if $ok;
+    my $error = $@;
+    die $error unless blessed($error) && $error->isa('Selecto::Error');
+    return { code => $error->code, %{$error->details // {}} };
+}
+
+sub _bulk_action_domain {
+    my ($self) = @_;
+    my $contract = $self->{action_domain}->contract;
+    $contract->{writes}{operations}{update}{bulk} = JSON::PP::true;
+    $contract->{capabilities}{'work_items.bulk_archive'} = {
+        operations => ['action', 'update'], action => 'bulk_archive',
+    };
+    $contract->{actions}{bulk_archive} = {
+        type => 'bulk_action', scope => 'bulk', capability => 'work_items.bulk_archive',
+        execution => { kind => 'updato', operation => 'update', set => { state => 'archived' } },
+    };
+    return Selecto::Domain->parse($contract, strict => 1);
+}
+
+sub _action_contract {
+    return {
+        schema_version => 1,
+        name => 'Certification Actions',
+        source => {
+            source_table => 'selecto_cert_actions', primary_key => 'id',
+            fields => [qw(id state tenant_id)],
+            columns => {
+                id => { type => 'integer' }, state => { type => 'string' },
+                tenant_id => { type => 'integer' },
+            },
+            associations => {},
+        },
+        schemas => {}, joins => {},
+        writes => {
+            operations => { update => { enabled => JSON::PP::true, require_filter => JSON::PP::true } },
+            fields => { state => { updatable => JSON::PP::true } },
+            transitions => { state => { done => ['archived'], archived => [] } },
+        },
+        actions => {
+            archive => {
+                type => 'transition', scope => 'row', capability => 'work_items.archive',
+                transition => { field => 'state', from => 'done', to => 'archived' },
+                execution => { kind => 'updato', operation => 'update', set => { state => 'archived' } },
+            },
+        },
+        capabilities => {
+            'work_items.archive' => { operations => ['action', 'update'], action => 'archive' },
+        },
+    };
 }
 
 sub _people_domain {
