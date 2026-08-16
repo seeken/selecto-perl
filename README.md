@@ -7,7 +7,7 @@ HTTP-neutral: DBI supplies the execution boundary, while routes, ORMs, and UI
 code remain in consumer applications.
 
 This is an alpha library. Its current compatibility target is observation
-protocol 1 and certification specification 2.0.0.
+protocol 1 and certification specification 2.1.0.
 
 ## Current surface
 
@@ -27,6 +27,8 @@ protocol 1 and certification specification 2.0.0.
   batch writes;
 - governed row and selected-id bulk action planning with explicit transition
   preconditions and fail-closed preview/execute capability decisions;
+- an HTTP-neutral canonical domain API host with OpenAPI 3.1 and byte-stable
+  UTF-8 JSON response bodies;
 - adapter capability reporting and an observation-protocol runner for central
   backend certification.
 

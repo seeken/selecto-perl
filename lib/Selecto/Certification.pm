@@ -13,11 +13,12 @@ use URI::Escape qw(uri_unescape);
 use Selecto;
 
 our $PROTOCOL_VERSION = 1;
-our $SPECIFICATION = '2.0.0';
+our $SPECIFICATION = '2.1.0';
 our @QUERY_CASES = map { sprintf('Q%03d', $_) } 1 .. 20;
 our @WRITE_CASES = map { sprintf('W%03d', $_) } 0 .. 6;
 our @DOMAIN_CASES = map { sprintf('D%03d', $_) } 1 .. 8;
 our @ACTION_VARIANT_CASES = map { sprintf('D%03d', $_) } 38 .. 40;
+our @CANONICAL_API_CASES = map { sprintf('D%03d', $_) } 64 .. 71;
 
 sub run {
     my ($class, @argv) = @_;
@@ -52,6 +53,7 @@ sub run {
             %{$suite->adapter->write_capabilities},
             domain_actions => 1,
             action_variants => 1,
+            canonical_domain_api => 1,
         }),
         metadata => _metadata($dbh),
         observations => \@observations,
@@ -198,6 +200,7 @@ package Selecto::Certification::Suite;
 use 5.034;
 use strict;
 use warnings;
+use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
@@ -213,6 +216,10 @@ sub new {
     $self->{action_domain} = Selecto::Domain->parse($self->_action_contract, strict => 1);
     $self->{action_variant_domain} = Selecto::Domain->parse($self->_action_variant_contract, strict => 1);
     $self->{action_execution_case_domain} = Selecto::Domain->parse($self->_action_execution_case_contract, strict => 1);
+    $self->{canonical_api} = Selecto::API->new(
+        domain => Selecto::Domain->parse($self->_canonical_api_contract, strict => 1),
+        base_path => '/api/v1/certification',
+    );
     return $self;
 }
 
@@ -244,6 +251,8 @@ sub run_case {
     return $self->_run_domain_action($case_id) if grep { $_ eq $case_id } @Selecto::Certification::DOMAIN_CASES;
     return $self->_run_action_variant($case_id)
         if grep { $_ eq $case_id } @Selecto::Certification::ACTION_VARIANT_CASES;
+    return $self->_run_canonical_api($case_id)
+        if grep { $_ eq $case_id } @Selecto::Certification::CANONICAL_API_CASES;
     Selecto::Error->throw('unsupported_case', "unsupported certification case $case_id");
 }
 
@@ -592,6 +601,119 @@ sub _run_action_variant {
     Selecto::Error->throw('unsupported_case', "unsupported action variant case $case_id");
 }
 
+sub _run_canonical_api {
+    my ($self, $case_id) = @_;
+    if ($case_id eq 'D064') {
+        return [$self->{canonical_api}->manifest, { api => 'Selecto::API->manifest' }];
+    }
+    if ($case_id eq 'D065') {
+        my $document = $self->{canonical_api}->openapi_document;
+        my @operations = sort {
+            join("\0", @$a) cmp join("\0", @$b)
+        } map {
+            my $path = $_;
+            map {
+                [$path, $_, $document->{paths}{$path}{$_}{operationId}]
+            } keys %{$document->{paths}{$path}}
+        } keys %{$document->{paths}};
+        my $selecto = $document->{'x-selecto'};
+        return [{
+            info => $document->{info},
+            json_schema_dialect => $document->{jsonSchemaDialect},
+            openapi => $document->{openapi},
+            operations => \@operations,
+            selecto => {
+                canonical_json => $selecto->{canonicalJson},
+                domain_fingerprint => $selecto->{domainFingerprint},
+                domain_schema_version => $selecto->{domainSchemaVersion},
+                domain_version => $selecto->{domainVersion},
+            },
+        }, { api => 'Selecto::API->openapi_document' }];
+    }
+    if ($case_id eq 'D066') {
+        return $self->_canonical_api_response({
+            method => 'GET', path => '/api/v1/certification/domain',
+        });
+    }
+    if ($case_id eq 'D067') {
+        return $self->_canonical_api_response({
+            method => 'GET', path => '/api/v1/certification/openapi.json',
+        });
+    }
+    if ($case_id eq 'D068') {
+        return $self->_canonical_api_response(
+            {
+                method => 'POST', path => '/api/v1/certification/query',
+                body => { select => ['id', 'label'] },
+            },
+            {
+                query => sub {
+                    return ['ok', {
+                        columns => ['id', 'label'],
+                        rows => [[7, 'Renée 東京'], [8, "line\nbreak"]],
+                    }];
+                },
+            },
+        );
+    }
+    if ($case_id eq 'D069') {
+        return $self->_canonical_api_response({
+            method => 'DELETE', path => '/api/v1/certification/domain',
+        });
+    }
+    if ($case_id eq 'D070') {
+        return $self->_canonical_api_response(
+            {
+                method => 'POST', path => '/api/v1/certification/write',
+                body => { operation => 'update' },
+            },
+            {
+                write => sub {
+                    my ($body) = @_;
+                    return ['ok', {
+                        affected_rows => 1,
+                        operation => $body->{operation},
+                    }];
+                },
+            },
+        );
+    }
+    if ($case_id eq 'D071') {
+        return $self->_canonical_api_response(
+            {
+                method => 'POST', path => '/api/v1/certification/actions/archive',
+                body => { target => 7 },
+            },
+            {
+                action => sub {
+                    my ($body, $params) = @_;
+                    return ['ok', {
+                        accepted => JSON::PP::true,
+                        action => $params->{action},
+                        target => $body->{target},
+                    }];
+                },
+            },
+        );
+    }
+    Selecto::Error->throw('unsupported_case', "unsupported canonical API case $case_id");
+}
+
+sub _canonical_api_response {
+    my ($self, $request, $handlers) = @_;
+    my $response = $self->{canonical_api}->request($request, $handlers // {});
+    my $body = $response->{body};
+    return [{
+        status => $response->{status},
+        headers => $response->{headers},
+        body_hex => unpack('H*', $body),
+        body_sha256 => sha256_hex($body),
+    }, {
+        api => 'Selecto::API->request',
+        body_bytes => length($body),
+    }];
+}
+
 sub _action_plan_error {
     my ($self, $domain, $intent) = @_;
     my $ok = eval { Selecto::Action->plan($domain, $intent); 1 };
@@ -653,6 +775,29 @@ sub _action_contract {
         capabilities => {
             'work_items.archive' => { operations => ['action', 'update'], action => 'archive' },
         },
+    };
+}
+
+sub _canonical_api_contract {
+    return {
+        schema_version => 1,
+        domain_version => '2.1.0',
+        domain_fingerprint => 'sha256:certification-api-v1',
+        name => 'Certification API',
+        source => {
+            source_table => 'selecto_cert_api',
+            primary_key => 'id',
+            fields => ['id', 'label'],
+            columns => {
+                id => { type => 'integer' },
+                label => { type => 'string' },
+            },
+            associations => {},
+        },
+        schemas => {},
+        joins => {},
+        writes => { operations => { update => { enabled => JSON::PP::true } } },
+        actions => { archive => { type => 'row_action', scope => 'row' } },
     };
 }
 
