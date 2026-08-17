@@ -84,8 +84,10 @@ sub compile {
             ) unless defined $position;
             $position . ' ' . uc($_->[1]) . ' NULLS FIRST';
         } @$orders;
-        $sql = 'SELECT * FROM (' . $sql . ') AS rollupfix ORDER BY ' .
-            join(', ', @outer_orders);
+        my $order_sql = join(', ', @outer_orders);
+        $sql = $self->_rollup_sort_fix_enabled
+            ? 'SELECT * FROM (' . $sql . ') AS rollupfix ORDER BY ' . $order_sql
+            : $sql . ' ORDER BY ' . $order_sql;
     } elsif (@$orders) {
         $sql .= ' ORDER BY ' . join(', ', map {
             $self->_compile_expression($domain, $_->[0], \@params) . ' ' . uc($_->[1])
@@ -599,6 +601,8 @@ sub _compile_pagination {
     $sql .= ' OFFSET ' . int($offset) if defined $offset;
     return $sql;
 }
+
+sub _rollup_sort_fix_enabled { return 1; }
 
 sub _logical_affected_rows { return $_[2]; }
 

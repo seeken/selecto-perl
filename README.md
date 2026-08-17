@@ -147,6 +147,29 @@ validated dotted field paths in the Perl runtime. Query-library `capability`
 values are descriptive metadata and do not replace application authorization
 or database row-level security.
 
+PostgreSQL hierarchical aggregates use `group_by_rollup`. Select the same
+governed group expressions first, then add `Selecto::Expression->grouping(...)`
+when the caller needs to distinguish detail, subtotal, and grand-total rows:
+
+```perl
+my $status = Selecto::Expression->field('status');
+my $rollup = $engine->query
+    ->select(
+        $status->as('status'),
+        Selecto::Expression->count->as('order_count'),
+        Selecto::Expression->grouping($status)->as('grouping_mask'),
+    )
+    ->group_by_rollup($status)
+    ->order_by($status);
+```
+
+Rollup ordering follows Selecto's PostgreSQL compatibility behavior: it uses
+selected-column positions with `NULLS FIRST`, and PostgreSQL 17 and older place
+that ordering and pagination around a `rollupfix` subquery. The adapter probes
+`server_version_num` once and disables the wrapper on PostgreSQL 18+. Pass
+`rollup_sort_fix => 1` or `rollup_sort_fix => 0` to the PostgreSQL adapter to
+override automatic detection.
+
 ## Database adapters
 
 Applications select a registered adapter by stable name. They do not need to

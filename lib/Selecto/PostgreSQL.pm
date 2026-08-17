@@ -4,6 +4,8 @@ use Mojo::Base 'Selecto::SQL';
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 
+has rollup_sort_fix => 'auto';
+
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
 
@@ -21,7 +23,23 @@ sub normalize_type {
 
 sub supports {
     my ($self, $feature) = @_;
-    return "$feature" eq 'transactions' || "$feature" eq 'returning' ? 1 : 0;
+    return "$feature" eq 'transactions' || "$feature" eq 'returning'
+        || "$feature" eq 'rollup' ? 1 : 0;
+}
+
+sub _rollup_sort_fix_enabled {
+    my ($self) = @_;
+    my $setting = $self->rollup_sort_fix;
+    Selecto::Error->throw('invalid_adapter', 'rollup_sort_fix must be auto, true, or false')
+        unless defined($setting) && !ref($setting)
+            && ("$setting" eq 'auto' || "$setting" eq '1' || "$setting" eq '0');
+    return $setting ? 1 : 0 unless "$setting" eq 'auto';
+    return $self->{_rollup_sort_fix_enabled}
+        if exists $self->{_rollup_sort_fix_enabled};
+    my $version = eval { ($self->dbh->selectrow_array('SHOW server_version_num'))[0] };
+    my $major = defined($version) && "$version" =~ /\A\d+\z/
+        ? int($version / 10_000) : undef;
+    return $self->{_rollup_sort_fix_enabled} = defined($major) && $major >= 18 ? 0 : 1;
 }
 
 sub _compile_dialect_expression {

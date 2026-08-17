@@ -19,11 +19,14 @@ sub new {
         'query state contains unsupported keys',
         { keys => \@unknown },
     ) if @unknown;
+    my $grouping_mode = $args{grouping_mode} // 'plain';
+    Selecto::Error->throw('invalid_query', 'grouping mode must be plain or rollup')
+        unless $grouping_mode eq 'plain' || $grouping_mode eq 'rollup';
     return bless {
         selections  => [@{$args{selections} // []}],
         predicate   => $args{predicate},
         groups      => [@{$args{groups} // []}],
-        grouping_mode => $args{grouping_mode} // 'plain',
+        grouping_mode => $grouping_mode,
         orders      => [map { [@$_] } @{$args{orders} // []}],
         limit_value => $args{limit_value},
         offset_value=> $args{offset_value},
@@ -61,6 +64,8 @@ sub group_by {
 sub group_by_rollup {
     my ($self, @fields) = @_;
     @fields = @{$fields[0]} if @fields == 1 && ref($fields[0]) eq 'ARRAY';
+    Selecto::Error->throw('invalid_query', 'rollup requires at least one grouping expression')
+        unless @fields;
     return $self->_copy(groups => [map {
         blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
     } @fields], grouping_mode => 'rollup');
