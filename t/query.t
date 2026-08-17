@@ -77,6 +77,68 @@ like($grouped_statement->sql, qr/COUNT\(\*\)/, 'aggregate is compiled');
 like($grouped_statement->sql, qr/GROUP BY "j_person"\."name"/, 'joined group is validated and compiled');
 is_deeply($grouped_statement->columns, ['person_name', 'order_count'], 'stable result columns use aliases');
 
+my $rollup = $join_engine->query->select(
+    Selecto::Expression->field('person.name')->as('person_name'),
+    Selecto::Expression->field('total')->as('total'),
+    Selecto::Expression->count->as('order_count'),
+    Selecto::Expression->grouping('person.name', 'total')->as('__selecto_rollup_grouping'),
+)->group_by_rollup('person.name', 'total')
+    ->order_by('person.name')
+    ->order_by('total');
+my $joined_rollup_statement = $join_engine->compile($rollup);
+like(
+    $joined_rollup_statement->sql,
+    qr/GROUPING\("j_person"\."name", "s0"\."total"\).*GROUP BY ROLLUP \("j_person"\."name", "s0"\."total"\)/,
+    'governed rollup compiles grouping metadata and hierarchical grouping sets',
+);
+like(
+    $joined_rollup_statement->sql,
+    qr/\ASELECT \* FROM \(SELECT .*\) AS rollupfix ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST\z/,
+    'PostgreSQL 17-and-older rollups use the positional outer-sort compatibility wrapper',
+);
+is_deeply(
+    $joined_rollup_statement->columns,
+    [qw(person_name total order_count __selecto_rollup_grouping)],
+    'rollup grouping metadata has a stable result alias',
+);
+ok($adapter->supports('rollup'), 'PostgreSQL reports its implemented rollup capability');
+
+{
+    package TestSelecto::PG18DBH;
+    our @ISA = ('TestSelecto::DBH');
+    sub selectrow_array { return 180000 }
+}
+my $pg18_adapter = Selecto::PostgreSQL->new(dbh => TestSelecto::PG18DBH->new);
+my $pg18_engine = Selecto::Engine->new(
+    domain => TestSelecto::orders_domain(), adapter => $pg18_adapter
+);
+my $pg18_rollup_statement = $pg18_engine->compile($rollup);
+unlike($pg18_rollup_statement->sql, qr/rollupfix/,
+    'PostgreSQL 18 disables the compatibility wrapper');
+like($pg18_rollup_statement->sql, qr/ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST\z/,
+    'PostgreSQL 18 rollups retain positional NULLS FIRST hierarchy ordering');
+
+my $forced_fix_adapter = Selecto::PostgreSQL->new(
+    dbh => TestSelecto::PG18DBH->new, rollup_sort_fix => 1
+);
+my $forced_fix_engine = Selecto::Engine->new(
+    domain => TestSelecto::orders_domain(), adapter => $forced_fix_adapter
+);
+like($forced_fix_engine->compile($rollup)->sql, qr/\) AS rollupfix ORDER BY/,
+    'rollup_sort_fix can force the compatibility wrapper on');
+
+my $disabled_fix_adapter = Selecto::PostgreSQL->new(
+    dbh => TestSelecto::DBH->new, rollup_sort_fix => 0
+);
+my $disabled_fix_engine = Selecto::Engine->new(
+    domain => TestSelecto::orders_domain(), adapter => $disabled_fix_adapter
+);
+unlike($disabled_fix_engine->compile($rollup)->sql, qr/rollupfix/,
+    'rollup_sort_fix can explicitly disable the compatibility wrapper');
+
+eval { Selecto::Query->new(grouping_mode => 'cube') };
+is($@->code, 'invalid_query', 'unsupported grouping modes fail closed');
+
 my $dated_domain = Selecto::Domain->new(
     name => 'Events',
     table => 'events',
