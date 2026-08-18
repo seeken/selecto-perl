@@ -39,6 +39,14 @@ WriteMakefile(
                 description => 'PostgreSQL execution and certification',
                 prereqs => { runtime => { requires => { 'DBD::Pg' => '3.016' } } },
             },
+            mysql => {
+                description => 'MySQL execution and certification',
+                prereqs => { runtime => { requires => { 'DBD::MariaDB' => '1.24' } } },
+            },
+            mariadb => {
+                description => 'MariaDB execution and certification',
+                prereqs => { runtime => { requires => { 'DBD::MariaDB' => '1.24' } } },
+            },
             sqlite => {
                 description => 'SQLite execution and certification',
                 prereqs => { runtime => { requires => { 'DBD::SQLite' => '1.64' } } },

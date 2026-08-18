@@ -9,6 +9,8 @@
 - Database implementations must inherit `Selecto::Adapter`, return
   `Selecto::Statement` objects, and register by a stable lowercase name. Keep
   dialect SQL and result normalization inside the concrete adapter.
+- MySQL and MariaDB use shared `DBD::MariaDB` mechanics but remain separate
+  registered adapter classes, target identities, services, and certificates.
 - The domain owns the root relation. Query objects must not expose or accept a
   `from` override; engines pass the domain and query intent to adapters
   separately, and adapters render the root from the domain.

@@ -58,6 +58,14 @@ is($sqlite_dsn, 'dbi:SQLite:dbname=:memory:', 'SQLite in-memory connection becom
 is($sqlite_username, undef, 'SQLite connection has no username');
 is($sqlite_password, undef, 'SQLite connection has no password');
 
+my ($mysql_dsn, $mysql_username, $mysql_password) =
+    Selecto::Certification::_connection_parts(
+        'mysql://selecto%20user:p%40ss@127.0.0.1:53306/selecto_cert', 'mysql'
+    );
+is($mysql_dsn, 'dbi:MariaDB:database=selecto_cert;host=127.0.0.1;port=53306', 'MySQL URL becomes a DBD::MariaDB DSN');
+is($mysql_username, 'selecto user', 'MySQL URL username is decoded');
+is($mysql_password, 'p@ss', 'MySQL URL password is decoded');
+
 my $sqlite_base = {
     %$base,
     target => {
@@ -68,6 +76,19 @@ my $sqlite_base = {
 ($status, $output) = run_request($sqlite_base);
 isnt($status, 0, 'valid SQLite target still requires a configured connection');
 like($output, qr/connection environment .* is not configured/, 'SQLite target is accepted before connection validation');
+
+for my $backend (qw(mysql mariadb)) {
+    my $service_base = {
+        %$base,
+        target => {
+            key => "perl_$backend", implementation => 'selecto_perl', runtime => 'perl',
+            backend => $backend, connection_env => 'SELECTO_CERT_PERL_SERVICE_TEST_URL',
+        },
+    };
+    ($status, $output) = run_request($service_base);
+    isnt($status, 0, "valid $backend target still requires a configured connection");
+    like($output, qr/connection environment .* is not configured/, "$backend identity is accepted before connection validation");
+}
 
 my $mismatched_key = {
     %$sqlite_base,

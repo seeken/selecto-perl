@@ -393,11 +393,7 @@ sub _compile_write {
                 unless ref($conflict) eq 'ARRAY' && @$conflict && !grep { ref($_) } @$conflict;
             Selecto::Error->throw('invalid_write', 'upsert update fields must be a non-empty string array')
                 unless ref($updates) eq 'ARRAY' && @$updates && !grep { ref($_) } @$updates;
-            $sql .= ' ON CONFLICT (' . join(', ', map { $self->quote_identifier(_checked_identifier($_)) } @$conflict) .
-                ') DO UPDATE SET ' . join(', ', map {
-                    my $field = _checked_identifier($_);
-                    $self->quote_identifier($field) . ' = EXCLUDED.' . $self->quote_identifier($field)
-                } @$updates);
+            $sql .= $self->_compile_upsert_clause($conflict, $updates);
         }
         return { sql => $sql, params => \@params };
     }
@@ -443,7 +439,7 @@ sub _execute_write_in_transaction {
     my $ok = eval {
         $sth = $self->{dbh}->prepare($compiled->{sql});
         $sth->execute(@{$compiled->{params}});
-        $affected = 0 + $sth->rows;
+        $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
         1;
     };
     die $self->normalize_error($@) unless $ok;
@@ -477,6 +473,17 @@ sub _compile_dialect_expression {
     my ($self, $domain, $expression, $params) = @_;
     Selecto::Error->throw('invalid_query', 'expression is not supported by this SQL dialect');
 }
+
+sub _compile_upsert_clause {
+    my ($self, $conflict, $updates) = @_;
+    return ' ON CONFLICT (' . join(', ', map { $self->quote_identifier(_checked_identifier($_)) } @$conflict) .
+        ') DO UPDATE SET ' . join(', ', map {
+            my $field = _checked_identifier($_);
+            $self->quote_identifier($field) . ' = EXCLUDED.' . $self->quote_identifier($field)
+        } @$updates);
+}
+
+sub _logical_affected_rows { return $_[2]; }
 
 sub _column_types { return (); }
 

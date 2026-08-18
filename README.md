@@ -19,8 +19,9 @@ protocol 1 and certification specification 2.2.0.
 - copy-on-write select, filter, group, order, limit, and offset queries;
 - field, literal, comparison, null, membership, conjunction, and aggregate
   expressions, plus governed PostgreSQL date/time format expressions;
-- PostgreSQL compilation with quoted identifiers and bound `$1` parameters,
-  and SQLite compilation with quoted identifiers and DBI `?` parameters;
+- PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
+  SQLite, MySQL, and MariaDB compilation with native identifier quoting and
+  DBI `?` parameters;
 - DBI execution with stable columns and backend-specific value normalization;
 - a versioned `Selecto::Adapter` contract, generic `Selecto::Statement`, and
   runtime adapter registry for independently packaged database support;
@@ -39,13 +40,14 @@ It does not contain HTTP routes, ORM, or UI compatibility code.
 
 Perl 5.34 or newer and Mojolicious 9.40 or newer are required. PostgreSQL
 execution and certification additionally require `DBD::Pg`; SQLite execution
-and certification require `DBD::SQLite`. The base distribution does not force
-either driver.
+and certification require `DBD::SQLite`; MySQL and MariaDB use
+`DBD::MariaDB`. The base distribution does not force any optional driver.
 
 ```sh
 cpanm --installdeps .
 cpanm DBD::Pg # only when using the PostgreSQL adapter
 cpanm DBD::SQLite # only when using the SQLite adapter
+cpanm DBD::MariaDB # when using MySQL or MariaDB
 perl Makefile.PL
 make test
 ```
@@ -63,7 +65,7 @@ mise run verify
 use Selecto;
 use DBI;
 
-my $domain = Selecto::Domain->parse($domain_json, strict => 1);
+my $domain = product_domain();
 my $dbh = DBI->connect($dsn, undef, undef, {
     RaiseError => 1,
     PrintError => 0,
@@ -115,11 +117,14 @@ Selecto::Adapter::Registry->default
 ```
 
 `Selecto->available_adapters` exposes the names currently registered. This
-release registers `postgresql` and `sqlite`. Both inherit portable compilation,
-execution, and transaction behavior from `Selecto::SQL`; each concrete package
+release registers `postgresql`, `sqlite`, `mysql`, and `mariadb`. All inherit
+portable compilation, execution, and transaction behavior from `Selecto::SQL`;
+the MySQL-family pair shares `Selecto::MySQLFamily` DBI mechanics while retaining
+separate public classes and target identities. Each concrete package
 owns its identity, placeholders, type normalization, capability declarations,
-and dialect-only expressions. SQLite fails closed for PostgreSQL-only bucket and
-date/time formatting expressions until native translations are implemented.
+upsert syntax, and dialect-only expressions. SQLite and the MySQL-family
+adapters fail closed for PostgreSQL-only bucket and date/time formatting
+expressions until native translations are implemented.
 
 Application values never enter the SQL string. The compiler emits placeholders
 and carries values separately in the statement's `params` array.
@@ -196,6 +201,21 @@ mise exec -- mix selecto.certify \
   --profiles capability_truth,core_query,portable_write
 ```
 
+MySQL and MariaDB require separate live services and certificates even though
+both use `DBD::MariaDB`:
+
+```sh
+SELECTO_CERT_PERL_MYSQL_URL='mysql://...' \
+  mise exec -- mix selecto.certify \
+  --targets perl_mysql,elixir_mysql \
+  --profiles capability_truth,core_query,portable_write
+
+SELECTO_CERT_PERL_MARIADB_URL='mysql://...' \
+  mise exec -- mix selecto.certify \
+  --targets perl_mariadb,elixir_mariadb \
+  --profiles capability_truth,core_query,portable_write
+```
+
 Certification is controlled differential evidence for the enumerated query,
 write, `domain_actions`, and `action_variants` cases. Action certification
 covers planning, target scope, transition preconditions, capability decisions,
@@ -211,7 +231,7 @@ concurrency, security, or performance.
   JSON rowsets, full-text search, and streaming;
 - deeper-than-one-hop relationships;
 - nested portable write graphs and adapter-independent mutation expressions;
-- additional database adapters beyond PostgreSQL and SQLite;
+- additional database adapters beyond PostgreSQL, SQLite, MySQL, and MariaDB;
 - framework-specific integration beyond the DBI handle boundary.
 
 Deferred capabilities fail closed instead of falling back to raw SQL.

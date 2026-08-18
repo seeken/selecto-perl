@@ -43,6 +43,7 @@ sub run {
     );
     $attributes{pg_enable_utf8} = 1 if $backend eq 'postgresql';
     $attributes{sqlite_unicode} = 1 if $backend eq 'sqlite';
+    $attributes{mariadb_client_found_rows} = 1 if $backend eq 'mysql' || $backend eq 'mariadb';
     my $dbh = DBI->connect($dsn, $username, $password, \%attributes);
     die "database connection failed\n" unless $dbh;
 
@@ -51,7 +52,9 @@ sub run {
         adapter_name => $backend,
         type_samples => $backend eq 'sqlite'
             ? [qw(integer decimal datetime)]
-            : [qw(int4 numeric timestamptz)],
+            : $backend eq 'mysql' || $backend eq 'mariadb'
+                ? [qw(int decimal datetime)]
+                : [qw(int4 numeric timestamptz)],
     );
     my @observations = map { _observe($suite, $_->{id}) } @{$request->{cases}};
     my %capabilities = %{$suite->adapter->write_capabilities};
@@ -90,7 +93,7 @@ sub read_request {
     die "unsupported target identity\n"
         unless $target->{implementation} eq 'selecto_perl'
         && $target->{runtime} eq 'perl'
-        && ($backend eq 'postgresql' || $backend eq 'sqlite')
+        && ($backend eq 'postgresql' || $backend eq 'sqlite' || $backend eq 'mysql' || $backend eq 'mariadb')
         && $target->{key} eq "perl_$backend";
     die "invalid connection environment name\n"
         unless $target->{connection_env} =~ /\A[A-Z][A-Z0-9_]*\z/;
@@ -127,6 +130,19 @@ sub _connection_parts {
         die "SQLite connection path is required\n" if $value eq '';
         return ('dbi:SQLite:dbname=' . $value, undef, undef);
     }
+    if ($backend eq 'mysql' || $backend eq 'mariadb') {
+        return ($value, undef, undef) if $value =~ /\Adbi:MariaDB:/i;
+        my ($userinfo, $host, $port, $database) = _parse_mysql_family_url($value);
+        my ($username, $password) = split /:/, ($userinfo // ''), 2;
+        $username = length($username // '') ? uri_unescape($username) : undef;
+        $password = defined($password) ? uri_unescape($password) : undef;
+        $database = uri_unescape($database);
+        die "MySQL-family connection URL must name a database\n"
+            unless $database =~ /\A[A-Za-z0-9_$-]+\z/;
+        my @parts = ('database=' . $database, 'host=' . $host);
+        push @parts, 'port=' . int($port) if defined($port);
+        return ('dbi:MariaDB:' . join(';', @parts), $username, $password);
+    }
     return ($value, undef, undef) if $value =~ /\Adbi:Pg:/i;
     my ($userinfo, $host, $port, $database, $query_string) = _parse_postgresql_url($value);
     my ($username, $password) = split /:/, ($userinfo // ''), 2;
@@ -152,6 +168,16 @@ sub _parse_postgresql_url {
     my ($userinfo, $host, $port, $database, $query) = ($1, $2, $3, $4, $5);
     $host =~ s/\A\[|\]\z//g;
     return ($userinfo, $host, $port, $database, $query);
+}
+
+sub _parse_mysql_family_url {
+    my ($value) = @_;
+    die "unsupported MySQL-family connection URL\n"
+        unless $value =~ m{\A(?:mysql|mariadb)://(?:([^/?#@]*)@)?(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?/([^?#]*)\z}i;
+    my ($userinfo, $host, $port, $database) = ($1, $2, $3, $4);
+    $host =~ s/\A\[|\]\z//g;
+    die "invalid MySQL-family host\n" if $host =~ /[;\s]/;
+    return ($userinfo, $host, $port, $database);
 }
 
 sub _dsn_quote {
@@ -196,10 +222,14 @@ sub _metadata {
     my ($dbh, $backend) = @_;
     my ($backend_version) = $backend eq 'sqlite'
         ? $dbh->selectrow_array('SELECT sqlite_version()')
-        : $dbh->selectrow_array(q{SELECT current_setting('server_version')});
+        : $backend eq 'mysql' || $backend eq 'mariadb'
+            ? $dbh->selectrow_array('SELECT VERSION()')
+            : $dbh->selectrow_array(q{SELECT current_setting('server_version')});
     my ($driver_module, $driver_version) = $backend eq 'sqlite'
         ? ('DBD::SQLite', eval { $DBD::SQLite::VERSION } // 'unknown')
-        : ('DBD::Pg', eval { $DBD::Pg::VERSION } // 'unknown');
+        : $backend eq 'mysql' || $backend eq 'mariadb'
+            ? ('DBD::MariaDB', eval { $DBD::MariaDB::VERSION } // 'unknown')
+            : ('DBD::Pg', eval { $DBD::Pg::VERSION } // 'unknown');
     return {
         protocol_version => $PROTOCOL_VERSION,
         runtime => { name => 'perl', version => "$^V", platform => $^O },
