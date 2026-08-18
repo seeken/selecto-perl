@@ -17,6 +17,8 @@ use_ok('Selecto::Error');
 use_ok('Selecto::Expression');
 use_ok('Selecto::PostgreSQL');
 use_ok('Selecto::Query');
+use_ok('Selecto::SQL');
+use_ok('Selecto::SQLite');
 use_ok('Selecto::Statement');
 use_ok('Selecto::Write');
 

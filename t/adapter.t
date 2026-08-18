@@ -9,10 +9,12 @@ use Selecto;
 my $dbh = TestSelecto::DBH->new;
 my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
 isa_ok($adapter, 'Selecto::PostgreSQL', 'default registry builds PostgreSQL by name');
-is_deeply(Selecto->available_adapters, ['postgresql'], 'available adapter names are discoverable');
+my $sqlite = Selecto->adapter(sqlite => (dbh => $dbh));
+isa_ok($sqlite, 'Selecto::SQLite', 'default registry builds SQLite by name');
+is_deeply(Selecto->available_adapters, ['postgresql', 'sqlite'], 'available adapter names are discoverable');
 is($adapter->contract_version, 1, 'adapter contract is versioned');
 
-eval { Selecto->adapter(sqlite => (dbh => $dbh)) };
+eval { Selecto->adapter(oracle => (dbh => $dbh)) };
 is($@->code, 'unknown_adapter', 'unregistered databases fail with a portable adapter error');
 
 {

@@ -34,28 +34,36 @@ sub run {
     die "connection environment $connection_env is not configured\n"
         unless defined($url) && $url ne '';
 
-    my ($dsn, $username, $password) = _connection_parts($url);
-    my $dbh = DBI->connect($dsn, $username, $password, {
+    my $backend = $target->{backend};
+    my ($dsn, $username, $password) = _connection_parts($url, $backend);
+    my %attributes = (
         RaiseError => 1,
         PrintError => 0,
         AutoCommit => 1,
-        pg_enable_utf8 => 1,
-    });
+    );
+    $attributes{pg_enable_utf8} = 1 if $backend eq 'postgresql';
+    $attributes{sqlite_unicode} = 1 if $backend eq 'sqlite';
+    my $dbh = DBI->connect($dsn, $username, $password, \%attributes);
     die "database connection failed\n" unless $dbh;
 
-    my $suite = Selecto::Certification::Suite->new(dbh => $dbh);
+    my $suite = Selecto::Certification::Suite->new(
+        dbh => $dbh,
+        adapter_name => $backend,
+        type_samples => $backend eq 'sqlite'
+            ? [qw(integer decimal datetime)]
+            : [qw(int4 numeric timestamptz)],
+    );
     my @observations = map { _observe($suite, $_->{id}) } @{$request->{cases}};
+    my %capabilities = %{$suite->adapter->write_capabilities};
+    if ($backend eq 'postgresql') {
+        @capabilities{qw(domain_actions action_variants canonical_domain_api)} = (1, 1, 1);
+    }
     my $response = {
         protocol_version => $PROTOCOL_VERSION,
         certification_spec => $SPECIFICATION,
         target => $target->{key},
-        capabilities => _json_booleans({
-            %{$suite->adapter->write_capabilities},
-            domain_actions => 1,
-            action_variants => 1,
-            canonical_domain_api => 1,
-        }),
-        metadata => _metadata($dbh),
+        capabilities => _json_booleans(\%capabilities),
+        metadata => _metadata($dbh, $backend),
         observations => \@observations,
     };
     print JSON::PP->new->canonical(1)->utf8(1)->encode($response), "\n";
@@ -78,10 +86,12 @@ sub read_request {
 
     my $target = $request->{target};
     _exact_object($target, [qw(key implementation runtime backend connection_env)], 'target');
+    my $backend = $target->{backend};
     die "unsupported target identity\n"
         unless $target->{implementation} eq 'selecto_perl'
         && $target->{runtime} eq 'perl'
-        && $target->{backend} eq 'postgresql';
+        && ($backend eq 'postgresql' || $backend eq 'sqlite')
+        && $target->{key} eq "perl_$backend";
     die "invalid connection environment name\n"
         unless $target->{connection_env} =~ /\A[A-Z][A-Z0-9_]*\z/;
     die "cases must be an array\n" unless ref($request->{cases}) eq 'ARRAY';
@@ -109,7 +119,14 @@ sub _exact_object {
 }
 
 sub _connection_parts {
-    my ($value) = @_;
+    my ($value, $backend) = @_;
+    $backend //= 'postgresql';
+    if ($backend eq 'sqlite') {
+        return ($value, undef, undef) if $value =~ /\Adbi:SQLite:/i;
+        return ('dbi:SQLite:dbname=:memory:', undef, undef) if $value eq ':memory:';
+        die "SQLite connection path is required\n" if $value eq '';
+        return ('dbi:SQLite:dbname=' . $value, undef, undef);
+    }
     return ($value, undef, undef) if $value =~ /\Adbi:Pg:/i;
     my ($userinfo, $host, $port, $database, $query_string) = _parse_postgresql_url($value);
     my ($username, $password) = split /:/, ($userinfo // ''), 2;
@@ -176,15 +193,19 @@ sub _observe {
 }
 
 sub _metadata {
-    my ($dbh) = @_;
-    my ($backend_version) = $dbh->selectrow_array(q{SELECT current_setting('server_version')});
-    my $driver_version = eval { $DBD::Pg::VERSION } // 'unknown';
+    my ($dbh, $backend) = @_;
+    my ($backend_version) = $backend eq 'sqlite'
+        ? $dbh->selectrow_array('SELECT sqlite_version()')
+        : $dbh->selectrow_array(q{SELECT current_setting('server_version')});
+    my ($driver_module, $driver_version) = $backend eq 'sqlite'
+        ? ('DBD::SQLite', eval { $DBD::SQLite::VERSION } // 'unknown')
+        : ('DBD::Pg', eval { $DBD::Pg::VERSION } // 'unknown');
     return {
         protocol_version => $PROTOCOL_VERSION,
         runtime => { name => 'perl', version => "$^V", platform => $^O },
         implementation => { module => 'Selecto', version => $Selecto::VERSION },
         engine => { name => 'selecto-perl', version => $Selecto::VERSION, source => 'native-perl', mode => 'native' },
-        driver => { module => 'DBD::Pg', version => "$driver_version" },
+        driver => { module => $driver_module, version => "$driver_version" },
         backend_version => "$backend_version",
         connection => { configured => JSON::PP::true, source => 'environment' },
     };
@@ -208,8 +229,12 @@ use Selecto;
 
 sub new {
     my ($class, %args) = @_;
-    my $self = bless { dbh => $args{dbh} }, $class;
-    $self->{adapter} = Selecto->adapter(postgresql => (dbh => $self->{dbh}));
+    my $self = bless {
+        dbh => $args{dbh},
+        adapter_name => $args{adapter_name} // 'postgresql',
+        type_samples => $args{type_samples} // [qw(int4 numeric timestamptz)],
+    }, $class;
+    $self->{adapter} = Selecto->adapter($self->{adapter_name} => (dbh => $self->{dbh}));
     $self->_setup_fixtures;
     $self->{people_engine} = Selecto::Engine->new(domain => $self->_people_domain, adapter => $self->{adapter});
     $self->{orders_engine} = Selecto::Engine->new(domain => $self->_orders_domain, adapter => $self->{adapter});
@@ -241,7 +266,7 @@ sub run_case {
         return [{ contract => 'portable_error', struct => ref($error), type => $error->code, message => $error->message }, {}];
     }
     if ($case_id eq 'A008') {
-        return [{ map { $_ => $self->{adapter}->normalize_type($_) } qw(int4 numeric timestamptz) }, {}];
+        return [{ map { $_ => $self->{adapter}->normalize_type($_) } @{$self->{type_samples}} }, {}];
     }
     return [$self->_capability_contract, {}] if $case_id eq 'A009';
     return [{ missing => [] }, {}] if $case_id eq 'A010';

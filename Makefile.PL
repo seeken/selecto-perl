@@ -39,6 +39,10 @@ WriteMakefile(
                 description => 'PostgreSQL execution and certification',
                 prereqs => { runtime => { requires => { 'DBD::Pg' => '3.016' } } },
             },
+            sqlite => {
+                description => 'SQLite execution and certification',
+                prereqs => { runtime => { requires => { 'DBD::SQLite' => '1.64' } } },
+            },
         },
     },
 );

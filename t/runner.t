@@ -52,6 +52,31 @@ is($username, 'selecto user', 'PostgreSQL URL username is decoded');
 is($password, 'p@ss', 'PostgreSQL URL password is decoded');
 is($dsn, q{dbi:Pg:dbname='selecto_cert';host='127.0.0.1';port=55435;sslmode='disable'}, 'PostgreSQL URL becomes a DBD::Pg DSN');
 
+my ($sqlite_dsn, $sqlite_username, $sqlite_password) =
+    Selecto::Certification::_connection_parts(':memory:', 'sqlite');
+is($sqlite_dsn, 'dbi:SQLite:dbname=:memory:', 'SQLite in-memory connection becomes a DBD::SQLite DSN');
+is($sqlite_username, undef, 'SQLite connection has no username');
+is($sqlite_password, undef, 'SQLite connection has no password');
+
+my $sqlite_base = {
+    %$base,
+    target => {
+        key => 'perl_sqlite', implementation => 'selecto_perl', runtime => 'perl',
+        backend => 'sqlite', connection_env => 'SELECTO_CERT_PERL_SQLITE_TEST_URL',
+    },
+};
+($status, $output) = run_request($sqlite_base);
+isnt($status, 0, 'valid SQLite target still requires a configured connection');
+like($output, qr/connection environment .* is not configured/, 'SQLite target is accepted before connection validation');
+
+my $mismatched_key = {
+    %$sqlite_base,
+    target => { %{$sqlite_base->{target}}, key => 'perl_postgresql' },
+};
+($status, $output) = run_request($mismatched_key);
+isnt($status, 0, 'backend and target-key mismatches are rejected');
+like($output, qr/unsupported target identity/, 'target identity failure is explicit');
+
 {
     package TestRunnerSuite;
     sub new { return bless {}, shift; }

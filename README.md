@@ -17,10 +17,11 @@ protocol 1 and certification specification 2.2.0.
 - canonical component policy metadata, including domain-selected private URL
   state for compatible exploration UIs;
 - copy-on-write select, filter, group, order, limit, and offset queries;
-- field, literal, comparison, null, membership, conjunction, aggregate, and
-  governed date/time format expressions;
-- PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
-- DBI execution with stable columns and normalized PostgreSQL values;
+- field, literal, comparison, null, membership, conjunction, and aggregate
+  expressions, plus governed PostgreSQL date/time format expressions;
+- PostgreSQL compilation with quoted identifiers and bound `$1` parameters,
+  and SQLite compilation with quoted identifiers and DBI `?` parameters;
+- DBI execution with stable columns and backend-specific value normalization;
 - a versioned `Selecto::Adapter` contract, generic `Selecto::Statement`, and
   runtime adapter registry for independently packaged database support;
 - portable insert, update, upsert, delete, expected-cardinality, and atomic
@@ -37,12 +38,14 @@ It does not contain HTTP routes, ORM, or UI compatibility code.
 ## Install for development
 
 Perl 5.34 or newer and Mojolicious 9.40 or newer are required. PostgreSQL
-execution and certification additionally require `DBD::Pg`; the base
-distribution can be installed for another adapter without that driver.
+execution and certification additionally require `DBD::Pg`; SQLite execution
+and certification require `DBD::SQLite`. The base distribution does not force
+either driver.
 
 ```sh
 cpanm --installdeps .
 cpanm DBD::Pg # only when using the PostgreSQL adapter
+cpanm DBD::SQLite # only when using the SQLite adapter
 perl Makefile.PL
 make test
 ```
@@ -112,8 +115,11 @@ Selecto::Adapter::Registry->default
 ```
 
 `Selecto->available_adapters` exposes the names currently registered. This
-release registers only `postgresql`; the contract and registry are the stable
-extension seam, not a claim that other dialects already work.
+release registers `postgresql` and `sqlite`. Both inherit portable compilation,
+execution, and transaction behavior from `Selecto::SQL`; each concrete package
+owns its identity, placeholders, type normalization, capability declarations,
+and dialect-only expressions. SQLite fails closed for PostgreSQL-only bucket and
+date/time formatting expressions until native translations are implemented.
 
 Application values never enter the SQL string. The compiler emits placeholders
 and carries values separately in the statement's `params` array.
@@ -181,6 +187,15 @@ SELECTO_CERT_PERL_POSTGRESQL_URL='postgres://...' \
   mise exec -- mix selecto.certify --targets perl_postgresql,elixir_postgresql
 ```
 
+SQLite uses an in-memory database by default and needs no service URL:
+
+```sh
+cd ../selecto_backend_certification
+mise exec -- mix selecto.certify \
+  --targets perl_sqlite,elixir_sqlite \
+  --profiles capability_truth,core_query,portable_write
+```
+
 Certification is controlled differential evidence for the enumerated query,
 write, `domain_actions`, and `action_variants` cases. Action certification
 covers planning, target scope, transition preconditions, capability decisions,
@@ -196,7 +211,7 @@ concurrency, security, or performance.
   JSON rowsets, full-text search, and streaming;
 - deeper-than-one-hop relationships;
 - nested portable write graphs and adapter-independent mutation expressions;
-- concrete non-PostgreSQL adapters (the registration contract is implemented);
+- additional database adapters beyond PostgreSQL and SQLite;
 - framework-specific integration beyond the DBI handle boundary.
 
 Deferred capabilities fail closed instead of falling back to raw SQL.

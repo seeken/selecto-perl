@@ -16,6 +16,8 @@ use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::PostgreSQL ();
 use Selecto::Query ();
+use Selecto::SQL ();
+use Selecto::SQLite ();
 use Selecto::Statement ();
 use Selecto::Write ();
 
