@@ -4,6 +4,7 @@ requires 'JSON::PP', '4.06';
 requires 'Mojolicious', '9.40';
 recommends 'DBD::Pg', '3.016';
 recommends 'DBD::MariaDB', '1.24';
+recommends 'DBD::ODBC', '1.61';
 recommends 'DBD::SQLite', '1.64';
 
 on test => sub {

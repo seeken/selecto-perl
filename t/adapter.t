@@ -15,9 +15,11 @@ my $mysql = Selecto->adapter(mysql => (dbh => $dbh));
 isa_ok($mysql, 'Selecto::MySQL', 'default registry builds MySQL by name');
 my $mariadb = Selecto->adapter(mariadb => (dbh => $dbh));
 isa_ok($mariadb, 'Selecto::MariaDB', 'default registry builds MariaDB by name');
+my $mssql = Selecto->adapter(mssql => (dbh => $dbh));
+isa_ok($mssql, 'Selecto::MSSQL', 'default registry builds Microsoft SQL Server by name');
 is_deeply(
     Selecto->available_adapters,
-    ['mariadb', 'mysql', 'postgresql', 'sqlite'],
+    ['mariadb', 'mssql', 'mysql', 'postgresql', 'sqlite'],
     'available adapter names are discoverable',
 );
 is($adapter->contract_version, 1, 'adapter contract is versioned');

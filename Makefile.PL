@@ -47,6 +47,10 @@ WriteMakefile(
                 description => 'MariaDB execution and certification',
                 prereqs => { runtime => { requires => { 'DBD::MariaDB' => '1.24' } } },
             },
+            mssql => {
+                description => 'Microsoft SQL Server execution and certification',
+                prereqs => { runtime => { requires => { 'DBD::ODBC' => '1.61' } } },
+            },
             sqlite => {
                 description => 'SQLite execution and certification',
                 prereqs => { runtime => { requires => { 'DBD::SQLite' => '1.64' } } },

@@ -15,6 +15,7 @@ use_ok('Selecto::Domain');
 use_ok('Selecto::Engine');
 use_ok('Selecto::Error');
 use_ok('Selecto::Expression');
+use_ok('Selecto::MSSQL');
 use_ok('Selecto::PostgreSQL');
 use_ok('Selecto::Query');
 use_ok('Selecto::SQL');

@@ -64,8 +64,11 @@ sub compile {
     $sql .= ' ORDER BY ' . join(', ', map {
         $self->_compile_expression($domain, $_->[0], \@params) . ' ' . uc($_->[1])
     } @$orders) if @$orders;
-    $sql .= ' LIMIT ' . $query->limit_value if defined $query->limit_value;
-    $sql .= ' OFFSET ' . $query->offset_value if defined $query->offset_value;
+    $sql .= $self->_compile_pagination(
+        $query->limit_value,
+        $query->offset_value,
+        @$orders ? 1 : 0,
+    );
     return Selecto::Statement->new(
         sql => $sql,
         params => \@params,
@@ -481,6 +484,14 @@ sub _compile_upsert_clause {
             my $field = _checked_identifier($_);
             $self->quote_identifier($field) . ' = EXCLUDED.' . $self->quote_identifier($field)
         } @$updates);
+}
+
+sub _compile_pagination {
+    my ($self, $limit, $offset, $ordered) = @_;
+    my $sql = '';
+    $sql .= ' LIMIT ' . int($limit) if defined $limit;
+    $sql .= ' OFFSET ' . int($offset) if defined $offset;
+    return $sql;
 }
 
 sub _logical_affected_rows { return $_[2]; }

@@ -14,6 +14,7 @@ use Selecto::Domain ();
 use Selecto::Engine ();
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::MSSQL ();
 use Selecto::PostgreSQL ();
 use Selecto::Query ();
 use Selecto::SQL ();

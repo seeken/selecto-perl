@@ -90,6 +90,44 @@ for my $backend (qw(mysql mariadb)) {
     like($output, qr/connection environment .* is not configured/, "$backend identity is accepted before connection validation");
 }
 
+my $mssql_base = {
+    %$base,
+    target => {
+        key => 'perl_mssql', implementation => 'selecto_perl', runtime => 'perl',
+        backend => 'mssql', connection_env => 'SELECTO_CERT_PERL_MSSQL_TEST_URL',
+    },
+};
+($status, $output) = run_request($mssql_base);
+isnt($status, 0, 'valid Microsoft SQL Server target still requires a configured connection');
+like($output, qr/connection environment .* is not configured/, 'Microsoft SQL Server identity is accepted before connection validation');
+
+{
+    local $ENV{SELECTO_PERL_MSSQL_ODBC_DRIVER} = '/opt/selecto/libtdsodbc.so';
+    my ($mssql_dsn, $mssql_username, $mssql_password) =
+        Selecto::Certification::_connection_parts(
+            'mssql://selecto%20user:p%40ss@127.0.0.1:51433/selecto_cert', 'mssql'
+        );
+    is(
+        $mssql_dsn,
+        'dbi:ODBC:Driver={/opt/selecto/libtdsodbc.so};Server=127.0.0.1;Port=51433;Database=selecto_cert;TDS_Version=7.4;ClientCharset=UTF-8',
+        'Microsoft SQL Server URL becomes a credential-free FreeTDS ODBC DSN',
+    );
+    is($mssql_username, 'selecto user', 'Microsoft SQL Server URL username is decoded');
+    is($mssql_password, 'p@ss', 'Microsoft SQL Server URL password is decoded');
+}
+
+{
+    local $ENV{SELECTO_PERL_MSSQL_ODBC_DRIVER} = 'invalid;PWD=must-not-enter-dsn';
+    my $ok = eval {
+        Selecto::Certification::_connection_parts(
+            'mssql://user:password@127.0.0.1:51433/selecto_cert', 'mssql'
+        );
+        1;
+    };
+    ok(!$ok, 'ODBC driver-name injection is rejected');
+    like($@, qr/driver name is invalid/, 'ODBC driver-name rejection is explicit');
+}
+
 my $mismatched_key = {
     %$sqlite_base,
     target => { %{$sqlite_base->{target}}, key => 'perl_postgresql' },

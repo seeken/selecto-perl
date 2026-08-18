@@ -12,6 +12,7 @@ sub default ($class) {
     return $DEFAULT if $DEFAULT;
     $DEFAULT = $class->new;
     $DEFAULT->register(mariadb => 'Selecto::MariaDB');
+    $DEFAULT->register(mssql => 'Selecto::MSSQL');
     $DEFAULT->register(mysql => 'Selecto::MySQL');
     $DEFAULT->register(postgresql => 'Selecto::PostgreSQL');
     $DEFAULT->register(sqlite => 'Selecto::SQLite');

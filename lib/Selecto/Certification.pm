@@ -46,6 +46,8 @@ sub run {
     $attributes{mariadb_client_found_rows} = 1 if $backend eq 'mysql' || $backend eq 'mariadb';
     my $dbh = DBI->connect($dsn, $username, $password, \%attributes);
     die "database connection failed\n" unless $dbh;
+    die "DBD::ODBC must be built with Unicode support\n"
+        if $backend eq 'mssql' && !$dbh->{odbc_has_unicode};
 
     my $suite = Selecto::Certification::Suite->new(
         dbh => $dbh,
@@ -54,6 +56,8 @@ sub run {
             ? [qw(integer decimal datetime)]
             : $backend eq 'mysql' || $backend eq 'mariadb'
                 ? [qw(int decimal datetime)]
+                : $backend eq 'mssql'
+                    ? [qw(int numeric datetime2)]
                 : [qw(int4 numeric timestamptz)],
     );
     my @observations = map { _observe($suite, $_->{id}) } @{$request->{cases}};
@@ -93,7 +97,7 @@ sub read_request {
     die "unsupported target identity\n"
         unless $target->{implementation} eq 'selecto_perl'
         && $target->{runtime} eq 'perl'
-        && ($backend eq 'postgresql' || $backend eq 'sqlite' || $backend eq 'mysql' || $backend eq 'mariadb')
+        && ($backend eq 'postgresql' || $backend eq 'sqlite' || $backend eq 'mysql' || $backend eq 'mariadb' || $backend eq 'mssql')
         && $target->{key} eq "perl_$backend";
     die "invalid connection environment name\n"
         unless $target->{connection_env} =~ /\A[A-Z][A-Z0-9_]*\z/;
@@ -143,6 +147,29 @@ sub _connection_parts {
         push @parts, 'port=' . int($port) if defined($port);
         return ('dbi:MariaDB:' . join(';', @parts), $username, $password);
     }
+    if ($backend eq 'mssql') {
+        return ($value, undef, undef) if $value =~ /\Adbi:ODBC:/i;
+        my ($userinfo, $host, $port, $database) = _parse_mssql_url($value);
+        my ($username, $password) = split /:/, ($userinfo // ''), 2;
+        $username = length($username // '') ? uri_unescape($username) : undef;
+        $password = defined($password) ? uri_unescape($password) : undef;
+        $database = uri_unescape($database);
+        die "Microsoft SQL Server connection URL must name a database\n"
+            unless $database =~ /\A[A-Za-z0-9_$-]+\z/;
+        my $driver = $ENV{SELECTO_PERL_MSSQL_ODBC_DRIVER} // 'ODBC Driver 18 for SQL Server';
+        die "Microsoft SQL Server ODBC driver name is invalid\n"
+            if $driver eq '' || $driver =~ /[;{}\r\n]/;
+        $port //= 1433;
+        my @parts = ('Driver={' . $driver . '}', 'Server=' . $host, 'Port=' . int($port), 'Database=' . $database);
+        if ($driver =~ /(?:free)?tds/i) {
+            push @parts, 'TDS_Version=7.4', 'ClientCharset=UTF-8';
+        } else {
+            $parts[1] = 'Server=tcp:' . $host . ',' . int($port);
+            splice @parts, 2, 1;
+            push @parts, 'Encrypt=no', 'TrustServerCertificate=yes';
+        }
+        return ('dbi:ODBC:' . join(';', @parts), $username, $password);
+    }
     return ($value, undef, undef) if $value =~ /\Adbi:Pg:/i;
     my ($userinfo, $host, $port, $database, $query_string) = _parse_postgresql_url($value);
     my ($username, $password) = split /:/, ($userinfo // ''), 2;
@@ -177,6 +204,18 @@ sub _parse_mysql_family_url {
     my ($userinfo, $host, $port, $database) = ($1, $2, $3, $4);
     $host =~ s/\A\[|\]\z//g;
     die "invalid MySQL-family host\n" if $host =~ /[;\s]/;
+    return ($userinfo, $host, $port, $database);
+}
+
+sub _parse_mssql_url {
+    my ($value) = @_;
+    die "unsupported Microsoft SQL Server connection URL\n"
+        unless $value =~ m{\Amssql://(?:([^/?#@]*)@)?(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?/([^?#]*)\z}i;
+    my ($userinfo, $host, $port, $database) = ($1, $2, $3, $4);
+    $host =~ s/\A\[|\]\z//g;
+    die "invalid Microsoft SQL Server host\n" if $host =~ /[;\s]/;
+    die "invalid Microsoft SQL Server port\n"
+        if defined($port) && ($port < 1 || $port > 65_535);
     return ($userinfo, $host, $port, $database);
 }
 
@@ -224,11 +263,15 @@ sub _metadata {
         ? $dbh->selectrow_array('SELECT sqlite_version()')
         : $backend eq 'mysql' || $backend eq 'mariadb'
             ? $dbh->selectrow_array('SELECT VERSION()')
+            : $backend eq 'mssql'
+                ? $dbh->selectrow_array(q{SELECT CAST(SERVERPROPERTY('ProductVersion') AS VARCHAR(128))})
             : $dbh->selectrow_array(q{SELECT current_setting('server_version')});
     my ($driver_module, $driver_version) = $backend eq 'sqlite'
         ? ('DBD::SQLite', eval { $DBD::SQLite::VERSION } // 'unknown')
         : $backend eq 'mysql' || $backend eq 'mariadb'
             ? ('DBD::MariaDB', eval { $DBD::MariaDB::VERSION } // 'unknown')
+            : $backend eq 'mssql'
+                ? ('DBD::ODBC', eval { $DBD::ODBC::VERSION } // 'unknown')
             : ('DBD::Pg', eval { $DBD::Pg::VERSION } // 'unknown');
     return {
         protocol_version => $PROTOCOL_VERSION,
@@ -507,7 +550,7 @@ sub _insert_command {
 
 sub _setup_fixtures {
     my ($self) = @_;
-    for my $sql (
+    my @statements = (
         'DROP TABLE IF EXISTS selecto_cert_orders',
         'DROP TABLE IF EXISTS selecto_cert_people',
         'DROP TABLE IF EXISTS selecto_cert_writes',
@@ -516,7 +559,20 @@ sub _setup_fixtures {
         'CREATE TABLE selecto_cert_writes (id integer primary key, external_id varchar(80) not null unique, name varchar(120) not null)',
         q{INSERT INTO selecto_cert_people VALUES (1, 'Ada Lovelace', 'ada', true, 10.50, '2024-01-01', '2024-01-01 10:00:00'), (2, 'Grace Hopper', null, true, 20.00, '2024-01-02', '2024-01-02 11:30:00'), (3, 'Renée 東京', 'O''Brien', false, 20.25, '2024-02-01', '2024-02-01 09:15:00'), (4, 'Linus Torvalds', null, true, null, '2024-03-01', '2024-03-01 08:00:00')},
         q{INSERT INTO selecto_cert_orders VALUES (101, 1, 'open', 12.50), (102, 1, 'closed', 7.50), (103, 2, 'open', 20.00), (104, null, 'orphan', 5.00), (105, 3, 'open', 20.25)},
-    ) {
+    );
+    if ($self->{adapter_name} eq 'mssql') {
+        @statements = (
+            'DROP TABLE IF EXISTS selecto_cert_orders',
+            'DROP TABLE IF EXISTS selecto_cert_people',
+            'DROP TABLE IF EXISTS selecto_cert_writes',
+            'CREATE TABLE selecto_cert_people (id int primary key, name nvarchar(120) not null, nickname nvarchar(120), active bit not null, score decimal(12,2), joined_on date not null, created_at datetime2 not null)',
+            'CREATE TABLE selecto_cert_orders (id int primary key, person_id int, state nvarchar(40) not null, total decimal(12,2) not null)',
+            'CREATE TABLE selecto_cert_writes (id int primary key, external_id nvarchar(80) not null unique, name nvarchar(120) not null)',
+            q{INSERT INTO selecto_cert_people VALUES (1, N'Ada Lovelace', N'ada', 1, 10.50, '2024-01-01', '2024-01-01T10:00:00'), (2, N'Grace Hopper', null, 1, 20.00, '2024-01-02', '2024-01-02T11:30:00'), (3, N'Renée 東京', N'O''Brien', 0, 20.25, '2024-02-01', '2024-02-01T09:15:00'), (4, N'Linus Torvalds', null, 1, null, '2024-03-01', '2024-03-01T08:00:00')},
+            q{INSERT INTO selecto_cert_orders VALUES (101, 1, N'open', 12.50), (102, 1, N'closed', 7.50), (103, 2, N'open', 20.00), (104, null, N'orphan', 5.00), (105, 3, N'open', 20.25)},
+        );
+    }
+    for my $sql (@statements) {
         $self->{dbh}->do($sql);
     }
     $self->_reset_writes;

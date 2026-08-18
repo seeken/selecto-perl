@@ -20,8 +20,8 @@ protocol 1 and certification specification 2.2.0.
 - field, literal, comparison, null, membership, conjunction, and aggregate
   expressions, plus governed PostgreSQL date/time format expressions;
 - PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
-  SQLite, MySQL, and MariaDB compilation with native identifier quoting and
-  DBI `?` parameters;
+  SQLite, MySQL, MariaDB, and Microsoft SQL Server compilation with native
+  identifier quoting and DBI `?` parameters;
 - DBI execution with stable columns and backend-specific value normalization;
 - a versioned `Selecto::Adapter` contract, generic `Selecto::Statement`, and
   runtime adapter registry for independently packaged database support;
@@ -41,13 +41,16 @@ It does not contain HTTP routes, ORM, or UI compatibility code.
 Perl 5.34 or newer and Mojolicious 9.40 or newer are required. PostgreSQL
 execution and certification additionally require `DBD::Pg`; SQLite execution
 and certification require `DBD::SQLite`; MySQL and MariaDB use
-`DBD::MariaDB`. The base distribution does not force any optional driver.
+`DBD::MariaDB`; Microsoft SQL Server uses a Unicode-enabled `DBD::ODBC` build
+and an installed ODBC driver. The base distribution does not force any
+optional driver.
 
 ```sh
 cpanm --installdeps .
 cpanm DBD::Pg # only when using the PostgreSQL adapter
 cpanm DBD::SQLite # only when using the SQLite adapter
 cpanm DBD::MariaDB # when using MySQL or MariaDB
+cpanm DBD::ODBC # only when using the Microsoft SQL Server adapter
 perl Makefile.PL
 make test
 ```
@@ -117,14 +120,16 @@ Selecto::Adapter::Registry->default
 ```
 
 `Selecto->available_adapters` exposes the names currently registered. This
-release registers `postgresql`, `sqlite`, `mysql`, and `mariadb`. All inherit
-portable compilation, execution, and transaction behavior from `Selecto::SQL`;
-the MySQL-family pair shares `Selecto::MySQLFamily` DBI mechanics while retaining
-separate public classes and target identities. Each concrete package
+release registers `postgresql`, `sqlite`, `mysql`, `mariadb`, and `mssql`. All
+inherit portable compilation, execution, and transaction behavior from
+`Selecto::SQL`; the MySQL-family pair shares `Selecto::MySQLFamily` DBI
+mechanics while retaining separate public classes and target identities. Each concrete package
 owns its identity, placeholders, type normalization, capability declarations,
 upsert syntax, and dialect-only expressions. SQLite and the MySQL-family
 adapters fail closed for PostgreSQL-only bucket and date/time formatting
-expressions until native translations are implemented.
+expressions until native translations are implemented. SQL Server uses guarded
+native `MERGE`, bracket-quoted identifiers, and ordered `OFFSET`/`FETCH`
+pagination; pagination without an order fails closed.
 
 Application values never enter the SQL string. The compiler emits placeholders
 and carries values separately in the statement's `params` array.
@@ -216,6 +221,22 @@ SELECTO_CERT_PERL_MARIADB_URL='mysql://...' \
   --profiles capability_truth,core_query,portable_write
 ```
 
+Microsoft SQL Server uses `DBD::ODBC`. The default driver name is
+`ODBC Driver 18 for SQL Server`; set `SELECTO_PERL_MSSQL_ODBC_DRIVER` when the
+installed driver has a different name or when supplying a FreeTDS driver path:
+
+```sh
+SELECTO_PERL_MSSQL_ODBC_DRIVER='/path/to/libtdsodbc.so' \
+SELECTO_CERT_PERL_MSSQL_URL='mssql://user:password@host:1433/database' \
+  mise exec -- mix selecto.certify \
+  --targets perl_mssql,elixir_mssql \
+  --profiles capability_truth,core_query,portable_write
+```
+
+The runner converts that URL to a credential-free ODBC DSN and passes the
+decoded username and password separately to DBI. Application code may instead
+construct and own any compatible DBI handle and pass it to `Selecto->adapter`.
+
 Certification is controlled differential evidence for the enumerated query,
 write, `domain_actions`, and `action_variants` cases. Action certification
 covers planning, target scope, transition preconditions, capability decisions,
@@ -231,7 +252,8 @@ concurrency, security, or performance.
   JSON rowsets, full-text search, and streaming;
 - deeper-than-one-hop relationships;
 - nested portable write graphs and adapter-independent mutation expressions;
-- additional database adapters beyond PostgreSQL, SQLite, MySQL, and MariaDB;
+- additional database adapters beyond PostgreSQL, SQLite, MySQL, MariaDB, and
+  Microsoft SQL Server;
 - framework-specific integration beyond the DBI handle boundary.
 
 Deferred capabilities fail closed instead of falling back to raw SQL.
