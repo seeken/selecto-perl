@@ -54,6 +54,8 @@ sub run {
         adapter_name => $backend,
         type_samples => $backend eq 'sqlite'
             ? [qw(integer decimal datetime)]
+            : $backend eq 'duckdb'
+                ? [qw(integer decimal timestamp)]
             : $backend eq 'mysql' || $backend eq 'mariadb'
                 ? [qw(int decimal datetime)]
                 : $backend eq 'mssql'
@@ -97,7 +99,7 @@ sub read_request {
     die "unsupported target identity\n"
         unless $target->{implementation} eq 'selecto_perl'
         && $target->{runtime} eq 'perl'
-        && ($backend eq 'postgresql' || $backend eq 'sqlite' || $backend eq 'mysql' || $backend eq 'mariadb' || $backend eq 'mssql')
+        && ($backend eq 'postgresql' || $backend eq 'sqlite' || $backend eq 'duckdb' || $backend eq 'mysql' || $backend eq 'mariadb' || $backend eq 'mssql')
         && $target->{key} eq "perl_$backend";
     die "invalid connection environment name\n"
         unless $target->{connection_env} =~ /\A[A-Z][A-Z0-9_]*\z/;
@@ -133,6 +135,12 @@ sub _connection_parts {
         return ('dbi:SQLite:dbname=:memory:', undef, undef) if $value eq ':memory:';
         die "SQLite connection path is required\n" if $value eq '';
         return ('dbi:SQLite:dbname=' . $value, undef, undef);
+    }
+    if ($backend eq 'duckdb') {
+        return ($value, undef, undef) if $value =~ /\Adbi:DuckDB:/i;
+        return ('dbi:DuckDB:dbname=:memory:', undef, undef) if $value eq ':memory:';
+        die "DuckDB connection path is required\n" if $value eq '';
+        return ('dbi:DuckDB:dbname=' . $value, undef, undef);
     }
     if ($backend eq 'mysql' || $backend eq 'mariadb') {
         return ($value, undef, undef) if $value =~ /\Adbi:MariaDB:/i;
@@ -261,6 +269,8 @@ sub _metadata {
     my ($dbh, $backend) = @_;
     my ($backend_version) = $backend eq 'sqlite'
         ? $dbh->selectrow_array('SELECT sqlite_version()')
+        : $backend eq 'duckdb'
+            ? $dbh->selectrow_array('SELECT version()')
         : $backend eq 'mysql' || $backend eq 'mariadb'
             ? $dbh->selectrow_array('SELECT VERSION()')
             : $backend eq 'mssql'
@@ -268,6 +278,8 @@ sub _metadata {
             : $dbh->selectrow_array(q{SELECT current_setting('server_version')});
     my ($driver_module, $driver_version) = $backend eq 'sqlite'
         ? ('DBD::SQLite', eval { $DBD::SQLite::VERSION } // 'unknown')
+        : $backend eq 'duckdb'
+            ? ('DBD::DuckDB', eval { $DBD::DuckDB::VERSION } // 'unknown')
         : $backend eq 'mysql' || $backend eq 'mariadb'
             ? ('DBD::MariaDB', eval { $DBD::MariaDB::VERSION } // 'unknown')
             : $backend eq 'mssql'

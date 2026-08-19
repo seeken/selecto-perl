@@ -11,6 +11,7 @@ use Selecto::Adapter::Registry ();
 use Selecto::Action ();
 use Selecto::API ();
 use Selecto::Domain ();
+use Selecto::DuckDB ();
 use Selecto::Engine ();
 use Selecto::Error ();
 use Selecto::Expression ();

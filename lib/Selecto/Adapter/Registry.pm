@@ -11,6 +11,7 @@ our $DEFAULT;
 sub default ($class) {
     return $DEFAULT if $DEFAULT;
     $DEFAULT = $class->new;
+    $DEFAULT->register(duckdb => 'Selecto::DuckDB');
     $DEFAULT->register(mariadb => 'Selecto::MariaDB');
     $DEFAULT->register(mssql => 'Selecto::MSSQL');
     $DEFAULT->register(mysql => 'Selecto::MySQL');

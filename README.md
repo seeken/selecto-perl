@@ -20,7 +20,7 @@ protocol 1 and certification specification 2.2.0.
 - field, literal, comparison, null, membership, conjunction, and aggregate
   expressions, plus governed PostgreSQL date/time format expressions;
 - PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
-  SQLite, MySQL, MariaDB, and Microsoft SQL Server compilation with native
+  SQLite, DuckDB, MySQL, MariaDB, and Microsoft SQL Server compilation with native
   identifier quoting and DBI `?` parameters;
 - DBI execution with stable columns and backend-specific value normalization;
 - a versioned `Selecto::Adapter` contract, generic `Selecto::Statement`, and
@@ -49,6 +49,7 @@ optional driver.
 cpanm --installdeps .
 cpanm DBD::Pg # only when using the PostgreSQL adapter
 cpanm DBD::SQLite # only when using the SQLite adapter
+cpanm DBD::DuckDB # only when using the DuckDB adapter
 cpanm DBD::MariaDB # when using MySQL or MariaDB
 cpanm DBD::ODBC # only when using the Microsoft SQL Server adapter
 perl Makefile.PL
@@ -120,7 +121,7 @@ Selecto::Adapter::Registry->default
 ```
 
 `Selecto->available_adapters` exposes the names currently registered. This
-release registers `postgresql`, `sqlite`, `mysql`, `mariadb`, and `mssql`. All
+release registers `postgresql`, `sqlite`, `duckdb`, `mysql`, `mariadb`, and `mssql`. All
 inherit portable compilation, execution, and transaction behavior from
 `Selecto::SQL`; the MySQL-family pair shares `Selecto::MySQLFamily` DBI
 mechanics while retaining separate public classes and target identities. Each concrete package

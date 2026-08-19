@@ -58,6 +58,12 @@ is($sqlite_dsn, 'dbi:SQLite:dbname=:memory:', 'SQLite in-memory connection becom
 is($sqlite_username, undef, 'SQLite connection has no username');
 is($sqlite_password, undef, 'SQLite connection has no password');
 
+my ($duckdb_dsn, $duckdb_username, $duckdb_password) =
+    Selecto::Certification::_connection_parts(':memory:', 'duckdb');
+is($duckdb_dsn, 'dbi:DuckDB:dbname=:memory:', 'DuckDB in-memory connection becomes a DBD::DuckDB DSN');
+is($duckdb_username, undef, 'DuckDB connection has no username');
+is($duckdb_password, undef, 'DuckDB connection has no password');
+
 my ($mysql_dsn, $mysql_username, $mysql_password) =
     Selecto::Certification::_connection_parts(
         'mysql://selecto%20user:p%40ss@127.0.0.1:53306/selecto_cert', 'mysql'

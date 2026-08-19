@@ -55,6 +55,10 @@ WriteMakefile(
                 description => 'SQLite execution and certification',
                 prereqs => { runtime => { requires => { 'DBD::SQLite' => '1.64' } } },
             },
+            duckdb => {
+                description => 'DuckDB execution and certification',
+                prereqs => { runtime => { requires => { 'DBD::DuckDB' => '0.16' } } },
+            },
         },
     },
 );

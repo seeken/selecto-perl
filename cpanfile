@@ -6,6 +6,7 @@ recommends 'DBD::Pg', '3.016';
 recommends 'DBD::MariaDB', '1.24';
 recommends 'DBD::ODBC', '1.61';
 recommends 'DBD::SQLite', '1.64';
+recommends 'DBD::DuckDB', '0.16';
 
 on test => sub {
     requires 'Test::More';
