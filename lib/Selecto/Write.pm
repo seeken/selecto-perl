@@ -31,6 +31,8 @@ sub new {
         relation => "$args{relation}",
         assignments => { map { ("$_", _clone($assignments->{$_})) } keys %$assignments },
         predicate => $args{predicate},
+        scope_predicate => $args{scope_predicate},
+        query_enforcement => $args{query_enforcement},
         expected_count => exists($args{expected_count}) ? $args{expected_count} : 1,
         metadata => { map { ("$_", _clone($metadata->{$_})) } keys %$metadata },
     }, $class;
@@ -40,8 +42,24 @@ sub operation      { return $_[0]->{operation}; }
 sub relation       { return $_[0]->{relation}; }
 sub assignments    { return { map { ($_ => _clone($_[0]->{assignments}{$_})) } keys %{$_[0]->{assignments}} }; }
 sub predicate      { return $_[0]->{predicate}; }
+sub scope_predicate { return $_[0]->{scope_predicate}; }
+sub query_enforcement { return $_[0]->{query_enforcement}; }
 sub expected_count { return $_[0]->{expected_count}; }
 sub metadata       { return { map { ($_ => _clone($_[0]->{metadata}{$_})) } keys %{$_[0]->{metadata}} }; }
+
+sub with_query_enforcement {
+    my ($self, $evidence) = @_;
+    return ref($self)->new(
+        operation => $self->operation,
+        relation => $self->relation,
+        assignments => $self->assignments,
+        predicate => $self->predicate,
+        scope_predicate => $self->scope_predicate,
+        query_enforcement => $evidence,
+        expected_count => $self->expected_count,
+        metadata => $self->metadata,
+    );
+}
 
 sub _clone {
     my ($value) = @_;

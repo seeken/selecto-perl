@@ -41,7 +41,21 @@ sub new {
         fields       => $fields,
         associations => \%associations,
         components   => _normalize_components($args{components}),
+        primary_key  => undef,
+        required_predicate => $args{required_predicate},
+        tenant_field => $args{tenant_field},
     }, $class;
+    $self->{primary_key} = _identifier(
+        $args{primary_key} // (exists($fields->{id}) ? 'id' : (sort keys %$fields)[0]),
+        'primary key',
+    );
+    Selecto::Error->throw('invalid_domain', 'primary key must be a root field')
+        unless exists $fields->{$self->{primary_key}};
+    if (defined($self->{tenant_field})) {
+        $self->{tenant_field} = _identifier($self->{tenant_field}, 'tenant field');
+        Selecto::Error->throw('invalid_domain', 'tenant field must be a root field')
+            unless exists $fields->{$self->{tenant_field}};
+    }
     my $fingerprint_value = {
         name => $self->{name},
         table => $self->{table},
@@ -49,6 +63,9 @@ sub new {
         associations => {
             map { $_ => $self->{associations}{$_}->fingerprint_value } sort keys %associations
         },
+        primary_key => $self->{primary_key},
+        required_predicate => _expression_value($self->{required_predicate}),
+        tenant_field => $self->{tenant_field},
     };
     $fingerprint_value->{components} = $self->{components} if keys %{$self->{components}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
@@ -134,6 +151,7 @@ sub _parse_canonical {
         table => $source->{source_table},
         fields => _canonical_fields($source),
         associations => \%associations,
+        primary_key => $source->{primary_key} // 'id',
         components => $raw->{components},
     );
     $domain->{contract} = dclone($raw);
@@ -158,6 +176,20 @@ sub _canonical_fields {
         $result{$field} = $column->{type};
     }
     return \%result;
+}
+
+sub _expression_value {
+    my ($expression) = @_;
+    return undef unless defined $expression;
+    return $expression unless blessed($expression) && $expression->isa('Selecto::Expression');
+    return {
+        kind => $expression->kind,
+        arguments => [map {
+            ref($_) eq 'ARRAY'
+                ? [map { _expression_value($_) } @$_]
+                : _expression_value($_)
+        } @{$expression->arguments}],
+    };
 }
 
 sub resolve {
@@ -246,6 +278,9 @@ sub table        { return $_[0]->{table}; }
 sub fields       { return { %{$_[0]->{fields}} }; }
 sub associations { return { %{$_[0]->{associations}} }; }
 sub fingerprint  { return $_[0]->{fingerprint}; }
+sub primary_key  { return $_[0]->{primary_key}; }
+sub required_predicate { return $_[0]->{required_predicate}; }
+sub tenant_field { return $_[0]->{tenant_field}; }
 sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
 sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
 sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }

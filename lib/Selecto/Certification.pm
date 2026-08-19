@@ -13,9 +13,10 @@ use URI::Escape qw(uri_unescape);
 use Selecto;
 
 our $PROTOCOL_VERSION = 1;
-our $SPECIFICATION = '2.2.0';
+our $SPECIFICATION = '2.3.0';
 our @QUERY_CASES = map { sprintf('Q%03d', $_) } 1 .. 25;
 our @WRITE_CASES = map { sprintf('W%03d', $_) } 0 .. 6;
+our @QUERY_ENFORCED_WRITE_CASES = map { sprintf('QEW%03d', $_) } 1 .. 15;
 our @DOMAIN_CASES = map { sprintf('D%03d', $_) } 1 .. 8;
 our @ACTION_VARIANT_CASES = map { sprintf('D%03d', $_) } 38 .. 40;
 our @CANONICAL_API_CASES = map { sprintf('D%03d', $_) } 64 .. 71;
@@ -62,7 +63,7 @@ sub run {
                     ? [qw(int numeric datetime2)]
                 : [qw(int4 numeric timestamptz)],
     );
-    my @observations = map { _observe($suite, $_->{id}) } @{$request->{cases}};
+    my @observations = map { _observe($suite, $_->{id}, $_->{fixture}) } @{$request->{cases}};
     my %capabilities = %{$suite->adapter->write_capabilities};
     if ($backend eq 'postgresql') {
         @capabilities{qw(domain_actions action_variants canonical_domain_api)} = (1, 1, 1);
@@ -106,7 +107,7 @@ sub read_request {
     die "cases must be an array\n" unless ref($request->{cases}) eq 'ARRAY';
     my %seen;
     for my $case (@{$request->{cases}}) {
-        _exact_object($case, [qw(id title profile kind requires)], 'case');
+        _exact_object($case, [qw(id title profile kind requires fixture)], 'case', [qw(id title profile kind requires)]);
         die "case id must be a string\n" if ref($case->{id}) || $case->{id} eq '';
         die "case title must be a string\n" if ref($case->{title});
         die "case profile must be a string\n" if ref($case->{profile});
@@ -118,11 +119,11 @@ sub read_request {
 }
 
 sub _exact_object {
-    my ($value, $allowed, $label) = @_;
+    my ($value, $allowed, $label, $required) = @_;
     die "$label must be an object\n" unless ref($value) eq 'HASH';
     my %allowed = map { $_ => 1 } @$allowed;
     my @unknown = sort grep { !$allowed{$_} } keys %$value;
-    my @missing = sort grep { !exists $value->{$_} } @$allowed;
+    my @missing = sort grep { !exists $value->{$_} } @{$required // $allowed};
     die "$label has unknown fields: " . join(',', @unknown) . "\n" if @unknown;
     die "$label is missing fields: " . join(',', @missing) . "\n" if @missing;
 }
@@ -236,11 +237,11 @@ sub _dsn_quote {
 }
 
 sub _observe {
-    my ($suite, $case_id) = @_;
+    my ($suite, $case_id, $fixture) = @_;
     my $started = clock_gettime(CLOCK_MONOTONIC);
     my ($value, $evidence);
     my $ok = eval {
-        my $result = $suite->run_case($case_id);
+        my $result = $suite->run_case($case_id, $fixture);
         die "case dispatcher must return value and evidence\n" unless ref($result) eq 'ARRAY' && @$result == 2;
         ($value, $evidence) = @$result;
         1;
@@ -323,6 +324,7 @@ sub new {
     $self->_setup_fixtures;
     $self->{people_engine} = Selecto::Engine->new(domain => $self->_people_domain, adapter => $self->{adapter});
     $self->{orders_engine} = Selecto::Engine->new(domain => $self->_orders_domain, adapter => $self->{adapter});
+    $self->{writes_engine} = Selecto::Engine->new(domain => $self->_writes_domain, adapter => $self->{adapter});
     $self->{action_domain} = Selecto::Domain->parse($self->_action_contract, strict => 1);
     $self->{action_variant_domain} = Selecto::Domain->parse($self->_action_variant_contract, strict => 1);
     $self->{action_execution_case_domain} = Selecto::Domain->parse($self->_action_execution_case_contract, strict => 1);
@@ -336,7 +338,7 @@ sub new {
 sub adapter { return $_[0]->{adapter}; }
 
 sub run_case {
-    my ($self, $case_id) = @_;
+    my ($self, $case_id, $fixture) = @_;
     return [$self->_required_contract, {}] if $case_id eq 'A001';
     return [$self->{adapter}->name, {}] if $case_id eq 'A002';
     return [{ module => $self->{adapter}->dialect, loaded => JSON::PP::true, behavior => JSON::PP::true }, {}] if $case_id eq 'A003';
@@ -358,6 +360,8 @@ sub run_case {
     return $self->_run_query($case_id) if grep { $_ eq $case_id } @Selecto::Certification::QUERY_CASES;
     return $self->_write_capability_contract if $case_id eq 'W000';
     return $self->_run_write($case_id) if grep { $_ eq $case_id } @Selecto::Certification::WRITE_CASES;
+    return $self->_run_query_enforced_write($case_id)
+        if grep { $_ eq $case_id } @Selecto::Certification::QUERY_ENFORCED_WRITE_CASES;
     return $self->_run_domain_action($case_id) if grep { $_ eq $case_id } @Selecto::Certification::DOMAIN_CASES;
     return $self->_run_action_variant($case_id)
         if grep { $_ eq $case_id } @Selecto::Certification::ACTION_VARIANT_CASES;
@@ -527,6 +531,211 @@ sub _run_write {
         ];
     }
     Selecto::Error->throw('unsupported_case', "unsupported write case $case_id");
+}
+
+sub _run_query_enforced_write {
+    my ($self, $case_id) = @_;
+    $self->_reset_writes;
+    my $x = 'Selecto::Expression';
+    my $engine = $self->{writes_engine};
+    my $query = $engine->query->where($x->all($x->eq('id', 1), $x->eq('name', 'before')));
+    my $update = sub {
+        my ($assignments, $predicate, $scope) = @_;
+        return $engine->enforce_query(
+            Selecto::Write::Command->new(
+                operation => 'update', relation => 'selecto_cert_writes',
+                assignments => $assignments, predicate => $predicate, scope_predicate => $scope,
+            ),
+            $query,
+        );
+    };
+
+    if ($case_id eq 'QEW001') {
+        my $guarded = $update->({ name => 'after' });
+        my $result = $engine->execute_write($guarded);
+        return [{
+            operation => $result->operation, affected_rows => $result->affected_rows,
+            guard_fields => [qw(external_id id name)], final_rows => $self->_write_state,
+        }, { preview => $self->{adapter}->preview_write($guarded) }];
+    }
+    if ($case_id eq 'QEW002') {
+        my $guarded = $update->({ external_id => 'should-not-apply' });
+        $self->{dbh}->do(q{UPDATE selecto_cert_writes SET name = 'changed' WHERE id = 1});
+        my $ok = eval { $engine->execute_write($guarded); 1 };
+        Selecto::Error->throw('expected_error', 'expected stale guarded update') if $ok;
+        my $error = $@;
+        die $error unless blessed($error) && $error->isa('Selecto::Error');
+        return [{ error_type => $error->code, affected_rows => 0, final_rows => $self->_write_state },
+            { error => $error->to_hash }];
+    }
+    if ($case_id eq 'QEW003') {
+        my $guarded = $update->(
+            { name => 'after' }, $x->eq('id', 1), $x->eq('external_id', 'baseline'),
+        );
+        my $result = $engine->execute_write($guarded);
+        return [{ affected_rows => $result->affected_rows, guard_sources => [qw(command tenant query)],
+            final_rows => $self->_write_state }, {}];
+    }
+    if ($case_id eq 'QEW004') {
+        my $nested = $engine->query->where($x->any(
+            $x->all($x->eq('name', 'before'), $x->gt('id', 0)),
+            $x->not($x->is_null('name')),
+        ));
+        my $guarded = $engine->enforce_query(
+            Selecto::Write::Command->new(
+                operation => 'update', relation => 'selecto_cert_writes', assignments => { name => 'after' },
+                predicate => $x->eq('id', 1), scope_predicate => $x->eq('external_id', 'baseline'),
+            ),
+            $nested,
+        );
+        my $preview = $self->{adapter}->preview_write($guarded);
+        my $effective = $x->all($guarded->predicate, $guarded->scope_predicate, $guarded->query_enforcement->predicate);
+        return [{ normalized_shape => Selecto::QueryEnforcement::shape($effective),
+            parameters => [@{$preview->{params}}[1 .. $#{$preview->{params}}]] }, { preview => $preview }];
+    }
+    if ($case_id eq 'QEW005') {
+        my $decorated = $query->select('id')->order_by('id', 'desc')->limit(1)->offset(0);
+        my $guarded = $engine->enforce_query(Selecto::Write::Command->new(
+            operation => 'update', relation => 'selecto_cert_writes', assignments => { name => 'after' },
+        ), $decorated);
+        my $result = $engine->execute_write($guarded);
+        return [{ affected_rows => $result->affected_rows,
+            ignored_query_clauses => [qw(limit offset order_by projection)], final_rows => $self->_write_state }, {}];
+    }
+    if ($case_id eq 'QEW006') {
+        $self->{dbh}->do('DELETE FROM selecto_cert_writes');
+        my $guarded = $engine->enforce_query(Selecto::Write::Command->new(
+            operation => 'insert', relation => 'selecto_cert_writes',
+            assignments => { id => 1, external_id => 'baseline', name => 'before' },
+        ), $query);
+        $engine->execute_write($guarded);
+        return [{ operation => 'insert', admitted => JSON::PP::true, dispatched => JSON::PP::true }, {}];
+    }
+    if ($case_id eq 'QEW007') {
+        return $self->_rejected_insert($query, { id => 1, external_id => 'baseline', name => 'inactive' });
+    }
+    if ($case_id eq 'QEW008') {
+        return $self->_rejected_insert($query, { id => 1, external_id => 'baseline' });
+    }
+    if ($case_id eq 'QEW009') {
+        my $nullable = $engine->query->where($x->not($x->eq('name', 'blocked')));
+        my $result = $self->_rejected_insert($nullable, { id => 1, external_id => 'baseline', name => undef });
+        $result->[0]{truth_value} = 'unknown';
+        return $result;
+    }
+    if ($case_id eq 'QEW010') {
+        my $captured = $update->({ name => 'after' })->query_enforcement;
+        my @variants = (
+            ['domain_name', { domain_name => 'other_domain' }],
+            ['root_relation', { root_relation => 'other_table' }],
+            ['domain_fingerprint', { domain_fingerprint => 'sha256:other' }],
+        );
+        my @attempts;
+        for my $variant (@variants) {
+            my ($field, $changes) = @$variant;
+            my $forged = Selecto::QueryEnforcement->new(
+                domain_name => $changes->{domain_name} // $captured->domain_name,
+                root_relation => $changes->{root_relation} // $captured->root_relation,
+                primary_key => $captured->primary_key,
+                domain_fingerprint => $changes->{domain_fingerprint} // $captured->domain_fingerprint,
+                predicate => $captured->predicate,
+            );
+            my $error = $self->_capture_error(sub {
+                $engine->enforce_query_evidence(Selecto::Write::Command->new(
+                    operation => 'update', relation => 'selecto_cert_writes', assignments => { name => 'after' },
+                ), $forged);
+            });
+            push @attempts, { field => $field, error_type => $error->{error_type} };
+        }
+        return [{ attempts => \@attempts, dispatched => JSON::PP::false }, {}];
+    }
+    if ($case_id eq 'QEW011') {
+        my @invalid = (
+            ['joined_field', $x->eq('owner.name', 'Ada')],
+            ['unsupported_operator', $x->new('like', $x->field('name'), $x->literal('A%'))],
+        );
+        my @attempts;
+        for my $item (@invalid) {
+            my ($kind, $predicate) = @$item;
+            my $error = $self->_capture_error(sub {
+                $engine->enforce_query(Selecto::Write::Command->new(
+                    operation => 'update', relation => 'selecto_cert_writes', assignments => { name => 'after' },
+                ), $engine->query->where($predicate));
+            });
+            push @attempts, { kind => $kind, error_type => $error->{error_type} };
+        }
+        return [{ attempts => \@attempts, dispatched => JSON::PP::false }, {}];
+    }
+    if ($case_id eq 'QEW012') {
+        my $empty = Selecto::Engine->new(
+            domain => Selecto::Domain->new(name => 'EmptyWrites', table => 'selecto_cert_writes',
+                fields => { id => 'integer', external_id => 'string', name => 'string' }),
+            adapter => $self->{adapter},
+        );
+        return [$self->_capture_error(sub { $empty->enforce_query(Selecto::Write::Command->new(
+            operation => 'update', relation => 'selecto_cert_writes', assignments => { name => 'after' },
+        ), $empty->query); }), {}];
+    }
+    if ($case_id eq 'QEW013') {
+        my $tenant = Selecto::Engine->new(
+            domain => Selecto::Domain->new(name => 'TenantWrites', table => 'selecto_cert_writes',
+                fields => { id => 'integer', external_id => 'string', name => 'string' }, tenant_field => 'external_id'),
+            adapter => $self->{adapter},
+        );
+        return [$self->_capture_error(sub { $tenant->enforce_query(Selecto::Write::Command->new(
+            operation => 'update', relation => 'selecto_cert_writes', assignments => { name => 'after' },
+        ), $tenant->query->where($x->eq('external_id', 'baseline'))); }), {}];
+    }
+    if ($case_id eq 'QEW014') {
+        return [$self->_capture_error(sub { $engine->enforce_query(Selecto::Write::Command->new(
+            operation => 'upsert', relation => 'selecto_cert_writes',
+            assignments => { id => 1, external_id => 'baseline', name => 'before' },
+            metadata => { conflict_target => ['external_id'], upsert_update_fields => ['name'] },
+        ), $query); }), {}];
+    }
+    if ($case_id eq 'QEW015') {
+        my $first = $update->({ name => 'after' });
+        my $second = $engine->enforce_query(Selecto::Write::Command->new(
+            operation => 'update', relation => 'selecto_cert_writes', assignments => { name => 'after' },
+        ), $engine->query->where($x->eq('id', 2)));
+        my $source = $first->query_enforcement->source_metadata;
+        my $serialized = JSON::PP->new->encode($source);
+        return [{
+            connection_free => $serialized !~ /(?:connection|driver)/ ? JSON::PP::true : JSON::PP::false,
+            sensitive_values_exposed => $serialized =~ /(?:baseline|before)/ ? JSON::PP::true : JSON::PP::false,
+            source_keys => [qw(domain_fingerprint domain_name predicate_fingerprint primary_key root_relation)],
+            predicate_fingerprint_changes_identity =>
+                $first->query_enforcement->predicate_fingerprint ne $second->query_enforcement->predicate_fingerprint
+                    ? JSON::PP::true : JSON::PP::false,
+        }, { source => $source }];
+    }
+    Selecto::Error->throw('unsupported_case', "unsupported query-enforced write case $case_id");
+}
+
+sub _rejected_insert {
+    my ($self, $query, $assignments) = @_;
+    my $engine = $self->{writes_engine};
+    my $ok = eval {
+        my $guarded = $engine->enforce_query(Selecto::Write::Command->new(
+            operation => 'insert', relation => 'selecto_cert_writes', assignments => $assignments,
+        ), $query);
+        $engine->execute_write($guarded);
+        1;
+    };
+    return [{ error_type => 'missing_error', admitted => JSON::PP::true, dispatched => JSON::PP::true }, {}] if $ok;
+    my $error = $@;
+    die $error unless blessed($error) && $error->isa('Selecto::Error');
+    return [{ error_type => $error->code, admitted => JSON::PP::false, dispatched => JSON::PP::false },
+        { error => $error->to_hash }];
+}
+
+sub _capture_error {
+    my ($self, $operation) = @_;
+    my $ok = eval { $operation->(); 1 };
+    return { error_type => 'missing_error', dispatched => JSON::PP::false } if $ok;
+    my $error = $@;
+    die $error unless blessed($error) && $error->isa('Selecto::Error');
+    return { error_type => $error->code, dispatched => JSON::PP::false };
 }
 
 sub _successful_write {
@@ -1120,6 +1329,16 @@ sub _orders_domain {
                 owner_key => 'person_id', related_key => 'id', join_type => 'left',
             },
         },
+    );
+}
+
+sub _writes_domain {
+    return Selecto::Domain->new(
+        name => 'certification_writes',
+        table => 'selecto_cert_writes',
+        primary_key => 'id',
+        fields => { id => 'integer', external_id => 'string', name => 'string' },
+        required_predicate => Selecto::Expression->eq('external_id', 'baseline'),
     );
 }
 

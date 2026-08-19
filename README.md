@@ -7,7 +7,7 @@ HTTP-neutral: DBI supplies the execution boundary, while routes, ORMs, and UI
 code remain in consumer applications.
 
 This is an alpha library. Its current compatibility target is observation
-protocol 1 and certification specification 2.2.0.
+protocol 1 and certification specification 2.3.0.
 
 ## Current surface
 
@@ -149,9 +149,38 @@ my $preview = $engine->adapter->preview_write($command);
 my $result = $engine->execute_write($command);
 ```
 
-Update and delete predicates are deliberately limited to equality in protocol
-1. Identifiers are validated separately from bound values. Each write and every
+Identifiers are validated separately from bound values. Each write and every
 batch executes transactionally; an expected-cardinality mismatch rolls back.
+
+The query that selected a row can also guard its later write. Capture immutable
+evidence at read time, then attach it to the command at the write boundary:
+
+```perl
+my $eligible = $engine->query->where(
+    Selecto::Expression->all(
+        Selecto::Expression->eq('id', 42),
+        Selecto::Expression->eq('status', 'active'),
+    ),
+);
+my $evidence = $engine->query_enforcement_evidence($eligible);
+
+my $guarded = Selecto::Write::Command->new(
+    operation      => 'update',
+    relation       => 'orders',
+    assignments    => { status => 'archived' },
+    predicate      => Selecto::Expression->eq('id', 42),
+    query_evidence => $evidence,
+);
+my $result = $engine->execute_write($guarded);
+```
+
+The adapter combines the command predicate, trusted scope, and captured query
+predicate in the same database statement. Inserts evaluate the candidate row
+against that same effective predicate before opening a transaction. SQL
+three-valued logic is preserved, missing root fields and domain drift fail
+closed, nested relationship predicates are rejected, and guarded upserts are
+unsupported because their insert/update eligibility cannot be expressed by a
+single portable rule.
 
 ## Governed actions
 

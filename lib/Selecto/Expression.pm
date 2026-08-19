@@ -69,6 +69,14 @@ sub all {
     return $class->new('and', [@expressions]);
 }
 
+sub any {
+    my ($class, @expressions) = @_;
+    @expressions = @{$expressions[0]} if @expressions == 1 && ref($expressions[0]) eq 'ARRAY';
+    return $class->new('or', [@expressions]);
+}
+
+sub not { my ($class, $expression) = @_; return $class->new('not', $expression); }
+
 sub _binary {
     my ($class, $kind, $field, $value) = @_;
     return $class->new($kind, $class->field($field), $class->literal($value));

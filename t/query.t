@@ -32,6 +32,22 @@ like($statement->sql, qr/"s0"\."name" = \$1/, 'predicate is compiled with a Post
 unlike($statement->sql, qr/O'Brien/, 'value is not interpolated into SQL');
 is_deeply($statement->params, [q{O'Brien}], 'value is carried separately');
 
+my $active_domain = Selecto::Domain->new(
+    name => 'Active people',
+    table => 'people',
+    fields => { id => 'integer', status => 'string' },
+    required_predicate => Selecto::Expression->eq('status', 'active'),
+);
+my $active_engine = Selecto::Engine->new(domain => $active_domain, adapter => $adapter);
+my $active_statement = $active_engine->compile(
+    $active_engine->query->select('id')->where(Selecto::Expression->eq('id', 7)));
+like($active_statement->sql, qr/"s0"\."status" = \$1/,
+    'domain-required predicate constrains the compiled read');
+like($active_statement->sql, qr/"s0"\."id" = \$2/,
+    'caller predicate remains part of the compiled read');
+is_deeply($active_statement->params, ['active', 7],
+    'required and caller predicates preserve deterministic parameter order');
+
 my $comparisons = $engine->query
     ->select('name')
     ->where(Selecto::Expression->all([

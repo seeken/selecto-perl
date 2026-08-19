@@ -18,6 +18,7 @@ use Selecto::Expression ();
 use Selecto::MSSQL ();
 use Selecto::PostgreSQL ();
 use Selecto::Query ();
+use Selecto::QueryEnforcement ();
 use Selecto::SQL ();
 use Selecto::SQLite ();
 use Selecto::Statement ();

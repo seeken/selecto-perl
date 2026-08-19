@@ -4,6 +4,7 @@ use Mojo::Base 'Selecto::Adapter';
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::QueryEnforcement ();
 use Selecto::Statement ();
 use Selecto::Write ();
 
@@ -30,7 +31,9 @@ sub compile {
     my @params;
     my @joins;
     my $associations = $domain->associations;
-    for my $name ($self->_referenced_associations($query)) {
+    my $predicate = Selecto::QueryEnforcement::combine(
+        $domain->required_predicate, $query->predicate);
+    for my $name ($self->_referenced_associations($query, $predicate)) {
         my $association = $associations->{$name};
         Selecto::Error->throw('unknown_association', "unknown association $name") unless $association;
         my $keyword = $association->join_type eq 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
@@ -52,7 +55,7 @@ sub compile {
     my $sql = 'SELECT ' . join(', ', @selection_sql) .
         ' FROM ' . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier('s0');
     $sql .= ' ' . join(' ', @joins) if @joins;
-    $sql .= ' WHERE ' . $self->_compile_expression($domain, $query->predicate, \@params) if $query->predicate;
+    $sql .= ' WHERE ' . $self->_compile_expression($domain, $predicate, \@params) if $predicate;
     my $groups = $query->groups;
     $sql .= ' GROUP BY ' . join(', ', map {
         my $key = _expression_key($_);
@@ -101,13 +104,16 @@ sub preview_write {
 
 sub execute_write {
     my ($self, $command) = @_;
-    return $self->_transaction(sub { return $self->_execute_write_in_transaction($command); });
+    my $compiled = $self->_compile_write($command);
+    return $self->_transaction(sub { return $self->_execute_compiled_write_in_transaction($command, $compiled); });
 }
 
 sub execute_batch {
     my ($self, $batch) = @_;
+    my @commands = @{$batch->commands};
+    my @compiled = map { $self->_compile_write($_) } @commands;
     return $self->_transaction(sub {
-        my @results = map { $self->_execute_write_in_transaction($_) } @{$batch->commands};
+        my @results = map { $self->_execute_compiled_write_in_transaction($commands[$_], $compiled[$_]) } 0 .. $#commands;
         return \@results;
     });
 }
@@ -182,12 +188,14 @@ sub _compile_expression {
         my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
         return $self->_compile_expression($domain, $arguments->[0], $params) . ' IN (' . join(', ', @markers) . ')';
     }
-    if ($kind eq 'and') {
+    if ($kind eq 'and' || $kind eq 'or') {
         my $expressions = $arguments->[0];
-        Selecto::Error->throw('invalid_query', 'AND requires expressions')
+        Selecto::Error->throw('invalid_query', uc($kind) . ' requires expressions')
             unless ref($expressions) eq 'ARRAY' && @$expressions;
-        return join(' AND ', map { '(' . $self->_compile_expression($domain, $_, $params) . ')' } @$expressions);
+        my $operator = $kind eq 'and' ? ' AND ' : ' OR ';
+        return join($operator, map { '(' . $self->_compile_expression($domain, $_, $params) . ')' } @$expressions);
     }
+    return 'NOT (' . $self->_compile_expression($domain, $arguments->[0], $params) . ')' if $kind eq 'not';
     return 'COUNT(*)' if $kind eq 'count';
     return 'COUNT(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
         if $kind eq 'count_field';
@@ -345,9 +353,9 @@ sub _field_sql {
 }
 
 sub _referenced_associations {
-    my ($self, $query) = @_;
+    my ($self, $query, $predicate) = @_;
     my @expressions = (@{$query->selections});
-    push @expressions, $query->predicate if $query->predicate;
+    push @expressions, $predicate if $predicate;
     push @expressions, @{$query->groups};
     push @expressions, map { $_->[0] } @{$query->orders};
     my %names;
@@ -382,9 +390,24 @@ sub _compile_write {
     my $operation = $command->operation;
     my $assignments = $command->assignments;
     if ($operation eq 'insert' || $operation eq 'upsert') {
+        Selecto::Error->throw('query_enforcement_unsupported_operation', 'query-enforced upsert is not supported')
+            if defined($command->query_enforcement) && $operation eq 'upsert';
         my @fields = sort keys %$assignments;
         Selecto::Error->throw('invalid_write', 'insert requires assignments') unless @fields;
         my @params = map { $assignments->{$_} } @fields;
+        my $insert_predicate = Selecto::QueryEnforcement::combine(
+            $command->predicate,
+            $command->scope_predicate,
+            defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
+        );
+        if ($insert_predicate) {
+            my $truth = Selecto::QueryEnforcement::evaluate($insert_predicate, $assignments);
+            Selecto::Error->throw(
+                'query_rule_violation',
+                'insert candidate does not satisfy the enforced query',
+                { truth_value => $truth },
+            ) unless $truth eq 'true';
+        }
         my $sql = 'INSERT INTO ' . $self->quote_identifier($relation) .
             ' (' . join(', ', map { $self->quote_identifier(_checked_identifier($_)) } @fields) . ')' .
             ' VALUES (' . join(', ', map { $self->placeholder($_ + 1) } 0 .. $#fields) . ')';
@@ -408,12 +431,26 @@ sub _compile_write {
             push @params, $assignments->{$_};
             $self->quote_identifier(_checked_identifier($_)) . ' = ' . $self->placeholder(scalar @params)
         } @fields;
-        my $predicate = $self->_compile_write_predicate($command->predicate, \@params);
+        my $predicate = $self->_compile_write_predicate(
+            Selecto::QueryEnforcement::combine(
+                $command->predicate,
+                $command->scope_predicate,
+                defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
+            ),
+            \@params,
+        );
         return { sql => 'UPDATE ' . $self->quote_identifier($relation) . ' SET ' . join(', ', @set) . " WHERE $predicate", params => \@params };
     }
     if ($operation eq 'delete') {
         my @params;
-        my $predicate = $self->_compile_write_predicate($command->predicate, \@params);
+        my $predicate = $self->_compile_write_predicate(
+            Selecto::QueryEnforcement::combine(
+                $command->predicate,
+                $command->scope_predicate,
+                defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
+            ),
+            \@params,
+        );
         return { sql => 'DELETE FROM ' . $self->quote_identifier($relation) . " WHERE $predicate", params => \@params };
     }
     Selecto::Error->throw('invalid_write', "unsupported operation $operation");
@@ -423,21 +460,55 @@ sub _compile_write_predicate {
     my ($self, $expression, $params) = @_;
     Selecto::Error->throw('invalid_write', 'write predicate is required')
         unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $kind = $expression->kind;
     my $arguments = $expression->arguments;
-    Selecto::Error->throw('invalid_write', 'only equality write predicates are portable in protocol v1')
-        unless $expression->kind eq 'eq'
-        && blessed($arguments->[0]) && $arguments->[0]->kind eq 'field'
-        && blessed($arguments->[1]) && $arguments->[1]->kind eq 'literal';
-    my $field_args = $arguments->[0]->arguments;
-    my $literal_args = $arguments->[1]->arguments;
-    my $field = _checked_identifier($field_args->[0]);
-    push @$params, $literal_args->[0];
-    return $self->quote_identifier($field) . ' = ' . $self->placeholder(scalar @$params);
+    if ($kind =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/) {
+        my $field = _write_field($arguments->[0]);
+        push @$params, _write_literal($arguments->[1]);
+        my $operator = { eq => '=', ne => '<>', gt => '>', gte => '>=', lt => '<', lte => '<=' }->{$kind};
+        return $self->quote_identifier($field) . " $operator " . $self->placeholder(scalar @$params);
+    }
+    if ($kind eq 'is_null' || $kind eq 'not_null') {
+        my $operator = $kind eq 'is_null' ? 'IS NULL' : 'IS NOT NULL';
+        return $self->quote_identifier(_write_field($arguments->[0])) . " $operator";
+    }
+    if ($kind eq 'in') {
+        my $values = $arguments->[1];
+        Selecto::Error->throw('query_rule_unsupported_predicate', 'query-enforced IN requires values')
+            unless ref($values) eq 'ARRAY' && @$values;
+        my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
+        return $self->quote_identifier(_write_field($arguments->[0])) . ' IN (' . join(', ', @markers) . ')';
+    }
+    if ($kind eq 'and' || $kind eq 'or') {
+        my $nested = $arguments->[0];
+        Selecto::Error->throw('query_rule_unsupported_predicate', 'boolean write predicate requires expressions')
+            unless ref($nested) eq 'ARRAY' && @$nested;
+        my $operator = $kind eq 'and' ? ' AND ' : ' OR ';
+        return join($operator, map { '(' . $self->_compile_write_predicate($_, $params) . ')' } @$nested);
+    }
+    return 'NOT (' . $self->_compile_write_predicate($arguments->[0], $params) . ')' if $kind eq 'not';
+    Selecto::Error->throw('query_rule_unsupported_predicate', 'predicate is outside the portable write subset');
 }
 
-sub _execute_write_in_transaction {
-    my ($self, $command) = @_;
-    my $compiled = $self->_compile_write($command);
+sub _write_field {
+    my ($expression) = @_;
+    Selecto::Error->throw('query_rule_unsupported_predicate', 'portable write predicate requires a field')
+        unless blessed($expression) && $expression->kind eq 'field';
+    my $field = $expression->arguments->[0];
+    Selecto::Error->throw('query_rule_unsupported_field', 'association fields are not portable write guards')
+        if $field =~ /\./;
+    return _checked_identifier($field);
+}
+
+sub _write_literal {
+    my ($expression) = @_;
+    Selecto::Error->throw('query_rule_unsupported_predicate', 'portable comparison requires a literal value')
+        unless blessed($expression) && $expression->kind eq 'literal';
+    return $expression->arguments->[0];
+}
+
+sub _execute_compiled_write_in_transaction {
+    my ($self, $command, $compiled) = @_;
     my ($sth, $affected);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($compiled->{sql});
