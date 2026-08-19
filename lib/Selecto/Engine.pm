@@ -8,6 +8,7 @@ use Selecto::Domain ();
 use Selecto::Error ();
 use Selecto::Query ();
 use Selecto::QueryEnforcement ();
+use Selecto::QueryLibrary ();
 
 sub new {
     my ($class, %args) = @_;
@@ -26,6 +27,23 @@ sub compile { my ($self, $query) = @_; return $self->{adapter}->compile($self->{
 sub all     { my ($self, $query) = @_; return $self->{adapter}->execute_query($self->compile($query)); }
 sub execute_write { my ($self, $command) = @_; return $self->{adapter}->execute_write($command); }
 sub execute_batch { my ($self, $batch) = @_; return $self->{adapter}->execute_batch($batch); }
+sub query_library { my ($self) = @_; return Selecto::QueryLibrary->library($self->domain); }
+sub apply_segment {
+    my ($self, $query, $id, $params) = @_;
+    return Selecto::QueryLibrary->apply_segment($self->domain, $query, $id, $params // {});
+}
+sub apply_projection {
+    my ($self, $query, $ids) = @_;
+    return Selecto::QueryLibrary->apply_projection($self->domain, $query, $ids);
+}
+sub apply_ordering {
+    my ($self, $query, $id) = @_;
+    return Selecto::QueryLibrary->apply_ordering($self->domain, $query, $id);
+}
+sub apply_view {
+    my ($self, $query, $id, $params) = @_;
+    return Selecto::QueryLibrary->apply_view($self->domain, $query, $id, $params // {});
+}
 
 sub enforce_query {
     my ($self, $command, $query) = @_;

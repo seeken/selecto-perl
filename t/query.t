@@ -99,6 +99,15 @@ like($dated_statement->sql,
     qr/ORDER BY TO_CHAR\("s0"\."occurred_on", 'YYYY-MM'\) ASC, "s0"\."name" DESC/,
     'ordered query intent retains multiple expressions and directions');
 
+my $formatted_filter_statement = $dated_engine->compile(
+    $dated_engine->query
+        ->select('id')
+        ->where(Selecto::Expression->eq($month, '2026-08'))
+);
+like($formatted_filter_statement->sql,
+    qr/TO_CHAR\("s0"\."occurred_on", 'YYYY-MM'\) = \$1/,
+    'comparison predicates accept governed expressions as their operand');
+
 my $numeric_domain = Selecto::Domain->new(
     name => 'Inventory',
     table => 'inventory',
@@ -134,6 +143,19 @@ is_deeply([@{$bucket_statement->params}[0 .. 5]], [0, 9, '0-9', 10, '10+', 'Othe
     'bucket boundaries and labels remain bound values');
 is scalar(@{$bucket_statement->params}), 8,
     'an identical grouped bucket reuses its compiled selection placeholders';
+
+my $rollup_statement = $numeric_engine->compile(
+    $numeric_engine->query->select(
+        $quantity_bucket->as('quantity_band'),
+        Selecto::Expression->count->as('inventory_count'),
+        Selecto::Expression->grouping($quantity_bucket)->as('rollup_grouping'),
+    )->group_by_rollup($quantity_bucket)->order_by($quantity_bucket, 'asc')->limit(25)
+);
+like($rollup_statement->sql,
+    qr/\ASELECT \* FROM \(SELECT .* GROUP BY ROLLUP \(CASE .*\)\) AS rollupfix ORDER BY 1 ASC NULLS FIRST LIMIT 25\z/s,
+    'ordered rollups use a positional outer sort without rebuilding the expression');
+is scalar(@{$rollup_statement->params}), 6,
+    'grouping metadata and positional rollup ordering reuse selected expression parameters';
 
 my $age_bucket = Selecto::Expression->bucket('occurred_on', {
     kind => 'elapsed_days_ranges',

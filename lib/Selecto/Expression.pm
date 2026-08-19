@@ -3,6 +3,7 @@ package Selecto::Expression;
 use 5.034;
 use strict;
 use warnings;
+use Scalar::Util qw(blessed);
 
 sub new {
     my ($class, $kind, @arguments) = @_;
@@ -12,33 +13,40 @@ sub new {
 sub field   { my ($class, $name) = @_; return $class->new('field', "$name"); }
 sub literal { my ($class, $value) = @_; return $class->new('literal', $value); }
 sub count   { my ($class) = @_; return $class->new('count'); }
-sub count_field { my ($class, $field) = @_; return $class->new('count_field', $class->field($field)); }
-sub count_distinct { my ($class, $field) = @_; return $class->new('count_distinct', $class->field($field)); }
-sub avg     { my ($class, $field) = @_; return $class->new('avg', $class->field($field)); }
-sub sum     { my ($class, $field) = @_; return $class->new('sum', $class->field($field)); }
-sub sum_zero { my ($class, $field) = @_; return $class->new('sum_zero', $class->field($field)); }
-sub min     { my ($class, $field) = @_; return $class->new('min', $class->field($field)); }
-sub max     { my ($class, $field) = @_; return $class->new('max', $class->field($field)); }
-sub true_count { my ($class, $field) = @_; return $class->new('true_count', $class->field($field)); }
-sub false_count { my ($class, $field) = @_; return $class->new('false_count', $class->field($field)); }
+sub count_field { my ($class, $field) = @_; return $class->new('count_field', $class->_operand($field)); }
+sub count_distinct { my ($class, $field) = @_; return $class->new('count_distinct', $class->_operand($field)); }
+sub avg     { my ($class, $field) = @_; return $class->new('avg', $class->_operand($field)); }
+sub sum     { my ($class, $field) = @_; return $class->new('sum', $class->_operand($field)); }
+sub sum_zero { my ($class, $field) = @_; return $class->new('sum_zero', $class->_operand($field)); }
+sub min     { my ($class, $field) = @_; return $class->new('min', $class->_operand($field)); }
+sub max     { my ($class, $field) = @_; return $class->new('max', $class->_operand($field)); }
+sub true_count { my ($class, $field) = @_; return $class->new('true_count', $class->_operand($field)); }
+sub false_count { my ($class, $field) = @_; return $class->new('false_count', $class->_operand($field)); }
+sub grouping {
+    my ($class, @fields) = @_;
+    @fields = @{$fields[0]} if @fields == 1 && ref($fields[0]) eq 'ARRAY';
+    return $class->new('grouping', [map {
+        $class->_operand($_)
+    } @fields]);
+}
 sub bucket {
     my ($class, $field, $specification) = @_;
-    return $class->new('bucket', $class->field($field), $specification);
+    return $class->new('bucket', $class->_operand($field), $specification);
 }
 sub count_bucket {
     my ($class, $field, $minimum, $maximum, $mode) = @_;
     return $class->new(
         'count_bucket',
-        $class->field($field),
+        $class->_operand($field),
         { minimum => $minimum, maximum => $maximum, mode => $mode // 'numeric' },
     );
 }
 sub datetime_format {
     my ($class, $field, $format) = @_;
-    return $class->new('datetime_format', $class->field($field), "$format");
+    return $class->new('datetime_format', $class->_operand($field), "$format");
 }
-sub is_null { my ($class, $field) = @_; return $class->new('is_null', $class->field($field)); }
-sub not_null { my ($class, $field) = @_; return $class->new('not_null', $class->field($field)); }
+sub is_null { my ($class, $field) = @_; return $class->new('is_null', $class->_operand($field)); }
+sub not_null { my ($class, $field) = @_; return $class->new('not_null', $class->_operand($field)); }
 
 sub eq  { my ($class, $field, $value) = @_; return $class->_binary('eq',  $field, $value); }
 sub ne  { my ($class, $field, $value) = @_; return $class->_binary('ne',  $field, $value); }
@@ -51,7 +59,7 @@ sub between {
     my ($class, $field, $start, $end) = @_;
     return $class->new(
         'between',
-        $class->field($field),
+        $class->_operand($field),
         $class->literal($start),
         $class->literal($end),
     );
@@ -60,7 +68,7 @@ sub between {
 sub in {
     my ($class, $field, @values) = @_;
     @values = @{$values[0]} if @values == 1 && ref($values[0]) eq 'ARRAY';
-    return $class->new('in', $class->field($field), [@values]);
+    return $class->new('in', $class->_operand($field), [@values]);
 }
 
 sub all {
@@ -79,7 +87,13 @@ sub not { my ($class, $expression) = @_; return $class->new('not', $expression);
 
 sub _binary {
     my ($class, $kind, $field, $value) = @_;
-    return $class->new($kind, $class->field($field), $class->literal($value));
+    return $class->new($kind, $class->_operand($field), $class->literal($value));
+}
+
+sub _operand {
+    my ($class, $value) = @_;
+    return $value if blessed($value) && $value->isa('Selecto::Expression');
+    return $class->field($value);
 }
 
 sub as {

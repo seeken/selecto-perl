@@ -15,6 +15,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
+    query_library
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(source_table primary_key fields columns associations);
@@ -41,6 +42,7 @@ sub new {
         fields       => $fields,
         associations => \%associations,
         components   => _normalize_components($args{components}),
+        query_library => _normalize_query_library($args{query_library}),
         primary_key  => undef,
         required_predicate => $args{required_predicate},
         tenant_field => $args{tenant_field},
@@ -68,6 +70,8 @@ sub new {
         tenant_field => $self->{tenant_field},
     };
     $fingerprint_value->{components} = $self->{components} if keys %{$self->{components}};
+    $fingerprint_value->{query_library} = $self->{query_library}
+        if keys %{$self->{query_library}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
     $self->{fingerprint} = 'sha256:' . sha256_hex($json);
     return $self;
@@ -103,6 +107,7 @@ sub parse {
         fields => $raw->{source}{fields},
         associations => $raw->{associations} // {},
         components => $raw->{components},
+        query_library => $raw->{query_library},
     );
 }
 
@@ -153,6 +158,7 @@ sub _parse_canonical {
         associations => \%associations,
         primary_key => $source->{primary_key} // 'id',
         components => $raw->{components},
+        query_library => $raw->{query_library},
     );
     $domain->{contract} = dclone($raw);
     return $domain;
@@ -241,6 +247,21 @@ sub _normalize_components {
     return \%components;
 }
 
+sub _normalize_query_library {
+    my ($value) = @_;
+    return {} unless defined $value;
+    _object($value, 'query_library');
+    my %known = map { $_ => 1 } qw(segments projections orderings views);
+    _reject_unknown($value, \%known, 'query_library');
+    my %library;
+    for my $registry (qw(segments projections orderings views)) {
+        my $definitions = $value->{$registry} // {};
+        _object($definitions, "query_library $registry");
+        $library{$registry} = dclone($definitions);
+    }
+    return \%library;
+}
+
 sub _reject_unknown {
     my ($value, $allowed, $location) = @_;
     my @unknown = sort grep { !$allowed->{$_} } keys %$value;
@@ -286,6 +307,7 @@ sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract
 sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
 sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }
+sub query_library { return dclone($_[0]->{query_library} // {}); }
 
 package Selecto::Domain::Association;
 

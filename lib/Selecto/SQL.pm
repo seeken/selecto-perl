@@ -44,9 +44,15 @@ sub compile {
             ' = ' . $self->quote_identifier($self->_join_alias($name)) . '.' . $self->quote_identifier($association->related_key);
     }
     my %compiled_selections;
+    my %selection_positions;
+    my $selection_position = 0;
     my @selection_sql = map {
-        my $expression_sql = $self->_compile_expression($domain, $_, \@params);
+        $selection_position++;
+        my $expression_sql = $self->_compile_expression(
+            $domain, $_, \@params, \%compiled_selections,
+        );
         $compiled_selections{_expression_key($_)} //= $expression_sql;
+        $selection_positions{_expression_key($_)} //= $selection_position;
         defined($_->alias_name)
             ? $expression_sql . ' AS ' . $self->quote_identifier($_->alias_name)
             : $expression_sql
@@ -57,16 +63,34 @@ sub compile {
     $sql .= ' ' . join(' ', @joins) if @joins;
     $sql .= ' WHERE ' . $self->_compile_expression($domain, $predicate, \@params) if $predicate;
     my $groups = $query->groups;
-    $sql .= ' GROUP BY ' . join(', ', map {
+    my $group_sql = join(', ', map {
         my $key = _expression_key($_);
         exists($compiled_selections{$key})
             ? $compiled_selections{$key}
             : $self->_compile_expression($domain, $_, \@params)
-    } @$groups) if @$groups;
+    } @$groups);
+    if (@$groups) {
+        $sql .= $query->grouping_mode eq 'rollup'
+            ? ' GROUP BY ROLLUP (' . $group_sql . ')'
+            : ' GROUP BY ' . $group_sql;
+    }
     my $orders = $query->orders;
-    $sql .= ' ORDER BY ' . join(', ', map {
-        $self->_compile_expression($domain, $_->[0], \@params) . ' ' . uc($_->[1])
-    } @$orders) if @$orders;
+    if ($query->grouping_mode eq 'rollup' && @$orders) {
+        my @outer_orders = map {
+            my $position = $selection_positions{_expression_key($_->[0])};
+            Selecto::Error->throw(
+                'invalid_query',
+                'rollup ordering expressions must also be selected',
+            ) unless defined $position;
+            $position . ' ' . uc($_->[1]) . ' NULLS FIRST';
+        } @$orders;
+        $sql = 'SELECT * FROM (' . $sql . ') AS rollupfix ORDER BY ' .
+            join(', ', @outer_orders);
+    } elsif (@$orders) {
+        $sql .= ' ORDER BY ' . join(', ', map {
+            $self->_compile_expression($domain, $_->[0], \@params) . ' ' . uc($_->[1])
+        } @$orders);
+    }
     $sql .= $self->_compile_pagination(
         $query->limit_value,
         $query->offset_value,
@@ -157,7 +181,7 @@ sub _selection_name {
 }
 
 sub _compile_expression {
-    my ($self, $domain, $expression, $params) = @_;
+    my ($self, $domain, $expression, $params, $compiled_selections) = @_;
     Selecto::Error->throw('invalid_query', 'expected an expression')
         unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $kind = $expression->kind;
@@ -197,6 +221,17 @@ sub _compile_expression {
     }
     return 'NOT (' . $self->_compile_expression($domain, $arguments->[0], $params) . ')' if $kind eq 'not';
     return 'COUNT(*)' if $kind eq 'count';
+    if ($kind eq 'grouping') {
+        my $fields = $arguments->[0];
+        Selecto::Error->throw('invalid_query', 'GROUPING requires fields')
+            unless ref($fields) eq 'ARRAY' && @$fields;
+        return 'GROUPING(' . join(', ', map {
+            my $key = _expression_key($_);
+            defined($compiled_selections) && exists($compiled_selections->{$key})
+                ? $compiled_selections->{$key}
+                : $self->_compile_expression($domain, $_, $params)
+        } @$fields) . ')';
+    }
     return 'COUNT(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
         if $kind eq 'count_field';
     return 'COUNT(DISTINCT ' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'

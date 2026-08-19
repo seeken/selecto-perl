@@ -4,13 +4,14 @@ use 5.034;
 use strict;
 use warnings;
 use Scalar::Util qw(blessed);
+use Storable qw(dclone);
 use Selecto::Error ();
 use Selecto::Expression ();
 
 sub new {
     my ($class, %args) = @_;
     my %allowed = map { $_ => 1 } qw(
-        selections predicate groups orders limit_value offset_value
+        selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
     );
     my @unknown = sort grep { !$allowed{$_} } keys %args;
     Selecto::Error->throw(
@@ -22,9 +23,14 @@ sub new {
         selections  => [@{$args{selections} // []}],
         predicate   => $args{predicate},
         groups      => [@{$args{groups} // []}],
+        grouping_mode => $args{grouping_mode} // 'plain',
         orders      => [map { [@$_] } @{$args{orders} // []}],
         limit_value => $args{limit_value},
         offset_value=> $args{offset_value},
+        applied_query_library => dclone($args{applied_query_library} // {
+            segments => [], projections => [], projection => undef,
+            ordering => undef, views => [],
+        }),
     }, $class;
 }
 
@@ -49,7 +55,15 @@ sub group_by {
     @fields = @{$fields[0]} if @fields == 1 && ref($fields[0]) eq 'ARRAY';
     return $self->_copy(groups => [map {
         blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
-    } @fields]);
+    } @fields], grouping_mode => 'plain');
+}
+
+sub group_by_rollup {
+    my ($self, @fields) = @_;
+    @fields = @{$fields[0]} if @fields == 1 && ref($fields[0]) eq 'ARRAY';
+    return $self->_copy(groups => [map {
+        blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
+    } @fields], grouping_mode => 'rollup');
 }
 
 sub order_by {
@@ -60,6 +74,35 @@ sub order_by {
     my $expression = blessed($field) && $field->isa('Selecto::Expression')
         ? $field : Selecto::Expression->field($field);
     return $self->_copy(orders => [@{$self->{orders}}, [$expression, $direction]]);
+}
+
+sub replace_selections {
+    my ($self, @values) = @_;
+    @values = @{$values[0]} if @values == 1 && ref($values[0]) eq 'ARRAY';
+    my @expressions = map {
+        blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
+    } @values;
+    return $self->_copy(selections => \@expressions);
+}
+
+sub replace_orders {
+    my ($self, $orders) = @_;
+    Selecto::Error->throw('invalid_query', 'orders must be an array')
+        unless ref($orders) eq 'ARRAY';
+    my $query = $self->_copy(orders => []);
+    for my $order (@$orders) {
+        Selecto::Error->throw('invalid_query', 'order entries must contain a field and direction')
+            unless ref($order) eq 'ARRAY' && @$order == 2;
+        $query = $query->order_by($order->[0], $order->[1]);
+    }
+    return $query;
+}
+
+sub with_applied_query_library {
+    my ($self, $applied) = @_;
+    Selecto::Error->throw('invalid_query', 'applied query library state must be an object')
+        unless ref($applied) eq 'HASH';
+    return $self->_copy(applied_query_library => $applied);
 }
 
 sub limit  { my ($self, $value) = @_; return $self->_copy(limit_value  => _nonnegative($value, 'limit')); }
@@ -78,9 +121,11 @@ sub _copy {
         selections   => $self->{selections},
         predicate    => $self->{predicate},
         groups       => $self->{groups},
+        grouping_mode => $self->{grouping_mode},
         orders       => $self->{orders},
         limit_value  => $self->{limit_value},
         offset_value => $self->{offset_value},
+        applied_query_library => $self->{applied_query_library},
         %changes,
     );
     return ref($self)->new(%state);
@@ -89,8 +134,10 @@ sub _copy {
 sub selections   { return [@{$_[0]->{selections}}]; }
 sub predicate    { return $_[0]->{predicate}; }
 sub groups       { return [@{$_[0]->{groups}}]; }
+sub grouping_mode { return $_[0]->{grouping_mode}; }
 sub orders       { return [map { [@$_] } @{$_[0]->{orders}}]; }
 sub limit_value  { return $_[0]->{limit_value}; }
 sub offset_value { return $_[0]->{offset_value}; }
+sub applied_query_library { return dclone($_[0]->{applied_query_library}); }
 
 1;

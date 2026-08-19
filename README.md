@@ -17,6 +17,8 @@ protocol 1 and certification specification 2.3.0.
 - canonical component policy metadata, including domain-selected private URL
   state for compatible exploration UIs;
 - copy-on-write select, filter, group, order, limit, and offset queries;
+- portable named query-library segments, projections, orderings, and views with
+  typed parameters and applied-definition provenance;
 - field, literal, comparison, null, membership, conjunction, and aggregate
   expressions, plus governed PostgreSQL date/time format expressions;
 - PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
@@ -100,6 +102,50 @@ date/time projection or grouping, use an allowlisted expression such as
 `select`, `group_by`, or `order_by`; arbitrary database format strings are not
 accepted. Portable comparison intents include `eq`, `ne`, `gt`, `gte`, `lt`,
 `lte`, and `between`; their values compile as adapter-bound parameters.
+
+## Query libraries
+
+Domains may own reusable query intent under `query_library`. A view composes
+named segments, a projection, and an ordering; values supplied to segment
+parameters are type-checked and remain adapter-bound.
+
+```perl
+my $domain = Selecto::Domain->new(
+    name => 'Products',
+    table => 'products',
+    fields => { id => 'integer', name => 'string', stock => 'integer' },
+    query_library => {
+        segments => {
+            low_stock => {
+                filters => [['lt', 'stock', ['param', 'threshold']]],
+                parameters => {threshold => {type => 'integer', required => 1}},
+            },
+        },
+        projections => {summary => {fields => [qw(id name stock)]}},
+        orderings => {stock_first => {order_by => [['stock', 'asc']]}},
+        views => {
+            replenishment => {
+                segments => ['low_stock'],
+                projection => 'summary',
+                ordering => 'stock_first',
+            },
+        },
+    },
+);
+
+my $query = $engine->apply_view(
+    $engine->query,
+    'replenishment',
+    {threshold => '8'},
+);
+my $applied = $query->applied_query_library;
+```
+
+Definitions are data rather than SQL fragments. Segment composition supports
+AND, OR, NOT, NOR, and two-input XOR groups; projection associations become
+validated dotted field paths in the Perl runtime. Query-library `capability`
+values are descriptive metadata and do not replace application authorization
+or database row-level security.
 
 ## Database adapters
 
