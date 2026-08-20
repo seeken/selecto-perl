@@ -20,7 +20,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(source_table primary_key fields columns associations tenant_field);
 my %ASSOCIATION = map { $_ => 1 } qw(queryable owner_key related_key cardinality);
-my %JOIN = map { $_ => 1 } qw(type);
+my %JOIN = map { $_ => 1 } qw(type name display_field dimension_key);
 my %COMPONENTS = map { $_ => 1 } qw(query_params);
 
 sub new {
@@ -57,6 +57,19 @@ sub new {
         $self->{tenant_field} = _identifier($self->{tenant_field}, 'tenant field');
         Selecto::Error->throw('invalid_domain', 'tenant field must be a root field')
             unless exists $fields->{$self->{tenant_field}};
+    }
+    for my $association (values %associations) {
+        next unless $association->join_mode eq 'star_dimension';
+        Selecto::Error->throw(
+            'invalid_domain',
+            'star dimension key must be a root field',
+            { association => $association->name, dimension_key => $association->dimension_key },
+        ) unless exists $fields->{$association->dimension_key};
+        Selecto::Error->throw(
+            'invalid_domain',
+            'star dimension key must match the association owner key',
+            { association => $association->name },
+        ) unless $association->dimension_key eq $association->owner_key;
     }
     my $fingerprint_value = {
         name => $self->{name},
@@ -140,12 +153,28 @@ sub _parse_canonical {
             _required_key($association, $key, "association $name");
         }
         _required_key($target, 'source_table', "schema $queryable");
+        my $join_mode = lc(_required_string($join->{type} // 'left', 'join type'));
+        Selecto::Error->throw('invalid_domain', "unsupported join type $join_mode")
+            unless $join_mode eq 'left' || $join_mode eq 'inner'
+                || $join_mode eq 'star_dimension';
+        my $target_primary_key = $target->{primary_key} // 'id';
+        my $cardinality = $association->{cardinality};
+        $cardinality = $association->{related_key} eq $target_primary_key ? 'one' : 'many'
+            unless defined $cardinality;
         $associations{$name} = {
             table => $target->{source_table},
             fields => _canonical_fields($target),
             owner_key => $association->{owner_key},
             related_key => $association->{related_key},
-            join_type => $join->{type} // 'left',
+            target_primary_key => $target_primary_key,
+            cardinality => $cardinality,
+            join_type => $join_mode eq 'star_dimension' ? 'left' : $join_mode,
+            join_mode => $join_mode,
+            ($join_mode eq 'star_dimension' ? (
+                display_field => $join->{display_field} // 'name',
+                dimension_key => $join->{dimension_key} // $association->{owner_key},
+                display_name => $join->{name} // $name,
+            ) : ()),
         };
     }
 
@@ -325,16 +354,62 @@ sub new {
     for my $key (qw(table fields owner_key related_key)) {
         Selecto::Domain::_required_key($value, $key, "association $args{name}");
     }
-    my $join_type = lc(Selecto::Domain::_required_string($value->{join_type} // 'left', 'join type'));
+    my $join_mode = lc(Selecto::Domain::_required_string(
+        $value->{join_mode} // $value->{join_type} // 'left', 'join type'
+    ));
+    Selecto::Error->throw('invalid_domain', "unsupported join type $join_mode")
+        unless $join_mode eq 'left' || $join_mode eq 'inner'
+            || $join_mode eq 'star_dimension';
+    my $join_type = $join_mode eq 'star_dimension' ? 'left'
+        : lc(Selecto::Domain::_required_string($value->{join_type} // $join_mode, 'join type'));
     Selecto::Error->throw('invalid_domain', "unsupported join type $join_type")
         unless $join_type eq 'left' || $join_type eq 'inner';
+    my $fields = Selecto::Domain::_normalize_fields($value->{fields}, 'association fields');
+    my $cardinality = lc(Selecto::Domain::_required_string(
+        $value->{cardinality} // 'one', 'association cardinality'
+    ));
+    Selecto::Error->throw('invalid_domain', "unsupported association cardinality $cardinality")
+        unless $cardinality eq 'one' || $cardinality eq 'many';
+    my $target_primary_key;
+    if (defined $value->{target_primary_key}) {
+        $target_primary_key = Selecto::Domain::_identifier(
+            $value->{target_primary_key}, 'association target primary key'
+        );
+        Selecto::Error->throw('invalid_domain', 'association target primary key is not queryable')
+            unless exists $fields->{$target_primary_key};
+    }
+    my $display_field;
+    my $dimension_key;
+    my $display_name;
+    if ($join_mode eq 'star_dimension') {
+        $display_field = Selecto::Domain::_identifier(
+            $value->{display_field} // 'name', 'star dimension display field'
+        );
+        Selecto::Error->throw('invalid_domain', 'star dimension display field is not queryable', {
+            association => $args{name}, display_field => $display_field,
+        }) unless exists $fields->{$display_field};
+        $dimension_key = Selecto::Domain::_identifier(
+            $value->{dimension_key} // $value->{owner_key}, 'star dimension key'
+        );
+        $display_name = Selecto::Domain::_required_string(
+            $value->{display_name} // $args{name}, 'star dimension name'
+        );
+    }
     return bless {
         name => Selecto::Domain::_identifier($args{name}, 'association'),
         table => Selecto::Domain::_identifier($value->{table}, 'association table'),
-        fields => Selecto::Domain::_normalize_fields($value->{fields}, 'association fields'),
+        fields => $fields,
         owner_key => Selecto::Domain::_identifier($value->{owner_key}, 'owner key'),
         related_key => Selecto::Domain::_identifier($value->{related_key}, 'related key'),
+        cardinality => $cardinality,
+        target_primary_key => $target_primary_key,
         join_type => $join_type,
+        join_mode => $join_mode,
+        ($join_mode eq 'star_dimension' ? (
+            display_field => $display_field,
+            dimension_key => $dimension_key,
+            display_name => $display_name,
+        ) : ()),
     }, $class;
 }
 
@@ -346,6 +421,15 @@ sub fingerprint_value {
         owner_key => $self->{owner_key},
         related_key => $self->{related_key},
         join_type => $self->{join_type},
+        ($self->{cardinality} eq 'many' ? (cardinality => 'many') : ()),
+        (defined($self->{target_primary_key}) && $self->{cardinality} eq 'many'
+            ? (target_primary_key => $self->{target_primary_key}) : ()),
+        ($self->{join_mode} eq 'star_dimension' ? (
+            join_mode => $self->{join_mode},
+            display_field => $self->{display_field},
+            dimension_key => $self->{dimension_key},
+            display_name => $self->{display_name},
+        ) : ()),
     };
 }
 
@@ -355,5 +439,11 @@ sub fields      { return { %{$_[0]->{fields}} }; }
 sub owner_key   { return $_[0]->{owner_key}; }
 sub related_key { return $_[0]->{related_key}; }
 sub join_type   { return $_[0]->{join_type}; }
+sub cardinality { return $_[0]->{cardinality}; }
+sub target_primary_key { return $_[0]->{target_primary_key}; }
+sub join_mode   { return $_[0]->{join_mode}; }
+sub display_field { return $_[0]->{display_field}; }
+sub dimension_key { return $_[0]->{dimension_key}; }
+sub display_name { return $_[0]->{display_name}; }
 
 1;
