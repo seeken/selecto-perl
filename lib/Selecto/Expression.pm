@@ -29,6 +29,18 @@ sub grouping {
         $class->_operand($_)
     } @fields]);
 }
+sub dimension_display {
+    my ($class, $display_field, $dimension_key) = @_;
+    return $class->new(
+        'dimension_display',
+        $class->_operand($display_field),
+        $class->_operand($dimension_key),
+    );
+}
+sub related_collection {
+    my ($class, $association, $fields) = @_;
+    return $class->new('related_collection', "$association", [map { "$_" } @$fields]);
+}
 sub bucket {
     my ($class, $field, $specification) = @_;
     return $class->new('bucket', $class->_operand($field), $specification);

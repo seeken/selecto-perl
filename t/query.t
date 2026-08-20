@@ -103,6 +103,52 @@ is_deeply(
 );
 ok($adapter->supports('rollup'), 'PostgreSQL reports its implemented rollup capability');
 
+my $line_domain = Selecto::Domain->new(
+    name => 'Invoices',
+    table => 'invoices',
+    fields => {id => 'integer', reference => 'string'},
+    associations => {
+        lines => {
+            table => 'invoice_lines',
+            fields => {id => 'integer', invoice_id => 'integer', sku => 'string'},
+            owner_key => 'id',
+            related_key => 'invoice_id',
+            target_primary_key => 'id',
+            cardinality => 'many',
+            join_type => 'left',
+        },
+    },
+);
+my $line_engine = Selecto::Engine->new(domain => $line_domain, adapter => $adapter);
+my $line_statement = $line_engine->compile(
+    $line_engine->query->select(
+        'id',
+        Selecto::Expression->related_collection('lines', ['sku'])->as('lines'),
+    )
+);
+like $line_statement->sql,
+    qr{COALESCE\(\(SELECT JSON_AGG\(JSON_BUILD_OBJECT\('sku', "c_lines"\."sku"\) ORDER BY "c_lines"\."id"\) FROM "invoice_lines" AS "c_lines" WHERE "c_lines"\."invoice_id" = "s0"\."id"\), '\[\]'::json\)},
+    'a to-many selection compiles as a correlated ordered JSON collection';
+unlike $line_statement->sql, qr{JOIN "invoice_lines"},
+    'a related collection does not multiply outer result rows';
+
+my $dimension_display = Selecto::Expression->dimension_display('person.name', 'person_id');
+my $dimension_rollup = $join_engine->query->select(
+    $dimension_display->as('person'),
+    Selecto::Expression->field('person_id')->as('__person_key'),
+    Selecto::Expression->count->as('order_count'),
+    Selecto::Expression->grouping('person_id')->as('__selecto_rollup_grouping'),
+)->group_by_rollup('person_id')->order_by($dimension_display);
+my $dimension_statement = $join_engine->compile($dimension_rollup);
+like $dimension_statement->sql,
+    qr/CASE WHEN GROUPING\("s0"\."person_id"\) = 1 THEN NULL ELSE MIN\("j_person"\."name"\) END AS "person"/,
+    'a star-dimension label is null only when its key is rolled up';
+like $dimension_statement->sql, qr/GROUP BY ROLLUP \("s0"\."person_id"\)/,
+    'a star-dimension query groups by the stable fact key';
+like $dimension_statement->sql,
+    qr/ORDER BY 4 DESC, 1 ASC NULLS LAST\z/,
+    'a one-dimension rollup sorts its total first and names alphabetically';
+
 {
     package TestSelecto::PG18DBH;
     our @ISA = ('TestSelecto::DBH');
@@ -214,8 +260,8 @@ my $rollup_statement = $numeric_engine->compile(
     )->group_by_rollup($quantity_bucket)->order_by($quantity_bucket, 'asc')->limit(25)
 );
 like($rollup_statement->sql,
-    qr/\ASELECT \* FROM \(SELECT .* GROUP BY ROLLUP \(CASE .*\)\) AS rollupfix ORDER BY 1 ASC NULLS FIRST LIMIT 25\z/s,
-    'ordered rollups use a positional outer sort without rebuilding the expression');
+    qr/\ASELECT \* FROM \(SELECT .* GROUP BY ROLLUP \(CASE .*\)\) AS rollupfix ORDER BY 3 DESC, 1 ASC NULLS LAST LIMIT 25\z/s,
+    'one-level rollups order the grand-total marker before values and real NULL buckets');
 is scalar(@{$rollup_statement->params}), 6,
     'grouping metadata and positional rollup ordering reuse selected expression parameters';
 

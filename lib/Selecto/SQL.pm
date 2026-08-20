@@ -76,14 +76,20 @@ sub compile {
     }
     my $orders = $query->orders;
     if ($query->grouping_mode eq 'rollup' && @$orders) {
+        my $single_grouping_position = _single_rollup_grouping_position(
+            $selections, $groups, \%selection_positions,
+        );
         my @outer_orders = map {
             my $position = $selection_positions{_expression_key($_->[0])};
             Selecto::Error->throw(
                 'invalid_query',
                 'rollup ordering expressions must also be selected',
             ) unless defined $position;
-            $position . ' ' . uc($_->[1]) . ' NULLS FIRST';
+            $position . ' ' . uc($_->[1]) .
+                (defined($single_grouping_position) ? ' NULLS LAST' : ' NULLS FIRST');
         } @$orders;
+        unshift @outer_orders, $single_grouping_position . ' DESC'
+            if defined $single_grouping_position;
         my $order_sql = join(', ', @outer_orders);
         $sql = $self->_rollup_sort_fix_enabled
             ? 'SELECT * FROM (' . $sql . ') AS rollupfix ORDER BY ' . $order_sql
@@ -104,6 +110,20 @@ sub compile {
         columns => \@columns,
         adapter_name => $self->name,
     );
+}
+
+sub _single_rollup_grouping_position {
+    my ($selections, $groups, $positions) = @_;
+    return undef unless @$groups == 1;
+    my $group_key = _expression_key($groups->[0]);
+    for my $selection (@$selections) {
+        next unless $selection->kind eq 'grouping';
+        my $arguments = $selection->arguments->[0];
+        next unless ref($arguments) eq 'ARRAY' && @$arguments == 1;
+        next unless _expression_key($arguments->[0]) eq $group_key;
+        return $positions->{_expression_key($selection)};
+    }
+    return undef;
 }
 
 sub execute_query {
@@ -263,6 +283,13 @@ sub _compile_expression {
                 : $self->_compile_expression($domain, $_, $params)
         } @$fields) . ')';
     }
+    if ($kind eq 'dimension_display') {
+        my $display_sql = $self->_compile_expression($domain, $arguments->[0], $params);
+        my $key_sql = $self->_compile_expression($domain, $arguments->[1], $params);
+        return "CASE WHEN GROUPING($key_sql) = 1 THEN NULL ELSE MIN($display_sql) END";
+    }
+    return $self->_compile_related_collection($domain, $expression)
+        if $kind eq 'related_collection';
     return 'COUNT(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
         if $kind eq 'count_field';
     return 'COUNT(DISTINCT ' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
@@ -281,6 +308,74 @@ sub _compile_expression {
         return 'SUM(COALESCE(' . $self->_compile_expression($domain, $arguments->[0], $params) . ', 0))';
     }
     Selecto::Error->throw('invalid_query', "unsupported expression $kind");
+}
+
+sub _compile_related_collection {
+    my ($self, $domain, $expression) = @_;
+    my ($association_name, $fields) = @{$expression->arguments};
+    Selecto::Error->throw('invalid_query', 'related collection association is invalid')
+        unless defined($association_name) && !ref($association_name)
+            && "$association_name" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+    Selecto::Error->throw('invalid_query', 'related collection fields are required')
+        unless ref($fields) eq 'ARRAY' && @$fields;
+    my $association = $domain->associations->{$association_name};
+    Selecto::Error->throw('unknown_association', "unknown association $association_name")
+        unless $association;
+    Selecto::Error->throw('invalid_query', 'related collections require a to-many association')
+        unless $association->cardinality eq 'many';
+    my $association_fields = $association->fields;
+    for my $field (@$fields) {
+        Selecto::Error->throw('invalid_query', 'related collection field is invalid')
+            unless defined($field) && !ref($field)
+                && "$field" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/
+                && exists $association_fields->{$field};
+    }
+
+    my $alias = 'c_' . $association_name;
+    my $quoted_alias = $self->quote_identifier($alias);
+    my $table = $self->quote_identifier($association->table);
+    my $related_key = $quoted_alias . '.' . $self->quote_identifier($association->related_key);
+    my $owner_key = $self->quote_identifier('s0') . '.' .
+        $self->quote_identifier($association->owner_key);
+    my $order = defined($association->target_primary_key)
+        ? $quoted_alias . '.' . $self->quote_identifier($association->target_primary_key)
+        : undef;
+    my $adapter = $self->name;
+
+    if ($adapter eq 'mssql') {
+        my $projection = join(', ', map {
+            $quoted_alias . '.' . $self->quote_identifier($_) . ' AS ' .
+                $self->quote_identifier($_)
+        } @$fields);
+        return "COALESCE((SELECT $projection FROM $table AS $quoted_alias " .
+            "WHERE $related_key = $owner_key" .
+            (defined($order) ? " ORDER BY $order" : '') . " FOR JSON PATH), '[]')";
+    }
+
+    my @pairs = map {
+        my $key = "$_";
+        $key =~ s/'/''/g;
+        "'$key', " . $quoted_alias . '.' . $self->quote_identifier($_)
+    } @$fields;
+    my ($aggregate, $empty);
+    if ($adapter eq 'postgresql') {
+        $aggregate = 'JSON_AGG(JSON_BUILD_OBJECT(' . join(', ', @pairs) . ')' .
+            (defined($order) ? " ORDER BY $order" : '') . ')';
+        $empty = q{'[]'::json};
+    } elsif ($adapter eq 'mysql' || $adapter eq 'mariadb') {
+        $aggregate = 'JSON_ARRAYAGG(JSON_OBJECT(' . join(', ', @pairs) . '))';
+        $empty = 'JSON_ARRAY()';
+    } elsif ($adapter eq 'sqlite' || $adapter eq 'duckdb') {
+        $aggregate = 'JSON_GROUP_ARRAY(JSON_OBJECT(' . join(', ', @pairs) . '))';
+        $empty = q{'[]'};
+    } else {
+        Selecto::Error->throw(
+            'unsupported_feature',
+            "related collections are not supported by adapter $adapter",
+        );
+    }
+    return "COALESCE((SELECT $aggregate FROM $table AS $quoted_alias " .
+        "WHERE $related_key = $owner_key), $empty)";
 }
 
 sub _compile_count_bucket {

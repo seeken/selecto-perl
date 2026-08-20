@@ -55,6 +55,47 @@ is($canonical->resolve('person.name')->{type}, 'string', 'canonical association 
 is($canonical->associations->{person}->join_type, 'inner', 'join metadata is applied');
 is($canonical->writes->{version}, 1, 'canonical write metadata remains available to governed consumers');
 is($canonical->components->{query_params}, 0, 'canonical component URL-state policy is retained');
+is $canonical->associations->{person}->cardinality, 'one',
+    'a join to the target primary key is inferred as to-one';
+
+my $many_contract = $canonical->contract;
+$many_contract->{schemas}{people}{fields} = [qw(id name order_id)];
+$many_contract->{schemas}{people}{columns}{order_id} = {type => 'integer'};
+$many_contract->{source}{associations}{person}{related_key} = 'order_id';
+my $many = Selecto::Domain->parse($many_contract, strict => 1);
+is $many->associations->{person}->cardinality, 'many',
+    'a join through a non-primary target key is inferred as to-many';
+is $many->associations->{person}->target_primary_key, 'id',
+    'a to-many association retains its target ordering key';
+
+my $star_contract = $canonical->contract;
+$star_contract->{joins}{person} = {
+    type => 'star_dimension',
+    name => 'Person',
+    display_field => 'name',
+    dimension_key => 'person_id',
+};
+my $star = Selecto::Domain->parse($star_contract, strict => 1);
+my $person_dimension = $star->associations->{person};
+is $person_dimension->join_mode, 'star_dimension',
+    'canonical star-dimension intent is retained';
+is $person_dimension->join_type, 'left',
+    'a star dimension compiles through a fact-preserving left join';
+is $person_dimension->display_field, 'name',
+    'a star dimension exposes its descriptive field';
+is $person_dimension->dimension_key, 'person_id',
+    'a star dimension exposes its fact-table key';
+is $person_dimension->display_name, 'Person',
+    'a star dimension retains its presentation name';
+
+my $bad_star_contract = $canonical->contract;
+$bad_star_contract->{joins}{person} = {
+    type => 'star_dimension', display_field => 'missing', dimension_key => 'person_id',
+};
+eval { Selecto::Domain->parse($bad_star_contract, strict => 1) };
+$error = $@;
+is $error->code, 'invalid_domain',
+    'a star dimension cannot expose a display field outside its schema';
 
 my $bad_components = eval {
     Selecto::Domain->new(
