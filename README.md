@@ -143,9 +143,13 @@ my $applied = $query->applied_query_library;
 
 Definitions are data rather than SQL fragments. Segment composition supports
 AND, OR, NOT, NOR, and two-input XOR groups; projection associations become
-validated dotted field paths in the Perl runtime. Query-library `capability`
-values are descriptive metadata and do not replace application authorization
-or database row-level security.
+validated dotted field paths in the Perl runtime. Several named segments can
+be applied together with `apply_segments`, which validates their combined
+parameter contract before changing the query. Built-in portable parameter
+types are validated; application-specific type names pass their values through
+for the host boundary to interpret. Query-library `capability` values are
+descriptive metadata and do not replace application authorization or database
+row-level security.
 
 PostgreSQL hierarchical aggregates use `group_by_rollup`. Select the same
 governed group expressions first, then add `Selecto::Expression->grouping(...)`
