@@ -26,15 +26,14 @@ sub new {
         Selecto::Error->throw('invalid_query', 'order direction must be asc or desc')
             unless $direction eq 'asc' || $direction eq 'desc';
     }
+    my $grouping_mode = $args{grouping_mode} // 'plain';
     Selecto::Error->throw('invalid_query', 'grouping mode must be plain or rollup')
-        if defined($args{grouping_mode})
-        && $args{grouping_mode} ne 'plain'
-        && $args{grouping_mode} ne 'rollup';
+        unless $grouping_mode eq 'plain' || $grouping_mode eq 'rollup';
     return bless {
         selections  => [@{$args{selections} // []}],
         predicate   => $args{predicate},
         groups      => [@{$args{groups} // []}],
-        grouping_mode => $args{grouping_mode} // 'plain',
+        grouping_mode => $grouping_mode,
         orders      => [map { [@$_] } @{$args{orders} // []}],
         limit_value  => defined($args{limit_value}) ? _nonnegative($args{limit_value}, 'limit') : undef,
         offset_value => defined($args{offset_value}) ? _nonnegative($args{offset_value}, 'offset') : undef,
@@ -72,6 +71,8 @@ sub group_by {
 sub group_by_rollup {
     my ($self, @fields) = @_;
     @fields = @{$fields[0]} if @fields == 1 && ref($fields[0]) eq 'ARRAY';
+    Selecto::Error->throw('invalid_query', 'rollup requires at least one grouping expression')
+        unless @fields;
     return $self->_copy(groups => [map {
         blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
     } @fields], grouping_mode => 'rollup');
