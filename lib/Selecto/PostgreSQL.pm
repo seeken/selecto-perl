@@ -54,6 +54,16 @@ sub _compile_dialect_expression {
         if $kind eq 'count_bucket';
     return $self->_compile_bucket($domain, $arguments->[0], $arguments->[1], $params)
         if $kind eq 'bucket';
+    if ($kind eq 'epoch_datetime') {
+        my ($field) = @$arguments;
+        Selecto::Error->throw('invalid_query', 'epoch datetime requires a governed field')
+            unless blessed($field) && $field->isa('Selecto::Expression') && $field->kind eq 'field';
+        my ($path) = @{$field->arguments};
+        my $resolved = $domain->resolve($path);
+        Selecto::Error->throw('invalid_query', 'epoch datetime requires an epoch datetime field')
+            unless $resolved->{type} eq 'epoch_datetime';
+        return 'TO_TIMESTAMP(' . $self->_compile_expression($domain, $field, $params) . ')';
+    }
     if ($kind eq 'datetime_format') {
         my %formats = (
             day => 'YYYY-MM-DD',
@@ -68,11 +78,15 @@ sub _compile_dialect_expression {
             hour => 'HH24',
         );
         my ($field, $format) = @$arguments;
-        Selecto::Error->throw('invalid_query', 'datetime format field must be a governed field')
-            unless blessed($field) && $field->isa('Selecto::Expression') && $field->kind eq 'field';
+        Selecto::Error->throw('invalid_query', 'datetime format field must be a governed temporal field')
+            unless blessed($field) && $field->isa('Selecto::Expression')
+                && ($field->kind eq 'field' || $field->kind eq 'epoch_datetime');
         Selecto::Error->throw('invalid_query', 'datetime format is not available')
             unless exists $formats{$format};
-        my ($path) = @{$field->arguments};
+        my $source = $field->kind eq 'epoch_datetime' ? $field->arguments->[0] : $field;
+        Selecto::Error->throw('invalid_query', 'datetime format field must be a governed field')
+            unless blessed($source) && $source->isa('Selecto::Expression') && $source->kind eq 'field';
+        my ($path) = @{$source->arguments};
         my $resolved = $domain->resolve($path);
         Selecto::Error->throw('invalid_query', 'datetime format requires a date or time field')
             unless $resolved->{type} =~ /(?:date|time)/i;

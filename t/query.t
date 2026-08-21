@@ -216,6 +216,28 @@ like($formatted_filter_statement->sql,
     qr/TO_CHAR\("s0"\."occurred_on", 'YYYY-MM'\) = \$1/,
     'comparison predicates accept governed expressions as their operand');
 
+my $epoch_domain = Selecto::Domain->new(
+    name => 'Epoch events',
+    table => 'epoch_events',
+    fields => { id => 'integer', occurred_at => 'epoch_datetime' },
+);
+my $epoch_engine = Selecto::Engine->new(domain => $epoch_domain, adapter => $adapter);
+my $epoch_time = Selecto::Expression->epoch_datetime('occurred_at');
+my $epoch_month = Selecto::Expression->datetime_format($epoch_time, 'month');
+my $epoch_statement = $epoch_engine->compile(
+    $epoch_engine->query
+        ->select($epoch_month->as('month'))
+        ->where(Selecto::Expression->gte($epoch_time, '2026-08-01T00:00')),
+);
+like $epoch_statement->sql,
+    qr/TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'YYYY-MM'\) AS "month"/,
+    'epoch datetime fields format through PostgreSQL timestamps';
+like $epoch_statement->sql,
+    qr/TO_TIMESTAMP\("s0"\."occurred_at"\) >= \$1/,
+    'epoch datetime filters compare against a timestamp expression';
+is_deeply $epoch_statement->params, ['2026-08-01T00:00'],
+    'epoch datetime filter values remain bound parameters';
+
 my $numeric_domain = Selecto::Domain->new(
     name => 'Inventory',
     table => 'inventory',

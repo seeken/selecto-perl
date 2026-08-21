@@ -300,7 +300,8 @@ sub _compile_expression {
             " = $value THEN 1 END)";
     }
     return $self->_compile_dialect_expression($domain, $expression, $params)
-        if $kind eq 'count_bucket' || $kind eq 'bucket' || $kind eq 'datetime_format';
+        if $kind eq 'count_bucket' || $kind eq 'bucket' || $kind eq 'datetime_format'
+            || $kind eq 'epoch_datetime';
     if ($kind eq 'avg' || $kind eq 'sum' || $kind eq 'min' || $kind eq 'max') {
         return uc($kind) . '(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')';
     }

@@ -57,6 +57,10 @@ sub datetime_format {
     my ($class, $field, $format) = @_;
     return $class->new('datetime_format', $class->_operand($field), "$format");
 }
+sub epoch_datetime {
+    my ($class, $field) = @_;
+    return $class->new('epoch_datetime', $class->_operand($field));
+}
 sub is_null { my ($class, $field) = @_; return $class->new('is_null', $class->_operand($field)); }
 sub not_null { my ($class, $field) = @_; return $class->new('not_null', $class->_operand($field)); }
 
