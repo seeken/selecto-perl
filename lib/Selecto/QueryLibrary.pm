@@ -394,6 +394,12 @@ sub _substitute {
             unless exists($params->{$id});
         return $params->{$id};
     }
+    if (ref($value) eq 'ARRAY' && @$value == 2 && "$value->[0]" eq 'field') {
+        my $field = "$value->[1]";
+        Selecto::Error->throw('invalid_query_library', 'field references require a non-empty field name')
+            unless length($field);
+        return Selecto::Expression->field($field);
+    }
     return [map { _substitute($_, $params) } @$value] if ref($value) eq 'ARRAY';
     return {map { ($_ => _substitute($value->{$_}, $params)) } keys %$value}
         if ref($value) eq 'HASH';

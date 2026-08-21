@@ -23,6 +23,7 @@ my $domain = Selecto::Domain->parse({
     query_library => {
         segments => {
             active => {filters => [['eq', 'status', 'active']]},
+            matching_fields => {filters => [['eq', 'id', ['field', 'priority']]]},
             priority_at_least => {
                 filters => [['gte', 'priority', ['param', 'minimum']]],
                 parameters => {minimum => {type => 'integer', required => 1}},
@@ -126,5 +127,14 @@ my $custom_typed = $engine->apply_segment(
 );
 is_deeply $engine->compile($custom_typed)->params, ['review'],
     'application-specific parameter types pass through as portable bound values';
+
+my $matching_fields = $engine->apply_segment(
+    $engine->query->select('id'), 'matching_fields',
+);
+my $matching_fields_statement = $engine->compile($matching_fields);
+like $matching_fields_statement->sql, qr/"s0"\."id" = "s0"\."priority"/,
+    'segment filters may compare two declared fields without treating the right side as a literal';
+is_deeply $matching_fields_statement->params, [],
+    'field-to-field segment comparisons do not create bound values';
 
 done_testing;
