@@ -99,7 +99,13 @@ sub not { my ($class, $expression) = @_; return $class->new('not', $expression);
 
 sub _binary {
     my ($class, $kind, $field, $value) = @_;
-    return $class->new($kind, $class->_operand($field), $class->literal($value));
+    # A binary comparison normally binds its right-hand value as a literal.
+    # Preserve an explicit expression there, though, so domains can safely
+    # compare two governed fields (for example, id <> parent_id).
+    my $right = blessed($value) && $value->isa(__PACKAGE__)
+        ? $value
+        : $class->literal($value);
+    return $class->new($kind, $class->_operand($field), $right);
 }
 
 sub _operand {
