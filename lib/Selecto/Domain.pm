@@ -11,14 +11,14 @@ use Selecto::Error ();
 
 my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
-    default_selected required_selected required_filters required_order_by required_group_by
+    default_selected required_selected required_order_by
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
     query_library
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
-my %RELATION = map { $_ => 1 } qw(source_table primary_key fields columns associations);
+my %RELATION = map { $_ => 1 } qw(source_table primary_key fields columns associations tenant_field);
 my %ASSOCIATION = map { $_ => 1 } qw(queryable owner_key related_key cardinality);
 my %JOIN = map { $_ => 1 } qw(type);
 my %COMPONENTS = map { $_ => 1 } qw(query_params);
@@ -157,6 +157,7 @@ sub _parse_canonical {
         fields => _canonical_fields($source),
         associations => \%associations,
         primary_key => $source->{primary_key} // 'id',
+        tenant_field => $source->{tenant_field},
         components => $raw->{components},
         query_library => $raw->{query_library},
     );

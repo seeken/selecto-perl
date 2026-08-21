@@ -19,14 +19,25 @@ sub new {
         'query state contains unsupported keys',
         { keys => \@unknown },
     ) if @unknown;
+    for my $order (@{$args{orders} // []}) {
+        Selecto::Error->throw('invalid_query', 'order entries must contain a field and direction')
+            unless ref($order) eq 'ARRAY' && @$order == 2;
+        my $direction = defined($order->[1]) ? lc("$order->[1]") : 'asc';
+        Selecto::Error->throw('invalid_query', 'order direction must be asc or desc')
+            unless $direction eq 'asc' || $direction eq 'desc';
+    }
+    Selecto::Error->throw('invalid_query', 'grouping mode must be plain or rollup')
+        if defined($args{grouping_mode})
+        && $args{grouping_mode} ne 'plain'
+        && $args{grouping_mode} ne 'rollup';
     return bless {
         selections  => [@{$args{selections} // []}],
         predicate   => $args{predicate},
         groups      => [@{$args{groups} // []}],
         grouping_mode => $args{grouping_mode} // 'plain',
         orders      => [map { [@$_] } @{$args{orders} // []}],
-        limit_value => $args{limit_value},
-        offset_value=> $args{offset_value},
+        limit_value  => defined($args{limit_value}) ? _nonnegative($args{limit_value}, 'limit') : undef,
+        offset_value => defined($args{offset_value}) ? _nonnegative($args{offset_value}, 'offset') : undef,
         applied_query_library => dclone($args{applied_query_library} // {
             segments => [], projections => [], projection => undef,
             ordering => undef, views => [],

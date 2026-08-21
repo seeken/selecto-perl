@@ -501,8 +501,8 @@ sub _run_write {
             metadata => { conflict_target => ['external_id'], upsert_update_fields => ['name'] },
         );
         my $preview = $self->{adapter}->preview_write($command);
-        my $first = $self->{people_engine}->execute_write($command);
-        my $second = $self->{people_engine}->execute_write($command);
+        my $first = $self->{writes_engine}->execute_write($command);
+        my $second = $self->{writes_engine}->execute_write($command);
         return [
             { affected_rows => [$first->affected_rows, $second->affected_rows], final_rows => $self->_write_state },
             { preview => $preview, results => [$first->to_hash, $second->to_hash] },
@@ -521,7 +521,7 @@ sub _run_write {
         );
         my $batch = Selecto::Write::Batch->new($first, $second);
         my @previews = map { $self->{adapter}->preview_write($_) } @{$batch->commands};
-        my $ok = eval { $self->{people_engine}->execute_batch($batch); 1 };
+        my $ok = eval { $self->{writes_engine}->execute_batch($batch); 1 };
         Selecto::Error->throw('expected_error', 'expected atomic batch failure') if $ok;
         my $error = $@;
         die $error unless blessed($error) && $error->isa('Selecto::Error');
@@ -741,7 +741,7 @@ sub _capture_error {
 sub _successful_write {
     my ($self, $command) = @_;
     my $preview = $self->{adapter}->preview_write($command);
-    my $result = $self->{people_engine}->execute_write($command);
+    my $result = $self->{writes_engine}->execute_write($command);
     return [
         { operation => $result->operation, affected_rows => $result->affected_rows, final_rows => $self->_write_state },
         { preview => $preview, result => $result->to_hash },
@@ -751,7 +751,7 @@ sub _successful_write {
 sub _expected_write_error {
     my ($self, $command) = @_;
     my $preview = $self->{adapter}->preview_write($command);
-    my $ok = eval { $self->{people_engine}->execute_write($command); 1 };
+    my $ok = eval { $self->{writes_engine}->execute_write($command); 1 };
     Selecto::Error->throw('expected_error', 'expected cardinality failure') if $ok;
     my $error = $@;
     die $error unless blessed($error) && $error->isa('Selecto::Error');

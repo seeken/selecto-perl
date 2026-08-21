@@ -8,7 +8,7 @@ WriteMakefile(
     VERSION_FROM     => 'lib/Selecto.pm',
     ABSTRACT_FROM    => 'lib/Selecto.pm',
     AUTHOR           => 'Chris Rohlfs',
-    LICENSE          => 'unrestricted',
+    LICENSE          => 'artistic_1',
     MIN_PERL_VERSION => '5.034',
     EXE_FILES        => ['bin/selecto-certify'],
     PREREQ_PM        => {
@@ -33,7 +33,7 @@ WriteMakefile(
                 web  => 'https://github.com/seeken/selecto-perl',
             },
         },
-        x_license => 'O-Saasy',
+        x_license => 'Artistic-1.0',
         optional_features => {
             postgresql => {
                 description => 'PostgreSQL execution and certification',
