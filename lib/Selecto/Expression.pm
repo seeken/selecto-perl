@@ -29,6 +29,18 @@ sub grouping {
         $class->_operand($_)
     } @fields]);
 }
+sub dimension_display {
+    my ($class, $display_field, $dimension_key) = @_;
+    return $class->new(
+        'dimension_display',
+        $class->_operand($display_field),
+        $class->_operand($dimension_key),
+    );
+}
+sub related_collection {
+    my ($class, $association, $fields) = @_;
+    return $class->new('related_collection', "$association", [map { "$_" } @$fields]);
+}
 sub bucket {
     my ($class, $field, $specification) = @_;
     return $class->new('bucket', $class->_operand($field), $specification);
@@ -44,6 +56,10 @@ sub count_bucket {
 sub datetime_format {
     my ($class, $field, $format) = @_;
     return $class->new('datetime_format', $class->_operand($field), "$format");
+}
+sub epoch_datetime {
+    my ($class, $field) = @_;
+    return $class->new('epoch_datetime', $class->_operand($field));
 }
 sub is_null { my ($class, $field) = @_; return $class->new('is_null', $class->_operand($field)); }
 sub not_null { my ($class, $field) = @_; return $class->new('not_null', $class->_operand($field)); }
@@ -87,7 +103,13 @@ sub not { my ($class, $expression) = @_; return $class->new('not', $expression);
 
 sub _binary {
     my ($class, $kind, $field, $value) = @_;
-    return $class->new($kind, $class->_operand($field), $class->literal($value));
+    # A binary comparison normally binds its right-hand value as a literal.
+    # Preserve an explicit expression there, though, so domains can safely
+    # compare two governed fields (for example, id <> parent_id).
+    my $right = blessed($value) && $value->isa(__PACKAGE__)
+        ? $value
+        : $class->literal($value);
+    return $class->new($kind, $class->_operand($field), $right);
 }
 
 sub _operand {

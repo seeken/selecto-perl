@@ -63,6 +63,10 @@ sub apply_segment {
     my ($self, $query, $id, $params) = @_;
     return Selecto::QueryLibrary->apply_segment($self->domain, $query, $id, $params // {});
 }
+sub apply_segments {
+    my ($self, $query, $ids, $params) = @_;
+    return Selecto::QueryLibrary->apply_segments($self->domain, $query, $ids, $params // {});
+}
 sub apply_projection {
     my ($self, $query, $ids) = @_;
     return Selecto::QueryLibrary->apply_projection($self->domain, $query, $ids);

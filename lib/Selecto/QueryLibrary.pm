@@ -88,12 +88,19 @@ sub ordering_entries {
 
 sub apply_segment {
     my ($class, $domain, $query, $segment_id, $params) = @_;
+    return $class->apply_segments($domain, $query, [$segment_id], $params // {});
+}
+
+sub apply_segments {
+    my ($class, $domain, $query, $segment_ids, $params) = @_;
     _query($query);
     $params //= {};
+    _array($segment_ids, 'query-library segments');
     Selecto::Error->throw('invalid_query_library', 'segment parameters must be an object')
         unless ref($params) eq 'HASH';
     my $library = $class->library($domain);
-    my $resolved = _resolve_segment($library, $segment_id, []);
+    my $resolved = {filters => [], parameters => {}, ids => []};
+    _merge_segment($resolved, _resolve_segment($library, $_, [])) for @$segment_ids;
     my $values = _normalize_parameters($resolved->{parameters}, $params);
     my @predicates = map { _filter_expression($_, $values) } @{$resolved->{filters}};
     my $predicate = @predicates == 1 ? $predicates[0]
@@ -156,14 +163,7 @@ sub apply_view {
     my ($class, $domain, $query, $view_id, $params) = @_;
     my $view = $class->definition($domain, 'views', $view_id);
     my @segments = @{$view->{segments} // []};
-    my $values = $class->normalize_parameters_for_selection(
-        $domain, {view => $view_id, segments => []}, $params // {},
-    );
-    for my $segment (@segments) {
-        my $specs = $class->parameter_specs($domain, segments => [$segment]);
-        my %segment_values = map { ($_ => $values->{$_}) } keys %$specs;
-        $query = $class->apply_segment($domain, $query, $segment, \%segment_values);
-    }
+    $query = $class->apply_segments($domain, $query, \@segments, $params // {});
     $query = $class->apply_projection($domain, $query, $view->{projection})
         if defined($view->{projection}) && "$view->{projection}" ne '';
     $query = $class->apply_ordering($domain, $query, $view->{ordering})
@@ -210,20 +210,27 @@ sub _resolve_group {
     my @parts = map { _resolve_segment($library, $_, $stack) } @$ids;
     my $merged = {filters => [], parameters => {}, ids => []};
     _merge_segment($merged, $_) for @parts;
-    my @operands = map { _filters_operand($_->{filters}) } @parts;
     my $predicate;
     if ($operator eq 'and') {
         $merged->{filters} = [map { @{$_->{filters}} } @parts];
         return $merged;
     } elsif ($operator eq 'or') {
+        if (!@parts || grep { !@{$_->{filters}} } @parts) {
+            $merged->{filters} = [];
+            return $merged;
+        }
+        my @operands = map { _filters_operand($_->{filters}) } @parts;
         $predicate = ['or', \@operands];
     } elsif ($operator eq 'not') {
+        my @operands = map { _filters_operand($_->{filters}) } @parts;
         Selecto::Error->throw('invalid_query_library', 'not segment groups require one segment')
             unless @operands == 1;
         $predicate = ['not', $operands[0]];
     } elsif ($operator eq 'nor') {
+        my @operands = map { _filters_operand($_->{filters}) } @parts;
         $predicate = ['not', ['or', \@operands]];
     } elsif ($operator eq 'xor') {
+        my @operands = map { _filters_operand($_->{filters}) } @parts;
         Selecto::Error->throw('invalid_query_library', 'xor segment groups require two segments')
             unless @operands == 2;
         $predicate = ['and', [
@@ -348,8 +355,8 @@ sub _cast_parameter {
         Selecto::Error->throw('invalid_query_library', "segment parameter $id must be uuid")
             unless !ref($value) && "$value" =~ /\A[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i;
     }
-    Selecto::Error->throw('invalid_query_library', "unknown segment parameter type $type")
-        unless $type =~ /\A(?:date|datetime|naive_datetime|utc_datetime|uuid)\z/;
+    Selecto::Error->throw('invalid_query_library', 'segment parameter type must be a non-empty string')
+        unless length($type);
     return $value;
 }
 
@@ -386,6 +393,12 @@ sub _substitute {
         Selecto::Error->throw('invalid_query_library', "missing resolved segment parameter $id")
             unless exists($params->{$id});
         return $params->{$id};
+    }
+    if (ref($value) eq 'ARRAY' && @$value == 2 && "$value->[0]" eq 'field') {
+        my $field = "$value->[1]";
+        Selecto::Error->throw('invalid_query_library', 'field references require a non-empty field name')
+            unless length($field);
+        return Selecto::Expression->field($field);
     }
     return [map { _substitute($_, $params) } @$value] if ref($value) eq 'ARRAY';
     return {map { ($_ => _substitute($value->{$_}, $params)) } keys %$value}

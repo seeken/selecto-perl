@@ -77,6 +77,114 @@ like($grouped_statement->sql, qr/COUNT\(\*\)/, 'aggregate is compiled');
 like($grouped_statement->sql, qr/GROUP BY "j_person"\."name"/, 'joined group is validated and compiled');
 is_deeply($grouped_statement->columns, ['person_name', 'order_count'], 'stable result columns use aliases');
 
+my $rollup = $join_engine->query->select(
+    Selecto::Expression->field('person.name')->as('person_name'),
+    Selecto::Expression->field('total')->as('total'),
+    Selecto::Expression->count->as('order_count'),
+    Selecto::Expression->grouping('person.name', 'total')->as('__selecto_rollup_grouping'),
+)->group_by_rollup('person.name', 'total')
+    ->order_by('person.name')
+    ->order_by('total');
+my $joined_rollup_statement = $join_engine->compile($rollup);
+like(
+    $joined_rollup_statement->sql,
+    qr/GROUPING\("j_person"\."name", "s0"\."total"\).*GROUP BY ROLLUP \("j_person"\."name", "s0"\."total"\)/,
+    'governed rollup compiles grouping metadata and hierarchical grouping sets',
+);
+like(
+    $joined_rollup_statement->sql,
+    qr/\ASELECT \* FROM \(SELECT .*\) AS rollupfix ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST\z/,
+    'PostgreSQL 17-and-older rollups use the positional outer-sort compatibility wrapper',
+);
+is_deeply(
+    $joined_rollup_statement->columns,
+    [qw(person_name total order_count __selecto_rollup_grouping)],
+    'rollup grouping metadata has a stable result alias',
+);
+ok($adapter->supports('rollup'), 'PostgreSQL reports its implemented rollup capability');
+
+my $line_domain = Selecto::Domain->new(
+    name => 'Invoices',
+    table => 'invoices',
+    fields => {id => 'integer', reference => 'string'},
+    associations => {
+        lines => {
+            table => 'invoice_lines',
+            fields => {id => 'integer', invoice_id => 'integer', sku => 'string'},
+            owner_key => 'id',
+            related_key => 'invoice_id',
+            target_primary_key => 'id',
+            cardinality => 'many',
+            join_type => 'left',
+        },
+    },
+);
+my $line_engine = Selecto::Engine->new(domain => $line_domain, adapter => $adapter);
+my $line_statement = $line_engine->compile(
+    $line_engine->query->select(
+        'id',
+        Selecto::Expression->related_collection('lines', ['sku'])->as('lines'),
+    )
+);
+like $line_statement->sql,
+    qr{COALESCE\(\(SELECT JSON_AGG\(JSON_BUILD_OBJECT\('sku', "c_lines"\."sku"\) ORDER BY "c_lines"\."id"\) FROM "invoice_lines" AS "c_lines" WHERE "c_lines"\."invoice_id" = "s0"\."id"\), '\[\]'::json\)},
+    'a to-many selection compiles as a correlated ordered JSON collection';
+unlike $line_statement->sql, qr{JOIN "invoice_lines"},
+    'a related collection does not multiply outer result rows';
+
+my $dimension_display = Selecto::Expression->dimension_display('person.name', 'person_id');
+my $dimension_rollup = $join_engine->query->select(
+    $dimension_display->as('person'),
+    Selecto::Expression->field('person_id')->as('__person_key'),
+    Selecto::Expression->count->as('order_count'),
+    Selecto::Expression->grouping('person_id')->as('__selecto_rollup_grouping'),
+)->group_by_rollup('person_id')->order_by($dimension_display);
+my $dimension_statement = $join_engine->compile($dimension_rollup);
+like $dimension_statement->sql,
+    qr/CASE WHEN GROUPING\("s0"\."person_id"\) = 1 THEN NULL ELSE MIN\("j_person"\."name"\) END AS "person"/,
+    'a star-dimension label is null only when its key is rolled up';
+like $dimension_statement->sql, qr/GROUP BY ROLLUP \("s0"\."person_id"\)/,
+    'a star-dimension query groups by the stable fact key';
+like $dimension_statement->sql,
+    qr/ORDER BY 4 DESC, 1 ASC NULLS LAST\z/,
+    'a one-dimension rollup sorts its total first and names alphabetically';
+
+{
+    package TestSelecto::PG18DBH;
+    our @ISA = ('TestSelecto::DBH');
+    sub selectrow_array { return 180000 }
+}
+my $pg18_adapter = Selecto::PostgreSQL->new(dbh => TestSelecto::PG18DBH->new);
+my $pg18_engine = Selecto::Engine->new(
+    domain => TestSelecto::orders_domain(), adapter => $pg18_adapter
+);
+my $pg18_rollup_statement = $pg18_engine->compile($rollup);
+unlike($pg18_rollup_statement->sql, qr/rollupfix/,
+    'PostgreSQL 18 disables the compatibility wrapper');
+like($pg18_rollup_statement->sql, qr/ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST\z/,
+    'PostgreSQL 18 rollups retain positional NULLS FIRST hierarchy ordering');
+
+my $forced_fix_adapter = Selecto::PostgreSQL->new(
+    dbh => TestSelecto::PG18DBH->new, rollup_sort_fix => 1
+);
+my $forced_fix_engine = Selecto::Engine->new(
+    domain => TestSelecto::orders_domain(), adapter => $forced_fix_adapter
+);
+like($forced_fix_engine->compile($rollup)->sql, qr/\) AS rollupfix ORDER BY/,
+    'rollup_sort_fix can force the compatibility wrapper on');
+
+my $disabled_fix_adapter = Selecto::PostgreSQL->new(
+    dbh => TestSelecto::DBH->new, rollup_sort_fix => 0
+);
+my $disabled_fix_engine = Selecto::Engine->new(
+    domain => TestSelecto::orders_domain(), adapter => $disabled_fix_adapter
+);
+unlike($disabled_fix_engine->compile($rollup)->sql, qr/rollupfix/,
+    'rollup_sort_fix can explicitly disable the compatibility wrapper');
+
+eval { Selecto::Query->new(grouping_mode => 'cube') };
+is($@->code, 'invalid_query', 'unsupported grouping modes fail closed');
+
 my $dated_domain = Selecto::Domain->new(
     name => 'Events',
     table => 'events',
@@ -107,6 +215,28 @@ my $formatted_filter_statement = $dated_engine->compile(
 like($formatted_filter_statement->sql,
     qr/TO_CHAR\("s0"\."occurred_on", 'YYYY-MM'\) = \$1/,
     'comparison predicates accept governed expressions as their operand');
+
+my $epoch_domain = Selecto::Domain->new(
+    name => 'Epoch events',
+    table => 'epoch_events',
+    fields => { id => 'integer', occurred_at => 'epoch_datetime' },
+);
+my $epoch_engine = Selecto::Engine->new(domain => $epoch_domain, adapter => $adapter);
+my $epoch_time = Selecto::Expression->epoch_datetime('occurred_at');
+my $epoch_month = Selecto::Expression->datetime_format($epoch_time, 'month');
+my $epoch_statement = $epoch_engine->compile(
+    $epoch_engine->query
+        ->select($epoch_month->as('month'))
+        ->where(Selecto::Expression->gte($epoch_time, '2026-08-01T00:00')),
+);
+like $epoch_statement->sql,
+    qr/TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'YYYY-MM'\) AS "month"/,
+    'epoch datetime fields format through PostgreSQL timestamps';
+like $epoch_statement->sql,
+    qr/TO_TIMESTAMP\("s0"\."occurred_at"\) >= \$1/,
+    'epoch datetime filters compare against a timestamp expression';
+is_deeply $epoch_statement->params, ['2026-08-01T00:00'],
+    'epoch datetime filter values remain bound parameters';
 
 my $numeric_domain = Selecto::Domain->new(
     name => 'Inventory',
@@ -152,8 +282,8 @@ my $rollup_statement = $numeric_engine->compile(
     )->group_by_rollup($quantity_bucket)->order_by($quantity_bucket, 'asc')->limit(25)
 );
 like($rollup_statement->sql,
-    qr/\ASELECT \* FROM \(SELECT .* GROUP BY ROLLUP \(CASE .*\)\) AS rollupfix ORDER BY 1 ASC NULLS FIRST LIMIT 25\z/s,
-    'ordered rollups use a positional outer sort without rebuilding the expression');
+    qr/\ASELECT \* FROM \(SELECT .* GROUP BY ROLLUP \(CASE .*\)\) AS rollupfix ORDER BY 3 DESC, 1 ASC NULLS LAST LIMIT 25\z/s,
+    'one-level rollups order the grand-total marker before values and real NULL buckets');
 is scalar(@{$rollup_statement->params}), 6,
     'grouping metadata and positional rollup ordering reuse selected expression parameters';
 

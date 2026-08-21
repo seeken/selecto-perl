@@ -13,6 +13,8 @@ protocol 1 and certification specification 2.3.0.
 
 - strict simplified and canonical schema-v1 JSON domain parsing;
 - validated root and one-hop relationship field resolution;
+- canonical relationship cardinality inference and correlated JSON collections
+  for to-many child data without multiplying root rows;
 - deterministic SHA-256 domain fingerprints;
 - canonical component policy metadata, including domain-selected private URL
   state for compatible exploration UIs;
@@ -143,9 +145,70 @@ my $applied = $query->applied_query_library;
 
 Definitions are data rather than SQL fragments. Segment composition supports
 AND, OR, NOT, NOR, and two-input XOR groups; projection associations become
-validated dotted field paths in the Perl runtime. Query-library `capability`
-values are descriptive metadata and do not replace application authorization
-or database row-level security.
+validated dotted field paths in the Perl runtime. Several named segments can
+be applied together with `apply_segments`, which validates their combined
+parameter contract before changing the query. Built-in portable parameter
+types are validated; application-specific type names pass their values through
+for the host boundary to interpret. Query-library `capability` values are
+descriptive metadata and do not replace application authorization or database
+row-level security.
+
+Canonical domains can mark a fact-to-reference join as a star dimension. The
+dimension key must be the association's root `owner_key`; `display_field`
+names the descriptive field on the joined schema:
+
+```perl
+joins => {
+    ref_status => {
+        type => 'star_dimension',
+        name => 'Status',
+        display_field => 'description',
+        dimension_key => 'status_id',
+    },
+},
+```
+
+The runtime retains both the physical left-join behavior and the semantic
+dimension metadata. Aggregate consumers can therefore present the description
+while grouping and filtering by the stable fact-table key.
+
+Canonical associations infer `cardinality => 'one'` when `related_key` targets
+the joined schema's primary key and `cardinality => 'many'` otherwise. Domains
+can override that inference explicitly. A detail consumer can keep one root row
+while selecting child data with a correlated collection:
+
+```perl
+Selecto::Expression->related_collection('load_det', [qw(vin)])
+    ->as('load_details')
+```
+
+The adapter emits a native JSON array of child objects, ordered by the child
+primary key where supported, without adding the association to the outer query.
+
+PostgreSQL hierarchical aggregates use `group_by_rollup`. Select the same
+governed group expressions first, then add `Selecto::Expression->grouping(...)`
+when the caller needs to distinguish detail, subtotal, and grand-total rows:
+
+```perl
+my $status = Selecto::Expression->field('status');
+my $rollup = $engine->query
+    ->select(
+        $status->as('status'),
+        Selecto::Expression->count->as('order_count'),
+        Selecto::Expression->grouping($status)->as('grouping_mask'),
+    )
+    ->group_by_rollup($status)
+    ->order_by($status);
+```
+
+Rollup ordering follows Selecto's PostgreSQL compatibility behavior and uses
+selected-column positions. A one-group rollup sorts its grouping marker first,
+placing the grand total before values while leaving a real NULL bucket last;
+multi-group hierarchy ordering uses `NULLS FIRST`. PostgreSQL 17 and older put
+that ordering and pagination around a `rollupfix` subquery. The adapter probes
+`server_version_num` once and disables the wrapper on PostgreSQL 18+. Pass
+`rollup_sort_fix => 1` or `rollup_sort_fix => 0` to the PostgreSQL adapter to
+override automatic detection.
 
 ## Database adapters
 

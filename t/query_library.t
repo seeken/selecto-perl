@@ -23,12 +23,25 @@ my $domain = Selecto::Domain->parse({
     query_library => {
         segments => {
             active => {filters => [['eq', 'status', 'active']]},
+            matching_fields => {filters => [['eq', 'id', ['field', 'priority']]]},
             priority_at_least => {
                 filters => [['gte', 'priority', ['param', 'minimum']]],
                 parameters => {minimum => {type => 'integer', required => 1}},
             },
             active_priority => {
                 segment_groups => [{operator => 'and', segments => [qw(active priority_at_least)]}],
+            },
+            unconstrained => {},
+            active_or_all => {
+                segment_groups => [{operator => 'or', segments => [qw(active unconstrained)]}],
+            },
+            status_code => {
+                filters => [['eq', 'status', ['param', 'code']]],
+                parameters => {code => {type => 'application/status', required => 1}},
+            },
+            conflicting_minimum => {
+                filters => [['gte', 'priority', ['param', 'minimum']]],
+                parameters => {minimum => {type => 'float', required => 1}},
             },
         },
         projections => {
@@ -81,5 +94,47 @@ my $direct = $engine->apply_view(
 );
 is_deeply $engine->compile($direct)->params, ['active', 4],
     'view parameters are partitioned across multiple direct segments';
+
+my $combined = $engine->apply_segments(
+    $engine->query->select('id'), [qw(active priority_at_least)], {minimum => '5'},
+);
+is_deeply $engine->compile($combined)->params, ['active', 5],
+    'multiple segments share one validated parameter set';
+is_deeply $combined->applied_query_library->{segments}, [qw(active priority_at_least)],
+    'combined segment application records stable provenance';
+
+eval {
+    $engine->apply_segments(
+        $engine->query,
+        [qw(priority_at_least conflicting_minimum)],
+        {minimum => '5'},
+    );
+};
+like "$@", qr/conflicting segment parameter minimum/,
+    'combined segments reject conflicting shared parameter definitions';
+
+my $unconstrained_or = $engine->apply_segment(
+    $engine->query->select('id'), 'active_or_all',
+);
+unlike $engine->compile($unconstrained_or)->sql, qr/\bWHERE\b/,
+    'OR with an unconstrained segment correctly leaves the query unconstrained';
+is_deeply $unconstrained_or->applied_query_library->{segments},
+    [qw(active unconstrained active_or_all)],
+    'an unconstrained OR still records every applied definition';
+
+my $custom_typed = $engine->apply_segment(
+    $engine->query->select('id'), 'status_code', {code => 'review'},
+);
+is_deeply $engine->compile($custom_typed)->params, ['review'],
+    'application-specific parameter types pass through as portable bound values';
+
+my $matching_fields = $engine->apply_segment(
+    $engine->query->select('id'), 'matching_fields',
+);
+my $matching_fields_statement = $engine->compile($matching_fields);
+like $matching_fields_statement->sql, qr/"s0"\."id" = "s0"\."priority"/,
+    'segment filters may compare two declared fields without treating the right side as a literal';
+is_deeply $matching_fields_statement->params, [],
+    'field-to-field segment comparisons do not create bound values';
 
 done_testing;
