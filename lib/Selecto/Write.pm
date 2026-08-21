@@ -61,6 +61,20 @@ sub with_query_enforcement {
     );
 }
 
+sub with_assignments {
+    my ($self, $assignments) = @_;
+    return ref($self)->new(
+        operation => $self->operation,
+        relation => $self->relation,
+        assignments => $assignments,
+        predicate => $self->predicate,
+        scope_predicate => $self->scope_predicate,
+        query_enforcement => $self->query_enforcement,
+        expected_count => $self->expected_count,
+        metadata => $self->metadata,
+    );
+}
+
 sub _clone {
     my ($value) = @_;
     return [map { _clone($_) } @$value] if ref($value) eq 'ARRAY';
@@ -87,6 +101,62 @@ sub new {
 
 sub commands { return [@{$_[0]->{commands}}]; }
 
+package Selecto::Write::Graph;
+
+use 5.034;
+use strict;
+use warnings;
+use Scalar::Util qw(blessed);
+use Selecto::Error ();
+
+sub new {
+    my ($class, %args) = @_;
+    my $nodes = $args{nodes};
+    Selecto::Error->throw('invalid_write_graph', 'graph nodes must be a non-empty array')
+        unless ref($nodes) eq 'ARRAY' && @$nodes;
+
+    my %seen;
+    my @normalized = map {
+        Selecto::Error->throw('invalid_write_graph', 'graph node must be an object')
+            unless ref($_) eq 'HASH';
+        my $id = defined($_->{id}) ? "$_->{id}" : '';
+        Selecto::Error->throw('invalid_write_graph', 'graph node id must be unique and non-empty')
+            unless $id ne '' && !$seen{$id}++;
+        Selecto::Error->throw('invalid_write_graph', "graph node $id must contain a write command")
+            unless blessed($_->{command}) && $_->{command}->isa('Selecto::Write::Command');
+        my $bindings = $_->{bindings} // [];
+        Selecto::Error->throw('invalid_write_graph', "graph node $id bindings must be an array")
+            unless ref($bindings) eq 'ARRAY';
+        {
+            id => $id,
+            command => $_->{command},
+            bindings => [map {
+                Selecto::Error->throw('invalid_write_graph', "graph node $id binding must be an object")
+                    unless ref($_) eq 'HASH';
+                my $field = defined($_->{field}) ? "$_->{field}" : '';
+                my $from = defined($_->{from}) ? "$_->{from}" : '';
+                my $key = defined($_->{key}) ? "$_->{key}" : '';
+                Selecto::Error->throw('invalid_write_graph', "graph node $id binding requires field, from, and key")
+                    unless $field ne '' && $from ne '' && $key ne '';
+                { field => $field, from => $from, key => $key };
+            } @$bindings],
+        };
+    } @$nodes;
+    return bless { nodes => \@normalized }, $class;
+}
+
+sub nodes { return [@{$_[0]->{nodes}}]; }
+
+package Selecto::Write::Graph::Result;
+
+use 5.034;
+use strict;
+use warnings;
+
+sub new { my ($class, %args) = @_; return bless { %args }, $class; }
+sub nodes { return { %{$_[0]->{nodes} // {}} }; }
+sub root  { return $_[0]->{root}; }
+
 package Selecto::Write::Result;
 
 use 5.034;
@@ -96,6 +166,12 @@ use warnings;
 sub new { my ($class, %args) = @_; return bless { %args }, $class; }
 sub operation { return $_[0]->{operation}; }
 sub affected_rows { return $_[0]->{affected_rows}; }
-sub to_hash { return { operation => $_[0]->{operation}, affected_rows => $_[0]->{affected_rows} }; }
+sub values { return { %{$_[0]->{values} // {}} }; }
+sub to_hash {
+    my ($self) = @_;
+    my $value = { operation => $self->{operation}, affected_rows => $self->{affected_rows} };
+    $value->{values} = $self->values if keys %{$self->{values} // {}};
+    return $value;
+}
 
 1;

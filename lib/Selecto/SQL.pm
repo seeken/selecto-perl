@@ -142,6 +142,35 @@ sub execute_batch {
     });
 }
 
+sub execute_graph {
+    my ($self, $graph) = @_;
+    Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
+        unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
+    Selecto::Error->throw('write_capability_missing', 'adapter does not support write graphs')
+        unless $self->write_capabilities->{write_graph};
+
+    return $self->_transaction(sub {
+        my %results;
+        for my $node (@{$graph->nodes}) {
+            my $assignments = $node->{command}->assignments;
+            for my $binding (@{$node->{bindings}}) {
+                my $source = $results{$binding->{from}};
+                Selecto::Error->throw('invalid_write_graph', "graph binding source $binding->{from} is unavailable")
+                    unless $source;
+                my $values = $source->values;
+                Selecto::Error->throw('invalid_write_graph', "graph binding value $binding->{from}.$binding->{key} is unavailable")
+                    unless exists $values->{$binding->{key}};
+                $assignments->{$binding->{field}} = $values->{$binding->{key}};
+            }
+            my $command = $node->{command}->with_assignments($assignments);
+            my $compiled = $self->_compile_write($command);
+            $results{$node->{id}} = $self->_execute_compiled_write_in_transaction($command, $compiled);
+        }
+        my $root = $graph->nodes->[0]{id};
+        return Selecto::Write::Graph::Result->new(nodes => \%results, root => $results{$root});
+    });
+}
+
 sub _compile_selection {
     my ($self, $domain, $expression, $params) = @_;
     my $sql = $self->_compile_expression($domain, $expression, $params);
@@ -456,7 +485,7 @@ sub _compile_write {
                 unless ref($updates) eq 'ARRAY' && @$updates && !grep { ref($_) } @$updates;
             $sql .= $self->_compile_upsert_clause($conflict, $updates);
         }
-        return { sql => $sql, params => \@params };
+        return $self->_append_returning($sql, \@params, $command);
     }
     if ($operation eq 'update') {
         my @fields = sort keys %$assignments;
@@ -474,7 +503,7 @@ sub _compile_write {
             ),
             \@params,
         );
-        return { sql => 'UPDATE ' . $self->quote_identifier($relation) . ' SET ' . join(', ', @set) . " WHERE $predicate", params => \@params };
+        return $self->_append_returning('UPDATE ' . $self->quote_identifier($relation) . ' SET ' . join(', ', @set) . " WHERE $predicate", \@params, $command);
     }
     if ($operation eq 'delete') {
         my @params;
@@ -486,9 +515,22 @@ sub _compile_write {
             ),
             \@params,
         );
-        return { sql => 'DELETE FROM ' . $self->quote_identifier($relation) . " WHERE $predicate", params => \@params };
+        return $self->_append_returning('DELETE FROM ' . $self->quote_identifier($relation) . " WHERE $predicate", \@params, $command);
     }
     Selecto::Error->throw('invalid_write', "unsupported operation $operation");
+}
+
+sub _append_returning {
+    my ($self, $sql, $params, $command) = @_;
+    my $returning = $command->metadata->{returning} // [];
+    Selecto::Error->throw('invalid_write', 'returning must be an array of declared identifiers')
+        unless ref($returning) eq 'ARRAY' && !grep { ref($_) || !defined($_) || !_checked_identifier($_) } @$returning;
+    if (@$returning) {
+        Selecto::Error->throw('write_capability_missing', 'adapter does not support returning')
+            unless $self->write_capabilities->{returning};
+        $sql .= ' RETURNING ' . join(', ', map { $self->quote_identifier(_checked_identifier($_)) } @$returning);
+    }
+    return { sql => $sql, params => $params, returning => [@$returning] };
 }
 
 sub _compile_write_predicate {
@@ -544,11 +586,16 @@ sub _write_literal {
 
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
-    my ($sth, $affected);
+    my ($sth, $affected, %values);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($compiled->{sql});
         $sth->execute(@{$compiled->{params}});
         $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
+        if (@{$compiled->{returning} // []}) {
+            my @row = $sth->fetchrow_array;
+            Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
+            @values{@{$compiled->{returning}}} = @row;
+        }
         1;
     };
     die $self->normalize_error($@) unless $ok;
@@ -558,7 +605,7 @@ sub _execute_compiled_write_in_transaction {
             actual => $affected,
         });
     }
-    return Selecto::Write::Result->new(operation => $command->operation, affected_rows => $affected);
+    return Selecto::Write::Result->new(operation => $command->operation, affected_rows => $affected, values => \%values);
 }
 
 sub _transaction {

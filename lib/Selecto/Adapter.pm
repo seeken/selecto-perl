@@ -62,5 +62,6 @@ sub execute_query ($self, @args) { Selecto::Error->throw('invalid_adapter', 'ada
 sub preview_write ($self, @args) { Selecto::Error->throw('invalid_adapter', 'adapter must implement preview_write'); }
 sub execute_write ($self, @args) { Selecto::Error->throw('invalid_adapter', 'adapter must implement execute_write'); }
 sub execute_batch ($self, @args) { Selecto::Error->throw('invalid_adapter', 'adapter must implement execute_batch'); }
+sub execute_graph ($self, @args) { Selecto::Error->throw('write_capability_missing', 'adapter does not support write graphs'); }
 
 1;

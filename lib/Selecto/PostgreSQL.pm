@@ -24,6 +24,10 @@ sub supports {
     return "$feature" eq 'transactions' || "$feature" eq 'returning' ? 1 : 0;
 }
 
+sub write_capabilities {
+    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, write_graph => 1 };
+}
+
 sub _compile_dialect_expression {
     my ($self, $domain, $expression, $params) = @_;
     my $kind = $expression->kind;

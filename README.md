@@ -27,8 +27,8 @@ protocol 1 and certification specification 2.3.0.
 - DBI execution with stable columns and backend-specific value normalization;
 - a versioned `Selecto::Adapter` contract, generic `Selecto::Statement`, and
   runtime adapter registry for independently packaged database support;
-- portable insert, update, upsert, delete, expected-cardinality, and atomic
-  batch writes;
+- portable insert, update, upsert, delete, expected-cardinality, atomic-batch,
+  and capability-gated owned write-graph operations;
 - governed row and selected-id bulk action planning with explicit transition
   preconditions and fail-closed preview/execute capability decisions;
 - an HTTP-neutral canonical domain API host with OpenAPI 3.1 and byte-stable

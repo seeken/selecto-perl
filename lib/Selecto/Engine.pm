@@ -27,6 +27,7 @@ sub compile { my ($self, $query) = @_; return $self->{adapter}->compile($self->{
 sub all     { my ($self, $query) = @_; return $self->{adapter}->execute_query($self->compile($query)); }
 sub execute_write { my ($self, $command) = @_; return $self->{adapter}->execute_write($command); }
 sub execute_batch { my ($self, $batch) = @_; return $self->{adapter}->execute_batch($batch); }
+sub execute_graph { my ($self, $graph) = @_; return $self->{adapter}->execute_graph($graph); }
 sub query_library { my ($self) = @_; return Selecto::QueryLibrary->library($self->domain); }
 sub apply_segment {
     my ($self, $query, $id, $params) = @_;
