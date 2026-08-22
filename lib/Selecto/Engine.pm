@@ -149,6 +149,12 @@ sub _validate_write_command {
         'write relation must be the domain table',
         { relation => $command->relation, expected => $self->{domain}->table },
     ) unless $command->relation eq $self->{domain}->table;
+    if (defined $command->query_enforcement) {
+        Selecto::QueryEnforcement::validate_source($self->{domain}, $command->relation, $command->query_enforcement);
+        my $tenant_field = $self->{domain}->tenant_field;
+        Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
+            if defined($tenant_field) && !_has_tenant_conjunct($command->scope_predicate, $tenant_field);
+    }
     return $self->_validate_command_against_contract(
         $command,
         fields      => $self->{domain}->fields,
