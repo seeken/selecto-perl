@@ -175,6 +175,7 @@ sub execute_graph {
         my %results;
         for my $node (@{$graph->nodes}) {
             my $assignments = $node->{command}->assignments;
+            my @scopes = grep { defined } ($node->{command}->scope_predicate);
             for my $binding (@{$node->{bindings}}) {
                 my $source = $results{$binding->{from}};
                 Selecto::Error->throw('invalid_write_graph', "graph binding source $binding->{from} is unavailable")
@@ -183,8 +184,15 @@ sub execute_graph {
                 Selecto::Error->throw('invalid_write_graph', "graph binding value $binding->{from}.$binding->{key} is unavailable")
                     unless exists $values->{$binding->{key}};
                 $assignments->{$binding->{field}} = $values->{$binding->{key}};
+                push @scopes, Selecto::Expression->eq(
+                    Selecto::Expression->field($binding->{scope_field}),
+                    Selecto::Expression->literal($values->{$binding->{key}}),
+                ) if defined $binding->{scope_field};
             }
             my $command = $node->{command}->with_assignments($assignments);
+            $command = $command->with_scope_predicate(
+                @scopes == 1 ? $scopes[0] : Selecto::Expression->all(@scopes)
+            ) if @scopes;
             my $compiled = $self->_compile_write($command);
             $results{$node->{id}} = $self->_execute_compiled_write_in_transaction($command, $compiled);
         }

@@ -75,6 +75,20 @@ sub with_assignments {
     );
 }
 
+sub with_scope_predicate {
+    my ($self, $scope_predicate) = @_;
+    return ref($self)->new(
+        operation => $self->operation,
+        relation => $self->relation,
+        assignments => $self->assignments,
+        predicate => $self->predicate,
+        scope_predicate => $scope_predicate,
+        query_enforcement => $self->query_enforcement,
+        expected_count => $self->expected_count,
+        metadata => $self->metadata,
+    );
+}
+
 sub _clone {
     my ($value) = @_;
     return [map { _clone($_) } @$value] if ref($value) eq 'ARRAY';
@@ -138,7 +152,8 @@ sub new {
                 my $key = defined($_->{key}) ? "$_->{key}" : '';
                 Selecto::Error->throw('invalid_write_graph', "graph node $id binding requires field, from, and key")
                     unless $field ne '' && $from ne '' && $key ne '';
-                { field => $field, from => $from, key => $key };
+                my $scope_field = defined($_->{scope_field}) ? "$_->{scope_field}" : undef;
+                { field => $field, from => $from, key => $key, (defined($scope_field) ? (scope_field => $scope_field) : ()) };
             } @$bindings],
         };
     } @$nodes;

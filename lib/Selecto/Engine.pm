@@ -262,6 +262,8 @@ sub _validate_graph_node {
     my $edge;
     my $edge_id;
     for my $binding (@$bindings) {
+        Selecto::Error->throw('invalid_write_graph', 'graph binding scope field must match its relationship field')
+            if defined($binding->{scope_field}) && $binding->{scope_field} ne $binding->{field};
         my $parent = $contexts->{$binding->{from}};
         Selecto::Error->throw('invalid_write_graph', "graph binding references unavailable node $binding->{from}")
             unless $parent;
