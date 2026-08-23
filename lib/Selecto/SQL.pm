@@ -14,6 +14,8 @@ our @FEATURE_INVENTORY = qw(
 );
 our %WRITE_CAPABILITIES = map { $_ => 1 } qw(insert update upsert delete transactions atomic_batch);
 
+has transaction_mode => 'managed';
+
 sub feature_inventory { return [@FEATURE_INVENTORY]; }
 sub write_capabilities { return { %WRITE_CAPABILITIES }; }
 
@@ -716,6 +718,17 @@ sub _execute_compiled_write_in_transaction {
 
 sub _transaction {
     my ($self, $operation) = @_;
+    my $mode = $self->transaction_mode;
+    Selecto::Error->throw('invalid_adapter', 'transaction_mode must be managed or external')
+        unless defined($mode) && ($mode eq 'managed' || $mode eq 'external');
+    if ($mode eq 'external') {
+        my $auto_commit = eval { $self->{dbh}{AutoCommit} };
+        Selecto::Error->throw(
+            'invalid_adapter',
+            'external transaction mode requires AutoCommit to be disabled',
+        ) unless defined($auto_commit) && !$auto_commit;
+        return $operation->();
+    }
     my $value;
     my $ok = eval {
         $self->{dbh}->begin_work;

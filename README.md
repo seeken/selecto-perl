@@ -258,6 +258,13 @@ my $preview = $engine->adapter->preview_write($command);
 my $result = $engine->execute_write($command);
 ```
 
+Adapters own transactions by default. A host that already owns a request or
+unit-of-work transaction may opt into `transaction_mode => 'external'` when it
+constructs the adapter. External mode requires a DBI handle with `AutoCommit`
+disabled and deliberately performs no begin, commit, or rollback; the host must
+commit success and roll back every exception. This mode fails closed rather than
+silently running an uncommitted write under `AutoCommit`.
+
 Identifiers are validated separately from bound values. Each write and every
 batch executes transactionally; an expected-cardinality mismatch rolls back.
 

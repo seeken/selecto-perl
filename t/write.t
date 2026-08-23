@@ -19,6 +19,27 @@ my $result = $adapter->execute_write($command);
 is_deeply($result->to_hash, { operation => 'update', affected_rows => 1 }, 'write result reports logical affected rows');
 is_deeply($dbh->events, ['BEGIN', 'COMMIT'], 'single write is transactional');
 
+my $external_dbh = TestSelecto::DBH->new({ affected => 1 });
+$external_dbh->{AutoCommit} = 0;
+my $external = Selecto::PostgreSQL->new(dbh => $external_dbh, transaction_mode => 'external');
+my $external_result = $external->execute_write($command);
+is($external_result->affected_rows, 1, 'external transaction mode executes the write');
+is_deeply($external_dbh->events, [],
+    'external transaction mode leaves begin, commit, and rollback to the caller');
+
+my $autocommit_dbh = TestSelecto::DBH->new({ affected => 1 });
+$autocommit_dbh->{AutoCommit} = 1;
+my $unsafe_external = Selecto::PostgreSQL->new(
+    dbh => $autocommit_dbh, transaction_mode => 'external',
+);
+eval { $unsafe_external->execute_write($command) };
+is($@->code, 'invalid_adapter', 'external mode fails closed when AutoCommit is enabled');
+is_deeply($autocommit_dbh->events, [], 'rejected external transaction dispatches nothing');
+
+my $invalid_mode = Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new, transaction_mode => 'sometimes');
+eval { $invalid_mode->execute_write($command) };
+is($@->code, 'invalid_adapter', 'unknown transaction mode fails closed');
+
 my $rollback_dbh = TestSelecto::DBH->new({ affected => 1 }, { affected => 0 });
 my $rollback_adapter = Selecto::PostgreSQL->new(dbh => $rollback_dbh);
 my $insert = Selecto::Write::Command->new(
@@ -40,4 +61,3 @@ eval {
 is($@->code, 'invalid_identifier', 'write relation cannot smuggle SQL');
 
 done_testing;
-
