@@ -132,6 +132,53 @@ like $line_statement->sql,
 unlike $line_statement->sql, qr{JOIN "invoice_lines"},
     'a related collection does not multiply outer result rows';
 
+my $through_domain = Selecto::Domain->new(
+    name => 'Tenant invoice tags',
+    table => 'invoices',
+    primary_key => 'id',
+    tenant_field => 'tenant_id',
+    fields => {id => 'integer', tenant_id => 'integer', reference => 'string'},
+    associations => {
+        tags => {
+            table => 'tags',
+            fields => {id => 'integer', tenant_id => 'integer', label => 'string'},
+            owner_key => 'id',
+            related_key => 'id',
+            target_primary_key => 'id',
+            cardinality => 'many',
+            join_type => 'left',
+            through => {
+                table => 'invoice_tags',
+                owner_key => 'invoice_id',
+                related_key => 'tag_id',
+                source_scope_key => 'tenant_id',
+                through_scope_key => 'tenant_id',
+                target_scope_key => 'tenant_id',
+            },
+        },
+    },
+);
+my $through_engine = Selecto::Engine->new(domain => $through_domain, adapter => $adapter);
+my $through_join = $through_engine->compile(
+    $through_engine->query->select('id', 'tags.label')
+);
+like(
+    $through_join->sql,
+    qr{LEFT JOIN \("invoice_tags" AS "t_tags" INNER JOIN "tags" AS "j_tags" ON "t_tags"\."tag_id" = "j_tags"\."id" AND "t_tags"\."tenant_id" = "j_tags"\."tenant_id"\) ON "s0"\."id" = "t_tags"\."invoice_id" AND "s0"\."tenant_id" = "t_tags"\."tenant_id"},
+    'a through association preserves roots while enforcing bridge-to-target scope',
+);
+my $through_collection = $through_engine->compile(
+    $through_engine->query->select(
+        'id',
+        Selecto::Expression->related_collection('tags', ['label'])->as('tags'),
+    )
+);
+like(
+    $through_collection->sql,
+    qr{FROM "invoice_tags" AS "ct_tags" INNER JOIN "tags" AS "c_tags" ON "ct_tags"\."tag_id" = "c_tags"\."id" AND "ct_tags"\."tenant_id" = "c_tags"\."tenant_id" WHERE "ct_tags"\."invoice_id" = "s0"\."id" AND "ct_tags"\."tenant_id" = "s0"\."tenant_id"},
+    'a related collection traverses its keyless bridge without multiplying roots',
+);
+
 my $dimension_display = Selecto::Expression->dimension_display('person.name', 'person_id');
 my $dimension_rollup = $join_engine->query->select(
     $dimension_display->as('person'),

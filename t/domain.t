@@ -68,6 +68,35 @@ is $many->associations->{person}->cardinality, 'many',
 is $many->associations->{person}->target_primary_key, 'id',
     'a to-many association retains its target ordering key';
 
+my $through_contract = $canonical->contract;
+$through_contract->{source}{associations}{person} = {
+    queryable => 'people',
+    owner_key => 'id',
+    related_key => 'id',
+    cardinality => 'many',
+    through => {
+        table => 'order_people',
+        owner_key => 'order_id',
+        related_key => 'person_id',
+    },
+};
+my $through = Selecto::Domain->parse($through_contract, strict => 1);
+is_deeply(
+    $through->associations->{person}->through,
+    {table => 'order_people', owner_key => 'order_id', related_key => 'person_id'},
+    'canonical associations retain an explicit keyless bridge contract',
+);
+isnt($through->fingerprint, $canonical->fingerprint,
+    'through metadata participates in the domain fingerprint');
+
+my $bad_through_contract = $through->contract;
+$bad_through_contract->{source}{associations}{person}{through}{source_scope_key} =
+    'person_id';
+eval { Selecto::Domain->parse($bad_through_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'partial through scope metadata fails closed');
+
 my $star_contract = $canonical->contract;
 $star_contract->{joins}{person} = {
     type => 'star_dimension',
