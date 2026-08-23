@@ -50,9 +50,11 @@ is($dbh->selectrow_array('SELECT count(*) FROM selecto_perl_test_items'), 1, 'fa
 $dbh->do('CREATE TABLE selecto_perl_test_invoices (id integer primary key, tenant_id integer not null)');
 $dbh->do('CREATE TABLE selecto_perl_test_tags (id integer primary key, tenant_id integer not null, label text not null)');
 $dbh->do('CREATE TABLE selecto_perl_test_invoice_tags (invoice_id integer not null, tag_id integer not null, tenant_id integer not null)');
+$dbh->do('CREATE TABLE selecto_perl_test_invoice_notes (id integer primary key, invoice_id integer not null, tenant_id integer not null, body text not null)');
 $dbh->do('INSERT INTO selecto_perl_test_invoices VALUES (1, 10), (2, 20)');
 $dbh->do(q{INSERT INTO selecto_perl_test_tags VALUES (5, 10, 'valid'), (6, 20, 'cross-tenant')});
 $dbh->do('INSERT INTO selecto_perl_test_invoice_tags VALUES (1, 5, 10), (1, 6, 10), (1, 6, 20)');
+$dbh->do(q{INSERT INTO selecto_perl_test_invoice_notes VALUES (7, 1, 10, 'valid'), (8, 1, 20, 'cross-tenant')});
 my $through_domain = Selecto::Domain->new(
     name => 'Scoped invoice tags',
     table => 'selecto_perl_test_invoices',
@@ -71,6 +73,16 @@ my $through_domain = Selecto::Domain->new(
                 source_scope_key => 'tenant_id', through_scope_key => 'tenant_id',
                 target_scope_key => 'tenant_id',
             },
+        },
+        notes => {
+            table => 'selecto_perl_test_invoice_notes',
+            fields => {
+                id => 'integer', invoice_id => 'integer', tenant_id => 'integer',
+                body => 'string',
+            },
+            owner_key => 'id', related_key => 'invoice_id', target_primary_key => 'id',
+            cardinality => 'many', join_type => 'left',
+            source_scope_key => 'tenant_id', target_scope_key => 'tenant_id',
         },
     },
 );
@@ -96,6 +108,16 @@ is_deeply(
     $collected->{rows},
     [[1, '[{"label":"valid"}]']],
     'live related collection traverses the scoped keyless bridge once',
+);
+my $direct_collected = $through_engine->all(
+    $through_engine->query->select(
+        'id', Selecto::Expression->related_collection('notes', ['body'])->as('notes'),
+    )->where(Selecto::Expression->eq('id', 1)),
+);
+is_deeply(
+    $direct_collected->{rows},
+    [[1, '[{"body":"valid"}]']],
+    'live direct related collection rejects a cross-tenant child row',
 );
 
 $dbh->disconnect;

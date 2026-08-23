@@ -97,6 +97,40 @@ $error = $@;
 is($error->code, 'invalid_domain',
     'partial through scope metadata fails closed');
 
+my $scoped_direct = Selecto::Domain->new(
+    name => 'Scoped parents',
+    table => 'parents',
+    fields => {id => 'integer', tenant_id => 'integer'},
+    associations => {
+        children => {
+            table => 'children',
+            fields => {id => 'integer', parent_id => 'integer', tenant_id => 'integer'},
+            owner_key => 'id', related_key => 'parent_id', cardinality => 'many',
+            source_scope_key => 'tenant_id', target_scope_key => 'tenant_id',
+        },
+    },
+);
+is($scoped_direct->associations->{children}->source_scope_key, 'tenant_id',
+    'direct association retains its source scope key');
+is($scoped_direct->associations->{children}->target_scope_key, 'tenant_id',
+    'direct association retains its target scope key');
+eval {
+    Selecto::Domain->new(
+        name => 'Bad scoped parents', table => 'parents',
+        fields => {id => 'integer', tenant_id => 'integer'},
+        associations => {
+            children => {
+                table => 'children', fields => {id => 'integer', parent_id => 'integer'},
+                owner_key => 'id', related_key => 'parent_id', cardinality => 'many',
+                source_scope_key => 'tenant_id',
+            },
+        },
+    );
+};
+$error = $@;
+is($error->code, 'invalid_domain',
+    'partial direct association scope metadata fails closed');
+
 my $star_contract = $canonical->contract;
 $star_contract->{joins}{person} = {
     type => 'star_dimension',

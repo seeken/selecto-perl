@@ -156,6 +156,16 @@ my $through_domain = Selecto::Domain->new(
                 target_scope_key => 'tenant_id',
             },
         },
+        notes => {
+            table => 'invoice_notes',
+            fields => {
+                id => 'integer', invoice_id => 'integer', tenant_id => 'integer',
+                body => 'string',
+            },
+            owner_key => 'id', related_key => 'invoice_id', target_primary_key => 'id',
+            cardinality => 'many', join_type => 'left',
+            source_scope_key => 'tenant_id', target_scope_key => 'tenant_id',
+        },
     },
 );
 my $through_engine = Selecto::Engine->new(domain => $through_domain, adapter => $adapter);
@@ -177,6 +187,24 @@ like(
     $through_collection->sql,
     qr{FROM "invoice_tags" AS "ct_tags" INNER JOIN "tags" AS "c_tags" ON "ct_tags"\."tag_id" = "c_tags"\."id" AND "ct_tags"\."tenant_id" = "c_tags"\."tenant_id" WHERE "ct_tags"\."invoice_id" = "s0"\."id" AND "ct_tags"\."tenant_id" = "s0"\."tenant_id"},
     'a related collection traverses its keyless bridge without multiplying roots',
+);
+my $direct_scoped_join = $through_engine->compile(
+    $through_engine->query->select('id', 'notes.body')
+);
+like(
+    $direct_scoped_join->sql,
+    qr{LEFT JOIN "invoice_notes" AS "j_notes" ON "s0"\."id" = "j_notes"\."invoice_id" AND "s0"\."tenant_id" = "j_notes"\."tenant_id"},
+    'a direct association enforces source-to-target scope in its join',
+);
+my $direct_scoped_collection = $through_engine->compile(
+    $through_engine->query->select(
+        'id', Selecto::Expression->related_collection('notes', ['body'])->as('notes'),
+    )
+);
+like(
+    $direct_scoped_collection->sql,
+    qr{FROM "invoice_notes" AS "c_notes" WHERE "c_notes"\."invoice_id" = "s0"\."id" AND "c_notes"\."tenant_id" = "s0"\."tenant_id"},
+    'a direct related collection enforces source-to-target scope',
 );
 
 my $dimension_display = Selecto::Expression->dimension_display('person.name', 'person_id');

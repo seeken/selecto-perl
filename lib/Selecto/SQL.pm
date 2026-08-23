@@ -66,11 +66,19 @@ sub compile {
                 ' ON ' . join(' AND ', @target_on) . ')' .
                 ' ON ' . join(' AND ', @bridge_on);
         } else {
+            my @target_on = (
+                $self->_qualified('s0', $association->owner_key) . ' = ' .
+                $self->_qualified($target_alias, $association->related_key),
+            );
+            if (defined $association->source_scope_key) {
+                push @target_on,
+                    $self->_qualified('s0', $association->source_scope_key) . ' = ' .
+                    $self->_qualified($target_alias, $association->target_scope_key);
+            }
             push @joins,
                 $keyword . ' ' . $self->quote_identifier($association->table) .
                 ' AS ' . $self->quote_identifier($target_alias) .
-                ' ON ' . $self->_qualified('s0', $association->owner_key) .
-                ' = ' . $self->_qualified($target_alias, $association->related_key);
+                ' ON ' . join(' AND ', @target_on);
         }
     }
     my %compiled_selections;
@@ -378,6 +386,11 @@ sub _compile_related_collection {
         $self->quote_identifier($association->owner_key);
     my $from = "$table AS $quoted_alias";
     my @predicates = ("$related_key = $owner_key");
+    if (defined $association->source_scope_key) {
+        push @predicates,
+            $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key) .
+            ' = ' . $self->_qualified('s0', $association->source_scope_key);
+    }
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
         my $quoted_bridge_alias = $self->quote_identifier($bridge_alias);

@@ -204,6 +204,12 @@ through => {
 Selecto joins root to bridge and bridge to target, enforcing both scope
 equalities in ordinary association queries and correlated related collections.
 
+Direct associations whose child rows repeat the tenant key can declare
+`source_scope_key` and `target_scope_key` on the association itself. Both keys
+are required together, validated against their respective schemas, included in
+the domain fingerprint, and compiled into ordinary joins and related
+collections. This prevents a foreign-key match from bypassing tenant scope.
+
 PostgreSQL hierarchical aggregates use `group_by_rollup`. Select the same
 governed group expressions first, then add `Selecto::Expression->grouping(...)`
 when the caller needs to distinguish detail, subtotal, and grand-total rows:
