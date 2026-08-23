@@ -185,6 +185,25 @@ Selecto::Expression->related_collection('load_det', [qw(vin)])
 The adapter emits a native JSON array of child objects, ordered by the child
 primary key where supported, without adding the association to the outer query.
 
+Keyless bridge tables are modeled explicitly rather than pretending the bridge
+has an identity. Add `through` to a to-many association with the bridge table's
+root and target foreign keys. Tenant-sensitive bridges can also declare all
+three scope keys; partial scope metadata fails closed:
+
+```perl
+through => {
+    table => 'invoice_tags',
+    owner_key => 'invoice_id',
+    related_key => 'tag_id',
+    source_scope_key => 'tenant_id',
+    through_scope_key => 'tenant_id',
+    target_scope_key => 'tenant_id',
+}
+```
+
+Selecto joins root to bridge and bridge to target, enforcing both scope
+equalities in ordinary association queries and correlated related collections.
+
 PostgreSQL hierarchical aggregates use `group_by_rollup`. Select the same
 governed group expressions first, then add `Selecto::Expression->grouping(...)`
 when the caller needs to distinguish detail, subtotal, and grand-total rows:

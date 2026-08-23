@@ -39,11 +39,39 @@ sub compile {
         my $association = $associations->{$name};
         Selecto::Error->throw('unknown_association', "unknown association $name") unless $association;
         my $keyword = $association->join_type eq 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
-        push @joins,
-            $keyword . ' ' . $self->quote_identifier($association->table) .
-            ' AS ' . $self->quote_identifier($self->_join_alias($name)) .
-            ' ON ' . $self->quote_identifier('s0') . '.' . $self->quote_identifier($association->owner_key) .
-            ' = ' . $self->quote_identifier($self->_join_alias($name)) . '.' . $self->quote_identifier($association->related_key);
+        my $target_alias = $self->_join_alias($name);
+        if (my $through = $association->through) {
+            my $bridge_alias = $self->_through_alias($name);
+            my @bridge_on = (
+                $self->_qualified('s0', $association->owner_key) . ' = ' .
+                    $self->_qualified($bridge_alias, $through->{owner_key}),
+            );
+            my @target_on = (
+                $self->_qualified($bridge_alias, $through->{related_key}) . ' = ' .
+                    $self->_qualified($target_alias, $association->related_key),
+            );
+            if (defined $through->{source_scope_key}) {
+                push @bridge_on,
+                    $self->_qualified('s0', $through->{source_scope_key}) . ' = ' .
+                    $self->_qualified($bridge_alias, $through->{through_scope_key});
+                push @target_on,
+                    $self->_qualified($bridge_alias, $through->{through_scope_key}) . ' = ' .
+                    $self->_qualified($target_alias, $through->{target_scope_key});
+            }
+            push @joins,
+                $keyword . ' (' . $self->quote_identifier($through->{table}) .
+                ' AS ' . $self->quote_identifier($bridge_alias) .
+                ' INNER JOIN ' . $self->quote_identifier($association->table) .
+                ' AS ' . $self->quote_identifier($target_alias) .
+                ' ON ' . join(' AND ', @target_on) . ')' .
+                ' ON ' . join(' AND ', @bridge_on);
+        } else {
+            push @joins,
+                $keyword . ' ' . $self->quote_identifier($association->table) .
+                ' AS ' . $self->quote_identifier($target_alias) .
+                ' ON ' . $self->_qualified('s0', $association->owner_key) .
+                ' = ' . $self->_qualified($target_alias, $association->related_key);
+        }
     }
     my %compiled_selections;
     my %selection_positions;
@@ -348,6 +376,32 @@ sub _compile_related_collection {
     my $related_key = $quoted_alias . '.' . $self->quote_identifier($association->related_key);
     my $owner_key = $self->quote_identifier('s0') . '.' .
         $self->quote_identifier($association->owner_key);
+    my $from = "$table AS $quoted_alias";
+    my @predicates = ("$related_key = $owner_key");
+    if (my $through = $association->through) {
+        my $bridge_alias = 'ct_' . $association_name;
+        my $quoted_bridge_alias = $self->quote_identifier($bridge_alias);
+        my $bridge_table = $self->quote_identifier($through->{table});
+        my @target_on = (
+            $quoted_bridge_alias . '.' . $self->quote_identifier($through->{related_key}) .
+            ' = ' . $related_key,
+        );
+        @predicates = (
+            $quoted_bridge_alias . '.' . $self->quote_identifier($through->{owner_key}) .
+            ' = ' . $owner_key,
+        );
+        if (defined $through->{source_scope_key}) {
+            push @predicates,
+                $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
+                ' = ' . $self->_qualified('s0', $through->{source_scope_key});
+            push @target_on,
+                $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
+                ' = ' . $quoted_alias . '.' . $self->quote_identifier($through->{target_scope_key});
+        }
+        $from = "$bridge_table AS $quoted_bridge_alias INNER JOIN $table AS $quoted_alias ON " .
+            join(' AND ', @target_on);
+    }
+    my $where = join(' AND ', @predicates);
     my $order = defined($association->target_primary_key)
         ? $quoted_alias . '.' . $self->quote_identifier($association->target_primary_key)
         : undef;
@@ -358,8 +412,8 @@ sub _compile_related_collection {
             $quoted_alias . '.' . $self->quote_identifier($_) . ' AS ' .
                 $self->quote_identifier($_)
         } @$fields);
-        return "COALESCE((SELECT $projection FROM $table AS $quoted_alias " .
-            "WHERE $related_key = $owner_key" .
+        return "COALESCE((SELECT $projection FROM $from " .
+            "WHERE $where" .
             (defined($order) ? " ORDER BY $order" : '') . " FOR JSON PATH), '[]')";
     }
 
@@ -385,8 +439,8 @@ sub _compile_related_collection {
             "related collections are not supported by adapter $adapter",
         );
     }
-    return "COALESCE((SELECT $aggregate FROM $table AS $quoted_alias " .
-        "WHERE $related_key = $owner_key), $empty)";
+    return "COALESCE((SELECT $aggregate FROM $from " .
+        "WHERE $where), $empty)";
 }
 
 sub _compile_count_bucket {
@@ -555,6 +609,11 @@ sub _expression_associations {
 }
 
 sub _join_alias { return 'j_' . $_[1]; }
+sub _through_alias { return 't_' . $_[1]; }
+sub _qualified {
+    my ($self, $alias, $field) = @_;
+    return $self->quote_identifier($alias) . '.' . $self->quote_identifier($field);
+}
 
 sub _compile_write {
     my ($self, $command) = @_;

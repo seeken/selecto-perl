@@ -47,5 +47,56 @@ eval { $engine->execute_batch(Selecto::Write::Batch->new($first, $second)) };
 is($@->code, 'cardinality_mismatch', 'live batch reports a portable cardinality error');
 is($dbh->selectrow_array('SELECT count(*) FROM selecto_perl_test_items'), 1, 'failed live batch rolls back atomically');
 
+$dbh->do('CREATE TABLE selecto_perl_test_invoices (id integer primary key, tenant_id integer not null)');
+$dbh->do('CREATE TABLE selecto_perl_test_tags (id integer primary key, tenant_id integer not null, label text not null)');
+$dbh->do('CREATE TABLE selecto_perl_test_invoice_tags (invoice_id integer not null, tag_id integer not null, tenant_id integer not null)');
+$dbh->do('INSERT INTO selecto_perl_test_invoices VALUES (1, 10), (2, 20)');
+$dbh->do(q{INSERT INTO selecto_perl_test_tags VALUES (5, 10, 'valid'), (6, 20, 'cross-tenant')});
+$dbh->do('INSERT INTO selecto_perl_test_invoice_tags VALUES (1, 5, 10), (1, 6, 10), (1, 6, 20)');
+my $through_domain = Selecto::Domain->new(
+    name => 'Scoped invoice tags',
+    table => 'selecto_perl_test_invoices',
+    primary_key => 'id',
+    tenant_field => 'tenant_id',
+    fields => {id => 'integer', tenant_id => 'integer'},
+    associations => {
+        tags => {
+            table => 'selecto_perl_test_tags',
+            fields => {id => 'integer', tenant_id => 'integer', label => 'string'},
+            owner_key => 'id', related_key => 'id', target_primary_key => 'id',
+            cardinality => 'many', join_type => 'left',
+            through => {
+                table => 'selecto_perl_test_invoice_tags',
+                owner_key => 'invoice_id', related_key => 'tag_id',
+                source_scope_key => 'tenant_id', through_scope_key => 'tenant_id',
+                target_scope_key => 'tenant_id',
+            },
+        },
+    },
+);
+my $through_engine = Selecto::Engine->new(
+    domain => $through_domain,
+    adapter => Selecto->adapter(sqlite => (dbh => $dbh)),
+);
+my $joined = $through_engine->all(
+    $through_engine->query->select('id', 'tags.label')
+        ->where(Selecto::Expression->eq('id', 1)),
+);
+is_deeply(
+    $joined->{rows},
+    [[1, 'valid']],
+    'live through join rejects bridge rows outside root or target scope',
+);
+my $collected = $through_engine->all(
+    $through_engine->query->select(
+        'id', Selecto::Expression->related_collection('tags', ['label'])->as('tags'),
+    )->where(Selecto::Expression->eq('id', 1)),
+);
+is_deeply(
+    $collected->{rows},
+    [[1, '[{"label":"valid"}]']],
+    'live related collection traverses the scoped keyless bridge once',
+);
+
 $dbh->disconnect;
 done_testing;

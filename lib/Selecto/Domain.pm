@@ -19,8 +19,11 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(source_table primary_key fields columns associations tenant_field);
-my %ASSOCIATION = map { $_ => 1 } qw(queryable owner_key related_key cardinality);
+my %ASSOCIATION = map { $_ => 1 } qw(queryable owner_key related_key cardinality through);
 my %JOIN = map { $_ => 1 } qw(type name display_field dimension_key);
+my %THROUGH = map { $_ => 1 } qw(
+    table owner_key related_key source_scope_key through_scope_key target_scope_key
+);
 my %COMPONENTS = map { $_ => 1 } qw(query_params);
 
 sub new {
@@ -59,6 +62,20 @@ sub new {
             unless exists $fields->{$self->{tenant_field}};
     }
     for my $association (values %associations) {
+        if (my $through = $association->through) {
+            if (defined $through->{source_scope_key}) {
+                Selecto::Error->throw(
+                    'invalid_domain',
+                    'through association source scope key must be a root field',
+                    {association => $association->name},
+                ) unless exists $fields->{$through->{source_scope_key}};
+                Selecto::Error->throw(
+                    'invalid_domain',
+                    'through association target scope key must be queryable',
+                    {association => $association->name},
+                ) unless exists $association->fields->{$through->{target_scope_key}};
+            }
+        }
         next unless $association->join_mode eq 'star_dimension';
         Selecto::Error->throw(
             'invalid_domain',
@@ -170,6 +187,7 @@ sub _parse_canonical {
             cardinality => $cardinality,
             join_type => $join_mode eq 'star_dimension' ? 'left' : $join_mode,
             join_mode => $join_mode,
+            (exists($association->{through}) ? (through => $association->{through}) : ()),
             ($join_mode eq 'star_dimension' ? (
                 display_field => $join->{display_field} // 'name',
                 dimension_key => $join->{dimension_key} // $association->{owner_key},
@@ -395,6 +413,34 @@ sub new {
             $value->{display_name} // $args{name}, 'star dimension name'
         );
     }
+    my $through;
+    if (exists $value->{through}) {
+        $through = $value->{through};
+        Selecto::Error->throw('invalid_domain', 'association through must be an object')
+            unless ref($through) eq 'HASH';
+        Selecto::Domain::_reject_unknown(
+            $through, \%THROUGH, "association $args{name} through"
+        );
+        for my $key (qw(table owner_key related_key)) {
+            Selecto::Domain::_required_key($through, $key, "association $args{name} through");
+        }
+        $through = {
+            table => Selecto::Domain::_identifier($through->{table}, 'through table'),
+            owner_key => Selecto::Domain::_identifier($through->{owner_key}, 'through owner key'),
+            related_key => Selecto::Domain::_identifier($through->{related_key}, 'through related key'),
+        };
+        my @scope_keys = qw(source_scope_key through_scope_key target_scope_key);
+        my $scope_count = grep { exists $value->{through}{$_} } @scope_keys;
+        Selecto::Error->throw(
+            'invalid_domain',
+            'through association scope requires source, through, and target keys',
+        ) if $scope_count && $scope_count != @scope_keys;
+        if ($scope_count) {
+            $through->{$_} = Selecto::Domain::_identifier(
+                $value->{through}{$_}, "through $_"
+            ) for @scope_keys;
+        }
+    }
     return bless {
         name => Selecto::Domain::_identifier($args{name}, 'association'),
         table => Selecto::Domain::_identifier($value->{table}, 'association table'),
@@ -405,6 +451,7 @@ sub new {
         target_primary_key => $target_primary_key,
         join_type => $join_type,
         join_mode => $join_mode,
+        (defined($through) ? (through => $through) : ()),
         ($join_mode eq 'star_dimension' ? (
             display_field => $display_field,
             dimension_key => $dimension_key,
@@ -424,6 +471,7 @@ sub fingerprint_value {
         ($self->{cardinality} eq 'many' ? (cardinality => 'many') : ()),
         (defined($self->{target_primary_key}) && $self->{cardinality} eq 'many'
             ? (target_primary_key => $self->{target_primary_key}) : ()),
+        (defined($self->{through}) ? (through => {%{$self->{through}}}) : ()),
         ($self->{join_mode} eq 'star_dimension' ? (
             join_mode => $self->{join_mode},
             display_field => $self->{display_field},
@@ -445,5 +493,6 @@ sub join_mode   { return $_[0]->{join_mode}; }
 sub display_field { return $_[0]->{display_field}; }
 sub dimension_key { return $_[0]->{dimension_key}; }
 sub display_name { return $_[0]->{display_name}; }
+sub through { return defined($_[0]->{through}) ? {%{$_[0]->{through}}} : undef; }
 
 1;
