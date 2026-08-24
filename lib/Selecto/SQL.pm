@@ -130,7 +130,16 @@ sub _compile_single {
             );
             my @target_on = (
                 $self->_qualified($bridge_alias, $through->{related_key}) . ' = ' .
-                    $self->_qualified($target_alias, $association->related_key),
+                    $self->_join_target_key(
+                        $self->_qualified($target_alias, $association->related_key),
+                        $through->{target_key_cast},
+                    ),
+            );
+            push @bridge_on, $self->_constant_join_predicates(
+                $bridge_alias, $through->{where}, \@params
+            );
+            push @target_on, $self->_constant_join_predicates(
+                $target_alias, $association->where, \@params
             );
             if (defined $through->{source_scope_key}) {
                 push @bridge_on,
@@ -151,6 +160,9 @@ sub _compile_single {
             my @target_on = (
                 $self->_qualified($parent_alias, $association->owner_key) . ' = ' .
                     $self->_qualified($target_alias, $association->related_key),
+            );
+            push @target_on, $self->_constant_join_predicates(
+                $target_alias, $association->where, \@params
             );
             if (defined $association->source_scope_key) {
                 push @target_on,
@@ -569,7 +581,7 @@ sub _compile_expression {
         unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $kind = $expression->kind;
     my $arguments = $expression->arguments;
-    return $self->_field_sql($domain, $arguments->[0]) if $kind eq 'field';
+    return $self->_field_sql($domain, $arguments->[0], $params) if $kind eq 'field';
     if ($kind eq 'literal') {
         push @$params, $arguments->[0];
         return $self->placeholder(scalar @$params);
@@ -620,7 +632,7 @@ sub _compile_expression {
         my $key_sql = $self->_compile_expression($domain, $arguments->[1], $params);
         return "CASE WHEN GROUPING($key_sql) = 1 THEN NULL ELSE MIN($display_sql) END";
     }
-    return $self->_compile_related_collection($domain, $expression)
+    return $self->_compile_related_collection($domain, $expression, $params)
         if $kind eq 'related_collection';
     return $self->_compile_window($domain, $expression, $params)
         if $kind eq 'window';
@@ -752,7 +764,7 @@ sub _window_boundary {
 }
 
 sub _compile_related_collection {
-    my ($self, $domain, $expression) = @_;
+    my ($self, $domain, $expression, $params) = @_;
     my ($association_name, $fields) = @{$expression->arguments};
     Selecto::Error->throw('invalid_query', 'related collection association is invalid')
         unless defined($association_name) && !ref($association_name)
@@ -785,13 +797,16 @@ sub _compile_related_collection {
             $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key) .
             ' = ' . $self->_qualified($self->_root_alias, $association->source_scope_key);
     }
+    push @predicates, $self->_constant_join_predicates(
+        $alias, $association->where, $params
+    );
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
         my $quoted_bridge_alias = $self->quote_identifier($bridge_alias);
         my $bridge_table = $self->quote_identifier($through->{table});
         my @target_on = (
             $quoted_bridge_alias . '.' . $self->quote_identifier($through->{related_key}) .
-            ' = ' . $related_key,
+            ' = ' . $self->_join_target_key($related_key, $through->{target_key_cast}),
         );
         @predicates = (
             $quoted_bridge_alias . '.' . $self->quote_identifier($through->{owner_key}) .
@@ -805,6 +820,12 @@ sub _compile_related_collection {
                 $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
                 ' = ' . $quoted_alias . '.' . $self->quote_identifier($through->{target_scope_key});
         }
+        push @predicates, $self->_constant_join_predicates(
+            $bridge_alias, $through->{where}, $params
+        );
+        push @target_on, $self->_constant_join_predicates(
+            $alias, $association->where, $params
+        );
         $from = "$bridge_table AS $quoted_bridge_alias INNER JOIN $table AS $quoted_alias ON " .
             join(' AND ', @target_on);
     }
@@ -977,7 +998,7 @@ sub _compile_bucket {
 }
 
 sub _field_sql {
-    my ($self, $domain, $path) = @_;
+    my ($self, $domain, $path, $params) = @_;
     my @segments = split /\./, "$path", -1;
     if (@segments == 2 && ref($self->{_query_sources}) eq 'HASH'
         && exists($self->{_query_sources}{$segments[0]})) {
@@ -986,10 +1007,45 @@ sub _field_sql {
         return $self->_qualified($segments[0], $segments[1]);
     }
     my $resolved = $domain->resolve($path);
+    if (!$resolved->{association}) {
+        my $metadata = $domain->field_metadata($path);
+        if (ref($metadata->{computed}) eq 'HASH') {
+            return $self->_compile_computed_field(
+                $domain, $path, $metadata->{computed}, $params
+            );
+        }
+    }
     my $table_alias = $resolved->{association}
         ? $self->_join_alias($resolved->{association_path})
         : $self->_root_alias;
     return $self->quote_identifier($table_alias) . '.' . $self->quote_identifier($resolved->{field});
+}
+
+sub _compile_computed_field {
+    my ($self, $domain, $path, $computed, $params) = @_;
+    Selecto::Error->throw('invalid_domain', 'unsupported computed field')
+        unless $computed->{kind} eq 'association_exists';
+    my $association_name = $computed->{association};
+    my $association = $domain->associations->{$association_name};
+    Selecto::Error->throw('invalid_domain', 'computed field association is unavailable', {
+        field => $path, association => $association_name,
+    }) unless $association && !$association->through;
+    my $alias = 'e_' . $association_name;
+    my @predicates = (
+        $self->_qualified($alias, $association->related_key) . ' = ' .
+            $self->_qualified($self->_root_alias, $association->owner_key),
+    );
+    if (defined $association->source_scope_key) {
+        push @predicates,
+            $self->_qualified($alias, $association->target_scope_key) . ' = ' .
+            $self->_qualified($self->_root_alias, $association->source_scope_key);
+    }
+    push @predicates, $self->_constant_join_predicates(
+        $alias, $association->where, $params
+    );
+    return 'EXISTS (SELECT 1 FROM ' . $self->quote_identifier($association->table) .
+        ' AS ' . $self->quote_identifier($alias) . ' WHERE ' .
+        join(' AND ', @predicates) . ')';
 }
 
 sub _referenced_associations {
@@ -1074,6 +1130,28 @@ sub _through_alias {
     return 't_' . $path;
 }
 sub _root_alias { return $_[0]->{_root_alias} // 's0'; }
+sub _join_target_key {
+    my ($self, $sql, $cast) = @_;
+    return $sql unless defined($cast);
+    Selecto::Error->throw('invalid_domain', 'unsupported join target key cast')
+        unless $cast eq 'string';
+    return "CAST($sql AS VARCHAR)";
+}
+sub _constant_join_predicates {
+    my ($self, $alias, $where, $params) = @_;
+    return () unless ref($where) eq 'HASH' && keys %$where;
+    my @predicates;
+    for my $field (sort keys %$where) {
+        my $column = $self->_qualified($alias, $field);
+        if (!defined($where->{$field})) {
+            push @predicates, "$column IS NULL";
+            next;
+        }
+        push @$params, $where->{$field};
+        push @predicates, $column . ' = ' . $self->placeholder(scalar @$params);
+    }
+    return @predicates;
+}
 sub _qualified {
     my ($self, $alias, $field) = @_;
     return $self->quote_identifier($alias) . '.' . $self->quote_identifier($field);

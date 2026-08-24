@@ -97,6 +97,30 @@ is($canonical->components->{query_params}, 0, 'canonical component URL-state pol
 is $canonical->associations->{person}->cardinality, 'one',
     'a join to the target primary key is inferred as to-one';
 
+my $computed_contract = $canonical->contract;
+push @{$computed_contract->{source}{fields}}, 'has_person';
+$computed_contract->{source}{columns}{has_person} = {
+    type => 'boolean',
+    computed => {kind => 'association_exists', association => 'person'},
+};
+my $computed = Selecto::Domain->parse($computed_contract, strict => 1);
+is_deeply($computed->field_metadata('has_person')->{computed}, {
+    kind => 'association_exists', association => 'person',
+}, 'canonical domains retain governed association-exists computed fields');
+
+my $bad_computed_contract = $computed->contract;
+$bad_computed_contract->{source}{columns}{has_person}{computed}{association} = 'passwords';
+eval { Selecto::Domain->parse($bad_computed_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'computed fields cannot reference associations outside the domain');
+
+$bad_computed_contract = $computed->contract;
+$bad_computed_contract->{source}{columns}{has_person}{computed}{kind} = 'raw_sql';
+eval { Selecto::Domain->parse($bad_computed_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain', 'arbitrary computed field kinds fail closed');
+
 my $many_contract = $canonical->contract;
 $many_contract->{schemas}{people}{fields} = [qw(id name order_id)];
 $many_contract->{schemas}{people}{columns}{order_id} = {type => 'integer'};
@@ -127,6 +151,33 @@ is_deeply(
 );
 isnt($through->fingerprint, $canonical->fingerprint,
     'through metadata participates in the domain fingerprint');
+
+my $qualified_through_contract = $through->contract;
+$qualified_through_contract->{source}{associations}{person}{where} = {userstatus => 'A'};
+$qualified_through_contract->{schemas}{people}{fields} = [qw(id name userstatus)];
+$qualified_through_contract->{schemas}{people}{columns}{userstatus} = {type => 'string'};
+$qualified_through_contract->{source}{associations}{person}{through}{where} = {type => 'E'};
+$qualified_through_contract->{source}{associations}{person}{through}{target_key_cast} = 'string';
+my $qualified_through = Selecto::Domain->parse($qualified_through_contract, strict => 1);
+is_deeply($qualified_through->associations->{person}->where, {userstatus => 'A'},
+    'canonical associations retain target constant predicates');
+is_deeply($qualified_through->associations->{person}->through->{where}, {type => 'E'},
+    'canonical through associations retain bridge constant predicates');
+is($qualified_through->associations->{person}->through->{target_key_cast}, 'string',
+    'canonical through associations retain an explicit target-key cast');
+
+my $bad_where_contract = $qualified_through->contract;
+$bad_where_contract->{source}{associations}{person}{where} = {password => 'secret'};
+eval { Selecto::Domain->parse($bad_where_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'association predicates cannot reference fields outside the governed schema');
+
+my $bad_cast_contract = $qualified_through->contract;
+$bad_cast_contract->{source}{associations}{person}{through}{target_key_cast} = 'integer';
+eval { Selecto::Domain->parse($bad_cast_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain', 'unsupported through target casts fail closed');
 
 my $bad_through_contract = $through->contract;
 $bad_through_contract->{source}{associations}{person}{through}{source_scope_key} =

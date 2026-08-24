@@ -22,11 +22,12 @@ my %RELATION = map { $_ => 1 } qw(
     source_table primary_key fields columns associations tenant_field redact_fields
 );
 my %ASSOCIATION = map { $_ => 1 } qw(
-    queryable owner_key related_key cardinality through source_scope_key target_scope_key
+    queryable owner_key related_key cardinality through source_scope_key target_scope_key where
 );
 my %JOIN = map { $_ => 1 } qw(type name display_field dimension_key);
 my %THROUGH = map { $_ => 1 } qw(
     table owner_key related_key source_scope_key through_scope_key target_scope_key
+    where target_key_cast
 );
 my %COMPONENTS = map { $_ => 1 } qw(query_params);
 
@@ -170,6 +171,7 @@ sub _parse_canonical {
     my $associations = _canonical_associations(
         $source, $schemas, $joins, $strict, '',
     );
+    _validate_computed_columns($source, $associations);
 
     _required_key($raw, 'name', 'domain');
     _required_key($source, 'source_table', 'source');
@@ -243,6 +245,7 @@ sub _canonical_associations {
                     target_scope_key => $association->{target_scope_key},
                 ) : ()),
                 (exists($association->{through}) ? (through => $association->{through}) : ()),
+                (exists($association->{where}) ? (where => $association->{where}) : ()),
                 ($join_mode eq 'star_dimension' ? (
                     display_field => $join->{display_field} // 'name',
                     dimension_key => $join->{dimension_key} // $association->{owner_key},
@@ -272,6 +275,32 @@ sub _canonical_fields {
         $result{$field} = $column->{type};
     }
     return \%result;
+}
+
+sub _validate_computed_columns {
+    my ($source, $associations) = @_;
+    for my $field (@{$source->{fields} // []}) {
+        my $column = $source->{columns}{$field};
+        next unless ref($column) eq 'HASH' && exists $column->{computed};
+        my $computed = $column->{computed};
+        _object($computed, "computed column $field");
+        my %allowed = map { $_ => 1 } qw(kind association);
+        _reject_unknown($computed, \%allowed, "computed column $field");
+        my $kind = _required_string($computed->{kind}, "computed column $field kind");
+        Selecto::Error->throw('invalid_domain', "unsupported computed column kind $kind")
+            unless $kind eq 'association_exists';
+        my $association = _identifier(
+            $computed->{association}, "computed column $field association"
+        );
+        Selecto::Error->throw(
+            'invalid_domain', 'computed column association is not governed',
+            {field => $field, association => $association},
+        ) unless exists $associations->{$association};
+        Selecto::Error->throw(
+            'invalid_domain', 'association-exists computed columns require a direct association',
+            {field => $field, association => $association},
+        ) if $associations->{$association}->through;
+    }
 }
 
 sub _expression_value {
@@ -428,6 +457,7 @@ sub _portable_associations {
                 target_scope_key => $association->target_scope_key,
             ) : ()),
             (defined($association->through) ? (through => $association->through) : ()),
+            (keys(%{$association->where}) ? (where => $association->where) : ()),
         };
         $joins->{$path} = {
             type => $association->join_mode,
@@ -443,6 +473,39 @@ sub _portable_associations {
 
 sub _portable_schema_name {
     return 'q' . join('', map { '_' . length($_) . '_' . $_ } @_);
+}
+
+sub field_metadata {
+    my ($self, $path) = @_;
+    my $contract = $self->{contract};
+    return {} unless ref($contract) eq 'HASH';
+    my @segments = split /\./, "$path", -1;
+    my $column;
+    if (@segments == 1) {
+        $column = $contract->{source}{columns}{$segments[0]}
+            if ref($contract->{source}) eq 'HASH'
+            && ref($contract->{source}{columns}) eq 'HASH';
+    }
+    elsif (@segments == 2) {
+        my ($association, $field) = @segments;
+        my $association_spec = $contract->{source}{associations}{$association}
+            if ref($contract->{source}) eq 'HASH'
+            && ref($contract->{source}{associations}) eq 'HASH';
+        my $queryable = ref($association_spec) eq 'HASH'
+            ? $association_spec->{queryable} : undef;
+        $column = $contract->{schemas}{$queryable}{columns}{$field}
+            if defined($queryable)
+            && ref($contract->{schemas}) eq 'HASH'
+            && ref($contract->{schemas}{$queryable}) eq 'HASH'
+            && ref($contract->{schemas}{$queryable}{columns}) eq 'HASH';
+    }
+    return ref($column) eq 'HASH' ? dclone($column) : {};
+}
+
+sub field_is_public {
+    my ($self, $path) = @_;
+    my $metadata = $self->field_metadata($path);
+    return $metadata->{internal} ? 0 : 1;
 }
 
 sub _normalize_fields {
@@ -486,6 +549,20 @@ sub _normalize_query_library {
         $library{$registry} = dclone($definitions);
     }
     return \%library;
+}
+
+sub _constant_predicates {
+    my ($value, $label) = @_;
+    _object($value, $label);
+    my %predicates;
+    for my $field (keys %$value) {
+        my $name = _identifier($field, "$label field");
+        my $literal = $value->{$field};
+        Selecto::Error->throw('invalid_domain', "$label values must be scalar literals")
+            if ref($literal) && !JSON::PP::is_bool($literal);
+        $predicates{$name} = $literal;
+    }
+    return \%predicates;
 }
 
 sub _reject_unknown {
@@ -571,6 +648,16 @@ sub new {
             value => $nested->{$name},
         );
     }
+    my $where = exists($value->{where})
+        ? Selecto::Domain::_constant_predicates(
+            $value->{where}, "association $args{name} where"
+        ) : {};
+    for my $field (keys %$where) {
+        Selecto::Error->throw(
+            'invalid_domain', 'association where field is not queryable',
+            {association => $args{name}, field => $field},
+        ) unless exists $fields->{$field};
+    }
     my $cardinality = lc(Selecto::Domain::_required_string(
         $value->{cardinality} // 'one', 'association cardinality'
     ));
@@ -631,7 +718,20 @@ sub new {
             table => Selecto::Domain::_identifier($through->{table}, 'through table'),
             owner_key => Selecto::Domain::_identifier($through->{owner_key}, 'through owner key'),
             related_key => Selecto::Domain::_identifier($through->{related_key}, 'through related key'),
+            (exists($through->{where}) ? (
+                where => Selecto::Domain::_constant_predicates(
+                    $through->{where}, "association $args{name} through where"
+                ),
+            ) : ()),
         };
+        if (exists $value->{through}{target_key_cast}) {
+            my $cast = Selecto::Domain::_required_string(
+                $value->{through}{target_key_cast}, 'through target key cast'
+            );
+            Selecto::Error->throw('invalid_domain', 'through target key cast must be string')
+                unless $cast eq 'string';
+            $through->{target_key_cast} = $cast;
+        }
         my @scope_keys = qw(source_scope_key through_scope_key target_scope_key);
         my $scope_count = grep { exists $value->{through}{$_} } @scope_keys;
         Selecto::Error->throw(
@@ -665,6 +765,7 @@ sub new {
             target_scope_key => $target_scope_key,
         ) : ()),
         (defined($through) ? (through => $through) : ()),
+        (keys(%$where) ? (where => $where) : ()),
         ($join_mode eq 'star_dimension' ? (
             display_field => $display_field,
             dimension_key => $dimension_key,
@@ -692,6 +793,7 @@ sub fingerprint_value {
         (defined($self->{target_primary_key}) && $self->{cardinality} eq 'many'
             ? (target_primary_key => $self->{target_primary_key}) : ()),
         (defined($self->{through}) ? (through => {%{$self->{through}}}) : ()),
+        (defined($self->{where}) ? (where => {%{$self->{where}}}) : ()),
         (defined($self->{source_scope_key}) ? (
             source_scope_key => $self->{source_scope_key},
             target_scope_key => $self->{target_scope_key},
@@ -720,6 +822,7 @@ sub display_field { return $_[0]->{display_field}; }
 sub dimension_key { return $_[0]->{dimension_key}; }
 sub display_name { return $_[0]->{display_name}; }
 sub through { return defined($_[0]->{through}) ? {%{$_[0]->{through}}} : undef; }
+sub where { return defined($_[0]->{where}) ? {%{$_[0]->{where}}} : {}; }
 sub source_scope_key { return $_[0]->{source_scope_key}; }
 sub target_scope_key { return $_[0]->{target_scope_key}; }
 
