@@ -53,6 +53,45 @@ my $canonical = Selecto::Domain->parse(JSON::PP->new->encode({
 is($canonical->table, 'orders', 'canonical source table is parsed');
 is($canonical->resolve('person.name')->{type}, 'string', 'canonical association fields resolve');
 is($canonical->associations->{person}->join_type, 'inner', 'join metadata is applied');
+
+my $deep = Selecto::Domain->parse({
+    schema_version => 1,
+    name => 'Orders with regions',
+    source => {
+        source_table => 'orders', primary_key => 'id',
+        fields => [qw(id customer_id)],
+        columns => {id => {type => 'integer'}, customer_id => {type => 'integer'}},
+        associations => {
+            customer => {queryable => 'customers', owner_key => 'customer_id', related_key => 'id'},
+        },
+    },
+    schemas => {
+        customers => {
+            source_table => 'customers', primary_key => 'id',
+            fields => [qw(id region_id name)],
+            columns => {
+                id => {type => 'integer'}, region_id => {type => 'integer'},
+                name => {type => 'string'},
+            },
+            associations => {
+                region => {queryable => 'regions', owner_key => 'region_id', related_key => 'id'},
+            },
+        },
+        regions => {
+            source_table => 'regions', primary_key => 'id', fields => [qw(id name)],
+            columns => {id => {type => 'integer'}, name => {type => 'string'}},
+            associations => {},
+        },
+    },
+    joins => {customer => {type => 'left'}, 'customer.region' => {type => 'inner'}},
+});
+is($deep->resolve('customer.region.name')->{type}, 'string',
+    'canonical fields resolve through more than one relationship');
+is_deeply(
+    [map { $_->name } @{$deep->resolve('customer.region.name')->{associations}}],
+    [qw(customer region)],
+    'deep resolution retains the exact relationship lineage',
+);
 is($canonical->writes->{version}, 1, 'canonical write metadata remains available to governed consumers');
 is($canonical->components->{query_params}, 0, 'canonical component URL-state policy is retained');
 is $canonical->associations->{person}->cardinality, 'one',

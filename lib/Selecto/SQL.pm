@@ -6,13 +6,17 @@ use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::QueryEnforcement ();
 use Selecto::Statement ();
+use Selecto::Stream ();
 use Selecto::Write ();
+use Selecto::Write::Expression ();
 
 our @FEATURE_INVENTORY = qw(
-    cte recursive_cte window_functions transactions returning rollup stream
+    cte recursive_cte window_functions set_operations transactions returning rollup stream
     schema_introspection text_search json_rowset lateral_join
 );
-our %WRITE_CAPABILITIES = map { $_ => 1 } qw(insert update upsert delete transactions atomic_batch);
+our %WRITE_CAPABILITIES = map { $_ => 1 } qw(
+    insert update upsert delete transactions atomic_batch mutation_expressions
+);
 
 has transaction_mode => 'managed';
 
@@ -28,22 +32,100 @@ sub quote_identifier {
 
 sub compile {
     my ($self, $domain, $query) = @_;
+    my $operations = $query->set_operations;
+    return $self->_compile_single($domain, $query) unless @$operations;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support set operations')
+        unless $self->supports('set_operations');
+
+    my $left = $self->_compile_single($domain, $query->_set_base_query);
+    my $sql = $left->sql;
+    my @params = @{$left->params};
+    my $columns = $left->columns;
+    for my $index (0 .. $#$operations) {
+        my $operation = $operations->[$index];
+        # SQL dialects disagree about compound-query precedence (notably when
+        # INTERSECT is mixed with UNION or EXCEPT). Preserve the immutable
+        # builder's left-to-right operation order by making each completed
+        # compound an explicit derived-table operand before the next edge.
+        if ($index > 0) {
+            $sql = 'SELECT * FROM (' . $sql . ') AS ' .
+                $self->quote_identifier('__selecto_set_left_' . ($index + 1));
+        }
+        my $right = $self->compile($domain, $operation->{query});
+        Selecto::Error->throw(
+            'invalid_query',
+            'set operation operands must select the same number of columns',
+        ) unless @{$right->columns} == @$columns;
+        my $right_sql = $self->_shift_placeholders($right->sql, scalar @params);
+        if (@{$operation->{query}->set_operations}) {
+            $right_sql = 'SELECT * FROM (' . $right_sql . ') AS ' .
+                $self->quote_identifier('__selecto_set_right_' . ($index + 1));
+        }
+        my $keyword = uc($operation->{operation}) . ($operation->{all} ? ' ALL' : '');
+        $sql .= " $keyword " . $right_sql;
+        push @params, @{$right->params};
+    }
+
+    my $orders = $query->orders;
+    if (@$orders) {
+        my $selections = $query->selections;
+        my %positions;
+        for my $index (0 .. $#$selections) {
+            $positions{_expression_key($selections->[$index])} //= $index + 1;
+            $positions{$self->_selection_name($selections->[$index])} //= $index + 1;
+        }
+        $sql .= ' ORDER BY ' . join(', ', map {
+            my $position = $positions{_expression_key($_->[0])};
+            $position //= $positions{$self->_selection_name($_->[0])};
+            Selecto::Error->throw(
+                'invalid_query',
+                'set result ordering must reference a selected output column',
+            ) unless defined $position;
+            $position . ' ' . uc($_->[1]);
+        } @$orders);
+    }
+    $sql .= $self->_compile_pagination(
+        $query->limit_value,
+        $query->offset_value,
+        @$orders ? 1 : 0,
+    );
+    return Selecto::Statement->new(
+        sql => $sql,
+        params => \@params,
+        columns => $columns,
+        adapter_name => $self->name,
+    );
+}
+
+sub _compile_single {
+    my ($self, $domain, $query, %options) = @_;
+    local $self->{_root_alias} = $options{root_alias} // 's0';
     my $selections = $query->selections;
     Selecto::Error->throw('invalid_query', 'query must select at least one expression') unless @$selections;
-    my @params;
+    my $sources = $self->_query_sources($domain, $query);
+    local $self->{_query_sources} = $sources;
+    my ($with_sql, $cte_params) = $self->_compile_cte_prefix($query);
+    my @params = @$cte_params;
     my @joins;
-    my $associations = $domain->associations;
     my $predicate = Selecto::QueryEnforcement::combine(
         $domain->required_predicate, $query->predicate);
-    for my $name ($self->_referenced_associations($query, $predicate)) {
-        my $association = $associations->{$name};
-        Selecto::Error->throw('unknown_association', "unknown association $name") unless $association;
+    my @association_paths = $self->_referenced_associations($query, $predicate);
+    my ($join_aliases, $through_aliases) = _association_alias_maps(@association_paths);
+    local $self->{_join_aliases} = $join_aliases;
+    local $self->{_through_aliases} = $through_aliases;
+    $self->_validate_query_aliases($sources, @association_paths);
+    for my $path (@association_paths) {
+        my $resolved = $domain->resolve_association($path);
+        my $association = $resolved->{association};
         my $keyword = $association->join_type eq 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
-        my $target_alias = $self->_join_alias($name);
+        my @segments = split /\./, $path;
+        pop @segments;
+        my $parent_alias = @segments ? $self->_join_alias(join('.', @segments)) : $self->_root_alias;
+        my $target_alias = $self->_join_alias($path);
         if (my $through = $association->through) {
-            my $bridge_alias = $self->_through_alias($name);
+            my $bridge_alias = $self->_through_alias($path);
             my @bridge_on = (
-                $self->_qualified('s0', $association->owner_key) . ' = ' .
+                $self->_qualified($parent_alias, $association->owner_key) . ' = ' .
                     $self->_qualified($bridge_alias, $through->{owner_key}),
             );
             my @target_on = (
@@ -52,7 +134,7 @@ sub compile {
             );
             if (defined $through->{source_scope_key}) {
                 push @bridge_on,
-                    $self->_qualified('s0', $through->{source_scope_key}) . ' = ' .
+                    $self->_qualified($parent_alias, $through->{source_scope_key}) . ' = ' .
                     $self->_qualified($bridge_alias, $through->{through_scope_key});
                 push @target_on,
                     $self->_qualified($bridge_alias, $through->{through_scope_key}) . ' = ' .
@@ -67,12 +149,12 @@ sub compile {
                 ' ON ' . join(' AND ', @bridge_on);
         } else {
             my @target_on = (
-                $self->_qualified('s0', $association->owner_key) . ' = ' .
-                $self->_qualified($target_alias, $association->related_key),
+                $self->_qualified($parent_alias, $association->owner_key) . ' = ' .
+                    $self->_qualified($target_alias, $association->related_key),
             );
             if (defined $association->source_scope_key) {
                 push @target_on,
-                    $self->_qualified('s0', $association->source_scope_key) . ' = ' .
+                    $self->_qualified($parent_alias, $association->source_scope_key) . ' = ' .
                     $self->_qualified($target_alias, $association->target_scope_key);
             }
             push @joins,
@@ -96,11 +178,24 @@ sub compile {
             : $expression_sql
     } @$selections;
     my @columns = map { $self->_selection_name($_) } @$selections;
+    push @joins, @{$self->_compile_cte_joins($domain, $query)};
+    push @joins, @{$self->_compile_lateral_joins($domain, $query, \@params)};
+    push @joins, @{$self->_compile_json_rowsets($domain, $query, \@params)};
+    push @joins, @{$options{extra_joins} // []};
     my $sql = 'SELECT ' . join(', ', @selection_sql) .
-        ' FROM ' . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier('s0');
+        ' FROM ' . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier($self->_root_alias);
     $sql .= ' ' . join(' ', @joins) if @joins;
-    $sql .= ' WHERE ' . $self->_compile_expression($domain, $predicate, \@params) if $predicate;
+    my @predicates;
+    push @predicates, $self->_compile_expression($domain, $predicate, \@params) if $predicate;
+    push @predicates, @{$options{extra_predicates} // []};
+    if (@predicates) {
+        $sql .= ' WHERE ' . (@predicates == 1
+            ? $predicates[0]
+            : join(' AND ', map { "($_)" } @predicates));
+    }
     my $groups = $query->groups;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support rollups')
+        if $query->grouping_mode eq 'rollup' && !$self->supports('rollup');
     my $group_sql = join(', ', map {
         my $key = _expression_key($_);
         exists($compiled_selections{$key})
@@ -143,11 +238,175 @@ sub compile {
         @$orders ? 1 : 0,
     );
     return Selecto::Statement->new(
-        sql => $sql,
+        sql => $with_sql . $sql,
         params => \@params,
         columns => \@columns,
         adapter_name => $self->name,
     );
+}
+
+sub _shift_placeholders {
+    my ($self, $sql, $offset) = @_;
+    return $sql unless $offset && $self->name eq 'postgresql';
+    $sql =~ s/\$(\d+)/q{$} . ($1 + $offset)/ge;
+    return $sql;
+}
+
+sub _query_sources {
+    my ($self, $domain, $query) = @_;
+    my %sources;
+    my $domain_associations = $domain->associations;
+    for my $spec (@{$query->ctes}, @{$query->lateral_joins}) {
+        Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
+            if exists $domain_associations->{$spec->{name}};
+        $sources{$spec->{name}} = {map { $_ => 1 } @{$spec->{columns}}};
+    }
+    for my $spec (@{$query->json_rowsets}) {
+        Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
+            if exists $domain_associations->{$spec->{name}};
+        $sources{$spec->{name}} = {map { $_ => 1 } keys %{$spec->{columns}}};
+    }
+    return \%sources;
+}
+
+sub _validate_query_aliases {
+    my ($self, $sources, @association_paths) = @_;
+    my %internal = ($self->_root_alias => 1);
+    for my $path (@association_paths) {
+        $internal{$self->_join_alias($path)} = 1;
+        $internal{$self->_through_alias($path)} = 1;
+    }
+    for my $name (sort keys %$sources) {
+        Selecto::Error->throw(
+            'invalid_query',
+            "query source $name conflicts with an internal relation alias",
+        ) if $internal{$name};
+    }
+}
+
+sub _compile_cte_prefix {
+    my ($self, $query) = @_;
+    my $ctes = $query->ctes;
+    return ('', []) unless @$ctes;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support CTEs')
+        unless $self->supports('cte');
+    my (@entries, @params);
+    my $recursive = 0;
+    for my $spec (@$ctes) {
+        my $columns = $spec->{columns};
+        my @statements;
+        if ($spec->{recursive}) {
+            Selecto::Error->throw('unsupported_feature', 'adapter does not support recursive CTEs')
+                unless $self->supports('recursive_cte');
+            $recursive = 1;
+            my $anchor = $self->compile($spec->{domain}, $spec->{anchor});
+            my $root_alias = 'r_' . $spec->{name};
+            my $join = $spec->{recursive_join};
+            $spec->{domain}->resolve($join->{owner_key});
+            my $recursive_join = 'INNER JOIN ' . $self->quote_identifier($spec->{name}) .
+                ' AS ' . $self->quote_identifier('p_' . $spec->{name}) .
+                ' ON ' . $self->_qualified($root_alias, $join->{owner_key}) . ' = ' .
+                $self->_qualified('p_' . $spec->{name}, $join->{related_key});
+            my $member = $self->_compile_single(
+                $spec->{domain}, $spec->{recursive_query},
+                root_alias => $root_alias,
+                extra_joins => [$recursive_join],
+            );
+            push @statements, $anchor, $member;
+        } else {
+            push @statements, $self->compile($spec->{domain}, $spec->{query});
+        }
+        for my $statement (@statements) {
+            Selecto::Error->throw('invalid_query', 'CTE projection width does not match declared columns')
+                unless @{$statement->columns} == @$columns;
+        }
+        my @parts;
+        for my $statement (@statements) {
+            push @parts, $self->_shift_placeholders($statement->sql, scalar @params);
+            push @params, @{$statement->params};
+        }
+        my $body = join(' UNION ALL ', @parts);
+        push @entries,
+            $self->quote_identifier($spec->{name}) . ' (' .
+            join(', ', map { $self->quote_identifier($_) } @$columns) .
+            ") AS ($body)";
+    }
+    return (
+        'WITH ' . ($recursive ? 'RECURSIVE ' : '') . join(', ', @entries) . ' ',
+        \@params,
+    );
+}
+
+sub _compile_cte_joins {
+    my ($self, $domain, $query) = @_;
+    my @joins;
+    for my $spec (@{$query->ctes}) {
+        my $join = $spec->{join};
+        my $owner = $domain->resolve($join->{owner_key});
+        Selecto::Error->throw('invalid_query', 'CTE owner key must be a root field')
+            if $owner->{association};
+        my $keyword = $join->{type} eq 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
+        push @joins,
+            $keyword . ' ' . $self->quote_identifier($spec->{name}) .
+            ' AS ' . $self->quote_identifier($spec->{name}) .
+            ' ON ' . $self->_qualified($self->_root_alias, $join->{owner_key}) . ' = ' .
+            $self->_qualified($spec->{name}, $join->{related_key});
+    }
+    return \@joins;
+}
+
+sub _compile_lateral_joins {
+    my ($self, $domain, $query, $params) = @_;
+    my $laterals = $query->lateral_joins;
+    return [] unless @$laterals;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support lateral joins')
+        unless $self->supports('lateral_join');
+    my @joins;
+    for my $spec (@$laterals) {
+        my $child_alias = 'l_' . $spec->{name};
+        my @correlations;
+        for my $child (sort keys %{$spec->{correlations}}) {
+            my $parent = $spec->{correlations}{$child};
+            my $child_field = $spec->{domain}->resolve($child);
+            my $parent_field = $domain->resolve($parent);
+            Selecto::Error->throw('invalid_query', 'lateral correlations require root fields')
+                if $child_field->{association} || $parent_field->{association};
+            push @correlations,
+                $self->_qualified($child_alias, $child) . ' = ' .
+                $self->_qualified($self->_root_alias, $parent);
+        }
+        my $statement = $self->_compile_single(
+            $spec->{domain}, $spec->{query},
+            root_alias => $child_alias,
+            extra_predicates => \@correlations,
+        );
+        Selecto::Error->throw('invalid_query', 'lateral projection width does not match declared columns')
+            unless @{$statement->columns} == @{$spec->{columns}};
+        my $sql = $self->_shift_placeholders($statement->sql, scalar @$params);
+        push @$params, @{$statement->params};
+        my $keyword = $spec->{type} eq 'cross' ? 'CROSS JOIN LATERAL'
+            : $spec->{type} eq 'inner' ? 'INNER JOIN LATERAL' : 'LEFT JOIN LATERAL';
+        push @joins,
+            $keyword . ' (' . $sql . ') AS ' . $self->quote_identifier($spec->{name}) .
+            ($spec->{type} eq 'cross' ? '' : ' ON TRUE');
+    }
+    return \@joins;
+}
+
+sub _compile_json_rowsets {
+    my ($self, $domain, $query, $params) = @_;
+    my $rowsets = $query->json_rowsets;
+    return [] unless @$rowsets;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support JSON rowsets')
+        unless $self->supports('json_rowset');
+    return [map {
+        $self->_compile_json_rowset_join($domain, $_, $params)
+    } @$rowsets];
+}
+
+sub _compile_json_rowset_join {
+    my ($self, $domain, $spec, $params) = @_;
+    Selecto::Error->throw('unsupported_feature', 'JSON rowsets are not supported by this SQL dialect');
 }
 
 sub _single_rollup_grouping_position {
@@ -178,6 +437,33 @@ sub execute_query {
     };
     die $self->normalize_error($@) unless $ok;
     return { columns => $statement->columns, rows => \@rows };
+}
+
+sub stream_query {
+    my ($self, $statement, %options) = @_;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support streaming')
+        unless $self->supports('stream');
+    Selecto::Error->throw('invalid_stream', 'stream_query requires a Selecto statement')
+        unless blessed($statement) && $statement->isa('Selecto::Statement');
+    my $fetch_size = $options{fetch_size} // 500;
+    Selecto::Error->throw('invalid_stream', 'fetch_size must be a positive integer')
+        unless defined($fetch_size) && !ref($fetch_size) && "$fetch_size" =~ /\A[1-9]\d*\z/;
+    my ($sth, @types);
+    my $ok = eval {
+        $sth = $self->{dbh}->prepare($statement->sql);
+        eval { $sth->{RowCacheSize} = int($fetch_size) };
+        $sth->execute(@{$statement->params});
+        @types = $self->_column_types($sth);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return Selecto::Stream->new(
+        sth => $sth,
+        columns => $statement->columns,
+        types => \@types,
+        decode => sub { return $self->_decode(@_); },
+        normalize_error => sub { return $self->normalize_error($_[0]); },
+    );
 }
 
 sub preview_write {
@@ -336,6 +622,8 @@ sub _compile_expression {
     }
     return $self->_compile_related_collection($domain, $expression)
         if $kind eq 'related_collection';
+    return $self->_compile_window($domain, $expression, $params)
+        if $kind eq 'window';
     return 'COUNT(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
         if $kind eq 'count_field';
     return 'COUNT(DISTINCT ' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
@@ -347,7 +635,7 @@ sub _compile_expression {
     }
     return $self->_compile_dialect_expression($domain, $expression, $params)
         if $kind eq 'count_bucket' || $kind eq 'bucket' || $kind eq 'datetime_format'
-            || $kind eq 'epoch_datetime';
+            || $kind eq 'epoch_datetime' || $kind eq 'text_search' || $kind eq 'text_rank';
     if ($kind eq 'avg' || $kind eq 'sum' || $kind eq 'min' || $kind eq 'max') {
         return uc($kind) . '(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')';
     }
@@ -355,6 +643,112 @@ sub _compile_expression {
         return 'SUM(COALESCE(' . $self->_compile_expression($domain, $arguments->[0], $params) . ', 0))';
     }
     Selecto::Error->throw('invalid_query', "unsupported expression $kind");
+}
+
+sub _compile_window {
+    my ($self, $domain, $expression, $params) = @_;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support window functions')
+        unless $self->supports('window_functions');
+    my ($function, $arguments, $over) = @{$expression->arguments};
+    my %functions = map { $_ => 1 } qw(
+        row_number rank dense_rank percent_rank cume_dist ntile
+        lag lead first_value last_value nth_value
+        count sum avg min max
+    );
+    Selecto::Error->throw('invalid_query', 'window function is not available')
+        unless defined($function) && $functions{$function};
+    Selecto::Error->throw('invalid_query', 'window arguments must be an array')
+        unless ref($arguments) eq 'ARRAY';
+    Selecto::Error->throw('invalid_query', 'window specification must be an object')
+        unless ref($over) eq 'HASH';
+    _validate_window_arity($function, scalar @$arguments);
+    my $argument_sql = join(', ', map {
+        $self->_compile_expression($domain, $_, $params)
+    } @$arguments);
+    $argument_sql = '*' if $function eq 'count' && !@$arguments;
+    my $call = uc($function) . '(' . $argument_sql . ')';
+    my @clauses;
+    my $partitions = $over->{partition_by} // [];
+    Selecto::Error->throw('invalid_query', 'window partition_by must be an array')
+        unless ref($partitions) eq 'ARRAY';
+    push @clauses, 'PARTITION BY ' . join(', ', map {
+        $self->_compile_expression($domain, $_, $params)
+    } @$partitions) if @$partitions;
+    my $orders = $over->{order_by} // [];
+    Selecto::Error->throw('invalid_query', 'window order_by must be an array')
+        unless ref($orders) eq 'ARRAY';
+    if (@$orders) {
+        push @clauses, 'ORDER BY ' . join(', ', map {
+            Selecto::Error->throw('invalid_query', 'window order entry is invalid')
+                unless ref($_) eq 'ARRAY' && @$_ == 2
+                    && ($_->[1] eq 'asc' || $_->[1] eq 'desc');
+            $self->_compile_expression($domain, $_->[0], $params) . ' ' . uc($_->[1]);
+        } @$orders);
+    }
+    push @clauses, $self->_compile_window_frame($over->{frame})
+        if exists($over->{frame});
+    return $call . ' OVER (' . join(' ', @clauses) . ')';
+}
+
+sub _compile_window_frame {
+    my ($self, $frame) = @_;
+    Selecto::Error->throw('invalid_query', 'window frame must be an object')
+        unless ref($frame) eq 'HASH';
+    my $type = uc($frame->{type} // 'rows');
+    Selecto::Error->throw('invalid_query', 'window frame type must be rows, range, or groups')
+        unless $type eq 'ROWS' || $type eq 'RANGE' || $type eq 'GROUPS';
+    Selecto::Error->throw('invalid_query', 'window frame requires start and end boundaries')
+        unless exists($frame->{start}) && exists($frame->{end});
+    my ($start_sql, $start_position) = _window_boundary($frame->{start});
+    my ($end_sql, $end_position) = _window_boundary($frame->{end});
+    Selecto::Error->throw('invalid_query', 'window frame start must not follow its end')
+        if $start_position > $end_position;
+    return "$type BETWEEN $start_sql AND $end_sql";
+}
+
+sub _validate_window_arity {
+    my ($function, $count) = @_;
+    my ($minimum, $maximum) = {
+        row_number => [0, 0], rank => [0, 0], dense_rank => [0, 0],
+        percent_rank => [0, 0], cume_dist => [0, 0], ntile => [1, 1],
+        lag => [1, 3], lead => [1, 3], first_value => [1, 1],
+        last_value => [1, 1], nth_value => [2, 2], count => [0, 1],
+        sum => [1, 1], avg => [1, 1], min => [1, 1], max => [1, 1],
+    }->{$function}->@*;
+    Selecto::Error->throw(
+        'invalid_query',
+        "window function $function has an invalid number of arguments",
+    ) if $count < $minimum || $count > $maximum;
+}
+
+sub _window_boundary {
+    my ($boundary) = @_;
+    if (!ref($boundary)) {
+        my %named = (
+            unbounded_preceding => 'UNBOUNDED PRECEDING',
+            current_row => 'CURRENT ROW',
+            unbounded_following => 'UNBOUNDED FOLLOWING',
+        );
+        if (defined($boundary) && exists($named{$boundary})) {
+            my %positions = (
+                unbounded_preceding => -9e99,
+                current_row => 0,
+                unbounded_following => 9e99,
+            );
+            return ($named{$boundary}, $positions{$boundary});
+        }
+    }
+    if (ref($boundary) eq 'HASH' && keys(%$boundary) == 1) {
+        for my $direction (qw(preceding following)) {
+            next unless exists $boundary->{$direction};
+            my $count = $boundary->{$direction};
+            Selecto::Error->throw('invalid_query', 'window frame offset must be a non-negative integer')
+                unless defined($count) && !ref($count) && "$count" =~ /\A\d+\z/;
+            my $position = $direction eq 'preceding' ? -int($count) : int($count);
+            return (int($count) . ' ' . uc($direction), $position);
+        }
+    }
+    Selecto::Error->throw('invalid_query', 'window frame boundary is invalid');
 }
 
 sub _compile_related_collection {
@@ -382,14 +776,14 @@ sub _compile_related_collection {
     my $quoted_alias = $self->quote_identifier($alias);
     my $table = $self->quote_identifier($association->table);
     my $related_key = $quoted_alias . '.' . $self->quote_identifier($association->related_key);
-    my $owner_key = $self->quote_identifier('s0') . '.' .
+    my $owner_key = $self->quote_identifier($self->_root_alias) . '.' .
         $self->quote_identifier($association->owner_key);
     my $from = "$table AS $quoted_alias";
     my @predicates = ("$related_key = $owner_key");
     if (defined $association->source_scope_key) {
         push @predicates,
             $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key) .
-            ' = ' . $self->_qualified('s0', $association->source_scope_key);
+            ' = ' . $self->_qualified($self->_root_alias, $association->source_scope_key);
     }
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
@@ -406,7 +800,7 @@ sub _compile_related_collection {
         if (defined $through->{source_scope_key}) {
             push @predicates,
                 $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
-                ' = ' . $self->_qualified('s0', $through->{source_scope_key});
+                ' = ' . $self->_qualified($self->_root_alias, $through->{source_scope_key});
             push @target_on,
                 $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
                 ' = ' . $quoted_alias . '.' . $self->quote_identifier($through->{target_scope_key});
@@ -584,10 +978,17 @@ sub _compile_bucket {
 
 sub _field_sql {
     my ($self, $domain, $path) = @_;
+    my @segments = split /\./, "$path", -1;
+    if (@segments == 2 && ref($self->{_query_sources}) eq 'HASH'
+        && exists($self->{_query_sources}{$segments[0]})) {
+        Selecto::Error->throw('unknown_field', "unknown query-source field $path")
+            unless $self->{_query_sources}{$segments[0]}{$segments[1]};
+        return $self->_qualified($segments[0], $segments[1]);
+    }
     my $resolved = $domain->resolve($path);
     my $table_alias = $resolved->{association}
-        ? $self->_join_alias($resolved->{association}->name)
-        : 's0';
+        ? $self->_join_alias($resolved->{association_path})
+        : $self->_root_alias;
     return $self->quote_identifier($table_alias) . '.' . $self->quote_identifier($resolved->{field});
 }
 
@@ -597,9 +998,14 @@ sub _referenced_associations {
     push @expressions, $predicate if $predicate;
     push @expressions, @{$query->groups};
     push @expressions, map { $_->[0] } @{$query->orders};
+    push @expressions, map {
+        Selecto::Expression->field($_->{source_field})
+    } @{$query->json_rowsets};
     my %names;
     $names{$_} = 1 for map { $self->_expression_associations($_) } @expressions;
-    return sort keys %names;
+    return sort {
+        scalar(split(/\./, $a)) <=> scalar(split(/\./, $b)) || $a cmp $b
+    } keys %names;
 }
 
 sub _expression_associations {
@@ -608,7 +1014,14 @@ sub _expression_associations {
     my $arguments = $expression->arguments;
     if ($expression->kind eq 'field') {
         my @segments = split /\./, $arguments->[0];
-        return @segments == 2 ? ($segments[0]) : ();
+        return () if @segments == 2 && ref($self->{_query_sources}) eq 'HASH'
+            && exists($self->{_query_sources}{$segments[0]});
+        pop @segments;
+        my @paths;
+        for my $index (0 .. $#segments) {
+            push @paths, join('.', @segments[0 .. $index]);
+        }
+        return @paths;
     }
     my @names;
     for my $argument (@$arguments) {
@@ -616,13 +1029,51 @@ sub _expression_associations {
             push @names, $self->_expression_associations($argument);
         } elsif (ref($argument) eq 'ARRAY') {
             push @names, map { $self->_expression_associations($_) } @$argument;
+        } elsif (ref($argument) eq 'HASH') {
+            push @names, map { $self->_expression_associations($argument->{$_}) }
+                sort keys %$argument;
         }
     }
     return @names;
 }
 
-sub _join_alias { return 'j_' . $_[1]; }
-sub _through_alias { return 't_' . $_[1]; }
+sub _association_alias_maps {
+    my @paths = @_;
+    my %groups;
+    for my $path (@paths) {
+        (my $base = $path) =~ s/\./__/g;
+        push @{$groups{$base}}, $path;
+    }
+    my (%joins, %through);
+    for my $base (keys %groups) {
+        my $collides = @{$groups{$base}} > 1;
+        for my $path (@{$groups{$base}}) {
+            my $suffix = $collides ? _encoded_association_path($path) : $base;
+            $joins{$path} = 'j_' . $suffix;
+            $through{$path} = 't_' . $suffix;
+        }
+    }
+    return (\%joins, \%through);
+}
+
+sub _encoded_association_path {
+    my ($path) = @_;
+    return 'path' . join('', map { '_' . length($_) . '_' . $_ } split /\./, $path);
+}
+
+sub _join_alias {
+    my ($self, $path) = @_;
+    return $self->{_join_aliases}{$path} if exists($self->{_join_aliases}{$path});
+    $path =~ s/\./__/g;
+    return 'j_' . $path;
+}
+sub _through_alias {
+    my ($self, $path) = @_;
+    return $self->{_through_aliases}{$path} if exists($self->{_through_aliases}{$path});
+    $path =~ s/\./__/g;
+    return 't_' . $path;
+}
+sub _root_alias { return $_[0]->{_root_alias} // 's0'; }
 sub _qualified {
     my ($self, $alias, $field) = @_;
     return $self->quote_identifier($alias) . '.' . $self->quote_identifier($field);
@@ -638,23 +1089,29 @@ sub _compile_write {
             if defined($command->query_enforcement) && $operation eq 'upsert';
         my @fields = sort keys %$assignments;
         Selecto::Error->throw('invalid_write', 'insert requires assignments') unless @fields;
-        my @params = map { $assignments->{$_} } @fields;
         my $insert_predicate = Selecto::QueryEnforcement::combine(
             $command->predicate,
             $command->scope_predicate,
             defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
         );
         if ($insert_predicate) {
-            my $truth = Selecto::QueryEnforcement::evaluate($insert_predicate, $assignments);
+            my $truth = Selecto::QueryEnforcement::evaluate(
+                $insert_predicate,
+                $self->_insert_candidate($assignments),
+            );
             Selecto::Error->throw(
                 'query_rule_violation',
                 'insert candidate does not satisfy the enforced query',
                 { truth_value => $truth },
             ) unless $truth eq 'true';
         }
+        my @params;
+        my @values = map {
+            $self->_compile_assignment_value($assignments->{$_}, \@params, $operation, 1)
+        } @fields;
         my $sql = 'INSERT INTO ' . $self->quote_identifier($relation) .
             ' (' . join(', ', map { $self->quote_identifier(_checked_identifier($_)) } @fields) . ')' .
-            ' VALUES (' . join(', ', map { $self->placeholder($_ + 1) } 0 .. $#fields) . ')';
+            ' VALUES (' . join(', ', @values) . ')';
         if ($operation eq 'upsert') {
             my $metadata = $command->metadata;
             my $conflict = $metadata->{conflict_target};
@@ -672,8 +1129,8 @@ sub _compile_write {
         Selecto::Error->throw('invalid_write', 'update requires assignments') unless @fields;
         my @params;
         my @set = map {
-            push @params, $assignments->{$_};
-            $self->quote_identifier(_checked_identifier($_)) . ' = ' . $self->placeholder(scalar @params)
+            $self->quote_identifier(_checked_identifier($_)) . ' = ' .
+                $self->_compile_assignment_value($assignments->{$_}, \@params, $operation, 1)
         } @fields;
         my $predicate = $self->_compile_write_predicate(
             Selecto::QueryEnforcement::combine(
@@ -698,6 +1155,75 @@ sub _compile_write {
         return $self->_append_returning('DELETE FROM ' . $self->quote_identifier($relation) . " WHERE $predicate", \@params, $command);
     }
     Selecto::Error->throw('invalid_write', "unsupported operation $operation");
+}
+
+sub _insert_candidate {
+    my ($self, $assignments) = @_;
+    my %candidate;
+    for my $field (keys %$assignments) {
+        my $value = $assignments->{$field};
+        if (blessed($value) && $value->isa('Selecto::Write::Expression')) {
+            next unless $value->kind eq 'literal';
+            $candidate{$field} = $value->arguments->[0];
+        } else {
+            $candidate{$field} = $value;
+        }
+    }
+    return \%candidate;
+}
+
+sub _compile_assignment_value {
+    my ($self, $value, $params, $operation, $top_level) = @_;
+    unless (blessed($value) && $value->isa('Selecto::Write::Expression')) {
+        push @$params, $value;
+        return $self->placeholder(scalar @$params);
+    }
+    return $self->_compile_mutation_expression($value, $params, $operation, $top_level);
+}
+
+sub _compile_mutation_expression {
+    my ($self, $expression, $params, $operation, $top_level) = @_;
+    Selecto::Error->throw('invalid_write', 'invalid mutation expression')
+        unless blessed($expression) && $expression->isa('Selecto::Write::Expression');
+    my $kind = $expression->kind;
+    my $arguments = $expression->arguments;
+    if ($kind eq 'literal') {
+        push @$params, $arguments->[0];
+        return $self->placeholder(scalar @$params);
+    }
+    return 'CURRENT_TIMESTAMP' if $kind eq 'current_timestamp';
+    if ($kind eq 'default') {
+        Selecto::Error->throw('invalid_write', 'DEFAULT must be a complete assignment value')
+            unless $top_level;
+        return $self->_compile_mutation_default($operation);
+    }
+    if ($kind eq 'field') {
+        Selecto::Error->throw(
+            'invalid_write',
+            'mutation field references are supported only by update assignments',
+        ) unless $operation eq 'update';
+        return $self->quote_identifier(_checked_identifier($arguments->[0]));
+    }
+    if ($kind =~ /\A(?:add|subtract|multiply|divide)\z/) {
+        my $operator = {
+            add => '+', subtract => '-', multiply => '*', divide => '/',
+        }->{$kind};
+        return '(' . $self->_compile_mutation_expression($arguments->[0], $params, $operation, 0) .
+            " $operator " . $self->_compile_mutation_expression($arguments->[1], $params, $operation, 0) . ')';
+    }
+    if ($kind eq 'coalesce') {
+        return 'COALESCE(' . join(', ', map {
+            $self->_compile_mutation_expression($_, $params, $operation, 0)
+        } @{$arguments->[0]}) . ')';
+    }
+    Selecto::Error->throw('invalid_write', "unsupported mutation expression $kind");
+}
+
+sub _compile_mutation_default {
+    my ($self, $operation) = @_;
+    Selecto::Error->throw('invalid_write', 'DEFAULT is not valid for this write operation')
+        unless $operation eq 'insert' || $operation eq 'upsert' || $operation eq 'update';
+    return 'DEFAULT';
 }
 
 sub _append_returning {

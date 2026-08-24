@@ -18,7 +18,9 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     query_library
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
-my %RELATION = map { $_ => 1 } qw(source_table primary_key fields columns associations tenant_field);
+my %RELATION = map { $_ => 1 } qw(
+    source_table primary_key fields columns associations tenant_field redact_fields
+);
 my %ASSOCIATION = map { $_ => 1 } qw(
     queryable owner_key related_key cardinality through source_scope_key target_scope_key
 );
@@ -36,10 +38,13 @@ sub new {
     _object($input, 'associations');
     for my $name (keys %$input) {
         my $association_name = _identifier($name, 'association');
-        $associations{$association_name} = Selecto::Domain::Association->new(
-            name => $association_name,
-            value => $input->{$name},
-        );
+        $associations{$association_name} =
+            blessed($input->{$name}) && $input->{$name}->isa('Selecto::Domain::Association')
+            ? $input->{$name}
+            : Selecto::Domain::Association->new(
+                name => $association_name,
+                value => $input->{$name},
+            );
     }
     my $self = bless {
         name         => _required_string($args{name}, 'name'),
@@ -162,26 +167,55 @@ sub _parse_canonical {
     my $joins = $raw->{joins} // {};
     _object($schemas, 'schemas');
     _object($joins, 'joins');
-    my $source_associations = $source->{associations} // {};
-    _object($source_associations, 'source associations');
-    my %associations;
+    my $associations = _canonical_associations(
+        $source, $schemas, $joins, $strict, '',
+    );
 
+    _required_key($raw, 'name', 'domain');
+    _required_key($source, 'source_table', 'source');
+    my $domain = $class->new(
+        name => $raw->{name},
+        table => $source->{source_table},
+        fields => _canonical_fields($source),
+        associations => $associations,
+        primary_key => $source->{primary_key} // 'id',
+        tenant_field => $source->{tenant_field},
+        components => $raw->{components},
+        query_library => $raw->{query_library},
+    );
+    $domain->{contract} = dclone($raw);
+    $domain->{canonical_schemas} = dclone($schemas);
+    $domain->{canonical_joins} = dclone($joins);
+    my $fingerprint_document = dclone($raw);
+    delete $fingerprint_document->{domain_fingerprint};
+    $domain->{fingerprint} = 'sha256:' . sha256_hex(
+        JSON::PP->new->canonical(1)->encode($fingerprint_document)
+    );
+    return $domain;
+}
+
+sub _canonical_associations {
+    my ($relation, $schemas, $joins, $strict, $prefix) = @_;
+    my $source_associations = $relation->{associations} // {};
+    _object($source_associations, $prefix eq '' ? 'source associations' : "schema $prefix associations");
+    my %associations;
     for my $name (keys %$source_associations) {
         my $association = $source_associations->{$name};
-        _object($association, "association $name");
-        _reject_unknown($association, \%ASSOCIATION, "association $name") if $strict;
-        _required_key($association, 'queryable', "association $name");
+        my $path = $prefix eq '' ? "$name" : "$prefix.$name";
+        _object($association, "association $path");
+        _reject_unknown($association, \%ASSOCIATION, "association $path") if $strict;
+        _required_key($association, 'queryable', "association $path");
         my $queryable = $association->{queryable};
         Selecto::Error->throw('invalid_domain', "missing schema $queryable")
             unless exists $schemas->{$queryable};
         my $target = $schemas->{$queryable};
         _object($target, "schema $queryable");
         _reject_unknown($target, \%RELATION, "schema $queryable") if $strict;
-        my $join = $joins->{$name} // {};
-        _object($join, "join $name");
-        _reject_unknown($join, \%JOIN, "join $name") if $strict;
+        my $join = $joins->{$path} // $joins->{$name} // {};
+        _object($join, "join $path");
+        _reject_unknown($join, \%JOIN, "join $path") if $strict;
         for my $key (qw(owner_key related_key)) {
-            _required_key($association, $key, "association $name");
+            _required_key($association, $key, "association $path");
         }
         _required_key($target, 'source_table', "schema $queryable");
         my $join_mode = lc(_required_string($join->{type} // 'left', 'join type'));
@@ -192,42 +226,32 @@ sub _parse_canonical {
         my $cardinality = $association->{cardinality};
         $cardinality = $association->{related_key} eq $target_primary_key ? 'one' : 'many'
             unless defined $cardinality;
-        $associations{$name} = {
-            table => $target->{source_table},
-            fields => _canonical_fields($target),
-            owner_key => $association->{owner_key},
-            related_key => $association->{related_key},
-            target_primary_key => $target_primary_key,
-            cardinality => $cardinality,
-            join_type => $join_mode eq 'star_dimension' ? 'left' : $join_mode,
-            join_mode => $join_mode,
-            (exists($association->{source_scope_key}) ? (
-                source_scope_key => $association->{source_scope_key},
-                target_scope_key => $association->{target_scope_key},
-            ) : ()),
-            (exists($association->{through}) ? (through => $association->{through}) : ()),
-            ($join_mode eq 'star_dimension' ? (
-                display_field => $join->{display_field} // 'name',
-                dimension_key => $join->{dimension_key} // $association->{owner_key},
-                display_name => $join->{name} // $name,
-            ) : ()),
-        };
+        $associations{$name} = Selecto::Domain::Association->new(
+            name => $name,
+            value => {
+                table => $target->{source_table},
+                fields => _canonical_fields($target),
+                owner_key => $association->{owner_key},
+                related_key => $association->{related_key},
+                target_primary_key => $target_primary_key,
+                cardinality => $cardinality,
+                join_type => $join_mode eq 'star_dimension' ? 'left' : $join_mode,
+                join_mode => $join_mode,
+                queryable => "$queryable",
+                (exists($association->{source_scope_key}) ? (
+                    source_scope_key => $association->{source_scope_key},
+                    target_scope_key => $association->{target_scope_key},
+                ) : ()),
+                (exists($association->{through}) ? (through => $association->{through}) : ()),
+                ($join_mode eq 'star_dimension' ? (
+                    display_field => $join->{display_field} // 'name',
+                    dimension_key => $join->{dimension_key} // $association->{owner_key},
+                    display_name => $join->{name} // $name,
+                ) : ()),
+            },
+        );
     }
-
-    _required_key($raw, 'name', 'domain');
-    _required_key($source, 'source_table', 'source');
-    my $domain = $class->new(
-        name => $raw->{name},
-        table => $source->{source_table},
-        fields => _canonical_fields($source),
-        associations => \%associations,
-        primary_key => $source->{primary_key} // 'id',
-        tenant_field => $source->{tenant_field},
-        components => $raw->{components},
-        query_library => $raw->{query_library},
-    );
-    $domain->{contract} = dclone($raw);
-    return $domain;
+    return \%associations;
 }
 
 sub _canonical_fields {
@@ -271,18 +295,154 @@ sub resolve {
         my $field = $segments[0];
         Selecto::Error->throw('unknown_field', "unknown field $path")
             unless exists $self->{fields}{$field};
-        return { association => undef, field => $field, type => $self->{fields}{$field} };
+        return {
+            association => undef, associations => [], association_path => undef,
+            field => $field, type => $self->{fields}{$field},
+        };
     }
-    if (@segments == 2) {
-        my ($association_name, $field) = @segments;
-        Selecto::Error->throw('unknown_association', "unknown association $association_name")
-            unless exists $self->{associations}{$association_name};
-        my $association = $self->{associations}{$association_name};
-        Selecto::Error->throw('unknown_field', "unknown field $path")
-            unless exists $association->{fields}{$field};
-        return { association => $association, field => $field, type => $association->{fields}{$field} };
+    my $field = pop @segments;
+    my $resolved = $self->resolve_association(join('.', @segments));
+    my $association = $resolved->{association};
+    my $fields = $association->fields;
+    Selecto::Error->throw('unknown_field', "unknown field $path")
+        unless exists $fields->{$field};
+    return {
+        association => $association,
+        associations => $resolved->{associations},
+        association_path => join('.', @segments),
+        field => $field,
+        type => $fields->{$field},
+    };
+}
+
+sub resolve_association {
+    my ($self, $path) = @_;
+    my @segments = split /\./, defined($path) ? "$path" : '', -1;
+    Selecto::Error->throw('invalid_field', 'association path must not be empty')
+        unless @segments && !grep { $_ eq '' } @segments;
+    my $associations = $self->{associations};
+    my @resolved;
+    my $prefix = '';
+    for my $name (@segments) {
+        my $full_path = $prefix eq '' ? $name : "$prefix.$name";
+        my $association = $associations->{$name};
+        Selecto::Error->throw('unknown_association', "unknown association $full_path")
+            unless $association;
+        push @resolved, $association;
+        $prefix = $full_path;
+        my $queryable = $association->queryable;
+        if (defined($queryable) && ref($self->{canonical_schemas}) eq 'HASH') {
+            my $relation = $self->{canonical_schemas}{$queryable};
+            Selecto::Error->throw('invalid_domain', "missing schema $queryable") unless $relation;
+            $associations = _canonical_associations(
+                $relation,
+                $self->{canonical_schemas},
+                $self->{canonical_joins} // {},
+                1,
+                $prefix,
+            );
+        } else {
+            $associations = $association->associations;
+        }
     }
-    Selecto::Error->throw('invalid_field', 'field paths may contain at most one association');
+    return {
+        association => $resolved[-1],
+        associations => \@resolved,
+        association_path => $prefix,
+    };
+}
+
+sub compose {
+    my ($invocant, @args) = @_;
+    my ($base, @overlays) = ref($invocant) ? ($invocant, @args) : @args;
+    require Selecto::Domain::Overlay;
+    return Selecto::Domain::Overlay->compose($base, @overlays);
+}
+
+sub as_contract {
+    my ($self) = @_;
+    return dclone($self->{contract}) if defined $self->{contract};
+    Selecto::Error->throw(
+        'invalid_domain_overlay',
+        'runtime predicate domains cannot be converted to portable overlay contracts',
+    ) if defined $self->{required_predicate};
+
+    my %columns = map {
+        $_ => {type => $self->{fields}{$_}}
+    } sort keys %{$self->{fields}};
+    my (%schemas, %joins);
+    my $source_associations = _portable_associations(
+        $self->{associations}, [], \%schemas, \%joins,
+    );
+
+    my $contract = {
+        schema_version => 1,
+        name => $self->{name},
+        source => {
+            source_table => $self->{table},
+            primary_key => $self->{primary_key},
+            fields => [sort keys %{$self->{fields}}],
+            columns => \%columns,
+            associations => $source_associations,
+            (defined($self->{tenant_field}) ? (tenant_field => $self->{tenant_field}) : ()),
+        },
+        schemas => \%schemas,
+        joins => \%joins,
+    };
+    $contract->{components} = dclone($self->{components}) if keys %{$self->{components}};
+    $contract->{query_library} = dclone($self->{query_library})
+        if keys %{$self->{query_library}};
+    return $contract;
+}
+
+sub _portable_associations {
+    my ($associations, $parent_path, $schemas, $joins) = @_;
+    my %references;
+    for my $name (sort keys %$associations) {
+        my $association = $associations->{$name};
+        my @path = (@$parent_path, $name);
+        my $path = join('.', @path);
+        my $schema_name = _portable_schema_name(@path);
+        my $fields = $association->fields;
+        my $target_primary_key = $association->target_primary_key
+            // (exists($fields->{id}) ? 'id' : (sort keys %$fields)[0]);
+        my %target_columns = map {
+            $_ => {type => $fields->{$_}}
+        } sort keys %$fields;
+        $schemas->{$schema_name} = {
+            source_table => $association->table,
+            primary_key => $target_primary_key,
+            fields => [sort keys %$fields],
+            columns => \%target_columns,
+            associations => _portable_associations(
+                $association->associations, \@path, $schemas, $joins,
+            ),
+        };
+        $references{$name} = {
+            queryable => $schema_name,
+            owner_key => $association->owner_key,
+            related_key => $association->related_key,
+            cardinality => $association->cardinality,
+            (defined($association->source_scope_key) ? (
+                source_scope_key => $association->source_scope_key,
+                target_scope_key => $association->target_scope_key,
+            ) : ()),
+            (defined($association->through) ? (through => $association->through) : ()),
+        };
+        $joins->{$path} = {
+            type => $association->join_mode,
+            ($association->join_mode eq 'star_dimension' ? (
+                name => $association->display_name,
+                display_field => $association->display_field,
+                dimension_key => $association->dimension_key,
+            ) : ()),
+        };
+    }
+    return \%references;
+}
+
+sub _portable_schema_name {
+    return 'q' . join('', map { '_' . length($_) . '_' . $_ } @_);
 }
 
 sub _normalize_fields {
@@ -401,6 +561,16 @@ sub new {
     Selecto::Error->throw('invalid_domain', "unsupported join type $join_type")
         unless $join_type eq 'left' || $join_type eq 'inner';
     my $fields = Selecto::Domain::_normalize_fields($value->{fields}, 'association fields');
+    my %associations;
+    my $nested = $value->{associations} // {};
+    Selecto::Domain::_object($nested, "association $args{name} associations");
+    for my $name (keys %$nested) {
+        my $association_name = Selecto::Domain::_identifier($name, 'association');
+        $associations{$association_name} = __PACKAGE__->new(
+            name => $association_name,
+            value => $nested->{$name},
+        );
+    }
     my $cardinality = lc(Selecto::Domain::_required_string(
         $value->{cardinality} // 'one', 'association cardinality'
     ));
@@ -482,6 +652,8 @@ sub new {
         name => Selecto::Domain::_identifier($args{name}, 'association'),
         table => Selecto::Domain::_identifier($value->{table}, 'association table'),
         fields => $fields,
+        associations => \%associations,
+        (defined($value->{queryable}) ? (queryable => "$value->{queryable}") : ()),
         owner_key => Selecto::Domain::_identifier($value->{owner_key}, 'owner key'),
         related_key => Selecto::Domain::_identifier($value->{related_key}, 'related key'),
         cardinality => $cardinality,
@@ -506,6 +678,13 @@ sub fingerprint_value {
     return {
         table => $self->{table},
         fields => { %{$self->{fields}} },
+        (defined($self->{queryable}) ? (queryable => $self->{queryable}) : ()),
+        (keys(%{$self->{associations} // {}}) ? (
+            associations => {
+                map { $_ => $self->{associations}{$_}->fingerprint_value }
+                    sort keys %{$self->{associations}}
+            },
+        ) : ()),
         owner_key => $self->{owner_key},
         related_key => $self->{related_key},
         join_type => $self->{join_type},
@@ -529,6 +708,8 @@ sub fingerprint_value {
 sub name        { return $_[0]->{name}; }
 sub table       { return $_[0]->{table}; }
 sub fields      { return { %{$_[0]->{fields}} }; }
+sub associations { return { %{$_[0]->{associations} // {}} }; }
+sub queryable   { return $_[0]->{queryable}; }
 sub owner_key   { return $_[0]->{owner_key}; }
 sub related_key { return $_[0]->{related_key}; }
 sub join_type   { return $_[0]->{join_type}; }

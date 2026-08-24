@@ -32,7 +32,9 @@ sub normalize_type {
 
 sub supports {
     my ($self, $feature) = @_;
-    return "$feature" eq 'transactions' ? 1 : 0;
+    return "$feature" eq 'transactions' || "$feature" eq 'set_operations'
+        || "$feature" eq 'window_functions' || "$feature" eq 'cte'
+        || "$feature" eq 'stream' ? 1 : 0;
 }
 
 sub _compile_pagination {
@@ -70,7 +72,10 @@ sub _compile_write {
     }
 
     my @quoted = map { $self->quote_identifier(_checked_identifier($_)) } @fields;
-    my @params = map { $assignments->{$_} } @fields;
+    my @params;
+    my @values = map {
+        $self->_compile_assignment_value($assignments->{$_}, \@params, 'upsert', 1)
+    } @fields;
     my @source = map { 'source.' . $_ } @quoted;
     my @matches = map {
         my $field = $self->quote_identifier(_checked_identifier($_));
@@ -82,11 +87,20 @@ sub _compile_write {
     } @$updates;
 
     my $sql = 'MERGE INTO ' . $self->quote_identifier($relation) . ' WITH (HOLDLOCK) AS target ' .
-        'USING (VALUES (' . join(', ', map { '?' } @fields) . ')) AS source (' . join(', ', @quoted) . ') ' .
+        'USING (VALUES (' . join(', ', @values) . ')) AS source (' . join(', ', @quoted) . ') ' .
         'ON ' . join(' AND ', @matches) . ' ' .
         'WHEN MATCHED THEN UPDATE SET ' . join(', ', @sets) . ' ' .
         'WHEN NOT MATCHED THEN INSERT (' . join(', ', @quoted) . ') VALUES (' . join(', ', @source) . ');';
     return { sql => $sql, params => \@params };
+}
+
+sub _compile_mutation_default {
+    my ($self, $operation) = @_;
+    Selecto::Error->throw(
+        'invalid_write',
+        'SQL Server MERGE does not support DEFAULT in its portable source row',
+    ) if $operation eq 'upsert';
+    return $self->SUPER::_compile_mutation_default($operation);
 }
 
 sub _logical_affected_rows {

@@ -11,6 +11,10 @@ use Selecto::Adapter::Registry ();
 use Selecto::Action ();
 use Selecto::API ();
 use Selecto::Domain ();
+use Selecto::Domain::DSL ();
+use Selecto::Domain::Overlay ();
+use Selecto::Domain::Ref ();
+use Selecto::Domain::Registry ();
 use Selecto::DuckDB ();
 use Selecto::Engine ();
 use Selecto::Error ();
@@ -23,7 +27,9 @@ use Selecto::QueryLibrary ();
 use Selecto::SQL ();
 use Selecto::SQLite ();
 use Selecto::Statement ();
+use Selecto::Stream ();
 use Selecto::Write ();
+use Selecto::Write::Expression ();
 
 sub adapter {
     my ($class, $name, %args) = @_;
@@ -31,6 +37,16 @@ sub adapter {
 }
 
 sub available_adapters { return Selecto::Adapter::Registry->default->names; }
+
+sub domain_registry {
+    my ($class, %args) = @_;
+    return Selecto::Domain::Registry->new(%args);
+}
+
+sub engine_registered {
+    my ($class, %args) = @_;
+    return Selecto::Engine->from_registry(%args);
+}
 
 1;
 

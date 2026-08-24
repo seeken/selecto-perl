@@ -20,15 +20,135 @@ $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_grandchildren');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_parents');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_events');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_employees');
 $dbh->do('CREATE TABLE selecto_perl_test_items (id integer primary key, name text not null)');
-$dbh->do(q{INSERT INTO selecto_perl_test_items VALUES (1, 'baseline')});
+$dbh->do('ALTER TABLE selecto_perl_test_items ADD COLUMN amount numeric NOT NULL DEFAULT 10');
+$dbh->do(q{ALTER TABLE selecto_perl_test_items ADD COLUMN payload jsonb NOT NULL DEFAULT '[]'::jsonb});
+$dbh->do(q{INSERT INTO selecto_perl_test_items (id, name, payload) VALUES (1, 'baseline', '[{"sku":"A-1","quantity":2}]')});
+$dbh->do('CREATE TABLE selecto_perl_test_events (id integer primary key, item_id integer not null, kind text not null)');
+$dbh->do(q{INSERT INTO selecto_perl_test_events VALUES (1, 1, 'status')});
+$dbh->do('CREATE TABLE selecto_perl_test_employees (id integer primary key, manager_id integer, name text not null)');
+$dbh->do(q{INSERT INTO selecto_perl_test_employees VALUES (1, NULL, 'CEO'), (2, 1, 'Lead'), (3, 2, 'Engineer')});
 
 my $domain = Selecto::Domain->new(
-    name => 'Items', table => 'selecto_perl_test_items', fields => { id => 'integer', name => 'string' },
+    name => 'Items', table => 'selecto_perl_test_items',
+    fields => { id => 'integer', name => 'string', amount => 'decimal', payload => 'jsonb' },
 );
 my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
 my $result = $engine->all($engine->query->select('id', 'name')->order_by('id'));
 is_deeply($result, { columns => ['id', 'name'], rows => [[1, 'baseline']] }, 'public query API executes through DBD::Pg');
+
+my $set_result = $engine->all(
+    $engine->query->select('id')->where(Selecto::Expression->eq('id', 1))
+        ->union_all($engine->query->select('id')->where(Selecto::Expression->eq('id', 1)))
+        ->intersect($engine->query->select('id')->where(Selecto::Expression->eq('id', 999))),
+);
+is_deeply($set_result->{rows}, [],
+    'PostgreSQL executes mixed set operations with portable left-to-right semantics');
+
+my $window_result = $engine->all(
+    $engine->query->select(
+        'id', Selecto::Expression->row_number(order_by => [['id', 'asc']])->as('position'),
+    ),
+);
+is_deeply($window_result->{rows}, [[1, 1]], 'PostgreSQL executes a governed window function');
+
+my $cte_source = $engine->query->select('id', 'name')
+    ->where(Selecto::Expression->eq('id', 1));
+my $cte_result = $engine->all(
+    $engine->query
+        ->with_cte(
+            'selected_items', $domain, $cte_source,
+            columns => [qw(id name)],
+            join => {owner_key => 'id', related_key => 'id', type => 'inner'},
+        )
+        ->select('id', 'selected_items.name'),
+);
+is_deeply($cte_result->{rows}, [[1, 'baseline']], 'PostgreSQL executes a governed CTE');
+
+my $employees = Selecto::Domain->new(
+    name => 'Employees', table => 'selecto_perl_test_employees',
+    fields => {id => 'integer', manager_id => 'integer', name => 'string'},
+);
+my $employee_engine = Selecto::Engine->new(domain => $employees, adapter => $engine->adapter);
+my $employee_anchor = $employee_engine->query->select(qw(id manager_id name))
+    ->where(Selecto::Expression->is_null('manager_id'));
+my $employee_member = $employee_engine->query->select(qw(id manager_id name));
+my $tree_result = $employee_engine->all(
+    $employee_engine->query
+        ->with_recursive_cte(
+            'employee_tree', $employees, $employee_anchor, $employee_member,
+            columns => [qw(id manager_id name)],
+            join => {owner_key => 'id', related_key => 'id', type => 'inner'},
+            recursive_join => {owner_key => 'manager_id', related_key => 'id', type => 'inner'},
+        )
+        ->select('id', 'employee_tree.name')
+        ->order_by('id'),
+);
+is_deeply(
+    $tree_result->{rows},
+    [[1, 'CEO'], [2, 'Lead'], [3, 'Engineer']],
+    'PostgreSQL executes a three-level recursive CTE',
+);
+
+my $rollup_result = $engine->all(
+    $engine->query->select(
+        'name',
+        Selecto::Expression->count->as('item_count'),
+        Selecto::Expression->grouping('name')->as('__selecto_rollup_grouping'),
+    )->group_by_rollup('name')->order_by('name'),
+);
+is_deeply(
+    $rollup_result->{rows},
+    [[undef, 1, 1], ['baseline', 1, 0]],
+    'PostgreSQL executes a rollup with an explicit grand-total marker',
+);
+
+my $events_domain = Selecto::Domain->new(
+    name => 'Events', table => 'selecto_perl_test_events',
+    fields => {id => 'integer', item_id => 'integer', kind => 'string'},
+);
+my $event_query = Selecto::Query->new->select('item_id', 'kind')
+    ->where(Selecto::Expression->eq('kind', 'status'));
+my $lateral_result = $engine->all(
+    $engine->query
+        ->lateral_join(
+            'events', $events_domain, $event_query,
+            columns => [qw(item_id kind)], correlations => {item_id => 'id'},
+        )
+        ->select('id', 'events.kind'),
+);
+is_deeply($lateral_result->{rows}, [[1, 'status']],
+    'PostgreSQL executes a correlated lateral subquery');
+
+my $json_result = $engine->all(
+    $engine->query
+        ->json_rowset('payload', 'payload_items', {sku => 'string', quantity => 'integer'})
+        ->select('id', 'payload_items.sku', 'payload_items.quantity'),
+);
+is_deeply($json_result->{rows}, [[1, 'A-1', 2]],
+    'PostgreSQL executes a typed JSON rowset');
+
+my $search_result = $engine->all(
+    $engine->query->select('id')->where(
+        Selecto::Expression->text_search(['name'], 'baseline', configuration => 'english'),
+    ),
+);
+is_deeply($search_result->{rows}, [[1]], 'PostgreSQL executes governed full-text search');
+
+my $stream = $engine->stream($engine->query->select('id', 'name')->order_by('id'), fetch_size => 1);
+is_deeply($stream->next, [1, 'baseline'], 'PostgreSQL streams one decoded row at a time');
+is($stream->next, undef, 'PostgreSQL streaming closes at exhaustion');
+
+my $mutation = $engine->execute_write(Selecto::Write::Command->new(
+    operation => 'update', relation => 'selecto_perl_test_items',
+    assignments => {amount => Selecto::Write::Expression->increment('amount', 1.25)},
+    predicate => Selecto::Expression->eq('id', 1),
+));
+is($mutation->affected_rows, 1, 'PostgreSQL executes an adapter-independent mutation expression');
+is($dbh->selectrow_array('SELECT amount FROM selecto_perl_test_items WHERE id = 1'), 11.25,
+    'PostgreSQL applies the mutation expression atomically');
 
 my $first = Selecto::Write::Command->new(
     operation => 'insert', relation => 'selecto_perl_test_items', assignments => { id => 2, name => 'must-roll-back' },
@@ -195,6 +315,8 @@ $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_grandchildren');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_parents');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_events');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_employees');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_items');
 $dbh->disconnect;
 done_testing;
