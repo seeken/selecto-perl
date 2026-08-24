@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
+use Selecto::Expression ();
 use lib 't/lib';
 use TestSelecto;
 
@@ -25,6 +26,16 @@ my $domain = TestSelecto::orders_domain();
 is($domain->resolve('id')->{type}, 'integer', 'resolves a root field');
 is($domain->resolve('person.name')->{type}, 'string', 'resolves a joined field');
 like($domain->fingerprint, qr/\Asha256:[0-9a-f]{64}\z/, 'domain is fingerprinted');
+
+my $scoped = $domain->with_required_predicate(
+    Selecto::Expression->in('person_id', [7, 11]),
+);
+is($domain->required_predicate, undef, 'scoping a domain does not mutate the shared domain');
+isa_ok($scoped->required_predicate, 'Selecto::Expression');
+isnt($scoped->fingerprint, $domain->fingerprint,
+    'the mandatory visibility predicate participates in the scoped fingerprint');
+is_deeply($scoped->contract, $domain->contract,
+    'a scoped domain retains its canonical contract metadata');
 
 my $canonical = Selecto::Domain->parse(JSON::PP->new->encode({
     schema_version => 1,

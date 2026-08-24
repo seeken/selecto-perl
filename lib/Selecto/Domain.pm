@@ -108,12 +108,19 @@ sub new {
             { association => $association->name },
         ) unless $association->dimension_key eq $association->owner_key;
     }
+    $self->_refresh_fingerprint;
+    return $self;
+}
+
+sub _refresh_fingerprint {
+    my ($self) = @_;
     my $fingerprint_value = {
         name => $self->{name},
         table => $self->{table},
         fields => $self->{fields},
         associations => {
-            map { $_ => $self->{associations}{$_}->fingerprint_value } sort keys %associations
+            map { $_ => $self->{associations}{$_}->fingerprint_value }
+                sort keys %{$self->{associations}}
         },
         primary_key => $self->{primary_key},
         required_predicate => _expression_value($self->{required_predicate}),
@@ -125,6 +132,13 @@ sub new {
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
     $self->{fingerprint} = 'sha256:' . sha256_hex($json);
     return $self;
+}
+
+sub with_required_predicate {
+    my ($self, $predicate) = @_;
+    my $copy = bless {%$self}, ref($self);
+    $copy->{required_predicate} = $predicate;
+    return $copy->_refresh_fingerprint;
 }
 
 sub parse {
