@@ -28,7 +28,7 @@ sub normalize_type {
 
 sub supports {
     my ($self, $feature) = @_;
-    return "$feature" eq 'transactions' ? 1 : 0;
+    return "$feature" eq 'transactions' || "$feature" eq 'stream' ? 1 : 0;
 }
 
 sub _compile_upsert_clause {

@@ -12,25 +12,33 @@ protocol 1 and certification specification 2.3.0.
 ## Current surface
 
 - strict simplified and canonical schema-v1 JSON domain parsing;
-- validated root and one-hop relationship field resolution;
+- validated root and arbitrary-depth relationship field resolution with
+  collision-safe SQL aliases and retained relationship lineage;
 - canonical relationship cardinality inference and correlated JSON collections
   for to-many child data without multiplying root rows;
 - deterministic SHA-256 domain fingerprints;
+- deterministic domain overlays, a fluent overlay DSL, and fail-closed named
+  domain registries with opaque provenance references;
 - canonical component policy metadata, including domain-selected private URL
   state for compatible exploration UIs;
-- copy-on-write select, filter, group, order, limit, and offset queries;
+- copy-on-write select, filter, group, order, limit, and offset queries, plus
+  CTEs, recursive CTEs, compound set operations, windows, rollups, lateral
+  subqueries, and typed JSON rowsets where the selected adapter supports them;
 - portable named query-library segments, projections, orderings, and views with
   typed parameters and applied-definition provenance;
-- field, literal, comparison, null, membership, conjunction, and aggregate
-  expressions, plus governed PostgreSQL date/time format expressions;
+- field, literal, comparison, null, membership, conjunction, aggregate,
+  window, and PostgreSQL full-text expressions, plus governed PostgreSQL
+  date/time format expressions;
 - PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
   SQLite, DuckDB, MySQL, MariaDB, and Microsoft SQL Server compilation with native
   identifier quoting and DBI `?` parameters;
-- DBI execution with stable columns and backend-specific value normalization;
+- eager and row-streaming DBI execution with stable columns and
+  backend-specific value normalization;
 - a versioned `Selecto::Adapter` contract, generic `Selecto::Statement`, and
   runtime adapter registry for independently packaged database support;
 - portable insert, update, upsert, delete, expected-cardinality, atomic-batch,
-  and capability-gated owned write-graph operations;
+  capability-gated arbitrary-depth write graphs, and closed mutation-expression
+  AST operations;
 - governed row and selected-id bulk action planning with explicit transition
   preconditions and fail-closed preview/execute capability decisions;
 - an HTTP-neutral canonical domain API host with OpenAPI 3.1 and byte-stable
@@ -105,6 +113,85 @@ date/time projection or grouping, use an allowlisted expression such as
 accepted. Portable comparison intents include `eq`, `ne`, `gt`, `gte`, `lt`,
 `lte`, and `between`; their values compile as adapter-bound parameters.
 
+Relationship paths are not limited to one join. If the domain declares the
+lineage, the same dotted path works in selections, predicates, grouping, and
+ordering:
+
+```perl
+my $query = $engine->query
+    ->select('id', 'customer.region.name')
+    ->where(Selecto::Expression->eq('customer.region.active', 1))
+    ->order_by('customer.region.name');
+```
+
+Both canonical nested schemas and constructor-domain nested `associations`
+retain the full lineage. Contract promotion for overlays preserves those
+nested relationships as canonical schemas.
+
+## Advanced queries and streaming
+
+Advanced sources remain domain-owned. A CTE or lateral subquery receives its
+own domain and immutable query plus an explicit key contract; callers cannot
+inject a table or SQL fragment. For example:
+
+```perl
+my $event_query = Selecto::Query->new
+    ->select(qw(order_id kind))
+    ->where(Selecto::Expression->eq('kind', 'status'));
+
+my $query = $engine->query
+    ->with_cte(
+        recent_events => $events_domain, $event_query,
+        columns => [qw(order_id kind)],
+        join => {owner_key => 'id', related_key => 'order_id', type => 'left'},
+    )
+    ->select('id', 'recent_events.kind');
+```
+
+`with_recursive_cte` takes separate anchor and recursive-member queries plus
+an explicit inner `recursive_join`. The recursive member cannot use a left
+join. `union`, `union_all`, `intersect`, and `except` build compound queries;
+chained operations are evaluated from left to right consistently across SQL
+dialects, and outer ordering and pagination apply after the compound result.
+Set operands with their own outer ordering or pagination are rejected as
+ambiguous. `ALL` is portable through `union_all`; `INTERSECT ALL` and
+`EXCEPT ALL` are rejected because supported adapters disagree on them.
+
+Window expressions use an allowlisted function set and validated frames:
+
+```perl
+my $running_total = Selecto::Expression->window_sum(
+    'total',
+    partition_by => ['customer_id'],
+    order_by => [['id', 'asc']],
+    frame => {
+        type => 'rows',
+        start => 'unbounded_preceding',
+        end => 'current_row',
+    },
+)->as('running_total');
+```
+
+PostgreSQL additionally implements correlated `lateral_join`, typed
+`json_rowset`, and `text_search`/`text_rank`. JSON column types and full-text
+configurations and modes are allowlisted; search strings and JSON paths remain
+bound parameters. Rollups continue to use `group_by_rollup` and grouping
+metadata as described below.
+
+For result sets that should not be accumulated into an array by Selecto, use
+the row-streaming API and close it early when iteration stops:
+
+```perl
+my $stream = $engine->stream($query, fetch_size => 500);
+while (my $row = $stream->next) {
+    consume($row);
+}
+$stream->close;
+```
+
+This keeps Selecto itself row-wise. Actual driver and server buffering remains
+a DBI-driver concern rather than a promise of a server-side cursor.
+
 ## Query libraries
 
 Domains may own reusable query intent under `query_library`. A view composes
@@ -152,6 +239,69 @@ types are validated; application-specific type names pass their values through
 for the host boundary to interpret. Query-library `capability` values are
 descriptive metadata and do not replace application authorization or database
 row-level security.
+
+## Domain overlays and registries
+
+Application-owned customization can remain separate from generated or shared
+domain contracts. Overlays are ordinary portable data; the DSL is a fluent
+builder for that data rather than a second runtime configuration format.
+
+```perl
+my $overlay = Selecto::Domain::DSL->define(sub {
+    my ($domain) = @_;
+    $domain
+        ->source_column(total => {label => 'Order total', format => 'currency'})
+        ->source_redact_fields('internal_margin')
+        ->write_field(status => {updatable => 1})
+        ->capability('orders.export' => {operations => ['read']});
+});
+
+my ($orders, $diagnostics) = Selecto::Domain->compose(
+    $generated_orders_contract,
+    $overlay,
+);
+```
+
+Composition is deterministic and validates the final strict domain. Maps
+deep-merge; `redact_fields` and `extensions` append uniquely; other lists and
+scalar values are replaced by later overlays. Updates to existing `actions`,
+`capabilities`, `source_relationships`, and `choice_sources` entries produce
+structured collision warnings. Invalid overlay shapes and invalid composed
+domains fail with typed `Selecto::Error` exceptions.
+
+A registry keeps name-to-domain resolution under server ownership and attaches
+provenance without embedding a domain in a caller-controlled reference:
+
+```perl
+my $registry = Selecto->domain_registry(name => 'MyApp::Domains')
+    ->register(orders => $orders)
+    ->register_provider(tenant_orders => sub {
+        my ($id, $context) = @_;
+        return Selecto::Domain::Registry->forbidden
+            unless $context->{can_read_orders};
+        return Selecto::Domain::Registry->ok(
+            tenant_orders_domain($context->{tenant_id}),
+            {version => '2026-08', tenant_id => $context->{tenant_id}},
+        );
+    });
+
+my ($domain, $ref) = $registry->resolve(
+    tenant_orders => {can_read_orders => 1, tenant_id => 42},
+);
+my $same_domain = $registry->resolve_ref($ref);
+
+my $engine = Selecto->engine_registered(
+    domain => $ref,
+    adapter => $adapter,
+);
+```
+
+Provider callbacks must return an explicit `ok`, `not_found`, or `forbidden`
+result. Bare hashes, invalid contracts, invalid contexts, registry substitution,
+and provider exceptions all fail closed; raw provider exception text is not
+exposed. Registry-backed engines retain the resolved reference through
+`domain_ref`, so downstream consumers can inspect provenance without accepting
+a caller-supplied domain map.
 
 Canonical domains can mark a fact-to-reference join as a star dimension. The
 dimension key must be the association's root `owner_key`; `display_field`
@@ -279,9 +429,63 @@ my $command = Selecto::Write::Command->new(
     predicate   => Selecto::Expression->eq('id', 42),
 );
 
-my $preview = $engine->adapter->preview_write($command);
+my $preview = $engine->preview_write($command);
 my $result = $engine->execute_write($command);
 ```
+
+The command is portable data; Engine preview and execution validate its table,
+fields, and any declared `writes.*` policy against the governing domain before
+adapter dispatch. Direct adapter calls are the low-level compiler and execution
+boundary and do not replace Engine governance.
+
+Assignments may use an adapter-independent mutation AST. Literal operands stay
+bound, identifiers are checked separately, and field references are validated
+against the governing domain:
+
+```perl
+my $command = Selecto::Write::Command->new(
+    operation => 'update',
+    relation => 'inventory',
+    assignments => {
+        quantity => Selecto::Write::Expression->decrement('quantity', 1),
+        updated_at => Selecto::Write::Expression->current_timestamp,
+    },
+    predicate => Selecto::Expression->eq('id', 42),
+);
+```
+
+The closed AST supports literals, root-field references, addition,
+subtraction, multiplication, division, `COALESCE`, `CURRENT_TIMESTAMP`, and a
+typed `DEFAULT` node. Field references are update-only because an inserted row
+does not yet exist. Dialects that cannot express an individual `DEFAULT`
+assignment fail with a typed error.
+
+Write graphs execute ordered nodes in one transaction and feed generated keys
+through explicit bindings. Graph construction rejects missing, forward, or
+disconnected dependencies, duplicate binding targets, and bindings that would
+overwrite authored assignments before an adapter runs. Keys required by later
+nodes are added to their source node's internal `RETURNING` shape
+automatically. Engine execution also checks each child against the exact
+writable relationship and nested domain declared by its parent:
+
+```perl
+my $graph = Selecto::Write::Graph->new(nodes => [
+    {id => 'order', command => $insert_order_returning_id},
+    {
+        id => 'line', command => $insert_line_returning_id,
+        bindings => [{field => 'order_id', from => 'order', key => 'id'}],
+    },
+    {
+        id => 'allocation', command => $insert_allocation,
+        bindings => [{field => 'line_id', from => 'line', key => 'id'}],
+    },
+]);
+my $result = $engine->execute_graph($graph);
+```
+
+PostgreSQL and DuckDB advertise native-returning graph execution. SQLite does
+so when its runtime library is 3.35 or newer; older SQLite versions fail the
+capability check rather than emulating generated-key behavior unsafely.
 
 Adapters own transactions by default. A host that already owns a request or
 unit-of-work transaction may opt into `transaction_mode => 'external'` when it
@@ -303,14 +507,14 @@ my $eligible = $engine->query->where(
         Selecto::Expression->eq('status', 'active'),
     ),
 );
-my $evidence = $engine->query_enforcement_evidence($eligible);
-
-my $guarded = Selecto::Write::Command->new(
-    operation      => 'update',
-    relation       => 'orders',
-    assignments    => { status => 'archived' },
-    predicate      => Selecto::Expression->eq('id', 42),
-    query_evidence => $evidence,
+my $guarded = $engine->enforce_query(
+    Selecto::Write::Command->new(
+        operation   => 'update',
+        relation    => 'orders',
+        assignments => { status => 'archived' },
+        predicate   => Selecto::Expression->eq('id', 42),
+    ),
+    $eligible,
 );
 my $result = $engine->execute_write($guarded);
 ```
@@ -419,12 +623,9 @@ concurrency, security, or performance.
 
 ## Explicitly deferred
 
-- CTEs, recursive queries, windows, set operations, rollups, lateral joins,
-  JSON rowsets, full-text search, and streaming;
-- deeper-than-one-hop relationships;
-- nested portable write graphs and adapter-independent mutation expressions;
-- additional database adapters beyond PostgreSQL, SQLite, MySQL, MariaDB, and
-  Microsoft SQL Server;
+- additional database adapters beyond PostgreSQL, SQLite, DuckDB, MySQL,
+  MariaDB, and Microsoft SQL Server;
 - framework-specific integration beyond the DBI handle boundary.
 
-Deferred capabilities fail closed instead of falling back to raw SQL.
+Unavailable adapter capabilities fail closed instead of falling back to raw
+SQL.

@@ -25,7 +25,14 @@ is($adapter->quote_identifier(q{odd`"name]}), q{"odd`""name]"}, 'identifier quot
 is($adapter->placeholder(2), '$2', 'PostgreSQL placeholder numbering is explicit');
 is($adapter->normalize_type('timestamptz'), 'utc_datetime', 'adapter type normalization is portable');
 ok($adapter->supports('transactions'), 'transactions are declared supported');
-ok(!$adapter->supports('cte'), 'deferred capability is declared unsupported');
+ok($adapter->supports('cte'), 'implemented CTE capability is declared supported');
+ok($adapter->supports('recursive_cte'), 'implemented recursive CTE capability is declared supported');
+ok($adapter->supports('window_functions'), 'implemented window capability is declared supported');
+ok($adapter->supports('set_operations'), 'implemented set-operation capability is declared supported');
+ok($adapter->supports('text_search'), 'implemented full-text capability is declared supported');
+ok($adapter->supports('lateral_join'), 'implemented lateral capability is declared supported');
+ok($adapter->supports('json_rowset'), 'implemented JSON-rowset capability is declared supported');
+ok($adapter->supports('stream'), 'implemented streaming capability is declared supported');
 isa_ok($adapter, 'Selecto::Adapter', 'PostgreSQL implements the database-neutral adapter contract');
 is($statement->adapter_name, 'postgresql', 'generic statement records its compiling adapter');
 

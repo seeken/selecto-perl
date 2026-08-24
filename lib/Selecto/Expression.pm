@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use Scalar::Util qw(blessed);
+use Selecto::Error ();
 
 sub new {
     my ($class, $kind, @arguments) = @_;
@@ -29,6 +30,55 @@ sub grouping {
         $class->_operand($_)
     } @fields]);
 }
+sub window {
+    my ($class, $function, $arguments, %over) = @_;
+    _known_options(\%over, [qw(partition_by order_by frame)], 'window');
+    $function = defined($function) ? lc("$function") : '';
+    $arguments //= [];
+    $arguments = [$arguments] unless ref($arguments) eq 'ARRAY';
+    my %field_arguments = map { $_ => 1 } qw(
+        sum avg min max count first_value last_value nth_value lag lead
+    );
+    my @arguments = map {
+        my $index = $_;
+        my $value = $arguments->[$index];
+        blessed($value) && $value->isa(__PACKAGE__) ? $value
+            : $field_arguments{$function} && $index == 0 ? $class->field($value)
+            : $class->literal($value)
+    } 0 .. $#$arguments;
+    my $partition = $over{partition_by} // [];
+    $partition = [$partition] unless ref($partition) eq 'ARRAY';
+    my $orders = $over{order_by} // [];
+    $orders = [$orders] unless ref($orders) eq 'ARRAY';
+    my @orders = map {
+        my ($field, $direction) = ref($_) eq 'ARRAY' ? @$_ : ($_, 'asc');
+        [$class->_operand($field), defined($direction) ? lc("$direction") : 'asc']
+    } @$orders;
+    return $class->new('window', $function, \@arguments, {
+        partition_by => [map { $class->_operand($_) } @$partition],
+        order_by => \@orders,
+        (exists($over{frame}) ? (frame => $over{frame}) : ()),
+    });
+}
+sub row_number { my ($class, %over) = @_; return $class->window('row_number', [], %over); }
+sub rank { my ($class, %over) = @_; return $class->window('rank', [], %over); }
+sub dense_rank { my ($class, %over) = @_; return $class->window('dense_rank', [], %over); }
+sub window_sum { my ($class, $field, %over) = @_; return $class->window('sum', [$field], %over); }
+sub window_avg { my ($class, $field, %over) = @_; return $class->window('avg', [$field], %over); }
+sub lag {
+    my ($class, $field, $offset, $default, %over) = @_;
+    $offset //= 1;
+    my @arguments = ($field, $offset);
+    push @arguments, $default if defined $default;
+    return $class->window('lag', \@arguments, %over);
+}
+sub lead {
+    my ($class, $field, $offset, $default, %over) = @_;
+    $offset //= 1;
+    my @arguments = ($field, $offset);
+    push @arguments, $default if defined $default;
+    return $class->window('lead', \@arguments, %over);
+}
 sub dimension_display {
     my ($class, $display_field, $dimension_key) = @_;
     return $class->new(
@@ -40,6 +90,34 @@ sub dimension_display {
 sub related_collection {
     my ($class, $association, $fields) = @_;
     return $class->new('related_collection', "$association", [map { "$_" } @$fields]);
+}
+sub text_search {
+    my ($class, $fields, $query, %options) = @_;
+    _known_options(\%options, [qw(configuration mode)], 'text search');
+    $fields = [$fields] unless ref($fields) eq 'ARRAY';
+    return $class->new(
+        'text_search',
+        [map { $class->_operand($_) } @$fields],
+        $class->literal($query),
+        {
+            configuration => $options{configuration} // 'simple',
+            mode => $options{mode} // 'plain',
+        },
+    );
+}
+sub text_rank {
+    my ($class, $fields, $query, %options) = @_;
+    _known_options(\%options, [qw(configuration mode)], 'text rank');
+    $fields = [$fields] unless ref($fields) eq 'ARRAY';
+    return $class->new(
+        'text_rank',
+        [map { $class->_operand($_) } @$fields],
+        $class->literal($query),
+        {
+            configuration => $options{configuration} // 'simple',
+            mode => $options{mode} // 'plain',
+        },
+    );
 }
 sub bucket {
     my ($class, $field, $specification) = @_;
@@ -116,6 +194,17 @@ sub _operand {
     my ($class, $value) = @_;
     return $value if blessed($value) && $value->isa('Selecto::Expression');
     return $class->field($value);
+}
+
+sub _known_options {
+    my ($options, $allowed, $label) = @_;
+    my %allowed = map { $_ => 1 } @$allowed;
+    my @unknown = sort grep { !$allowed{$_} } keys %$options;
+    Selecto::Error->throw(
+        'invalid_query',
+        "$label contains unsupported options",
+        {keys => \@unknown},
+    ) if @unknown;
 }
 
 sub as {

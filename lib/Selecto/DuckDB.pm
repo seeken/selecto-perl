@@ -26,7 +26,14 @@ sub normalize_type {
 
 sub supports {
     my ($self, $feature) = @_;
-    return "$feature" eq 'transactions' || "$feature" eq 'returning' ? 1 : 0;
+    return "$feature" eq 'transactions' || "$feature" eq 'returning'
+        || "$feature" eq 'set_operations' || "$feature" eq 'window_functions'
+        || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
+        || "$feature" eq 'stream' ? 1 : 0;
+}
+
+sub write_capabilities {
+    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, write_graph => 1 };
 }
 
 sub _decode {

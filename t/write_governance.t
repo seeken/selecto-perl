@@ -45,9 +45,12 @@ for my $key (qw(limit_value offset_value)) {
 }
 
 # Writes are bound to the domain by default.
-my $error = exception { $engine->execute_write(Selecto::Write::Command->new(
+my $wrong_relation = Selecto::Write::Command->new(
     operation => 'update', relation => 'item_notes', assignments => { note => 'x' },
-)) };
+);
+my $error = exception { $engine->preview_write($wrong_relation) };
+is($error->code, 'write_relation_mismatch', 'write previews cross the domain governance boundary');
+$error = exception { $engine->execute_write($wrong_relation) };
 is($error->code, 'write_relation_mismatch', 'ungoverned cross-table write is rejected');
 
 $error = exception { $engine->execute_write(Selecto::Write::Command->new(
@@ -359,7 +362,7 @@ my $skipped_edge = Selecto::Write::Graph->new(nodes => [
         operation => 'insert', relation => 'item_notes', assignments => { note => 'hi' },
     ), bindings => [{field => 'item_id', from => 'root', key => 'id'}] },
     { id => 'deep', command => Selecto::Write::Command->new(
-        operation => 'insert', relation => 'items', assignments => { status => 'sneaky' },
+        operation => 'insert', relation => 'items', assignments => {},
     ), bindings => [{field => 'status', from => 'note', key => 'id'}] },
 ]);
 $error = exception { $form_engine->execute_graph($skipped_edge) };
@@ -372,7 +375,7 @@ my $wrong_field = Selecto::Write::Graph->new(nodes => [
         metadata => { returning => ['id'] },
     ) },
     { id => 'note', command => Selecto::Write::Command->new(
-        operation => 'insert', relation => 'item_notes', assignments => { note => 'hi' },
+        operation => 'insert', relation => 'item_notes', assignments => {},
     ), bindings => [{field => 'note', from => 'root', key => 'id'}] },
 ]);
 $error = exception { $form_engine->execute_graph($wrong_field) };
@@ -509,5 +512,100 @@ $error = exception { $duplicate_engine->execute_graph(Selecto::Write::Graph->new
     ), bindings => [{field => 'item_id', from => 'root', key => 'id'}] },
 ])) };
 is($error->code, 'invalid_domain', 'conflicting duplicate physical edges fail closed regardless of naming');
+
+# Multiple bindings cannot select their governing relationship by array order.
+# These two bindings independently match different writable edges to the same
+# child table, so both permutations must fail before adapter capability checks.
+my $mixed_edge_domain = Selecto::Domain->parse({
+    schema_version => 1,
+    name           => 'MixedEdges',
+    source         => {
+        source_table => 'items', primary_key => 'id',
+        fields => ['id', 'status'],
+        columns => { id => { type => 'integer' }, status => { type => 'string' } },
+        associations => {},
+    },
+    schemas => {}, joins => {},
+    writes => {
+        operations => { insert => { enabled => JSON::PP::true } },
+        fields     => { status => { insertable => JSON::PP::true } },
+        relationships => {
+            notes_by_id => {
+                writable => JSON::PP::true, ownership => 'owned',
+                allowed_ops => ['insert'], parent_key => 'id', child_key => 'item_id',
+                domain => $form_domain->writes->{relationships}{notes}{domain},
+            },
+            notes_by_status => {
+                writable => JSON::PP::true, ownership => 'owned',
+                allowed_ops => ['insert'], parent_key => 'status', child_key => 'note',
+                domain => $form_domain->writes->{relationships}{notes}{domain},
+            },
+        },
+    },
+});
+my $mixed_edge_engine = Selecto::Engine->new(domain => $mixed_edge_domain, adapter => $engine->adapter);
+my @mixed_bindings = (
+    {field => 'item_id', from => 'root', key => 'id'},
+    {field => 'note', from => 'root', key => 'status'},
+);
+for my $bindings (\@mixed_bindings, [reverse @mixed_bindings]) {
+    $error = exception { $mixed_edge_engine->execute_graph(Selecto::Write::Graph->new(nodes => [
+        { id => 'root', command => Selecto::Write::Command->new(
+            operation => 'insert', relation => 'items', assignments => { status => 'open' },
+            metadata => { returning => ['id'] },
+        ) },
+        { id => 'note', command => Selecto::Write::Command->new(
+            operation => 'insert', relation => 'item_notes', assignments => {},
+        ), bindings => $bindings },
+    ])) };
+    is($error->code, 'write_relation_mismatch',
+        'conflicting graph edges fail regardless of binding order');
+}
+
+# Authored edge keys must actually exist in the exact parent and nested
+# contracts when those contracts declare their fields.
+for my $case (
+    ['missing_child', 'id', 'invalid_domain',
+        'relationship child_key must exist in the nested domain'],
+    ['item_id', 'missing_parent', 'unknown_field',
+        'relationship parent_key must exist in the parent domain'],
+) {
+    my ($child_key, $parent_key, $expected_code, $description) = @$case;
+    my $invalid_edge_domain = Selecto::Domain->parse({
+        schema_version => 1,
+        name           => 'InvalidEdgeKeys',
+        source         => {
+            source_table => 'items', primary_key => 'id',
+            fields => ['id', 'status'],
+            columns => { id => { type => 'integer' }, status => { type => 'string' } },
+            associations => {},
+        },
+        schemas => {}, joins => {},
+        writes => {
+            operations => { insert => { enabled => JSON::PP::true } },
+            fields     => { status => { insertable => JSON::PP::true } },
+            relationships => {
+                notes => {
+                    writable => JSON::PP::true, ownership => 'owned',
+                    allowed_ops => ['insert'], parent_key => $parent_key, child_key => $child_key,
+                    domain => $form_domain->writes->{relationships}{notes}{domain},
+                },
+            },
+        },
+    });
+    my $invalid_edge_engine = Selecto::Engine->new(
+        domain => $invalid_edge_domain, adapter => $engine->adapter,
+    );
+    $error = exception { $invalid_edge_engine->execute_graph(Selecto::Write::Graph->new(nodes => [
+        { id => 'root', command => Selecto::Write::Command->new(
+            operation => 'insert', relation => 'items', assignments => { status => 'open' },
+            metadata => { returning => ['id'] },
+        ) },
+        { id => 'note', command => Selecto::Write::Command->new(
+            operation => 'insert', relation => 'item_notes', assignments => { note => 'hi' },
+        ), bindings => [{field => $child_key, from => 'root', key => $parent_key}] },
+    ])) };
+    is($error->code, $expected_code, $description);
+}
 
 done_testing;

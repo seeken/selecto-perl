@@ -77,6 +77,84 @@ like($grouped_statement->sql, qr/COUNT\(\*\)/, 'aggregate is compiled');
 like($grouped_statement->sql, qr/GROUP BY "j_person"\."name"/, 'joined group is validated and compiled');
 is_deeply($grouped_statement->columns, ['person_name', 'order_count'], 'stable result columns use aliases');
 
+my $deep_domain = Selecto::Domain->parse({
+    schema_version => 1,
+    name => 'Deep orders',
+    source => {
+        source_table => 'orders', primary_key => 'id',
+        fields => [qw(id person_id)],
+        columns => {id => {type => 'integer'}, person_id => {type => 'integer'}},
+        associations => {
+            person => {queryable => 'people', owner_key => 'person_id', related_key => 'id'},
+        },
+    },
+    schemas => {
+        people => {
+            source_table => 'people', primary_key => 'id', fields => [qw(id region_id name)],
+            columns => {
+                id => {type => 'integer'}, region_id => {type => 'integer'},
+                name => {type => 'string'},
+            },
+            associations => {
+                region => {queryable => 'regions', owner_key => 'region_id', related_key => 'id'},
+            },
+        },
+        regions => {
+            source_table => 'regions', primary_key => 'id', fields => [qw(id name)],
+            columns => {id => {type => 'integer'}, name => {type => 'string'}},
+            associations => {},
+        },
+    },
+    joins => {person => {type => 'left'}, 'person.region' => {type => 'inner'}},
+});
+my $deep_engine = Selecto::Engine->new(domain => $deep_domain, adapter => $adapter);
+my $deep_statement = $deep_engine->compile(
+    $deep_engine->query
+        ->select('id', Selecto::Expression->field('person.region.name')->as('region'))
+        ->where(Selecto::Expression->eq('person.region.name', 'Mountain'))
+        ->order_by('person.region.name')
+);
+like($deep_statement->sql,
+    qr/LEFT JOIN "people" AS "j_person" ON "s0"\."person_id" = "j_person"\."id"/,
+    'deep paths join their first relationship exactly once');
+like($deep_statement->sql,
+    qr/INNER JOIN "regions" AS "j_person__region" ON "j_person"\."region_id" = "j_person__region"\."id"/,
+    'deep paths join each later relationship from its exact parent alias');
+like($deep_statement->sql,
+    qr/WHERE "j_person__region"\."name" = \$1 ORDER BY "j_person__region"\."name" ASC/,
+    'deep relationship fields work consistently in predicates and ordering');
+is_deeply($deep_statement->params, ['Mountain'],
+    'deep relationship predicates remain parameterized');
+
+my $collision_domain = Selecto::Domain->new(
+    name => 'Collision-safe deep aliases',
+    table => 'roots',
+    fields => {id => 'integer', a_id => 'integer', direct_id => 'integer'},
+    associations => {
+        a => {
+            table => 'as', fields => {id => 'integer', b_id => 'integer'},
+            owner_key => 'a_id', related_key => 'id',
+            associations => {
+                b => {
+                    table => 'bs', fields => {id => 'integer', name => 'string'},
+                    owner_key => 'b_id', related_key => 'id',
+                },
+            },
+        },
+        a__b => {
+            table => 'direct_bs', fields => {id => 'integer', name => 'string'},
+            owner_key => 'direct_id', related_key => 'id',
+        },
+    },
+);
+my $collision_engine = Selecto::Engine->new(domain => $collision_domain, adapter => $adapter);
+my $collision_sql = $collision_engine->compile(
+    $collision_engine->query->select('a.b.name', 'a__b.name')
+)->sql;
+like($collision_sql, qr/AS "j_path_1_a_1_b"/, 'deep alias collisions use an injective path encoding');
+like($collision_sql, qr/AS "j_path_4_a__b"/, 'single-hop aliases cannot collide with encoded deep paths');
+unlike($collision_sql, qr/AS "j_a__b"/, 'the ambiguous alias is never emitted');
+
 my $rollup = $join_engine->query->select(
     Selecto::Expression->field('person.name')->as('person_name'),
     Selecto::Expression->field('total')->as('total'),

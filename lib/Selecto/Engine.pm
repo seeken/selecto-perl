@@ -6,11 +6,14 @@ use warnings;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Selecto::Domain ();
+use Selecto::Domain::Ref ();
+use Selecto::Domain::Registry ();
 use Selecto::Error ();
 use Selecto::Query ();
 use Selecto::QueryEnforcement ();
 use Selecto::QueryLibrary ();
 use Selecto::Write ();
+use Selecto::Write::Expression ();
 
 sub new {
     my ($class, %args) = @_;
@@ -18,15 +21,55 @@ sub new {
         unless blessed($args{domain}) && $args{domain}->isa('Selecto::Domain');
     Selecto::Error->throw('invalid_adapter', 'engine requires a Selecto database adapter')
         unless blessed($args{adapter}) && $args{adapter}->isa('Selecto::Adapter');
+    Selecto::Error->throw('invalid_domain_ref', 'engine domain_ref must be a Selecto domain reference')
+        if defined($args{domain_ref})
+            && !(blessed($args{domain_ref}) && $args{domain_ref}->isa('Selecto::Domain::Ref'));
     $args{adapter}->assert_contract;
-    return bless { domain => $args{domain}, adapter => $args{adapter} }, $class;
+    return bless {
+        domain => $args{domain},
+        adapter => $args{adapter},
+        domain_ref => $args{domain_ref},
+    }, $class;
+}
+
+sub from_registry {
+    my ($class, %args) = @_;
+    my $subject = $args{domain};
+    my $registry = $args{registry};
+    Selecto::Error->throw('invalid_adapter', 'engine requires a Selecto database adapter')
+        unless blessed($args{adapter}) && $args{adapter}->isa('Selecto::Adapter');
+    if (blessed($subject) && $subject->isa('Selecto::Domain::Ref')) {
+        $registry //= $subject->registry;
+    }
+    Selecto::Error->throw('invalid_domain_registry', 'registered engine requires a domain registry')
+        unless blessed($registry) && $registry->isa('Selecto::Domain::Registry');
+    my ($domain, $ref) = blessed($subject) && $subject->isa('Selecto::Domain::Ref')
+        ? $registry->resolve_ref($subject, $args{context})
+        : $registry->resolve($subject, $args{context});
+    return $class->new(
+        domain => $domain,
+        domain_ref => $ref,
+        adapter => $args{adapter},
+    );
 }
 
 sub domain  { return $_[0]->{domain}; }
 sub adapter { return $_[0]->{adapter}; }
+sub domain_ref { return $_[0]->{domain_ref}; }
 sub query   { return Selecto::Query->new; }
 sub compile { my ($self, $query) = @_; return $self->{adapter}->compile($self->{domain}, $query); }
 sub all     { my ($self, $query) = @_; return $self->{adapter}->execute_query($self->compile($query)); }
+sub stream {
+    my ($self, $query, %options) = @_;
+    Selecto::Error->throw('unsupported_feature', 'configured adapter does not support streaming')
+        unless $self->{adapter}->supports('stream') && $self->{adapter}->can('stream_query');
+    return $self->{adapter}->stream_query($self->compile($query), %options);
+}
+sub preview_write {
+    my ($self, $command) = @_;
+    $self->_validate_write_command($command);
+    return $self->{adapter}->preview_write($command);
+}
 sub execute_write {
     my ($self, $command) = @_;
     $self->_validate_write_command($command);
@@ -212,6 +255,13 @@ sub _validate_command_against_contract {
                 { field => $field },
             ) unless ref($spec) eq 'HASH' && $spec->{$permission};
         }
+        for my $field (_mutation_reference_fields($command->assignments)) {
+            Selecto::Error->throw(
+                'unknown_field',
+                "mutation expression field is not declared by $label",
+                { field => $field },
+            ) unless exists $domain_fields->{$field};
+        }
     }
     return $self unless $domain_fields;
     # Metadata is validated for every operation, deletes included.
@@ -246,6 +296,16 @@ sub _validate_command_against_contract {
         }
     }
     return $self;
+}
+
+sub _mutation_reference_fields {
+    my ($assignments) = @_;
+    my %fields;
+    for my $value (values %$assignments) {
+        next unless blessed($value) && $value->isa('Selecto::Write::Expression');
+        $fields{$_} = 1 for @{$value->referenced_fields};
+    }
+    return sort keys %fields;
 }
 
 # Graph authorization is edge-aware: every child node must bind through a
@@ -322,6 +382,18 @@ sub _match_relationship {
         next unless defined($parent_key) && "$binding->{key}" eq $parent_key;
         my $candidate = _relationship_context($spec, $table,
             "$parent_context->{table}>$table/$child_key/$parent_key");
+        Selecto::Error->throw(
+            'invalid_domain',
+            'relationship parent_key is not declared by its parent domain',
+            {relationship => $name, field => $parent_key},
+        ) if $parent_context->{fields_known}
+            && !exists($parent_context->{fields}{$parent_key});
+        Selecto::Error->throw(
+            'invalid_domain',
+            'relationship child_key is not declared by its nested domain',
+            {relationship => $name, field => $child_key},
+        ) if $candidate->{fields_known}
+            && !exists($candidate->{fields}{$child_key});
         # Duplicate declarations of one physical edge must not let naming
         # order pick the governing policy.
         if ($chosen) {
@@ -352,7 +424,9 @@ sub _relationship_context {
     if (exists($spec->{allowed_ops}) && defined($spec->{allowed_ops})) {
         Selecto::Error->throw('invalid_domain', 'relationship allowed_ops must be an array of operation names')
             unless ref($spec->{allowed_ops}) eq 'ARRAY'
-            && !grep { ref($_) } @{$spec->{allowed_ops}};
+            && !grep {
+                !defined($_) || ref($_) || "$_" !~ /\A(?:insert|update|upsert|delete)\z/
+            } @{$spec->{allowed_ops}};
     }
     my $nested = ref($spec->{domain}) eq 'HASH' ? $spec->{domain} : {};
     my $nested_writes = _checked_writes($nested->{writes});

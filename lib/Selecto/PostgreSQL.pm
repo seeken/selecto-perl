@@ -3,6 +3,7 @@ package Selecto::PostgreSQL;
 use Mojo::Base 'Selecto::SQL';
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
+use Selecto::Expression ();
 
 has rollup_sort_fix => 'auto';
 
@@ -24,7 +25,11 @@ sub normalize_type {
 sub supports {
     my ($self, $feature) = @_;
     return "$feature" eq 'transactions' || "$feature" eq 'returning'
-        || "$feature" eq 'rollup' ? 1 : 0;
+        || "$feature" eq 'rollup' || "$feature" eq 'set_operations'
+        || "$feature" eq 'window_functions' || "$feature" eq 'text_search'
+        || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
+        || "$feature" eq 'lateral_join' || "$feature" eq 'json_rowset'
+        || "$feature" eq 'stream' ? 1 : 0;
 }
 
 sub _rollup_sort_fix_enabled {
@@ -93,7 +98,80 @@ sub _compile_dialect_expression {
         return 'TO_CHAR(' . $self->_compile_expression($domain, $field, $params) .
             ", '" . $formats{$format} . "')";
     }
+    if ($kind eq 'text_search' || $kind eq 'text_rank') {
+        my ($fields, $query, $options) = @$arguments;
+        Selecto::Error->throw('invalid_query', 'text search requires at least one governed field')
+            unless ref($fields) eq 'ARRAY' && @$fields;
+        Selecto::Error->throw('invalid_query', 'text search options must be an object')
+            unless ref($options) eq 'HASH';
+        Selecto::Error->throw('invalid_query', 'text search query must be a non-empty scalar')
+            unless blessed($query) && $query->isa('Selecto::Expression')
+                && $query->kind eq 'literal'
+                && defined($query->arguments->[0]) && !ref($query->arguments->[0])
+                && "$query->arguments->[0]" ne '';
+        my %configurations = map { $_ => 1 } qw(
+            simple english danish dutch finnish french german hungarian italian
+            norwegian portuguese romanian russian spanish swedish turkish
+        );
+        my $configuration = lc($options->{configuration} // 'simple');
+        Selecto::Error->throw('invalid_query', 'text search configuration is not available')
+            unless $configurations{$configuration};
+        my %modes = (
+            plain => 'PLAINTO_TSQUERY',
+            phrase => 'PHRASETO_TSQUERY',
+            websearch => 'WEBSEARCH_TO_TSQUERY',
+        );
+        my $mode = lc($options->{mode} // 'plain');
+        Selecto::Error->throw('invalid_query', 'text search mode is not available')
+            unless $modes{$mode};
+        my $document = join(" || ' ' || ", map {
+            'COALESCE(CAST(' . $self->_compile_expression($domain, $_, $params) . " AS TEXT), '')"
+        } @$fields);
+        my $query_sql = $self->_compile_expression($domain, $query, $params);
+        my $vector = "TO_TSVECTOR('$configuration', $document)";
+        my $tsquery = "$modes{$mode}('$configuration', $query_sql)";
+        return "$vector @@ $tsquery" if $kind eq 'text_search';
+        return "TS_RANK($vector, $tsquery)";
+    }
     return $self->SUPER::_compile_dialect_expression($domain, $expression, $params);
+}
+
+sub _compile_json_rowset_join {
+    my ($self, $domain, $spec, $params) = @_;
+    my $resolved = $domain->resolve($spec->{source_field});
+    Selecto::Error->throw('invalid_query', 'JSON rowset source must be a JSON field')
+        unless $resolved->{type} =~ /json/i;
+    my $source = $self->_compile_expression(
+        $domain,
+        Selecto::Expression->field($spec->{source_field}),
+        $params,
+    ) . '::jsonb';
+    if (exists($spec->{path})) {
+        my $path = $spec->{path};
+        Selecto::Error->throw('invalid_query', 'JSON rowset path must be a non-empty string')
+            unless defined($path) && !ref($path) && "$path" ne '';
+        push @$params, "$path";
+        $source = 'JSONB_PATH_QUERY_ARRAY(' . $source . ', ' .
+            $self->placeholder(scalar @$params) . '::jsonpath)';
+    }
+    my %types = (
+        integer => 'BIGINT', int => 'BIGINT', bigint => 'BIGINT',
+        decimal => 'NUMERIC', numeric => 'NUMERIC', number => 'NUMERIC',
+        string => 'TEXT', text => 'TEXT', boolean => 'BOOLEAN',
+        date => 'DATE', datetime => 'TIMESTAMP', utc_datetime => 'TIMESTAMPTZ',
+        json => 'JSONB', jsonb => 'JSONB',
+    );
+    my @columns = map {
+        my $type = lc("$spec->{columns}{$_}");
+        Selecto::Error->throw('invalid_query', "JSON rowset type $type is not portable")
+            unless exists $types{$type};
+        $self->quote_identifier($_) . ' ' . $types{$type};
+    } sort keys %{$spec->{columns}};
+    my $keyword = $spec->{type} eq 'cross' ? 'CROSS JOIN LATERAL'
+        : $spec->{type} eq 'inner' ? 'INNER JOIN LATERAL' : 'LEFT JOIN LATERAL';
+    return $keyword . ' JSONB_TO_RECORDSET(' . $source . ') AS ' .
+        $self->quote_identifier($spec->{name}) . ' (' . join(', ', @columns) . ')' .
+        ($spec->{type} eq 'cross' ? '' : ' ON TRUE');
 }
 
 sub _column_types {
