@@ -210,6 +210,54 @@ like $line_statement->sql,
 unlike $line_statement->sql, qr{JOIN "invoice_lines"},
     'a related collection does not multiply outer result rows';
 
+my $flag_domain = Selecto::Domain->parse({
+    schema_version => 1,
+    domain_version => '1.0.0',
+    name => 'Flagged invoices',
+    source => {
+        source_table => 'invoices', primary_key => 'id',
+        fields => [qw(id rush)],
+        columns => {
+            id => {type => 'integer'},
+            rush => {
+                type => 'boolean',
+                computed => {kind => 'association_exists', association => 'rush_flags'},
+            },
+        },
+        associations => {
+            rush_flags => {
+                queryable => 'flags', owner_key => 'id', related_key => 'invoice_id',
+                cardinality => 'many', where => {type => 'R'},
+            },
+        },
+    },
+    schemas => {
+        flags => {
+            source_table => 'invoice_flags', primary_key => 'id',
+            fields => [qw(id invoice_id type)],
+            columns => {
+                id => {type => 'integer'}, invoice_id => {type => 'integer'},
+                type => {type => 'string'},
+            },
+            associations => {},
+        },
+    },
+    joins => {rush_flags => {type => 'left'}},
+}, strict => 1);
+my $flag_engine = Selecto::Engine->new(domain => $flag_domain, adapter => $adapter);
+my $flag_statement = $flag_engine->compile(
+    $flag_engine->query->select('id', 'rush')->where(
+        Selecto::Expression->eq('rush', 1)
+    ),
+);
+like $flag_statement->sql,
+    qr{SELECT "s0"\."id", EXISTS \(SELECT 1 FROM "invoice_flags" AS "e_rush_flags" WHERE "e_rush_flags"\."invoice_id" = "s0"\."id" AND "e_rush_flags"\."type" = \$1\).*WHERE EXISTS \(SELECT 1 FROM "invoice_flags" AS "e_rush_flags" WHERE "e_rush_flags"\."invoice_id" = "s0"\."id" AND "e_rush_flags"\."type" = \$2\) = \$3}s,
+    'association-exists computed fields compile for both display and filtering';
+unlike $flag_statement->sql, qr{LEFT JOIN "invoice_flags"},
+    'association-exists fields do not denormalize root rows';
+is_deeply $flag_statement->params, ['R', 'R', 1],
+    'association-exists constants and filter values remain bound parameters';
+
 my $through_domain = Selecto::Domain->new(
     name => 'Tenant invoice tags',
     table => 'invoices',
@@ -232,17 +280,20 @@ my $through_domain = Selecto::Domain->new(
                 source_scope_key => 'tenant_id',
                 through_scope_key => 'tenant_id',
                 target_scope_key => 'tenant_id',
+                where => {type => 'E'},
+                target_key_cast => 'string',
             },
         },
         notes => {
             table => 'invoice_notes',
             fields => {
                 id => 'integer', invoice_id => 'integer', tenant_id => 'integer',
-                body => 'string',
+                event_id => 'integer', body => 'string',
             },
             owner_key => 'id', related_key => 'invoice_id', target_primary_key => 'id',
             cardinality => 'many', join_type => 'left',
             source_scope_key => 'tenant_id', target_scope_key => 'tenant_id',
+            where => {event_id => 6},
         },
     },
 );
@@ -252,9 +303,11 @@ my $through_join = $through_engine->compile(
 );
 like(
     $through_join->sql,
-    qr{LEFT JOIN \("invoice_tags" AS "t_tags" INNER JOIN "tags" AS "j_tags" ON "t_tags"\."tag_id" = "j_tags"\."id" AND "t_tags"\."tenant_id" = "j_tags"\."tenant_id"\) ON "s0"\."id" = "t_tags"\."invoice_id" AND "s0"\."tenant_id" = "t_tags"\."tenant_id"},
+    qr{LEFT JOIN \("invoice_tags" AS "t_tags" INNER JOIN "tags" AS "j_tags" ON "t_tags"\."tag_id" = CAST\("j_tags"\."id" AS VARCHAR\) AND "t_tags"\."tenant_id" = "j_tags"\."tenant_id"\) ON "s0"\."id" = "t_tags"\."invoice_id" AND "t_tags"\."type" = \$1 AND "s0"\."tenant_id" = "t_tags"\."tenant_id"},
     'a through association preserves roots while enforcing bridge-to-target scope',
 );
+is_deeply($through_join->params, ['E'],
+    'through association constants remain bound parameters');
 my $through_collection = $through_engine->compile(
     $through_engine->query->select(
         'id',
@@ -263,17 +316,21 @@ my $through_collection = $through_engine->compile(
 );
 like(
     $through_collection->sql,
-    qr{FROM "invoice_tags" AS "ct_tags" INNER JOIN "tags" AS "c_tags" ON "ct_tags"\."tag_id" = "c_tags"\."id" AND "ct_tags"\."tenant_id" = "c_tags"\."tenant_id" WHERE "ct_tags"\."invoice_id" = "s0"\."id" AND "ct_tags"\."tenant_id" = "s0"\."tenant_id"},
+    qr{FROM "invoice_tags" AS "ct_tags" INNER JOIN "tags" AS "c_tags" ON "ct_tags"\."tag_id" = CAST\("c_tags"\."id" AS VARCHAR\) AND "ct_tags"\."tenant_id" = "c_tags"\."tenant_id" WHERE "ct_tags"\."invoice_id" = "s0"\."id" AND "ct_tags"\."tenant_id" = "s0"\."tenant_id" AND "ct_tags"\."type" = \$1},
     'a related collection traverses its keyless bridge without multiplying roots',
 );
+is_deeply($through_collection->params, ['E'],
+    'related through collection constants remain bound parameters');
 my $direct_scoped_join = $through_engine->compile(
     $through_engine->query->select('id', 'notes.body')
 );
 like(
     $direct_scoped_join->sql,
-    qr{LEFT JOIN "invoice_notes" AS "j_notes" ON "s0"\."id" = "j_notes"\."invoice_id" AND "s0"\."tenant_id" = "j_notes"\."tenant_id"},
+    qr{LEFT JOIN "invoice_notes" AS "j_notes" ON "s0"\."id" = "j_notes"\."invoice_id" AND "j_notes"\."event_id" = \$1 AND "s0"\."tenant_id" = "j_notes"\."tenant_id"},
     'a direct association enforces source-to-target scope in its join',
 );
+is_deeply($direct_scoped_join->params, [6],
+    'direct association constants remain bound parameters');
 my $direct_scoped_collection = $through_engine->compile(
     $through_engine->query->select(
         'id', Selecto::Expression->related_collection('notes', ['body'])->as('notes'),
@@ -281,9 +338,11 @@ my $direct_scoped_collection = $through_engine->compile(
 );
 like(
     $direct_scoped_collection->sql,
-    qr{FROM "invoice_notes" AS "c_notes" WHERE "c_notes"\."invoice_id" = "s0"\."id" AND "c_notes"\."tenant_id" = "s0"\."tenant_id"},
+    qr{FROM "invoice_notes" AS "c_notes" WHERE "c_notes"\."invoice_id" = "s0"\."id" AND "c_notes"\."tenant_id" = "s0"\."tenant_id" AND "c_notes"\."event_id" = \$1},
     'a direct related collection enforces source-to-target scope',
 );
+is_deeply($direct_scoped_collection->params, [6],
+    'direct related collection constants remain bound parameters');
 
 my $dimension_display = Selecto::Expression->dimension_display('person.name', 'person_id');
 my $dimension_rollup = $join_engine->query->select(
