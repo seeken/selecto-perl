@@ -6,6 +6,8 @@ use Test::More;
 use lib 't/lib';
 use TestSelecto;
 use Selecto::MySQL ();
+use Selecto::PostgreSQL ();
+use Selecto::SQLite ();
 
 sub exception (&) {
     my ($operation) = @_;

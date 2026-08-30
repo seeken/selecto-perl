@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Test::More;
 use Selecto;
+use Selecto::PostgreSQL ();
 
 my $domain = Selecto::Domain->parse({
     schema_version => 1,

@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use lib 't/lib';
 use TestSelecto;
+use Selecto::PostgreSQL ();
 
 my $dbh = TestSelecto::DBH->new({ affected => 1 });
 my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);

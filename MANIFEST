@@ -40,6 +40,8 @@ script/with-local-deps
 t/00-load.t
 t/action.t
 t/adapter.t
+t/fixtures/Selecto-Adapter-FutureDB/Makefile.PL
+t/fixtures/Selecto-Adapter-FutureDB/lib/Selecto/Adapter/FutureDB.pm
 t/advanced_query.t
 t/api.t
 t/domain.t

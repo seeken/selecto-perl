@@ -18,7 +18,7 @@ sub new ($class, @args) {
     return $self->assert_contract;
 }
 
-sub contract_version ($self) { return $CONTRACT_VERSION; }
+sub contract_version ($self_or_class) { return $CONTRACT_VERSION; }
 sub required_methods ($self) { return [@REQUIRED_METHODS]; }
 
 sub assert_contract ($self) {
