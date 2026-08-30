@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use lib 't/lib';
 use TestSelecto;
+use Selecto::PostgreSQL ();
 
 my $dbh = TestSelecto::DBH->new({
     rows => [[1, 'Ada'], [2, 'Grace'], [3, 'Linus']],

@@ -3,8 +3,22 @@ use strict;
 use warnings;
 use Test::More;
 use lib 't/lib';
+use lib 't/fixtures/Selecto-Adapter-FutureDB/lib';
 use TestSelecto;
 use Selecto;
+
+is_deeply(
+    [grep { exists $INC{$_} } qw(
+        Selecto/DuckDB.pm
+        Selecto/MariaDB.pm
+        Selecto/MSSQL.pm
+        Selecto/MySQL.pm
+        Selecto/PostgreSQL.pm
+        Selecto/SQLite.pm
+    )],
+    [],
+    'loading the core leaves concrete adapters unloaded',
+);
 
 my $dbh = TestSelecto::DBH->new;
 my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
@@ -29,23 +43,25 @@ is($adapter->contract_version, 1, 'adapter contract is versioned');
 eval { Selecto->adapter(oracle => (dbh => $dbh)) };
 is($@->code, 'unknown_adapter', 'unregistered databases fail with a portable adapter error');
 
-{
-    package TestSelecto::FutureAdapter;
-    use Mojo::Base 'Selecto::Adapter';
-    sub name { return 'futuredb'; }
-    sub dialect { return __PACKAGE__; }
-    sub compile { return Selecto::Statement->new(sql => 'SELECT 1', adapter_name => 'futuredb'); }
-    sub execute_query { return { columns => [], rows => [] }; }
-    sub preview_write { return {}; }
-    sub execute_write { return {}; }
-    sub execute_batch { return []; }
-}
-
-$INC{'TestSelecto/FutureAdapter.pm'} = __FILE__;
-my $registry = Selecto::Adapter::Registry->new
-    ->register(futuredb => 'TestSelecto::FutureAdapter');
-my $future = $registry->build(futuredb => (dbh => $dbh));
+require Selecto::Adapter::FutureDB;
+my $future = Selecto->adapter(futuredb => (dbh => $dbh));
 isa_ok($future, 'Selecto::Adapter', 'a separately implemented database can register without core changes');
 is($future->name, 'futuredb', 'registered adapter retains its portable name');
+
+eval {
+    Selecto::Adapter::Registry->default->register(
+        futuredb => 'Selecto::Adapter::FutureDB',
+        contract_version => 1,
+    );
+};
+is($@->code, 'duplicate_adapter', 'duplicate stable adapter names fail closed');
+
+eval {
+    Selecto::Adapter::Registry->new->register(
+        legacydb => 'Selecto::Adapter::FutureDB',
+        contract_version => 999,
+    );
+};
+is($@->code, 'adapter_contract_mismatch', 'adapter contract version mismatches fail closed');
 
 done_testing;

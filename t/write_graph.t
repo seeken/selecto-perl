@@ -4,6 +4,10 @@ use warnings;
 use Test::More;
 use lib 't/lib';
 use TestSelecto;
+use Selecto::DuckDB ();
+use Selecto::MSSQL ();
+use Selecto::PostgreSQL ();
+use Selecto::SQLite ();
 
 my $dbh = TestSelecto::DBH->new(
     { affected => 1, rows => [[41]] },

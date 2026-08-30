@@ -4,6 +4,8 @@ use warnings;
 use Test::More;
 use lib 't/lib';
 use TestSelecto;
+use Selecto::PostgreSQL ();
+use Selecto::SQLite ();
 
 my $adapter = Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new);
 my $engine = Selecto::Engine->new(

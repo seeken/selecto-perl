@@ -401,8 +401,16 @@ implements the seven required compile/execution methods, returns generic
 
 ```perl
 Selecto::Adapter::Registry->default
-    ->register(sqlite => 'Selecto::SQLite');
+    ->register(futuredb => 'MyApp::Selecto::FutureDB', contract_version => 1);
 ```
+
+An independently distributed adapter can register itself when its module is
+loaded. `use MyApp::Selecto::FutureDB` is then the only import-time setup the
+application needs; `Selecto->adapter('futuredb', ...)` resolves it through the
+same lazy registry as built-in adapters. Adapter names are unique and the
+registry rejects contract versions other than
+`$Selecto::Adapter::CONTRACT_VERSION`. Built-in implementations remain lazily
+loaded and the core entrypoint does not import concrete adapter modules.
 
 `Selecto->available_adapters` exposes the names currently registered. This
 release registers `postgresql`, `sqlite`, `duckdb`, `mysql`, `mariadb`, and `mssql`. All
