@@ -159,7 +159,14 @@ sub _validate_canonical_value ($value, $path) {
         'references are outside Selecto Canonical JSON v1',
         { path => $path, type => ref($value) },
     ) if ref($value);
-    if (looks_like_number($value) && "$value" !~ /\A-?(?:0|[1-9][0-9]*)\z/) {
+    # Perl scalars can be numeric-looking strings while still carrying an
+    # intentional JSON string type (notably exact NUMERIC/DECIMAL values from
+    # DBI adapters). Use JSON::PP's scalar typing decision before rejecting a
+    # native non-integer number from Canonical JSON v1.
+    my $encoded_scalar = JSON::PP->new->allow_nonref(1)->encode($value);
+    if ($encoded_scalar !~ /\A"/
+        && looks_like_number($value)
+        && "$value" !~ /\A-?(?:0|[1-9][0-9]*)\z/) {
         Selecto::Error->throw(
             'non_canonical_value',
             'floats are outside Selecto Canonical JSON v1',

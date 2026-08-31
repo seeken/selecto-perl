@@ -41,6 +41,11 @@ is(
 );
 eval { Selecto::API::canonical_json({ float => 1.25 }) };
 is($@->code, 'non_canonical_value', 'canonical JSON rejects floats');
+is(
+    Selecto::API::canonical_json({ exact_decimal => "1.2500" }),
+    '{"exact_decimal":"1.2500"}',
+    'canonical JSON preserves an exact numeric-looking string as a string',
+);
 
 my $api = Selecto::API->new(domain => $domain, base_path => '/api/v1/certification');
 is_deeply($api->manifest->{domain}, {
