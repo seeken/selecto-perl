@@ -20,6 +20,7 @@ use_ok('Selecto::DuckDB');
 use_ok('Selecto::Engine');
 use_ok('Selecto::Error');
 use_ok('Selecto::Expression');
+use_ok('Selecto::Identifier');
 use_ok('Selecto::MSSQL');
 use_ok('Selecto::PostgreSQL');
 use_ok('Selecto::Query');

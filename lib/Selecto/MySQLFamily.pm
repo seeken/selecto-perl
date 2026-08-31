@@ -2,6 +2,7 @@ package Selecto::MySQLFamily;
 
 use Mojo::Base 'Selecto::SQL';
 use Selecto::Error ();
+use Selecto::Identifier ();
 
 sub placeholder {
     my ($self, $index) = @_;
@@ -33,9 +34,9 @@ sub supports {
 
 sub _compile_upsert_clause {
     my ($self, $conflict, $updates) = @_;
-    _checked_identifier($_) for @$conflict;
+    Selecto::Identifier::checked($_) for @$conflict;
     return ' ON DUPLICATE KEY UPDATE ' . join(', ', map {
-        my $field = _checked_identifier($_);
+        my $field = Selecto::Identifier::checked($_);
         $self->quote_identifier($field) . ' = VALUES(' . $self->quote_identifier($field) . ')'
     } @$updates);
 }
@@ -71,12 +72,13 @@ sub _decode {
     return $value;
 }
 
-sub _checked_identifier {
-    my ($value) = @_;
-    my $string = defined($value) ? "$value" : '';
-    Selecto::Error->throw('invalid_identifier', 'invalid SQL identifier')
-        unless $string =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
-    return $string;
+sub _compile_related_collection_sql {
+    my ($self, $spec) = @_;
+    my @pairs = $self->_related_collection_json_pairs($spec->{fields}, $spec->{quoted_alias});
+    my $aggregate = 'JSON_ARRAYAGG(JSON_OBJECT(' . join(', ', @pairs) . '))';
+    return $self->_related_collection_aggregate_sql(
+        $aggregate, $spec->{from}, $spec->{where}, 'JSON_ARRAY()',
+    );
 }
 
 1;

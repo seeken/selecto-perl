@@ -4,6 +4,7 @@ use Mojo::Base 'Selecto::Adapter';
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::Identifier ();
 use Selecto::QueryEnforcement ();
 use Selecto::Statement ();
 use Selecto::Stream ();
@@ -259,8 +260,12 @@ sub _compile_single {
 
 sub _shift_placeholders {
     my ($self, $sql, $offset) = @_;
-    return $sql unless $offset && $self->name eq 'postgresql';
-    $sql =~ s/\$(\d+)/q{$} . ($1 + $offset)/ge;
+    return $sql unless $offset;
+    return $self->_renumber_placeholders($sql, $offset);
+}
+
+sub _renumber_placeholders {
+    my ($self, $sql, $offset) = @_;
     return $sql;
 }
 
@@ -833,168 +838,35 @@ sub _compile_related_collection {
     my $order = defined($association->target_primary_key)
         ? $quoted_alias . '.' . $self->quote_identifier($association->target_primary_key)
         : undef;
-    my $adapter = $self->name;
+    return $self->_compile_related_collection_sql({
+        fields => $fields,
+        quoted_alias => $quoted_alias,
+        from => $from,
+        where => $where,
+        order => $order,
+    });
+}
 
-    if ($adapter eq 'mssql') {
-        my $projection = join(', ', map {
-            $quoted_alias . '.' . $self->quote_identifier($_) . ' AS ' .
-                $self->quote_identifier($_)
-        } @$fields);
-        return "COALESCE((SELECT $projection FROM $from " .
-            "WHERE $where" .
-            (defined($order) ? " ORDER BY $order" : '') . " FOR JSON PATH), '[]')";
-    }
-
-    my @pairs = map {
+sub _related_collection_json_pairs {
+    my ($self, $fields, $quoted_alias) = @_;
+    return map {
         my $key = "$_";
         $key =~ s/'/''/g;
         "'$key', " . $quoted_alias . '.' . $self->quote_identifier($_)
     } @$fields;
-    my ($aggregate, $empty);
-    if ($adapter eq 'postgresql') {
-        $aggregate = 'JSON_AGG(JSON_BUILD_OBJECT(' . join(', ', @pairs) . ')' .
-            (defined($order) ? " ORDER BY $order" : '') . ')';
-        $empty = q{'[]'::json};
-    } elsif ($adapter eq 'mysql' || $adapter eq 'mariadb') {
-        $aggregate = 'JSON_ARRAYAGG(JSON_OBJECT(' . join(', ', @pairs) . '))';
-        $empty = 'JSON_ARRAY()';
-    } elsif ($adapter eq 'sqlite' || $adapter eq 'duckdb') {
-        $aggregate = 'JSON_GROUP_ARRAY(JSON_OBJECT(' . join(', ', @pairs) . '))';
-        $empty = q{'[]'};
-    } else {
-        Selecto::Error->throw(
-            'unsupported_feature',
-            "related collections are not supported by adapter $adapter",
-        );
-    }
-    return "COALESCE((SELECT $aggregate FROM $from " .
-        "WHERE $where), $empty)";
 }
 
-sub _compile_count_bucket {
-    my ($self, $domain, $field, $specification, $params) = @_;
-    Selecto::Error->throw('invalid_query', 'bucket count specification must be an object')
-        unless ref($specification) eq 'HASH';
-    my $mode = $specification->{mode} // 'numeric';
-    Selecto::Error->throw('invalid_query', 'bucket count mode is not available')
-        unless $mode eq 'numeric' || $mode eq 'elapsed_days';
-    my $field_sql = $self->_compile_expression($domain, $field, $params);
-    my $value_sql = $mode eq 'elapsed_days'
-        ? "CURRENT_DATE - DATE($field_sql)"
-        : $field_sql;
-    my ($minimum, $maximum) = @{$specification}{qw(minimum maximum)};
-    Selecto::Error->throw('invalid_query', 'bucket count requires at least one boundary')
-        unless defined($minimum) || defined($maximum);
-    Selecto::Error->throw('invalid_query', 'bucket count boundaries must be integers')
-        if (defined($minimum) && "$minimum" !~ /\A\d+\z/)
-        || (defined($maximum) && "$maximum" !~ /\A\d+\z/);
-    my @predicates;
-    if (defined($minimum)) {
-        push @$params, int($minimum);
-        push @predicates, $value_sql . ' >= ' . $self->placeholder(scalar @$params);
-    }
-    if (defined($maximum)) {
-        push @$params, int($maximum);
-        push @predicates, $value_sql . ' <= ' . $self->placeholder(scalar @$params);
-    }
-    return 'COUNT(CASE WHEN ' . join(' AND ', @predicates) . ' THEN 1 END)';
+sub _related_collection_aggregate_sql {
+    my ($self, $aggregate, $from, $where, $empty) = @_;
+    return "COALESCE((SELECT $aggregate FROM $from WHERE $where), $empty)";
 }
 
-sub _compile_bucket {
-    my ($self, $domain, $field, $specification, $params) = @_;
-    Selecto::Error->throw('invalid_query', 'bucket specification must be an object')
-        unless ref($specification) eq 'HASH';
-    my $kind = $specification->{kind} // '';
-    my $field_sql = $self->_compile_expression($domain, $field, $params);
-    my ($path) = @{$field->arguments};
-    my $resolved = $domain->resolve($path);
-
-    if ($kind eq 'numeric_increment' || $kind eq 'year_increment') {
-        Selecto::Error->throw('invalid_query', 'bucket increment must be a positive integer')
-            unless defined($specification->{increment})
-            && "$specification->{increment}" =~ /\A[1-9]\d*\z/;
-        Selecto::Error->throw('invalid_query', 'numeric buckets require a numeric field')
-            if $kind eq 'numeric_increment' && $resolved->{type} !~ /(?:int|decimal|number|numeric|float|double|real)/i;
-        Selecto::Error->throw('invalid_query', 'year buckets require a date or time field')
-            if $kind eq 'year_increment' && $resolved->{type} !~ /(?:date|time)/i;
-        my $value_sql = $kind eq 'year_increment' ? "EXTRACT(YEAR FROM $field_sql)" : $field_sql;
-        my $increment = int($specification->{increment});
-        my $start = "CAST(FLOOR(CAST($value_sql AS NUMERIC) / $increment) AS BIGINT) * $increment";
-        return "CASE WHEN $field_sql IS NULL THEN 'Other' ELSE CAST(($start) AS TEXT) || '-' || " .
-            'CAST(((' . $start . ') + ' . ($increment - 1) . ') AS TEXT) END';
-    }
-
-    if ($kind eq 'text_prefix') {
-        Selecto::Error->throw('invalid_query', 'text prefix bucket requires a text field')
-            unless $resolved->{type} =~ /(?:string|text|char|citext)/i;
-        my $length = $specification->{prefix_length} // 2;
-        Selecto::Error->throw('invalid_query', 'text prefix length must be between 1 and 10')
-            unless "$length" =~ /\A\d+\z/ && $length >= 1 && $length <= 10;
-        my $normalized = "BTRIM(COALESCE(CAST($field_sql AS TEXT), ''))";
-        if ($specification->{exclude_articles}) {
-            $normalized = "REGEXP_REPLACE($normalized, '^(a|an|the)([[:space:]]+|$)', '', 'i')";
-        }
-        $normalized = "LOWER($normalized)" unless exists($specification->{ignore_case}) && !$specification->{ignore_case};
-        return "CASE WHEN $normalized = '' THEN 'Other' ELSE UPPER(LEFT($normalized, " . int($length) . ')) END';
-    }
-
-    my %range_kinds = map { $_ => 1 } qw(
-        numeric_ranges elapsed_days_ranges date_relative_ranges year_ranges
+sub _compile_related_collection_sql {
+    my ($self, $spec) = @_;
+    Selecto::Error->throw(
+        'unsupported_feature',
+        'related collections are not supported by adapter ' . $self->name,
     );
-    Selecto::Error->throw('invalid_query', 'bucket kind is not available') unless $range_kinds{$kind};
-    Selecto::Error->throw('invalid_query', 'numeric buckets require a numeric field')
-        if $kind eq 'numeric_ranges' && $resolved->{type} !~ /(?:int|decimal|number|numeric|float|double|real)/i;
-    Selecto::Error->throw('invalid_query', 'temporal buckets require a date or time field')
-        if $kind ne 'numeric_ranges' && $resolved->{type} !~ /(?:date|time)/i;
-    my $ranges = $specification->{ranges};
-    Selecto::Error->throw('invalid_query', 'bucket ranges must be a non-empty array')
-        unless ref($ranges) eq 'ARRAY' && @$ranges;
-    my $value_sql = $kind eq 'elapsed_days_ranges' ? "CURRENT_DATE - DATE($field_sql)"
-        : $kind eq 'year_ranges' ? "EXTRACT(YEAR FROM $field_sql)"
-        : $kind eq 'date_relative_ranges' ? "DATE($field_sql)"
-        : $field_sql;
-    my @clauses;
-    for my $range (@$ranges) {
-        Selecto::Error->throw('invalid_query', 'bucket range must be an object')
-            unless ref($range) eq 'HASH';
-        my ($minimum, $maximum, $label) = @{$range}{qw(minimum maximum label)};
-        Selecto::Error->throw('invalid_query', 'bucket range label is required')
-            unless defined($label) && !ref($label) && length("$label") <= 80;
-        my $predicate;
-        if ($kind eq 'date_relative_ranges' && defined($minimum) && "$minimum" =~ /\A(?:today|yesterday|tomorrow)\z/) {
-            Selecto::Error->throw('invalid_query', 'date keyword bucket boundaries must match')
-                unless defined($maximum) && "$maximum" eq "$minimum";
-            $predicate = $minimum eq 'today' ? "$value_sql = CURRENT_DATE"
-                : $minimum eq 'yesterday' ? "$value_sql = CURRENT_DATE - INTERVAL '1 day'"
-                : "$value_sql = CURRENT_DATE + INTERVAL '1 day'";
-        } else {
-            Selecto::Error->throw('invalid_query', 'bucket range requires at least one boundary')
-                unless defined($minimum) || defined($maximum);
-            Selecto::Error->throw('invalid_query', 'bucket range boundaries must be integers')
-                if (defined($minimum) && "$minimum" !~ /\A\d+\z/)
-                || (defined($maximum) && "$maximum" !~ /\A\d+\z/);
-            my @predicates;
-            if (defined($minimum)) {
-                push @$params, int($minimum);
-                my $marker = $self->placeholder(scalar @$params);
-                push @predicates, $kind eq 'date_relative_ranges'
-                    ? "$value_sql <= CURRENT_DATE - ($marker * INTERVAL '1 day')"
-                    : "$value_sql >= $marker";
-            }
-            if (defined($maximum)) {
-                push @$params, int($maximum);
-                my $marker = $self->placeholder(scalar @$params);
-                push @predicates, $kind eq 'date_relative_ranges'
-                    ? "$value_sql >= CURRENT_DATE - ($marker * INTERVAL '1 day')"
-                    : "$value_sql <= $marker";
-            }
-            $predicate = join(' AND ', @predicates);
-        }
-        push @$params, "$label";
-        push @clauses, 'WHEN ' . $predicate . ' THEN ' . $self->placeholder(scalar @$params);
-    }
-    push @$params, 'Other';
-    return 'CASE ' . join(' ', @clauses) . ' ELSE ' . $self->placeholder(scalar @$params) . ' END';
 }
 
 sub _field_sql {
@@ -1159,7 +1031,7 @@ sub _qualified {
 
 sub _compile_write {
     my ($self, $command) = @_;
-    my $relation = _checked_identifier($command->relation);
+    my $relation = Selecto::Identifier::checked($command->relation);
     my $operation = $command->operation;
     my $assignments = $command->assignments;
     if ($operation eq 'insert' || $operation eq 'upsert') {
@@ -1188,7 +1060,7 @@ sub _compile_write {
             $self->_compile_assignment_value($assignments->{$_}, \@params, $operation, 1)
         } @fields;
         my $sql = 'INSERT INTO ' . $self->quote_identifier($relation) .
-            ' (' . join(', ', map { $self->quote_identifier(_checked_identifier($_)) } @fields) . ')' .
+            ' (' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @fields) . ')' .
             ' VALUES (' . join(', ', @values) . ')';
         if ($operation eq 'upsert') {
             my $metadata = $command->metadata;
@@ -1207,7 +1079,7 @@ sub _compile_write {
         Selecto::Error->throw('invalid_write', 'update requires assignments') unless @fields;
         my @params;
         my @set = map {
-            $self->quote_identifier(_checked_identifier($_)) . ' = ' .
+            $self->quote_identifier(Selecto::Identifier::checked($_)) . ' = ' .
                 $self->_compile_assignment_value($assignments->{$_}, \@params, $operation, 1)
         } @fields;
         my $predicate = $self->_compile_write_predicate(
@@ -1280,7 +1152,7 @@ sub _compile_mutation_expression {
             'invalid_write',
             'mutation field references are supported only by update assignments',
         ) unless $operation eq 'update';
-        return $self->quote_identifier(_checked_identifier($arguments->[0]));
+        return $self->quote_identifier(Selecto::Identifier::checked($arguments->[0]));
     }
     if ($kind =~ /\A(?:add|subtract|multiply|divide)\z/) {
         my $operator = {
@@ -1308,11 +1180,11 @@ sub _append_returning {
     my ($self, $sql, $params, $command) = @_;
     my $returning = $command->metadata->{returning} // [];
     Selecto::Error->throw('invalid_write', 'returning must be an array of declared identifiers')
-        unless ref($returning) eq 'ARRAY' && !grep { ref($_) || !defined($_) || !_checked_identifier($_) } @$returning;
+        unless ref($returning) eq 'ARRAY' && !grep { ref($_) || !defined($_) || !Selecto::Identifier::checked($_) } @$returning;
     if (@$returning) {
         Selecto::Error->throw('write_capability_missing', 'adapter does not support returning')
             unless $self->write_capabilities->{returning};
-        $sql .= ' RETURNING ' . join(', ', map { $self->quote_identifier(_checked_identifier($_)) } @$returning);
+        $sql .= ' RETURNING ' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$returning);
     }
     return { sql => $sql, params => $params, returning => [@$returning] };
 }
@@ -1358,7 +1230,7 @@ sub _write_field {
     my $field = $expression->arguments->[0];
     Selecto::Error->throw('query_rule_unsupported_field', 'association fields are not portable write guards')
         if $field =~ /\./;
-    return _checked_identifier($field);
+    return Selecto::Identifier::checked($field);
 }
 
 sub _write_literal {
@@ -1427,9 +1299,9 @@ sub _compile_dialect_expression {
 
 sub _compile_upsert_clause {
     my ($self, $conflict, $updates) = @_;
-    return ' ON CONFLICT (' . join(', ', map { $self->quote_identifier(_checked_identifier($_)) } @$conflict) .
+    return ' ON CONFLICT (' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$conflict) .
         ') DO UPDATE SET ' . join(', ', map {
-            my $field = _checked_identifier($_);
+            my $field = Selecto::Identifier::checked($_);
             $self->quote_identifier($field) . ' = EXCLUDED.' . $self->quote_identifier($field)
         } @$updates);
 }
@@ -1449,13 +1321,5 @@ sub _logical_affected_rows { return $_[2]; }
 sub _column_types { return (); }
 
 sub _decode { return $_[1]; }
-
-sub _checked_identifier {
-    my ($value) = @_;
-    my $string = defined($value) ? "$value" : '';
-    Selecto::Error->throw('invalid_identifier', 'invalid SQL identifier')
-        unless $string =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
-    return $string;
-}
 
 1;

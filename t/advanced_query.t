@@ -225,6 +225,11 @@ is_deeply($cte_query->ctes->[0]{columns}, [qw(order_id kind)],
     'CTE accessors do not expose mutable column state');
 is($cte_query->ctes->[0]{join}{owner_key}, 'id',
     'CTE accessors do not expose mutable join contracts');
+my $cte_count = $cte_query->order_by('id')->limit(25)->count_query;
+is_deeply($cte_count->ctes->[0]{columns}, [qw(order_id kind)],
+    'count_query retains CTE sources that affect row identity');
+is_deeply($cte_count->orders, [], 'count_query still drops ordering around a CTE');
+ok(!defined($cte_count->limit_value), 'count_query still drops pagination around a CTE');
 
 eval {
     $advanced_engine->compile(

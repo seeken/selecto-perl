@@ -14,8 +14,10 @@
 - The domain owns the root relation. Query objects must not expose or accept a
   `from` override; engines pass the domain and query intent to adapters
   separately, and adapters render the root from the domain.
-- Certification observations must exercise public Selecto APIs. The central
-  harness owns expected values and certification verdicts.
+- Certification observations must exercise public Selecto APIs. The observation
+  runner lives in sibling `selecto-perl-certification`; `bin/selecto-certify`
+  in this repo is a workspace wrapper that launches it. The central harness
+  owns expected values and certification verdicts.
 - Keep credentials and connection strings out of errors, JSON output, fixtures,
   and reports. Use only independently authored synthetic test data.
 - Run `script/with-local-deps prove -lr t` and

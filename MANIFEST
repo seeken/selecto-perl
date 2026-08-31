@@ -12,7 +12,6 @@ lib/Selecto/Action/Plan.pm
 lib/Selecto/Action/Planner.pm
 lib/Selecto/Adapter.pm
 lib/Selecto/Adapter/Registry.pm
-lib/Selecto/Certification.pm
 lib/Selecto/Domain.pm
 lib/Selecto/Domain/DSL.pm
 lib/Selecto/Domain/Overlay.pm
@@ -22,6 +21,7 @@ lib/Selecto/DuckDB.pm
 lib/Selecto/Engine.pm
 lib/Selecto/Error.pm
 lib/Selecto/Expression.pm
+lib/Selecto/Identifier.pm
 lib/Selecto/MariaDB.pm
 lib/Selecto/MySQL.pm
 lib/Selecto/MySQLFamily.pm
@@ -59,7 +59,6 @@ t/postgresql.t
 t/query.t
 t/query_enforcement.t
 t/query_library.t
-t/runner.t
 t/sqlite.integration.t
 t/stream.t
 t/write.t

@@ -5,11 +5,13 @@ use utf8;
 use Test::More;
 use DBI ();
 use Selecto;
-use Selecto::Certification ();
 use Selecto::Domain ();
 use Selecto::Engine ();
 use Selecto::Expression ();
 use Selecto::Write ();
+
+eval { require Selecto::Certification; 1 }
+    or plan skip_all => 'Selecto::Certification is not installed';
 
 plan skip_all => 'DBD::ODBC is not installed' unless eval { require DBD::ODBC; 1 };
 plan skip_all => 'SELECTO_PERL_TEST_MSSQL_URL is not configured'

@@ -563,6 +563,11 @@ fail closed in both preview and execute phases. Applying the plan through a host
 execution adapter and issuing or consuming opaque authorization grants remain
 separate future boundaries.
 
+The observation-protocol runner is the sibling `selecto-perl-certification`
+package. `bin/selecto-certify` in this repository is a workspace wrapper that
+loads that runner so existing certification targets can keep using this
+directory as their working tree.
+
 ## Verification
 
 ```sh

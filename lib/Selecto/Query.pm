@@ -379,7 +379,23 @@ sub with_applied_query_library {
     my ($self, $applied) = @_;
     Selecto::Error->throw('invalid_query', 'applied query library state must be an object')
         unless ref($applied) eq 'HASH';
-    return $self->_copy(applied_query_library => $applied);
+    return $self->_copy(applied_query_library => dclone($applied));
+}
+
+sub count_query {
+    my ($self, @values) = @_;
+    @values = @{$values[0]} if @values == 1 && ref($values[0]) eq 'ARRAY';
+    my %changes = (
+        orders => [],
+        limit_value => undef,
+        offset_value => undef,
+    );
+    if (@values) {
+        $changes{selections} = [map {
+            blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
+        } @values];
+    }
+    return $self->_copy(%changes);
 }
 
 sub limit  { my ($self, $value) = @_; return $self->_copy(limit_value  => _nonnegative($value, 'limit')); }
