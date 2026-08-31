@@ -5,7 +5,9 @@ use utf8;
 use Test::More;
 use DBI ();
 use Selecto;
-use Selecto::Certification ();
+
+eval { require Selecto::Certification; 1 }
+    or plan skip_all => 'Selecto::Certification is not installed';
 
 plan skip_all => 'DBD::MariaDB is not installed' unless eval { require DBD::MariaDB; 1 };
 

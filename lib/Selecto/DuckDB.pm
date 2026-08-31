@@ -47,6 +47,15 @@ sub _decode {
     return $value;
 }
 
+sub _compile_related_collection_sql {
+    my ($self, $spec) = @_;
+    my @pairs = $self->_related_collection_json_pairs($spec->{fields}, $spec->{quoted_alias});
+    my $aggregate = 'JSON_GROUP_ARRAY(JSON_OBJECT(' . join(', ', @pairs) . '))';
+    return $self->_related_collection_aggregate_sql(
+        $aggregate, $spec->{from}, $spec->{where}, q{'[]'},
+    );
+}
+
 sub _transaction {
     my ($self, $operation) = @_;
     my $value;

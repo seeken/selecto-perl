@@ -4,8 +4,17 @@ use 5.034;
 use strict;
 use warnings;
 use FindBin qw($Bin);
-use lib "$Bin/../lib";
-use Selecto::Certification ();
+use File::Spec::Functions qw(catdir rel2abs);
+
+my $core = rel2abs(catdir($Bin, '..'));
+my $cert = $ENV{SELECTO_LIVE_SELECTO_PERL_CERTIFICATION}
+    // catdir($core, '..', 'selecto-perl-certification');
+$cert = rel2abs($cert);
+die "selecto-perl-certification was not found at $cert\n"
+    unless -f catdir($cert, 'lib', 'Selecto', 'Certification.pm');
+
+unshift @INC, catdir($core, 'lib'), catdir($cert, 'lib');
+require Selecto::Certification;
 
 my $ok = eval { Selecto::Certification->run(@ARGV); 1 };
 if (!$ok) {
@@ -14,4 +23,3 @@ if (!$ok) {
     warn "selecto-certify: $error\n";
     exit 1;
 }
-

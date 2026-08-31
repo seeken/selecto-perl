@@ -4,7 +4,11 @@ use warnings;
 use Test::More;
 use lib 't/lib';
 use TestSelecto;
+use Selecto::Identifier ();
+use Selecto::MSSQL ();
+use Selecto::MySQL ();
 use Selecto::PostgreSQL ();
+use Selecto::SQLite ();
 
 my $dbh = TestSelecto::DBH->new;
 my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
@@ -541,5 +545,62 @@ is_deeply($membership_statement->params, ['open'], 'expression values are isolat
 
 eval { $engine->query->select('id')->order_by('id', 'sideways') };
 is($@->code, 'invalid_query', 'invalid order direction fails closed');
+
+ok(Selecto::Identifier::valid('sku_1'), 'SQL identifiers accept letters, digits, and underscores');
+ok(!Selecto::Identifier::valid('odd name'), 'SQL identifiers reject spaces');
+eval { Selecto::Identifier::checked(q{id"; DROP TABLE people; --}) };
+is($@->code, 'invalid_identifier', 'hostile identifiers fail closed');
+
+my $paged = $engine->query->select('id', 'name')
+    ->where(Selecto::Expression->eq('name', 'Ada'))
+    ->order_by('id')->limit(25)->offset(50);
+my $counted = $paged->count_query;
+is_deeply(
+    [map { $_->arguments->[0] } @{$counted->selections}],
+    [qw(id name)],
+    'count_query keeps original selections by default',
+);
+is($counted->predicate->kind, 'eq', 'count_query keeps the predicate');
+is_deeply($counted->orders, [], 'count_query drops ordering');
+ok(!defined($counted->limit_value), 'count_query drops limit');
+ok(!defined($counted->offset_value), 'count_query drops offset');
+is($paged->limit_value, 25, 'count_query does not mutate the source query');
+is($paged->count_query('id')->selections->[0]->arguments->[0], 'id',
+    'count_query can replace selections');
+
+my $applied = {segments => ['live'], views => []};
+my $with_library = $engine->query->select('id')->with_applied_query_library($applied);
+$applied->{segments}[0] = 'mutated';
+is_deeply($with_library->applied_query_library->{segments}, ['live'],
+    'applied query library state is isolated from caller mutation');
+
+my $collection_query = $line_engine->query->select(
+    'id',
+    Selecto::Expression->related_collection('lines', ['sku'])->as('lines'),
+);
+like(
+    Selecto::Engine->new(
+        domain => $line_domain,
+        adapter => Selecto::SQLite->new(dbh => TestSelecto::DBH->new),
+    )->compile($collection_query)->sql,
+    qr/JSON_GROUP_ARRAY\(JSON_OBJECT\('sku', "c_lines"\."sku"\)\)/,
+    'SQLite related collections use JSON_GROUP_ARRAY',
+);
+like(
+    Selecto::Engine->new(
+        domain => $line_domain,
+        adapter => Selecto::MySQL->new(dbh => TestSelecto::DBH->new),
+    )->compile($collection_query)->sql,
+    qr/JSON_ARRAYAGG\(JSON_OBJECT\('sku', `c_lines`\.`sku`\)\)/,
+    'MySQL related collections use JSON_ARRAYAGG',
+);
+like(
+    Selecto::Engine->new(
+        domain => $line_domain,
+        adapter => Selecto::MSSQL->new(dbh => TestSelecto::DBH->new),
+    )->compile($collection_query)->sql,
+    qr/FOR JSON PATH/,
+    'SQL Server related collections use FOR JSON PATH',
+);
 
 done_testing;

@@ -5,7 +5,9 @@ use Test::More;
 use DBI ();
 use JSON::PP ();
 use Selecto;
-use Selecto::Certification ();
+
+eval { require Selecto::Certification; 1 }
+    or plan skip_all => 'Selecto::Certification is not installed';
 
 my $url = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not configured' unless defined($url) && $url ne '';

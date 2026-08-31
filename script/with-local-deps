@@ -3,11 +3,17 @@ set -eu
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 local_lib="$repo_dir/local/lib/perl5"
+perl_paths="$local_lib:$repo_dir/lib"
+
+cert_dir=${SELECTO_LIVE_SELECTO_PERL_CERTIFICATION:-"$repo_dir/../selecto-perl-certification"}
+if [ -f "$cert_dir/lib/Selecto/Certification.pm" ]; then
+  perl_paths="$perl_paths:$cert_dir/lib"
+fi
 
 if [ -n "${PERL5LIB:-}" ]; then
-  export PERL5LIB="$local_lib:$repo_dir/lib:$PERL5LIB"
+  export PERL5LIB="$perl_paths:$PERL5LIB"
 else
-  export PERL5LIB="$local_lib:$repo_dir/lib"
+  export PERL5LIB="$perl_paths"
 fi
 
 exec "$@"

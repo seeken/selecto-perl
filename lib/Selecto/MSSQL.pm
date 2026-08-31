@@ -3,6 +3,7 @@ package Selecto::MSSQL;
 use Mojo::Base 'Selecto::SQL';
 use DBI qw(:sql_types);
 use Selecto::Error ();
+use Selecto::Identifier ();
 
 sub name    { return 'mssql'; }
 sub dialect { return __PACKAGE__; }
@@ -51,7 +52,7 @@ sub _compile_write {
     my ($self, $command) = @_;
     return $self->SUPER::_compile_write($command) unless $command->operation eq 'upsert';
 
-    my $relation = _checked_identifier($command->relation);
+    my $relation = Selecto::Identifier::checked($command->relation);
     my $assignments = $command->assignments;
     my @fields = sort keys %$assignments;
     Selecto::Error->throw('invalid_write', 'upsert requires assignments') unless @fields;
@@ -66,23 +67,23 @@ sub _compile_write {
 
     my %assigned = map { $_ => 1 } @fields;
     for my $field (@$conflict, @$updates) {
-        $field = _checked_identifier($field);
+        $field = Selecto::Identifier::checked($field);
         Selecto::Error->throw('invalid_write', 'upsert conflict and update fields must be assigned')
             unless $assigned{$field};
     }
 
-    my @quoted = map { $self->quote_identifier(_checked_identifier($_)) } @fields;
+    my @quoted = map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @fields;
     my @params;
     my @values = map {
         $self->_compile_assignment_value($assignments->{$_}, \@params, 'upsert', 1)
     } @fields;
     my @source = map { 'source.' . $_ } @quoted;
     my @matches = map {
-        my $field = $self->quote_identifier(_checked_identifier($_));
+        my $field = $self->quote_identifier(Selecto::Identifier::checked($_));
         'target.' . $field . ' = source.' . $field
     } @$conflict;
     my @sets = map {
-        my $field = $self->quote_identifier(_checked_identifier($_));
+        my $field = $self->quote_identifier(Selecto::Identifier::checked($_));
         'target.' . $field . ' = source.' . $field
     } @$updates;
 
@@ -137,12 +138,17 @@ sub _decode {
     return $value;
 }
 
-sub _checked_identifier {
-    my ($value) = @_;
-    my $string = defined($value) ? "$value" : '';
-    Selecto::Error->throw('invalid_identifier', 'invalid SQL identifier')
-        unless $string =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
-    return $string;
+sub _compile_related_collection_sql {
+    my ($self, $spec) = @_;
+    my $quoted_alias = $spec->{quoted_alias};
+    my $projection = join(', ', map {
+        $quoted_alias . '.' . $self->quote_identifier($_) . ' AS ' .
+            $self->quote_identifier($_)
+    } @{$spec->{fields}});
+    return "COALESCE((SELECT $projection FROM $spec->{from} " .
+        "WHERE $spec->{where}" .
+        (defined($spec->{order}) ? " ORDER BY $spec->{order}" : '') .
+        " FOR JSON PATH), '[]')";
 }
 
 1;
