@@ -47,6 +47,10 @@ protocol 1 and certification specification 2.3.0.
   backend certification.
 
 It does not contain HTTP routes, ORM, or UI compatibility code.
+The separate `@selecto/api-console` browser package consumes `Selecto::API`
+unchanged. Mojolicious applications can use the generated assets and mounting
+helper shipped by `selecto-perl-components`, while this core remains
+HTTP-neutral.
 
 ## Install for development
 
