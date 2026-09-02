@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
+use Storable qw(dclone);
 use Selecto::Expression ();
 use lib 't/lib';
 use TestSelecto;
@@ -270,6 +271,127 @@ my $bad_components = eval {
 };
 ok(!$bad_components, 'component URL-state policy requires a boolean');
 is($@->code, 'invalid_domain', 'invalid component policy fails through the domain boundary');
+
+my $action_contract = $canonical->contract;
+$action_contract->{detail_actions} = {
+    open_order => {
+        name => 'Open order',
+        description => 'Open this order in maintenance.',
+        type => 'external_link',
+        required_fields => [qw(id person.name)],
+        payload => {
+            url_template => '/orders/maint?id={{id}}&person={{person.name}}',
+            target => '_blank',
+        },
+    },
+};
+my $action_domain = Selecto::Domain->parse($action_contract, strict => 1);
+is_deeply(
+    $action_domain->detail_actions->{open_order},
+    $action_contract->{detail_actions}{open_order},
+    'canonical detail actions retain their validated external-link contract',
+);
+
+my $modal_action_contract = dclone($action_contract);
+$modal_action_contract->{detail_actions}{open_order} = {
+    name => 'Order maintenance',
+    description => 'Review this order without leaving the result set.',
+    type => 'iframe_modal',
+    required_fields => [qw(id person.name)],
+    payload => {
+        url_template => '/orders/maint?id={{id}}&person={{person.name}}',
+        title => 'Order {{id}}',
+        size => 'fullscreen',
+        referrer_policy => 'same-origin',
+        navigation_enabled => 1,
+        allow => 'clipboard-write',
+    },
+};
+my $modal_action_domain = Selecto::Domain->parse($modal_action_contract, strict => 1);
+is_deeply(
+    $modal_action_domain->detail_actions->{open_order},
+    $modal_action_contract->{detail_actions}{open_order},
+    'canonical detail actions retain their validated iframe-modal contract',
+);
+
+my $default_modal_contract = dclone($modal_action_contract);
+delete @{$default_modal_contract->{detail_actions}{open_order}{payload}}{
+    qw(title size referrer_policy navigation_enabled allow)
+};
+my $default_modal = Selecto::Domain->parse($default_modal_contract, strict => 1)
+    ->detail_actions->{open_order}{payload};
+is_deeply(
+    $default_modal,
+    {
+        url_template => '/orders/maint?id={{id}}&person={{person.name}}',
+        title => 'Order maintenance',
+        size => 'xl',
+        referrer_policy => 'strict-origin-when-cross-origin',
+        navigation_enabled => 1,
+    },
+    'iframe-modal presentation and navigation defaults are portable',
+);
+
+my $bad_action_contract = dclone($action_contract);
+$bad_action_contract->{detail_actions}{open_order}{payload}{url_template} =
+    'javascript:alert({{id}})';
+eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain', 'executable detail-action URLs fail closed');
+
+$bad_action_contract = dclone($action_contract);
+$bad_action_contract->{detail_actions}{open_order}{required_fields} = ['person.name'];
+eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'every detail-action URL placeholder must be a declared required field');
+
+$bad_action_contract = dclone($action_contract);
+$bad_action_contract->{detail_actions}{open_order}{required_fields} = [qw(id person.secret)];
+$bad_action_contract->{detail_actions}{open_order}{payload}{url_template} =
+    '/orders/maint?id={{id}}&secret={{person.secret}}';
+eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'detail actions cannot require fields outside the governed domain');
+
+$bad_action_contract = $many->contract;
+$bad_action_contract->{detail_actions} = {
+    open_order => {
+        name => 'Open order', type => 'external_link',
+        required_fields => [qw(id person.name)],
+        payload => {url_template => '/orders/maint?id={{id}}&person={{person.name}}'},
+    },
+};
+eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'detail-action fields cannot introduce a to-many row multiplication');
+
+$bad_action_contract = dclone($action_contract);
+$bad_action_contract->{detail_actions}{open_order}{type} = 'modal';
+eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain', 'unsupported detail-action types fail closed');
+
+$bad_action_contract = dclone($modal_action_contract);
+$bad_action_contract->{detail_actions}{open_order}{payload}{title} = 'Order {{person.secret}}';
+eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'iframe-modal title placeholders must be governed required fields');
+
+$bad_action_contract = dclone($modal_action_contract);
+$bad_action_contract->{detail_actions}{open_order}{payload}{referrer_policy} = 'send-everything';
+eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain', 'unknown iframe referrer policies fail closed');
+
+$bad_action_contract = dclone($modal_action_contract);
+$bad_action_contract->{detail_actions}{open_order}{payload}{target} = '_blank';
+eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain', 'external-link settings cannot leak into iframe actions');
 
 eval { $canonical->resolve('person.secret') };
 $error = $@;
