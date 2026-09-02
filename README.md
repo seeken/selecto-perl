@@ -26,6 +26,9 @@ protocol 1 and certification specification 2.3.0.
   subqueries, and typed JSON rowsets where the selected adapter supports them;
 - portable named query-library segments, projections, orderings, and views with
   typed parameters and applied-definition provenance;
+- validated portable detail-action metadata with governed required fields and
+  safe external-link or iframe-modal URL templates for compatible exploration
+  UIs;
 - field, literal, comparison, null, membership, conjunction, aggregate,
   window, and PostgreSQL full-text expressions, plus governed PostgreSQL
   date/time format expressions;
@@ -379,6 +382,12 @@ my $rollup = $engine->query
     ->group_by_rollup($status)
     ->order_by($status);
 ```
+
+Detail-row actions support governed `external_link` destinations and reusable
+`iframe_modal` previews. Modal payloads can declare a templated title, size,
+referrer policy, optional iframe permissions, and whether the host should offer
+previous/next navigation. Applications still resolve and authorize each action
+before rendering it.
 
 Rollup ordering follows Selecto's PostgreSQL compatibility behavior and uses
 selected-column positions. A one-group rollup sorts its grouping marker first,

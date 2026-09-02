@@ -30,6 +30,12 @@ my %THROUGH = map { $_ => 1 } qw(
     where target_key_cast
 );
 my %COMPONENTS = map { $_ => 1 } qw(query_params);
+my %DETAIL_ACTION = map { $_ => 1 } qw(
+    name description type required_fields payload capability
+);
+my %DETAIL_ACTION_PAYLOAD = map { $_ => 1 } qw(
+    url_template target title size allow referrer_policy sandbox navigation_enabled
+);
 
 sub new {
     my ($class, %args) = @_;
@@ -54,6 +60,7 @@ sub new {
         associations => \%associations,
         components   => _normalize_components($args{components}),
         query_library => _normalize_query_library($args{query_library}),
+        detail_actions => {},
         primary_key  => undef,
         required_predicate => $args{required_predicate},
         tenant_field => $args{tenant_field},
@@ -108,6 +115,11 @@ sub new {
             { association => $association->name },
         ) unless $association->dimension_key eq $association->owner_key;
     }
+    if (defined($args{detail_actions})) {
+        $self->{detail_actions} = _validate_detail_actions(
+            $self, $args{detail_actions},
+        );
+    }
     $self->_refresh_fingerprint;
     return $self;
 }
@@ -129,6 +141,8 @@ sub _refresh_fingerprint {
     $fingerprint_value->{components} = $self->{components} if keys %{$self->{components}};
     $fingerprint_value->{query_library} = $self->{query_library}
         if keys %{$self->{query_library}};
+    $fingerprint_value->{detail_actions} = $self->{detail_actions}
+        if keys %{$self->{detail_actions}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
     $self->{fingerprint} = 'sha256:' . sha256_hex($json);
     return $self;
@@ -172,6 +186,7 @@ sub parse {
         associations => $raw->{associations} // {},
         components => $raw->{components},
         query_library => $raw->{query_library},
+        detail_actions => $raw->{detail_actions},
     );
 }
 
@@ -202,6 +217,9 @@ sub _parse_canonical {
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
+    $domain->{detail_actions} = _validate_detail_actions(
+        $domain, $raw->{detail_actions},
+    );
     my $fingerprint_document = dclone($raw);
     delete $fingerprint_document->{domain_fingerprint};
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
@@ -565,6 +583,178 @@ sub _normalize_query_library {
     return \%library;
 }
 
+sub _validate_detail_actions {
+    my ($domain, $value) = @_;
+    return {} unless defined $value;
+    _object($value, 'detail_actions');
+    my %actions;
+    for my $raw_id (sort keys %$value) {
+        my $id = _identifier($raw_id, 'detail action');
+        my $action = $value->{$raw_id};
+        _object($action, "detail action $id");
+        _reject_unknown($action, \%DETAIL_ACTION, "detail action $id");
+        my $name = _required_string($action->{name}, "detail action $id name");
+        my $type = lc _required_string($action->{type}, "detail action $id type");
+        Selecto::Error->throw(
+            'invalid_domain', "unsupported detail action type $type",
+            {action => $id},
+        ) unless $type eq 'external_link' || $type eq 'iframe_modal';
+        my $description;
+        if (defined($action->{description})) {
+            $description = _required_string(
+                $action->{description}, "detail action $id description",
+            );
+        }
+        my $capability;
+        if (defined($action->{capability})) {
+            $capability = _required_string(
+                $action->{capability}, "detail action $id capability",
+            );
+        }
+        my $required_fields = $action->{required_fields} // [];
+        Selecto::Error->throw(
+            'invalid_domain', "detail action $id required_fields must be an array",
+        ) unless ref($required_fields) eq 'ARRAY';
+        my (@fields, %seen_field);
+        for my $raw_field (@$required_fields) {
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id required field must be a field path",
+            ) if !defined($raw_field) || ref($raw_field)
+                || "$raw_field" !~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+            my $field = "$raw_field";
+            next if $seen_field{$field}++;
+            my $resolved = eval { $domain->resolve($field) };
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id required field is not queryable",
+                {action => $id, field => $field},
+            ) unless $resolved;
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id required field cannot denormalize rows",
+                {action => $id, field => $field},
+            ) if grep { $_->cardinality eq 'many' } @{$resolved->{associations} // []};
+            push @fields, $field;
+        }
+        my $payload = $action->{payload};
+        _object($payload, "detail action $id payload");
+        _reject_unknown($payload, \%DETAIL_ACTION_PAYLOAD, "detail action $id payload");
+        my $url_template = _required_string(
+            $payload->{url_template}, "detail action $id payload url_template",
+        );
+        Selecto::Error->throw(
+            'invalid_domain', "detail action $id URL template is not safe",
+            {action => $id},
+        ) if $url_template =~ /\x00/
+            || $url_template =~ m{\A//}
+            || $url_template =~ /\A(?:javascript|data|vbscript):/i
+            || $url_template =~ /\A(?!https?:)[A-Za-z][A-Za-z0-9+.-]*:/i;
+        my %required = map { $_ => 1 } @fields;
+        my @placeholders = $url_template =~ /\{\{\s*([^}]+?)\s*\}\}/g;
+        Selecto::Error->throw(
+            'invalid_domain', "detail action $id URL template requires placeholders",
+            {action => $id},
+        ) unless @placeholders;
+        for my $placeholder (@placeholders) {
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id URL placeholder is not a required field",
+                {action => $id, field => $placeholder},
+            ) unless $required{$placeholder};
+        }
+        my $without_placeholders = $url_template;
+        $without_placeholders =~ s/\{\{\s*[^}]+?\s*\}\}//g;
+        Selecto::Error->throw(
+            'invalid_domain', "detail action $id URL template has malformed placeholders",
+            {action => $id},
+        ) if $without_placeholders =~ /[{}]/;
+        my %normalized_payload = (url_template => $url_template);
+        if ($type eq 'external_link') {
+            for my $key (qw(title size allow referrer_policy sandbox navigation_enabled)) {
+                Selecto::Error->throw(
+                    'invalid_domain', "detail action $id payload $key is only available for iframe_modal",
+                    {action => $id},
+                ) if exists $payload->{$key};
+            }
+            my $target = defined($payload->{target})
+                ? _required_string($payload->{target}, "detail action $id payload target")
+                : '_self';
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id target is not available",
+                {action => $id, target => $target},
+            ) unless $target =~ /\A_(?:self|blank|parent|top)\z/;
+            $normalized_payload{target} = $target;
+        } else {
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id payload target is only available for external_link",
+                {action => $id},
+            ) if exists $payload->{target};
+            my $title = defined($payload->{title})
+                ? _required_string($payload->{title}, "detail action $id payload title")
+                : $name;
+            my @title_placeholders = $title =~ /\{\{\s*([^}]+?)\s*\}\}/g;
+            for my $placeholder (@title_placeholders) {
+                Selecto::Error->throw(
+                    'invalid_domain', "detail action $id title placeholder is not a required field",
+                    {action => $id, field => $placeholder},
+                ) unless $required{$placeholder};
+            }
+            my $title_without_placeholders = $title;
+            $title_without_placeholders =~ s/\{\{\s*[^}]+?\s*\}\}//g;
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id title has malformed placeholders",
+                {action => $id},
+            ) if $title_without_placeholders =~ /[{}]/;
+            my $size = defined($payload->{size})
+                ? lc _required_string($payload->{size}, "detail action $id payload size")
+                : 'xl';
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id iframe size is not available",
+                {action => $id, size => $size},
+            ) unless $size =~ /\A(?:sm|md|lg|xl|full|third|fullscreen)\z/;
+            my $referrer_policy = defined($payload->{referrer_policy})
+                ? lc _required_string(
+                    $payload->{referrer_policy},
+                    "detail action $id payload referrer_policy",
+                )
+                : 'strict-origin-when-cross-origin';
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id iframe referrer policy is not available",
+                {action => $id, referrer_policy => $referrer_policy},
+            ) unless $referrer_policy =~ /\A(?:no-referrer|no-referrer-when-downgrade|origin|origin-when-cross-origin|same-origin|strict-origin|strict-origin-when-cross-origin|unsafe-url)\z/;
+            my $navigation_enabled = exists($payload->{navigation_enabled})
+                ? $payload->{navigation_enabled} : 1;
+            my $boolean = JSON::PP::is_bool($navigation_enabled)
+                || (!ref($navigation_enabled) && "$navigation_enabled" =~ /\A(?:0|1)\z/);
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id navigation_enabled must be a boolean",
+                {action => $id},
+            ) unless $boolean;
+            $normalized_payload{title} = $title;
+            $normalized_payload{size} = $size;
+            $normalized_payload{referrer_policy} = $referrer_policy;
+            $normalized_payload{navigation_enabled} = $navigation_enabled ? 1 : 0;
+            for my $key (qw(allow sandbox)) {
+                next unless exists $payload->{$key};
+                my $setting = _required_string(
+                    $payload->{$key}, "detail action $id payload $key",
+                );
+                Selecto::Error->throw(
+                    'invalid_domain', "detail action $id iframe $key contains unsafe characters",
+                    {action => $id},
+                ) if $setting =~ /[\x00-\x1f\x7f<>"'`]/;
+                $normalized_payload{$key} = $setting;
+            }
+        }
+        $actions{$id} = {
+            name => $name,
+            type => $type,
+            required_fields => \@fields,
+            payload => \%normalized_payload,
+            (defined($description) ? (description => $description) : ()),
+            (defined($capability) ? (capability => $capability) : ()),
+        };
+    }
+    return \%actions;
+}
+
 sub _constant_predicates {
     my ($value, $label) = @_;
     _object($value, $label);
@@ -622,6 +812,7 @@ sub tenant_field { return $_[0]->{tenant_field}; }
 sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
 sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
 sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
+sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }
 sub query_library { return dclone($_[0]->{query_library} // {}); }
