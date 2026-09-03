@@ -316,16 +316,48 @@ sub _canonical_fields {
 
 sub _validate_computed_columns {
     my ($source, $associations) = @_;
+    my %predicate_dependencies;
     for my $field (@{$source->{fields} // []}) {
         my $column = $source->{columns}{$field};
         next unless ref($column) eq 'HASH' && exists $column->{computed};
         my $computed = $column->{computed};
         _object($computed, "computed column $field");
-        my %allowed = map { $_ => 1 } qw(kind association);
-        _reject_unknown($computed, \%allowed, "computed column $field");
         my $kind = _required_string($computed->{kind}, "computed column $field kind");
+        my %allowed = map { $_ => 1 } $kind eq 'predicate'
+            ? qw(kind expression) : qw(kind association);
+        _reject_unknown($computed, \%allowed, "computed column $field");
         Selecto::Error->throw('invalid_domain', "unsupported computed column kind $kind")
-            unless $kind eq 'association_exists';
+            unless $kind eq 'association_exists' || $kind eq 'predicate';
+        if ($kind eq 'predicate') {
+            Selecto::Error->throw(
+                'invalid_domain', 'predicate computed columns must be boolean', {field => $field},
+            ) unless ($column->{type} // '') eq 'boolean';
+            Selecto::Error->throw(
+                'invalid_domain', 'predicate computed columns require an expression', {field => $field},
+            ) unless exists $computed->{expression};
+            require Selecto::Expression;
+            my $expression;
+            my $ok = eval {
+                $expression = Selecto::Expression->from_filter_ast($computed->{expression});
+                1;
+            };
+            Selecto::Error->throw(
+                'invalid_domain', 'computed predicate expression is invalid', {field => $field},
+            ) unless $ok;
+            my @dependencies = _computed_predicate_fields($expression);
+            for my $dependency (@dependencies) {
+                Selecto::Error->throw(
+                    'invalid_domain', 'computed predicates may reference only root domain fields',
+                    {field => $field, dependency => $dependency},
+                ) if $dependency =~ /\./;
+                Selecto::Error->throw(
+                    'invalid_domain', 'computed predicate references an unknown field',
+                    {field => $field, dependency => $dependency},
+                ) unless exists $source->{columns}{$dependency};
+            }
+            $predicate_dependencies{$field} = \@dependencies;
+            next;
+        }
         my $association = _identifier(
             $computed->{association}, "computed column $field association"
         );
@@ -338,6 +370,43 @@ sub _validate_computed_columns {
             {field => $field, association => $association},
         ) if $associations->{$association}->through;
     }
+    _validate_computed_predicate_cycles(\%predicate_dependencies, $source);
+}
+
+sub _computed_predicate_fields {
+    my ($expression) = @_;
+    return () unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $arguments = $expression->arguments;
+    return ("$arguments->[0]") if $expression->kind eq 'field';
+    my @fields;
+    for my $argument (@$arguments) {
+        if (blessed($argument) && $argument->isa('Selecto::Expression')) {
+            push @fields, _computed_predicate_fields($argument);
+        } elsif (ref($argument) eq 'ARRAY') {
+            push @fields, map { _computed_predicate_fields($_) } @$argument;
+        }
+    }
+    my %seen;
+    return grep { !$seen{$_}++ } @fields;
+}
+
+sub _validate_computed_predicate_cycles {
+    my ($dependencies, $source) = @_;
+    my (%visiting, %visited);
+    my $visit;
+    $visit = sub {
+        my ($field) = @_;
+        Selecto::Error->throw(
+            'invalid_domain', 'computed predicate dependency cycle detected', {field => $field},
+        ) if $visiting{$field};
+        return if $visited{$field}++;
+        local $visiting{$field} = 1;
+        for my $dependency (@{$dependencies->{$field} // []}) {
+            next unless exists $dependencies->{$dependency};
+            $visit->($dependency);
+        }
+    };
+    $visit->($_) for sort keys %$dependencies;
 }
 
 sub _expression_value {

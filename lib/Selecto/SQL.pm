@@ -896,7 +896,11 @@ sub _field_sql {
 sub _compile_computed_field {
     my ($self, $domain, $path, $computed, $params) = @_;
     Selecto::Error->throw('invalid_domain', 'unsupported computed field')
-        unless $computed->{kind} eq 'association_exists';
+        unless $computed->{kind} eq 'association_exists' || $computed->{kind} eq 'predicate';
+    if ($computed->{kind} eq 'predicate') {
+        my $expression = Selecto::Expression->from_filter_ast($computed->{expression});
+        return '(' . $self->_compile_expression($domain, $expression, $params) . ')';
+    }
     my $association_name = $computed->{association};
     my $association = $domain->associations->{$association_name};
     Selecto::Error->throw('invalid_domain', 'computed field association is unavailable', {
