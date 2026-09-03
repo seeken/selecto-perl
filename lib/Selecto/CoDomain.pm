@@ -129,7 +129,7 @@ sub lookup {
         }
         push @results, {
             value => "$value", label => "$label",
-            (@description ? (description => join(' · ', @description)) : ()),
+            (@description ? (description => join(" \x{b7} ", @description)) : ()),
         };
     }
     return {results => \@results, query => $query};

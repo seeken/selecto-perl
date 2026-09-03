@@ -138,7 +138,7 @@ my $lookup = Selecto::CoDomain->lookup(
 );
 is_deeply $lookup->{results}, [{
     value => '501', label => 'Acme Transport',
-    description => 'Client ID 501 · Key ACME · City Detroit · State MI · Status Active',
+    description => "Client ID 501 \x{b7} Key ACME \x{b7} City Detroit \x{b7} State MI \x{b7} Status Active",
 }], 'co-domain lookup maps the target projection into portable lookup results';
 like $CoDomainTest::Adapter::LAST_STATEMENT->sql,
     qr/TO_TSQUERY\('simple', \$\d+\)/,
