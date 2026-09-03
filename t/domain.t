@@ -120,6 +120,38 @@ is_deeply($computed->field_metadata('has_person')->{computed}, {
     kind => 'association_exists', association => 'person',
 }, 'canonical domains retain governed association-exists computed fields');
 
+my $predicate_contract = $computed->contract;
+push @{$predicate_contract->{source}{fields}}, 'is_ready';
+$predicate_contract->{source}{columns}{is_ready} = {
+    type => 'boolean',
+    internal => 1,
+    computed => {
+        kind => 'predicate',
+        expression => ['and', [
+            ['gt', 'id', 0],
+            ['eq', 'has_person', 1],
+        ]],
+    },
+};
+my $predicate_computed = Selecto::Domain->parse($predicate_contract, strict => 1);
+is_deeply($predicate_computed->field_metadata('is_ready')->{computed}, {
+    kind => 'predicate',
+    expression => ['and', [
+        ['gt', 'id', 0],
+        ['eq', 'has_person', 1],
+    ]],
+}, 'canonical domains retain governed predicate computed fields');
+ok !$predicate_computed->field_is_public('is_ready'),
+    'SQL-computed eligibility fields may remain internal to consumers';
+
+my $cyclic_predicate_contract = $predicate_computed->contract;
+$cyclic_predicate_contract->{source}{columns}{has_person}{computed} = {
+    kind => 'predicate', expression => ['eq', 'is_ready', 1],
+};
+eval { Selecto::Domain->parse($cyclic_predicate_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain', 'computed predicate dependency cycles fail closed');
+
 my $bad_computed_contract = $computed->contract;
 $bad_computed_contract->{source}{columns}{has_person}{computed}{association} = 'passwords';
 eval { Selecto::Domain->parse($bad_computed_contract, strict => 1) };

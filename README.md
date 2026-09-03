@@ -135,6 +135,31 @@ Both canonical nested schemas and constructor-domain nested `associations`
 retain the full lineage. Contract promotion for overlays preserves those
 nested relationships as canonical schemas.
 
+Canonical domains may also expose an internal SQL-computed boolean using the
+same governed filter AST as query-library segments. This is useful for action
+eligibility and other row-state decisions that should travel with the primary
+query instead of triggering per-row application calls:
+
+```perl
+ready_for_dispatch => {
+    type => 'boolean',
+    internal => 1,
+    computed => {
+        kind => 'predicate',
+        expression => ['and', [
+            ['in', 'status', [qw(A O)]],
+            ['eq', 'has_payload', 1],
+        ]],
+    },
+},
+```
+
+Predicate computations accept the portable comparison, null, membership, and
+boolean operators, reference only governed root fields, and bind every literal
+through the adapter. Raw SQL is not accepted. They may compose other computed
+root fields, including `association_exists` fields, provided the dependency
+graph is acyclic.
+
 ## Advanced queries and streaming
 
 Advanced sources remain domain-owned. A CTE or lateral subquery receives its
@@ -236,6 +261,42 @@ my $query = $engine->apply_view(
 );
 my $applied = $query->applied_query_library;
 ```
+
+Co-domains let one domain declare a bounded lookup owned and governed by
+another domain. The portable contract names the target domain, its reusable
+view or projection, searchable fields, and the result mapping; the host still
+owns target-engine resolution and request-specific authorization scope:
+
+```perl
+co_domains => {
+    carriers => {
+        domain => 'client',
+        view => 'carrier_lookup',
+        search => {
+            fields => [qw(id co_name cl_key city state)],
+            mode => 'prefix', rank => 1,
+        },
+        result => {
+            value_field => 'id', label_field => 'co_name',
+            description_fields => [qw(id cl_key city state)],
+        },
+    },
+}
+
+my $result = Selecto::CoDomain->lookup(
+    source_domain => $load_domain,
+    co_domain => 'carriers',
+    engine => $tenant_scoped_client_engine,
+    query => $search_text,
+    predicate => $selection_specific_scope,
+    limit => 20,
+);
+```
+
+The target engine's mandatory tenant predicate is preserved. The optional
+predicate can only further restrict the lookup, which is useful when an action
+selection determines eligibility. Co-domain contracts never carry connection
+details, raw SQL, or a client-selected target engine.
 
 Definitions are data rather than SQL fragments. Segment composition supports
 AND, OR, NOT, NOR, and two-input XOR groups; projection associations become
