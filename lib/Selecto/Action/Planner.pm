@@ -45,7 +45,11 @@ sub plan {
 
     my ($scope, $filters, $expected, $target) = _target($contract, $action, $operation_spec, $intent->{target});
     my ($transition, $preconditions) = _transition($writes, $action, $changes);
-    push @$filters, map { [$_->{field}, $_->{value}] } @$preconditions;
+    $preconditions = [@{_declared_preconditions($contract, $action, $operation)}, @$preconditions];
+    push @$filters, map {
+        ($_->{comparator} // 'eq') eq 'eq' ? [$_->{field}, $_->{value}]
+            : [$_->{field}, $_->{comparator}, $_->{value}]
+    } @$preconditions;
 
     my $capability = defined($action->{capability}) ? "$action->{capability}" : undef;
     _validate_capability($contract, $capability, $action_id, $operation);
@@ -67,6 +71,47 @@ sub plan {
         execution_case       => $execution_case,
         collection_patches   => $collection_patches,
     );
+}
+
+sub _declared_preconditions {
+    my ($contract, $action, $operation) = @_;
+    my $raw = $action->{preconditions};
+    return [] unless defined $raw;
+    Selecto::Error->throw('invalid_action_preconditions', 'action preconditions must be a list')
+        unless ref($raw) eq 'ARRAY';
+    Selecto::Error->throw('action_preconditions_unsupported_operation', 'action preconditions require update or delete')
+        if @$raw && $operation ne 'update' && $operation ne 'delete';
+    my %aliases = (eq => 'eq', '=' => 'eq', neq => 'neq', '!=' => 'neq', '<>' => 'neq',
+        gt => 'gt', '>' => 'gt', gte => 'gte', '>=' => 'gte', lt => 'lt', '<' => 'lt',
+        lte => 'lte', '<=' => 'lte', in => 'in');
+    my $columns = $contract->{source}{columns} // {};
+    _object($columns, 'source columns');
+    my @result;
+    for my $item (@$raw) {
+        my ($field, $comparator, $value);
+        if (ref($item) eq 'HASH') {
+            ($field, $comparator, $value) = ($item->{field}, $item->{comparator} // $item->{operator} // $item->{op} // 'eq', $item->{value});
+        } elsif (ref($item) eq 'ARRAY' && @$item == 2) {
+            ($field, $value) = @$item;
+            $comparator = 'eq';
+        } elsif (ref($item) eq 'ARRAY' && @$item == 3) {
+            ($comparator, $field, $value) = @$item;
+        } else {
+            Selecto::Error->throw('invalid_action_precondition', 'invalid action precondition shape');
+        }
+        Selecto::Error->throw('invalid_action_precondition_field', 'field must be a non-empty scalar identifier')
+            if !defined($field) || ref($field) || $field eq '';
+        Selecto::Error->throw('action_precondition_field_not_found', 'field must be a direct source column')
+            if $field =~ /\./ || !exists($columns->{$field});
+        Selecto::Error->throw('invalid_action_precondition_comparator', 'unsupported action comparator')
+            if !defined($comparator) || ref($comparator) || !exists($aliases{$comparator});
+        $comparator = $aliases{$comparator};
+        Selecto::Error->throw('invalid_action_precondition_value', 'IN requires a non-empty list')
+            if $comparator eq 'in' && (ref($value) ne 'ARRAY' || !@$value);
+        push @result, {type => 'filter', field => $field, comparator => $comparator,
+            value => ref($value) ? dclone($value) : $value, reason => 'action_precondition'};
+    }
+    return \@result;
 }
 
 sub _select_variant {

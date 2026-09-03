@@ -2,6 +2,7 @@ LICENSE
 MANIFEST
 Makefile.PL
 README.md
+docs/action-preconditions.md
 bin/selecto-certify
 cpanfile
 lib/Selecto.pm
