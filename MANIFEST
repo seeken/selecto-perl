@@ -7,6 +7,7 @@ bin/selecto-certify
 cpanfile
 lib/Selecto.pm
 lib/Selecto/API.pm
+lib/Selecto/API/EngineHandler.pm
 lib/Selecto/Action.pm
 lib/Selecto/Action/Capability.pm
 lib/Selecto/Action/Plan.pm
@@ -46,6 +47,7 @@ t/fixtures/Selecto-Adapter-FutureDB/Makefile.PL
 t/fixtures/Selecto-Adapter-FutureDB/lib/Selecto/Adapter/FutureDB.pm
 t/advanced_query.t
 t/api.t
+t/api_engine_handler.t
 t/co_domain.t
 t/domain.t
 t/domain_overlay.t

@@ -9,6 +9,7 @@ use_ok('Selecto::Action::Capability');
 use_ok('Selecto::Action::Plan');
 use_ok('Selecto::Action::Planner');
 use_ok('Selecto::API');
+use_ok('Selecto::API::EngineHandler');
 use_ok('Selecto::Adapter');
 use_ok('Selecto::Adapter::Registry');
 use_ok('Selecto::CoDomain');

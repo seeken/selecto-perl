@@ -44,8 +44,8 @@ protocol 1 and certification specification 2.7.0.
   AST operations;
 - governed row and selected-id bulk action planning with explicit transition
   preconditions and fail-closed preview/execute capability decisions;
-- an HTTP-neutral canonical domain API host with OpenAPI 3.1 and byte-stable
-  UTF-8 JSON response bodies;
+- an HTTP-neutral canonical domain API host and governed-engine query handler
+  with OpenAPI 3.1 and byte-stable UTF-8 JSON response bodies;
 - adapter capability reporting and an observation-protocol runner for central
   backend certification.
 
@@ -112,6 +112,37 @@ my $query = $engine->query
 
 my $result = $engine->all($query);
 ```
+
+An HTTP host can expose the canonical API query format without reimplementing
+its validation. The host must supply an engine whose domain already contains
+every required scope and policy restriction:
+
+```perl
+use Selecto::API;
+use Selecto::API::EngineHandler;
+
+my $api = Selecto::API->new(
+    domain => $engine->domain,
+    base_path => '/api/v1/products',
+);
+my $handler = Selecto::API::EngineHandler->new(
+    default_limit => 100,
+    max_limit => 1000,
+);
+$handler->describe_openapi($api);
+
+my $result = $handler->query($engine, {
+    projection => 'summary',
+    segments => ['available'],
+    filters => [{field => 'stock', op => 'gte', value => 1}],
+    ordering => 'by_name',
+});
+```
+
+`EngineHandler` does not construct an engine, authenticate users, choose a
+tenant, or modify the domain. It validates every field and query-library name
+against the supplied engine's governed domain, so internal fields and
+host-pruned definitions remain unavailable.
 
 `order_by` may be repeated to build a stable multi-column order. For governed
 date/time projection or grouping, use an allowlisted expression such as
