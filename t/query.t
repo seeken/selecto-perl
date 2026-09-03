@@ -263,6 +263,31 @@ unlike $flag_statement->sql, qr{LEFT JOIN "invoice_flags"},
 is_deeply $flag_statement->params, ['R', 'R', 1],
     'association-exists constants and filter values remain bound parameters';
 
+my $eligibility_contract = $flag_domain->contract;
+push @{$eligibility_contract->{source}{fields}}, 'eligible';
+$eligibility_contract->{source}{columns}{eligible} = {
+    type => 'boolean', internal => 1,
+    computed => {
+        kind => 'predicate',
+        expression => ['and', [
+            ['gt', 'id', 0],
+            ['eq', 'rush', 1],
+        ]],
+    },
+};
+my $eligibility_domain = Selecto::Domain->parse($eligibility_contract, strict => 1);
+my $eligibility_engine = Selecto::Engine->new(
+    domain => $eligibility_domain, adapter => $adapter,
+);
+my $eligibility_statement = $eligibility_engine->compile(
+    $eligibility_engine->query->select('id', 'eligible'),
+);
+like $eligibility_statement->sql,
+    qr{SELECT "s0"\."id", \(\("s0"\."id" > \$1\) AND \(EXISTS \(SELECT 1 FROM "invoice_flags" AS "e_rush_flags".*\) = \$3\)\) FROM}s,
+    'predicate computed fields compile governed boolean logic into the data query';
+is_deeply $eligibility_statement->params, [0, 'R', 1],
+    'predicate computed fields keep nested literals adapter-bound';
+
 my $through_domain = Selecto::Domain->new(
     name => 'Tenant invoice tags',
     table => 'invoices',

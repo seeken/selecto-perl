@@ -135,6 +135,31 @@ Both canonical nested schemas and constructor-domain nested `associations`
 retain the full lineage. Contract promotion for overlays preserves those
 nested relationships as canonical schemas.
 
+Canonical domains may also expose an internal SQL-computed boolean using the
+same governed filter AST as query-library segments. This is useful for action
+eligibility and other row-state decisions that should travel with the primary
+query instead of triggering per-row application calls:
+
+```perl
+ready_for_dispatch => {
+    type => 'boolean',
+    internal => 1,
+    computed => {
+        kind => 'predicate',
+        expression => ['and', [
+            ['in', 'status', [qw(A O)]],
+            ['eq', 'has_payload', 1],
+        ]],
+    },
+},
+```
+
+Predicate computations accept the portable comparison, null, membership, and
+boolean operators, reference only governed root fields, and bind every literal
+through the adapter. Raw SQL is not accepted. They may compose other computed
+root fields, including `association_exists` fields, provided the dependency
+graph is acyclic.
+
 ## Advanced queries and streaming
 
 Advanced sources remain domain-owned. A CTE or lateral subquery receives its

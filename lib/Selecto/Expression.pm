@@ -179,6 +179,68 @@ sub any {
 
 sub not { my ($class, $expression) = @_; return $class->new('not', $expression); }
 
+sub from_filter_ast {
+    my ($class, $filter) = @_;
+    Selecto::Error->throw('invalid_query', 'filter expression must be a non-empty array')
+        unless ref($filter) eq 'ARRAY' && @$filter;
+    my ($operator, @arguments) = @$filter;
+    Selecto::Error->throw('invalid_query', 'filter operator must be a scalar')
+        if !defined($operator) || ref($operator);
+    $operator = lc "$operator";
+
+    if ($operator eq 'and' || $operator eq 'or') {
+        my $items = @arguments == 1 && ref($arguments[0]) eq 'ARRAY'
+            ? $arguments[0] : \@arguments;
+        Selecto::Error->throw('invalid_query', "$operator filter requires expressions")
+            unless @$items;
+        my @expressions = map { $class->from_filter_ast($_) } @$items;
+        return $operator eq 'and' ? $class->all(\@expressions) : $class->any(\@expressions);
+    }
+    if ($operator eq 'not') {
+        Selecto::Error->throw('invalid_query', 'not filter requires one expression')
+            unless @arguments == 1;
+        return $class->not($class->from_filter_ast($arguments[0]));
+    }
+
+    my ($field, $value, $end) = @arguments;
+    Selecto::Error->throw('invalid_query', 'filter field must be a governed field name')
+        unless defined($field) && !ref($field)
+            && "$field" =~ /\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*\z/;
+    if ($operator eq 'is_null' || $operator eq 'not_null') {
+        Selecto::Error->throw('invalid_query', "$operator filter accepts only a field")
+            unless @arguments == 1;
+        return $operator eq 'is_null' ? $class->is_null($field) : $class->not_null($field);
+    }
+    if ($operator eq 'in') {
+        Selecto::Error->throw('invalid_query', 'in filter requires a non-empty literal list')
+            unless @arguments == 2 && ref($value) eq 'ARRAY' && @$value
+                && !grep { ref($_) } @$value;
+        return $class->in($field, $value);
+    }
+    if ($operator eq 'between') {
+        Selecto::Error->throw('invalid_query', 'between filter requires two literal bounds')
+            unless @arguments == 3 && !ref($value) && !ref($end);
+        return $class->between($field, $value, $end);
+    }
+    Selecto::Error->throw('invalid_query', "unsupported filter operator $operator")
+        unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/;
+    Selecto::Error->throw('invalid_query', "$operator filter requires a value")
+        unless @arguments == 2;
+    my $right;
+    if (ref($value) eq 'ARRAY' && @$value == 2
+        && defined($value->[0]) && !ref($value->[0]) && "$value->[0]" eq 'field') {
+        Selecto::Error->throw('invalid_query', 'field reference requires a governed field name')
+            unless defined($value->[1]) && !ref($value->[1])
+                && "$value->[1]" =~ /\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*\z/;
+        $right = $class->field($value->[1]);
+    } else {
+        Selecto::Error->throw('invalid_query', "$operator filter value must be a literal or field reference")
+            if ref($value);
+        $right = $class->literal($value);
+    }
+    return $class->can($operator)->($class, $field, $right);
+}
+
 sub _binary {
     my ($class, $kind, $field, $value) = @_;
     # A binary comparison normally binds its right-hand value as a literal.
