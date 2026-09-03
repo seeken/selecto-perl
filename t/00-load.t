@@ -11,6 +11,7 @@ use_ok('Selecto::Action::Planner');
 use_ok('Selecto::API');
 use_ok('Selecto::Adapter');
 use_ok('Selecto::Adapter::Registry');
+use_ok('Selecto::CoDomain');
 use_ok('Selecto::Domain');
 use_ok('Selecto::Domain::DSL');
 use_ok('Selecto::Domain::Overlay');

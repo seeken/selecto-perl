@@ -15,7 +15,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
-    query_library
+    query_library co_domains
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(
@@ -60,6 +60,7 @@ sub new {
         associations => \%associations,
         components   => _normalize_components($args{components}),
         query_library => _normalize_query_library($args{query_library}),
+        co_domains   => _normalize_co_domains($args{co_domains}),
         detail_actions => {},
         primary_key  => undef,
         required_predicate => $args{required_predicate},
@@ -141,6 +142,8 @@ sub _refresh_fingerprint {
     $fingerprint_value->{components} = $self->{components} if keys %{$self->{components}};
     $fingerprint_value->{query_library} = $self->{query_library}
         if keys %{$self->{query_library}};
+    $fingerprint_value->{co_domains} = $self->{co_domains}
+        if keys %{$self->{co_domains}};
     $fingerprint_value->{detail_actions} = $self->{detail_actions}
         if keys %{$self->{detail_actions}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
@@ -186,6 +189,7 @@ sub parse {
         associations => $raw->{associations} // {},
         components => $raw->{components},
         query_library => $raw->{query_library},
+        co_domains => $raw->{co_domains},
         detail_actions => $raw->{detail_actions},
     );
 }
@@ -213,6 +217,7 @@ sub _parse_canonical {
         tenant_field => $source->{tenant_field},
         components => $raw->{components},
         query_library => $raw->{query_library},
+        co_domains => $raw->{co_domains},
     );
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
@@ -311,16 +316,48 @@ sub _canonical_fields {
 
 sub _validate_computed_columns {
     my ($source, $associations) = @_;
+    my %predicate_dependencies;
     for my $field (@{$source->{fields} // []}) {
         my $column = $source->{columns}{$field};
         next unless ref($column) eq 'HASH' && exists $column->{computed};
         my $computed = $column->{computed};
         _object($computed, "computed column $field");
-        my %allowed = map { $_ => 1 } qw(kind association);
-        _reject_unknown($computed, \%allowed, "computed column $field");
         my $kind = _required_string($computed->{kind}, "computed column $field kind");
+        my %allowed = map { $_ => 1 } $kind eq 'predicate'
+            ? qw(kind expression) : qw(kind association);
+        _reject_unknown($computed, \%allowed, "computed column $field");
         Selecto::Error->throw('invalid_domain', "unsupported computed column kind $kind")
-            unless $kind eq 'association_exists';
+            unless $kind eq 'association_exists' || $kind eq 'predicate';
+        if ($kind eq 'predicate') {
+            Selecto::Error->throw(
+                'invalid_domain', 'predicate computed columns must be boolean', {field => $field},
+            ) unless ($column->{type} // '') eq 'boolean';
+            Selecto::Error->throw(
+                'invalid_domain', 'predicate computed columns require an expression', {field => $field},
+            ) unless exists $computed->{expression};
+            require Selecto::Expression;
+            my $expression;
+            my $ok = eval {
+                $expression = Selecto::Expression->from_filter_ast($computed->{expression});
+                1;
+            };
+            Selecto::Error->throw(
+                'invalid_domain', 'computed predicate expression is invalid', {field => $field},
+            ) unless $ok;
+            my @dependencies = _computed_predicate_fields($expression);
+            for my $dependency (@dependencies) {
+                Selecto::Error->throw(
+                    'invalid_domain', 'computed predicates may reference only root domain fields',
+                    {field => $field, dependency => $dependency},
+                ) if $dependency =~ /\./;
+                Selecto::Error->throw(
+                    'invalid_domain', 'computed predicate references an unknown field',
+                    {field => $field, dependency => $dependency},
+                ) unless exists $source->{columns}{$dependency};
+            }
+            $predicate_dependencies{$field} = \@dependencies;
+            next;
+        }
         my $association = _identifier(
             $computed->{association}, "computed column $field association"
         );
@@ -333,6 +370,43 @@ sub _validate_computed_columns {
             {field => $field, association => $association},
         ) if $associations->{$association}->through;
     }
+    _validate_computed_predicate_cycles(\%predicate_dependencies, $source);
+}
+
+sub _computed_predicate_fields {
+    my ($expression) = @_;
+    return () unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $arguments = $expression->arguments;
+    return ("$arguments->[0]") if $expression->kind eq 'field';
+    my @fields;
+    for my $argument (@$arguments) {
+        if (blessed($argument) && $argument->isa('Selecto::Expression')) {
+            push @fields, _computed_predicate_fields($argument);
+        } elsif (ref($argument) eq 'ARRAY') {
+            push @fields, map { _computed_predicate_fields($_) } @$argument;
+        }
+    }
+    my %seen;
+    return grep { !$seen{$_}++ } @fields;
+}
+
+sub _validate_computed_predicate_cycles {
+    my ($dependencies, $source) = @_;
+    my (%visiting, %visited);
+    my $visit;
+    $visit = sub {
+        my ($field) = @_;
+        Selecto::Error->throw(
+            'invalid_domain', 'computed predicate dependency cycle detected', {field => $field},
+        ) if $visiting{$field};
+        return if $visited{$field}++;
+        local $visiting{$field} = 1;
+        for my $dependency (@{$dependencies->{$field} // []}) {
+            next unless exists $dependencies->{$dependency};
+            $visit->($dependency);
+        }
+    };
+    $visit->($_) for sort keys %$dependencies;
 }
 
 sub _expression_value {
@@ -453,6 +527,8 @@ sub as_contract {
     $contract->{components} = dclone($self->{components}) if keys %{$self->{components}};
     $contract->{query_library} = dclone($self->{query_library})
         if keys %{$self->{query_library}};
+    $contract->{co_domains} = dclone($self->{co_domains})
+        if keys %{$self->{co_domains}};
     return $contract;
 }
 
@@ -581,6 +657,111 @@ sub _normalize_query_library {
         $library{$registry} = dclone($definitions);
     }
     return \%library;
+}
+
+sub _normalize_co_domains {
+    my ($value) = @_;
+    return {} unless defined $value;
+    _object($value, 'co_domains');
+    my %co_domains;
+    my %known = map { $_ => 1 } qw(
+        domain view segments projection ordering parameters search result
+    );
+    my %search_known = map { $_ => 1 } qw(fields configuration mode rank);
+    my %result_known = map { $_ => 1 } qw(value_field label_field description_fields);
+    for my $raw_id (sort keys %$value) {
+        my $id = _identifier($raw_id, 'co-domain');
+        my $definition = $value->{$raw_id};
+        _object($definition, "co-domain $id");
+        _reject_unknown($definition, \%known, "co-domain $id");
+        my %normalized = (
+            domain => _identifier($definition->{domain}, "co-domain $id domain"),
+        );
+        for my $key (qw(view projection ordering)) {
+            next unless exists $definition->{$key};
+            $normalized{$key} = _identifier(
+                $definition->{$key}, "co-domain $id $key",
+            );
+        }
+        if (exists $definition->{segments}) {
+            Selecto::Error->throw(
+                'invalid_domain', "co-domain $id segments must be an array",
+            ) unless ref($definition->{segments}) eq 'ARRAY';
+            $normalized{segments} = [map {
+                _identifier($_, "co-domain $id segment")
+            } @{$definition->{segments}}];
+        }
+        Selecto::Error->throw(
+            'invalid_domain', "co-domain $id requires exactly one of view or projection",
+        ) unless (defined($normalized{view}) ? 1 : 0)
+            + (defined($normalized{projection}) ? 1 : 0) == 1;
+        Selecto::Error->throw(
+            'invalid_domain', "co-domain $id view cannot be combined with segments or ordering",
+        ) if defined($normalized{view})
+            && (exists($normalized{segments}) || defined($normalized{ordering}));
+        if (exists $definition->{parameters}) {
+            _object($definition->{parameters}, "co-domain $id parameters");
+            $normalized{parameters} = dclone($definition->{parameters});
+        }
+
+        my $search = $definition->{search};
+        _object($search, "co-domain $id search");
+        _reject_unknown($search, \%search_known, "co-domain $id search");
+        Selecto::Error->throw(
+            'invalid_domain', "co-domain $id search fields must be a non-empty array",
+        ) unless ref($search->{fields}) eq 'ARRAY' && @{$search->{fields}};
+        my %normalized_search = (
+            fields => [map {
+                my $field = _required_string($_, "co-domain $id search field");
+                Selecto::Error->throw('invalid_domain', "co-domain $id search field is invalid")
+                    unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+                $field;
+            } @{$search->{fields}}],
+            configuration => lc(_required_string(
+                $search->{configuration} // 'simple',
+                "co-domain $id search configuration",
+            )),
+            mode => lc(_required_string(
+                $search->{mode} // 'plain', "co-domain $id search mode",
+            )),
+        );
+        Selecto::Error->throw('invalid_domain', "co-domain $id search mode is not available")
+            unless $normalized_search{mode} =~ /\A(?:plain|phrase|websearch|prefix)\z/;
+        if (exists $search->{rank}) {
+            my $rank = $search->{rank};
+            my $boolean = JSON::PP::is_bool($rank)
+                || (!ref($rank) && "$rank" =~ /\A(?:0|1)\z/);
+            Selecto::Error->throw(
+                'invalid_domain', "co-domain $id search rank must be a boolean",
+            ) unless $boolean;
+            $normalized_search{rank} = $rank ? 1 : 0;
+        }
+        $normalized{search} = \%normalized_search;
+
+        my $result = $definition->{result};
+        _object($result, "co-domain $id result");
+        _reject_unknown($result, \%result_known, "co-domain $id result");
+        my %normalized_result;
+        for my $key (qw(value_field label_field)) {
+            my $field = _required_string($result->{$key}, "co-domain $id result $key");
+            Selecto::Error->throw('invalid_domain', "co-domain $id result $key is invalid")
+                unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+            $normalized_result{$key} = $field;
+        }
+        my $description_fields = $result->{description_fields} // [];
+        Selecto::Error->throw(
+            'invalid_domain', "co-domain $id result description_fields must be an array",
+        ) unless ref($description_fields) eq 'ARRAY';
+        $normalized_result{description_fields} = [map {
+            my $field = _required_string($_, "co-domain $id description field");
+            Selecto::Error->throw('invalid_domain', "co-domain $id description field is invalid")
+                unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+            $field;
+        } @$description_fields];
+        $normalized{result} = \%normalized_result;
+        $co_domains{$id} = \%normalized;
+    }
+    return \%co_domains;
 }
 
 sub _validate_detail_actions {
@@ -816,6 +997,7 @@ sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }
 sub query_library { return dclone($_[0]->{query_library} // {}); }
+sub co_domains   { return dclone($_[0]->{co_domains} // {}); }
 
 package Selecto::Domain::Association;
 

@@ -136,6 +136,7 @@ sub _compile_dialect_expression {
             plain => 'PLAINTO_TSQUERY',
             phrase => 'PHRASETO_TSQUERY',
             websearch => 'WEBSEARCH_TO_TSQUERY',
+            prefix => 'TO_TSQUERY',
         );
         my $mode = lc($options->{mode} // 'plain');
         Selecto::Error->throw('invalid_query', 'text search mode is not available')

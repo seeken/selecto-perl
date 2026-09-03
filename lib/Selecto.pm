@@ -10,6 +10,7 @@ use Selecto::Adapter ();
 use Selecto::Adapter::Registry ();
 use Selecto::Action ();
 use Selecto::API ();
+use Selecto::CoDomain ();
 use Selecto::Domain ();
 use Selecto::Domain::DSL ();
 use Selecto::Domain::Overlay ();
