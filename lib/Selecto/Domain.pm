@@ -15,7 +15,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
-    query_library
+    query_library co_domains
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(
@@ -60,6 +60,7 @@ sub new {
         associations => \%associations,
         components   => _normalize_components($args{components}),
         query_library => _normalize_query_library($args{query_library}),
+        co_domains   => _normalize_co_domains($args{co_domains}),
         detail_actions => {},
         primary_key  => undef,
         required_predicate => $args{required_predicate},
@@ -141,6 +142,8 @@ sub _refresh_fingerprint {
     $fingerprint_value->{components} = $self->{components} if keys %{$self->{components}};
     $fingerprint_value->{query_library} = $self->{query_library}
         if keys %{$self->{query_library}};
+    $fingerprint_value->{co_domains} = $self->{co_domains}
+        if keys %{$self->{co_domains}};
     $fingerprint_value->{detail_actions} = $self->{detail_actions}
         if keys %{$self->{detail_actions}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
@@ -186,6 +189,7 @@ sub parse {
         associations => $raw->{associations} // {},
         components => $raw->{components},
         query_library => $raw->{query_library},
+        co_domains => $raw->{co_domains},
         detail_actions => $raw->{detail_actions},
     );
 }
@@ -213,6 +217,7 @@ sub _parse_canonical {
         tenant_field => $source->{tenant_field},
         components => $raw->{components},
         query_library => $raw->{query_library},
+        co_domains => $raw->{co_domains},
     );
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
@@ -453,6 +458,8 @@ sub as_contract {
     $contract->{components} = dclone($self->{components}) if keys %{$self->{components}};
     $contract->{query_library} = dclone($self->{query_library})
         if keys %{$self->{query_library}};
+    $contract->{co_domains} = dclone($self->{co_domains})
+        if keys %{$self->{co_domains}};
     return $contract;
 }
 
@@ -581,6 +588,111 @@ sub _normalize_query_library {
         $library{$registry} = dclone($definitions);
     }
     return \%library;
+}
+
+sub _normalize_co_domains {
+    my ($value) = @_;
+    return {} unless defined $value;
+    _object($value, 'co_domains');
+    my %co_domains;
+    my %known = map { $_ => 1 } qw(
+        domain view segments projection ordering parameters search result
+    );
+    my %search_known = map { $_ => 1 } qw(fields configuration mode rank);
+    my %result_known = map { $_ => 1 } qw(value_field label_field description_fields);
+    for my $raw_id (sort keys %$value) {
+        my $id = _identifier($raw_id, 'co-domain');
+        my $definition = $value->{$raw_id};
+        _object($definition, "co-domain $id");
+        _reject_unknown($definition, \%known, "co-domain $id");
+        my %normalized = (
+            domain => _identifier($definition->{domain}, "co-domain $id domain"),
+        );
+        for my $key (qw(view projection ordering)) {
+            next unless exists $definition->{$key};
+            $normalized{$key} = _identifier(
+                $definition->{$key}, "co-domain $id $key",
+            );
+        }
+        if (exists $definition->{segments}) {
+            Selecto::Error->throw(
+                'invalid_domain', "co-domain $id segments must be an array",
+            ) unless ref($definition->{segments}) eq 'ARRAY';
+            $normalized{segments} = [map {
+                _identifier($_, "co-domain $id segment")
+            } @{$definition->{segments}}];
+        }
+        Selecto::Error->throw(
+            'invalid_domain', "co-domain $id requires exactly one of view or projection",
+        ) unless (defined($normalized{view}) ? 1 : 0)
+            + (defined($normalized{projection}) ? 1 : 0) == 1;
+        Selecto::Error->throw(
+            'invalid_domain', "co-domain $id view cannot be combined with segments or ordering",
+        ) if defined($normalized{view})
+            && (exists($normalized{segments}) || defined($normalized{ordering}));
+        if (exists $definition->{parameters}) {
+            _object($definition->{parameters}, "co-domain $id parameters");
+            $normalized{parameters} = dclone($definition->{parameters});
+        }
+
+        my $search = $definition->{search};
+        _object($search, "co-domain $id search");
+        _reject_unknown($search, \%search_known, "co-domain $id search");
+        Selecto::Error->throw(
+            'invalid_domain', "co-domain $id search fields must be a non-empty array",
+        ) unless ref($search->{fields}) eq 'ARRAY' && @{$search->{fields}};
+        my %normalized_search = (
+            fields => [map {
+                my $field = _required_string($_, "co-domain $id search field");
+                Selecto::Error->throw('invalid_domain', "co-domain $id search field is invalid")
+                    unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+                $field;
+            } @{$search->{fields}}],
+            configuration => lc(_required_string(
+                $search->{configuration} // 'simple',
+                "co-domain $id search configuration",
+            )),
+            mode => lc(_required_string(
+                $search->{mode} // 'plain', "co-domain $id search mode",
+            )),
+        );
+        Selecto::Error->throw('invalid_domain', "co-domain $id search mode is not available")
+            unless $normalized_search{mode} =~ /\A(?:plain|phrase|websearch|prefix)\z/;
+        if (exists $search->{rank}) {
+            my $rank = $search->{rank};
+            my $boolean = JSON::PP::is_bool($rank)
+                || (!ref($rank) && "$rank" =~ /\A(?:0|1)\z/);
+            Selecto::Error->throw(
+                'invalid_domain', "co-domain $id search rank must be a boolean",
+            ) unless $boolean;
+            $normalized_search{rank} = $rank ? 1 : 0;
+        }
+        $normalized{search} = \%normalized_search;
+
+        my $result = $definition->{result};
+        _object($result, "co-domain $id result");
+        _reject_unknown($result, \%result_known, "co-domain $id result");
+        my %normalized_result;
+        for my $key (qw(value_field label_field)) {
+            my $field = _required_string($result->{$key}, "co-domain $id result $key");
+            Selecto::Error->throw('invalid_domain', "co-domain $id result $key is invalid")
+                unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+            $normalized_result{$key} = $field;
+        }
+        my $description_fields = $result->{description_fields} // [];
+        Selecto::Error->throw(
+            'invalid_domain', "co-domain $id result description_fields must be an array",
+        ) unless ref($description_fields) eq 'ARRAY';
+        $normalized_result{description_fields} = [map {
+            my $field = _required_string($_, "co-domain $id description field");
+            Selecto::Error->throw('invalid_domain', "co-domain $id description field is invalid")
+                unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+            $field;
+        } @$description_fields];
+        $normalized{result} = \%normalized_result;
+        $co_domains{$id} = \%normalized;
+    }
+    return \%co_domains;
 }
 
 sub _validate_detail_actions {
@@ -816,6 +928,7 @@ sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }
 sub query_library { return dclone($_[0]->{query_library} // {}); }
+sub co_domains   { return dclone($_[0]->{co_domains} // {}); }
 
 package Selecto::Domain::Association;
 

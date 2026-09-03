@@ -237,6 +237,42 @@ my $query = $engine->apply_view(
 my $applied = $query->applied_query_library;
 ```
 
+Co-domains let one domain declare a bounded lookup owned and governed by
+another domain. The portable contract names the target domain, its reusable
+view or projection, searchable fields, and the result mapping; the host still
+owns target-engine resolution and request-specific authorization scope:
+
+```perl
+co_domains => {
+    carriers => {
+        domain => 'client',
+        view => 'carrier_lookup',
+        search => {
+            fields => [qw(id co_name cl_key city state)],
+            mode => 'prefix', rank => 1,
+        },
+        result => {
+            value_field => 'id', label_field => 'co_name',
+            description_fields => [qw(id cl_key city state)],
+        },
+    },
+}
+
+my $result = Selecto::CoDomain->lookup(
+    source_domain => $load_domain,
+    co_domain => 'carriers',
+    engine => $tenant_scoped_client_engine,
+    query => $search_text,
+    predicate => $selection_specific_scope,
+    limit => 20,
+);
+```
+
+The target engine's mandatory tenant predicate is preserved. The optional
+predicate can only further restrict the lookup, which is useful when an action
+selection determines eligibility. Co-domain contracts never carry connection
+details, raw SQL, or a client-selected target engine.
+
 Definitions are data rather than SQL fragments. Segment composition supports
 AND, OR, NOT, NOR, and two-input XOR groups; projection associations become
 validated dotted field paths in the Perl runtime. Several named segments can
