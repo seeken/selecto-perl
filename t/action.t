@@ -216,4 +216,56 @@ eval {
 $error = $@;
 is($error->code, 'invalid_action_input', 'invalid discriminators fail closed before variant selection');
 
+my $guarded_contract = $domain->contract;
+$guarded_contract->{actions}{archive}{preconditions} = [
+    ['state', 'done'], ['<=', 'id', 9], {field => 'id', op => 'in', value => [7, 8]},
+];
+my $guarded_domain = Selecto::Domain->parse($guarded_contract, strict => 1);
+my $guarded = Selecto::Action->plan($guarded_domain, {action => 'archive', target => 7, preconditions => []});
+is_deeply($guarded->filters, [['id', 7], ['state', 'done'], ['id', 'lte', 9], ['id', 'in', [7, 8]], ['state', 'done']], 'declared guards supplement target and transition');
+is_deeply($guarded->preconditions->[1], {type => 'filter', field => 'id', comparator => 'lte', value => 9, reason => 'action_precondition'}, 'normalized guard metadata');
+is_deeply(Selecto::Action->capability_request($guarded, 'execute')->{preconditions}, $guarded->preconditions, 'policy receives declared guards');
+$guarded_contract->{actions}{archive}{preconditions} = [];
+is(scalar @{$guarded_domain->contract->{actions}{archive}{preconditions}}, 3, 'domain retains a copy');
+
+for my $comparator (qw(eq neq gt gte lt lte in)) {
+    my $contract = $domain->contract;
+    $contract->{actions}{bulk_archive}{preconditions} = [[$comparator, 'id', $comparator eq 'in' ? [2, 3] : 2]];
+    my $plan = Selecto::Action->plan(Selecto::Domain->parse($contract), {action => 'bulk_archive', target => {ids => [2, 3]}});
+    is($plan->preconditions->[0]{comparator}, $comparator, "$comparator works without transition");
+    is(scalar @{$plan->filters}, 2, 'guard retains target');
+    is_deeply($plan->expected_cardinality, ['exactly', 2], 'bulk cardinality remains exact');
+}
+
+for my $attempt (
+    [{}, 'invalid_action_preconditions'], [[42], 'invalid_action_precondition'],
+    [[['', 1]], 'invalid_action_precondition_field'], [[['missing', 1]], 'action_precondition_field_not_found'],
+    [[['owner.id', 1]], 'action_precondition_field_not_found'], [[['like', 'state', '%']], 'invalid_action_precondition_comparator'],
+    [[{field => 'id', op => JSON::PP::false, value => 7}], 'invalid_action_precondition_comparator'],
+    [[{field => 'id', op => 0, value => 7}], 'invalid_action_precondition_comparator'],
+    [[['in', 'id', []]], 'invalid_action_precondition_value'], [[['in', 'id', 7]], 'invalid_action_precondition_value'],
+) {
+    my $contract = $domain->contract;
+    $contract->{actions}{archive}{preconditions} = $attempt->[0];
+    eval { Selecto::Action->plan(Selecto::Domain->parse($contract), {action => 'archive', target => 7}) };
+    my $error = $@;
+    ok(blessed($error) && $error->isa('Selecto::Error'), 'malformed guard is rejected');
+    is($error->code, $attempt->[1], 'rejection is explicit');
+}
+
+for my $operation (qw(insert upsert delete)) {
+    my $contract = $domain->contract;
+    $contract->{writes}{operations}{$operation} = {enabled => 1};
+    $contract->{writes}{fields}{state}{insertable} = 1;
+    my $action = $contract->{actions}{archive};
+    delete $action->{capability}; delete $action->{transition};
+    $action->{execution} = {kind => 'updato', operation => $operation, set => $operation eq 'delete' ? {} : {state => 'archived'}};
+    $action->{preconditions} = [['state', 'done']];
+    my $plan;
+    eval { $plan = Selecto::Action->plan(Selecto::Domain->parse($contract), {action => 'archive', target => 7}) };
+    my $error = $@;
+    if ($operation eq 'delete') { is_deeply($plan->filters, [['id', 7], ['state', 'done']], 'delete keeps guard'); }
+    else { is($error->code, 'action_preconditions_unsupported_operation', "$operation rejects ignored guards"); }
+}
+
 done_testing;

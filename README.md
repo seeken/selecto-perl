@@ -7,7 +7,7 @@ HTTP-neutral: DBI supplies the execution boundary, while routes, ORMs, and UI
 code remain in consumer applications.
 
 This is an alpha library. Its current compatibility target is observation
-protocol 1 and certification specification 2.3.0.
+protocol 1 and certification specification 2.7.0.
 
 ## Current surface
 
@@ -549,6 +549,9 @@ unsupported because their insert/update eligibility cannot be expressed by a
 single portable rule.
 
 ## Governed actions
+
+Domain actions support arbitrary declared update/delete prerequisite filters.
+See [the contract and host execution obligations](docs/action-preconditions.md).
 
 Actions project a declared domain action into a constrained write plan; callers
 do not supply arbitrary operations or assignments:
