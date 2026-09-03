@@ -13,7 +13,7 @@ my %MAP_SECTION = map { $_ => 1 } qw(
     source schemas joins associations filters functions query_members query_library
     published_views detail_actions components columns custom_columns jsonb_schemas
     subfilters window_functions pagination retarget writes actions capabilities
-    source_relationships choice_sources
+    source_relationships choice_sources co_domains
 );
 my %COLLISION_SECTION = map { $_ => 1 } qw(
     actions capabilities source_relationships choice_sources
