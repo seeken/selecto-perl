@@ -61,6 +61,12 @@ my $canonical = Selecto::Domain->parse(JSON::PP->new->encode({
     joins => { person => { type => 'inner' } },
     writes => { version => 1 },
     components => { query_params => JSON::PP::false },
+    domain_dependencies => [{
+        provider => 'billing', contract => 'invoice_summary_v1',
+        uses => {fields => ['invoice_id']},
+    }],
+    operations => {approve => {version => '1.0.0'}},
+    experiences => {'order-editor' => {operation => 'approve'}},
 }), strict => 1);
 is($canonical->table, 'orders', 'canonical source table is parsed');
 is($canonical->resolve('person.name')->{type}, 'string', 'canonical association fields resolve');
@@ -106,6 +112,25 @@ is_deeply(
 );
 is($canonical->writes->{version}, 1, 'canonical write metadata remains available to governed consumers');
 is($canonical->components->{query_params}, 0, 'canonical component URL-state policy is retained');
+is($canonical->domain_dependencies->[0]{contract}, 'invoice_summary_v1',
+    'canonical domain dependencies are retained');
+is($canonical->operations->{approve}{version}, '1.0.0',
+    'canonical operation registries are retained');
+is($canonical->experiences->{'order-editor'}{operation}, 'approve',
+    'canonical experience registries are retained');
+
+for my $invalid_consumer_section (
+    {domain_dependencies => [{provider => '', contract => 'invoice'}]},
+    {domain_dependencies => [{provider => 'billing', contract => 'invoice', surface => 'old'}]},
+    {operations => {'' => {}}},
+    {experiences => {'order-editor' => 'form'}},
+) {
+    my $invalid = $canonical->contract;
+    @{$invalid}{keys %$invalid_consumer_section} = values %$invalid_consumer_section;
+    eval { Selecto::Domain->parse($invalid, strict => 1) };
+    ok(blessed($@) && $@->isa('Selecto::Error'),
+        'malformed canonical consumer contract metadata fails closed');
+}
 is $canonical->associations->{person}->cardinality, 'one',
     'a join to the target primary key is inferred as to-one';
 

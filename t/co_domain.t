@@ -187,6 +187,13 @@ $error = $@;
 is $error->code, 'unknown_domain_key',
     'unknown co-domain search keys fail closed during strict parsing';
 
+my $blank_configuration = $loads->as_contract;
+$blank_configuration->{co_domains}{carriers}{search}{configuration} = '   ';
+eval { Selecto::Domain->parse($blank_configuration, strict => 1) };
+$error = $@;
+is $error->code, 'invalid_domain',
+    'blank co-domain search configurations fail closed during strict parsing';
+
 my $ambiguous_contract = $loads->as_contract;
 $ambiguous_contract->{co_domains}{carriers}{projection} = 'carrier_lookup';
 eval { Selecto::Domain->parse($ambiguous_contract, strict => 1) };
