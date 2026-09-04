@@ -109,6 +109,50 @@ is_deeply $adapter->{last_statement}->params,
     [41, qw(A P), '2026-01-01', '2026-02-01'],
     'all predicate values remain bound parameters';
 
+my ($shortcut_start, $shortcut_end) = Selecto::DateShortcut->bounds('this_week');
+$handler->query($engine, {
+    select => ['id'],
+    filters => [{field => 'occurred_at', op => 'date_shortcut', value => 'this_week'}],
+});
+like $adapter->{last_statement}->sql,
+    qr/TO_TIMESTAMP\("s0"\."occurred_at"\) >= \$2\) AND \(TO_TIMESTAMP\("s0"\."occurred_at"\) < \$3/,
+    'date shortcuts compile as a half-open temporal range';
+is_deeply $adapter->{last_statement}->params,
+    [41, $shortcut_start, $shortcut_end],
+    'date shortcut intent resolves to server-local bound parameters';
+
+my $recurring_plan = Selecto::DateShortcut->plan('ytd_all_years');
+$handler->query($engine, {
+    select => ['id'],
+    filters => [{field => 'occurred_at', op => 'date_shortcut', value => 'ytd_all_years'}],
+});
+like $adapter->{last_statement}->sql,
+    qr/TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) >= \$2\).*TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) <= \$3/,
+    'all-years date shortcuts compare recurring calendar positions';
+is_deeply $adapter->{last_statement}->params,
+    [41, $recurring_plan->{start}, $recurring_plan->{end}],
+    'recurring date shortcut boundaries remain bound parameters';
+
+my $shortcut_error = eval {
+    $handler->query($engine, {
+        select => ['id'],
+        filters => [{field => 'occurred_at', op => 'date_shortcut', value => 'forever'}],
+    });
+    undef;
+} // $@;
+is $shortcut_error->code, 'invalid_api_query',
+    'unknown semantic date shortcuts fail closed';
+
+$shortcut_error = eval {
+    $handler->query($engine, {
+        select => ['id'],
+        filters => [{field => 'status', op => 'date_shortcut', value => 'this_week'}],
+    });
+    undef;
+} // $@;
+is $shortcut_error->code, 'invalid_api_query',
+    'date shortcuts cannot be applied to non-temporal fields';
+
 $result = $handler->query($engine, {view => 'active_directory'});
 is_deeply $result->{columns}, [qw(id name status)],
     'a view applies its named projection';
@@ -176,6 +220,11 @@ is $schema->{properties}{limit}{maximum}, 50,
     'OpenAPI result limits come from handler configuration';
 is $schema->{properties}{limit}{default}, 12,
     'OpenAPI default result limit comes from handler configuration';
+my $filter_schema = $api->openapi_document->{components}{schemas}{SelectoFilter};
+ok grep($_ eq 'date_shortcut', @{$filter_schema->{properties}{op}{enum}}),
+    'OpenAPI advertises semantic date-shortcut filters';
+is $filter_schema->{'x-selecto-date-shortcuts'}[3]{id}, 'this_week',
+    'OpenAPI publishes the shared date-shortcut catalog';
 ok !exists($api->openapi_document->{security}),
     'generic OpenAPI decoration does not invent host authentication';
 
