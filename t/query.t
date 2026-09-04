@@ -449,6 +449,14 @@ like($dated_statement->sql,
     qr/ORDER BY TO_CHAR\("s0"\."occurred_on", 'YYYY-MM'\) ASC, "s0"\."name" DESC/,
     'ordered query intent retains multiple expressions and directions');
 
+my $time = Selecto::Expression->datetime_format('occurred_on', 'time');
+my $time_statement = $dated_engine->compile(
+    $dated_engine->query->select($time->as('occurred_time'))
+);
+like $time_statement->sql,
+    qr/TO_CHAR\("s0"\."occurred_on", 'HH24:MI:SS'\) AS "occurred_time"/,
+    'governed time format can display the time independently from its date';
+
 my $formatted_filter_statement = $dated_engine->compile(
     $dated_engine->query
         ->select('id')

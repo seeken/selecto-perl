@@ -88,12 +88,14 @@ sub _compile_dialect_expression {
     if ($kind eq 'datetime_format') {
         my %formats = (
             day => 'YYYY-MM-DD',
+            time => 'HH24:MI:SS',
             day_hour => 'YYYY-MM-DD HH24',
             week => 'IYYY-IW',
             month => 'YYYY-MM',
             quarter => 'YYYY-"Q"Q',
             year => 'YYYY',
             month_of_year => 'MM',
+            month_day => 'MM-DD',
             day_of_month => 'DD',
             day_of_week => 'ID',
             hour => 'HH24',

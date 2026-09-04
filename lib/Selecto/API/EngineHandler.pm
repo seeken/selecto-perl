@@ -9,6 +9,7 @@ use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Selecto::Engine ();
 use Selecto::Error ();
+use Selecto::DateShortcut ();
 use Selecto::Expression ();
 use Selecto::QueryLibrary ();
 
@@ -230,11 +231,12 @@ sub describe_openapi ($self, $api) {
     $openapi->{components}{schemas}{SelectoFilter} = {
         type => 'object', additionalProperties => JSON::PP::false,
         required => [qw(field op)],
+        'x-selecto-date-shortcuts' => Selecto::DateShortcut->choices,
         properties => {
             field => {type => 'string'},
             op => {
                 type => 'string',
-                enum => [qw(eq ne gt gte lt lte between in is_null not_null)],
+                enum => [qw(eq ne gt gte lt lte between date_shortcut in is_null not_null)],
             },
             value => {}, end => {},
         },
@@ -293,6 +295,20 @@ sub _filters ($self, $domain, $filters) {
                 _literal_value($filter->{value}, 'between start'),
                 _literal_value($filter->{end}, 'between end'),
             );
+            next;
+        }
+        if ($operator eq 'date_shortcut') {
+            Selecto::Error->throw(
+                'invalid_api_query', 'date_shortcut requires a temporal field',
+            ) unless ($definition->{type} // '') =~ /\A(?:date|datetime|naive_datetime|utc_datetime|epoch_datetime)\z/;
+            my $shortcut = _required_string(
+                $filter->{value}, 'date shortcut value',
+            );
+            Selecto::Error->throw(
+                'invalid_api_query', 'Date shortcut is not available',
+                {value => $shortcut},
+            ) unless Selecto::DateShortcut->valid($shortcut);
+            push @expressions, Selecto::DateShortcut->expression($operand, $shortcut);
             next;
         }
         Selecto::Error->throw(

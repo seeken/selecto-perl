@@ -15,6 +15,7 @@ lib/Selecto/Action/Planner.pm
 lib/Selecto/Adapter.pm
 lib/Selecto/Adapter/Registry.pm
 lib/Selecto/CoDomain.pm
+lib/Selecto/DateShortcut.pm
 lib/Selecto/Domain.pm
 lib/Selecto/Domain/DSL.pm
 lib/Selecto/Domain/Overlay.pm
