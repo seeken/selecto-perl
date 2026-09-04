@@ -15,7 +15,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
-    query_library co_domains
+    query_library co_domains domain_dependencies operations experiences
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(
@@ -61,6 +61,9 @@ sub new {
         components   => _normalize_components($args{components}),
         query_library => _normalize_query_library($args{query_library}),
         co_domains   => _normalize_co_domains($args{co_domains}),
+        domain_dependencies => _normalize_domain_dependencies($args{domain_dependencies}),
+        operations   => _normalize_consumer_registry($args{operations}, 'operations'),
+        experiences  => _normalize_consumer_registry($args{experiences}, 'experiences'),
         detail_actions => {},
         primary_key  => undef,
         required_predicate => $args{required_predicate},
@@ -144,6 +147,12 @@ sub _refresh_fingerprint {
         if keys %{$self->{query_library}};
     $fingerprint_value->{co_domains} = $self->{co_domains}
         if keys %{$self->{co_domains}};
+    $fingerprint_value->{domain_dependencies} = $self->{domain_dependencies}
+        if @{$self->{domain_dependencies}};
+    $fingerprint_value->{operations} = $self->{operations}
+        if keys %{$self->{operations}};
+    $fingerprint_value->{experiences} = $self->{experiences}
+        if keys %{$self->{experiences}};
     $fingerprint_value->{detail_actions} = $self->{detail_actions}
         if keys %{$self->{detail_actions}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
@@ -190,6 +199,9 @@ sub parse {
         components => $raw->{components},
         query_library => $raw->{query_library},
         co_domains => $raw->{co_domains},
+        domain_dependencies => $raw->{domain_dependencies},
+        operations => $raw->{operations},
+        experiences => $raw->{experiences},
         detail_actions => $raw->{detail_actions},
     );
 }
@@ -218,6 +230,9 @@ sub _parse_canonical {
         components => $raw->{components},
         query_library => $raw->{query_library},
         co_domains => $raw->{co_domains},
+        domain_dependencies => $raw->{domain_dependencies},
+        operations => $raw->{operations},
+        experiences => $raw->{experiences},
     );
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
@@ -529,6 +544,12 @@ sub as_contract {
         if keys %{$self->{query_library}};
     $contract->{co_domains} = dclone($self->{co_domains})
         if keys %{$self->{co_domains}};
+    $contract->{domain_dependencies} = dclone($self->{domain_dependencies})
+        if @{$self->{domain_dependencies}};
+    $contract->{operations} = dclone($self->{operations})
+        if keys %{$self->{operations}};
+    $contract->{experiences} = dclone($self->{experiences})
+        if keys %{$self->{experiences}};
     return $contract;
 }
 
@@ -717,7 +738,7 @@ sub _normalize_co_domains {
                     unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
                 $field;
             } @{$search->{fields}}],
-            configuration => lc(_required_string(
+            configuration => lc(_nonblank_string(
                 $search->{configuration} // 'simple',
                 "co-domain $id search configuration",
             )),
@@ -762,6 +783,60 @@ sub _normalize_co_domains {
         $co_domains{$id} = \%normalized;
     }
     return \%co_domains;
+}
+
+sub _normalize_domain_dependencies {
+    my ($value) = @_;
+    return [] unless defined $value;
+    Selecto::Error->throw('invalid_domain', 'domain_dependencies must be an array')
+        unless ref($value) eq 'ARRAY';
+    my %known = map { $_ => 1 } qw(
+        provider contract accepts expected_fingerprint uses satisfies
+    );
+    my %uses_known = map { $_ => 1 } qw(fields filters query_members);
+    my @dependencies;
+    for my $index (0 .. $#$value) {
+        my $dependency = $value->[$index];
+        _object($dependency, "domain dependency $index");
+        _reject_unknown($dependency, \%known, "domain dependency $index");
+        _nonblank_string($dependency->{provider}, "domain dependency $index provider");
+        _nonblank_string($dependency->{contract}, "domain dependency $index contract");
+        for my $key (qw(accepts expected_fingerprint)) {
+            _nonblank_string($dependency->{$key}, "domain dependency $index $key")
+                if exists $dependency->{$key};
+        }
+        if (exists $dependency->{uses}) {
+            _object($dependency->{uses}, "domain dependency $index uses");
+            _reject_unknown($dependency->{uses}, \%uses_known, "domain dependency $index uses");
+            _identifier_list(
+                $dependency->{uses}{$_}, "domain dependency $index uses $_",
+            ) for keys %{$dependency->{uses}};
+        }
+        _identifier_list($dependency->{satisfies}, "domain dependency $index satisfies")
+            if exists $dependency->{satisfies};
+        push @dependencies, dclone($dependency);
+    }
+    return \@dependencies;
+}
+
+sub _normalize_consumer_registry {
+    my ($value, $section) = @_;
+    return {} unless defined $value;
+    _object($value, $section);
+    my %registry;
+    for my $id (keys %$value) {
+        _nonblank_string($id, "$section id");
+        _object($value->{$id}, "$section entry $id");
+        $registry{$id} = dclone($value->{$id});
+    }
+    return \%registry;
+}
+
+sub _identifier_list {
+    my ($value, $label) = @_;
+    Selecto::Error->throw('invalid_domain', "$label must be an array")
+        unless ref($value) eq 'ARRAY';
+    _nonblank_string($_, "$label entry") for @$value;
 }
 
 sub _validate_detail_actions {
@@ -974,6 +1049,14 @@ sub _required_string {
     return "$value";
 }
 
+sub _nonblank_string {
+    my ($value, $label) = @_;
+    my $text = _required_string($value, $label);
+    Selecto::Error->throw('invalid_domain', "$label must be a non-empty string")
+        if $text !~ /\S/;
+    return $text;
+}
+
 sub _identifier {
     my ($value, $label) = @_;
     my $string = _required_string($value, $label);
@@ -998,6 +1081,9 @@ sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract
 sub components   { return dclone($_[0]->{components} // {}); }
 sub query_library { return dclone($_[0]->{query_library} // {}); }
 sub co_domains   { return dclone($_[0]->{co_domains} // {}); }
+sub domain_dependencies { return dclone($_[0]->{domain_dependencies} // []); }
+sub operations   { return dclone($_[0]->{operations} // {}); }
+sub experiences  { return dclone($_[0]->{experiences} // {}); }
 
 package Selecto::Domain::Association;
 
