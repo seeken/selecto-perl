@@ -217,6 +217,7 @@ sub _parse_canonical {
         $source, $schemas, $joins, $strict, '',
     );
     _validate_computed_columns($source, $associations);
+    _validate_action_eligibility($raw, $source);
 
     _required_key($raw, 'name', 'domain');
     _required_key($source, 'source_table', 'source');
@@ -386,6 +387,28 @@ sub _validate_computed_columns {
         ) if $associations->{$association}->through;
     }
     _validate_computed_predicate_cycles(\%predicate_dependencies, $source);
+}
+
+sub _validate_action_eligibility {
+    my ($contract, $source) = @_;
+    my $actions = $contract->{actions} // {};
+    _object($actions, 'actions');
+    for my $action_id (sort keys %$actions) {
+        my $action = $actions->{$action_id};
+        _object($action, "action $action_id");
+        next unless exists $action->{selection};
+        my $selection = $action->{selection};
+        _object($selection, "action $action_id selection");
+        next unless exists $selection->{eligibility_field};
+        my $field = _identifier(
+            $selection->{eligibility_field}, "action $action_id eligibility field",
+        );
+        my $column = $source->{columns}{$field};
+        Selecto::Error->throw(
+            'invalid_domain', 'eligibility_field must name a boolean root field',
+            {action => $action_id, field => $field},
+        ) unless ref($column) eq 'HASH' && ($column->{type} // '') eq 'boolean';
+    }
 }
 
 sub _computed_predicate_fields {

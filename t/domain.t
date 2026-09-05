@@ -169,6 +169,22 @@ is_deeply($predicate_computed->field_metadata('is_ready')->{computed}, {
 ok !$predicate_computed->field_is_public('is_ready'),
     'SQL-computed eligibility fields may remain internal to consumers';
 
+my $eligible_action_contract = $predicate_computed->contract;
+$eligible_action_contract->{actions}{dispatch}{selection}{eligibility_field} = 'is_ready';
+my $eligible_action = Selecto::Domain->parse($eligible_action_contract, strict => 1);
+is(
+    $eligible_action->actions->{dispatch}{selection}{eligibility_field},
+    'is_ready',
+    'actions retain a governed boolean root eligibility field',
+);
+
+my $non_boolean_eligibility_contract = $predicate_computed->contract;
+$non_boolean_eligibility_contract->{actions}{dispatch}{selection}{eligibility_field} = 'id';
+eval { Selecto::Domain->parse($non_boolean_eligibility_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'action eligibility fields must name boolean root fields');
+
 my $cyclic_predicate_contract = $predicate_computed->contract;
 $cyclic_predicate_contract->{source}{columns}{has_person}{computed} = {
     kind => 'predicate', expression => ['eq', 'is_ready', 1],
