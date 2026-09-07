@@ -14,9 +14,11 @@ has 'dbh';
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
     Selecto::Error->throw('invalid_adapter', 'database adapter requires a DBI-compatible handle')
-        unless blessed($self->dbh);
+        if $self->requires_dbh && !blessed($self->dbh);
     return $self->assert_contract;
 }
+
+sub requires_dbh ($self_or_class) { return 1; }
 
 sub contract_version ($self_or_class) { return $CONTRACT_VERSION; }
 sub required_methods ($self) { return [@REQUIRED_METHODS]; }

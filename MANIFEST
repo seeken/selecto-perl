@@ -21,6 +21,10 @@ lib/Selecto/Domain/DSL.pm
 lib/Selecto/Domain/Overlay.pm
 lib/Selecto/Domain/Ref.pm
 lib/Selecto/Domain/Registry.pm
+lib/Selecto/Document/Engine.pm
+lib/Selecto/Document/Missing.pm
+lib/Selecto/Document/Plan.pm
+lib/Selecto/Document/ShapeRelease.pm
 lib/Selecto/DuckDB.pm
 lib/Selecto/Engine.pm
 lib/Selecto/Error.pm
@@ -54,6 +58,7 @@ t/co_domain.t
 t/domain.t
 t/domain_overlay.t
 t/domain_registry.t
+t/document_contract.t
 t/duckdb.integration.t
 t/files.t
 t/lib/TestSelecto.pm
