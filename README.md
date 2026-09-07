@@ -49,6 +49,9 @@ centrally certified for the 2.8 governed co-domain/computed-eligibility profile.
   fail-closed declaration validation;
 - an HTTP-neutral canonical domain API host and governed-engine query handler
   with OpenAPI 3.1 and byte-stable UTF-8 JSON response bodies;
+- an initial HTTP-neutral `Selecto::Files` record-and-role facade with hidden
+  tenant/storage authority, memory and managed-local publication, bounded
+  filehandle streaming, idempotency, holds, and purge;
 - adapter capability reporting and an observation-protocol runner for central
   backend certification.
 
@@ -66,6 +69,24 @@ and certification require `DBD::SQLite`; MySQL and MariaDB use
 `DBD::MariaDB`; Microsoft SQL Server uses a Unicode-enabled `DBD::ODBC` build
 and an installed ODBC driver. The base distribution does not force any
 optional driver.
+
+`Selecto::Files` binds tenant and actor authority in trusted host code, then
+projects only authorized display metadata and application-owned content routes.
+Its memory profile covers tenant isolation, same-operation idempotency,
+download, guarded detach, retention holds, and exact-version purge. Public
+values contain no tenant, scope, provider, bucket, object key, or credential.
+
+`Selecto::Files::LocalStorage` is the initial version-1 storage implementation.
+`upload_handle` reads caller-owned handles in 64 KiB chunks, checks the declared
+size and optional SHA-256, and never closes the input. Local publication uses a
+private same-directory staging file, file and parent-directory `fsync`, and a
+hard link so an existing final object is never replaced. Cancellation and
+failed verification remove staging content. References accept only portable
+segments, and reads reject symlink final components where `O_NOFOLLOW` is
+available. The current tests cover macOS behavior; directory-swap races,
+process or power-loss recovery, other operating systems, and multi-node storage
+remain uncertified. DBI metadata, Mojo routes, S3/cloud adapters, workers, and
+live-provider evidence remain separate admission work.
 
 ```sh
 cpanm --installdeps .
