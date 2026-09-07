@@ -8,6 +8,7 @@ use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Error ();
+use Selecto::DataRules ();
 
 my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
@@ -15,7 +16,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
-    query_library co_domains domain_dependencies operations experiences
+    query_library co_domains domain_dependencies operations experiences rules
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(
@@ -65,6 +66,7 @@ sub new {
         operations   => _normalize_consumer_registry($args{operations}, 'operations'),
         experiences  => _normalize_consumer_registry($args{experiences}, 'experiences'),
         detail_actions => {},
+        rules        => undef,
         primary_key  => undef,
         required_predicate => $args{required_predicate},
         tenant_field => $args{tenant_field},
@@ -124,6 +126,7 @@ sub new {
             $self, $args{detail_actions},
         );
     }
+    $self->{rules} = Selecto::DataRules->parse($args{rules}) if defined $args{rules};
     $self->_refresh_fingerprint;
     return $self;
 }
@@ -203,6 +206,7 @@ sub parse {
         operations => $raw->{operations},
         experiences => $raw->{experiences},
         detail_actions => $raw->{detail_actions},
+        rules => $raw->{rules},
     );
 }
 
@@ -234,6 +238,7 @@ sub _parse_canonical {
         domain_dependencies => $raw->{domain_dependencies},
         operations => $raw->{operations},
         experiences => $raw->{experiences},
+        rules => $raw->{rules},
     );
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
@@ -1097,6 +1102,7 @@ sub primary_key  { return $_[0]->{primary_key}; }
 sub required_predicate { return $_[0]->{required_predicate}; }
 sub tenant_field { return $_[0]->{tenant_field}; }
 sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
+sub rules        { return $_[0]->{rules}; }
 sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
 sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
 sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
