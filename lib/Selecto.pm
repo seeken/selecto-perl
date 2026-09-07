@@ -19,6 +19,7 @@ use Selecto::Domain::Registry ();
 use Selecto::Engine ();
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::Files ();
 use Selecto::Query ();
 use Selecto::QueryEnforcement ();
 use Selecto::QueryLibrary ();

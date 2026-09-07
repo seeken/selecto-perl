@@ -25,6 +25,7 @@ lib/Selecto/DuckDB.pm
 lib/Selecto/Engine.pm
 lib/Selecto/Error.pm
 lib/Selecto/Expression.pm
+lib/Selecto/Files.pm
 lib/Selecto/Identifier.pm
 lib/Selecto/MariaDB.pm
 lib/Selecto/MySQL.pm
@@ -54,6 +55,7 @@ t/domain.t
 t/domain_overlay.t
 t/domain_registry.t
 t/duckdb.integration.t
+t/files.t
 t/lib/TestSelecto.pm
 t/mssql.integration.t
 t/mssql.t
