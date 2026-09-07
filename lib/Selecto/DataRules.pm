@@ -1,0 +1,52 @@
+package Selecto::DataRules;
+use 5.034;
+use strict;
+use warnings;
+use JSON::PP ();
+use Math::BigRat ();
+use Storable qw(dclone);
+use Selecto::Error ();
+our $SCHEMA = 'selecto.data_rules.v1';
+
+sub parse {
+    my ($class, $raw) = @_;
+    _hash($raw, 'invalid_data_rules_contract', 'data rules'); _keys($raw, [qw(schema definitions normalizers bindings)], 'data rules');
+    _fail('invalid_data_rules_contract', 'unsupported data-rules schema') unless ($raw->{schema} // '') eq $SCHEMA;
+    my (%definitions, %normalizers, %bindings);
+    for my $id (keys %{_hash($raw->{definitions}, 'invalid_data_rules_contract', 'definitions')}) {
+        _fail('invalid_data_rules_contract', 'definition id is invalid') unless _id($id);
+        my $entry = $raw->{definitions}{$id}; _hash($entry, 'invalid_data_rules_contract', 'definition'); _keys($entry, [qw(version test message)], 'definition'); _positive($entry->{version}); _test($entry->{test});
+        $definitions{$id} = {version => $entry->{version}, test => dclone($entry->{test})};
+    }
+    for my $id (keys %{_hash($raw->{normalizers}, 'invalid_data_rules_contract', 'normalizers')}) {
+        _fail('invalid_data_rules_contract', 'normalizer id is invalid') unless _id($id);
+        my $entry = $raw->{normalizers}{$id}; _hash($entry, 'invalid_data_rules_contract', 'normalizer'); _keys($entry, [qw(version steps)], 'normalizer'); _positive($entry->{version});
+        _fail('invalid_data_rules_contract', 'normalizer steps are invalid') unless ref($entry->{steps}) eq 'ARRAY' && @{$entry->{steps}};
+        for my $step (@{$entry->{steps}}) { _hash($step, 'invalid_data_rules_contract', 'normalizer step'); _keys($step, [qw(op profile)], 'normalizer step'); my $ok = ($step->{op}//'') eq 'text.trim' && (($step->{profile}//'') eq 'ascii_v1' || ($step->{profile}//'') eq 'ascii_whitespace_v1'); $ok ||= (($step->{op}//'') eq 'text.uppercase' || ($step->{op}//'') eq 'text.lowercase') && ($step->{profile}//'') eq 'ascii_v1'; _fail('invalid_data_rules_contract', 'normalizer step is unsupported') unless $ok; }
+        $normalizers{$id} = {version => $entry->{version}, steps => dclone($entry->{steps})};
+    }
+    for my $id (keys %{_hash($raw->{bindings}, 'invalid_data_rules_contract', 'bindings')}) {
+        _fail('invalid_data_rules_contract', 'binding id is invalid') unless _id($id);
+        my $entry = $raw->{bindings}{$id}; _hash($entry, 'invalid_data_rules_contract', 'binding'); _keys($entry, [qw(subject operations rule normalizer condition enforcement)], 'binding');
+        _fail('unsupported_rule_operator', 'binding condition is unsupported') if exists $entry->{condition};
+        my $subject = $entry->{subject}; _hash($subject, 'invalid_data_rules_contract', 'subject'); _keys($subject, [qw(scope path action)], 'subject'); my $scope = $subject->{scope}//''; my $path = _path($subject->{path});
+        my $action_ok = defined($subject->{action}) && _id($subject->{action}); _fail('invalid_data_rules_contract', 'subject is invalid') unless $scope =~ /\A(?:input|action_input|candidate|transaction|evidence)\z/ && (($scope eq 'action_input') == $action_ok);
+        my $rule = _ref($entry->{rule}); _fail('unresolved_rule_reference', 'rule reference does not resolve') unless exists($definitions{$rule->{id}}) && $definitions{$rule->{id}}{version} == $rule->{version};
+        my $ops = $entry->{operations}//[]; _fail('invalid_data_rules_contract', 'operations are invalid') unless ref($ops) eq 'ARRAY'; my %seen; _fail('invalid_data_rules_contract', 'operations are invalid') if grep { !defined($_) || !/\A(?:insert|update|delete|upsert)\z/ || $seen{$_}++ } @$ops;
+        my $normalizer; if (exists $entry->{normalizer}) { $normalizer = _ref($entry->{normalizer}); _fail('unresolved_rule_reference', 'normalizer reference does not resolve') unless exists($normalizers{$normalizer->{id}}) && $normalizers{$normalizer->{id}}{version} == $normalizer->{version}; }
+        $bindings{$id} = {subject => {scope => $scope, path => $path, (defined($subject->{action}) ? (action => $subject->{action}) : ())}, operations => [@$ops], rule => $rule, (defined($normalizer) ? (normalizer => $normalizer) : ())};
+    }
+    return bless {definitions => \%definitions, normalizers => \%normalizers, bindings => \%bindings}, $class;
+}
+
+sub evaluate {
+    my ($self, %request) = @_; my $stage = $request{stage}//''; my $normalized = dclone(_hash($request{subject}, 'invalid_data_rules_request', 'subject'));
+    for my $id (sort keys %{$self->{bindings}}) { my $binding = $self->{bindings}{$id}; my $subject = $binding->{subject}; next unless $subject->{scope} eq $stage; next if @{$binding->{operations}} && !grep { $_ eq ($request{operation}//'') } @{$binding->{operations}}; next if $stage eq 'action_input' && ($subject->{action}//'') ne ($request{action}//''); my $path = $subject->{path}; return _result('pending', $normalized, 'authoritative_stage_required', $path) if ($stage eq 'transaction' || $stage eq 'evidence') && ($request{authoritative_stage}//'') ne $stage; my ($value, $present) = _at($normalized, $path); if (my $normalizer = $binding->{normalizer}) { my ($next, $code) = _normalize($value, $present, $self->{normalizers}{$normalizer->{id}}); return _result('failed', $normalized, $code, $path) if defined $code; _set($normalized, $path, $next); ($value, $present) = ($next, 1); } my ($passed, $code) = _evaluate($self->{definitions}{$binding->{rule}{id}}{test}, $value, $present); return _result('failed', $normalized, $code, $path) unless $passed; }
+    return _result('passed', $normalized);
+}
+
+sub _test { my ($t)=@_; _hash($t, 'invalid_data_rules_contract', 'definition test'); my $op=$t->{op}//''; _fail('unsupported_rule_operator','rule operator is unsupported') unless $op =~ /\A(?:number\.gt|text\.pattern|collection\.count|collection\.unique_by|value\.eq)\z/; if ($op eq 'number.gt') { _keys($t,[qw(op bound)],'number rule'); _fail('invalid_data_rules_contract','number bound is invalid') unless defined _decimal($t->{bound}); } elsif ($op eq 'text.pattern') { _keys($t,[qw(op profile pattern match flags)],'pattern rule'); _fail('invalid_text_pattern','pattern is outside ascii_v1') unless ($t->{profile}//'') eq 'ascii_v1' && ($t->{match}//'') =~ /\A(?:full|search)\z/ && ref($t->{flags}) eq 'ARRAY' && !@{$t->{flags}} && _pattern($t->{pattern}); my $ok=eval{qr/$t->{pattern}/;1}; _fail('invalid_text_pattern','pattern is malformed') unless $ok; } elsif ($op eq 'collection.count') { _keys($t,[qw(op exact min max)],'collection count rule'); my($e,$n,$x)=map{_nonneg($t->{$_})}qw(exact min max); _fail('invalid_data_rules_contract','collection bounds are invalid') if (!defined($e)&&!defined($n)&&!defined($x)) || (defined($e)&&(defined($n)||defined($x))) || (defined($n)&&defined($x)&&$n>$x); } elsif ($op eq 'collection.unique_by') { _keys($t,[qw(op paths)],'collection uniqueness rule'); _fail('invalid_data_rules_contract','collection paths are invalid') unless ref($t->{paths}) eq 'ARRAY' && @{$t->{paths}}; my %seen; for (@{$t->{paths}}) { my $key=join("\0", @{_path($_)}); _fail('invalid_data_rules_contract','collection paths are invalid') if $seen{$key}++; } } else { _keys($t,[qw(op value)],'equality rule'); } }
+sub _evaluate { my($t,$v,$present)=@_; return(0,'invalid_type') unless $present&&defined$v; my$op=$t->{op}; if($op eq 'number.gt'){my($a,$b)=(_decimal($v),_decimal($t->{bound}));return(0,'invalid_type')unless defined$a&&defined$b;return($a>$b?1:0,'numeric_bound')} if($op eq 'text.pattern'){return(0,'invalid_type')if ref$v;return(0,'evaluation_limit')if length$v>4096;my$m=$v=~/$t->{pattern}/;$m&&=$t->{match}ne'full'||$v=~/\A(?:$t->{pattern})\z/;return($m?1:0,'pattern_mismatch')} if($op eq 'collection.count'){return(0,'invalid_type')unless ref$v eq'ARRAY';my($e,$n,$x)=map{_nonneg($t->{$_})}qw(exact min max);return((!defined($e)||@$v==$e)&&(!defined($n)||@$v>=$n)&&(!defined($x)||@$v<=$x)?1:0,'invalid_collection_count')} if($op eq 'collection.unique_by'){return(0,'invalid_type')unless ref$v eq'ARRAY';my%seen;for my$item(@$v){return(0,'invalid_collection_item')unless ref$item eq'HASH';my@tuple;for(@{$t->{paths}}){my($part,$found)=_at($item,_path($_));return(0,'invalid_collection_item')unless$found;push@tuple,$part}my$key=_stable(\@tuple);return(0,'duplicate_collection_value')if$seen{$key}++}return(1,undef)}return(_stable($v) eq _stable($t->{value})?1:0,'not_equal') }
+sub _normalize { my($v,$present,$n)=@_;return(undef,'invalid_type')unless$present;my$c=$v;for my$s(@{$n->{steps}}){return(undef,'invalid_type')if ref$c;if($s->{op}eq'text.trim'){$c=~s/\A[ \t\r\n\f\v]+|[ \t\r\n\f\v]+\z//g}else{return(undef,'normalization_error')unless$c=~/\A[\x00-\x7F]*\z/;$c=$s->{op}eq'text.uppercase'?uc$c:lc$c}}return($c,undef) }
+sub _hash { my($v,$code,$label)=@_;_fail($code,"$label must be an object")unless ref$v eq'HASH';return$v } sub _keys {my($v,$a,$l)=@_;my%a=map{$_=>1}@$a;_fail('unknown_rule_option',"unknown member in $l")if grep{!$a{$_}}keys%$v} sub _id{defined($_[0])&&!ref($_[0])&&$_[0]=~/\A[A-Za-z_][A-Za-z0-9_]*\z/} sub _positive{_fail('invalid_rule_version','version must be a positive integer')unless defined($_[0])&&!ref($_[0])&&$_[0]=~/\A[1-9][0-9]*\z/;$_[0]} sub _nonneg{defined($_[0])&&!ref($_[0])&&$_[0]=~/\A(?:0|[1-9][0-9]*)\z/?$_[0]:undef} sub _ref{my$v=_hash($_[0],'invalid_data_rules_contract','reference');_keys($v,[qw(id version)],'reference');_fail('invalid_data_rules_contract','reference id is invalid')unless _id($v->{id});{id=>$v->{id},version=>_positive($v->{version})}} sub _path{my$v=$_[0];_fail('invalid_data_rules_contract','path is invalid')unless ref$v eq'ARRAY'&&@$v&&!grep{!defined($_)||ref($_)||$_ eq''}@$v;[@$v]} sub _pattern{my$v=$_[0];return 0 unless defined$v&&!ref$v&&length$v&&length$v<=256&&$v=~/\A[\x00-\x7F]*\z/;return 0 if$v=~/\(\?|\^|\$|\\[pP]|\[\[:|&&|\*\?|\+\?|\?\?|\*\+|\+\+|\?\+|\\[1-9]/;while($v=~/\\(.)/g){return 0 unless index('dDsSwWtrn\\.[]{}()|?*+-',$1)>=0}1} sub _at{my($r,$p)=@_;my$c=$r;for(@$p){return(undef,0)unless ref$c eq'HASH'&&exists$c->{$_};$c=$c->{$_}}($c,1)}sub _set{my($r,$p,$v)=@_;my$c=$r;for my$k(@$p[0..$#$p-1]){$c->{$k}={}unless ref$c->{$k}eq'HASH';$c=$c->{$k}}$c->{$p->[-1]}=$v}sub _decimal{my$v=$_[0];return undef unless defined$v&&!ref$v&&"$v"=~/\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/;Math::BigRat->new("$v")}sub _stable{JSON::PP->new->canonical(1)->encode($_[0])}sub _result{my($s,$n,$c,$p)=@_;{state=>$s,normalized=>dclone($n),(defined$c?(code=>$c):()),(defined$p?(path=>[@$p]):())}}sub _fail{Selecto::Error->throw(@_)}
+1;

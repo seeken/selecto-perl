@@ -11,6 +11,7 @@ use Selecto::Adapter::Registry ();
 use Selecto::Action ();
 use Selecto::API ();
 use Selecto::CoDomain ();
+use Selecto::DataRules ();
 use Selecto::Domain ();
 use Selecto::Domain::DSL ();
 use Selecto::Domain::Overlay ();
