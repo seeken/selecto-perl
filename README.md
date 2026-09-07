@@ -553,6 +553,15 @@ expressions until native translations are implemented. SQL Server uses guarded
 native `MERGE`, bracket-quoted identifiers, and ordered `OFFSET`/`FETCH`
 pagination; pagination without an order fails closed.
 
+Document databases use the separate `Selecto::Document::Engine` contract. An
+approved `Selecto::Document::ShapeRelease` publishes fields, relations, and
+named access patterns; `Selecto::Document::Plan` binds trusted tenant scope and
+rejects undeclared projections, predicates, ordering, and unbounded limits.
+External document adapters still inherit `Selecto::Adapter`, but may override
+the DBI requirement and accept an explicitly injected native client. The first
+external consumer is `Selecto::DB::MongoDB`; it remains fixture-only until live
+MongoDB certification is recorded.
+
 Application values never enter the SQL string. The compiler emits placeholders
 and carries values separately in the statement's `params` array.
 
