@@ -783,3 +783,9 @@ concurrency, security, or performance.
 
 Unavailable adapter capabilities fail closed instead of falling back to raw
 SQL.
+
+Document metadata and plans now use private copied state. Engines reject plans
+from another source or tenant before dispatch. Integer document predicates use
+`Selecto::Document::Integer`, whose decimal string preserves signed Int64 exactly.
+The separate MongoDB adapter must receive the same release and trusted tenant
+at construction. Compiled pipeline access is by detached inspection copy.
