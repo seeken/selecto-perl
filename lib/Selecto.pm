@@ -4,7 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 
-our $VERSION = '0.2.0_01';
+our $VERSION = '0.2.0_02';
 
 use Selecto::Adapter ();
 use Selecto::Adapter::Registry ();
@@ -18,6 +18,7 @@ use Selecto::Domain::Overlay ();
 use Selecto::Domain::Ref ();
 use Selecto::Domain::Registry ();
 use Selecto::Document::Engine ();
+use Selecto::Document::Integer ();
 use Selecto::Document::Missing ();
 use Selecto::Document::Plan ();
 use Selecto::Document::ShapeRelease ();

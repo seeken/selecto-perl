@@ -77,3 +77,4 @@ t/stream.t
 t/write.t
 t/write_governance.t
 t/write_graph.t
+lib/Selecto/Document/Integer.pm

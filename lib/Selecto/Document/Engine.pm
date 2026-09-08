@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use Scalar::Util qw(blessed);
+use Hash::Util qw(lock_hash);
 use Selecto::Document::Plan ();
 use Selecto::Error ();
 
@@ -15,7 +16,9 @@ sub new {
         unless blessed($args{adapter}) && $args{adapter}->isa('Selecto::Adapter');
     Selecto::Error->throw('tenant_required', 'document engine requires trusted tenant scope')
         unless defined($args{tenant}) && !ref($args{tenant}) && length("$args{tenant}");
-    return bless { release => $args{release}, adapter => $args{adapter}, tenant => "$args{tenant}" }, $class;
+    my $self = bless { release => $args{release}, adapter => $args{adapter}, tenant => "$args{tenant}" }, $class;
+    lock_hash(%$self);
+    return $self;
 }
 
 sub plan {
@@ -23,7 +26,13 @@ sub plan {
     return Selecto::Document::Plan->new(%args, release => $self->{release}, tenant => $self->{tenant});
 }
 
-sub compile { my ($self, $plan) = @_; return $self->{adapter}->compile($self->{release}, $plan); }
+sub compile {
+    my ($self, $plan) = @_;
+    Selecto::Error->throw('invalid_document_plan', 'Native plan required')
+        unless blessed($plan) && $plan->isa('Selecto::Document::Plan');
+    $plan->validate_scope($self->{release}, $self->{tenant});
+    return $self->{adapter}->compile($self->{release}, $plan);
+}
 sub all { my ($self, $plan) = @_; return $self->{adapter}->execute_query($self->compile($plan)); }
 
 1;
