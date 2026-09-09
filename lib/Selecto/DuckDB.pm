@@ -27,7 +27,8 @@ sub normalize_type {
 sub supports {
     my ($self, $feature) = @_;
     return "$feature" eq 'transactions' || "$feature" eq 'returning'
-        || "$feature" eq 'set_operations' || "$feature" eq 'window_functions'
+        || "$feature" eq 'rollup' || "$feature" eq 'set_operations'
+        || "$feature" eq 'window_functions'
         || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
         || "$feature" eq 'stream' ? 1 : 0;
 }
