@@ -26,6 +26,18 @@ like($engine->compile($query)->sql, qr/"s0"\."name" = \?/, 'DuckDB uses prepared
 is_deeply($engine->all($query)->{rows}, [], 'bound injection-shaped input remains data');
 is($adapter->normalize_type('timestamp'), 'naive_datetime', 'DuckDB types normalize portably');
 ok($adapter->supports('transactions'), 'DuckDB declares transaction support');
+ok($adapter->supports('rollup'), 'DuckDB declares native rollup support');
+
+my $rollup = $engine->query->select(
+    'name',
+    Selecto::Expression->count->as('item_count'),
+    Selecto::Expression->grouping('name')->as('__selecto_rollup_grouping'),
+)->group_by_rollup('name')->order_by('name', 'asc');
+is_deeply(
+    $engine->all($rollup)->{rows},
+    [[undef, 1, 1], ['baseline', 1, 0]],
+    'DuckDB executes rollups with the grouping marker used by Explorer',
+);
 
 my $upsert = Selecto::Write::Command->new(
     operation => 'upsert', relation => 'selecto_perl_duckdb_items',
