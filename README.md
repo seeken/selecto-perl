@@ -168,6 +168,30 @@ tenant, or modify the domain. It validates every field and query-library name
 against the supplied engine's governed domain, so internal fields and
 host-pruned definitions remain unavailable.
 
+An API caller explicitly requests a subtable by grouping fields from one direct
+to-many association in a nested selection array. This preserves one row per
+root record. The collection column uses the association name, while its object
+keys use each selected field's full dotted path unless an alias was supplied:
+
+```perl
+my $result = $handler->query($engine, {
+    select => ['id', [
+        'load_det.vin',
+        {field => 'load_det.created', alias => 'created_day', format => 'day'},
+    ]],
+});
+```
+
+All entries in a nested array must belong to the same direct to-many
+association. Ordinary top-level selections remain flat and may therefore
+return multiple rows for one root record.
+
+`row_format` controls both levels consistently. Its default, `arrays`, returns
+root rows and subtable rows as ordered arrays; the response's `columns` and
+`subtables.<association>.columns` lists describe those positions. Set
+`row_format` to `objects` to return both root rows and subtable rows as JSON
+objects keyed by those same column names.
+
 `order_by` may be repeated to build a stable multi-column order. For governed
 date/time projection or grouping, use an allowlisted expression such as
 `Selecto::Expression->datetime_format('occurred_on', 'month')` consistently in

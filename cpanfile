@@ -1,5 +1,6 @@
 requires 'perl', '5.034';
 requires 'DBI', '1.643';
+requires 'DateTime::TimeZone';
 requires 'JSON::PP', '4.06';
 requires 'Mojolicious', '9.40';
 recommends 'DBD::Pg', '3.016';

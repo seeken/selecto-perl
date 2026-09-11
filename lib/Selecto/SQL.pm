@@ -101,6 +101,7 @@ sub compile {
 sub _compile_single {
     my ($self, $domain, $query, %options) = @_;
     local $self->{_root_alias} = $options{root_alias} // 's0';
+    local $self->{_timezone} = $query->timezone;
     my $selections = $query->selections;
     Selecto::Error->throw('invalid_query', 'query must select at least one expression') unless @$selections;
     my $sources = $self->_query_sources($domain, $query);
@@ -176,6 +177,16 @@ sub _compile_single {
                 ' ON ' . join(' AND ', @target_on);
         }
     }
+    my @columns = map { $self->_selection_name($_) } @$selections;
+    my %column_counts;
+    $column_counts{$_}++ for @columns;
+    my @duplicate_columns = sort grep { $column_counts{$_} > 1 } keys %column_counts;
+    Selecto::Error->throw(
+        'invalid_query',
+        'query selections produce duplicate result column names; provide explicit aliases',
+        {columns => \@duplicate_columns},
+    ) if @duplicate_columns;
+
     my %compiled_selections;
     my %selection_positions;
     my $selection_position = 0;
@@ -186,11 +197,12 @@ sub _compile_single {
         );
         $compiled_selections{_expression_key($_)} //= $expression_sql;
         $selection_positions{_expression_key($_)} //= $selection_position;
-        defined($_->alias_name)
-            ? $expression_sql . ' AS ' . $self->quote_identifier($_->alias_name)
+        my $needs_result_alias = defined($_->alias_name)
+            || ($_->kind eq 'field' && $_->arguments->[0] =~ /\./);
+        $needs_result_alias
+            ? $expression_sql . ' AS ' . $self->quote_identifier($columns[$selection_position - 1])
             : $expression_sql
     } @$selections;
-    my @columns = map { $self->_selection_name($_) } @$selections;
     push @joins, @{$self->_compile_cte_joins($domain, $query)};
     push @joins, @{$self->_compile_lateral_joins($domain, $query, \@params)};
     push @joins, @{$self->_compile_json_rowsets($domain, $query, \@params)};
@@ -574,8 +586,7 @@ sub _selection_name {
     return $expression->alias_name if defined $expression->alias_name;
     if ($expression->kind eq 'field') {
         my ($field) = @{$expression->arguments};
-        my @segments = split /\./, $field;
-        return $segments[-1];
+        return Selecto::Identifier::result_name($field);
     }
     return $expression->kind;
 }
@@ -781,15 +792,43 @@ sub _compile_related_collection {
         unless $association;
     Selecto::Error->throw('invalid_query', 'related collections require a to-many association')
         unless $association->cardinality eq 'many';
+    my $alias = 'c_' . $association_name;
     my $association_fields = $association->fields;
+    my @collection_fields;
     for my $field (@$fields) {
+        if (!ref($field)) {
+            Selecto::Error->throw('invalid_query', 'related collection field is invalid')
+                unless defined($field)
+                    && "$field" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/
+                    && exists $association_fields->{$field};
+            push @collection_fields, {
+                key => "$field",
+                sql => $self->_qualified($alias, $field),
+            };
+            next;
+        }
         Selecto::Error->throw('invalid_query', 'related collection field is invalid')
-            unless defined($field) && !ref($field)
-                && "$field" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/
-                && exists $association_fields->{$field};
+            unless ref($field) eq 'HASH'
+                && defined($field->{key}) && !ref($field->{key}) && length("$field->{key}")
+                && blessed($field->{expression})
+                && $field->{expression}->isa('Selecto::Expression');
+        my @paths = $self->_expression_field_paths($field->{expression});
+        Selecto::Error->throw(
+            'invalid_query', 'related collection expressions must reference one child field',
+        ) unless @paths == 1;
+        my $resolved = $domain->resolve($paths[0]);
+        Selecto::Error->throw(
+            'invalid_query', 'related collection expression belongs to another association',
+        ) unless ($resolved->{association_path} // '') eq $association_name;
+        local $self->{_join_aliases} = {
+            %{$self->{_join_aliases} // {}}, $association_name => $alias,
+        };
+        push @collection_fields, {
+            key => "$field->{key}",
+            sql => $self->_compile_expression($domain, $field->{expression}, $params),
+        };
     }
 
-    my $alias = 'c_' . $association_name;
     my $quoted_alias = $self->quote_identifier($alias);
     my $table = $self->quote_identifier($association->table);
     my $related_key = $quoted_alias . '.' . $self->quote_identifier($association->related_key);
@@ -839,7 +878,7 @@ sub _compile_related_collection {
         ? $quoted_alias . '.' . $self->quote_identifier($association->target_primary_key)
         : undef;
     return $self->_compile_related_collection_sql({
-        fields => $fields,
+        fields => \@collection_fields,
         quoted_alias => $quoted_alias,
         from => $from,
         where => $where,
@@ -850,10 +889,29 @@ sub _compile_related_collection {
 sub _related_collection_json_pairs {
     my ($self, $fields, $quoted_alias) = @_;
     return map {
-        my $key = "$_";
+        my $key = $_->{key};
         $key =~ s/'/''/g;
-        "'$key', " . $quoted_alias . '.' . $self->quote_identifier($_)
+        "'$key', " . $_->{sql}
     } @$fields;
+}
+
+sub _expression_field_paths {
+    my ($self, $expression) = @_;
+    return () unless blessed($expression) && $expression->isa('Selecto::Expression');
+    return ($expression->arguments->[0]) if $expression->kind eq 'field';
+    my @paths;
+    for my $argument (@{$expression->arguments}) {
+        if (blessed($argument) && $argument->isa('Selecto::Expression')) {
+            push @paths, $self->_expression_field_paths($argument);
+        } elsif (ref($argument) eq 'ARRAY') {
+            push @paths, map { $self->_expression_field_paths($_) } @$argument;
+        } elsif (ref($argument) eq 'HASH') {
+            push @paths, map { $self->_expression_field_paths($argument->{$_}) }
+                sort keys %$argument;
+        }
+    }
+    my %seen;
+    return grep { !$seen{$_}++ } @paths;
 }
 
 sub _related_collection_aggregate_sql {
@@ -890,7 +948,13 @@ sub _field_sql {
     my $table_alias = $resolved->{association}
         ? $self->_join_alias($resolved->{association_path})
         : $self->_root_alias;
-    return $self->quote_identifier($table_alias) . '.' . $self->quote_identifier($resolved->{field});
+    my $sql = $self->quote_identifier($table_alias) . '.' . $self->quote_identifier($resolved->{field});
+    return $sql unless defined($self->{_timezone})
+        && ($resolved->{type} eq 'utc_datetime' || $resolved->{type} eq 'epoch_datetime')
+        && !$self->{_suppress_field_timezone};
+    return $self->_compile_timezone_sql(
+        $sql, $resolved->{type}, $self->{_timezone}, $params,
+    );
 }
 
 sub _compile_computed_field {
@@ -944,6 +1008,7 @@ sub _expression_associations {
     my ($self, $expression) = @_;
     return () unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $arguments = $expression->arguments;
+    return () if $expression->kind eq 'related_collection';
     if ($expression->kind eq 'field') {
         my @segments = split /\./, $arguments->[0];
         return () if @segments == 2 && ref($self->{_query_sources}) eq 'HASH'
@@ -1299,6 +1364,13 @@ sub _transaction {
 sub _compile_dialect_expression {
     my ($self, $domain, $expression, $params) = @_;
     Selecto::Error->throw('invalid_query', 'expression is not supported by this SQL dialect');
+}
+
+sub _compile_timezone_sql {
+    my ($self) = @_;
+    Selecto::Error->throw(
+        'unsupported_feature', 'adapter does not support explicit query timezones',
+    );
 }
 
 sub _compile_upsert_clause {

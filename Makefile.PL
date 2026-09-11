@@ -13,6 +13,7 @@ WriteMakefile(
     EXE_FILES        => ['bin/selecto-certify'],
     PREREQ_PM        => {
         'DBI'         => '1.643',
+        'DateTime::TimeZone' => 0,
         'Digest::SHA' => 0,
         'JSON::PP'    => '4.06',
         'Mojolicious' => '9.40',

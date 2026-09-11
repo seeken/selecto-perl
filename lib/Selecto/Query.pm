@@ -5,14 +5,16 @@ use strict;
 use warnings;
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
+use DateTime::TimeZone ();
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::Identifier ();
 
 sub new {
     my ($class, %args) = @_;
     my %allowed = map { $_ => 1 } qw(
         selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
-        set_operations ctes lateral_joins json_rowsets
+        set_operations ctes lateral_joins json_rowsets timezone
     );
     my @unknown = sort grep { !$allowed{$_} } keys %args;
     Selecto::Error->throw(
@@ -62,6 +64,11 @@ sub new {
     my $ctes = $args{ctes} // [];
     my $lateral_joins = $args{lateral_joins} // [];
     my $json_rowsets = $args{json_rowsets} // [];
+    my $timezone = $args{timezone};
+    Selecto::Error->throw('invalid_query', 'timezone must be a valid IANA timezone name')
+        if defined($timezone) && (
+            ref($timezone) || !DateTime::TimeZone->is_valid_name("$timezone")
+        );
     Selecto::Error->throw('invalid_query', 'CTEs must be an array') unless ref($ctes) eq 'ARRAY';
     Selecto::Error->throw('invalid_query', 'lateral joins must be an array')
         unless ref($lateral_joins) eq 'ARRAY';
@@ -85,6 +92,7 @@ sub new {
         ctes => [map { _clone_cte_spec($_) } @$ctes],
         lateral_joins => [map { _clone_lateral_spec($_) } @$lateral_joins],
         json_rowsets => [map { _clone_json_rowset_spec($_) } @$json_rowsets],
+        timezone => defined($timezone) ? "$timezone" : undef,
         applied_query_library => dclone($args{applied_query_library} // {
             segments => [], projections => [], projection => undef,
             ordering => undef, views => [],
@@ -317,7 +325,8 @@ sub _query_columns {
     my ($query) = @_;
     my @columns = map {
         defined($_->alias_name) ? $_->alias_name
-            : $_->kind eq 'field' ? (split(/\./, $_->arguments->[0]))[-1]
+            : $_->kind eq 'field'
+                ? Selecto::Identifier::result_name($_->arguments->[0])
             : Selecto::Error->throw(
                 'invalid_query',
                 'computed CTE and lateral selections require aliases',
@@ -332,7 +341,7 @@ sub _columns {
         unless ref($columns) eq 'ARRAY' && @$columns;
     my %seen;
     for my $column (@$columns) {
-        _source_name($column, "$label column");
+        Selecto::Identifier::result_name($column);
         Selecto::Error->throw('invalid_query', "$label columns must be unique")
             if $seen{"$column"}++;
     }
@@ -400,6 +409,7 @@ sub count_query {
 
 sub limit  { my ($self, $value) = @_; return $self->_copy(limit_value  => _nonnegative($value, 'limit')); }
 sub offset { my ($self, $value) = @_; return $self->_copy(offset_value => _nonnegative($value, 'offset')); }
+sub use_timezone { my ($self, $value) = @_; return $self->_copy(timezone => $value); }
 
 sub _nonnegative {
     my ($value, $label) = @_;
@@ -422,6 +432,7 @@ sub _copy {
         ctes => $self->{ctes},
         lateral_joins => $self->{lateral_joins},
         json_rowsets => $self->{json_rowsets},
+        timezone => $self->{timezone},
         applied_query_library => $self->{applied_query_library},
         %changes,
     );
@@ -435,6 +446,7 @@ sub grouping_mode { return $_[0]->{grouping_mode}; }
 sub orders       { return [map { [@$_] } @{$_[0]->{orders}}]; }
 sub limit_value  { return $_[0]->{limit_value}; }
 sub offset_value { return $_[0]->{offset_value}; }
+sub timezone { return $_[0]->{timezone}; }
 sub set_operations { return [map {{%$_}} @{$_[0]->{set_operations}}]; }
 sub ctes { return [map { _clone_cte_spec($_) } @{$_[0]->{ctes}}]; }
 sub lateral_joins { return [map { _clone_lateral_spec($_) } @{$_[0]->{lateral_joins}}]; }

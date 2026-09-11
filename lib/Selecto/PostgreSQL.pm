@@ -83,21 +83,29 @@ sub _compile_dialect_expression {
         my $resolved = $domain->resolve($path);
         Selecto::Error->throw('invalid_query', 'epoch datetime requires an epoch datetime field')
             unless $resolved->{type} eq 'epoch_datetime';
-        return 'TO_TIMESTAMP(' . $self->_compile_expression($domain, $field, $params) . ')';
+        local $self->{_suppress_field_timezone} = 1;
+        my $sql = 'TO_TIMESTAMP(' . $self->_compile_expression($domain, $field, $params) . ')';
+        return defined($self->{_timezone})
+            ? $self->_compile_timezone_sql($sql, 'epoch_datetime', $self->{_timezone}, $params)
+            : $sql;
     }
     if ($kind eq 'datetime_format') {
         my %formats = (
             day => 'YYYY-MM-DD',
             time => 'HH24:MI:SS',
             day_hour => 'YYYY-MM-DD HH24',
-            week => 'IYYY-IW',
+            week => 'IYYY-"W"IW',
+            iso_week => 'IYYY-"W"IW',
+            iso_week_date => 'IYYY-"W"IW-ID',
             month => 'YYYY-MM',
             quarter => 'YYYY-"Q"Q',
             year => 'YYYY',
             month_of_year => 'MM',
             month_day => 'MM-DD',
             day_of_month => 'DD',
-            day_of_week => 'ID',
+            day_of_week => 'FMDay',
+            day_of_week_num => 'ID',
+            day_of_year => 'DDD',
             hour => 'HH24',
         );
         my ($field, $format) = @$arguments;
@@ -105,7 +113,8 @@ sub _compile_dialect_expression {
             unless blessed($field) && $field->isa('Selecto::Expression')
                 && ($field->kind eq 'field' || $field->kind eq 'epoch_datetime');
         Selecto::Error->throw('invalid_query', 'datetime format is not available')
-            unless exists $formats{$format};
+            unless $format =~ /\A(?:iso8601|rfc3339_millis|epoch_seconds|epoch_milliseconds|timezone_offset)\z/
+                || exists $formats{$format};
         my $source = $field->kind eq 'epoch_datetime' ? $field->arguments->[0] : $field;
         Selecto::Error->throw('invalid_query', 'datetime format field must be a governed field')
             unless blessed($source) && $source->isa('Selecto::Expression') && $source->kind eq 'field';
@@ -113,6 +122,47 @@ sub _compile_dialect_expression {
         my $resolved = $domain->resolve($path);
         Selecto::Error->throw('invalid_query', 'datetime format requires a date or time field')
             unless $resolved->{type} =~ /(?:date|time)/i;
+        if ($format eq 'iso8601') {
+            if ($resolved->{type} eq 'date') {
+                return 'TO_CHAR(' . $self->_compile_expression($domain, $field, $params) .
+                    q{, 'YYYY-MM-DD')};
+            }
+            if ($resolved->{type} eq 'utc_datetime' || $resolved->{type} eq 'epoch_datetime') {
+                my $timezone = $self->{_timezone};
+                local $self->{_suppress_field_timezone} = 1;
+                local $self->{_timezone};
+                my $instant_sql = $self->_compile_expression($domain, $field, $params);
+                return $self->_compile_iso8601_instant_sql(
+                    $instant_sql, $timezone, $params,
+                );
+            }
+            return 'TO_CHAR(' . $self->_compile_expression($domain, $field, $params) .
+                q{, 'YYYY-MM-DD"T"HH24:MI:SS')};
+        }
+        if ($format =~ /\A(?:rfc3339_millis|epoch_seconds|epoch_milliseconds|timezone_offset)\z/) {
+            my $timezone = $self->{_timezone};
+            local $self->{_suppress_field_timezone} = 1;
+            local $self->{_timezone};
+            my $instant_sql = $self->_compile_expression($domain, $field, $params);
+            if ($resolved->{type} ne 'utc_datetime' && $resolved->{type} ne 'epoch_datetime') {
+                if (defined($timezone) && $timezone ne 'UTC') {
+                    push @$params, $timezone;
+                    $instant_sql = '(' . $instant_sql . ' AT TIME ZONE ' .
+                        $self->placeholder(scalar @$params) . ')';
+                } else {
+                    $instant_sql = '(' . $instant_sql . q{ AT TIME ZONE 'UTC')};
+                }
+            }
+            return 'CAST(FLOOR(EXTRACT(EPOCH FROM ' . $instant_sql . ')) AS BIGINT)'
+                if $format eq 'epoch_seconds';
+            return 'CAST(FLOOR(EXTRACT(EPOCH FROM ' . $instant_sql . ') * 1000) AS BIGINT)'
+                if $format eq 'epoch_milliseconds';
+            return $self->_compile_timezone_offset_sql($instant_sql, $timezone, $params)
+                if $format eq 'timezone_offset';
+            return $self->_compile_rfc3339_instant_sql(
+                $instant_sql, $timezone, $params, 1,
+            );
+        }
         return 'TO_CHAR(' . $self->_compile_expression($domain, $field, $params) .
             ", '" . $formats{$format} . "')";
     }
@@ -153,6 +203,47 @@ sub _compile_dialect_expression {
         return "TS_RANK($vector, $tsquery)";
     }
     return $self->SUPER::_compile_dialect_expression($domain, $expression, $params);
+}
+
+sub _compile_timezone_sql {
+    my ($self, $sql, $type, $timezone, $params) = @_;
+    push @$params, $timezone;
+    return '(' . $sql . ' AT TIME ZONE ' . $self->placeholder(scalar @$params) . ')';
+}
+
+sub _compile_iso8601_instant_sql {
+    my ($self, $sql, $timezone, $params) = @_;
+    return $self->_compile_rfc3339_instant_sql($sql, $timezone, $params, 0);
+}
+
+sub _compile_rfc3339_instant_sql {
+    my ($self, $sql, $timezone, $params, $milliseconds) = @_;
+    my $pattern = $milliseconds
+        ? 'YYYY-MM-DD"T"HH24:MI:SS.MS'
+        : 'YYYY-MM-DD"T"HH24:MI:SS';
+    return q{TO_CHAR((} . $sql . q{ AT TIME ZONE 'UTC'), '} . $pattern . q{') || 'Z'}
+        unless defined($timezone) && $timezone ne 'UTC';
+    push @$params, $timezone;
+    my $placeholder = $self->placeholder(scalar @$params);
+    my $local = '(' . $sql . ' AT TIME ZONE ' . $placeholder . ')';
+    return q{TO_CHAR(} . $local . q{, '} . $pattern . q{') || } .
+        $self->_compile_timezone_offset_sql($sql, $timezone, $params, $placeholder);
+}
+
+sub _compile_timezone_offset_sql {
+    my ($self, $sql, $timezone, $params, $placeholder) = @_;
+    return q{'+00:00'} unless defined($timezone) && $timezone ne 'UTC';
+    unless (defined $placeholder) {
+        push @$params, $timezone;
+        $placeholder = $self->placeholder(scalar @$params);
+    }
+    my $local = '(' . $sql . ' AT TIME ZONE ' . $placeholder . ')';
+    my $offset = 'CAST(EXTRACT(EPOCH FROM (' . $local . ' - (' . $sql .
+        q{ AT TIME ZONE 'UTC'))) AS INTEGER)};
+    return
+        q{CASE WHEN } . $offset . q{ >= 0 THEN '+' ELSE '-' END || } .
+        q{LPAD(CAST(FLOOR(ABS(} . $offset . q{) / 3600) AS TEXT), 2, '0') || ':' || } .
+        q{LPAD(CAST(FLOOR(MOD(ABS(} . $offset . q{), 3600) / 60) AS TEXT), 2, '0')};
 }
 
 sub _compile_json_rowset_join {

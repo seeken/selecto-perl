@@ -18,4 +18,13 @@ sub checked {
     return $string;
 }
 
+sub result_name {
+    my ($path) = @_;
+    my $name = defined($path) ? "$path" : '';
+    my @segments = split /\./, $name, -1;
+    Selecto::Error->throw('invalid_identifier', 'invalid result field path')
+        unless @segments && !grep { !valid($_) } @segments;
+    return join '.', @segments;
+}
+
 1;
