@@ -10,7 +10,9 @@ use Scalar::Util qw(blessed);
 use Selecto::Engine ();
 use Selecto::Error ();
 use Selecto::DateShortcut ();
+use Selecto::DateFormat ();
 use Selecto::Expression ();
+use Selecto::Identifier ();
 use Selecto::QueryLibrary ();
 
 has max_fields        => 100;
@@ -45,7 +47,7 @@ sub query ($self, $engine, $body) {
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
     _object($body, 'query body');
     _reject_unknown($body, [qw(
-        select projection view segments parameters filters ordering order_by limit offset
+        select projection view segments parameters filters ordering order_by limit offset timezone row_format
     )], 'query body');
 
     my $has_select = exists $body->{select};
@@ -66,13 +68,22 @@ sub query ($self, $engine, $body) {
     my $parameters = $body->{parameters} // {};
     _object($parameters, 'parameters');
     my $named_ordering = $body->{ordering};
+    my $timezone = exists($body->{timezone})
+        ? _required_string($body->{timezone}, 'timezone') : undef;
+    my $row_format = lc(exists($body->{row_format})
+        ? _required_string($body->{row_format}, 'row_format') : 'arrays');
+    Selecto::Error->throw(
+        'invalid_api_query', 'row_format must be arrays or objects',
+        {row_format => $row_format},
+    ) unless $row_format eq 'arrays' || $row_format eq 'objects';
+    my @subtables;
 
     if ($has_select) {
-        my @fields = _string_array(
-            $body->{select}, 'select', $self->max_fields, 1,
+        my $selection_plan = _api_selections(
+            $domain, $body->{select}, $self->max_fields,
         );
-        _public_field_definition($domain, $_) for @fields;
-        $query = $query->select(\@fields);
+        $query = $query->select($selection_plan->{expressions});
+        @subtables = @{$selection_plan->{subtables}};
     } elsif ($has_projection) {
         my @projections = ref($body->{projection}) eq 'ARRAY'
             ? _string_array(
@@ -156,6 +167,15 @@ sub query ($self, $engine, $body) {
         ? _bounded_integer($body->{offset}, 'offset', 0, undef)
         : 0;
     $query = $query->limit($limit)->offset($offset);
+    if (defined $timezone) {
+        my $ok = eval { $query = $query->use_timezone($timezone); 1 };
+        if (!$ok) {
+            Selecto::Error->throw(
+                'invalid_api_query', 'timezone must be a valid IANA timezone name',
+                {timezone => $timezone},
+            );
+        }
+    }
 
     my $result = $engine->all($query);
     Selecto::Error->throw(
@@ -163,10 +183,16 @@ sub query ($self, $engine, $body) {
     ) unless ref($result) eq 'HASH'
         && ref($result->{columns}) eq 'ARRAY'
         && ref($result->{rows}) eq 'ARRAY';
+    _shape_result_rows($result, \@subtables, $row_format);
+    my %subtable_metadata = map {
+        $_->{column} => {columns => [@{$_->{columns}}]}
+    } @subtables;
     return {
         columns => $result->{columns},
         rows => $result->{rows},
         returned => scalar(@{$result->{rows}}),
+        row_format => $row_format,
+        subtables => \%subtable_metadata,
         limit => $limit,
         offset => $offset,
         query_library => $query->applied_query_library,
@@ -194,7 +220,14 @@ sub describe_openapi ($self, $api) {
         description => 'Choose exactly one of select, projection, or view.',
         properties => {
             select => {
-                type => 'array', items => {type => 'string'},
+                type => 'array',
+                items => {
+                    oneOf => [
+                        {type => 'string'},
+                        {'$ref' => '#/components/schemas/SelectoSelection'},
+                        {'$ref' => '#/components/schemas/SelectoSubtableSelection'},
+                    ],
+                },
                 maxItems => $self->max_fields,
             },
             projection => {
@@ -226,6 +259,39 @@ sub describe_openapi ($self, $api) {
                 default => $self->default_limit,
             },
             offset => {type => 'integer', minimum => 0, default => 0},
+            timezone => {
+                type => 'string',
+                description => 'IANA timezone applied to UTC and epoch datetime fields and filters.',
+                example => 'America/New_York',
+            },
+            row_format => {
+                type => 'string', enum => [qw(arrays objects)], default => 'arrays',
+                description => 'Shape used for root rows and nested subtable rows.',
+            },
+        },
+    };
+    $openapi->{components}{schemas}{SelectoSelection} = {
+        type => 'object', additionalProperties => JSON::PP::false,
+        required => ['field'],
+        properties => {
+            field => {type => 'string'},
+            alias => {
+                type => 'string', pattern => '^[A-Za-z_][A-Za-z0-9_]*$',
+            },
+            format => {
+                type => 'string',
+                enum => [map { $_->{id} } @{Selecto::DateFormat->choices}],
+            },
+        },
+    };
+    $openapi->{components}{schemas}{SelectoSubtableSelection} = {
+        type => 'array', minItems => 1, maxItems => $self->max_fields,
+        description => 'Fields from one direct to-many association returned as a nested collection.',
+        items => {
+            oneOf => [
+                {type => 'string'},
+                {'$ref' => '#/components/schemas/SelectoSelection'},
+            ],
         },
     };
     $openapi->{components}{schemas}{SelectoFilter} = {
@@ -358,6 +424,161 @@ sub _required_string ($value, $label) {
         'invalid_api_query', "$label must be a non-empty string",
     ) if !defined($value) || ref($value) || "$value" eq '';
     return "$value";
+}
+
+sub _api_selections ($domain, $value, $maximum) {
+    Selecto::Error->throw('invalid_api_query', 'select must be an array')
+        unless ref($value) eq 'ARRAY';
+    Selecto::Error->throw('invalid_api_query', 'select must not be empty')
+        unless @$value;
+    my (@expressions, @subtables, %column_names);
+    my $field_count = 0;
+    for my $entry (@$value) {
+        if (ref($entry) ne 'ARRAY') {
+            my $selection = _api_selection_entry($domain, $entry, 'select entry');
+            $field_count++;
+            Selecto::Error->throw(
+                'invalid_api_query',
+                'select entries produce duplicate result column names; provide distinct aliases',
+                {column => $selection->{result_name}},
+            ) if $column_names{$selection->{result_name}}++;
+            push @expressions, $selection->{flat_expression};
+            next;
+        }
+        Selecto::Error->throw('invalid_api_query', 'subtable selection must not be empty')
+            unless @$entry;
+        my (@fields, %nested_names, $association);
+        for my $nested_entry (@$entry) {
+            Selecto::Error->throw(
+                'invalid_api_query', 'subtable selections cannot contain another array',
+            ) if ref($nested_entry) eq 'ARRAY';
+            my $selection = _api_selection_entry(
+                $domain, $nested_entry, 'subtable select entry',
+            );
+            $field_count++;
+            my $definition = $selection->{definition};
+            Selecto::Error->throw(
+                'invalid_api_query',
+                'subtable fields must belong to a direct to-many association',
+                {field => $selection->{field}},
+            ) unless $definition->{association}
+                && @{$definition->{associations}} == 1
+                && $definition->{association}->cardinality eq 'many';
+            $association //= $definition->{association_path};
+            Selecto::Error->throw(
+                'invalid_api_query',
+                'all fields in a subtable must belong to the same association',
+                {association => $association, field => $selection->{field}},
+            ) unless $definition->{association_path} eq $association;
+            Selecto::Error->throw(
+                'invalid_api_query',
+                'subtable fields produce duplicate names; provide distinct aliases',
+                {column => $selection->{result_name}},
+            ) if $nested_names{$selection->{result_name}}++;
+            push @fields, {
+                key => $selection->{result_name}, expression => $selection->{expression},
+            };
+        }
+        Selecto::Error->throw(
+            'invalid_api_query',
+            'a subtable association collides with another result column',
+            {column => $association},
+        ) if $column_names{$association}++;
+        push @subtables, {
+            column => $association,
+            columns => [map { $_->{key} } @fields],
+        };
+        push @expressions, Selecto::Expression->related_collection(
+            $association, \@fields,
+        )->as($association);
+    }
+    Selecto::Error->throw('invalid_api_query', 'Too many select entries')
+        if $field_count > $maximum;
+    return {
+        expressions => \@expressions,
+        subtables => \@subtables,
+    };
+}
+
+sub _api_selection_entry ($domain, $entry, $label) {
+    my ($field, $alias, $format);
+    if (ref($entry) eq 'HASH') {
+        _reject_unknown($entry, [qw(field alias format)], $label);
+        $field = _required_string($entry->{field}, "$label field");
+        if (exists $entry->{alias}) {
+            $alias = _required_string($entry->{alias}, "$label alias");
+            Selecto::Error->throw(
+                'invalid_api_query', 'select alias must be a valid identifier',
+                {alias => $alias},
+            ) unless Selecto::Identifier::valid($alias);
+        }
+        if (exists $entry->{format}) {
+            $format = _required_string($entry->{format}, "$label format");
+            Selecto::Error->throw(
+                'invalid_api_query', 'select format is not available',
+                {format => $format},
+            ) unless Selecto::DateFormat::valid($format);
+        }
+    } else {
+        $field = _required_string($entry, $label);
+    }
+    my $definition = _public_field_definition($domain, $field);
+    Selecto::Error->throw(
+        'invalid_api_query', 'select format requires a date or time field',
+        {field => $field, format => $format},
+    ) if defined($format) && $definition->{type} !~ /(?:date|time)/i;
+    my $result_name = defined($alias)
+        ? $alias : Selecto::Identifier::result_name($field);
+    my $expression = Selecto::Expression->field($field);
+    if (defined $format) {
+        $expression = Selecto::Expression->epoch_datetime($expression)
+            if $definition->{type} eq 'epoch_datetime';
+        $expression = Selecto::Expression->datetime_format($expression, $format);
+    }
+    return {
+        field => $field, definition => $definition,
+        result_name => $result_name, expression => $expression,
+        flat_expression => defined($alias) || defined($format)
+            ? $expression->as($result_name) : $expression,
+    };
+}
+
+sub _shape_result_rows ($result, $subtables, $row_format) {
+    my %subtable = map { $_->{column} => $_ } @$subtables;
+    for my $index (0 .. $#{$result->{columns}}) {
+        my $specification = $subtable{$result->{columns}[$index]};
+        next unless $specification;
+        for my $row (@{$result->{rows}}) {
+            Selecto::Error->throw(
+                'invalid_api_host', 'Selecto adapter returned an invalid row',
+            ) unless ref($row) eq 'ARRAY';
+            my $decoded = $row->[$index];
+            my $ok = ref($decoded) eq 'ARRAY';
+            $ok = defined($decoded) && !ref($decoded)
+                && eval { $decoded = JSON::PP->new->decode($decoded); 1 }
+                unless $ok;
+            Selecto::Error->throw(
+                'invalid_api_host', 'Selecto adapter returned an invalid related collection',
+                {column => $result->{columns}[$index]},
+            ) unless $ok && ref($decoded) eq 'ARRAY'
+                && !grep { ref($_) ne 'HASH' } @$decoded;
+            $row->[$index] = $row_format eq 'objects' ? $decoded : [map {
+                my $record = $_;
+                [map { $record->{$_} } @{$specification->{columns}}]
+            } @$decoded];
+        }
+    }
+    return if $row_format eq 'arrays';
+    my @columns = @{$result->{columns}};
+    $result->{rows} = [map {
+        my $row = $_;
+        Selecto::Error->throw(
+            'invalid_api_host', 'Selecto adapter returned an invalid row',
+        ) unless ref($row) eq 'ARRAY' && @$row == @columns;
+        my %record;
+        @record{@columns} = @$row;
+        \%record;
+    } @{$result->{rows}}];
 }
 
 sub _string_array ($value, $label, $maximum, $required = 0) {

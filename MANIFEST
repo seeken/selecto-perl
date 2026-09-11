@@ -31,6 +31,7 @@ lib/Selecto/Error.pm
 lib/Selecto/Expression.pm
 lib/Selecto/Files.pm
 lib/Selecto/Identifier.pm
+lib/Selecto/DateFormat.pm
 lib/Selecto/MariaDB.pm
 lib/Selecto/MySQL.pm
 lib/Selecto/MySQLFamily.pm

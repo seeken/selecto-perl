@@ -89,7 +89,23 @@ sub dimension_display {
 }
 sub related_collection {
     my ($class, $association, $fields) = @_;
-    return $class->new('related_collection', "$association", [map { "$_" } @$fields]);
+    Selecto::Error->throw('invalid_query', 'related collection fields must be an array')
+        unless ref($fields) eq 'ARRAY';
+    my @fields = map {
+        if (!ref($_)) {
+            "$_";
+        } elsif (ref($_) eq 'HASH') {
+            Selecto::Error->throw(
+                'invalid_query', 'related collection field requires key and expression',
+            ) unless defined($_->{key}) && !ref($_->{key}) && length("$_->{key}")
+                && blessed($_->{expression}) && $_->{expression}->isa(__PACKAGE__)
+                && !grep { $_ ne 'key' && $_ ne 'expression' } keys %$_;
+            {key => "$_->{key}", expression => $_->{expression}};
+        } else {
+            Selecto::Error->throw('invalid_query', 'related collection field is invalid');
+        }
+    } @$fields;
+    return $class->new('related_collection', "$association", \@fields);
 }
 sub text_search {
     my ($class, $fields, $query, %options) = @_;

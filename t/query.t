@@ -82,6 +82,32 @@ like($grouped_statement->sql, qr/COUNT\(\*\)/, 'aggregate is compiled');
 like($grouped_statement->sql, qr/GROUP BY "j_person"\."name"/, 'joined group is validated and compiled');
 is_deeply($grouped_statement->columns, ['person_name', 'order_count'], 'stable result columns use aliases');
 
+my $joined_field_statement = $join_engine->compile(
+    $join_engine->query->select('id', 'person.name'),
+);
+is_deeply(
+    $joined_field_statement->columns,
+    ['id', 'person.name'],
+    'unaliased joined fields retain their full path in result column names',
+);
+like(
+    $joined_field_statement->sql,
+    qr/"j_person"\."name" AS "person\.name"/,
+    'exact path-based result names are emitted as quoted SQL aliases',
+);
+
+my $duplicate_result_error = eval {
+    $join_engine->compile($join_engine->query->select(
+        'person.name',
+        'person.name',
+    ));
+    undef;
+} // $@;
+is($duplicate_result_error->code, 'invalid_query',
+    'duplicate default result names fail closed');
+is_deeply($duplicate_result_error->details, {columns => ['person.name']},
+    'duplicate result errors identify the colliding column');
+
 my $deep_domain = Selecto::Domain->parse({
     schema_version => 1,
     name => 'Deep orders',
@@ -214,6 +240,20 @@ like $line_statement->sql,
     'a to-many selection compiles as a correlated ordered JSON collection';
 unlike $line_statement->sql, qr{JOIN "invoice_lines"},
     'a related collection does not multiply outer result rows';
+
+my $named_line_statement = $line_engine->compile(
+    $line_engine->query->select(
+        Selecto::Expression->related_collection('lines', [{
+            key => 'lines.sku',
+            expression => Selecto::Expression->field('lines.sku'),
+        }])->as('lines'),
+    )
+);
+like $named_line_statement->sql,
+    qr{JSON_BUILD_OBJECT\('lines\.sku', "c_lines"\."sku"\)},
+    'related collections accept governed expressions with explicit JSON keys';
+unlike $named_line_statement->sql, qr{JOIN "invoice_lines"},
+    'a structured related collection expression remains correlated, not joined';
 
 my $flag_domain = Selecto::Domain->parse({
     schema_version => 1,
@@ -457,6 +497,47 @@ like $time_statement->sql,
     qr/TO_CHAR\("s0"\."occurred_on", 'HH24:MI:SS'\) AS "occurred_time"/,
     'governed time format can display the time independently from its date';
 
+my $iso_date_statement = $dated_engine->compile(
+    $dated_engine->query->select(
+        Selecto::Expression->datetime_format('occurred_on', 'iso8601')->as('occurred_on')
+    )
+);
+like $iso_date_statement->sql,
+    qr/TO_CHAR\("s0"\."occurred_on", 'YYYY-MM-DD'\) AS "occurred_on"/,
+    'proper DATE fields use the ISO calendar-date representation';
+
+my $weekday_statement = $dated_engine->compile(
+    $dated_engine->query->select(
+        Selecto::Expression->datetime_format('occurred_on', 'day_of_week')->as('weekday'),
+        Selecto::Expression->datetime_format('occurred_on', 'day_of_week_num')->as('weekday_num'),
+    )
+);
+like $weekday_statement->sql, qr/TO_CHAR\("s0"\."occurred_on", 'FMDay'\) AS "weekday"/,
+    'day_of_week returns an unpadded day name';
+like $weekday_statement->sql, qr/TO_CHAR\("s0"\."occurred_on", 'ID'\) AS "weekday_num"/,
+    'day_of_week_num uses ISO Monday-through-Sunday numbering';
+
+my $calendar_formats_statement = $dated_engine->compile(
+    $dated_engine->query->select(
+        Selecto::Expression->datetime_format('occurred_on', 'week')->as('week'),
+        Selecto::Expression->datetime_format('occurred_on', 'iso_week')->as('iso_week'),
+        Selecto::Expression->datetime_format('occurred_on', 'iso_week_date')->as('iso_week_date'),
+        Selecto::Expression->datetime_format('occurred_on', 'day_of_year')->as('day_of_year'),
+    )
+);
+like $calendar_formats_statement->sql,
+    qr/TO_CHAR\("s0"\."occurred_on", 'IYYY-"W"IW'\) AS "week"/,
+    'the existing week format now uses the proper ISO W designator';
+like $calendar_formats_statement->sql,
+    qr/TO_CHAR\("s0"\."occurred_on", 'IYYY-"W"IW'\) AS "iso_week"/,
+    'iso_week explicitly exposes the ISO week representation';
+like $calendar_formats_statement->sql,
+    qr/TO_CHAR\("s0"\."occurred_on", 'IYYY-"W"IW-ID'\) AS "iso_week_date"/,
+    'iso_week_date includes the ISO weekday number';
+like $calendar_formats_statement->sql,
+    qr/TO_CHAR\("s0"\."occurred_on", 'DDD'\) AS "day_of_year"/,
+    'day_of_year exposes the ordinal calendar day';
+
 my $formatted_filter_statement = $dated_engine->compile(
     $dated_engine->query
         ->select('id')
@@ -487,6 +568,51 @@ like $epoch_statement->sql,
     'epoch datetime filters compare against a timestamp expression';
 is_deeply $epoch_statement->params, ['2026-08-01T00:00'],
     'epoch datetime filter values remain bound parameters';
+
+my $epoch_iso_statement = $epoch_engine->compile(
+    $epoch_engine->query->select(
+        Selecto::Expression->datetime_format($epoch_time, 'iso8601')->as('occurred_at')
+    )
+);
+like $epoch_iso_statement->sql,
+    qr/TO_CHAR\(\(TO_TIMESTAMP\("s0"\."occurred_at"\) AT TIME ZONE 'UTC'\), 'YYYY-MM-DD"T"HH24:MI:SS'\) \|\| 'Z'/,
+    'epoch instants use an RFC 3339 UTC representation by default';
+
+my $epoch_iso_local_statement = $epoch_engine->compile(
+    $epoch_engine->query
+        ->select(Selecto::Expression->datetime_format($epoch_time, 'iso8601')->as('occurred_at'))
+        ->use_timezone('Asia/Kolkata')
+);
+like $epoch_iso_local_statement->sql, qr/FLOOR\(ABS\(.+\) \/ 3600\)/,
+    'localized ISO instants compute offset hours without rounding half-hour zones';
+like $epoch_iso_local_statement->sql, qr/MOD\(ABS\(.+\), 3600\) \/ 60/,
+    'localized ISO instants include offset minutes';
+is_deeply $epoch_iso_local_statement->params, ['Asia/Kolkata'],
+    'localized ISO timezone remains a bound parameter';
+
+my $epoch_interchange_statement = $epoch_engine->compile(
+    $epoch_engine->query->select(
+        Selecto::Expression->datetime_format($epoch_time, 'rfc3339_millis')->as('rfc3339_millis'),
+        Selecto::Expression->datetime_format($epoch_time, 'epoch_seconds')->as('epoch_seconds'),
+        Selecto::Expression->datetime_format($epoch_time, 'epoch_milliseconds')->as('epoch_milliseconds'),
+        Selecto::Expression->datetime_format($epoch_time, 'timezone_offset')->as('timezone_offset'),
+    )->use_timezone('America/New_York')
+);
+like $epoch_interchange_statement->sql,
+    qr/'YYYY-MM-DD"T"HH24:MI:SS\.MS'\) \|\| CASE WHEN/,
+    'RFC 3339 millisecond timestamps include localized milliseconds and an offset';
+like $epoch_interchange_statement->sql,
+    qr/CAST\(FLOOR\(EXTRACT\(EPOCH FROM TO_TIMESTAMP\("s0"\."occurred_at"\)\)\) AS BIGINT\) AS "epoch_seconds"/,
+    'epoch_seconds compiles to an integer Unix timestamp';
+like $epoch_interchange_statement->sql,
+    qr/CAST\(FLOOR\(EXTRACT\(EPOCH FROM TO_TIMESTAMP\("s0"\."occurred_at"\)\) \* 1000\) AS BIGINT\) AS "epoch_milliseconds"/,
+    'epoch_milliseconds compiles to integer milliseconds';
+like $epoch_interchange_statement->sql,
+    qr/AS "timezone_offset"/,
+    'timezone_offset compiles as an independent result field';
+is_deeply $epoch_interchange_statement->params,
+    ['America/New_York', 'America/New_York'],
+    'only offset-producing formats bind the requested timezone';
 
 my $numeric_domain = Selecto::Domain->new(
     name => 'Inventory',

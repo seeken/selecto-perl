@@ -142,8 +142,7 @@ sub _compile_related_collection_sql {
     my ($self, $spec) = @_;
     my $quoted_alias = $spec->{quoted_alias};
     my $projection = join(', ', map {
-        $quoted_alias . '.' . $self->quote_identifier($_) . ' AS ' .
-            $self->quote_identifier($_)
+        $_->{sql} . ' AS ' . $self->quote_identifier($_->{key})
     } @{$spec->{fields}});
     return "COALESCE((SELECT $projection FROM $spec->{from} " .
         "WHERE $spec->{where}" .

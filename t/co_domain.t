@@ -28,7 +28,7 @@ use Selecto::PostgreSQL ();
             cl_key => 'ACME',
             city => 'Detroit',
             state => 'MI',
-            descr => 'Active',
+            'client_status.descr' => 'Active',
         );
         return {
             columns => $statement->columns,
