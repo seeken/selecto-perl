@@ -78,6 +78,7 @@ my $domain = Selecto::Domain->parse({
     writes => {
         operations => {
             insert => {enabled => JSON::PP::true},
+            upsert => {enabled => JSON::PP::true},
             update => {enabled => JSON::PP::true, bulk => JSON::PP::true},
             delete => {enabled => JSON::PP::true},
         },
@@ -141,6 +142,16 @@ like $adapter->{last_write}{sql}, qr/"tenant_id" = \$3/,
     'API writes retain the trusted domain scope';
 is_deeply $adapter->{last_write}{params}, ['closed', 7, 41],
     'API write values and scope remain bound parameters';
+
+my $scope_error = eval {
+    $handler->write($engine, {
+        operation => 'upsert', assignments => {name => 'candidate'},
+        conflict_target => ['name'], upsert_update_fields => ['name'],
+    });
+    undef;
+} // $@;
+is $scope_error->code, 'query_enforcement_unsupported_operation',
+    'scoped upsert cannot mutate an unchecked conflicting row';
 
 my $write_error = eval {
     $handler->write($engine, {
