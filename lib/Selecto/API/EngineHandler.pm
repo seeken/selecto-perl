@@ -14,6 +14,7 @@ use Selecto::DateFormat ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
 use Selecto::QueryLibrary ();
+use Selecto::Write ();
 
 has max_fields        => 100;
 has max_filters       => 20;
@@ -22,12 +23,13 @@ has max_orders        => 10;
 has max_segments      => 20;
 has max_limit         => 1000;
 has default_limit     => 100;
+has max_write_count   => 1000;
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
     for my $name (qw(
         max_fields max_filters max_filter_values max_orders max_segments
-        max_limit default_limit
+        max_limit default_limit max_write_count
     )) {
         my $value = $self->$name;
         Selecto::Error->throw(
@@ -38,7 +40,121 @@ sub new ($class, @args) {
     Selecto::Error->throw(
         'invalid_api_handler', 'default_limit cannot exceed max_limit',
     ) if $self->default_limit > $self->max_limit;
+    Selecto::Error->throw(
+        'invalid_api_handler', 'max_write_count must be positive',
+    ) if $self->max_write_count < 1;
     return $self;
+}
+
+sub write ($self, $engine, $body) {
+    Selecto::Error->throw(
+        'invalid_api_host', 'API write handler requires a Selecto engine',
+    ) unless blessed($engine) && $engine->isa('Selecto::Engine');
+    _write_object($body, 'write body');
+    _write_reject_unknown($body, [qw(
+        operation assignments filters expected_count returning
+        conflict_target upsert_update_fields
+    )], 'write body');
+
+    my $operation = lc _write_required_string($body->{operation}, 'write operation');
+    Selecto::Error->throw(
+        'invalid_api_write', 'write operation must be insert, update, upsert, or delete',
+        {operation => $operation},
+    ) unless $operation =~ /\A(?:insert|update|upsert|delete)\z/;
+
+    my $domain = $engine->domain;
+    my $writes = $domain->writes;
+    my $operation_spec = ref($writes->{operations}) eq 'HASH'
+        ? $writes->{operations}{$operation} : undef;
+    Selecto::Error->throw(
+        'write_operation_not_enabled',
+        "operation $operation is not published by the API write contract",
+    ) unless ref($operation_spec) eq 'HASH' && $operation_spec->{enabled};
+
+    my $assignments = $body->{assignments} // {};
+    _write_object($assignments, 'assignments');
+    Selecto::Error->throw(
+        'invalid_api_write', "$operation requires at least one assignment",
+    ) if $operation ne 'delete' && !keys %$assignments;
+    Selecto::Error->throw(
+        'invalid_api_write', 'delete does not accept assignments',
+    ) if $operation eq 'delete' && keys %$assignments;
+    my %normalized_assignments = map {
+        my $field = "$_";
+        Selecto::Error->throw(
+            'invalid_api_write', 'write assignments must use root domain fields',
+            {field => $field},
+        ) if $field =~ /\./;
+        _public_field_definition($domain, $field);
+        ($field => _write_value($assignments->{$field}, "assignment $field"));
+    } keys %$assignments;
+
+    my @filters = $self->_write_filters($domain, $body->{filters} // []);
+    if ($operation eq 'update' || $operation eq 'delete') {
+        Selecto::Error->throw(
+            'invalid_api_write', "$operation requires at least one explicit filter",
+        ) unless @filters;
+    } elsif (@filters) {
+        Selecto::Error->throw(
+            'invalid_api_write', "$operation does not accept filters",
+        );
+    }
+    my $predicate = @filters == 1 ? $filters[0]
+        : @filters ? Selecto::Expression->all(\@filters) : undef;
+
+    my $expected_count = exists($body->{expected_count})
+        ? _write_bounded_integer(
+            $body->{expected_count}, 'expected_count', 1, $self->max_write_count,
+        ) : 1;
+    Selecto::Error->throw(
+        'invalid_api_write', 'this write operation does not permit bulk changes',
+        {expected_count => $expected_count},
+    ) if $expected_count > 1 && !$operation_spec->{bulk};
+    Selecto::Error->throw(
+        'invalid_api_write', 'insert and upsert expect exactly one affected row',
+    ) if ($operation eq 'insert' || $operation eq 'upsert') && $expected_count != 1;
+
+    my %metadata;
+    for my $key (qw(returning conflict_target upsert_update_fields)) {
+        next unless exists $body->{$key};
+        my @fields = _write_string_array(
+            $body->{$key}, $key, $self->max_fields,
+            $key eq 'returning' ? 0 : 1,
+        );
+        for my $field (@fields) {
+            Selecto::Error->throw(
+                'invalid_api_write', "$key must use root domain fields",
+                {field => $field},
+            ) if $field =~ /\./;
+            _public_field_definition($domain, $field);
+        }
+        $metadata{$key} = \@fields;
+    }
+    if ($operation eq 'upsert') {
+        Selecto::Error->throw(
+            'invalid_api_write', 'upsert requires conflict_target and upsert_update_fields',
+        ) unless @{$metadata{conflict_target} // []}
+            && @{$metadata{upsert_update_fields} // []};
+    } elsif (exists($metadata{conflict_target}) || exists($metadata{upsert_update_fields})) {
+        Selecto::Error->throw(
+            'invalid_api_write',
+            'conflict_target and upsert_update_fields are only valid for upsert',
+        );
+    }
+
+    my $scope = $domain->required_predicate;
+    Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
+        if defined($domain->tenant_field) && !defined($scope);
+    my $command = Selecto::Write::Command->new(
+        operation => $operation,
+        relation => $domain->table,
+        assignments => \%normalized_assignments,
+        predicate => $predicate,
+        scope_predicate => $scope,
+        expected_count => $expected_count,
+        metadata => \%metadata,
+    );
+    return $engine->execute_write($command)->to_hash;
 }
 
 sub query ($self, $engine, $body) {
@@ -317,7 +433,144 @@ sub describe_openapi ($self, $api) {
             },
         },
     };
+    my $write_path = $api->base_path . '/write';
+    $openapi->{paths}{$write_path}{post}{summary} = 'Run a governed domain write';
+    $openapi->{paths}{$write_path}{post}{requestBody} = {
+        required => JSON::PP::true,
+        content => {'application/json' => {
+            schema => {'$ref' => '#/components/schemas/SelectoWrite'},
+        }},
+    };
+    $openapi->{components}{schemas}{SelectoWrite} = {
+        type => 'object', additionalProperties => JSON::PP::false,
+        required => ['operation'],
+        properties => {
+            operation => {type => 'string', enum => [qw(insert update upsert delete)]},
+            assignments => {
+                type => 'object',
+                description => 'Root fields and values permitted by writes.fields.',
+            },
+            filters => {
+                type => 'array', maxItems => $self->max_filters,
+                items => {'$ref' => '#/components/schemas/SelectoWriteFilter'},
+            },
+            expected_count => {
+                type => 'integer', minimum => 1, maximum => $self->max_write_count,
+                default => 1,
+            },
+            returning => {type => 'array', items => {type => 'string'}},
+            conflict_target => {type => 'array', minItems => 1, items => {type => 'string'}},
+            upsert_update_fields => {type => 'array', minItems => 1, items => {type => 'string'}},
+        },
+    };
+    $openapi->{components}{schemas}{SelectoWriteFilter} = {
+        type => 'object', additionalProperties => JSON::PP::false,
+        required => [qw(field op)],
+        properties => {
+            field => {type => 'string'},
+            op => {type => 'string', enum => [qw(eq ne gt gte lt lte in is_null not_null)]},
+            value => {},
+        },
+    };
     return $api;
+}
+
+sub _write_filters ($self, $domain, $filters) {
+    Selecto::Error->throw('invalid_api_write', 'filters must be an array')
+        unless ref($filters) eq 'ARRAY';
+    Selecto::Error->throw('invalid_api_write', 'Too many filters')
+        if @$filters > $self->max_filters;
+    my @expressions;
+    for my $filter (@$filters) {
+        _write_object($filter, 'write filter');
+        _write_reject_unknown($filter, [qw(field op value)], 'write filter');
+        my $field = _write_required_string($filter->{field}, 'write filter field');
+        Selecto::Error->throw(
+            'invalid_api_write', 'write filters must use root domain fields',
+            {field => $field},
+        ) if $field =~ /\./;
+        _public_field_definition($domain, $field);
+        my $operator = lc _write_required_string($filter->{op}, 'write filter operator');
+        my $operand = Selecto::Expression->field($field);
+        if ($operator eq 'is_null' || $operator eq 'not_null') {
+            push @expressions, Selecto::Expression->can($operator)->(
+                'Selecto::Expression', $operand,
+            );
+            next;
+        }
+        if ($operator eq 'in') {
+            my $values = $filter->{value};
+            Selecto::Error->throw(
+                'invalid_api_write', 'in filter value must be a non-empty array',
+            ) unless ref($values) eq 'ARRAY' && @$values;
+            Selecto::Error->throw('invalid_api_write', 'Too many in filter values')
+                if @$values > $self->max_filter_values;
+            push @expressions, Selecto::Expression->in(
+                $operand,
+                [map { _write_value($_, 'in filter value') } @$values],
+            );
+            next;
+        }
+        Selecto::Error->throw(
+            'invalid_api_write', "Unsupported write filter operator $operator",
+        ) unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/;
+        push @expressions, Selecto::Expression->can($operator)->(
+            'Selecto::Expression', $operand,
+            _write_value($filter->{value}, 'write filter value'),
+        );
+    }
+    return @expressions;
+}
+
+sub _write_value ($value, $label) {
+    return $value ? 1 : 0 if blessed($value) && JSON::PP::is_bool($value);
+    Selecto::Error->throw('invalid_api_write', "$label must be a JSON scalar")
+        if ref($value);
+    return $value;
+}
+
+sub _write_object ($value, $label) {
+    Selecto::Error->throw('invalid_api_write', "$label must be an object")
+        unless ref($value) eq 'HASH';
+    return $value;
+}
+
+sub _write_reject_unknown ($value, $allowed, $label) {
+    my %allowed = map { $_ => 1 } @$allowed;
+    my @unknown = sort grep { !$allowed{$_} } keys %$value;
+    Selecto::Error->throw(
+        'invalid_api_write', "$label contains unsupported properties",
+        {properties => \@unknown},
+    ) if @unknown;
+}
+
+sub _write_required_string ($value, $label) {
+    Selecto::Error->throw('invalid_api_write', "$label must be a non-empty string")
+        if !defined($value) || ref($value) || "$value" eq '';
+    return "$value";
+}
+
+sub _write_string_array ($value, $label, $maximum, $required = 0) {
+    Selecto::Error->throw('invalid_api_write', "$label must be an array")
+        unless ref($value) eq 'ARRAY';
+    Selecto::Error->throw('invalid_api_write', "$label must not be empty")
+        if $required && !@$value;
+    Selecto::Error->throw('invalid_api_write', "Too many $label entries")
+        if @$value > $maximum;
+    my %seen;
+    return grep { !$seen{$_}++ }
+        map { _write_required_string($_, "$label entry") } @$value;
+}
+
+sub _write_bounded_integer ($value, $label, $minimum, $maximum) {
+    Selecto::Error->throw('invalid_api_write', "$label must be an integer")
+        unless defined($value) && !ref($value) && "$value" =~ /\A\d+\z/;
+    my $integer = int($value);
+    Selecto::Error->throw('invalid_api_write', "$label is below its minimum")
+        if $integer < $minimum;
+    Selecto::Error->throw('invalid_api_write', "$label exceeds its maximum")
+        if defined($maximum) && $integer > $maximum;
+    return $integer;
 }
 
 sub _filters ($self, $domain, $filters) {
