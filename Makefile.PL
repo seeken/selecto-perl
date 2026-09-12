@@ -14,6 +14,7 @@ WriteMakefile(
     PREREQ_PM        => {
         'DBI'         => '1.643',
         'DateTime::TimeZone' => 0,
+        'DateTime' => 0,
         'Digest::SHA' => 0,
         'JSON::PP'    => '4.06',
         'Mojolicious' => '9.40',

@@ -143,6 +143,8 @@ sub write ($self, $engine, $body) {
     }
 
     my $scope = $domain->required_predicate;
+    Selecto::Error->throw('query_enforcement_unsupported_operation', 'query-scoped API upsert is not supported')
+        if $operation eq 'upsert' && defined($scope);
     Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
         if defined($domain->tenant_field) && !defined($scope);
     my $command = Selecto::Write::Command->new(
