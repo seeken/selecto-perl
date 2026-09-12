@@ -47,8 +47,8 @@ centrally certified for the 2.8 governed co-domain/computed-eligibility profile.
   preconditions and fail-closed preview/execute capability decisions;
 - governed co-domain lookup and boolean-root action selection eligibility with
   fail-closed declaration validation;
-- an HTTP-neutral canonical domain API host and governed-engine query handler
-  with OpenAPI 3.1 and byte-stable UTF-8 JSON response bodies;
+- an HTTP-neutral canonical domain API host and governed-engine query/write
+  handler with OpenAPI 3.1 and byte-stable UTF-8 JSON response bodies;
 - an initial HTTP-neutral `Selecto::Files` record-and-role facade with hidden
   tenant/storage authority, memory and managed-local publication, bounded
   filehandle streaming, idempotency, holds, and purge;
@@ -167,6 +167,26 @@ my $result = $handler->query($engine, {
 tenant, or modify the domain. It validates every field and query-library name
 against the supplied engine's governed domain, so internal fields and
 host-pruned definitions remain unavailable.
+
+The same handler accepts the canonical governed-write body. The domain must
+explicitly enable the operation and field permissions under `writes`.
+Update/delete requests always require caller filters in addition to the
+engine's trusted required predicate, and `expected_count` is enforced by the
+adapter transaction:
+
+```perl
+my $result = $handler->write($engine, {
+    operation => 'update',
+    assignments => {status => 'closed'},
+    filters => [{field => 'id', op => 'eq', value => 17}],
+    expected_count => 1,
+    returning => ['id', 'status'],
+});
+```
+
+Only public root fields can be assigned, filtered, or returned. Upserts also
+require explicit `conflict_target` and `upsert_update_fields` arrays. A count
+greater than one is accepted only when that operation publishes `bulk`.
 
 An API caller explicitly requests a subtable by grouping fields from one direct
 to-many association in a nested selection array. This preserves one row per

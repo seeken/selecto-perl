@@ -9,6 +9,7 @@ use Selecto::API::EngineHandler ();
 use Selecto::Domain ();
 use Selecto::Engine ();
 use Selecto::Expression ();
+use Selecto::Write ();
 
 {
     package TestAPIEngineHandler::Adapter;
@@ -25,6 +26,15 @@ use Selecto::Expression ();
                         : "value:$_"
             } @{$statement->columns}]],
         };
+    }
+
+    sub execute_write ($self, $command) {
+        $self->{last_write} = $self->preview_write($command);
+        return Selecto::Write::Result->new(
+            operation => $command->operation,
+            affected_rows => $command->expected_count,
+            values => {id => 7},
+        );
     }
 }
 
@@ -65,6 +75,18 @@ my $domain = Selecto::Domain->parse({
         },
     },
     joins => {lines => {type => 'left'}},
+    writes => {
+        operations => {
+            insert => {enabled => JSON::PP::true},
+            update => {enabled => JSON::PP::true, bulk => JSON::PP::true},
+            delete => {enabled => JSON::PP::true},
+        },
+        fields => {
+            name => {insertable => JSON::PP::true, updatable => JSON::PP::true},
+            status => {insertable => JSON::PP::true, updatable => JSON::PP::true},
+            tenant_id => {insertable => JSON::PP::true},
+        },
+    },
     query_library => {
         segments => {
             active => {filters => [['eq', 'status', 'A']]},
@@ -100,6 +122,55 @@ my $handler = Selecto::API::EngineHandler->new(
     max_limit => 50,
     default_limit => 12,
 );
+
+my $write_result = $handler->write($engine, {
+    operation => 'update',
+    assignments => {status => 'closed'},
+    filters => [{field => 'id', op => 'eq', value => 7}],
+    expected_count => 1,
+    returning => ['id'],
+});
+is_deeply $write_result, {
+    operation => 'update', affected_rows => 1, values => {id => 7},
+}, 'API writes return the canonical write result';
+like $adapter->{last_write}{sql}, qr/UPDATE "records" SET "status" = \$1/,
+    'API assignments compile through the governed write engine';
+like $adapter->{last_write}{sql}, qr/"id" = \$2/,
+    'API write filters are compiled as bound root-field predicates';
+like $adapter->{last_write}{sql}, qr/"tenant_id" = \$3/,
+    'API writes retain the trusted domain scope';
+is_deeply $adapter->{last_write}{params}, ['closed', 7, 41],
+    'API write values and scope remain bound parameters';
+
+my $write_error = eval {
+    $handler->write($engine, {
+        operation => 'update', assignments => {status => 'closed'},
+    });
+    undef;
+} // $@;
+is $write_error->code, 'invalid_api_write',
+    'update API writes require an explicit caller filter';
+
+$write_error = eval {
+    $handler->write($engine, {
+        operation => 'delete',
+        filters => [{field => 'id', op => 'eq', value => 7}],
+        expected_count => 2,
+    });
+    undef;
+} // $@;
+is $write_error->code, 'invalid_api_write',
+    'non-bulk write operations cannot opt into a larger cardinality';
+
+$write_error = eval {
+    $handler->write($engine, {
+        operation => 'update', assignments => {name => 'unsafe'},
+        filters => [{field => 'lines.sku', op => 'eq', value => 'ABC'}],
+    });
+    undef;
+} // $@;
+is $write_error->code, 'invalid_api_write',
+    'API write predicates cannot cross relationships';
 
 my $result = $handler->query($engine, {
     select => [qw(id name)],
@@ -342,6 +413,12 @@ $error = eval {
 } // $@;
 is $error->code, 'invalid_api_handler',
     'an inconsistent handler limit configuration is rejected';
+$error = eval {
+    Selecto::API::EngineHandler->new(max_write_count => 0);
+    undef;
+} // $@;
+is $error->code, 'invalid_api_handler',
+    'write cardinality configuration must allow at least one row';
 
 my $api = Selecto::API->new(domain => $domain, base_path => '/api/v1/records');
 is $handler->describe_openapi($api), $api,
@@ -389,6 +466,15 @@ ok grep($_ eq 'date_shortcut', @{$filter_schema->{properties}{op}{enum}}),
     'OpenAPI advertises semantic date-shortcut filters';
 is $filter_schema->{'x-selecto-date-shortcuts'}[3]{id}, 'this_week',
     'OpenAPI publishes the shared date-shortcut catalog';
+my $write_schema = $api->openapi_document->{components}{schemas}{SelectoWrite};
+is_deeply $write_schema->{properties}{operation}{enum}, [qw(insert update upsert delete)],
+    'OpenAPI publishes the portable governed write operations';
+is $write_schema->{properties}{expected_count}{maximum}, 1000,
+    'OpenAPI publishes the bounded write cardinality';
+is_deeply $api->openapi_document->{paths}{'/api/v1/records/write'}{post}{requestBody}
+    {content}{'application/json'}{schema},
+    {'$ref' => '#/components/schemas/SelectoWrite'},
+    'OpenAPI binds the write endpoint to the governed write request schema';
 ok !exists($api->openapi_document->{security}),
     'generic OpenAPI decoration does not invent host authentication';
 
