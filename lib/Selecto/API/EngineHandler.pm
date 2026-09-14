@@ -82,7 +82,8 @@ sub write_command ($self, $engine, $body) {
         my $field_specs = ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : {};
         my @missing = sort grep {
             my $spec = $field_specs->{$_};
-            ref($spec) eq 'HASH' && $spec->{required} && !exists($assignments->{$_})
+            ref($spec) eq 'HASH' && $spec->{required}
+                && _required_write_value_missing($assignments, $_)
         } keys %$field_specs;
         Selecto::Error->throw(
             'missing_required_write_fields',
@@ -579,6 +580,14 @@ sub _write_value ($value, $label) {
     Selecto::Error->throw('invalid_api_write', "$label must be a JSON scalar")
         if ref($value);
     return $value;
+}
+
+sub _required_write_value_missing ($assignments, $field) {
+    return 1 unless exists $assignments->{$field};
+    my $value = $assignments->{$field};
+    return 1 unless defined $value;
+    return 1 if !ref($value) && "$value" =~ /\A\s*\z/;
+    return 0;
 }
 
 sub _write_assignment_value ($value, $field, $definition) {
