@@ -249,7 +249,7 @@ sub _validate_command_against_contract {
         my @missing = sort grep {
             my $spec = $fields_spec->{$_};
             ref($spec) eq 'HASH' && $spec->{required}
-                && !exists($command->assignments->{$_})
+                && _required_write_value_missing($command->assignments, $_)
         } keys %$fields_spec;
         Selecto::Error->throw(
             'missing_required_write_fields',
@@ -310,6 +310,15 @@ sub _validate_command_against_contract {
         }
     }
     return $self;
+}
+
+sub _required_write_value_missing {
+    my ($assignments, $field) = @_;
+    return 1 unless exists $assignments->{$field};
+    my $value = $assignments->{$field};
+    return 1 unless defined $value;
+    return 1 if !ref($value) && "$value" =~ /\A\s*\z/;
+    return 0;
 }
 
 sub _mutation_reference_fields {

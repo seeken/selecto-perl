@@ -181,6 +181,17 @@ is $required_error->code, 'missing_required_write_fields',
 is_deeply $required_error->details->{missing_fields}, ['name'],
     'empty-insert errors retain the omitted field list';
 
+$required_error = eval {
+    $handler->write($engine, {
+        operation => 'insert', assignments => {name => "  \t"},
+    });
+    undef;
+} // $@;
+is $required_error->code, 'missing_required_write_fields',
+    'blank required insert strings are treated as missing';
+is_deeply $required_error->details->{missing_fields}, ['name'],
+    'blank required fields are identified in machine-readable details';
+
 my $engine_required_error = eval {
     $engine->preview_write(Selecto::Write::Command->new(
         operation => 'insert', relation => 'records', assignments => {status => 'direct'},
@@ -189,6 +200,15 @@ my $engine_required_error = eval {
 } // $@;
 is $engine_required_error->code, 'missing_required_write_fields',
     'the engine enforces required fields outside the HTTP handler too';
+
+$engine_required_error = eval {
+    $engine->preview_write(Selecto::Write::Command->new(
+        operation => 'insert', relation => 'records', assignments => {name => '   '},
+    ));
+    undef;
+} // $@;
+is $engine_required_error->code, 'missing_required_write_fields',
+    'the engine also rejects blank required strings outside the HTTP handler';
 
 my $date_error = eval {
     $handler->write_command($engine, {
