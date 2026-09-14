@@ -47,6 +47,26 @@ isnt $execution_error->code, 'write_returning_missing',
 is_deeply $failed_write_dbh->events, ['BEGIN', 'ROLLBACK'],
     'a false DBI execute result rolls back the managed transaction';
 
+my $constraint_error = $failed_write_adapter->normalize_error(
+    qq{DBD::Pg::st execute failed: ERROR: null value in column "lic_no" of relation "truck" violates not-null constraint},
+);
+is $constraint_error->code, 'database_not_null_violation',
+    'PostgreSQL not-null failures retain a specific public error code';
+is $constraint_error->message, 'Required field lic_no was not provided.',
+    'PostgreSQL not-null failures identify the omitted field';
+is_deeply $constraint_error->details, {
+    constraint => 'not_null', field => 'lic_no', relation => 'truck',
+}, 'constraint errors expose safe machine-readable context without row values';
+
+my $unique_error = $failed_write_adapter->normalize_error(
+    qq{ERROR: duplicate key value violates unique constraint "items_code_key"\nDETAIL: Key (tenant_id, code)=(41, secret) already exists.},
+);
+is $unique_error->code, 'database_unique_violation',
+    'PostgreSQL unique failures retain a specific public error code';
+is_deeply $unique_error->details, {
+    constraint => 'unique', fields => [qw(tenant_id code)],
+}, 'unique errors expose field names but never conflicting values';
+
 my $external_dbh = TestSelecto::DBH->new({ affected => 1 });
 $external_dbh->{AutoCommit} = 0;
 my $external = Selecto::PostgreSQL->new(dbh => $external_dbh, transaction_mode => 'external');

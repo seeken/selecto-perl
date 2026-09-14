@@ -23,6 +23,52 @@ sub normalize_type {
     return { int4 => 'integer', numeric => 'decimal', timestamptz => 'utc_datetime' }->{"$name"} // 'unknown';
 }
 
+sub normalize_error {
+    my ($self, $error) = @_;
+    return $error if blessed($error) && $error->isa('Selecto::Error');
+
+    my $text = eval { "$error" } // '';
+    my $state = eval { $self->dbh->state } // '';
+    if ($state eq '23502' || $text =~ /null value in column "[^"]+"[^\n]*violates not-null constraint/i) {
+        my ($field) = $text =~ /null value in column "([A-Za-z_][A-Za-z0-9_]*)"/i;
+        my ($relation) = $text =~ /relation "([A-Za-z_][A-Za-z0-9_]*)"/i;
+        my %details = (constraint => 'not_null');
+        $details{field} = $field if defined $field;
+        $details{relation} = $relation if defined $relation;
+        return Selecto::Error->new(
+            code => 'database_not_null_violation',
+            message => defined($field)
+                ? "Required field $field was not provided."
+                : 'A required database field was not provided.',
+            details => \%details,
+        );
+    }
+    if ($state eq '23505' || $text =~ /duplicate key value violates unique constraint/i) {
+        my ($field_list) = $text =~ /Key \(([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\)=/i;
+        my @fields = defined($field_list) ? split(/\s*,\s*/, $field_list) : ();
+        return Selecto::Error->new(
+            code => 'database_unique_violation',
+            message => 'A value conflicts with an existing record.',
+            details => {constraint => 'unique', @fields ? (fields => \@fields) : ()},
+        );
+    }
+    if ($state eq '23503' || $text =~ /violates foreign key constraint/i) {
+        return Selecto::Error->new(
+            code => 'database_foreign_key_violation',
+            message => 'A referenced record does not exist or is not available.',
+            details => {constraint => 'foreign_key'},
+        );
+    }
+    if ($state eq '23514' || $text =~ /violates check constraint/i) {
+        return Selecto::Error->new(
+            code => 'database_check_violation',
+            message => 'A database validation constraint was not satisfied.',
+            details => {constraint => 'check'},
+        );
+    }
+    return $self->SUPER::normalize_error($error);
+}
+
 sub supports {
     my ($self, $feature) = @_;
     return "$feature" eq 'transactions' || "$feature" eq 'returning'
