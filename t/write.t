@@ -103,4 +103,24 @@ is_deeply $guard_error->details, {
     field => 'tenant_id', missing_fields => ['tenant_id'],
 }, 'the query-guard error includes a machine-readable missing field';
 
+for my $expected (2, 1) {
+    my $returning_dbh = TestSelecto::DBH->new({ affected => 0, rows => [[7], [8]] });
+    my $returning_adapter = Selecto::PostgreSQL->new(dbh => $returning_dbh);
+    my $returning_command = Selecto::Write::Command->new(
+        operation => 'update', relation => 'items', assignments => { name => 'after' },
+        predicate => Selecto::Expression->gt('id', 0), expected_count => $expected,
+        metadata => { returning => ['id'] },
+    );
+    my $returned = eval { $returning_adapter->execute_write($returning_command) };
+    if ($expected == 2) {
+        is_deeply($returned->to_hash, {operation => 'update', affected_rows => 2, values => {id => 7}},
+            'returning counts all returned rows rather than a provisional driver count');
+        is_deeply($returning_dbh->events, ['BEGIN', 'COMMIT'], 'exhausted returning write commits');
+    } else {
+        is($@->code, 'cardinality_mismatch', 'returning detects a multi-row cardinality mismatch');
+        is_deeply($returning_dbh->events, ['BEGIN', 'ROLLBACK'], 'returning mismatch rolls back');
+    }
+    is($returning_dbh->prepared->[0]{index}, 2, 'entire returning result is consumed');
+}
+
 done_testing;

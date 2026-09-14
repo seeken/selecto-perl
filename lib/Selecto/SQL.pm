@@ -1371,13 +1371,20 @@ sub _execute_compiled_write_in_transaction {
         die _dbi_error($self->{dbh}, 'database prepare failed') unless $sth;
         my $executed = $self->_execute_statement($sth, $compiled->{params});
         die _dbi_error($sth, 'database write failed') unless defined $executed;
-        $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
         if (@{$compiled->{returning} // []}) {
             my @row = $sth->fetchrow_array;
             die _dbi_error($sth, 'database returning fetch failed')
                 if !@row && eval { $sth->err };
             Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
             @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row);
+            # RETURNING emits one row per affected row. Some DBI drivers report
+            # provisional counts until the result is exhausted. Drain before
+             # checking cardinality or committing, retaining only the first row.
+             my $returned = 1;
+             while (my @remaining = $sth->fetchrow_array) { ++$returned; }
+             $affected = $self->_logical_affected_rows($command->operation, $returned);
+         } else {
+             $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
         }
         1;
     };

@@ -46,6 +46,22 @@ like($preview->{sql}, qr/target\.\[external_id\] = source\.\[external_id\]/, 'ME
 is_deeply($preview->{params}, ['one', 1, 'updated'], 'MERGE parameters follow deterministic field order');
 is($adapter->_logical_affected_rows('upsert', 1), 1, 'SQL Server normalizes logical upsert rows');
 
+for my $returning ([], ['id']) {
+    my $request = Selecto::Write::Command->new(
+        operation => 'upsert', relation => 'items',
+        assignments => { id => 1, name => 'updated' },
+        metadata => { conflict_target => ['id'], upsert_update_fields => ['name'],
+            returning => $returning },
+    );
+    my $compiled = eval { $adapter->preview_write($request) };
+    if (@$returning) {
+        ok(!$compiled, 'MERGE does not silently discard requested returning fields');
+        is($@->code, 'write_capability_missing', 'MERGE returning fails before execution');
+    } else {
+        ok($compiled, 'MERGE accepts an empty returning list');
+    }
+}
+
 is($adapter->_decode('1234567890123456789012345678.90', DBI::SQL_NUMERIC()), '1234567890123456789012345678.9', 'SQL Server preserves an exact high-precision decimal string');
 is($adapter->_decode('2024-02-01 09:15:00.0000000', DBI::SQL_TYPE_TIMESTAMP()), '2024-02-01T09:15:00', 'SQL Server normalizes datetime2 values');
 
