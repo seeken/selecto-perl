@@ -91,7 +91,7 @@ sub evaluate {
     my $arguments = $expression->arguments;
     if ($kind =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/) {
         my ($field, $expected) = _field_literal($expression);
-        _not_evaluable() unless exists $candidate->{$field};
+        _not_evaluable($field) unless exists $candidate->{$field};
         my $actual = $candidate->{$field};
         return 'unknown' unless defined($actual) && defined($expected);
         my $comparison = _compare($actual, $expected);
@@ -103,13 +103,13 @@ sub evaluate {
     }
     if ($kind eq 'is_null' || $kind eq 'not_null') {
         my $field = _root_field($arguments->[0]);
-        _not_evaluable() unless exists $candidate->{$field};
+        _not_evaluable($field) unless exists $candidate->{$field};
         my $value = defined($candidate->{$field}) ? 'false' : 'true';
         return $kind eq 'not_null' ? _negate($value) : $value;
     }
     if ($kind eq 'in') {
         my $field = _root_field($arguments->[0]);
-        _not_evaluable() unless exists $candidate->{$field};
+        _not_evaluable($field) unless exists $candidate->{$field};
         my $actual = $candidate->{$field};
         return 'unknown' unless defined $actual;
         my $unknown = 0;
@@ -217,7 +217,14 @@ sub _unsupported {
 }
 
 sub _not_evaluable {
-    Selecto::Error->throw('query_rule_not_evaluable', 'query rule cannot be evaluated against insert candidate');
+    my ($field) = @_;
+    Selecto::Error->throw(
+        'query_rule_not_evaluable',
+        defined($field)
+            ? "query rule requires insert field $field"
+            : 'query rule cannot be evaluated against insert candidate',
+        defined($field) ? {field => $field, missing_fields => [$field]} : {},
+    );
 }
 
 1;

@@ -47,6 +47,11 @@ sub new ($class, @args) {
 }
 
 sub write ($self, $engine, $body) {
+    my $command = $self->write_command($engine, $body);
+    return $engine->execute_write($command)->to_hash;
+}
+
+sub write_command ($self, $engine, $body) {
     Selecto::Error->throw(
         'invalid_api_host', 'API write handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
@@ -73,6 +78,18 @@ sub write ($self, $engine, $body) {
 
     my $assignments = $body->{assignments} // {};
     _write_object($assignments, 'assignments');
+    if ($operation eq 'insert' || $operation eq 'upsert') {
+        my $field_specs = ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : {};
+        my @missing = sort grep {
+            my $spec = $field_specs->{$_};
+            ref($spec) eq 'HASH' && $spec->{required} && !exists($assignments->{$_})
+        } keys %$field_specs;
+        Selecto::Error->throw(
+            'missing_required_write_fields',
+            "$operation is missing required fields: " . join(', ', @missing),
+            {operation => $operation, fields => \@missing, missing_fields => \@missing},
+        ) if @missing;
+    }
     Selecto::Error->throw(
         'invalid_api_write', "$operation requires at least one assignment",
     ) if $operation ne 'delete' && !keys %$assignments;
@@ -85,8 +102,10 @@ sub write ($self, $engine, $body) {
             'invalid_api_write', 'write assignments must use root domain fields',
             {field => $field},
         ) if $field =~ /\./;
-        _public_field_definition($domain, $field);
-        ($field => _write_value($assignments->{$field}, "assignment $field"));
+        my $definition = _public_field_definition($domain, $field);
+        ($field => _write_assignment_value(
+            $assignments->{$field}, $field, $definition,
+        ));
     } keys %$assignments;
 
     my @filters = $self->_write_filters($domain, $body->{filters} // []);
@@ -156,7 +175,7 @@ sub write ($self, $engine, $body) {
         expected_count => $expected_count,
         metadata => \%metadata,
     );
-    return $engine->execute_write($command)->to_hash;
+    return $command;
 }
 
 sub query ($self, $engine, $body) {
@@ -529,6 +548,25 @@ sub _write_value ($value, $label) {
     Selecto::Error->throw('invalid_api_write', "$label must be a JSON scalar")
         if ref($value);
     return $value;
+}
+
+sub _write_assignment_value ($value, $field, $definition) {
+    my $normalized = _write_value($value, "assignment $field");
+    return $normalized unless defined $normalized;
+    my $type = lc($definition->{type} // 'string');
+    if ($type eq 'date') {
+        my ($year, $month, $day) = "$normalized" =~ /\A(\d{4})-(\d{2})-(\d{2})\z/;
+        my @days = (0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31);
+        $days[2] = 29 if defined($year)
+            && ($year % 400 == 0 || ($year % 4 == 0 && $year % 100 != 0));
+        Selecto::Error->throw(
+            'invalid_api_write',
+            "assignment $field must be an ISO date (YYYY-MM-DD) or null",
+            {field => $field, type => $type, expected => 'YYYY-MM-DD or null'},
+        ) unless defined($year) && $month >= 1 && $month <= 12
+            && $day >= 1 && $day <= $days[$month];
+    }
+    return $normalized;
 }
 
 sub _write_object ($value, $label) {

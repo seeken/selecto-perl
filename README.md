@@ -184,6 +184,21 @@ my $result = $handler->write($engine, {
 });
 ```
 
+Hosts that need to compose an application-specific transaction can call
+`write_command($engine, $body)` to normalize the same API payload without
+executing it. The returned `Selecto::Write::Command` must still be executed
+through a governed engine; preparing it does not bypass the engine's operation,
+field, scope, or cardinality checks.
+
+Write fields may declare `required => 1`. The engine enforces these fields for
+`insert` and `upsert` operations and reports all omissions as
+`missing_required_write_fields`, with `fields` and `missing_fields` arrays in
+the error details. If an undeclared requirement instead comes from an enforced
+query scope, `query_rule_not_evaluable` identifies the missing insert field.
+Date assignments are validated before execution and must use `YYYY-MM-DD` or
+JSON `null`; database execution failures cannot be misreported as missing
+`RETURNING` rows.
+
 Only public root fields can be assigned, filtered, or returned. Upserts also
 require explicit `conflict_target` and `upsert_update_fields` arrays. A count
 greater than one is accepted only when that operation publishes `bulk`.
