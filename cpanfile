@@ -4,6 +4,7 @@ requires 'DateTime::TimeZone';
 requires 'DateTime';
 requires 'JSON::PP', '4.06';
 requires 'Mojolicious', '9.40';
+requires 'Text::CSV', '2.04';
 recommends 'DBD::Pg', '3.016';
 recommends 'DBD::MariaDB', '1.24';
 recommends 'DBD::ODBC', '1.61';
