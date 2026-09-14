@@ -47,4 +47,19 @@ my $unsupported = Selecto::Engine->new(
 eval { $unsupported->stream($unsupported->query->select('id')) };
 is($@->code, 'unsupported_feature', 'adapters without streaming fail before execution');
 
+{
+    package TestSelecto::DecodeFailureSTH;
+    sub fetchrow_array { return 'sensitive raw value'; }
+    sub finish { $_[0]->{finished}++; return 1; }
+}
+my $failing_sth = bless {}, 'TestSelecto::DecodeFailureSTH';
+my $failing_stream = Selecto::Stream->new(sth=>$failing_sth, columns=>['value'], types=>['text'],
+    decode=>sub { die 'sensitive decode diagnostic'; },
+    normalize_error=>sub { $adapter->normalize_error($_[0]) });
+eval { $failing_stream->next };
+is $@->code, 'query_error', 'decode failures cross the normalized stream error boundary';
+unlike "$@", qr/sensitive/, 'decode failures do not expose values or driver diagnostics';
+ok $failing_stream->closed, 'decode failure closes the stream';
+is $failing_sth->{finished}, 1, 'decode failure releases the statement exactly once';
+
 done_testing;

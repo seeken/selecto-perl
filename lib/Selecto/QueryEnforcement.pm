@@ -6,6 +6,7 @@ use warnings;
 use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 use Scalar::Util qw(blessed looks_like_number);
+use Math::BigInt ();
 use Selecto::Error ();
 use Selecto::Expression ();
 
@@ -112,12 +113,12 @@ sub evaluate {
         _not_evaluable($field) unless exists $candidate->{$field};
         my $actual = $candidate->{$field};
         return 'unknown' unless defined $actual;
-        my $unknown = 0;
+        my ($unknown, $matched) = (0, 0);
         for my $expected (@{$arguments->[1]}) {
             if (!defined $expected) { $unknown = 1; next; }
-            return 'true' if _compare($actual, $expected) == 0;
+            $matched = 1 if _compare($actual, $expected) == 0;
         }
-        return $unknown ? 'unknown' : 'false';
+        return $matched ? 'true' : $unknown ? 'unknown' : 'false';
     }
     if ($kind eq 'and' || $kind eq 'or') {
         my @values = map { evaluate($_, $candidate) } @{$arguments->[0]};
@@ -194,9 +195,40 @@ sub _field_literal {
 
 sub _compare {
     my ($left, $right) = @_;
-    return $left <=> $right if looks_like_number($left) && looks_like_number($right);
     _not_evaluable() if ref($left) || ref($right);
+    my ($a, $b) = (_finite_decimal($left), _finite_decimal($right));
+    if ($a && $b) {
+        return $a->[0] <=> $b->[0] if $a->[0] != $b->[0];
+        return 0 unless $a->[0];
+        my $order = $a->[1]->bcmp($b->[1]);
+        unless ($order) {
+            my $length = length($a->[2]) > length($b->[2]) ? length($a->[2]) : length($b->[2]);
+            $order = ($a->[2] . ('0' x ($length - length($a->[2]))))
+                cmp ($b->[2] . ('0' x ($length - length($b->[2]))));
+        }
+        return $a->[0] * $order;
+    }
     return "$left" cmp "$right";
+}
+
+# Compact exact decimal ordering: exponents are arbitrary integers and only
+# input-sized significands are padded. No native float or 10**exponent is used.
+# Native non-finite values stringify to Inf/NaN and are never lexical fallbacks.
+sub _finite_decimal {
+    my ($value) = @_;
+    if ("$value" =~ /\A[ \t\r\n\f\x0b]*([+-]?)(?:([0-9]+)(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?[ \t\r\n\f\x0b]*\z/) {
+        my ($sign, $whole, $fraction, $leading_fraction, $exponent) = ($1, $2, $3, $4, $5);
+        $fraction = $leading_fraction // $fraction // '';
+        my $digits = ($whole // '') . $fraction;
+        $digits =~ s/\A0+//;
+        # Host BigInt rounding defaults must not affect policy decisions.
+        local $Math::BigInt::accuracy;
+        local $Math::BigInt::precision;
+        my $magnitude = Math::BigInt->new($exponent // '0')->badd(length($digits) - length($fraction));
+        return [length($digits) ? ($sign eq '-' ? -1 : 1) : 0, $magnitude, $digits];
+    }
+    _not_evaluable() if looks_like_number($value);
+    return undef;
 }
 
 sub _negate { return $_[0] eq 'unknown' ? 'unknown' : $_[0] eq 'true' ? 'false' : 'true'; }

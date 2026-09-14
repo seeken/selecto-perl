@@ -5,10 +5,11 @@ use Test::More;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
+use FindBin qw($Bin);
 use Selecto::DataRules ();
 use Selecto::Domain ();
 
-my $fixtures = $ENV{SELECTO_DATA_RULE_FIXTURES} // '../selecto-protocol/spec/fixtures/rules';
+my $fixtures = $ENV{SELECTO_DATA_RULE_FIXTURES} // "$Bin/fixtures/data_rules";
 my $json = JSON::PP->new;
 open my $contract_file, '<', "$fixtures/baseline.contract.json" or die $!;
 my $contract = $json->decode(do { local $/; <$contract_file> });

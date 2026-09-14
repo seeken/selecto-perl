@@ -1,0 +1,1695 @@
+{
+  "format": "selecto.query-enforced-scalar.v1",
+  "scope": "pure-candidate-comparison-not-live-write-certification",
+  "cases": [
+    {
+      "id": "S001",
+      "op": "eq",
+      "actual": "1",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S002",
+      "op": "ne",
+      "actual": "1",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S003",
+      "op": "gt",
+      "actual": "1",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S004",
+      "op": "gte",
+      "actual": "1",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S005",
+      "op": "lt",
+      "actual": "1",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S006",
+      "op": "lte",
+      "actual": "1",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S007",
+      "op": "eq",
+      "actual": ".5",
+      "expected": "0.50",
+      "outcome": "true"
+    },
+    {
+      "id": "S008",
+      "op": "ne",
+      "actual": ".5",
+      "expected": "0.50",
+      "outcome": "false"
+    },
+    {
+      "id": "S009",
+      "op": "gt",
+      "actual": ".5",
+      "expected": "0.50",
+      "outcome": "false"
+    },
+    {
+      "id": "S010",
+      "op": "gte",
+      "actual": ".5",
+      "expected": "0.50",
+      "outcome": "true"
+    },
+    {
+      "id": "S011",
+      "op": "lt",
+      "actual": ".5",
+      "expected": "0.50",
+      "outcome": "false"
+    },
+    {
+      "id": "S012",
+      "op": "lte",
+      "actual": ".5",
+      "expected": "0.50",
+      "outcome": "true"
+    },
+    {
+      "id": "S013",
+      "op": "eq",
+      "actual": "1.",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S014",
+      "op": "ne",
+      "actual": "1.",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S015",
+      "op": "gt",
+      "actual": "1.",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S016",
+      "op": "gte",
+      "actual": "1.",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S017",
+      "op": "lt",
+      "actual": "1.",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S018",
+      "op": "lte",
+      "actual": "1.",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S019",
+      "op": "eq",
+      "actual": "  +001e1  ",
+      "expected": "10",
+      "outcome": "true"
+    },
+    {
+      "id": "S020",
+      "op": "ne",
+      "actual": "  +001e1  ",
+      "expected": "10",
+      "outcome": "false"
+    },
+    {
+      "id": "S021",
+      "op": "gt",
+      "actual": "  +001e1  ",
+      "expected": "10",
+      "outcome": "false"
+    },
+    {
+      "id": "S022",
+      "op": "gte",
+      "actual": "  +001e1  ",
+      "expected": "10",
+      "outcome": "true"
+    },
+    {
+      "id": "S023",
+      "op": "lt",
+      "actual": "  +001e1  ",
+      "expected": "10",
+      "outcome": "false"
+    },
+    {
+      "id": "S024",
+      "op": "lte",
+      "actual": "  +001e1  ",
+      "expected": "10",
+      "outcome": "true"
+    },
+    {
+      "id": "S025",
+      "op": "eq",
+      "actual": "-.5",
+      "expected": "-0.50",
+      "outcome": "true"
+    },
+    {
+      "id": "S026",
+      "op": "ne",
+      "actual": "-.5",
+      "expected": "-0.50",
+      "outcome": "false"
+    },
+    {
+      "id": "S027",
+      "op": "gt",
+      "actual": "-.5",
+      "expected": "-0.50",
+      "outcome": "false"
+    },
+    {
+      "id": "S028",
+      "op": "gte",
+      "actual": "-.5",
+      "expected": "-0.50",
+      "outcome": "true"
+    },
+    {
+      "id": "S029",
+      "op": "lt",
+      "actual": "-.5",
+      "expected": "-0.50",
+      "outcome": "false"
+    },
+    {
+      "id": "S030",
+      "op": "lte",
+      "actual": "-.5",
+      "expected": "-0.50",
+      "outcome": "true"
+    },
+    {
+      "id": "S031",
+      "op": "eq",
+      "actual": "-0e999999999999999999999999",
+      "expected": "0",
+      "outcome": "true"
+    },
+    {
+      "id": "S032",
+      "op": "ne",
+      "actual": "-0e999999999999999999999999",
+      "expected": "0",
+      "outcome": "false"
+    },
+    {
+      "id": "S033",
+      "op": "gt",
+      "actual": "-0e999999999999999999999999",
+      "expected": "0",
+      "outcome": "false"
+    },
+    {
+      "id": "S034",
+      "op": "gte",
+      "actual": "-0e999999999999999999999999",
+      "expected": "0",
+      "outcome": "true"
+    },
+    {
+      "id": "S035",
+      "op": "lt",
+      "actual": "-0e999999999999999999999999",
+      "expected": "0",
+      "outcome": "false"
+    },
+    {
+      "id": "S036",
+      "op": "lte",
+      "actual": "-0e999999999999999999999999",
+      "expected": "0",
+      "outcome": "true"
+    },
+    {
+      "id": "S037",
+      "op": "eq",
+      "actual": "9007199254740993",
+      "expected": "9007199254740992",
+      "outcome": "false"
+    },
+    {
+      "id": "S038",
+      "op": "ne",
+      "actual": "9007199254740993",
+      "expected": "9007199254740992",
+      "outcome": "true"
+    },
+    {
+      "id": "S039",
+      "op": "gt",
+      "actual": "9007199254740993",
+      "expected": "9007199254740992",
+      "outcome": "true"
+    },
+    {
+      "id": "S040",
+      "op": "gte",
+      "actual": "9007199254740993",
+      "expected": "9007199254740992",
+      "outcome": "true"
+    },
+    {
+      "id": "S041",
+      "op": "lt",
+      "actual": "9007199254740993",
+      "expected": "9007199254740992",
+      "outcome": "false"
+    },
+    {
+      "id": "S042",
+      "op": "lte",
+      "actual": "9007199254740993",
+      "expected": "9007199254740992",
+      "outcome": "false"
+    },
+    {
+      "id": "S043",
+      "op": "eq",
+      "actual": "999999999999999999999999999999999999.0002",
+      "expected": "999999999999999999999999999999999999.0001",
+      "outcome": "false"
+    },
+    {
+      "id": "S044",
+      "op": "ne",
+      "actual": "999999999999999999999999999999999999.0002",
+      "expected": "999999999999999999999999999999999999.0001",
+      "outcome": "true"
+    },
+    {
+      "id": "S045",
+      "op": "gt",
+      "actual": "999999999999999999999999999999999999.0002",
+      "expected": "999999999999999999999999999999999999.0001",
+      "outcome": "true"
+    },
+    {
+      "id": "S046",
+      "op": "gte",
+      "actual": "999999999999999999999999999999999999.0002",
+      "expected": "999999999999999999999999999999999999.0001",
+      "outcome": "true"
+    },
+    {
+      "id": "S047",
+      "op": "lt",
+      "actual": "999999999999999999999999999999999999.0002",
+      "expected": "999999999999999999999999999999999999.0001",
+      "outcome": "false"
+    },
+    {
+      "id": "S048",
+      "op": "lte",
+      "actual": "999999999999999999999999999999999999.0002",
+      "expected": "999999999999999999999999999999999999.0001",
+      "outcome": "false"
+    },
+    {
+      "id": "S049",
+      "op": "eq",
+      "actual": "-999999999999999999999999999999999999.0002",
+      "expected": "-999999999999999999999999999999999999.0001",
+      "outcome": "false"
+    },
+    {
+      "id": "S050",
+      "op": "ne",
+      "actual": "-999999999999999999999999999999999999.0002",
+      "expected": "-999999999999999999999999999999999999.0001",
+      "outcome": "true"
+    },
+    {
+      "id": "S051",
+      "op": "gt",
+      "actual": "-999999999999999999999999999999999999.0002",
+      "expected": "-999999999999999999999999999999999999.0001",
+      "outcome": "false"
+    },
+    {
+      "id": "S052",
+      "op": "gte",
+      "actual": "-999999999999999999999999999999999999.0002",
+      "expected": "-999999999999999999999999999999999999.0001",
+      "outcome": "false"
+    },
+    {
+      "id": "S053",
+      "op": "lt",
+      "actual": "-999999999999999999999999999999999999.0002",
+      "expected": "-999999999999999999999999999999999999.0001",
+      "outcome": "true"
+    },
+    {
+      "id": "S054",
+      "op": "lte",
+      "actual": "-999999999999999999999999999999999999.0002",
+      "expected": "-999999999999999999999999999999999999.0001",
+      "outcome": "true"
+    },
+    {
+      "id": "S055",
+      "op": "eq",
+      "actual": "1e999999999999999999999999",
+      "expected": "9e999999999999999999999998",
+      "outcome": "false"
+    },
+    {
+      "id": "S056",
+      "op": "ne",
+      "actual": "1e999999999999999999999999",
+      "expected": "9e999999999999999999999998",
+      "outcome": "true"
+    },
+    {
+      "id": "S057",
+      "op": "gt",
+      "actual": "1e999999999999999999999999",
+      "expected": "9e999999999999999999999998",
+      "outcome": "true"
+    },
+    {
+      "id": "S058",
+      "op": "gte",
+      "actual": "1e999999999999999999999999",
+      "expected": "9e999999999999999999999998",
+      "outcome": "true"
+    },
+    {
+      "id": "S059",
+      "op": "lt",
+      "actual": "1e999999999999999999999999",
+      "expected": "9e999999999999999999999998",
+      "outcome": "false"
+    },
+    {
+      "id": "S060",
+      "op": "lte",
+      "actual": "1e999999999999999999999999",
+      "expected": "9e999999999999999999999998",
+      "outcome": "false"
+    },
+    {
+      "id": "S061",
+      "op": "eq",
+      "actual": "1e-999999999999999999999999",
+      "expected": "9e-999999999999999999999998",
+      "outcome": "false"
+    },
+    {
+      "id": "S062",
+      "op": "ne",
+      "actual": "1e-999999999999999999999999",
+      "expected": "9e-999999999999999999999998",
+      "outcome": "true"
+    },
+    {
+      "id": "S063",
+      "op": "gt",
+      "actual": "1e-999999999999999999999999",
+      "expected": "9e-999999999999999999999998",
+      "outcome": "false"
+    },
+    {
+      "id": "S064",
+      "op": "gte",
+      "actual": "1e-999999999999999999999999",
+      "expected": "9e-999999999999999999999998",
+      "outcome": "false"
+    },
+    {
+      "id": "S065",
+      "op": "lt",
+      "actual": "1e-999999999999999999999999",
+      "expected": "9e-999999999999999999999998",
+      "outcome": "true"
+    },
+    {
+      "id": "S066",
+      "op": "lte",
+      "actual": "1e-999999999999999999999999",
+      "expected": "9e-999999999999999999999998",
+      "outcome": "true"
+    },
+    {
+      "id": "S067",
+      "op": "eq",
+      "actual": "0",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S068",
+      "op": "ne",
+      "actual": "0",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S069",
+      "op": "gt",
+      "actual": "0",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S070",
+      "op": "gte",
+      "actual": "0",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S071",
+      "op": "lt",
+      "actual": "0",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S072",
+      "op": "lte",
+      "actual": "0",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S073",
+      "op": "eq",
+      "actual": "-1",
+      "expected": "0",
+      "outcome": "false"
+    },
+    {
+      "id": "S074",
+      "op": "ne",
+      "actual": "-1",
+      "expected": "0",
+      "outcome": "true"
+    },
+    {
+      "id": "S075",
+      "op": "gt",
+      "actual": "-1",
+      "expected": "0",
+      "outcome": "false"
+    },
+    {
+      "id": "S076",
+      "op": "gte",
+      "actual": "-1",
+      "expected": "0",
+      "outcome": "false"
+    },
+    {
+      "id": "S077",
+      "op": "lt",
+      "actual": "-1",
+      "expected": "0",
+      "outcome": "true"
+    },
+    {
+      "id": "S078",
+      "op": "lte",
+      "actual": "-1",
+      "expected": "0",
+      "outcome": "true"
+    },
+    {
+      "id": "S079",
+      "op": "eq",
+      "actual": "12.01",
+      "expected": "12.001",
+      "outcome": "false"
+    },
+    {
+      "id": "S080",
+      "op": "ne",
+      "actual": "12.01",
+      "expected": "12.001",
+      "outcome": "true"
+    },
+    {
+      "id": "S081",
+      "op": "gt",
+      "actual": "12.01",
+      "expected": "12.001",
+      "outcome": "true"
+    },
+    {
+      "id": "S082",
+      "op": "gte",
+      "actual": "12.01",
+      "expected": "12.001",
+      "outcome": "true"
+    },
+    {
+      "id": "S083",
+      "op": "lt",
+      "actual": "12.01",
+      "expected": "12.001",
+      "outcome": "false"
+    },
+    {
+      "id": "S084",
+      "op": "lte",
+      "actual": "12.01",
+      "expected": "12.001",
+      "outcome": "false"
+    },
+    {
+      "id": "S085",
+      "op": "eq",
+      "actual": "Ada",
+      "expected": "Bob",
+      "outcome": "false"
+    },
+    {
+      "id": "S086",
+      "op": "ne",
+      "actual": "Ada",
+      "expected": "Bob",
+      "outcome": "true"
+    },
+    {
+      "id": "S087",
+      "op": "gt",
+      "actual": "Ada",
+      "expected": "Bob",
+      "outcome": "false"
+    },
+    {
+      "id": "S088",
+      "op": "gte",
+      "actual": "Ada",
+      "expected": "Bob",
+      "outcome": "false"
+    },
+    {
+      "id": "S089",
+      "op": "lt",
+      "actual": "Ada",
+      "expected": "Bob",
+      "outcome": "true"
+    },
+    {
+      "id": "S090",
+      "op": "lte",
+      "actual": "Ada",
+      "expected": "Bob",
+      "outcome": "true"
+    },
+    {
+      "id": "S091",
+      "op": "eq",
+      "actual": "(1)",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S092",
+      "op": "ne",
+      "actual": "(1)",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S093",
+      "op": "gt",
+      "actual": "(1)",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S094",
+      "op": "gte",
+      "actual": "(1)",
+      "expected": "1",
+      "outcome": "false"
+    },
+    {
+      "id": "S095",
+      "op": "lt",
+      "actual": "(1)",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S096",
+      "op": "lte",
+      "actual": "(1)",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "S097",
+      "op": "eq",
+      "actual": "0x10",
+      "expected": "16",
+      "outcome": "false"
+    },
+    {
+      "id": "S098",
+      "op": "ne",
+      "actual": "0x10",
+      "expected": "16",
+      "outcome": "true"
+    },
+    {
+      "id": "S099",
+      "op": "gt",
+      "actual": "0x10",
+      "expected": "16",
+      "outcome": "false"
+    },
+    {
+      "id": "S100",
+      "op": "gte",
+      "actual": "0x10",
+      "expected": "16",
+      "outcome": "false"
+    },
+    {
+      "id": "S101",
+      "op": "lt",
+      "actual": "0x10",
+      "expected": "16",
+      "outcome": "true"
+    },
+    {
+      "id": "S102",
+      "op": "lte",
+      "actual": "0x10",
+      "expected": "16",
+      "outcome": "true"
+    },
+    {
+      "id": "S103",
+      "op": "eq",
+      "actual": "nan(foo)",
+      "expected": "nan(foo)",
+      "outcome": "true"
+    },
+    {
+      "id": "S104",
+      "op": "ne",
+      "actual": "nan(foo)",
+      "expected": "nan(foo)",
+      "outcome": "false"
+    },
+    {
+      "id": "S105",
+      "op": "gt",
+      "actual": "nan(foo)",
+      "expected": "nan(foo)",
+      "outcome": "false"
+    },
+    {
+      "id": "S106",
+      "op": "gte",
+      "actual": "nan(foo)",
+      "expected": "nan(foo)",
+      "outcome": "true"
+    },
+    {
+      "id": "S107",
+      "op": "lt",
+      "actual": "nan(foo)",
+      "expected": "nan(foo)",
+      "outcome": "false"
+    },
+    {
+      "id": "S108",
+      "op": "lte",
+      "actual": "nan(foo)",
+      "expected": "nan(foo)",
+      "outcome": "true"
+    },
+    {
+      "id": "S109",
+      "op": "eq",
+      "actual": "NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S110",
+      "op": "ne",
+      "actual": "NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S111",
+      "op": "gt",
+      "actual": "NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S112",
+      "op": "gte",
+      "actual": "NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S113",
+      "op": "lt",
+      "actual": "NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S114",
+      "op": "lte",
+      "actual": "NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S115",
+      "op": "eq",
+      "actual": "1",
+      "expected": "NaN",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S116",
+      "op": "eq",
+      "actual": "+NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S117",
+      "op": "ne",
+      "actual": "+NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S118",
+      "op": "gt",
+      "actual": "+NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S119",
+      "op": "gte",
+      "actual": "+NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S120",
+      "op": "lt",
+      "actual": "+NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S121",
+      "op": "lte",
+      "actual": "+NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S122",
+      "op": "eq",
+      "actual": "1",
+      "expected": "+NaN",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S123",
+      "op": "eq",
+      "actual": "-NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S124",
+      "op": "ne",
+      "actual": "-NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S125",
+      "op": "gt",
+      "actual": "-NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S126",
+      "op": "gte",
+      "actual": "-NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S127",
+      "op": "lt",
+      "actual": "-NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S128",
+      "op": "lte",
+      "actual": "-NaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S129",
+      "op": "eq",
+      "actual": "1",
+      "expected": "-NaN",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S130",
+      "op": "eq",
+      "actual": "sNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S131",
+      "op": "ne",
+      "actual": "sNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S132",
+      "op": "gt",
+      "actual": "sNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S133",
+      "op": "gte",
+      "actual": "sNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S134",
+      "op": "lt",
+      "actual": "sNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S135",
+      "op": "lte",
+      "actual": "sNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S136",
+      "op": "eq",
+      "actual": "1",
+      "expected": "sNaN",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S137",
+      "op": "eq",
+      "actual": "qNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S138",
+      "op": "ne",
+      "actual": "qNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S139",
+      "op": "gt",
+      "actual": "qNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S140",
+      "op": "gte",
+      "actual": "qNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S141",
+      "op": "lt",
+      "actual": "qNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S142",
+      "op": "lte",
+      "actual": "qNaN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S143",
+      "op": "eq",
+      "actual": "1",
+      "expected": "qNaN",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S144",
+      "op": "eq",
+      "actual": "nanq",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S145",
+      "op": "ne",
+      "actual": "nanq",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S146",
+      "op": "gt",
+      "actual": "nanq",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S147",
+      "op": "gte",
+      "actual": "nanq",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S148",
+      "op": "lt",
+      "actual": "nanq",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S149",
+      "op": "lte",
+      "actual": "nanq",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S150",
+      "op": "eq",
+      "actual": "1",
+      "expected": "nanq",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S151",
+      "op": "eq",
+      "actual": "nans",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S152",
+      "op": "ne",
+      "actual": "nans",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S153",
+      "op": "gt",
+      "actual": "nans",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S154",
+      "op": "gte",
+      "actual": "nans",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S155",
+      "op": "lt",
+      "actual": "nans",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S156",
+      "op": "lte",
+      "actual": "nans",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S157",
+      "op": "eq",
+      "actual": "1",
+      "expected": "nans",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S158",
+      "op": "eq",
+      "actual": "nan(1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S159",
+      "op": "ne",
+      "actual": "nan(1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S160",
+      "op": "gt",
+      "actual": "nan(1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S161",
+      "op": "gte",
+      "actual": "nan(1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S162",
+      "op": "lt",
+      "actual": "nan(1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S163",
+      "op": "lte",
+      "actual": "nan(1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S164",
+      "op": "eq",
+      "actual": "1",
+      "expected": "nan(1)",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S165",
+      "op": "eq",
+      "actual": "NaN(0x123)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S166",
+      "op": "ne",
+      "actual": "NaN(0x123)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S167",
+      "op": "gt",
+      "actual": "NaN(0x123)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S168",
+      "op": "gte",
+      "actual": "NaN(0x123)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S169",
+      "op": "lt",
+      "actual": "NaN(0x123)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S170",
+      "op": "lte",
+      "actual": "NaN(0x123)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S171",
+      "op": "eq",
+      "actual": "1",
+      "expected": "NaN(0x123)",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S172",
+      "op": "eq",
+      "actual": "nan(0b1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S173",
+      "op": "ne",
+      "actual": "nan(0b1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S174",
+      "op": "gt",
+      "actual": "nan(0b1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S175",
+      "op": "gte",
+      "actual": "nan(0b1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S176",
+      "op": "lt",
+      "actual": "nan(0b1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S177",
+      "op": "lte",
+      "actual": "nan(0b1)",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S178",
+      "op": "eq",
+      "actual": "1",
+      "expected": "nan(0b1)",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S179",
+      "op": "eq",
+      "actual": "Inf",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S180",
+      "op": "ne",
+      "actual": "Inf",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S181",
+      "op": "gt",
+      "actual": "Inf",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S182",
+      "op": "gte",
+      "actual": "Inf",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S183",
+      "op": "lt",
+      "actual": "Inf",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S184",
+      "op": "lte",
+      "actual": "Inf",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S185",
+      "op": "eq",
+      "actual": "1",
+      "expected": "Inf",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S186",
+      "op": "eq",
+      "actual": "-Infinity",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S187",
+      "op": "ne",
+      "actual": "-Infinity",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S188",
+      "op": "gt",
+      "actual": "-Infinity",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S189",
+      "op": "gte",
+      "actual": "-Infinity",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S190",
+      "op": "lt",
+      "actual": "-Infinity",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S191",
+      "op": "lte",
+      "actual": "-Infinity",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S192",
+      "op": "eq",
+      "actual": "1",
+      "expected": "-Infinity",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S193",
+      "op": "eq",
+      "actual": "1.#INF00",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S194",
+      "op": "ne",
+      "actual": "1.#INF00",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S195",
+      "op": "gt",
+      "actual": "1.#INF00",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S196",
+      "op": "gte",
+      "actual": "1.#INF00",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S197",
+      "op": "lt",
+      "actual": "1.#INF00",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S198",
+      "op": "lte",
+      "actual": "1.#INF00",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S199",
+      "op": "eq",
+      "actual": "1",
+      "expected": "1.#INF00",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S200",
+      "op": "eq",
+      "actual": "1.#IND0",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S201",
+      "op": "ne",
+      "actual": "1.#IND0",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S202",
+      "op": "gt",
+      "actual": "1.#IND0",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S203",
+      "op": "gte",
+      "actual": "1.#IND0",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S204",
+      "op": "lt",
+      "actual": "1.#IND0",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S205",
+      "op": "lte",
+      "actual": "1.#IND0",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S206",
+      "op": "eq",
+      "actual": "1",
+      "expected": "1.#IND0",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S207",
+      "op": "eq",
+      "actual": "1.#QNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S208",
+      "op": "ne",
+      "actual": "1.#QNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S209",
+      "op": "gt",
+      "actual": "1.#QNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S210",
+      "op": "gte",
+      "actual": "1.#QNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S211",
+      "op": "lt",
+      "actual": "1.#QNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S212",
+      "op": "lte",
+      "actual": "1.#QNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S213",
+      "op": "eq",
+      "actual": "1",
+      "expected": "1.#QNAN",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S214",
+      "op": "eq",
+      "actual": "1.#SNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S215",
+      "op": "ne",
+      "actual": "1.#SNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S216",
+      "op": "gt",
+      "actual": "1.#SNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S217",
+      "op": "gte",
+      "actual": "1.#SNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S218",
+      "op": "lt",
+      "actual": "1.#SNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S219",
+      "op": "lte",
+      "actual": "1.#SNAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S220",
+      "op": "eq",
+      "actual": "1",
+      "expected": "1.#SNAN",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S221",
+      "op": "eq",
+      "actual": "1.#NAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S222",
+      "op": "ne",
+      "actual": "1.#NAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S223",
+      "op": "gt",
+      "actual": "1.#NAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S224",
+      "op": "gte",
+      "actual": "1.#NAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S225",
+      "op": "lt",
+      "actual": "1.#NAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S226",
+      "op": "lte",
+      "actual": "1.#NAN",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S227",
+      "op": "eq",
+      "actual": "1",
+      "expected": "1.#NAN",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S228",
+      "op": "in",
+      "actual": "1",
+      "expected": [
+        "1",
+        "NaN"
+      ],
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S229",
+      "op": "in",
+      "actual": "1",
+      "expected": [
+        "NaN",
+        "1"
+      ],
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "S230",
+      "op": "in",
+      "actual": "1",
+      "expected": [
+        "1",
+        null
+      ],
+      "outcome": "true"
+    },
+    {
+      "id": "S231",
+      "op": "in",
+      "actual": "1",
+      "expected": [
+        "2",
+        null
+      ],
+      "outcome": "unknown"
+    },
+    {
+      "id": "S232",
+      "op": "in",
+      "actual": null,
+      "expected": [
+        "1"
+      ],
+      "outcome": "unknown"
+    },
+    {
+      "id": "S233",
+      "op": "in",
+      "actual": "1",
+      "expected": [
+        null
+      ],
+      "outcome": "unknown"
+    },
+    {
+      "id": "S234",
+      "op": "eq",
+      "actual": null,
+      "expected": "1",
+      "outcome": "unknown"
+    },
+    {
+      "id": "S235",
+      "op": "ne",
+      "actual": null,
+      "expected": "1",
+      "outcome": "unknown"
+    },
+    {
+      "id": "S236",
+      "op": "gt",
+      "actual": null,
+      "expected": "1",
+      "outcome": "unknown"
+    },
+    {
+      "id": "S237",
+      "op": "gte",
+      "actual": null,
+      "expected": "1",
+      "outcome": "unknown"
+    },
+    {
+      "id": "S238",
+      "op": "lt",
+      "actual": null,
+      "expected": "1",
+      "outcome": "unknown"
+    },
+    {
+      "id": "S239",
+      "op": "lte",
+      "actual": null,
+      "expected": "1",
+      "outcome": "unknown"
+    }
+  ]
+}

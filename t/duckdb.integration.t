@@ -41,7 +41,7 @@ my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
 my $query = $engine->query->select(qw(id name active total))
     ->where(Selecto::Expression->eq(name => q{baseline' OR 1=1 --}));
 
-like($engine->compile($query)->sql, qr/"s0"\."name" = \?/, 'DuckDB uses prepared positional parameters');
+like($engine->compile($query)->sql, qr/"s0"\."name" = \$1/, 'DuckDB uses native numbered parameters');
 is_deeply($engine->all($query)->{rows}, [], 'bound injection-shaped input remains data');
 is($adapter->normalize_type('timestamp'), 'naive_datetime', 'DuckDB types normalize portably');
 ok($adapter->supports('transactions'), 'DuckDB declares transaction support');

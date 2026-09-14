@@ -4,6 +4,7 @@ use Mojo::Base 'Selecto::SQL';
 use DBI qw(:sql_types);
 use Selecto::Error ();
 use Selecto::Identifier ();
+use Scalar::Util qw(blessed);
 
 sub name    { return 'mssql'; }
 sub dialect { return __PACKAGE__; }
@@ -46,6 +47,70 @@ sub _compile_pagination {
     my $sql = ' OFFSET ' . (defined($offset) ? int($offset) : 0) . ' ROWS';
     $sql .= ' FETCH NEXT ' . int($limit) . ' ROWS ONLY' if defined $limit;
     return $sql;
+}
+
+sub _compile_expression {
+    my ($self, $domain, $expression, $params, $selections) = @_;
+    return $self->SUPER::_compile_expression($domain, $expression, $params, $selections)
+        unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $kind = $expression->kind;
+    my $args = $expression->arguments;
+    my %operators = (eq => '=', ne => '<>', gt => '>', gte => '>=', lt => '<', lte => '<=');
+    if (exists($operators{$kind})
+        && ($self->_decimal_field($domain, $args->[0]) || $self->_decimal_field($domain, $args->[1]))) {
+        return $self->_decimal_operand($domain, $args->[0], $params) . ' ' . $operators{$kind} . ' '
+            . $self->_decimal_operand($domain, $args->[1], $params);
+    }
+    if ($kind eq 'between' && $self->_decimal_field($domain, $args->[0])) {
+        return $self->_compile_expression($domain, $args->[0], $params) . ' BETWEEN '
+            . $self->_decimal_operand($domain, $args->[1], $params) . ' AND '
+            . $self->_decimal_operand($domain, $args->[2], $params);
+    }
+    if ($kind eq 'in' && $self->_decimal_field($domain, $args->[0])) {
+        Selecto::Error->throw('invalid_query', 'IN requires at least one value')
+            unless ref($args->[1]) eq 'ARRAY' && @{$args->[1]};
+        my $left = $self->_compile_expression($domain, $args->[0], $params);
+        my @markers = map { $self->_decimal_parameter($_, $params) } @{$args->[1]};
+        return $left . ' IN (' . join(', ', @markers) . ')';
+    }
+    return $self->SUPER::_compile_expression($domain, $expression, $params, $selections);
+}
+
+sub _decimal_field {
+    my ($self, $domain, $expression) = @_;
+    return 0 unless blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind eq 'field';
+    # Query-source aliases are resolved by the shared compiler, not by a root
+    # Domain. Leave those expressions on the existing path if not resolvable.
+    my $resolved = eval { $domain->resolve($expression->arguments->[0]) };
+    return $resolved && $resolved->{type} =~ /\A(?:decimal|numeric)\z/;
+}
+
+sub _decimal_operand {
+    my ($self, $domain, $expression, $params) = @_;
+    return $self->_decimal_parameter($expression->arguments->[0], $params)
+        if $expression->kind eq 'literal';
+    return $self->_compile_expression($domain, $expression, $params);
+}
+
+sub _decimal_parameter {
+    my ($self, $value, $params) = @_;
+    if (!defined $value) { push @$params, undef; return '?'; }
+    Selecto::Error->throw('invalid_query', 'decimal parameter must be exact base-10 text')
+        if ref($value) || "$value" !~ /\A-?\d+(?:\.\d+)?\z/;
+    my $unsigned = "$value";
+    $unsigned =~ s/\A-//;
+    my ($whole, $fraction) = split /\./, $unsigned, 2;
+    $whole =~ s/\A0+//;
+    $fraction //= '';
+    $fraction =~ s/0+\z//;
+    my $scale = length($fraction);
+    Selecto::Error->throw('unsupported_precision', 'decimal parameter exceeds SQL Server precision')
+        if length($whole) + $scale > 38;
+    push @$params, $value;
+    # An inferred string parameter would be rounded to the column's scale.
+    # Its own exact DECIMAL type must be established before comparison.
+    return 'CAST(? AS DECIMAL(38,' . $scale . '))';
 }
 
 sub _compile_write {

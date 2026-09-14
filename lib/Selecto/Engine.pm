@@ -168,7 +168,9 @@ sub _is_tenant_comparison {
     return 0 unless $operand->arguments->[0] eq $field;
     my $value = $arguments[1];
     if ($expression->kind eq 'eq') {
-        return blessed($value) && $value->isa('Selecto::Expression') && $value->kind eq 'literal';
+        return 0 unless blessed($value) && $value->isa('Selecto::Expression') && $value->kind eq 'literal';
+        my $literal = $value->arguments->[0];
+        return defined($literal) && !ref($literal);
     }
     return 0 unless ref($value) eq 'ARRAY' && @$value;
     # Selecto::Expression->in stores raw scalar list elements; each is bound

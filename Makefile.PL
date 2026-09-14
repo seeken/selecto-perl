@@ -17,6 +17,7 @@ WriteMakefile(
         'DateTime' => 0,
         'Digest::SHA' => 0,
         'JSON::PP'    => '4.06',
+        'Math::BigInt' => 0,
         'Mojolicious' => '9.40',
         'Scalar::Util'=> 0,
         'Storable'    => 0,
