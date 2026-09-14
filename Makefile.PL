@@ -21,6 +21,7 @@ WriteMakefile(
         'Mojolicious' => '9.40',
         'Scalar::Util'=> 0,
         'Storable'    => 0,
+        'Text::CSV'   => '2.04',
         'URI::Escape' => 0,
     },
     TEST_REQUIRES => {
