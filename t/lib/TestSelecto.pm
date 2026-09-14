@@ -49,9 +49,10 @@ sub prepare {
     return $sth;
 }
 
-sub begin_work { push @{$_[0]->{events}}, 'BEGIN'; return 1; }
+sub begin_work { push @{$_[0]->{events}}, 'BEGIN'; $_[0]{AutoCommit} = 0; return 1; }
 sub commit     { push @{$_[0]->{events}}, 'COMMIT'; return 1; }
 sub rollback   { push @{$_[0]->{events}}, 'ROLLBACK'; return 1; }
+sub errstr     { return $_[0]->{errstr}; }
 sub prepared   { return [@{$_[0]->{prepared}}]; }
 sub events     { return [@{$_[0]->{events}}]; }
 
@@ -69,7 +70,16 @@ sub new {
     }, $class;
 }
 
-sub execute { my ($self, @params) = @_; $self->{params} = [@params]; return 1; }
+sub execute {
+    my ($self, @params) = @_;
+    $self->{params} = [@params];
+    if (defined $self->{spec}{execute_error}) {
+        $self->{errstr} = $self->{spec}{execute_error};
+        $self->{owner}{errstr} = $self->{errstr};
+        return undef;
+    }
+    return 1;
+}
 sub fetchrow_array {
     my ($self) = @_;
     my $rows = $self->{spec}{rows} // [];
@@ -77,8 +87,9 @@ sub fetchrow_array {
     return @{$rows->[$self->{index}++]};
 }
 sub rows   { return $_[0]->{spec}{affected} // scalar(@{$_[0]->{spec}{rows} // []}); }
+sub err    { return defined($_[0]->{errstr}) ? 1 : undef; }
+sub errstr { return $_[0]->{errstr}; }
 sub sql    { return $_[0]->{sql}; }
 sub params { return [@{$_[0]->{params}}]; }
 
 1;
-

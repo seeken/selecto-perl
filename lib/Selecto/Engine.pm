@@ -243,6 +243,18 @@ sub _validate_command_against_contract {
     my $domain_fields = $context{fields};
     my $label = $context{label} // $command->relation;
     my $permission = $operation eq 'insert' || $operation eq 'upsert' ? 'insertable' : 'updatable';
+    if (defined($fields_spec) && ($operation eq 'insert' || $operation eq 'upsert')) {
+        my @missing = sort grep {
+            my $spec = $fields_spec->{$_};
+            ref($spec) eq 'HASH' && $spec->{required}
+                && !exists($command->assignments->{$_})
+        } keys %$fields_spec;
+        Selecto::Error->throw(
+            'missing_required_write_fields',
+            "$operation is missing required fields: " . join(', ', @missing),
+            {operation => $operation, fields => \@missing, missing_fields => \@missing},
+        ) if @missing;
+    }
     if ($domain_fields && $operation ne 'delete') {
         for my $field (sort keys %{$command->assignments}) {
             Selecto::Error->throw('unknown_field', "write field is not declared by $label", { field => $field })

@@ -46,12 +46,13 @@ my $domain = Selecto::Domain->parse({
     source => {
         source_table => 'records',
         primary_key => 'id',
-        fields => [qw(id name status occurred_at tenant_id)],
+        fields => [qw(id name status occurred_at occurred_on tenant_id)],
         columns => {
             id => {type => 'integer'},
             name => {type => 'string'},
             status => {type => 'string'},
             occurred_at => {type => 'epoch_datetime'},
+            occurred_on => {type => 'date'},
             tenant_id => {type => 'integer', internal => 1},
         },
         associations => {
@@ -83,8 +84,12 @@ my $domain = Selecto::Domain->parse({
             delete => {enabled => JSON::PP::true},
         },
         fields => {
-            name => {insertable => JSON::PP::true, updatable => JSON::PP::true},
+            name => {
+                insertable => JSON::PP::true, updatable => JSON::PP::true,
+                required => JSON::PP::true,
+            },
             status => {insertable => JSON::PP::true, updatable => JSON::PP::true},
+            occurred_on => {insertable => JSON::PP::true, updatable => JSON::PP::true},
             tenant_id => {insertable => JSON::PP::true},
         },
     },
@@ -142,6 +147,63 @@ like $adapter->{last_write}{sql}, qr/"tenant_id" = \$3/,
     'API writes retain the trusted domain scope';
 is_deeply $adapter->{last_write}{params}, ['closed', 7, 41],
     'API write values and scope remain bound parameters';
+
+my $prepared_command = $handler->write_command($engine, {
+    operation => 'update',
+    assignments => {status => 'prepared'},
+    filters => [{field => 'id', op => 'eq', value => 7}],
+});
+isa_ok $prepared_command, 'Selecto::Write::Command',
+    'hosts can prepare a normalized API command for an application transaction';
+is $prepared_command->assignments->{status}, 'prepared',
+    'prepared API commands preserve normalized assignments';
+
+my $required_error = eval {
+    $handler->write($engine, {
+        operation => 'insert', assignments => {status => 'missing name'},
+    });
+    undef;
+} // $@;
+is $required_error->code, 'missing_required_write_fields',
+    'API inserts reject omitted contract-required fields before SQL compilation';
+is $required_error->message, 'insert is missing required fields: name',
+    'the required-field error names the omitted input';
+is_deeply $required_error->details, {
+    operation => 'insert', fields => ['name'], missing_fields => ['name'],
+}, 'the required-field error exposes machine-readable omitted fields';
+
+$required_error = eval {
+    $handler->write($engine, {operation => 'insert', assignments => {}});
+    undef;
+} // $@;
+is $required_error->code, 'missing_required_write_fields',
+    'an empty insert still reports its specific required fields';
+is_deeply $required_error->details->{missing_fields}, ['name'],
+    'empty-insert errors retain the omitted field list';
+
+my $engine_required_error = eval {
+    $engine->preview_write(Selecto::Write::Command->new(
+        operation => 'insert', relation => 'records', assignments => {status => 'direct'},
+    ));
+    undef;
+} // $@;
+is $engine_required_error->code, 'missing_required_write_fields',
+    'the engine enforces required fields outside the HTTP handler too';
+
+my $date_error = eval {
+    $handler->write_command($engine, {
+        operation => 'insert', assignments => {name => 'dated', occurred_on => ''},
+    });
+    undef;
+} // $@;
+is $date_error->code, 'invalid_api_write',
+    'empty strings are rejected for date assignments before database execution';
+is $date_error->message,
+    'assignment occurred_on must be an ISO date (YYYY-MM-DD) or null',
+    'date assignment errors identify the field and accepted representation';
+is_deeply $date_error->details, {
+    field => 'occurred_on', type => 'date', expected => 'YYYY-MM-DD or null',
+}, 'date assignment errors include machine-readable field details';
 
 my $scope_error = eval {
     $handler->write($engine, {

@@ -20,6 +20,33 @@ my $result = $adapter->execute_write($command);
 is_deeply($result->to_hash, { operation => 'update', affected_rows => 1 }, 'write result reports logical affected rows');
 is_deeply($dbh->events, ['BEGIN', 'COMMIT'], 'single write is transactional');
 
+my $existing_transaction_dbh = TestSelecto::DBH->new({affected => 1});
+$existing_transaction_dbh->{AutoCommit} = 0;
+my $existing_transaction_adapter = Selecto::PostgreSQL->new(
+    dbh => $existing_transaction_dbh,
+);
+$existing_transaction_adapter->execute_write($command);
+is_deeply $existing_transaction_dbh->events, ['COMMIT'],
+    'managed writes reuse an already-open DBI transaction without begin_work noise';
+
+my $failed_write_dbh = TestSelecto::DBH->new({
+    execute_error => 'invalid input syntax for type date',
+});
+my $failed_write_adapter = Selecto::PostgreSQL->new(dbh => $failed_write_dbh);
+my $execution_error = eval {
+    $failed_write_adapter->execute_write(Selecto::Write::Command->new(
+        operation => 'insert', relation => 'items', assignments => {id => 9},
+        metadata => {returning => ['id']},
+    ));
+    undef;
+} // $@;
+is $execution_error->code, 'query_error',
+    'a false DBI execute result is reported as an execution error';
+isnt $execution_error->code, 'write_returning_missing',
+    'a failed write is not masked as a missing RETURNING row';
+is_deeply $failed_write_dbh->events, ['BEGIN', 'ROLLBACK'],
+    'a false DBI execute result rolls back the managed transaction';
+
 my $external_dbh = TestSelecto::DBH->new({ affected => 1 });
 $external_dbh->{AutoCommit} = 0;
 my $external = Selecto::PostgreSQL->new(dbh => $external_dbh, transaction_mode => 'external');
@@ -60,5 +87,20 @@ eval {
     ));
 };
 is($@->code, 'invalid_identifier', 'write relation cannot smuggle SQL');
+
+my $guard_error = eval {
+    $adapter->preview_write(Selecto::Write::Command->new(
+        operation => 'insert', relation => 'items', assignments => {name => 'unscoped'},
+        scope_predicate => Selecto::Expression->eq('tenant_id', 7),
+    ));
+    undef;
+} // $@;
+is $guard_error->code, 'query_rule_not_evaluable',
+    'an insert missing a query-guard field remains rejected';
+is $guard_error->message, 'query rule requires insert field tenant_id',
+    'the query-guard error identifies the omitted insert field';
+is_deeply $guard_error->details, {
+    field => 'tenant_id', missing_fields => ['tenant_id'],
+}, 'the query-guard error includes a machine-readable missing field';
 
 done_testing;

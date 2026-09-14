@@ -1314,10 +1314,14 @@ sub _execute_compiled_write_in_transaction {
     my ($sth, $affected, %values);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($compiled->{sql});
-        $sth->execute(@{$compiled->{params}});
+        die _dbi_error($self->{dbh}, 'database prepare failed') unless $sth;
+        my $executed = $sth->execute(@{$compiled->{params}});
+        die _dbi_error($sth, 'database write failed') unless defined $executed;
         $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
         if (@{$compiled->{returning} // []}) {
             my @row = $sth->fetchrow_array;
+            die _dbi_error($sth, 'database returning fetch failed')
+                if !@row && eval { $sth->err };
             Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
             @values{@{$compiled->{returning}}} = @row;
         }
@@ -1348,9 +1352,16 @@ sub _transaction {
     }
     my $value;
     my $ok = eval {
-        $self->{dbh}->begin_work;
+        my $auto_commit = eval { $self->{dbh}{AutoCommit} };
+        if (!defined($auto_commit) || $auto_commit) {
+            my $begun = $self->{dbh}->begin_work;
+            die _dbi_error($self->{dbh}, 'database transaction could not begin')
+                unless $begun;
+        }
         $value = $operation->();
-        $self->{dbh}->commit;
+        my $committed = $self->{dbh}->commit;
+        die _dbi_error($self->{dbh}, 'database transaction could not commit')
+            unless $committed;
         1;
     };
     if (!$ok) {
@@ -1359,6 +1370,12 @@ sub _transaction {
         die $error;
     }
     return $value;
+}
+
+sub _dbi_error {
+    my ($handle, $fallback) = @_;
+    my $message = eval { $handle->errstr };
+    return defined($message) && length("$message") ? "$message" : $fallback;
 }
 
 sub _compile_dialect_expression {
