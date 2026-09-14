@@ -157,7 +157,10 @@ sub _compile_write {
         'ON ' . join(' AND ', @matches) . ' ' .
         'WHEN MATCHED THEN UPDATE SET ' . join(', ', @sets) . ' ' .
         'WHEN NOT MATCHED THEN INSERT (' . join(', ', @quoted) . ') VALUES (' . join(', ', @source) . ');';
-    return { sql => $sql, params => \@params };
+    # Keep the shared returning validation on the specialized MERGE path.
+    # SQL Server does not yet implement the portable returning contract; never
+    # execute a mutation while silently dropping requested result fields.
+    return $self->_append_returning($sql, \@params, $command);
 }
 
 sub _compile_mutation_default {
