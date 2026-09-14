@@ -27,10 +27,13 @@ sub new {
 sub next {
     my ($self) = @_;
     return undef if $self->{closed};
-    my (@row, $available);
+    my (@row, $available, $decoded);
     my $ok = eval {
         @row = $self->{sth}->fetchrow_array;
         $available = @row ? 1 : 0;
+        $decoded = [map {
+            $self->{decode}->($row[$_], $self->{types}[$_])
+        } 0 .. $#row] if $available;
         1;
     };
     if (!$ok) {
@@ -42,9 +45,7 @@ sub next {
         $self->close;
         return undef;
     }
-    return [map {
-        $self->{decode}->($row[$_], $self->{types}[$_])
-    } 0 .. $#row];
+    return $decoded;
 }
 
 sub columns { return [@{$_[0]->{columns}}]; }

@@ -216,8 +216,27 @@ sub query ($self, $engine, $body) {
     my @subtables;
 
     if ($has_select) {
+        # Validate caller intent before composing host-mandated output fields.
+        _api_selections($domain, $body->{select}, $self->max_fields);
+        my @required = @{($domain->contract // {})->{required_selected} // []};
+        my %required = map { $_ => 1 } @required;
+        my $field_identity = sub {
+            my ($entry) = @_;
+            return $entry unless ref($entry);
+            return $entry->{field} if ref($entry) eq 'HASH'
+                && ($entry->{alias} // $entry->{field}) eq $entry->{field};
+            return undef;
+        };
+        my %authored = map {
+            my $field = $field_identity->($_);
+            defined($field) ? ($field => $_) : ()
+        } @{$body->{select}};
+        my @selections = (
+            (map { exists($authored{$_}) ? $authored{$_} : $_ } @required),
+            (grep { my $field = $field_identity->($_); !defined($field) || !$required{$field} } @{$body->{select}}),
+        );
         my $selection_plan = _api_selections(
-            $domain, $body->{select}, $self->max_fields,
+            $domain, \@selections, $self->max_fields,
         );
         $query = $query->select($selection_plan->{expressions});
         @subtables = @{$selection_plan->{subtables}};
@@ -248,6 +267,13 @@ sub query ($self, $engine, $body) {
         push @{$applied->{views}}, $view_id
             unless grep { $_ eq $view_id } @{$applied->{views}};
         $query = $query->with_applied_query_library($applied);
+    }
+
+    if (!$has_select) {
+        # Named library definitions are not permission to expose internal fields.
+        my @fields = map { $_->arguments->[0] } @{$query->selections};
+        my $selection_plan = _api_selections($domain, \@fields, $self->max_fields);
+        $query = $query->replace_selections($selection_plan->{expressions});
     }
 
     if (@segments) {
@@ -314,7 +340,12 @@ sub query ($self, $engine, $body) {
         }
     }
 
-    my $result = $engine->all($query);
+    # A zero-sized page still validates the compiled query, but does not fetch
+    # data. SQL Server cannot execute FETCH NEXT 0, so compile with one solely
+    # to obtain validated column metadata; never execute that statement.
+    my $result = $limit == 0
+        ? {columns => $engine->compile($query->limit(1))->columns, rows => []}
+        : $engine->all($query);
     Selecto::Error->throw(
         'invalid_api_host', 'Selecto adapter returned an invalid result',
     ) unless ref($result) eq 'HASH'
@@ -855,6 +886,7 @@ sub _shape_result_rows ($result, $subtables, $row_format) {
                 {column => $result->{columns}[$index]},
             ) unless $ok && ref($decoded) eq 'ARRAY'
                 && !grep { ref($_) ne 'HASH' } @$decoded;
+            $decoded = _collection_json_value($decoded);
             $row->[$index] = $row_format eq 'objects' ? $decoded : [map {
                 my $record = $_;
                 [map { $record->{$_} } @{$specification->{columns}}]
@@ -872,6 +904,22 @@ sub _shape_result_rows ($result, $subtables, $row_format) {
         @record{@columns} = @$row;
         \%record;
     } @{$result->{rows}}];
+}
+
+sub _collection_json_value ($value) {
+    return [map { _collection_json_value($_) } @$value] if ref($value) eq 'ARRAY';
+    return {map { $_ => _collection_json_value($value->{$_}) } keys %$value}
+        if ref($value) eq 'HASH';
+    return $value unless defined($value) && !ref($value);
+    # Preserve strings and safe numeric JSON types. Comparing decimal digits
+    # avoids routing exact 64-bit IDs through floating-point arithmetic.
+    my $wire = JSON::PP->new->allow_nonref(1)->encode($value);
+    if ($wire =~ /\A-?([0-9]+)\z/) {
+        my $digits = $1;
+        return substr($wire, 0) if length($digits) > 16
+            || (length($digits) == 16 && $digits gt '9007199254740991');
+    }
+    return $value;
 }
 
 sub _string_array ($value, $label, $maximum, $required = 0) {

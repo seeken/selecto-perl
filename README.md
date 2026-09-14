@@ -12,6 +12,25 @@ centrally certified for the 2.8 governed co-domain/computed-eligibility profile.
 
 ## Current surface
 
+- query timezones on raw epoch-datetime fields convert numeric storage to an
+  instant before applying the zone on PostgreSQL and DuckDB. Explicit temporal
+  expressions and formatted selections are converted only once. Without an
+  explicit timezone, raw epoch selections retain their exact numeric storage
+  representation. `t/epoch_timezone.t` checks these boundaries with synthetic
+  data, alongside UTC fields, NULLs, negative microseconds, DST folds, aliases,
+  filters and required scope. PostgreSQL and DuckDB pass the raw-result checks;
+- DuckDB uses adapter-owned final-result transport for exact timestamp/decimal
+  decoding, normalized scalar booleans, streaming and write RETURNING. Numeric
+  input avoids the driver's automatic floating-point inference; governed
+  numeric comparisons establish each parameter's own scale. Native relational
+  operations precede serialization. See [DuckDB result transport](docs/duckdb-result-transport.md)
+  for the implementation boundary and executable coverage;
+- DuckDB temporal formatters allocate a bound value for every repeated SQL
+  occurrence, including quarters and named-zone RFC3339/offsets. PostgreSQL DATE
+  interchange formats explicitly interpret midnight as TIMESTAMP in the
+  requested zone, avoiding the session-dependent DATE overload. The live
+  `t/temporal_format_bindings.t` compares all 20 formats across four temporal
+  types and five zones, with fixed midnight expectations in non-UTC sessions;
 - strict simplified and canonical schema-v1 JSON domain parsing;
 - validated root and arbitrary-depth relationship field resolution with
   collision-safe SQL aliases and retained relationship lineage;
@@ -33,8 +52,8 @@ centrally certified for the 2.8 governed co-domain/computed-eligibility profile.
 - field, literal, comparison, null, membership, conjunction, aggregate,
   window, and PostgreSQL full-text expressions, plus governed PostgreSQL
   date/time format expressions;
-- PostgreSQL compilation with quoted identifiers and bound `$1` parameters;
-  SQLite, DuckDB, MySQL, MariaDB, and Microsoft SQL Server compilation with native
+- PostgreSQL and DuckDB compilation with quoted identifiers and bound `$1` parameters;
+  SQLite, MySQL, MariaDB, and Microsoft SQL Server compilation with native
   identifier quoting and DBI `?` parameters;
 - eager and row-streaming DBI execution with stable columns and
   backend-specific value normalization;
@@ -323,6 +342,15 @@ PostgreSQL additionally implements correlated `lateral_join`, typed
 configurations and modes are allowlisted; search strings and JSON paths remain
 bound parameters. Rollups continue to use `group_by_rollup` and grouping
 metadata as described below.
+
+PostgreSQL and DuckDB reuse the parameter identities of governed grouping
+expressions in selections, `GROUPING` metadata, and ordering. This includes
+timezone-adjusted fields and date formats; equal values bound under different
+parameter names do not identify the same SQL grouping expression. DuckDB uses
+native numbered parameters (also for writes and nested queries). Anonymous DBI
+adapters retain separate parameter occurrences instead of copying bound SQL
+without its values. Formatter-local timezone suppression and nested query roots
+remain separate compilation contexts.
 
 For result sets that should not be accumulated into an array by Selecto, use
 the row-streaming API and close it early when iteration stops:
@@ -809,6 +837,13 @@ SELECTO_CERT_PERL_MARIADB_URL='mysql://...' \
   --profiles capability_truth,core_query,portable_write
 ```
 
+For MSSQL comparisons against domain-resolved decimal/numeric fields, parameters
+retain their own exact scale through generated DECIMAL casts. Equality, range,
+BETWEEN and IN predicates keep values separately bound; numeric-looking text
+fields remain text. Precision beyond 38 digits fails explicitly. This does not
+establish coverage for domainless write expressions or unresolved derived-field
+types; those paths require separate typed compilation and execution evidence.
+
 Microsoft SQL Server uses `DBD::ODBC`. The default driver name is
 `ODBC Driver 18 for SQL Server`; set `SELECTO_PERL_MSSQL_ODBC_DRIVER` when the
 installed driver has a different name or when supplying a FreeTDS driver path:
@@ -833,6 +868,20 @@ assignments. It does not yet certify opaque authorization grants, host action
 execution adapters, audit delivery, or replay resistance. The broader
 certificate is not proof of arbitrary schemas, SQL, data, driver settings,
 concurrency, security, or performance.
+
+## Query-enforced candidate admission
+
+Query-enforced INSERT admission now compares finite decimal/exponent scalars
+exactly, using compact significands and arbitrary-integer exponents rather than
+native floating point. NaN/infinity operands fail as `query_rule_not_evaluable`
+instead of producing undefined-comparison warnings or accidental equality.
+IN evaluates all comparable operands, so an earlier match cannot hide a later
+non-finite value. NULL comparison still yields SQL unknown. Trusted tenant
+scope requires a positive equality or IN over defined, non-reference scalars;
+NULL, query-only filters and OR/NOT branches cannot provide that authority.
+The shared 239-case scalar fixture is packaged in `t/fixtures/` and executed by
+`t/query_enforcement_scalar.t`. This is pure candidate-admission evidence, not
+execution of every rule against every database or database-collation emulation.
 
 ## Explicitly deferred
 

@@ -391,6 +391,28 @@ like(
 );
 is_deeply($through_collection->params, ['E'],
     'related through collection constants remain bound parameters');
+my $filtered_through_domain = Selecto::Domain->new(
+    name => 'Filtered invoice tags', table => 'invoices', primary_key => 'id',
+    fields => {id => 'integer'},
+    associations => {tags => {
+        table => 'tags', fields => {id => 'integer', label => 'string', active => 'integer'},
+        owner_key => 'id', related_key => 'id', target_primary_key => 'id', cardinality => 'many',
+        where => {active => 2},
+        through => {table => 'invoice_tags', owner_key => 'invoice_id', related_key => 'tag_id',
+            where => {active => 1}},
+    }},
+);
+for my $dialect (Selecto::PostgreSQL->new(dbh => $dbh), Selecto::SQLite->new(dbh => $dbh)) {
+    my $filtered_engine = Selecto::Engine->new(domain => $filtered_through_domain, adapter => $dialect);
+    my $compiled = $filtered_engine->compile($filtered_engine->query->select(
+        Selecto::Expression->literal('marker')->as('marker'),
+        Selecto::Expression->related_collection('tags', ['label'])->as('tags'),
+    )->where(Selecto::Expression->eq('id',7)));
+    is_deeply $compiled->params, ['marker',2,1,7],
+        $dialect->name . ' binds each through collection predicate exactly once in SQL order';
+    like $compiled->sql, qr/"c_tags"\."active" = .* WHERE .*"ct_tags"\."active" = /,
+        $dialect->name . ' emits target predicates before bridge predicates';
+}
 my $direct_scoped_join = $through_engine->compile(
     $through_engine->query->select('id', 'notes.body')
 );

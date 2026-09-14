@@ -68,4 +68,51 @@ my $evidence = Selecto::QueryEnforcement->capture(
 unlike($evidence->source_metadata->{predicate_fingerprint}, qr/active/, 'metadata contains only a digest');
 is(Selecto::QueryEnforcement::shape($evidence->predicate), 'and(eq,eq)', 'shape is deterministic');
 
+my $tenant_domain = Selecto::Domain->new(
+    name => 'Scoped Items', table => 'items', fields => $domain->fields,
+    tenant_field => 'tenant_id',
+);
+my $tenant_engine = Selecto::Engine->new(domain => $tenant_domain, adapter => $engine->adapter);
+my $tenant_query = $tenant_engine->query->where(Selecto::Expression->eq('tenant_id', 7));
+for my $scope (
+    undef,
+    Selecto::Expression->eq('tenant_id', undef),
+    Selecto::Expression->eq('tenant_id', []),
+    Selecto::Expression->not(Selecto::Expression->eq('tenant_id', 7)),
+    Selecto::Expression->any(Selecto::Expression->eq('tenant_id', 7), Selecto::Expression->eq('id', 1)),
+    Selecto::Expression->in('tenant_id', [7, undef]),
+) {
+    $error = exception { $tenant_engine->enforce_query(Selecto::Write::Command->new(
+        operation => 'update', relation => 'items', assignments => {status => 'must-not-apply'},
+        predicate => Selecto::Expression->eq('tenant_id', 7), scope_predicate => $scope,
+    ), $tenant_query) };
+    is($error->code, 'missing_tenant_scope', 'query/caller/NULL/negative/disjunctive scope cannot supply tenant authority');
+}
+for my $scope (
+    Selecto::Expression->eq('tenant_id', 7),
+    Selecto::Expression->in('tenant_id', [7]),
+    Selecto::Expression->all(Selecto::Expression->eq('id', 1), Selecto::Expression->eq('tenant_id', 7)),
+) {
+    my $command = $tenant_engine->enforce_query(Selecto::Write::Command->new(
+        operation => 'update', relation => 'items', assignments => {status => 'changed'},
+        predicate => Selecto::Expression->eq('id', 1), scope_predicate => $scope,
+    ), $tenant_query);
+    my $result = $tenant_engine->execute_write($command);
+    is($result->{affected_rows}, 1, 'positive scalar tenant scope executes against the native adapter');
+}
+is($dbh->selectrow_array(q{SELECT status FROM items WHERE id = 1}), 'changed', 'scope rejection preserved data');
+
+for my $probe (
+    ['NaN', Selecto::Expression->eq('status', '1')],
+    ['active', Selecto::Expression->in('status', ['active', 'NaN'])],
+) {
+    my $command = $engine->enforce_query(Selecto::Write::Command->new(
+        operation => 'insert', relation => 'items',
+        assignments => {id => 2, tenant_id => 7, status => $probe->[0], total => '10.5'},
+    ), $engine->query->where($probe->[1]));
+    $error = exception { $engine->execute_write($command) };
+    is($error->code, 'query_rule_not_evaluable', 'non-finite admission rejects through public write execution');
+    is($dbh->selectrow_array('SELECT count(*) FROM items WHERE id = 2'), 0, 'rejected candidate was not persisted');
+}
+
 done_testing;

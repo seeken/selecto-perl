@@ -24,6 +24,10 @@ has transaction_mode => 'managed';
 sub feature_inventory { return [@FEATURE_INVENTORY]; }
 sub write_capabilities { return { %WRITE_CAPABILITIES }; }
 
+# Anonymous DBI parameters are separate occurrences, even when their values
+# happen to be equal. Dialects with reusable numbered parameters opt in.
+sub _reuses_parameter_identity { return 0; }
+
 sub quote_identifier {
     my ($self, $identifier) = @_;
     my $quoted = defined($identifier) ? "$identifier" : '';
@@ -187,6 +191,18 @@ sub _compile_single {
         {columns => \@duplicate_columns},
     ) if @duplicate_columns;
 
+    my $groups = $query->groups;
+    local $self->{_group_expression_sql} = {};
+    local $self->{_group_expression_params} = \@params;
+    if ($self->_reuses_parameter_identity) {
+        # Compile governed group expressions before their consumers. This also
+        # handles GROUPING before its dimension, unselected sort keys, and a
+        # selected expression that contains a grouped expression.
+        for my $group (@$groups) {
+            my $group_sql = $self->_compile_expression($domain, $group, \@params);
+            $self->{_group_expression_sql}{$self->_group_expression_key($domain, $group)} = $group_sql;
+        }
+    }
     my %compiled_selections;
     my %selection_positions;
     my $selection_position = 0;
@@ -218,12 +234,11 @@ sub _compile_single {
             ? $predicates[0]
             : join(' AND ', map { "($_)" } @predicates));
     }
-    my $groups = $query->groups;
     Selecto::Error->throw('unsupported_feature', 'adapter does not support rollups')
         if $query->grouping_mode eq 'rollup' && !$self->supports('rollup');
     my $group_sql = join(', ', map {
         my $key = _expression_key($_);
-        exists($compiled_selections{$key})
+        $self->_reuses_parameter_identity && exists($compiled_selections{$key})
             ? $compiled_selections{$key}
             : $self->_compile_expression($domain, $_, \@params)
     } @$groups);
@@ -254,7 +269,11 @@ sub _compile_single {
             : $sql . ' ORDER BY ' . $order_sql;
     } elsif (@$orders) {
         $sql .= ' ORDER BY ' . join(', ', map {
-            $self->_compile_expression($domain, $_->[0], \@params) . ' ' . uc($_->[1])
+            my $key = _expression_key($_->[0]);
+            my $expression_sql = @$groups && $self->_reuses_parameter_identity && exists($compiled_selections{$key})
+                ? $compiled_selections{$key}
+                : $self->_compile_expression($domain, $_->[0], \@params);
+            $expression_sql . ' ' . uc($_->[1])
         } @$orders);
     }
     $sql .= $self->_compile_pagination(
@@ -278,6 +297,16 @@ sub _shift_placeholders {
 
 sub _renumber_placeholders {
     my ($self, $sql, $offset) = @_;
+    return $sql;
+}
+
+sub _renumber_dollar_placeholders {
+    my ($self, $sql, $offset) = @_;
+    # Generated identifiers and format literals may themselves contain $1.
+    # Only parameter tokens outside quoted SQL are shifted for nested queries.
+    $sql =~ s{('(?:''|[^'])*'|"(?:""|[^"])*")|\$(\d+)}{
+        defined($1) ? $1 : q{$} . ($2 + $offset)
+    }gex;
     return $sql;
 }
 
@@ -456,8 +485,8 @@ sub execute_query {
     my ($self, $statement) = @_;
     my ($sth, @rows);
     my $ok = eval {
-        $sth = $self->{dbh}->prepare($statement->sql);
-        $sth->execute(@{$statement->params});
+        $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
+        $self->_execute_statement($sth, $statement->params);
         my @types = $self->_column_types($sth);
         while (my @row = $sth->fetchrow_array) {
             push @rows, [map { $self->_decode($row[$_], $types[$_]) } 0 .. $#row];
@@ -479,9 +508,9 @@ sub stream_query {
         unless defined($fetch_size) && !ref($fetch_size) && "$fetch_size" =~ /\A[1-9]\d*\z/;
     my ($sth, @types);
     my $ok = eval {
-        $sth = $self->{dbh}->prepare($statement->sql);
+        $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
         eval { $sth->{RowCacheSize} = int($fetch_size) };
-        $sth->execute(@{$statement->params});
+        $self->_execute_statement($sth, $statement->params);
         @types = $self->_column_types($sth);
         1;
     };
@@ -494,6 +523,9 @@ sub stream_query {
         normalize_error => sub { return $self->normalize_error($_[0]); },
     );
 }
+
+sub _query_transport_sql { return $_[1]->sql; }
+sub _execute_statement { return $_[1]->execute(@{$_[2]}); }
 
 sub preview_write {
     my ($self, $command) = @_;
@@ -567,12 +599,24 @@ sub _expression_key {
     return _value_key($expression);
 }
 
+sub _group_expression_key {
+    my ($self, $domain, $expression) = @_;
+    # Formatter implementations temporarily suppress field localization or use
+    # another zone. Those are different expressions, as are correlated roots.
+    return _value_key([
+        "$domain", $self->_root_alias, $self->{_timezone},
+        $self->{_suppress_field_timezone} ? 1 : 0, $expression,
+    ]);
+}
+
 sub _value_key {
     my ($value) = @_;
     return 'u' unless defined $value;
     if (blessed($value) && $value->isa('Selecto::Expression')) {
         return 'e:' . $value->kind . ':' . _value_key($value->arguments);
     }
+    return 'b:' . ($value ? 1 : 0)
+        if blessed($value) && $value->isa('JSON::PP::Boolean');
     return 'a:[' . join(',', map { _value_key($_) } @$value) . ']'
         if ref($value) eq 'ARRAY';
     return 'h:{' . join(',', map { _value_key($_) . '=' . _value_key($value->{$_}) } sort keys %$value) . '}'
@@ -595,6 +639,10 @@ sub _compile_expression {
     my ($self, $domain, $expression, $params, $compiled_selections) = @_;
     Selecto::Error->throw('invalid_query', 'expected an expression')
         unless blessed($expression) && $expression->isa('Selecto::Expression');
+    if (defined($self->{_group_expression_params}) && $self->{_group_expression_params} == $params) {
+        my $key = $self->_group_expression_key($domain, $expression);
+        return $self->{_group_expression_sql}{$key} if exists $self->{_group_expression_sql}{$key};
+    }
     my $kind = $expression->kind;
     my $arguments = $expression->arguments;
     return $self->_field_sql($domain, $arguments->[0], $params) if $kind eq 'field';
@@ -638,7 +686,7 @@ sub _compile_expression {
             unless ref($fields) eq 'ARRAY' && @$fields;
         return 'GROUPING(' . join(', ', map {
             my $key = _expression_key($_);
-            defined($compiled_selections) && exists($compiled_selections->{$key})
+            $self->_reuses_parameter_identity && defined($compiled_selections) && exists($compiled_selections->{$key})
                 ? $compiled_selections->{$key}
                 : $self->_compile_expression($domain, $_, $params)
         } @$fields) . ')';
@@ -841,9 +889,6 @@ sub _compile_related_collection {
             $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key) .
             ' = ' . $self->_qualified($self->_root_alias, $association->source_scope_key);
     }
-    push @predicates, $self->_constant_join_predicates(
-        $alias, $association->where, $params
-    );
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
         my $quoted_bridge_alias = $self->quote_identifier($bridge_alias);
@@ -864,14 +909,20 @@ sub _compile_related_collection {
                 $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
                 ' = ' . $quoted_alias . '.' . $self->quote_identifier($through->{target_scope_key});
         }
-        push @predicates, $self->_constant_join_predicates(
-            $bridge_alias, $through->{where}, $params
-        );
+        # ON precedes WHERE in the emitted SQL, so bind target predicates first.
+        # Do not bind the discarded direct-association predicate for this path.
         push @target_on, $self->_constant_join_predicates(
             $alias, $association->where, $params
         );
+        push @predicates, $self->_constant_join_predicates(
+            $bridge_alias, $through->{where}, $params
+        );
         $from = "$bridge_table AS $quoted_bridge_alias INNER JOIN $table AS $quoted_alias ON " .
             join(' AND ', @target_on);
+    } else {
+        push @predicates, $self->_constant_join_predicates(
+            $alias, $association->where, $params
+        );
     }
     my $where = join(' AND ', @predicates);
     my $order = defined($association->target_primary_key)
@@ -1253,10 +1304,13 @@ sub _append_returning {
     if (@$returning) {
         Selecto::Error->throw('write_capability_missing', 'adapter does not support returning')
             unless $self->write_capabilities->{returning};
-        $sql .= ' RETURNING ' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$returning);
+        $sql .= ' RETURNING ' . join(', ', map { $self->_returning_field_sql(Selecto::Identifier::checked($_)) } @$returning);
     }
     return { sql => $sql, params => $params, returning => [@$returning] };
 }
+
+sub _returning_field_sql { return $_[0]->quote_identifier($_[1]); }
+sub _decode_returning_values { my ($self, $sth, @values) = @_; return @values; }
 
 sub _compile_write_predicate {
     my ($self, $expression, $params) = @_;
@@ -1315,7 +1369,7 @@ sub _execute_compiled_write_in_transaction {
     my $ok = eval {
         $sth = $self->{dbh}->prepare($compiled->{sql});
         die _dbi_error($self->{dbh}, 'database prepare failed') unless $sth;
-        my $executed = $sth->execute(@{$compiled->{params}});
+        my $executed = $self->_execute_statement($sth, $compiled->{params});
         die _dbi_error($sth, 'database write failed') unless defined $executed;
         $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
         if (@{$compiled->{returning} // []}) {
@@ -1323,7 +1377,7 @@ sub _execute_compiled_write_in_transaction {
             die _dbi_error($sth, 'database returning fetch failed')
                 if !@row && eval { $sth->err };
             Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
-            @values{@{$compiled->{returning}}} = @row;
+            @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row);
         }
         1;
     };

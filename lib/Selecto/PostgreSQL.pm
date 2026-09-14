@@ -9,6 +9,7 @@ has rollup_sort_fix => 'auto';
 
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
+sub _reuses_parameter_identity { return 1; }
 
 sub placeholder {
     my ($self, $index) = @_;
@@ -53,8 +54,7 @@ sub write_capabilities {
 
 sub _renumber_placeholders {
     my ($self, $sql, $offset) = @_;
-    $sql =~ s/\$(\d+)/q{$} . ($1 + $offset)/ge;
-    return $sql;
+    return $self->_renumber_dollar_placeholders($sql, $offset);
 }
 
 sub _compile_related_collection_sql {
@@ -86,7 +86,7 @@ sub _compile_dialect_expression {
         local $self->{_suppress_field_timezone} = 1;
         my $sql = 'TO_TIMESTAMP(' . $self->_compile_expression($domain, $field, $params) . ')';
         return defined($self->{_timezone})
-            ? $self->_compile_timezone_sql($sql, 'epoch_datetime', $self->{_timezone}, $params)
+            ? $self->_compile_timezone_sql($sql, 'utc_datetime', $self->{_timezone}, $params)
             : $sql;
     }
     if ($kind eq 'datetime_format') {
@@ -145,6 +145,10 @@ sub _compile_dialect_expression {
             local $self->{_timezone};
             my $instant_sql = $self->_compile_expression($domain, $field, $params);
             if ($resolved->{type} ne 'utc_datetime' && $resolved->{type} ne 'epoch_datetime') {
+                # DATE has no time or zone. PostgreSQL otherwise resolves its
+                # AT TIME ZONE overload through a session-dependent timestamptz.
+                $instant_sql = 'CAST(' . $instant_sql . ' AS TIMESTAMP)'
+                    if $resolved->{type} eq 'date';
                 if (defined($timezone) && $timezone ne 'UTC') {
                     push @$params, $timezone;
                     $instant_sql = '(' . $instant_sql . ' AT TIME ZONE ' .
@@ -207,6 +211,9 @@ sub _compile_dialect_expression {
 
 sub _compile_timezone_sql {
     my ($self, $sql, $type, $timezone, $params) = @_;
+    # Raw epoch fields are numbers; explicit epoch_datetime expressions have
+    # already become instants and call this hook with utc_datetime instead.
+    $sql = 'TO_TIMESTAMP(' . $sql . ')' if $type eq 'epoch_datetime';
     push @$params, $timezone;
     return '(' . $sql . ' AT TIME ZONE ' . $self->placeholder(scalar @$params) . ')';
 }
@@ -232,7 +239,7 @@ sub _compile_rfc3339_instant_sql {
 
 sub _compile_timezone_offset_sql {
     my ($self, $sql, $timezone, $params, $placeholder) = @_;
-    return q{'+00:00'} unless defined($timezone) && $timezone ne 'UTC';
+    return q{CAST('+00:00' AS TEXT)} unless defined($timezone) && $timezone ne 'UTC';
     unless (defined $placeholder) {
         push @$params, $timezone;
         $placeholder = $self->placeholder(scalar @$params);
