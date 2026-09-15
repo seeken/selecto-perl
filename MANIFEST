@@ -31,6 +31,7 @@ lib/Selecto/Error.pm
 lib/Selecto/Expression.pm
 lib/Selecto/Files.pm
 lib/Selecto/Identifier.pm
+lib/Selecto/Importer.pm
 lib/Selecto/DateFormat.pm
 lib/Selecto/MariaDB.pm
 lib/Selecto/MySQL.pm
@@ -93,6 +94,7 @@ t/mssql_decimal_scale.t
 t/epoch_timezone.t
 t/temporal_format_bindings.t
 t/grouped_expression_bindings.t
+t/importer.t
 t/data_rules.t
 t/fixtures/data_rules/baseline.contract.json
 t/fixtures/data_rules/baseline.cases.json

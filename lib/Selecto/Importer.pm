@@ -505,14 +505,19 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
 
 sub _contract ($self) {
     return $self->{_contract} if $self->{_contract};
-    my $extension = $self->domain->contract->{extensions}{importer};
+    my $extension = $self->domain->imports;
     Selecto::Error->throw('import_not_enabled', 'This domain does not publish an importer contract')
         unless ref($extension) eq 'HASH' && $extension->{enabled};
     _reject_unknown($extension, [qw(contract_version enabled field_policy fields actions key_sets idempotency)], 'importer extension');
     Selecto::Error->throw('invalid_import_contract', 'importer contract_version must be 1')
-        unless ($extension->{contract_version} // 1) == 1;
+        unless exists($extension->{contract_version}) && !ref($extension->{contract_version})
+            && "$extension->{contract_version}" eq '1';
+    Selecto::Error->throw('invalid_import_contract', 'importer enabled must be boolean true')
+        unless JSON::PP::is_bool($extension->{enabled})
+            || (!ref($extension->{enabled}) && "$extension->{enabled}" eq '1');
     Selecto::Error->throw('invalid_import_contract', 'importer field_policy must be declared_only')
-        unless ($extension->{field_policy} // 'declared_only') eq 'declared_only';
+        unless defined($extension->{field_policy}) && !ref($extension->{field_policy})
+            && $extension->{field_policy} eq 'declared_only';
     _object($extension->{fields}, 'importer fields');
     my $domain_fields = $self->domain->fields;
     my %fields;
@@ -542,17 +547,21 @@ sub _contract ($self) {
             Selecto::Error->throw('invalid_import_contract', "Trusted importer field $name needs trusted_provider")
                 unless defined($spec->{trusted_provider}) && !ref($spec->{trusted_provider}) && length($spec->{trusted_provider});
         }
+        my $header_aliases = _string_list($spec->{header_aliases} // [], "Importer field $name header_aliases");
         my $transforms = $spec->{transforms} // [];
         Selecto::Error->throw('invalid_import_contract', "Importer field $name transforms must be an array") unless ref($transforms) eq 'ARRAY';
+        my %seen_transform;
         for my $transform (@$transforms) {
             Selecto::Error->throw('invalid_import_contract', "Importer field $name has invalid transform")
-                unless defined($transform) && !ref($transform) && $transform =~ /\A(?:trim|uppercase|lowercase|normalize_whitespace|empty_to_null)\z/;
+                unless defined($transform) && !ref($transform)
+                    && $transform =~ /\A(?:trim|uppercase|lowercase|normalize_whitespace|empty_to_null)\z/
+                    && !$seen_transform{$transform}++;
         }
         my $blank_policy = $spec->{blank_policy} // 'omit';
         Selecto::Error->throw('invalid_import_contract', "Importer field $name has invalid blank_policy")
             unless $blank_policy =~ /\A(?:omit|empty|null|error)\z/;
         $fields{$name} = {
-            sources => [@$sources], header_aliases => [@{$spec->{header_aliases} // []}],
+            sources => [@$sources], header_aliases => $header_aliases,
             transforms => [@$transforms], blank_policy => $blank_policy,
             ($match_only ? (match_only => JSON::PP::true) : ()),
             (!$match_only ? (write_on => \@write_on) : ()),
@@ -570,9 +579,9 @@ sub _contract ($self) {
         my $domain_action = $domain_actions->{$action_id};
         Selecto::Error->throw('invalid_import_contract', "Importer action $action_id is not a published domain action")
             unless ref($domain_action) eq 'HASH';
-        my %domain_inputs = map { $_->{id} => $_ } grep {
-            ref($_) eq 'HASH' && defined($_->{id})
-        } @{$domain_action->{inputs} // []};
+        my $domain_inputs = $domain_action->{inputs} // {};
+        _object($domain_inputs, "domain action $action_id inputs");
+        my %domain_inputs = %$domain_inputs;
         _object($extension_action->{inputs}, "importer action $action_id inputs");
         my %inputs;
         for my $name (keys %{$extension_action->{inputs}}) {
@@ -593,18 +602,22 @@ sub _contract ($self) {
                 Selecto::Error->throw('invalid_import_contract', "Trusted importer action input $action_id.$name needs trusted_provider")
                     unless defined($spec->{trusted_provider}) && !ref($spec->{trusted_provider}) && length($spec->{trusted_provider});
             }
+            my $header_aliases = _string_list($spec->{header_aliases} // [], "Importer action $action_id input $name header_aliases");
             my $transforms = $spec->{transforms} // [];
             Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name transforms must be an array")
                 unless ref($transforms) eq 'ARRAY';
+            my %seen_transform;
             for my $transform (@$transforms) {
                 Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name has invalid transform")
-                    unless defined($transform) && !ref($transform) && $transform =~ /\A(?:trim|uppercase|lowercase|normalize_whitespace|empty_to_null)\z/;
+                    unless defined($transform) && !ref($transform)
+                        && $transform =~ /\A(?:trim|uppercase|lowercase|normalize_whitespace|empty_to_null)\z/
+                        && !$seen_transform{$transform}++;
             }
             my $blank_policy = $spec->{blank_policy} // 'omit';
             Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name has invalid blank_policy")
                 unless $blank_policy =~ /\A(?:omit|empty|null|error)\z/;
             $inputs{$name} = {
-                sources => [@$sources], header_aliases => [@{$spec->{header_aliases} // []}],
+                sources => [@$sources], header_aliases => $header_aliases,
                 transforms => [@$transforms], blank_policy => $blank_policy,
                 label => $domain_inputs{$name}{label} // $name,
                 type => $domain_inputs{$name}{type} // 'string',
@@ -632,20 +645,22 @@ sub _contract ($self) {
         _reject_unknown($key, [qw(id label fields cardinality allowed_on_match allowed_on_missing default_on_match default_on_missing)], 'importer key set');
         my $id = _string($key->{id}, 'importer key set id');
         Selecto::Error->throw('invalid_import_contract', "Duplicate importer key set $id") if $key_ids{$id}++;
+        _string($key->{label}, "Importer key set $id label") if exists $key->{label};
         my $key_fields = $key->{fields};
         Selecto::Error->throw('invalid_import_contract', "Importer key set $id fields must be a non-empty array")
             unless ref($key_fields) eq 'ARRAY' && @$key_fields;
+        my %seen_key_field;
         for my $field (@$key_fields) {
             Selecto::Error->throw('invalid_import_contract', "Importer key set $id uses non-importable field $field")
-                unless exists $fields{$field};
+                if !defined($field) || ref($field) || !exists($fields{$field}) || $seen_key_field{$field}++;
         }
         my $cardinality = $key->{cardinality} // 'zero_or_one';
         Selecto::Error->throw('invalid_import_contract', "Importer key set $id must have zero_or_one cardinality")
             unless $cardinality eq 'zero_or_one';
         my $on_match = $key->{allowed_on_match} // [qw(update skip error)];
         my $on_missing = $key->{allowed_on_missing} // [qw(insert skip error)];
-        _allowed_decisions($on_match, "Importer key set $id allowed_on_match");
-        _allowed_decisions($on_missing, "Importer key set $id allowed_on_missing");
+        _allowed_decisions($on_match, [qw(update skip error)], "Importer key set $id allowed_on_match");
+        _allowed_decisions($on_missing, [qw(insert skip error)], "Importer key set $id allowed_on_missing");
         my $default_match = $key->{default_on_match} // $on_match->[0];
         my $default_missing = $key->{default_on_missing} // $on_missing->[0];
         _choice($default_match, $on_match, "Importer key set $id default_on_match");
@@ -656,10 +671,16 @@ sub _contract ($self) {
             default_on_match => $default_match, default_on_missing => $default_missing,
         };
     }
+    my $idempotency = $extension->{idempotency} // {supported => JSON::PP::false};
+    _object($idempotency, 'importer idempotency');
+    _reject_unknown($idempotency, ['supported'], 'importer idempotency');
+    my $supported = $idempotency->{supported} // JSON::PP::false;
+    Selecto::Error->throw('invalid_import_contract', 'importer idempotency supported must be boolean')
+        unless JSON::PP::is_bool($supported) || (!ref($supported) && "$supported" =~ /\A(?:0|1)\z/);
     $self->{_contract} = {
         contract_version => 1, enabled => JSON::PP::true, field_policy => 'declared_only',
         fields => \%fields, actions => \%actions, key_sets => \@normalized_keys,
-        idempotency => _clone($extension->{idempotency} // {supported => JSON::PP::false}),
+        idempotency => {supported => $supported ? JSON::PP::true : JSON::PP::false},
     };
     return $self->{_contract};
 }
@@ -711,13 +732,14 @@ sub _normalize_errors ($value) {
     return {mode => $mode};
 }
 
-sub _allowed_decisions ($values, $label) {
+sub _allowed_decisions ($values, $allowed_values, $label) {
     Selecto::Error->throw('invalid_import_contract', "$label must be a non-empty array")
         unless ref($values) eq 'ARRAY' && @$values;
     my %seen;
+    my %allowed = map { $_ => 1 } @$allowed_values;
     for my $value (@$values) {
         Selecto::Error->throw('invalid_import_contract', "$label has invalid value")
-            unless defined($value) && !ref($value) && $value =~ /\A(?:insert|update|skip|error)\z/ && !$seen{$value}++;
+            unless defined($value) && !ref($value) && $allowed{$value} && !$seen{$value}++;
     }
 }
 
@@ -725,6 +747,18 @@ sub _choice ($value, $choices, $label) {
     Selecto::Error->throw('invalid_import_configuration', "$label is not allowed", {value => $value})
         unless defined($value) && !ref($value) && grep { $_ eq $value } @$choices;
     return $value;
+}
+
+sub _string_list ($values, $label) {
+    Selecto::Error->throw('invalid_import_contract', "$label must be an array")
+        unless ref($values) eq 'ARRAY';
+    my (%seen, @result);
+    for my $value (@$values) {
+        Selecto::Error->throw('invalid_import_contract', "$label values must be unique non-empty strings")
+            unless defined($value) && !ref($value) && length($value) && !$seen{$value}++;
+        push @result, "$value";
+    }
+    return \@result;
 }
 
 sub _blank ($value) { return !defined($value) || (!ref($value) && $value =~ /\A\s*\z/); }

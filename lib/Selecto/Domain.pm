@@ -14,7 +14,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
     default_selected required_selected required_order_by
     filters functions query_members published_views detail_actions capabilities
-    source_relationships choice_sources writes actions extensions columns custom_columns
+    source_relationships choice_sources writes actions imports extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
     query_library co_domains domain_dependencies operations experiences rules
 );
@@ -401,6 +401,26 @@ sub _validate_action_eligibility {
     for my $action_id (sort keys %$actions) {
         my $action = $actions->{$action_id};
         _object($action, "action $action_id");
+        if (exists $action->{inputs}) {
+            my $inputs = $action->{inputs};
+            _object($inputs, "action $action_id inputs");
+            for my $input_id (sort keys %$inputs) {
+                _identifier($input_id, "action $action_id input");
+                my $input = $inputs->{$input_id};
+                _object($input, "action $action_id input $input_id");
+                if (exists $input->{type}) {
+                    _nonblank_string($input->{type}, "action $action_id input $input_id type");
+                }
+                if (exists $input->{required}) {
+                    my $required = $input->{required};
+                    my $boolean = JSON::PP::is_bool($required)
+                        || (!ref($required) && "$required" =~ /\A(?:0|1)\z/);
+                    Selecto::Error->throw(
+                        'invalid_domain', "action $action_id input $input_id required must be boolean",
+                    ) unless $boolean;
+                }
+            }
+        }
         next unless exists $action->{selection};
         my $selection = $action->{selection};
         _object($selection, "action $action_id selection");
@@ -1105,6 +1125,7 @@ sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract})
 sub rules        { return $_[0]->{rules}; }
 sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
 sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
+sub imports      { my $contract = $_[0]->contract // {}; return dclone($contract->{imports} // {}); }
 sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }
