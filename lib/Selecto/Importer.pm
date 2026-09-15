@@ -9,6 +9,7 @@ use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Text::CSV ();
+use Selecto::DateShortcut ();
 use Selecto::Domain ();
 use Selecto::Error ();
 
@@ -32,6 +33,20 @@ sub new ($class, @args) {
 }
 
 sub contract ($self) { return _clone($self->_contract); }
+
+# A request-scoped domain can carry a required visibility predicate.  That
+# predicate is vital for query/write authorization but is not part of the
+# portable importer configuration authored in the browser.  Prefer the
+# canonical, published fingerprint when the domain has one.
+sub domain_fingerprint ($self) {
+    my $contract = $self->domain->contract;
+    return $contract->{domain_fingerprint}
+        if ref($contract) eq 'HASH'
+            && defined($contract->{domain_fingerprint})
+            && !ref($contract->{domain_fingerprint})
+            && length($contract->{domain_fingerprint});
+    return $self->domain->fingerprint;
+}
 
 sub inspect_csv ($self, $content, %options) {
     Selecto::Error->throw('invalid_import_file', 'CSV content must be a scalar')
@@ -114,10 +129,10 @@ sub inspect_csv ($self, $content, %options) {
 sub normalize_configuration ($self, $configuration, %options) {
     _object($configuration, 'import configuration');
     _reject_unknown($configuration, [qw(
-        config_version domain_fingerprint upload_id profile parser rows mappings match idempotency errors parameters
+        config_version domain_fingerprint upload_id profile parser rows mappings actions match idempotency errors parameters
     )], 'import configuration');
     my $contract = $self->_contract;
-    my $fingerprint = $self->domain->fingerprint;
+    my $fingerprint = $self->domain_fingerprint;
     Selecto::Error->throw('import_domain_changed', 'Import configuration does not match the current domain', {
         expected => $fingerprint, received => $configuration->{domain_fingerprint},
     }) if defined($configuration->{domain_fingerprint}) && $configuration->{domain_fingerprint} ne $fingerprint;
@@ -185,6 +200,80 @@ sub normalize_configuration ($self, $configuration, %options) {
             target => $target, source => \%source, transforms => [@$transforms], blank_policy => $blank_policy,
         };
     }
+    my $actions = $configuration->{actions} // [];
+    Selecto::Error->throw('invalid_import_configuration', 'import actions must be an array')
+        unless ref($actions) eq 'ARRAY';
+    my %published_actions = %{$contract->{actions} // {}};
+    my %mapped_actions;
+    my @normalized_actions;
+    for my $configured (@$actions) {
+        _object($configured, 'import action');
+        _reject_unknown($configured, [qw(action inputs)], 'import action');
+        my $action_id = _string($configured->{action}, 'import action id');
+        Selecto::Error->throw('import_action_not_enabled', "Action $action_id is not enabled for importing", {action => $action_id})
+            unless exists $published_actions{$action_id};
+        Selecto::Error->throw('invalid_import_configuration', "Action $action_id is configured more than once", {action => $action_id})
+            if $mapped_actions{$action_id}++;
+        my $inputs = $configured->{inputs};
+        _object($inputs, "import action $action_id inputs");
+        my %input_specs = %{$published_actions{$action_id}{inputs}};
+        my %normalized_inputs;
+        for my $name (keys %$inputs) {
+            Selecto::Error->throw('import_action_input_not_enabled', "Action input $action_id.$name is not enabled for importing", {
+                action => $action_id, input => $name,
+            }) unless exists $input_specs{$name};
+            my $mapping = $inputs->{$name};
+            _object($mapping, "import action $action_id input $name");
+            _reject_unknown($mapping, [qw(source transforms blank_policy)], "import action $action_id input $name");
+            _object($mapping->{source}, "import action $action_id input $name source");
+            _reject_unknown($mapping->{source}, [qw(kind column_id value name)], "import action $action_id input $name source");
+            my $kind = _string($mapping->{source}{kind}, "import action $action_id input $name source kind");
+            my %allowed_sources = map { $_ => 1 } @{$input_specs{$name}{sources} // []};
+            Selecto::Error->throw('import_source_not_allowed', "Source $kind is not allowed for action $action_id input $name", {
+                action => $action_id, input => $name, source => $kind,
+            }) unless $allowed_sources{$kind};
+            my %source = (kind => $kind);
+            if ($kind eq 'column') {
+                my $column_id = _string($mapping->{source}{column_id}, "import action $action_id input $name column_id");
+                Selecto::Error->throw('import_column_missing', "Column $column_id is not present in this upload", {
+                    action => $action_id, input => $name, column_id => $column_id,
+                }) unless exists $columns{$column_id};
+                $source{column_id} = $column_id;
+            } elsif ($kind eq 'static') {
+                Selecto::Error->throw('invalid_import_configuration', "Static source for action $action_id input $name requires value")
+                    unless exists $mapping->{source}{value};
+                $source{value} = _clone($mapping->{source}{value});
+            } elsif ($kind eq 'parameter') {
+                $source{name} = _string($mapping->{source}{name}, "import action $action_id input $name parameter name");
+            } elsif ($kind eq 'trusted') {
+                $source{name} = $input_specs{$name}{trusted_provider};
+                Selecto::Error->throw('invalid_import_contract', "Trusted action input $action_id.$name has no provider")
+                    unless defined($source{name}) && length($source{name});
+            }
+            my $transforms = $mapping->{transforms} // [];
+            Selecto::Error->throw('invalid_import_configuration', "Transforms for action $action_id input $name must be an array")
+                unless ref($transforms) eq 'ARRAY';
+            my %allowed_transforms = map { $_ => 1 } @{$input_specs{$name}{transforms} // []};
+            for my $transform (@$transforms) {
+                Selecto::Error->throw('import_transform_not_allowed', "Transform $transform is not allowed for action $action_id input $name", {
+                    action => $action_id, input => $name, transform => $transform,
+                }) unless defined($transform) && !ref($transform) && $allowed_transforms{$transform};
+            }
+            my $blank_policy = $mapping->{blank_policy} // $input_specs{$name}{blank_policy} // 'omit';
+            Selecto::Error->throw('invalid_import_configuration', "Invalid blank policy for action $action_id input $name")
+                unless $blank_policy =~ /\A(?:omit|empty|null|error)\z/;
+            $normalized_inputs{$name} = {
+                source => \%source, transforms => [@$transforms], blank_policy => $blank_policy,
+            };
+        }
+        for my $name (keys %input_specs) {
+            next unless $input_specs{$name}{required};
+            Selecto::Error->throw('import_action_input_missing', "Action $action_id requires input $name", {
+                action => $action_id, input => $name,
+            }) unless exists $normalized_inputs{$name};
+        }
+        push @normalized_actions, {action => $action_id, inputs => \%normalized_inputs};
+    }
     my $match = $configuration->{match} // {};
     _object($match, 'import match');
     _reject_unknown($match, [qw(key_set on_match on_missing)], 'import match');
@@ -208,6 +297,7 @@ sub normalize_configuration ($self, $configuration, %options) {
         domain_fingerprint => $fingerprint,
         (defined($configuration->{upload_id}) ? (upload_id => _string($configuration->{upload_id}, 'upload_id')) : ()),
         mappings => \@normalized,
+        actions => \@normalized_actions,
         match => {key_set => $key_set_id, on_match => $on_match, on_missing => $on_missing},
         rows => {start => $start, defined($end) ? (end => $end) : ()},
         parameters => _clone($configuration->{parameters} // {}),
@@ -238,6 +328,7 @@ sub preview_rows ($self, $inspection, $configuration, %options) {
 
 sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
     my %assignments;
+    my %assignment_write_on;
     my %match_values;
     my $fields = $self->_contract->{fields};
     my @errors;
@@ -256,12 +347,61 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
         if (!$present || _blank($value)) {
             my $policy = $mapping->{blank_policy};
             if ($policy eq 'omit') { next }
-            if ($policy eq 'empty') { $values->{$mapping->{target}} = ''; next }
-            if ($policy eq 'null') { $values->{$mapping->{target}} = undef; next }
+            if ($policy eq 'empty' || $policy eq 'null') {
+                $values->{$mapping->{target}} = $policy eq 'empty' ? '' : undef;
+                $assignment_write_on{$mapping->{target}} = $field->{write_on}
+                    unless $field->{match_only};
+                next;
+            }
             push @errors, {code => 'import_required_value_missing', field => $mapping->{target}, message => 'A value is required'};
             next;
         }
         $values->{$mapping->{target}} = $value;
+        # This is derived from the governed write contract, never accepted
+        # from the browser. It lets a trusted insert requirement such as a
+        # tenant/client field participate in an insert without accidentally
+        # attempting to change it on a matched update.
+        $assignment_write_on{$mapping->{target}} = $field->{write_on}
+            unless $field->{match_only};
+    }
+    my @pending_actions;
+    for my $configured (@{$configuration->{actions} // []}) {
+        my %inputs;
+        for my $name (keys %{$configured->{inputs}}) {
+            my $mapping = $configured->{inputs}{$name};
+            my $input_spec = $self->_contract->{actions}{$configured->{action}}{inputs}{$name};
+            my ($present, $value) = _resolve_value($mapping, $row->{values}, $configuration->{parameters}, $trusted);
+            if ($present) {
+                my $ok = eval { $value = _apply_transforms($value, $mapping->{transforms}); 1 };
+                if (!$ok) {
+                    my $error = _error_hash($@, undef);
+                    $error->{action} = $configured->{action};
+                    $error->{input} = $name;
+                    push @errors, $error;
+                    next;
+                }
+            }
+            if (!$present || _blank($value)) {
+                my $policy = $mapping->{blank_policy};
+                if ($policy eq 'omit') { next }
+                if ($policy eq 'empty') { $inputs{$name} = ''; next }
+                if ($policy eq 'null') { $inputs{$name} = undef; next }
+                push @errors, {
+                    code => 'import_required_value_missing', action => $configured->{action}, input => $name,
+                    message => 'An action input value is required',
+                };
+                next;
+            }
+            if (($input_spec->{type} // '') eq 'date' && !Selecto::DateShortcut->valid_date($value)) {
+                push @errors, {
+                    code => 'import_invalid_action_input', action => $configured->{action}, input => $name,
+                    message => 'An action date must be an ISO date (YYYY-MM-DD)',
+                };
+                next;
+            }
+            $inputs{$name} = $value;
+        }
+        push @pending_actions, {action => $configured->{action}, inputs => \%inputs};
     }
     my %key_values = map {
         $_ => exists($assignments{$_}) ? $assignments{$_} : $match_values{$_}
@@ -291,6 +431,31 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
             $decision = $configuration->{match}{on_missing};
         }
     }
+    # Key resolution has already used all mapped values.  Now shape the write
+    # from the selected operation, so insert-only values are context for an
+    # insert but are not sent as assignments in an update.
+    if (!@errors && ($decision eq 'insert' || $decision eq 'update')) {
+        for my $field (keys %assignments) {
+            my $write_on = $assignment_write_on{$field} // [];
+            delete $assignments{$field} unless grep { $_ eq $decision } @$write_on;
+        }
+    }
+    my @actions;
+    if (!@errors && @pending_actions) {
+        if ($decision eq 'insert') {
+            push @errors, {
+                code => 'import_action_requires_match',
+                message => 'A governed action can only be applied to an existing matched record',
+            };
+        } elsif ($decision eq 'update') {
+            my $id = ref($target) eq 'HASH' ? $target->{$self->domain->primary_key} : undef;
+            if (!defined $id) {
+                push @errors, {code => 'invalid_import_host', message => 'Matched record has no primary key for action execution'};
+            } else {
+                @actions = map {{%$_, target => {ids => [$id]}}} @pending_actions;
+            }
+        }
+    }
     # Requiredness belongs to governed inserts. An update may intentionally
     # contain only its key plus one changed field, so do this only after the
     # match decision is known.
@@ -307,11 +472,9 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
     my $write;
     if ($decision eq 'insert' || $decision eq 'update') {
         $write = {
-            operation => $decision,
-            assignments => \%assignments,
-            expected_count => 1,
-            returning => [$self->domain->primary_key],
-        };
+            operation => $decision, assignments => \%assignments,
+            expected_count => 1, returning => [$self->domain->primary_key],
+        } if keys %assignments;
         if ($decision eq 'update') {
             my $id = ref($target) eq 'HASH' ? $target->{$self->domain->primary_key} : undef;
             if (!defined $id) {
@@ -319,9 +482,14 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
                 $decision = 'error';
                 undef $write;
             } else {
-                $write->{filters} = [{field => $self->domain->primary_key, op => 'eq', value => $id}];
+                $write->{filters} = [{field => $self->domain->primary_key, op => 'eq', value => $id}]
+                    if $write;
             }
         }
+    }
+    if (!@errors && $decision eq 'update' && !$write && !@actions) {
+        push @errors, {code => 'import_no_operation', message => 'The matched row has no governed write or action to apply'};
+        $decision = 'error';
     }
     return {
         row_number => $row->{row_number}, physical_line => $row->{physical_line},
@@ -331,6 +499,7 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
         defined($target) ? (target => _clone($target)) : (),
         errors => \@errors,
         defined($write) ? (write => $write) : (),
+        @actions ? (actions => \@actions) : (),
     };
 }
 
@@ -339,7 +508,7 @@ sub _contract ($self) {
     my $extension = $self->domain->contract->{extensions}{importer};
     Selecto::Error->throw('import_not_enabled', 'This domain does not publish an importer contract')
         unless ref($extension) eq 'HASH' && $extension->{enabled};
-    _reject_unknown($extension, [qw(contract_version enabled field_policy fields key_sets idempotency)], 'importer extension');
+    _reject_unknown($extension, [qw(contract_version enabled field_policy fields actions key_sets idempotency)], 'importer extension');
     Selecto::Error->throw('invalid_import_contract', 'importer contract_version must be 1')
         unless ($extension->{contract_version} // 1) == 1;
     Selecto::Error->throw('invalid_import_contract', 'importer field_policy must be declared_only')
@@ -359,6 +528,9 @@ sub _contract ($self) {
         my $write = $self->domain->writes->{fields}{$name};
         Selecto::Error->throw('invalid_import_contract', "Import field $name is not governed-write enabled", {field => $name})
             unless $match_only || (ref($write) eq 'HASH' && ($write->{insertable} || $write->{updatable}));
+        my @write_on = $match_only ? () : grep {
+            ($_ eq 'insert' && $write->{insertable}) || ($_ eq 'update' && $write->{updatable})
+        } qw(insert update);
         my $sources = $spec->{sources} // [];
         Selecto::Error->throw('invalid_import_contract', "Importer field $name sources must be an array") unless ref($sources) eq 'ARRAY' && @$sources;
         my %seen;
@@ -383,7 +555,71 @@ sub _contract ($self) {
             sources => [@$sources], header_aliases => [@{$spec->{header_aliases} // []}],
             transforms => [@$transforms], blank_policy => $blank_policy,
             ($match_only ? (match_only => JSON::PP::true) : ()),
+            (!$match_only ? (write_on => \@write_on) : ()),
             (defined($spec->{trusted_provider}) ? (trusted_provider => $spec->{trusted_provider}) : ()),
+        };
+    }
+    my $action_extensions = $extension->{actions} // {};
+    _object($action_extensions, 'importer actions');
+    my $domain_actions = $self->domain->actions;
+    my %actions;
+    for my $action_id (keys %$action_extensions) {
+        my $extension_action = $action_extensions->{$action_id};
+        _object($extension_action, "importer action $action_id");
+        _reject_unknown($extension_action, [qw(inputs)], "importer action $action_id");
+        my $domain_action = $domain_actions->{$action_id};
+        Selecto::Error->throw('invalid_import_contract', "Importer action $action_id is not a published domain action")
+            unless ref($domain_action) eq 'HASH';
+        my %domain_inputs = map { $_->{id} => $_ } grep {
+            ref($_) eq 'HASH' && defined($_->{id})
+        } @{$domain_action->{inputs} // []};
+        _object($extension_action->{inputs}, "importer action $action_id inputs");
+        my %inputs;
+        for my $name (keys %{$extension_action->{inputs}}) {
+            my $spec = $extension_action->{inputs}{$name};
+            _object($spec, "importer action $action_id input $name");
+            _reject_unknown($spec, [qw(sources header_aliases transforms blank_policy trusted_provider)], "importer action $action_id input $name");
+            Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name is not declared by the action")
+                unless exists $domain_inputs{$name};
+            my $sources = $spec->{sources} // [];
+            Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name sources must be a non-empty array")
+                unless ref($sources) eq 'ARRAY' && @$sources;
+            my %seen;
+            for my $source (@$sources) {
+                Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name has invalid source")
+                    unless defined($source) && !ref($source) && $source =~ /\A(?:column|static|parameter|trusted)\z/ && !$seen{$source}++;
+            }
+            if (grep { $_ eq 'trusted' } @$sources) {
+                Selecto::Error->throw('invalid_import_contract', "Trusted importer action input $action_id.$name needs trusted_provider")
+                    unless defined($spec->{trusted_provider}) && !ref($spec->{trusted_provider}) && length($spec->{trusted_provider});
+            }
+            my $transforms = $spec->{transforms} // [];
+            Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name transforms must be an array")
+                unless ref($transforms) eq 'ARRAY';
+            for my $transform (@$transforms) {
+                Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name has invalid transform")
+                    unless defined($transform) && !ref($transform) && $transform =~ /\A(?:trim|uppercase|lowercase|normalize_whitespace|empty_to_null)\z/;
+            }
+            my $blank_policy = $spec->{blank_policy} // 'omit';
+            Selecto::Error->throw('invalid_import_contract', "Importer action $action_id input $name has invalid blank_policy")
+                unless $blank_policy =~ /\A(?:omit|empty|null|error)\z/;
+            $inputs{$name} = {
+                sources => [@$sources], header_aliases => [@{$spec->{header_aliases} // []}],
+                transforms => [@$transforms], blank_policy => $blank_policy,
+                label => $domain_inputs{$name}{label} // $name,
+                type => $domain_inputs{$name}{type} // 'string',
+                ($domain_inputs{$name}{required} ? (required => JSON::PP::true) : ()),
+                (defined($spec->{trusted_provider}) ? (trusted_provider => $spec->{trusted_provider}) : ()),
+            };
+        }
+        for my $name (keys %domain_inputs) {
+            next unless $domain_inputs{$name}{required};
+            Selecto::Error->throw('invalid_import_contract', "Importer action $action_id must declare required input $name")
+                unless exists $inputs{$name};
+        }
+        $actions{$action_id} = {
+            label => $domain_action->{label} // $action_id,
+            inputs => \%inputs,
         };
     }
     my $key_sets = $extension->{key_sets} // [];
@@ -422,7 +658,7 @@ sub _contract ($self) {
     }
     $self->{_contract} = {
         contract_version => 1, enabled => JSON::PP::true, field_policy => 'declared_only',
-        fields => \%fields, key_sets => \@normalized_keys,
+        fields => \%fields, actions => \%actions, key_sets => \@normalized_keys,
         idempotency => _clone($extension->{idempotency} // {supported => JSON::PP::false}),
     };
     return $self->{_contract};

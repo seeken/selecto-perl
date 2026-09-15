@@ -42,6 +42,17 @@ my $domain = Selecto::Domain->parse({
                 description => {sources => ['static']}, lic_no => {sources => ['column']},
                 lic_state => {sources => ['static']}, owner => {sources => ['static']},
             },
+            actions => {
+                record_odometer => {
+                    inputs => {
+                        miles => {
+                            sources => ['column'], header_aliases => ['Odometer'],
+                            transforms => ['trim'], blank_policy => 'error',
+                        },
+                        read_date => {sources => ['static']},
+                    },
+                },
+            },
             key_sets => [
                 {
                     id => 'vin', fields => ['vin'], cardinality => 'zero_or_one',
@@ -57,6 +68,17 @@ my $domain = Selecto::Domain->parse({
             idempotency => {supported => 1},
         },
     },
+    actions => {
+        record_odometer => {
+            label => 'Record Odometer', description => 'Record a reading.',
+            type => 'bulk_action', scope => 'row', bulk => {enabled => 1},
+            capability => 'equipment.record_odometer', execution => {kind => 'host', operation => 'record_odometer'},
+            inputs => [
+                {id => 'miles', label => 'Odometer miles', type => 'number', required => 1},
+                {id => 'read_date', label => 'Odometer reading date', type => 'date'},
+            ],
+        },
+    },
 }, strict => 1);
 
 my $importer = Selecto::Importer->new(domain => $domain);
@@ -66,7 +88,7 @@ is $inspection->{columns}[0]{header}, 'VIN', 'CSV inspection preserves headers';
 is $inspection->{rows}[0]{values}{c1}, ' abc ', 'inspection preserves source values for transforms';
 
 my $configuration = {
-    config_version => 1, domain_fingerprint => $domain->fingerprint,
+    config_version => 1, domain_fingerprint => $importer->domain_fingerprint,
     mappings => [
         {target => 'client_id', source => {kind => 'trusted'}},
         {target => 'vin', source => {kind => 'column', column_id => 'c1'}, transforms => [qw(trim uppercase)]},
@@ -91,24 +113,50 @@ is $preview->{rows}[0]{assignments}{vin}, 'ABC', 'configured transforms are appl
 is $preview->{rows}[0]{write}{assignments}{client_id}, 44, 'trusted client context supplies tenant assignment';
 is $preview->{rows}[1]{decision}, 'update', 'matching VIN produces governed update plan';
 is $preview->{rows}[1]{write}{filters}[0]{value}, 19, 'update is filtered to the resolved target ID';
+ok !exists($preview->{rows}[1]{write}{assignments}{client_id}), 'insert-only trusted client is omitted from a matched update';
 is scalar @{$preview->{rows}[1]{errors}}, 0, 'update does not require unrelated insert-only fields';
 
-my $id_inspection = $importer->inspect_csv("Truck ID,Truck Name\n19,Renamed unit\n");
+my $id_inspection = $importer->inspect_csv("Truck ID,Truck Name,Odometer\n19,Renamed unit,12345\n");
 my $id_preview = $importer->preview_rows($id_inspection, {
-    config_version => 1, domain_fingerprint => $domain->fingerprint,
+    config_version => 1, domain_fingerprint => $importer->domain_fingerprint,
     mappings => [
         {target => 'id', source => {kind => 'column', column_id => 'c1'}},
+        {target => 'client_id', source => {kind => 'trusted'}},
         {target => 'short_desc', source => {kind => 'column', column_id => 'c2'}},
     ],
+    actions => [{
+        action => 'record_odometer',
+        inputs => {
+            miles => {source => {kind => 'column', column_id => 'c3'}, transforms => ['trim']},
+            read_date => {source => {kind => 'static', value => '2026-09-14'}},
+        },
+    }],
     match => {key_set => 'truck_id', on_match => 'update', on_missing => 'error'},
-}, key_resolver => sub {
+}, trusted_values => {current_client_id => 44}, key_resolver => sub {
     my ($values) = @_;
     return {matches => $values->{id} == 19 ? [{id => 19}] : []};
 });
 is $id_preview->{rows}[0]{decision}, 'update', 'a match-only ID can select an existing record';
 is $id_preview->{rows}[0]{key}{id}, 19, 'match-only ID is passed to the key resolver';
 ok !exists($id_preview->{rows}[0]{write}{assignments}{id}), 'match-only ID is never included in the governed write';
+ok !exists($id_preview->{rows}[0]{write}{assignments}{client_id}), 'trusted insert-only client is not included in an ID-matched update';
 is $id_preview->{rows}[0]{write}{assignments}{short_desc}, 'Renamed unit', 'mapped write fields remain governed assignments';
+is $id_preview->{rows}[0]{actions}[0]{action}, 'record_odometer', 'published importer action is planned for a matched row';
+is_deeply $id_preview->{rows}[0]{actions}[0]{target}, {ids => [19]}, 'import action targets the resolved governed record';
+is $id_preview->{rows}[0]{actions}[0]{inputs}{miles}, 12345, 'action input is mapped from its file column';
+is $id_preview->{rows}[0]{actions}[0]{inputs}{read_date}, '2026-09-14', 'date action input is mapped from a static ISO date';
+
+my $invalid_date_preview = $importer->preview_rows($id_inspection, {
+    config_version => 1, domain_fingerprint => $importer->domain_fingerprint,
+    mappings => [{target => 'id', source => {kind => 'column', column_id => 'c1'}}],
+    actions => [{action => 'record_odometer', inputs => {
+        miles => {source => {kind => 'column', column_id => 'c3'}},
+        read_date => {source => {kind => 'static', value => '09/14/2026'}},
+    }}],
+    match => {key_set => 'truck_id', on_match => 'update', on_missing => 'error'},
+}, trusted_values => {current_client_id => 44}, key_resolver => sub { return {matches => [{id => 19}]}; });
+is $invalid_date_preview->{rows}[0]{decision}, 'error', 'an invalid static action date fails while previewing';
+is $invalid_date_preview->{rows}[0]{errors}[0]{code}, 'import_invalid_action_input', 'preview explains the invalid action date';
 
 my $bad = {%$configuration, mappings => [grep { $_->{target} ne 'owner' } @{$configuration->{mappings}}]};
 my $bad_preview = $importer->preview_rows($inspection, $bad,
