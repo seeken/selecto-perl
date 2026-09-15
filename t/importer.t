@@ -31,8 +31,7 @@ my $domain = Selecto::Domain->parse({
             owner => {insertable => 1, updatable => 1, required => 1},
         },
     },
-    extensions => {
-        importer => {
+    imports => {
             contract_version => 1, enabled => 1, field_policy => 'declared_only',
             fields => {
                 id => {sources => ['column'], header_aliases => ['Truck ID'], match_only => 1},
@@ -66,22 +65,23 @@ my $domain = Selecto::Domain->parse({
                 },
             ],
             idempotency => {supported => 1},
-        },
     },
     actions => {
         record_odometer => {
             label => 'Record Odometer', description => 'Record a reading.',
             type => 'bulk_action', scope => 'row', bulk => {enabled => 1},
             capability => 'equipment.record_odometer', execution => {kind => 'host', operation => 'record_odometer'},
-            inputs => [
-                {id => 'miles', label => 'Odometer miles', type => 'number', required => 1},
-                {id => 'read_date', label => 'Odometer reading date', type => 'date'},
-            ],
+            inputs => {
+                miles => {label => 'Odometer miles', type => 'number', required => 1},
+                read_date => {label => 'Odometer reading date', type => 'date'},
+            },
         },
     },
 }, strict => 1);
 
 my $importer = Selecto::Importer->new(domain => $domain);
+is $domain->imports->{contract_version}, 1, 'domain exposes the canonical imports contract';
+is ref($domain->actions->{record_odometer}{inputs}), 'HASH', 'action inputs use the canonical keyed map';
 my $inspection = $importer->inspect_csv("VIN,Truck Name,lic_no\n abc ,Unit 7,T7\nEXISTING,Only changed,T8\n");
 is $inspection->{row_count}, 2, 'CSV inspection counts data rows';
 is $inspection->{columns}[0]{header}, 'VIN', 'CSV inspection preserves headers';
@@ -170,5 +170,11 @@ my $error = eval {
     undef;
 } // $@;
 is $error->code, 'import_key_set_not_found', 'unknown key sets fail closed';
+
+my $unsafe_contract = $domain->contract;
+$unsafe_contract->{imports}{key_sets}[0]{allowed_on_match} = ['insert'];
+my $unsafe_domain = Selecto::Domain->parse($unsafe_contract, strict => 1);
+my $unsafe_error = eval { Selecto::Importer->new(domain => $unsafe_domain); undef } // $@;
+is $unsafe_error->code, 'invalid_import_contract', 'insert is never an allowed matched-row decision';
 
 done_testing;

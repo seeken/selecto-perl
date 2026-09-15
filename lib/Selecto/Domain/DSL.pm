@@ -72,6 +72,7 @@ sub query_projection { my $self = shift; return $self->_named_path(['query_libra
 sub query_ordering   { my $self = shift; return $self->_named_path(['query_library', 'orderings'], @_); }
 sub query_view       { my $self = shift; return $self->_named_path(['query_library', 'views'], @_); }
 sub co_domain        { my $self = shift; return $self->_named_path(['co_domains'], @_); }
+sub imports          { my $self = shift; return $self->_merge_path(['imports'], _config('imports', @_)); }
 
 sub write_operation    { my $self = shift; return $self->_named_path(['writes', 'operations'], @_); }
 sub write_field        { my $self = shift; return $self->_named_path(['writes', 'fields'], @_); }
