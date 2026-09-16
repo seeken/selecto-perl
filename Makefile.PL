@@ -16,6 +16,9 @@ WriteMakefile(
         'DateTime::TimeZone' => 0,
         'DateTime' => 0,
         'Digest::SHA' => 0,
+        'Encode'      => 0,
+        'Excel::Writer::XLSX' => '1.10',
+        'File::Temp'  => 0,
         'JSON::PP'    => '4.06',
         'Math::BigInt' => 0,
         'Mojolicious' => '9.40',
@@ -25,7 +28,6 @@ WriteMakefile(
         'URI::Escape' => 0,
     },
     TEST_REQUIRES => {
-        'File::Temp' => 0,
         'Test::More' => 0,
     },
     META_MERGE => {

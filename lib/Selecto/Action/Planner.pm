@@ -338,6 +338,21 @@ sub _target {
         Selecto::Error->throw('bulk_action_operation_not_enabled', 'bulk action requires a bulk-enabled write operation')
             unless $operation_spec->{bulk};
         my @normalized = map { _target_value($_) } @$ids;
+        my $selection = ref($action->{selection}) eq 'HASH' ? $action->{selection} : {};
+        my $minimum = $selection->{min_rows} // 1;
+        my $maximum = $selection->{max_rows};
+        Selecto::Error->throw(
+            'action_cardinality_mismatch',
+            $minimum == 1 ? 'action requires at least one target row'
+                : "action requires at least $minimum target rows",
+            {minimum => 0 + $minimum, actual => scalar(@normalized)},
+        ) if @normalized < $minimum;
+        Selecto::Error->throw(
+            'action_cardinality_mismatch',
+            $maximum == 1 ? 'action requires exactly one target row'
+                : "action permits at most $maximum target rows",
+            {maximum => 0 + $maximum, actual => scalar(@normalized)},
+        ) if defined($maximum) && @normalized > $maximum;
         return ('bulk', [[$primary_key, 'in', \@normalized]], ['exactly', scalar @normalized], { ids => \@normalized });
     }
 

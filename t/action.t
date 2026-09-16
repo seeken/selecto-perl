@@ -88,6 +88,23 @@ eval {
 $error = $@;
 is($error->code, 'invalid_action_target', 'duplicate bulk targets fail closed');
 
+my $single_target_contract = $domain->contract;
+$single_target_contract->{actions}{bulk_archive}{selection} = {
+    min_rows => 1, max_rows => 1, presentation => 'row_dialog',
+};
+my $single_target_domain = Selecto::Domain->parse($single_target_contract, strict => 1);
+eval {
+    Selecto::Action->plan(
+        $single_target_domain,
+        { action => 'bulk_archive', target => { ids => [2, 3] } },
+    );
+};
+$error = $@;
+is($error->code, 'action_cardinality_mismatch',
+    'action planning enforces the domain maximum target cardinality');
+is_deeply($error->details, {maximum => 1, actual => 2},
+    'cardinality errors report the configured maximum and actual rows');
+
 my $variant_contract = $domain->contract;
 $variant_contract->{source}{fields} = [qw(
     id state documents_complete checked_in_at medical_form_received follow_up_note priority

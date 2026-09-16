@@ -178,6 +178,29 @@ is(
     'actions retain a governed boolean root eligibility field',
 );
 
+my $single_row_action_contract = $predicate_computed->contract;
+$single_row_action_contract->{actions}{dispatch}{selection} = {
+    mode => 'rows', min_rows => 1, max_rows => 1,
+    presentation => 'row_dialog', eligibility_field => 'is_ready',
+};
+my $single_row_action = Selecto::Domain->parse(
+    $single_row_action_contract, strict => 1,
+);
+is_deeply(
+    $single_row_action->actions->{dispatch}{selection},
+    $single_row_action_contract->{actions}{dispatch}{selection},
+    'actions retain governed selection cardinality and row presentation metadata',
+);
+
+my $invalid_row_presentation = $predicate_computed->contract;
+$invalid_row_presentation->{actions}{dispatch}{selection} = {
+    mode => 'rows', max_rows => 2, presentation => 'row_inline',
+};
+eval { Selecto::Domain->parse($invalid_row_presentation, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'row action presentations require a single-row maximum');
+
 my $non_boolean_eligibility_contract = $predicate_computed->contract;
 $non_boolean_eligibility_contract->{actions}{dispatch}{selection}{eligibility_field} = 'id';
 eval { Selecto::Domain->parse($non_boolean_eligibility_contract, strict => 1) };

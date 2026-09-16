@@ -424,6 +424,35 @@ sub _validate_action_eligibility {
         next unless exists $action->{selection};
         my $selection = $action->{selection};
         _object($selection, "action $action_id selection");
+        my $mode = $selection->{mode} // 'rows';
+        Selecto::Error->throw(
+            'invalid_domain', "action $action_id selection mode must be rows or groups",
+        ) if ref($mode) || "$mode" !~ /\A(?:rows|groups)\z/;
+        for my $key (qw(min_rows max_rows)) {
+            next unless exists $selection->{$key};
+            my $value = $selection->{$key};
+            Selecto::Error->throw(
+                'invalid_domain', "action $action_id selection $key must be an integer from 1 to 1000",
+            ) if ref($value) || "$value" !~ /\A\d+\z/
+                || $value < 1 || $value > 1000;
+        }
+        Selecto::Error->throw(
+            'invalid_domain', "action $action_id selection max_rows must be at least min_rows",
+        ) if exists($selection->{min_rows}) && exists($selection->{max_rows})
+            && $selection->{max_rows} < $selection->{min_rows};
+        my $presentation = $selection->{presentation} // 'toolbar';
+        Selecto::Error->throw(
+            'invalid_domain',
+            "action $action_id selection presentation must be toolbar, row_dialog, or row_inline",
+        ) if ref($presentation)
+            || "$presentation" !~ /\A(?:toolbar|row_dialog|row_inline)\z/;
+        if ($presentation ne 'toolbar') {
+            Selecto::Error->throw(
+                'invalid_domain',
+                "action $action_id $presentation presentation requires rows mode and max_rows 1",
+            ) unless $mode eq 'rows'
+                && exists($selection->{max_rows}) && $selection->{max_rows} == 1;
+        }
         next unless exists $selection->{eligibility_field};
         my $field = _identifier(
             $selection->{eligibility_field}, "action $action_id eligibility field",
