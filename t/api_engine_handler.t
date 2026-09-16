@@ -568,6 +568,24 @@ is_deeply $api->openapi_document->{paths}{'/api/v1/records/write'}{post}{request
     {content}{'application/json'}{schema},
     {'$ref' => '#/components/schemas/SelectoWrite'},
     'OpenAPI binds the write endpoint to the governed write request schema';
+is_deeply
+    $api->openapi_document->{paths}{'/api/v1/records/query'}{post}{parameters}[0]{schema}{enum},
+    [qw(json csv tsv xlsx)],
+    'OpenAPI advertises every query response format';
+is
+    $api->openapi_document->{paths}{'/api/v1/records/query'}{post}{parameters}[1]{name},
+    'filename',
+    'OpenAPI advertises the optional response download filename';
+like
+    $api->openapi_document->{paths}{'/api/v1/records/query'}{post}{parameters}[1]{description},
+    qr/matching extension is required/,
+    'OpenAPI documents the required filename extension';
+is_deeply [sort keys %{
+    $api->openapi_document->{paths}{'/api/v1/records/query'}{post}{responses}{200}{content}
+}], [sort qw(
+    application/json text/csv text/tab-separated-values
+    application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+)], 'OpenAPI publishes the JSON, delimited, and XLSX response media types';
 ok !exists($api->openapi_document->{security}),
     'generic OpenAPI decoration does not invent host authentication';
 

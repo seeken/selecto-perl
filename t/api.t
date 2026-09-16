@@ -3,7 +3,7 @@ use strict;
 use warnings;
 use utf8;
 use Test::More;
-use Encode qw(encode_utf8);
+use Encode qw(decode_utf8 encode_utf8);
 use JSON::PP ();
 use Selecto::API ();
 use Selecto::Domain ();
@@ -71,6 +71,80 @@ is(
     'query callback response is byte stable',
 );
 is($response->{headers}{'content-length'}, length($response->{body}), 'byte length is exact');
+is $response->{headers}{vary}, 'Accept',
+    'query responses declare Accept-based content negotiation';
+
+my $csv_response = $api->request(
+    {
+        method => 'POST', path => '/api/v1/certification/query', body => {},
+        accept => 'text/csv',
+    },
+    {query => sub { return ['ok', {
+        columns => [qw(id label)], rows => [[7, 'Renée 東京']],
+    }]; }},
+);
+is $csv_response->{status}, 200, 'CSV query response succeeds';
+is $csv_response->{headers}{'content-type'}, 'text/csv; charset=utf-8',
+    'CSV query response has its standard media type';
+is $csv_response->{headers}{'content-disposition'},
+    'attachment; filename="certification-api-query.csv"',
+    'CSV query response has a safe domain-derived filename';
+is decode_utf8($csv_response->{body}), "id,label\r\n7,\"Renée 東京\"\r\n",
+    'CSV query response contains headings and UTF-8 row data';
+
+my $named_csv_response = $api->request(
+    {
+        method => 'POST', path => '/api/v1/certification/query', body => {},
+        accept => 'text/csv', download_filename => 'September Certifications.csv',
+    },
+    {query => sub { return ['ok', {
+        columns => [qw(id label)], rows => [[7, 'Approved']],
+    }]; }},
+);
+is $named_csv_response->{headers}{'content-disposition'},
+    'attachment; filename="September Certifications.csv"',
+    'a caller may choose a safe download filename with the required extension';
+
+my $bad_filename_response = $api->request(
+    {
+        method => 'POST', path => '/api/v1/certification/query', body => {},
+        accept => 'text/csv', download_filename => 'certifications.xlsx',
+    },
+    {query => sub { die 'an invalid filename must not execute the query' }},
+);
+is $bad_filename_response->{status}, 400,
+    'a download filename with the wrong extension is rejected before execution';
+like $bad_filename_response->{body}, qr/"code":"invalid_response_filename"/,
+    'invalid download filenames use a stable machine-readable code';
+like $bad_filename_response->{body}, qr/"expected_extension":"\.csv"/,
+    'the filename error reports the required extension';
+
+my $tsv_response = $api->request(
+    {
+        method => 'POST', path => '/api/v1/certification/query', body => {},
+        response_format => 'tsv', accept => 'application/json',
+    },
+    {query => sub { return ['ok', {
+        columns => [qw(id label)], rows => [{id => 7, label => "tab\tvalue"}],
+    }]; }},
+);
+is $tsv_response->{headers}{'content-type'},
+    'text/tab-separated-values; charset=utf-8',
+    'explicit response format takes precedence over Accept';
+is decode_utf8($tsv_response->{body}), "id\tlabel\r\n7\t\"tab\tvalue\"\r\n",
+    'TSV query response supports object rows and quotes embedded tabs';
+
+my $not_acceptable = $api->request(
+    {
+        method => 'POST', path => '/api/v1/certification/query', body => {},
+        accept => 'application/pdf',
+    },
+    {query => sub { die 'unsupported formats must not execute the query' }},
+);
+is $not_acceptable->{status}, 406,
+    'an unsupported Accept media type is rejected before query execution';
+like $not_acceptable->{body}, qr/"code":"response_format_not_acceptable"/,
+    'not-acceptable responses use a stable machine-readable code';
 
 my $missing = $api->request({
     method => 'DELETE',

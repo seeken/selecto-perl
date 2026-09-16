@@ -8,6 +8,7 @@ cpanfile
 lib/Selecto.pm
 lib/Selecto/API.pm
 lib/Selecto/API/EngineHandler.pm
+lib/Selecto/API/ResultFormatter.pm
 lib/Selecto/Action.pm
 lib/Selecto/Action/Capability.pm
 lib/Selecto/Action/Plan.pm
@@ -56,6 +57,7 @@ t/fixtures/Selecto-Adapter-FutureDB/lib/Selecto/Adapter/FutureDB.pm
 t/advanced_query.t
 t/api.t
 t/api_engine_handler.t
+t/api_result_formatter.t
 t/api_query_library_parity_live.t
 t/api_through_association_parity_live.t
 t/api_write_parity_live.t

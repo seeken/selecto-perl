@@ -10,6 +10,7 @@ use Selecto::Adapter ();
 use Selecto::Adapter::Registry ();
 use Selecto::Action ();
 use Selecto::API ();
+use Selecto::API::ResultFormatter ();
 use Selecto::CoDomain ();
 use Selecto::DataRules ();
 use Selecto::Domain ();

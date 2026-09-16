@@ -5,6 +5,7 @@ use utf8;
 use Mojo::Base -base, -signatures;
 use JSON::PP ();
 use Scalar::Util qw(blessed looks_like_number);
+use Selecto::API::ResultFormatter ();
 use Selecto::Domain ();
 use Selecto::Error ();
 
@@ -52,7 +53,8 @@ sub request ($self, $request, $handlers = {}) {
     my $route = $self->_route($method, $path);
     return _response(200, $self->domain, $JSON_CONTENT_TYPE) if $route eq 'domain';
     return _response(200, $self->openapi, $OPENAPI_CONTENT_TYPE) if $route eq 'openapi';
-    return _dispatch($route->[0], $route->[1], $body, $handlers) if ref($route) eq 'ARRAY';
+    return $self->_dispatch($route->[0], $route->[1], $body, $request, $handlers)
+        if ref($route) eq 'ARRAY';
     return _error_response(
         404,
         'route_not_found',
@@ -81,7 +83,55 @@ sub _route ($self, $method, $path) {
     return 'not_found';
 }
 
-sub _dispatch ($operation, $params, $body, $handlers) {
+sub _dispatch ($self, $operation, $params, $body, $request, $handlers) {
+    my $format;
+    my $format_ok = eval {
+        $format = Selecto::API::ResultFormatter->negotiate(
+            $request->{response_format}, $request->{accept},
+        );
+        1;
+    };
+    unless ($format_ok) {
+        my $error = $@;
+        return _error_response(
+            blessed($error) && $error->isa('Selecto::Error')
+                && $error->code eq 'response_format_not_acceptable' ? 406 : 400,
+            blessed($error) && $error->isa('Selecto::Error')
+                ? $error->code : 'invalid_response_format',
+            blessed($error) && $error->isa('Selecto::Error')
+                ? $error->message : 'Response format is invalid',
+            blessed($error) && $error->isa('Selecto::Error')
+                ? $error->details : {},
+        );
+    }
+    if ($operation ne 'query' && $format ne 'json') {
+        return _error_response(
+            406, 'response_format_not_acceptable',
+            'CSV, TSV, and XLSX responses are available only for queries',
+            {operation => $operation, format => $format},
+        );
+    }
+    my $download_filename;
+    if (defined $request->{download_filename} && "$request->{download_filename}" ne '') {
+        my $filename_ok = eval {
+            $download_filename = _validate_download_filename(
+                $request->{download_filename}, $format,
+            );
+            1;
+        };
+        unless ($filename_ok) {
+            my $error = $@;
+            return _error_response(
+                400,
+                blessed($error) && $error->isa('Selecto::Error')
+                    ? $error->code : 'invalid_response_filename',
+                blessed($error) && $error->isa('Selecto::Error')
+                    ? $error->message : 'Response filename is invalid',
+                blessed($error) && $error->isa('Selecto::Error')
+                    ? $error->details : {},
+            );
+        }
+    }
     my $handler = $handlers->{$operation};
     return _error_response(
         501,
@@ -106,7 +156,11 @@ sub _dispatch ($operation, $params, $body, $handlers) {
     ) unless ref($result) eq 'ARRAY' && @$result == 2
         && ($result->[0] eq 'ok' || $result->[0] eq 'error');
 
-    return _success($result->[1]) if $result->[0] eq 'ok';
+    if ($result->[0] eq 'ok') {
+        return _query_success($self, $result->[1], $format, $download_filename)
+            if $operation eq 'query';
+        return _success($result->[1]);
+    }
     my $error = $result->[1];
     return _error_response(
         500,
@@ -120,6 +174,66 @@ sub _dispatch ($operation, $params, $body, $handlers) {
         _error_string($error, 'message', 'Canonical API operation rejected'),
         ref($error->{details}) eq 'HASH' ? $error->{details} : {},
     );
+}
+
+sub _query_success ($self, $data, $format, $download_filename = undef) {
+    my $response;
+    if ($format eq 'json') {
+        $response = _success($data);
+    } else {
+        my $body;
+        my $ok = eval {
+            $body = Selecto::API::ResultFormatter->encode_result($format, $data);
+            1;
+        };
+        unless ($ok) {
+            return _error_response(
+                500, 'response_encoding_failed',
+                'The query succeeded but its requested response could not be encoded',
+            );
+        }
+        my $specification = Selecto::API::ResultFormatter->specification($format);
+        my $filename = $download_filename
+            // _download_filename($self->domain->{name}, $specification->{extension});
+        $response = {
+            status => 200,
+            headers => {
+                'content-disposition' => qq{attachment; filename="$filename"},
+                'content-length' => '' . length($body),
+                'content-type' => $specification->{content_type},
+                'x-content-type-options' => 'nosniff',
+            },
+            body => $body,
+        };
+    }
+    $response->{headers}{vary} = 'Accept';
+    return $response;
+}
+
+sub _validate_download_filename ($filename, $format) {
+    Selecto::Error->throw(
+        'invalid_response_filename',
+        'download filename is available only for CSV, TSV, and XLSX responses',
+        {format => $format},
+    ) if $format eq 'json';
+    my $extension = Selecto::API::ResultFormatter->specification($format)->{extension};
+    Selecto::Error->throw(
+        'invalid_response_filename',
+        "download filename must be a safe filename ending in .$extension",
+        {expected_extension => ".$extension"},
+    ) if ref($filename)
+        || length("$filename") > 160
+        || "$filename" !~ /\A[A-Za-z0-9][A-Za-z0-9._ ()-]*\.\Q$extension\E\z/i
+        || "$filename" =~ /\.\./;
+    return "$filename";
+}
+
+sub _download_filename ($name, $extension) {
+    $name = lc($name // 'selecto');
+    $name =~ s/[^a-z0-9]+/-/g;
+    $name =~ s/\A-+|-+\z//g;
+    $name = 'selecto' unless length $name;
+    return "$name-query.$extension";
 }
 
 sub canonical_json ($value) {

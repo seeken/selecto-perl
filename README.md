@@ -67,7 +67,8 @@ centrally certified for the 2.8 governed co-domain/computed-eligibility profile.
 - governed co-domain lookup and boolean-root action selection eligibility with
   fail-closed declaration validation;
 - an HTTP-neutral canonical domain API host and governed-engine query/write
-  handler with OpenAPI 3.1 and byte-stable UTF-8 JSON response bodies;
+  handler with OpenAPI 3.1, byte-stable UTF-8 JSON, CSV, TSV, and XLSX query
+  response bodies;
 - an initial HTTP-neutral `Selecto::Files` record-and-role facade with hidden
   tenant/storage authority, memory and managed-local publication, bounded
   filehandle streaming, idempotency, holds, and purge;
@@ -186,6 +187,18 @@ my $result = $handler->query($engine, {
 tenant, or modify the domain. It validates every field and query-library name
 against the supplied engine's governed domain, so internal fields and
 host-pruned definitions remain unavailable.
+
+Query responses default to canonical JSON. HTTP hosts can pass the request's
+`Accept` header as `accept`, or an explicit `?format=` value as
+`response_format`, to `Selecto::API::request`. Supported representations are
+`json`, `csv`, `tsv`, and `xlsx`; the explicit format takes precedence. CSV and
+TSV include the selected column names as their first row, encode nested
+subtables as canonical JSON cells, and guard formula-leading spreadsheet
+values. XLSX returns an attachment-safe workbook and writes textual values as
+strings rather than formulas. The governed query limit still bounds every
+representation. A host may pass a `filename` query parameter through as
+`download_filename`; it must be a safe basename of at most 160 characters and
+end in the extension required by the chosen CSV, TSV, or XLSX format.
 
 The same handler accepts the canonical governed-write body. The domain must
 explicitly enable the operation and field permissions under `writes`.
@@ -790,6 +803,22 @@ the returned plan. Missing resolvers and hidden or disabled policy decisions
 fail closed in both preview and execute phases. Applying the plan through a host
 execution adapter and issuing or consuming opaque authorization grants remain
 separate future boundaries.
+
+An action can further constrain selected-ID requests with domain metadata:
+
+```perl
+selection => {
+    mode => 'rows',
+    min_rows => 1,
+    max_rows => 1,
+    presentation => 'row_dialog', # toolbar, row_dialog, or row_inline
+},
+```
+
+The portable planner enforces `min_rows` and `max_rows` for array targets.
+`presentation` is a consumer hint; row presentations require a rows selection
+with `max_rows => 1`, while the default `toolbar` presentation supports any
+valid row cardinality.
 
 The observation-protocol runner is the sibling `selecto-perl-certification`
 package. `bin/selecto-certify` in this repository is a workspace wrapper that
