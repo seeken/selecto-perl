@@ -91,12 +91,14 @@ t/write_governance.t
 t/write_graph.t
 lib/Selecto/Document/Integer.pm
 lib/Selecto/DataRules.pm
+lib/Selecto/FieldPolicy.pm
 t/manifest.t
 t/mssql_decimal_scale.t
 t/epoch_timezone.t
 t/temporal_format_bindings.t
 t/grouped_expression_bindings.t
 t/importer.t
+t/field_policy.t
 t/data_rules.t
 t/fixtures/data_rules/baseline.contract.json
 t/fixtures/data_rules/baseline.cases.json
