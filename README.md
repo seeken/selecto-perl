@@ -600,10 +600,18 @@ my $rollup = $engine->query
 ```
 
 Detail-row actions support governed `external_link` destinations and reusable
-`iframe_modal` previews. Modal payloads can declare a templated title, size,
+`iframe_modal` previews, plus native `record_editor` dialogs backed by the
+domain's update contract. Modal payloads can declare a templated title, size,
 referrer policy, optional iframe permissions, and whether the host should offer
 previous/next navigation. Applications still resolve and authorize each action
 before rendering it.
+
+An `editors` entry is an explicit allowlist of public root fields already
+declared `updatable` under `writes.fields`. It may also name published actions
+that should be offered as separate row-targeted workflows. A matching
+`record_editor` detail action names the editor and a required target field.
+Strict parsing rejects unknown, internal, non-updatable, or duplicated fields
+and references to unpublished editors or actions.
 
 Rollup ordering follows Selecto's PostgreSQL compatibility behavior and uses
 selected-column positions. A one-group rollup sorts its grouping marker first,

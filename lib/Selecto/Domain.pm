@@ -14,7 +14,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
     default_selected required_selected required_order_by
     filters functions query_members published_views detail_actions capabilities
-    source_relationships choice_sources writes actions imports extensions columns custom_columns
+    source_relationships choice_sources writes actions imports editors extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
     query_library co_domains domain_dependencies operations experiences rules
 );
@@ -35,7 +35,11 @@ my %DETAIL_ACTION = map { $_ => 1 } qw(
     name description type required_fields payload capability
 );
 my %DETAIL_ACTION_PAYLOAD = map { $_ => 1 } qw(
-    url_template target title size allow referrer_policy sandbox navigation_enabled
+    url_template target title size allow referrer_policy sandbox navigation_enabled editor target_field
+);
+my %EDITOR = map { $_ => 1 } qw(label description fields actions submit_label);
+my %EDITOR_FIELD = map { $_ => 1 } qw(
+    field label control required nullable rows placeholder options
 );
 
 sub new {
@@ -243,6 +247,9 @@ sub _parse_canonical {
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
+    $domain->{editors} = _validate_editors($domain, $raw->{editors});
+    $domain->{contract}{editors} = dclone($domain->{editors})
+        if keys %{$domain->{editors}};
     $domain->{detail_actions} = _validate_detail_actions(
         $domain, $raw->{detail_actions},
     );
@@ -931,7 +938,8 @@ sub _validate_detail_actions {
         Selecto::Error->throw(
             'invalid_domain', "unsupported detail action type $type",
             {action => $id},
-        ) unless $type eq 'external_link' || $type eq 'iframe_modal';
+        ) unless $type eq 'external_link' || $type eq 'iframe_modal'
+            || $type eq 'record_editor';
         my $description;
         if (defined($action->{description})) {
             $description = _required_string(
@@ -970,6 +978,77 @@ sub _validate_detail_actions {
         my $payload = $action->{payload};
         _object($payload, "detail action $id payload");
         _reject_unknown($payload, \%DETAIL_ACTION_PAYLOAD, "detail action $id payload");
+        if ($type eq 'record_editor') {
+            my @unsupported = grep { exists $payload->{$_} } qw(
+                url_template target allow referrer_policy sandbox
+            );
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id record editor payload contains unsupported settings",
+                {action => $id, settings => \@unsupported},
+            ) if @unsupported;
+            my $editor = _identifier(
+                $payload->{editor}, "detail action $id payload editor",
+            );
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id references an unknown editor",
+                {action => $id, editor => $editor},
+            ) unless exists($domain->{editors}{$editor});
+            my $target_field = _identifier(
+                $payload->{target_field} // $domain->primary_key,
+                "detail action $id payload target_field",
+            );
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id target_field is not a required field",
+                {action => $id, field => $target_field},
+            ) unless grep { $_ eq $target_field } @fields;
+            my $title = defined($payload->{title})
+                ? _required_string($payload->{title}, "detail action $id payload title")
+                : $name;
+            my %required = map { $_ => 1 } @fields;
+            my @title_placeholders = $title =~ /\{\{\s*([^}]+?)\s*\}\}/g;
+            for my $placeholder (@title_placeholders) {
+                Selecto::Error->throw(
+                    'invalid_domain', "detail action $id title placeholder is not a required field",
+                    {action => $id, field => $placeholder},
+                ) unless $required{$placeholder};
+            }
+            my $title_without_placeholders = $title;
+            $title_without_placeholders =~ s/\{\{\s*[^}]+?\s*\}\}//g;
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id title has malformed placeholders",
+                {action => $id},
+            ) if $title_without_placeholders =~ /[{}]/;
+            my $size = defined($payload->{size})
+                ? lc _required_string($payload->{size}, "detail action $id payload size")
+                : 'lg';
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id editor size is not available",
+                {action => $id, size => $size},
+            ) unless $size =~ /\A(?:sm|md|lg|xl|full|third|fullscreen)\z/;
+            my $navigation_enabled = exists($payload->{navigation_enabled})
+                ? $payload->{navigation_enabled} : 1;
+            my $boolean = JSON::PP::is_bool($navigation_enabled)
+                || (!ref($navigation_enabled) && "$navigation_enabled" =~ /\A(?:0|1)\z/);
+            Selecto::Error->throw(
+                'invalid_domain', "detail action $id navigation_enabled must be a boolean",
+                {action => $id},
+            ) unless $boolean;
+            $actions{$id} = {
+                name => $name,
+                type => $type,
+                required_fields => \@fields,
+                payload => {
+                    editor => $editor,
+                    target_field => $target_field,
+                    title => $title,
+                    size => $size,
+                    navigation_enabled => $navigation_enabled ? 1 : 0,
+                },
+                (defined($description) ? (description => $description) : ()),
+                (defined($capability) ? (capability => $capability) : ()),
+            };
+            next;
+        }
         my $url_template = _required_string(
             $payload->{url_template}, "detail action $id payload url_template",
         );
@@ -1088,6 +1167,140 @@ sub _validate_detail_actions {
     return \%actions;
 }
 
+sub _validate_editors {
+    my ($domain, $value) = @_;
+    return {} unless defined $value;
+    _object($value, 'editors');
+    my $contract = $domain->{contract} // {};
+    my $writes = $contract->{writes} // {};
+    my $update = ref($writes->{operations}) eq 'HASH'
+        ? $writes->{operations}{update} : undef;
+    my $write_fields = ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : {};
+    my $actions = ref($contract->{actions}) eq 'HASH' ? $contract->{actions} : {};
+    my %editors;
+    for my $raw_id (sort keys %$value) {
+        my $id = _identifier($raw_id, 'editor');
+        my $editor = $value->{$raw_id};
+        _object($editor, "editor $id");
+        _reject_unknown($editor, \%EDITOR, "editor $id");
+        Selecto::Error->throw(
+            'invalid_domain', "editor $id requires an enabled update write operation",
+            {editor => $id},
+        ) unless ref($update) eq 'HASH' && $update->{enabled};
+        my $label = _required_string($editor->{label} // $id, "editor $id label");
+        my $fields = $editor->{fields};
+        Selecto::Error->throw(
+            'invalid_domain', "editor $id fields must be a non-empty array",
+        ) unless ref($fields) eq 'ARRAY' && @$fields;
+        my (@normalized_fields, %seen);
+        for my $index (0 .. $#$fields) {
+            my $entry = $fields->[$index];
+            $entry = {field => $entry} if defined($entry) && !ref($entry);
+            _object($entry, "editor $id field $index");
+            _reject_unknown($entry, \%EDITOR_FIELD, "editor $id field $index");
+            my $field = _identifier($entry->{field}, "editor $id field");
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id field is duplicated",
+                {editor => $id, field => $field},
+            ) if $seen{$field}++;
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id field is not a public root field",
+                {editor => $id, field => $field},
+            ) unless exists($domain->{fields}{$field}) && $domain->field_is_public($field);
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id field is not updatable",
+                {editor => $id, field => $field},
+            ) unless ref($write_fields->{$field}) eq 'HASH'
+                && $write_fields->{$field}{updatable};
+            my %normalized = (field => $field);
+            for my $key (qw(label placeholder)) {
+                $normalized{$key} = _required_string(
+                    $entry->{$key}, "editor $id field $field $key",
+                ) if exists $entry->{$key};
+            }
+            my $control = exists($entry->{control})
+                ? lc _required_string($entry->{control}, "editor $id field $field control")
+                : '';
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id field $field control is not available",
+            ) if length($control)
+                && $control !~ /\A(?:text|textarea|number|date|datetime-local|checkbox|select)\z/;
+            $normalized{control} = $control if length $control;
+            for my $key (qw(required nullable)) {
+                next unless exists $entry->{$key};
+                my $setting = $entry->{$key};
+                my $boolean = JSON::PP::is_bool($setting)
+                    || (!ref($setting) && "$setting" =~ /\A(?:0|1)\z/);
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id field $field $key must be a boolean",
+                ) unless $boolean;
+                $normalized{$key} = $setting ? 1 : 0;
+            }
+            if (exists $entry->{rows}) {
+                my $rows = $entry->{rows};
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id field $field rows must be from 2 to 20",
+                ) if ref($rows) || "$rows" !~ /\A\d+\z/ || $rows < 2 || $rows > 20;
+                $normalized{rows} = 0 + $rows;
+            }
+            if (exists $entry->{options}) {
+                my $options = $entry->{options};
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id field $field options must be a non-empty array",
+                ) unless ref($options) eq 'ARRAY' && @$options;
+                my @options;
+                for my $option (@$options) {
+                    _object($option, "editor $id field $field option");
+                    _reject_unknown($option, {value => 1, label => 1}, "editor $id field $field option");
+                    Selecto::Error->throw(
+                        'invalid_domain', "editor $id field $field option value must be scalar",
+                    ) if !exists($option->{value}) || ref($option->{value});
+                    push @options, {
+                        value => $option->{value},
+                        label => _required_string(
+                            $option->{label}, "editor $id field $field option label",
+                        ),
+                    };
+                }
+                $normalized{options} = \@options;
+                $normalized{control} //= 'select';
+            }
+            push @normalized_fields, \%normalized;
+        }
+        my $editor_actions = $editor->{actions} // [];
+        Selecto::Error->throw(
+            'invalid_domain', "editor $id actions must be an array",
+        ) unless ref($editor_actions) eq 'ARRAY';
+        my (@normalized_actions, %seen_action);
+        for my $raw_action (@$editor_actions) {
+            my $action = _identifier($raw_action, "editor $id action");
+            next if $seen_action{$action}++;
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id action is not published",
+                {editor => $id, action => $action},
+            ) unless ref($actions->{$action}) eq 'HASH';
+            my $selection = $actions->{$action}{selection} // {};
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id action must accept a row target",
+                {editor => $id, action => $action},
+            ) if ref($selection) eq 'HASH' && ($selection->{mode} // 'rows') eq 'groups';
+            push @normalized_actions, $action;
+        }
+        $editors{$id} = {
+            label => $label,
+            fields => \@normalized_fields,
+            actions => \@normalized_actions,
+            (exists($editor->{description}) ? (
+                description => _required_string($editor->{description}, "editor $id description"),
+            ) : ()),
+            (exists($editor->{submit_label}) ? (
+                submit_label => _required_string($editor->{submit_label}, "editor $id submit_label"),
+            ) : ()),
+        };
+    }
+    return \%editors;
+}
+
 sub _constant_predicates {
     my ($value, $label) = @_;
     _object($value, $label);
@@ -1155,6 +1368,7 @@ sub rules        { return $_[0]->{rules}; }
 sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
 sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
 sub imports      { my $contract = $_[0]->contract // {}; return dclone($contract->{imports} // {}); }
+sub editors      { return dclone($_[0]->{editors} // {}); }
 sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }

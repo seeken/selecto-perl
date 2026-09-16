@@ -428,6 +428,53 @@ is_deeply(
     'iframe-modal presentation and navigation defaults are portable',
 );
 
+my $editor_contract = dclone($action_contract);
+$editor_contract->{writes} = {
+    operations => {update => {enabled => 1}},
+    fields => {person_id => {updatable => 1}},
+};
+$editor_contract->{editors} = {
+    order_profile => {
+        label => 'Edit order',
+        fields => [{field => 'person_id', control => 'number', required => 1}],
+        actions => [],
+    },
+};
+$editor_contract->{detail_actions}{open_order} = {
+    name => 'Edit order',
+    type => 'record_editor',
+    required_fields => ['id'],
+    payload => {editor => 'order_profile'},
+};
+my $editor_domain = Selecto::Domain->parse($editor_contract, strict => 1);
+is_deeply(
+    $editor_domain->editors->{order_profile}{fields},
+    [{field => 'person_id', control => 'number', required => 1}],
+    'canonical record editors retain governed editable field metadata',
+);
+is_deeply(
+    $editor_domain->detail_actions->{open_order}{payload},
+    {
+        editor => 'order_profile', target_field => 'id', title => 'Edit order',
+        size => 'lg', navigation_enabled => 1,
+    },
+    'record-editor row actions receive portable target and presentation defaults',
+);
+
+my $bad_editor_contract = dclone($editor_contract);
+$bad_editor_contract->{editors}{order_profile}{fields}[0]{field} = 'id';
+eval { Selecto::Domain->parse($bad_editor_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'record editors cannot publish fields outside the update write contract');
+
+$bad_editor_contract = dclone($editor_contract);
+$bad_editor_contract->{detail_actions}{open_order}{payload}{editor} = 'missing_editor';
+eval { Selecto::Domain->parse($bad_editor_contract, strict => 1) };
+$error = $@;
+is($error->code, 'invalid_domain',
+    'record-editor row actions cannot reference unpublished editors');
+
 my $bad_action_contract = dclone($action_contract);
 $bad_action_contract->{detail_actions}{open_order}{payload}{url_template} =
     'javascript:alert({{id}})';
