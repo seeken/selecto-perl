@@ -26,6 +26,7 @@ use Selecto::Document::ShapeRelease ();
 use Selecto::Engine ();
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::FieldPolicy ();
 use Selecto::Files ();
 use Selecto::Query ();
 use Selecto::QueryEnforcement ();

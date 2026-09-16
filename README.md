@@ -64,6 +64,9 @@ centrally certified for the 2.8 governed co-domain/computed-eligibility profile.
   AST operations;
 - governed row and selected-id bulk action planning with explicit transition
   preconditions and fail-closed preview/execute capability decisions;
+- an HTTP-neutral field-policy resolver that intersects public field metadata,
+  governed write permissions, form profiles, capabilities, and record-state
+  eligibility into hidden, read-only, editable, or action-backed descriptors;
 - governed co-domain lookup and boolean-root action selection eligibility with
   fail-closed declaration validation;
 - an HTTP-neutral canonical domain API host and governed-engine query/write
