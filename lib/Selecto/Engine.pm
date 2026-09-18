@@ -67,11 +67,13 @@ sub stream {
 }
 sub preview_write {
     my ($self, $command) = @_;
+    $command = $self->_normalize_write_command($command);
     $self->_validate_write_command($command);
     return $self->{adapter}->preview_write($command);
 }
 sub execute_write {
     my ($self, $command) = @_;
+    $command = $self->_normalize_write_command($command);
     $self->_validate_write_command($command);
     return $self->{adapter}->execute_write($command);
 }
@@ -79,14 +81,18 @@ sub execute_batch {
     my ($self, $batch) = @_;
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
-    $self->_validate_write_command($_) for @{$batch->commands};
-    return $self->{adapter}->execute_batch($batch);
+    my @commands = map { $self->_normalize_write_command($_) } @{$batch->commands};
+    $self->_validate_write_command($_) for @commands;
+    return $self->{adapter}->execute_batch(Selecto::Write::Batch->new(@commands));
 }
 sub execute_graph {
     my ($self, $graph) = @_;
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
     my @nodes = @{$graph->nodes};
+    $nodes[0]{command} = $self->_normalize_write_command($nodes[0]{command});
+    $graph = Selecto::Write::Graph->new(nodes => \@nodes);
+    @nodes = @{$graph->nodes};
     $self->_validate_write_command($nodes[0]{command});
     my %contexts = ($nodes[0]{id} => {
         table         => $self->{domain}->table,
@@ -100,6 +106,17 @@ sub execute_graph {
         $contexts{$node->{id}} = $self->_validate_graph_node($node, \%contexts);
     }
     return $self->{adapter}->execute_graph($graph);
+}
+
+sub _normalize_write_command {
+    my ($self, $command) = @_;
+    return $command unless blessed($command)
+        && $command->isa('Selecto::Write::Command')
+        && $command->relation eq $self->{domain}->table
+        && $command->operation ne 'delete';
+    return $command->with_assignments(
+        $self->{domain}->normalize_write_assignments($command->assignments),
+    );
 }
 sub query_library { my ($self) = @_; return Selecto::QueryLibrary->library($self->domain); }
 sub apply_segment {
@@ -204,6 +221,7 @@ sub _validate_write_command {
         $command,
         fields      => $self->{domain}->fields,
         writes      => _checked_writes($self->{domain}->writes),
+        values_foreign_keys => $self->{domain}->values_foreign_keys,
         allowed_ops => undef,
         label       => $command->relation,
     );
@@ -277,6 +295,9 @@ sub _validate_command_against_contract {
             ) unless exists $domain_fields->{$field};
         }
     }
+    _validate_values_foreign_keys(
+        $command->assignments, $context{values_foreign_keys}, $label,
+    ) if $operation ne 'delete';
     return $self unless $domain_fields;
     # Metadata is validated for every operation, deletes included.
     my $metadata = $command->metadata;
@@ -310,6 +331,35 @@ sub _validate_command_against_contract {
         }
     }
     return $self;
+}
+
+sub _validate_values_foreign_keys {
+    my ($assignments, $foreign_keys, $label) = @_;
+    return unless ref($foreign_keys) eq 'HASH';
+    for my $field (sort keys %$foreign_keys) {
+        next unless exists $assignments->{$field};
+        my $value = $assignments->{$field};
+        next unless defined $value;
+        next if blessed($value) && $value->isa('Selecto::Write::Expression');
+        my $spec = $foreign_keys->{$field};
+        next unless ref($spec) eq 'HASH' && ref($spec->{values}) eq 'ARRAY';
+        next if grep {
+            defined($_) && !ref($_) && "$_" eq "$value"
+        } @{$spec->{values}};
+        my $display_name = $spec->{display_name}
+            // $spec->{association} // $field;
+        Selecto::Error->throw(
+            'write_foreign_key_violation',
+            "field $field must reference an available $display_name value",
+            {
+                field => $field,
+                relation => $label,
+                association => $spec->{association},
+                value => "$value",
+                allowed_values => [@{$spec->{values}}],
+            },
+        );
+    }
 }
 
 sub _required_write_value_missing {

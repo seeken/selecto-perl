@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use Digest::SHA qw(sha256_hex);
+use Encode qw(encode_utf8);
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
@@ -25,7 +26,9 @@ my %RELATION = map { $_ => 1 } qw(
 my %ASSOCIATION = map { $_ => 1 } qw(
     queryable owner_key related_key cardinality through source_scope_key target_scope_key where
 );
-my %JOIN = map { $_ => 1 } qw(type name display_field dimension_key);
+my %JOIN = map { $_ => 1 } qw(
+    type name display_field dimension_key display_fallback
+);
 my %THROUGH = map { $_ => 1 } qw(
     table owner_key related_key source_scope_key through_scope_key target_scope_key
     where target_key_cast
@@ -167,7 +170,7 @@ sub _refresh_fingerprint {
     $fingerprint_value->{detail_actions} = $self->{detail_actions}
         if keys %{$self->{detail_actions}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
-    $self->{fingerprint} = 'sha256:' . sha256_hex($json);
+    $self->{fingerprint} = 'sha256:' . sha256_hex(encode_utf8($json));
     return $self;
 }
 
@@ -233,6 +236,9 @@ sub _parse_canonical {
     my $associations = _canonical_associations(
         $source, $schemas, $joins, $strict, '',
     );
+    _apply_values_foreign_key_metadata(
+        $source, $associations, $raw->{writes},
+    );
     _validate_computed_columns($source, $associations);
     _validate_action_eligibility($raw, $source);
 
@@ -265,9 +271,62 @@ sub _parse_canonical {
     my $fingerprint_document = dclone($raw);
     delete $fingerprint_document->{domain_fingerprint};
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
-        JSON::PP->new->canonical(1)->encode($fingerprint_document)
+        encode_utf8(JSON::PP->new->canonical(1)->encode($fingerprint_document))
     );
     return $domain;
+}
+
+sub _apply_values_foreign_key_metadata {
+    my ($source, $associations, $writes) = @_;
+    my %owner_association;
+    for my $name (sort keys %$associations) {
+        my $association = $associations->{$name};
+        my $values = $association->values;
+        next unless defined($values)
+            && $association->cardinality eq 'one'
+            && !defined($association->through);
+        my $owner_key = $association->owner_key;
+        next unless ref($source->{columns}{$owner_key}) eq 'HASH';
+        Selecto::Error->throw(
+            'invalid_domain',
+            'a root field cannot reference multiple inline-values associations',
+            {
+                field => $owner_key,
+                associations => [$owner_association{$owner_key}, $name],
+            },
+        ) if exists $owner_association{$owner_key};
+        $owner_association{$owner_key} = $name;
+
+        my $value_field = $association->related_key;
+        my $label_field = $association->join_mode eq 'star_dimension'
+            ? $association->display_field : $value_field;
+        my @options;
+        for my $row (@$values) {
+            my $value = $row->{$value_field};
+            Selecto::Error->throw(
+                'invalid_domain',
+                'inline-values foreign key values cannot be null',
+                {association => $name, field => $value_field},
+            ) unless defined $value;
+            my $label = $row->{$label_field};
+            $label = $value unless defined($label) && !ref($label);
+            push @options, {value => $value, label => "$label"};
+        }
+        next unless @options;
+        my $foreign_key = {
+            kind => 'values',
+            association => $name,
+            value_field => $value_field,
+            label_field => $label_field,
+        };
+        $source->{columns}{$owner_key}{foreign_key} = dclone($foreign_key);
+        $source->{columns}{$owner_key}{options} = \@options;
+        my $write_field = ref($writes) eq 'HASH'
+            && ref($writes->{fields}) eq 'HASH'
+                ? $writes->{fields}{$owner_key} : undef;
+        $write_field->{foreign_key} = dclone($foreign_key)
+            if ref($write_field) eq 'HASH' && $write_field->{insertable};
+    }
 }
 
 sub _canonical_associations {
@@ -307,6 +366,37 @@ sub _canonical_associations {
             unless $join_mode eq 'left' || $join_mode eq 'inner'
                 || $join_mode eq 'star_dimension';
         my $target_primary_key = $target->{primary_key} // 'id';
+        my $display_fallback;
+        if (exists $join->{display_fallback}) {
+            Selecto::Error->throw(
+                'invalid_domain',
+                'display fallback is available only for star dimensions',
+                {association => $path},
+            ) unless $join_mode eq 'star_dimension';
+            $display_fallback = lc(_required_string(
+                $join->{display_fallback}, 'star dimension display fallback'
+            ));
+            Selecto::Error->throw(
+                'invalid_domain',
+                'star dimension display fallback must be dimension_key',
+                {association => $path},
+            ) unless $display_fallback eq 'dimension_key';
+            my $display_field = $join->{display_field} // 'name';
+            my $owner_column = ref($relation->{columns}) eq 'HASH'
+                ? $relation->{columns}{$association->{owner_key}} : undef;
+            my $display_column = ref($target->{columns}) eq 'HASH'
+                ? $target->{columns}{$display_field} : undef;
+            my $owner_type = ref($owner_column) eq 'HASH'
+                ? $owner_column->{type} : undef;
+            my $display_type = ref($display_column) eq 'HASH'
+                ? $display_column->{type} : undef;
+            Selecto::Error->throw(
+                'invalid_domain',
+                'star dimension display fallback requires matching display and key types',
+                {association => $path},
+            ) unless defined($owner_type) && defined($display_type)
+                && $owner_type eq $display_type;
+        }
         my $cardinality = $association->{cardinality};
         $cardinality = $association->{related_key} eq $target_primary_key ? 'one' : 'many'
             unless defined $cardinality;
@@ -336,6 +426,8 @@ sub _canonical_associations {
                     display_field => $join->{display_field} // 'name',
                     dimension_key => $join->{dimension_key} // $association->{owner_key},
                     display_name => $join->{name} // $name,
+                    (defined($display_fallback)
+                        ? (display_fallback => $display_fallback) : ()),
                 ) : ()),
             },
         );
@@ -396,6 +488,22 @@ sub _canonical_fields {
         $column = Selecto::Analytics::UnitRegistry->normalize_column_metadata(
             $column, "column $field",
         );
+        if (exists $column->{text_case}) {
+            my $text_case = lc(_required_string(
+                $column->{text_case}, "column $field text_case",
+            ));
+            Selecto::Error->throw(
+                'invalid_domain',
+                'column text_case must be uppercase or lowercase',
+                {field => $field},
+            ) unless $text_case eq 'uppercase' || $text_case eq 'lowercase';
+            Selecto::Error->throw(
+                'invalid_domain',
+                'column text_case is available only for string fields',
+                {field => $field},
+            ) unless ($column->{type} // '') eq 'string';
+            $column->{text_case} = $text_case;
+        }
         $relation->{columns}{$field} = $column;
         $result{$field} = $column->{type};
     }
@@ -740,6 +848,9 @@ sub _portable_associations {
                 name => $association->display_name,
                 display_field => $association->display_field,
                 dimension_key => $association->dimension_key,
+                (defined($association->display_fallback) ? (
+                    display_fallback => $association->display_fallback,
+                ) : ()),
             ) : ()),
         };
     }
@@ -775,6 +886,47 @@ sub field_metadata {
             && ref($contract->{schemas}{$queryable}{columns}) eq 'HASH';
     }
     return ref($column) eq 'HASH' ? dclone($column) : {};
+}
+
+sub values_foreign_keys {
+    my ($self) = @_;
+    my %foreign_keys;
+    for my $name (sort keys %{$self->{associations}}) {
+        my $association = $self->{associations}{$name};
+        my $values = $association->values;
+        next unless defined($values)
+            && $association->cardinality eq 'one'
+            && !defined($association->through);
+        my $field = $association->owner_key;
+        $foreign_keys{$field} = {
+            association => $name,
+            display_name => $association->join_mode eq 'star_dimension'
+                ? $association->display_name : $name,
+            value_field => $association->related_key,
+            values => [
+                map { $_->{$association->related_key} } @$values
+            ],
+        };
+    }
+    return dclone(\%foreign_keys);
+}
+
+sub normalize_field_value {
+    my ($self, $path, $value) = @_;
+    return $value unless defined($value) && !ref($value);
+    my $text_case = $self->field_metadata($path)->{text_case};
+    return uc("$value") if defined($text_case) && $text_case eq 'uppercase';
+    return lc("$value") if defined($text_case) && $text_case eq 'lowercase';
+    return $value;
+}
+
+sub normalize_write_assignments {
+    my ($self, $assignments) = @_;
+    return {} unless ref($assignments) eq 'HASH';
+    return {
+        map { $_ => $self->normalize_field_value($_, $assignments->{$_}) }
+            keys %$assignments
+    };
 }
 
 sub field_unit {
@@ -1637,6 +1789,7 @@ sub new {
     my $display_field;
     my $dimension_key;
     my $display_name;
+    my $display_fallback;
     if ($join_mode eq 'star_dimension') {
         $display_field = Selecto::Domain::_identifier(
             $value->{display_field} // 'name', 'star dimension display field'
@@ -1650,6 +1803,15 @@ sub new {
         $display_name = Selecto::Domain::_required_string(
             $value->{display_name} // $args{name}, 'star dimension name'
         );
+        if (defined $value->{display_fallback}) {
+            $display_fallback = lc(Selecto::Domain::_required_string(
+                $value->{display_fallback}, 'star dimension display fallback'
+            ));
+            Selecto::Error->throw(
+                'invalid_domain',
+                'star dimension display fallback must be dimension_key',
+            ) unless $display_fallback eq 'dimension_key';
+        }
     }
     my ($source_scope_key, $target_scope_key);
     my $direct_scope_count = grep { exists $value->{$_} }
@@ -1737,6 +1899,8 @@ sub new {
             display_field => $display_field,
             dimension_key => $dimension_key,
             display_name => $display_name,
+            (defined($display_fallback)
+                ? (display_fallback => $display_fallback) : ()),
         ) : ()),
     }, $class;
 }
@@ -1774,6 +1938,8 @@ sub fingerprint_value {
             display_field => $self->{display_field},
             dimension_key => $self->{dimension_key},
             display_name => $self->{display_name},
+            (defined($self->{display_fallback})
+                ? (display_fallback => $self->{display_fallback}) : ()),
         ) : ()),
     };
 }
@@ -1794,6 +1960,7 @@ sub join_mode   { return $_[0]->{join_mode}; }
 sub display_field { return $_[0]->{display_field}; }
 sub dimension_key { return $_[0]->{dimension_key}; }
 sub display_name { return $_[0]->{display_name}; }
+sub display_fallback { return $_[0]->{display_fallback}; }
 sub through { return defined($_[0]->{through}) ? {%{$_[0]->{through}}} : undef; }
 sub where { return defined($_[0]->{where}) ? {%{$_[0]->{where}}} : {}; }
 sub source_scope_key { return $_[0]->{source_scope_key}; }
