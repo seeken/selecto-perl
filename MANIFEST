@@ -3,6 +3,7 @@ MANIFEST
 Makefile.PL
 README.md
 docs/action-preconditions.md
+docs/analytics-units.md
 bin/selecto-certify
 cpanfile
 lib/Selecto.pm
@@ -13,6 +14,9 @@ lib/Selecto/Action.pm
 lib/Selecto/Action/Capability.pm
 lib/Selecto/Action/Plan.pm
 lib/Selecto/Action/Planner.pm
+lib/Selecto/Analytics/UnitRegistry.pm
+lib/Selecto/Analytics/TransformRegistry.pm
+lib/Selecto/Analytics/Pipeline.pm
 lib/Selecto/Adapter.pm
 lib/Selecto/Adapter/Registry.pm
 lib/Selecto/CoDomain.pm
@@ -51,6 +55,8 @@ lib/Selecto/Write/Expression.pm
 script/with-local-deps
 t/00-load.t
 t/action.t
+t/analytics_unit_registry.t
+t/analytics_pipeline.t
 t/adapter.t
 t/fixtures/Selecto-Adapter-FutureDB/Makefile.PL
 t/fixtures/Selecto-Adapter-FutureDB/lib/Selecto/Adapter/FutureDB.pm

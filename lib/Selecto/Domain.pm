@@ -216,6 +216,8 @@ sub parse {
 
 sub _parse_canonical {
     my ($class, $raw, $source, $strict) = @_;
+    $raw = dclone($raw);
+    $source = $raw->{source};
     _reject_unknown($source, \%RELATION, 'source') if $strict;
     my $schemas = $raw->{schemas} // {};
     my $joins = $raw->{joins} // {};
@@ -337,6 +339,11 @@ sub _canonical_fields {
         my $column = $relation->{columns}{$field};
         _object($column, "column $field");
         _required_key($column, 'type', "column $field");
+        require Selecto::Analytics::UnitRegistry;
+        $column = Selecto::Analytics::UnitRegistry->normalize_column_metadata(
+            $column, "column $field",
+        );
+        $relation->{columns}{$field} = $column;
         $result{$field} = $column->{type};
     }
     return \%result;
@@ -713,6 +720,22 @@ sub field_metadata {
             && ref($contract->{schemas}{$queryable}{columns}) eq 'HASH';
     }
     return ref($column) eq 'HASH' ? dclone($column) : {};
+}
+
+sub field_unit {
+    my ($self, $path) = @_;
+    require Selecto::Analytics::UnitRegistry;
+    return Selecto::Analytics::UnitRegistry->column_unit(
+        $self->field_metadata($path),
+    );
+}
+
+sub field_behavior {
+    my ($self, $path) = @_;
+    require Selecto::Analytics::UnitRegistry;
+    return Selecto::Analytics::UnitRegistry->column_behavior(
+        $self->field_metadata($path),
+    );
 }
 
 sub field_is_public {
