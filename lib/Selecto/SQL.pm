@@ -120,6 +120,9 @@ sub _compile_single {
     local $self->{_join_aliases} = $join_aliases;
     local $self->{_through_aliases} = $through_aliases;
     $self->_validate_query_aliases($sources, @association_paths);
+    $with_sql = $self->_append_values_ctes(
+        $with_sql, \@params, $domain, $sources, @association_paths,
+    );
     for my $path (@association_paths) {
         my $resolved = $domain->resolve_association($path);
         my $association = $resolved->{association};
@@ -176,7 +179,7 @@ sub _compile_single {
                     $self->_qualified($target_alias, $association->target_scope_key);
             }
             push @joins,
-                $keyword . ' ' . $self->quote_identifier($association->table) .
+                $keyword . ' ' . $self->_association_source_sql($association) .
                 ' AS ' . $self->quote_identifier($target_alias) .
                 ' ON ' . join(' AND ', @target_on);
         }
@@ -287,6 +290,54 @@ sub _compile_single {
         columns => \@columns,
         adapter_name => $self->name,
     );
+}
+
+sub _association_source_sql {
+    my ($self, $association) = @_;
+    return $self->quote_identifier($association->table);
+}
+
+sub _append_values_ctes {
+    my ($self, $with_sql, $params, $domain, $sources, @paths) = @_;
+    my (@entries, %seen);
+    for my $path (@paths) {
+        my $association = $domain->resolve_association($path)->{association};
+        my $rows = $association->values;
+        next unless defined $rows;
+        my $table = $association->table;
+        next if $seen{$table}++;
+        Selecto::Error->throw(
+            'invalid_query',
+            "query source $table conflicts with an inline values relation",
+        ) if exists $sources->{$table};
+        Selecto::Error->throw('unsupported_feature', 'adapter does not support values relations')
+            unless $self->supports('cte');
+        my $fields = $association->value_fields;
+        Selecto::Error->throw('invalid_domain', 'values relation has no fields')
+            unless ref($fields) eq 'ARRAY' && @$fields;
+        my @selects;
+        for my $row_index (0 .. $#$rows) {
+            my $row = $rows->[$row_index];
+            my @values;
+            for my $field (@$fields) {
+                push @$params, $row->{$field};
+                my $value = $self->placeholder(scalar @$params);
+                $value .= ' AS ' . $self->quote_identifier($field)
+                    if $row_index == 0;
+                push @values, $value;
+            }
+            push @selects, 'SELECT ' . join(', ', @values);
+        }
+        push @entries,
+            $self->quote_identifier($table) . ' AS (' .
+            join(' UNION ALL ', @selects) . ')';
+    }
+    return $with_sql unless @entries;
+    if (length $with_sql) {
+        $with_sql =~ s/\s+\z//;
+        return $with_sql . ', ' . join(', ', @entries) . ' ';
+    }
+    return 'WITH ' . join(', ', @entries) . ' ';
 }
 
 sub _shift_placeholders {

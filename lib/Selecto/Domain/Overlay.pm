@@ -13,13 +13,13 @@ my %MAP_SECTION = map { $_ => 1 } qw(
     source schemas joins associations filters functions query_members query_library
     published_views detail_actions components columns custom_columns jsonb_schemas
     subfilters window_functions pagination retarget writes actions imports capabilities
-    source_relationships choice_sources co_domains
+    source_relationships choice_sources co_domains editors
 );
 my %COLLISION_SECTION = map { $_ => 1 } qw(
     actions capabilities source_relationships choice_sources
 );
 my %LIST_SECTION = map { $_ => 1 } qw(
-    default_selected required_selected required_order_by extensions redact_fields
+    default_selected required_selected required_order_by redact_fields
 );
 
 sub compose {
@@ -112,6 +112,19 @@ sub _validate_section_shapes {
             },
         ) unless ref($value->{$section}) eq 'ARRAY';
     }
+    if (exists($value->{extensions})
+        && ref($value->{extensions}) ne 'ARRAY'
+        && ref($value->{extensions}) ne 'HASH') {
+        Selecto::Error->throw(
+            $code,
+            "$label extensions must be an array or object",
+            {
+                section => 'extensions',
+                (defined($overlay_index) ? (overlay_index => $overlay_index) : ()),
+                actual => _value_type($value->{extensions}),
+            },
+        );
+    }
     if (ref($value->{source}) eq 'HASH' && exists $value->{source}{redact_fields}) {
         Selecto::Error->throw(
             $code,
@@ -141,6 +154,10 @@ sub _merge_section_value {
     if (($section eq 'extensions' || $section eq 'redact_fields')
         && ref($base) eq 'ARRAY' && ref($overlay) eq 'ARRAY') {
         return _unique_list(@$base, @$overlay);
+    }
+    if ($section eq 'extensions'
+        && ref($base) eq 'HASH' && ref($overlay) eq 'HASH') {
+        return _deep_merge($base, $overlay, $path);
     }
     if ($MAP_SECTION{$section} && ref($base) eq 'HASH' && ref($overlay) eq 'HASH') {
         return _deep_merge($base, $overlay, $path);
