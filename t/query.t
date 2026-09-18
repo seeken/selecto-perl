@@ -96,6 +96,49 @@ like(
     'exact path-based result names are emitted as quoted SQL aliases',
 );
 
+my $values_domain = Selecto::Domain->parse({
+    schema_version => 1,
+    name => 'Items with inline status names',
+    source => {
+        source_table => 'items', primary_key => 'id',
+        fields => [qw(id status)],
+        columns => {id => {type => 'integer'}, status => {type => 'string'}},
+        associations => {
+            status_name => {
+                queryable => 'status_values', owner_key => 'status', related_key => 'id',
+            },
+        },
+    },
+    schemas => {
+        status_values => {
+            values => [
+                {id => 'at', name => 'Active'},
+                {id => q{o'h}, name => q{O'Brien}},
+            ],
+            primary_key => 'id', fields => [qw(id name)],
+            columns => {id => {type => 'string'}, name => {type => 'string'}},
+            associations => {},
+        },
+    },
+    joins => {
+        status_name => {
+            type => 'star_dimension', name => 'Status',
+            display_field => 'name', dimension_key => 'status',
+        },
+    },
+});
+my $values_engine = Selecto::Engine->new(domain => $values_domain, adapter => $adapter);
+my $values_statement = $values_engine->compile(
+    $values_engine->query->select('id', 'status_name.name'),
+);
+like $values_statement->sql,
+    qr{WITH "__selecto_values_status_values" AS \(SELECT \$1 AS "id", \$2 AS "name" UNION ALL SELECT \$3, \$4\).*LEFT JOIN "__selecto_values_status_values" AS "j_status_name"}s,
+    'inline values relations compile as governed joined rows';
+unlike $values_statement->sql, qr/O'Brien|O''Brien/,
+    'inline relation values are not interpolated into SQL';
+is_deeply $values_statement->params, ['at', 'Active', q{o'h}, q{O'Brien}],
+    'inline relation values remain adapter-bound parameters';
+
 my $duplicate_result_error = eval {
     $join_engine->compile($join_engine->query->select(
         'person.name',

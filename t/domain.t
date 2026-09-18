@@ -349,6 +349,31 @@ is $person_dimension->dimension_key, 'person_id',
 is $person_dimension->display_name, 'Person',
     'a star dimension retains its presentation name';
 
+my $values_contract = $canonical->contract;
+delete $values_contract->{schemas}{people}{source_table};
+$values_contract->{schemas}{people}{values} = [
+    {id => 1, name => 'Ada'},
+    {id => 2, name => 'Grace'},
+];
+my $values_domain = Selecto::Domain->parse($values_contract, strict => 1);
+is_deeply $values_domain->associations->{person}->values,
+    [{id => 1, name => 'Ada'}, {id => 2, name => 'Grace'}],
+    'canonical values schemas retain their governed rows';
+
+my $ambiguous_values_contract = $canonical->contract;
+$ambiguous_values_contract->{schemas}{people}{values} = [{id => 1, name => 'Ada'}];
+eval { Selecto::Domain->parse($ambiguous_values_contract, strict => 1) };
+$error = $@;
+is $error->code, 'invalid_domain',
+    'a canonical schema cannot combine a table and inline values';
+
+my $incomplete_values_contract = $values_contract;
+$incomplete_values_contract->{schemas}{people}{values} = [{id => 1}];
+eval { Selecto::Domain->parse($incomplete_values_contract, strict => 1) };
+$error = $@;
+is $error->code, 'invalid_domain',
+    'every canonical values row must provide every declared field';
+
 my $bad_star_contract = $canonical->contract;
 $bad_star_contract->{joins}{person} = {
     type => 'star_dimension', display_field => 'missing', dimension_key => 'person_id',
