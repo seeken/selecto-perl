@@ -166,8 +166,20 @@ sub _compile_single {
                 ' ON ' . join(' AND ', @target_on) . ')' .
                 ' ON ' . join(' AND ', @bridge_on);
         } else {
+            my $owner_sql = $self->_qualified(
+                $parent_alias, $association->owner_key,
+            );
+            if (defined($association->values)) {
+                my $owner_path = @segments
+                    ? join('.', @segments, $association->owner_key)
+                    : $association->owner_key;
+                $owner_sql = _text_case_sql(
+                    $owner_sql,
+                    $domain->field_metadata($owner_path)->{text_case},
+                );
+            }
             my @target_on = (
-                $self->_qualified($parent_alias, $association->owner_key) . ' = ' .
+                $owner_sql . ' = ' .
                     $self->_qualified($target_alias, $association->related_key),
             );
             push @target_on, $self->_constant_join_predicates(
@@ -1051,12 +1063,40 @@ sub _field_sql {
         ? $self->_join_alias($resolved->{association_path})
         : $self->_root_alias;
     my $sql = $self->quote_identifier($table_alias) . '.' . $self->quote_identifier($resolved->{field});
+    my $association = $resolved->{association};
+    if ($association
+        && $association->join_mode eq 'star_dimension'
+        && defined($association->display_fallback)
+        && $association->display_fallback eq 'dimension_key'
+        && $resolved->{field} eq $association->display_field) {
+        my @association_path = split /\./, $resolved->{association_path};
+        pop @association_path;
+        my $owner_alias = @association_path
+            ? $self->_join_alias(join('.', @association_path))
+            : $self->_root_alias;
+        my $key_sql = $self->quote_identifier($owner_alias) . '.'
+            . $self->quote_identifier($association->dimension_key);
+        my $key_path = @association_path
+            ? join('.', @association_path, $association->dimension_key)
+            : $association->dimension_key;
+        $key_sql = _text_case_sql(
+            $key_sql, $domain->field_metadata($key_path)->{text_case},
+        );
+        $sql = "COALESCE($sql, $key_sql)";
+    }
     return $sql unless defined($self->{_timezone})
         && ($resolved->{type} eq 'utc_datetime' || $resolved->{type} eq 'epoch_datetime')
         && !$self->{_suppress_field_timezone};
     return $self->_compile_timezone_sql(
         $sql, $resolved->{type}, $self->{_timezone}, $params,
     );
+}
+
+sub _text_case_sql {
+    my ($sql, $text_case) = @_;
+    return "UPPER($sql)" if defined($text_case) && $text_case eq 'uppercase';
+    return "LOWER($sql)" if defined($text_case) && $text_case eq 'lowercase';
+    return $sql;
 }
 
 sub _compile_computed_field {

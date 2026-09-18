@@ -9,6 +9,7 @@ use Selecto::MSSQL ();
 use Selecto::MySQL ();
 use Selecto::PostgreSQL ();
 use Selecto::SQLite ();
+use Selecto::Write ();
 
 my $dbh = TestSelecto::DBH->new;
 my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
@@ -102,7 +103,10 @@ my $values_domain = Selecto::Domain->parse({
     source => {
         source_table => 'items', primary_key => 'id',
         fields => [qw(id status)],
-        columns => {id => {type => 'integer'}, status => {type => 'string'}},
+        columns => {
+            id => {type => 'integer'},
+            status => {type => 'string', text_case => 'lowercase'},
+        },
         associations => {
             status_name => {
                 queryable => 'status_values', owner_key => 'status', related_key => 'id',
@@ -124,20 +128,71 @@ my $values_domain = Selecto::Domain->parse({
         status_name => {
             type => 'star_dimension', name => 'Status',
             display_field => 'name', dimension_key => 'status',
+            display_fallback => 'dimension_key',
+        },
+    },
+    writes => {
+        operations => {insert => {enabled => 1}},
+        fields => {
+            id => {insertable => 1},
+            status => {insertable => 1},
         },
     },
 });
 my $values_engine = Selecto::Engine->new(domain => $values_domain, adapter => $adapter);
+is_deeply $values_domain->field_metadata('status')->{foreign_key}, {
+    kind => 'values',
+    association => 'status_name',
+    value_field => 'id',
+    label_field => 'name',
+}, 'inline-values dimensions publish foreign-key metadata on their root key';
+is_deeply $values_domain->field_metadata('status')->{options}, [
+    {value => 'at', label => 'Active'},
+    {value => q{o'h}, label => q{O'Brien}},
+], 'inline-values foreign keys publish labeled choices for write clients';
+is_deeply $values_domain->values_foreign_keys->{status}{values},
+    ['at', q{o'h}],
+    'inline-values foreign keys retain their governed insert values';
+is_deeply $values_domain->writes->{fields}{status}{foreign_key}, {
+    kind => 'values',
+    association => 'status_name',
+    value_field => 'id',
+    label_field => 'name',
+}, 'inline-values foreign keys are explicit in the governed insert contract';
 my $values_statement = $values_engine->compile(
     $values_engine->query->select('id', 'status_name.name'),
 );
 like $values_statement->sql,
     qr{WITH "__selecto_values_status_values" AS \(SELECT \$1 AS "id", \$2 AS "name" UNION ALL SELECT \$3, \$4\).*LEFT JOIN "__selecto_values_status_values" AS "j_status_name"}s,
     'inline values relations compile as governed joined rows';
+like $values_statement->sql,
+    qr{LOWER\("s0"\."status"\) = "j_status_name"\."id"},
+    'values joins normalize existing stored keys to their canonical text case';
+like $values_statement->sql,
+    qr{COALESCE\("j_status_name"\."name", LOWER\("s0"\."status"\)\)},
+    'star dimensions can display a nonconforming stored key instead of null';
 unlike $values_statement->sql, qr/O'Brien|O''Brien/,
     'inline relation values are not interpolated into SQL';
 is_deeply $values_statement->params, ['at', 'Active', q{o'h}, q{O'Brien}],
     'inline relation values remain adapter-bound parameters';
+
+my $invalid_values_write = eval {
+    $values_engine->preview_write(Selecto::Write::Command->new(
+        operation => 'insert', relation => 'items',
+        assignments => {id => 10, status => 'unknown'},
+    ));
+    undef;
+};
+is $@->code, 'write_foreign_key_violation',
+    'inline-values foreign keys reject an unknown insert value before SQL execution';
+my $valid_values_write = $values_engine->preview_write(
+    Selecto::Write::Command->new(
+        operation => 'insert', relation => 'items',
+        assignments => {id => 10, status => 'AT'},
+    ),
+);
+is_deeply $valid_values_write->{params}, [10, 'at'],
+    'inline-values foreign keys normalize case before validation and SQL generation';
 
 my $duplicate_result_error = eval {
     $join_engine->compile($join_engine->query->select(

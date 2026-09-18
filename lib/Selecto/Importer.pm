@@ -343,6 +343,9 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
                 push @errors, _error_hash($error, $mapping->{target});
                 next;
             }
+            $value = $self->domain->normalize_field_value(
+                $mapping->{target}, $value,
+            );
         }
         if (!$present || _blank($value)) {
             my $policy = $mapping->{blank_policy};
