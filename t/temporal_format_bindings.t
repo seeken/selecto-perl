@@ -53,8 +53,8 @@ subtest 'PostgreSQL DATE midnight follows the requested timezone, not the sessio
     plan skip_all => 'DBD::Pg is required' unless eval {require DBI; require DBD::Pg; 1};
     my $dbh = DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,
         {RaiseError=>1,PrintError=>0,AutoCommit=>1});
-    $dbh->do('CREATE TEMP TABLE selecto_temporal_bindings(id INTEGER,day DATE,naive TIMESTAMP,active BOOLEAN)');
-    $dbh->do(q{INSERT INTO selecto_temporal_bindings VALUES(1,'1969-12-31','2024-01-01 10:00:00',true)});
+    $dbh->do('CREATE TEMP TABLE selecto_temporal_bindings(id INTEGER,day DATE,naive TIMESTAMP,instant TIMESTAMPTZ,epoch NUMERIC(20,6),active BOOLEAN)');
+    $dbh->do(q{INSERT INTO selecto_temporal_bindings VALUES(1,'1969-12-31','2024-01-01 10:00:00','2024-01-01 10:00:00+00',1704103200,true)});
     my $engine = Selecto::Engine->new(domain => $domain,
         adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
     my $handler = Selecto::API::EngineHandler->new;
@@ -89,6 +89,20 @@ subtest 'PostgreSQL DATE midnight follows the requested timezone, not the sessio
             is_deeply $handler->query($engine, $naive)->{rows},
                 [[1, '2024-01-01T10:00:00', $naive_timestamp, $naive_epoch, '2024-01-01 10']],
                 "$zone naive timestamp preserves wall time under session $session";
+            my $instant_iso = $zone eq 'UTC'
+                ? '2024-01-01T10:00:00Z' : '2024-01-01T05:00:00-05:00';
+            my $instant_rfc = $zone eq 'UTC'
+                ? '2024-01-01T10:00:00.000Z' : '2024-01-01T05:00:00.000-05:00';
+            for my $field (qw(instant epoch)) {
+                my $request = {select => [map {{field => $field, format => $_, alias => $_}}
+                    qw(iso8601 rfc3339_millis epoch_seconds epoch_milliseconds day_hour timezone_offset)],
+                    timezone => $zone, filters => [{field => 'id', op => 'eq', value => 1}]};
+                is_deeply $handler->query($engine, $request)->{rows},
+                    [[1, $instant_iso, $instant_rfc, 1704103200, 1704103200000,
+                        ($zone eq 'UTC' ? '2024-01-01 10' : '2024-01-01 05'),
+                        ($zone eq 'UTC' ? '+00:00' : '-05:00')]],
+                    "$zone $field display ignores session $session";
+            }
         }
     }
     $dbh->disconnect;
