@@ -128,6 +128,30 @@ is $preview->{rows}[1]{write}{filters}[0]{value}, 19, 'update is filtered to the
 ok !exists($preview->{rows}[1]{write}{assignments}{client_id}), 'insert-only trusted client is omitted from a matched update';
 is scalar @{$preview->{rows}[1]{errors}}, 0, 'update does not require unrelated insert-only fields';
 
+my $action_boundary_inspection = $importer->inspect_csv(
+    "VIN,Truck Name,lic_no,Odometer\nNEW,New unit,T1,12345\nEXISTING,Renamed unit,T2, \n");
+my $action_boundary_configuration = {
+    %$configuration,
+    actions => [{action => 'record_odometer', inputs => {
+        miles => {source => {kind => 'column', column_id => 'c4'}, transforms => ['trim']},
+        read_date => {source => {kind => 'static', value => '2026-09-14'}},
+    }}],
+};
+my $action_resolver_calls = 0;
+my $action_boundary_preview = $importer->preview_rows(
+    $action_boundary_inspection, $action_boundary_configuration,
+    trusted_values => {current_client_id => 44},
+    key_resolver => sub { $action_resolver_calls++; return {matches => []} },
+);
+is $action_resolver_calls, 1, 'blank required action input never reaches host key resolution';
+is_deeply [map { $_->{errors}[0]{code} } @{$action_boundary_preview->{rows}}],
+    [qw(import_action_requires_match import_required_value_missing)],
+    'unmatched action and blank required input fail closed';
+for my $row (@{$action_boundary_preview->{rows}}) {
+    is $row->{decision}, 'error', 'unsafe action row cannot be planned';
+    ok !defined($row->{write}) && !@{$row->{actions} // []}, 'unsafe action row has no write or action';
+}
+
 my $id_inspection = $importer->inspect_csv("Truck ID,Truck Name,Odometer\n19,Renamed unit,12345\n");
 my $id_preview = $importer->preview_rows($id_inspection, {
     config_version => 1, domain_fingerprint => $importer->domain_fingerprint,
