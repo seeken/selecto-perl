@@ -47,6 +47,34 @@ subtest 'numbered placeholder occurrence accounting' => sub {
     }
 };
 
+subtest 'PostgreSQL DATE midnight follows the requested timezone, not the session' => sub {
+    my $database = $ENV{SELECTO_API_TEST_DATABASE};
+    plan skip_all => 'disposable API PostgreSQL database is not configured' unless defined $database && length $database;
+    plan skip_all => 'DBD::Pg is required' unless eval {require DBI; require DBD::Pg; 1};
+    my $dbh = DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,
+        {RaiseError=>1,PrintError=>0,AutoCommit=>1});
+    $dbh->do('CREATE TEMP TABLE selecto_temporal_bindings(id INTEGER,day DATE,active BOOLEAN)');
+    $dbh->do(q{INSERT INTO selecto_temporal_bindings VALUES(1,'1969-12-31',true)});
+    my $engine = Selecto::Engine->new(domain => $domain,
+        adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+    my $handler = Selecto::API::EngineHandler->new;
+    for my $case (
+        ['America/New_York', '1969-12-31T00:00:00.000-05:00', -68400, '-05:00'],
+        ['UTC', '1969-12-31T00:00:00.000Z', -86400, '+00:00'],
+    ) {
+        my ($zone, @expected) = @$case;
+        my $request = {select => [map {{field => 'day', format => $_, alias => $_}}
+            qw(rfc3339_millis epoch_seconds timezone_offset day)],
+            timezone => $zone, filters => [{field => 'id', op => 'eq', value => 1}]};
+        for my $session ('UTC', 'Pacific/Honolulu') {
+            $dbh->do("SET TIME ZONE '$session'"); # Authored fixture zone only.
+            is_deeply $handler->query($engine, $request)->{rows},
+                [[1, @expected, '1969-12-31']], "$zone DATE midnight ignores session $session";
+        }
+    }
+    $dbh->disconnect;
+};
+
 subtest 'all temporal formats execute equivalently on PostgreSQL and DuckDB' => sub {
     my $database = $ENV{SELECTO_API_TEST_DATABASE};
     plan skip_all => 'disposable API PostgreSQL database is not configured' unless defined $database && length $database;
