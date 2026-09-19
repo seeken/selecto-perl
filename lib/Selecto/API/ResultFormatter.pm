@@ -211,7 +211,7 @@ sub _xlsx ($columns, $rows) {
                 $worksheet->write_blank($row_index, $column_index, undef);
                 next;
             }
-            if (_native_number($value)) {
+            if (_safe_xlsx_number($value)) {
                 $worksheet->write_number($row_index, $column_index, 0 + $value);
             } else {
                 my $text = _flat_value($value);
@@ -262,6 +262,18 @@ sub _native_number ($value) {
     return 0 if ref($value) || !looks_like_number($value);
     my $encoded = JSON::PP->new->allow_nonref(1)->utf8(0)->encode($value);
     return $encoded !~ /\A"/ ? 1 : 0;
+}
+
+sub _safe_xlsx_number ($value) {
+    return 0 unless _native_number($value);
+    my $encoded = JSON::PP->new->allow_nonref(1)->utf8(0)->encode($value);
+    if ($encoded =~ /\A-?(?:0|[1-9][0-9]*)\z/) {
+        my $digits = $encoded =~ s/\A-//r;
+        my $limit = '9007199254740991';
+        return 0 if length($digits) > length($limit)
+            || (length($digits) == length($limit) && $digits gt $limit);
+    }
+    return 1;
 }
 
 1;
