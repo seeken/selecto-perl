@@ -17,9 +17,11 @@ my $domain = Selecto::Domain->parse({
     required_selected => ['id'],
     source => {source_table => 'selecto_temporal_bindings', primary_key => 'id',
         fields => [qw(id naive day instant epoch active)], columns => {
-            id => {type => 'integer'}, naive => {type => 'naive_datetime'},
-            day => {type => 'date'}, instant => {type => 'utc_datetime'},
-            epoch => {type => 'epoch_datetime'}, active => {type => 'boolean', internal => JSON::PP::true}},
+            id => {type => 'integer'}, naive => {type => 'naive_datetime', nullable => JSON::PP::true},
+            day => {type => 'date', nullable => JSON::PP::true},
+            instant => {type => 'utc_datetime', nullable => JSON::PP::true},
+            epoch => {type => 'epoch_datetime', nullable => JSON::PP::true},
+            active => {type => 'boolean', internal => JSON::PP::true}},
         associations => {}}, schemas => {}, joins => {},
 })->with_required_predicate(Selecto::Expression->eq('active', JSON::PP::true));
 
@@ -151,6 +153,26 @@ subtest 'all temporal formats execute equivalently on PostgreSQL and DuckDB' => 
             adapter => Selecto->adapter(($index ? 'duckdb' : 'postgresql') => (dbh => $dbh)));
     }
     my $handler = Selecto::API::EngineHandler->new;
+    for my $case (
+        ['UTC', '1969-12-31T23:59:59Z', '1969-12-31T23:59:59.999Z', '23:59:59', '23', '+00:00'],
+        ['America/New_York', '1969-12-31T18:59:59-05:00', '1969-12-31T18:59:59.999-05:00', '18:59:59', '18', '-05:00'],
+    ) {
+        my ($zone, $iso, $rfc, $time, $hour, $offset) = @$case;
+        my $request = {select => ['id', map {{field => 'epoch', format => $_, alias => $_}} @formats],
+            timezone => $zone, filters => [{field => 'id', op => 'eq', value => 1}]};
+        my $nullable = {select => ['id', map {{field => 'epoch', format => $_, alias => $_}} @formats],
+            timezone => $zone, filters => [{field => 'id', op => 'eq', value => 5}]};
+        for my $session ('UTC', 'Pacific/Honolulu') {
+            $handles[0]->do("SET TIME ZONE '$session'"); # Authored fixture zones only.
+            is_deeply $handler->query($engines[0], $request)->{rows}, [[1,
+                $iso, $rfc, -1, -1, '1969-12-31', $time, "1969-12-31 $hour",
+                '1970-W01', '1970-W01', '1970-W01-3', '1969-12', '1969-Q4',
+                '1969', '12', '31', 'Wednesday', '3', '365', $hour, $offset]],
+                "$zone negative fractional epoch follows floor under session $session";
+            is_deeply $handler->query($engines[0], $nullable)->{rows}, [[5, (undef) x 20]],
+                "$zone NULL epoch preserves all formatted NULLs under session $session";
+        }
+    }
     for my $index (0..1) {
         my $engine = $engines[$index];
         for my $case (
