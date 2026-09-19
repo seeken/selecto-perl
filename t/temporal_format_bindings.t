@@ -70,6 +70,16 @@ subtest 'PostgreSQL DATE midnight follows the requested timezone, not the sessio
             $dbh->do("SET TIME ZONE '$session'"); # Authored fixture zone only.
             is_deeply $handler->query($engine, $request)->{rows},
                 [[1, @expected, '1969-12-31']], "$zone DATE midnight ignores session $session";
+            my $all = {select => [map {{field => 'day', format => $_, alias => $_}} @formats],
+                timezone => $zone, filters => [{field => 'id', op => 'eq', value => 1}]};
+            my @expected_all = (
+                '1969-12-31', $expected[0], $expected[1], $expected[1] * 1000,
+                '1969-12-31', '00:00:00', '1969-12-31 00', '1970-W01', '1970-W01',
+                '1970-W01-3', '1969-12', '1969-Q4', '1969', '12', '31',
+                'Wednesday', '3', '365', '00', $expected[2],
+            );
+            is_deeply $handler->query($engine, $all)->{rows}, [[1, @expected_all]],
+                "$zone all 20 DATE formats ignore session $session";
         }
     }
     $dbh->disconnect;
