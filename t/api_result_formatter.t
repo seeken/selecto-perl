@@ -4,6 +4,7 @@ use warnings;
 use utf8;
 
 use Encode qw(decode);
+use IO::Uncompress::Unzip ();
 use JSON::PP ();
 use Test::More;
 use Selecto::API::ResultFormatter ();
@@ -52,6 +53,29 @@ is $object_csv, "id,label\r\n9,\"Object row\"\r\n",
 my $xlsx = Selecto::API::ResultFormatter->encode_result('xlsx', $result);
 is substr($xlsx, 0, 2), 'PK', 'XLSX output is an Office Open XML zip archive';
 ok length($xlsx) > 1000, 'XLSX output contains a complete workbook';
+
+my $wide_integer = 0 + '9007199254740993';
+my $wide_xlsx = Selecto::API::ResultFormatter->encode_result('xlsx', {
+    columns => ['id'], rows => [[7], [$wide_integer]],
+});
+my $archive = IO::Uncompress::Unzip->new(\$wide_xlsx)
+    or die $IO::Uncompress::Unzip::UnzipError;
+my %parts;
+do {
+    my $name = $archive->getHeaderInfo->{Name};
+    if ($name eq 'xl/worksheets/sheet1.xml' || $name eq 'xl/sharedStrings.xml') {
+        my $contents = '';
+        my $chunk;
+        $contents .= $chunk while $archive->read($chunk) > 0;
+        $parts{$name} = $contents;
+    }
+} while $archive->nextStream > 0;
+like $parts{'xl/worksheets/sheet1.xml'}, qr{<c r="A2"><v>7</v></c>},
+    'safe XLSX integers remain numeric cells';
+like $parts{'xl/worksheets/sheet1.xml'}, qr{<c r="A3" t="s"><v>1</v></c>},
+    'integers outside Excel exact range become text cells';
+like $parts{'xl/sharedStrings.xml'}, qr{<si><t>9007199254740993</t></si>},
+    'wide integer text retains every digit';
 
 my $error = eval {
     Selecto::API::ResultFormatter->negotiate(undef, 'application/pdf');
