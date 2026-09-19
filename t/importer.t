@@ -87,6 +87,18 @@ is $inspection->{row_count}, 2, 'CSV inspection counts data rows';
 is $inspection->{columns}[0]{header}, 'VIN', 'CSV inspection preserves headers';
 is $inspection->{rows}[0]{values}{c1}, ' abc ', 'inspection preserves source values for transforms';
 
+my $unterminated_error = eval { $importer->inspect_csv("VIN,Name\n\"BAD,Name\n"); undef } // $@;
+is $unterminated_error->code, 'import_parser_error', 'unterminated CSV quote fails closed at EOF';
+my $invalid_utf8_error = eval { $importer->inspect_csv("VIN,Name\nA,\xFF\n"); undef } // $@;
+is $invalid_utf8_error->code, 'invalid_import_file', 'invalid UTF-8 bytes are rejected';
+my $utf8_bytes = $importer->inspect_csv("VIN,Name\nA,Caf\xC3\xA9\n");
+is $utf8_bytes->{rows}[0]{values}{c2}, "Caf\x{E9}", 'valid UTF-8 bytes are decoded';
+my $decoded_text = "VIN,Name\nA,Caf\x{E9}\n";
+utf8::upgrade($decoded_text);
+my $utf8_text = $importer->inspect_csv($decoded_text);
+is $utf8_text->{rows}[0]{values}{c2}, "Caf\x{E9}", 'decoded Unicode text is preserved';
+is $utf8_text->{sha256}, $utf8_bytes->{sha256}, 'Unicode text and equivalent bytes have the same digest';
+
 my $configuration = {
     config_version => 1, domain_fingerprint => $importer->domain_fingerprint,
     mappings => [
