@@ -14,7 +14,7 @@ plan skip_all => 'API PostgreSQL database is not configured' unless defined $dat
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBI; require DBD::Pg; 1 };
 my $dbh = DBI->connect("dbi:Pg:dbname=$database;host=/tmp", undef, undef,
     {RaiseError => 1, PrintError => 0, AutoCommit => 1});
-$dbh->do('CREATE TEMP TABLE records(id INTEGER PRIMARY KEY,name TEXT,tenant_id INTEGER,secret TEXT)');
+$dbh->do('CREATE TEMP TABLE records(id INTEGER PRIMARY KEY,name TEXT NOT NULL,tenant_id INTEGER,secret TEXT)');
 $dbh->do(q{INSERT INTO records VALUES(1,'a',7,'s'),(2,'b',8,'s'),(3,'c',7,'s')});
 my $domain = Selecto::Domain->parse({
     schema_version => 1, domain_version => '1.0.0',
@@ -63,5 +63,28 @@ is_deeply $handler->write($engine,$delete),
     {operation => 'delete', affected_rows => 2, values => {name => 'bulk'}}, 'bulk delete returning';
 is_deeply $dbh->selectall_arrayref('SELECT id,name FROM records ORDER BY id'),
     [[2,'b'],[4,'upserted']], 'only scoped records were deleted';
+
+my $duplicate = eval {
+    $handler->write($unscoped, {operation => 'insert',
+        assignments => {id => 4, name => 'duplicate', tenant_id => 7}});
+    undef;
+} // $@;
+is $duplicate->code, 'database_unique_violation',
+    'live PostgreSQL duplicate key retains its public error code';
+is_deeply $duplicate->details, {constraint => 'unique', fields => ['id']},
+    'live duplicate key reports the field without leaking its value';
+
+my $missing_database_field = eval {
+    $handler->write($unscoped, {operation => 'insert',
+        assignments => {id => 5, name => undef, tenant_id => 7}});
+    undef;
+} // $@;
+is $missing_database_field->code, 'database_not_null_violation',
+    'live PostgreSQL not-null failure retains its public error code';
+is_deeply $missing_database_field->details,
+    {constraint => 'not_null', field => 'name', relation => 'records'},
+    'live not-null failure reports field and relation without row values';
+is_deeply $dbh->selectall_arrayref('SELECT id,name FROM records ORDER BY id'),
+    [[2,'b'],[4,'upserted']], 'both failed inserts leave persisted rows unchanged';
 $dbh->disconnect;
 done_testing;
