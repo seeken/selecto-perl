@@ -84,7 +84,32 @@ is $missing_database_field->code, 'database_not_null_violation',
 is_deeply $missing_database_field->details,
     {constraint => 'not_null', field => 'name', relation => 'records'},
     'live not-null failure reports field and relation without row values';
+$dbh->do('ALTER TABLE records ADD FOREIGN KEY (tenant_id) REFERENCES records(id) NOT VALID');
+$dbh->do(q{ALTER TABLE records ADD CHECK (name <> 'invalid')});
+my $missing_reference = eval {
+    $handler->write($unscoped, {operation => 'insert',
+        assignments => {id => 5, name => 'private missing parent', tenant_id => 9}});
+    undef;
+} // $@;
+is $missing_reference->code, 'database_foreign_key_violation',
+    'live PostgreSQL foreign-key failure retains its public error code';
+is $missing_reference->message, 'A referenced record does not exist or is not available.',
+    'foreign-key message does not reveal the missing key';
+is_deeply $missing_reference->details, {constraint => 'foreign_key'},
+    'foreign-key details contain only the safe category';
+
+my $failed_check = eval {
+    $handler->write($unscoped, {operation => 'insert',
+        assignments => {id => 5, name => 'invalid', tenant_id => 2}});
+    undef;
+} // $@;
+is $failed_check->code, 'database_check_violation',
+    'live PostgreSQL check failure retains its public error code';
+is $failed_check->message, 'A database validation constraint was not satisfied.',
+    'check message does not reveal the rejected row';
+is_deeply $failed_check->details, {constraint => 'check'},
+    'check details contain only the safe category';
 is_deeply $dbh->selectall_arrayref('SELECT id,name FROM records ORDER BY id'),
-    [[2,'b'],[4,'upserted']], 'both failed inserts leave persisted rows unchanged';
+    [[2,'b'],[4,'upserted']], 'all failed inserts leave persisted rows unchanged';
 $dbh->disconnect;
 done_testing;
