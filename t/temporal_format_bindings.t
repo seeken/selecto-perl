@@ -55,6 +55,8 @@ subtest 'PostgreSQL DATE midnight follows the requested timezone, not the sessio
         {RaiseError=>1,PrintError=>0,AutoCommit=>1});
     $dbh->do('CREATE TEMP TABLE selecto_temporal_bindings(id INTEGER,day DATE,naive TIMESTAMP,instant TIMESTAMPTZ,epoch NUMERIC(20,6),active BOOLEAN)');
     $dbh->do(q{INSERT INTO selecto_temporal_bindings VALUES(1,'1969-12-31','2024-01-01 10:00:00','2024-01-01 10:00:00+00',1704103200,true)});
+    $dbh->do(q{INSERT INTO selecto_temporal_bindings(id,naive,active) VALUES
+        (2,'2024-03-10 02:30:00',true),(3,'2024-11-03 01:30:00',true)});
     my $engine = Selecto::Engine->new(domain => $domain,
         adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
     my $handler = Selecto::API::EngineHandler->new;
@@ -103,6 +105,23 @@ subtest 'PostgreSQL DATE midnight follows the requested timezone, not the sessio
                         ($zone eq 'UTC' ? '+00:00' : '-05:00')]],
                     "$zone $field display ignores session $session";
             }
+        }
+    }
+    for my $case (
+        [2, 'UTC', '2024-03-10T02:30:00', '2024-03-10T02:30:00.000Z', 1710037800, '2024-03-10 02', '+00:00'],
+        [2, 'America/New_York', '2024-03-10T02:30:00', '2024-03-10T03:30:00.000-04:00', 1710055800, '2024-03-10 02', '-04:00'],
+        [3, 'UTC', '2024-11-03T01:30:00', '2024-11-03T01:30:00.000Z', 1730597400, '2024-11-03 01', '+00:00'],
+        [3, 'America/New_York', '2024-11-03T01:30:00', '2024-11-03T01:30:00.000-05:00', 1730615400, '2024-11-03 01', '-05:00'],
+    ) {
+        my ($id, $zone, $iso, $rfc, $epoch, $day_hour, $offset) = @$case;
+        my $request = {select => [map {{field => 'naive', format => $_, alias => $_}}
+            qw(iso8601 rfc3339_millis epoch_seconds epoch_milliseconds day_hour timezone_offset)],
+            timezone => $zone, filters => [{field => 'id', op => 'eq', value => $id}]};
+        for my $session ('UTC', 'Pacific/Honolulu') {
+            $dbh->do("SET TIME ZONE '$session'"); # Authored fixture zones only.
+            is_deeply $handler->query($engine, $request)->{rows},
+                [[$id, $iso, $rfc, $epoch, $epoch * 1000, $day_hour, $offset]],
+                "$zone naive DST row $id ignores session $session";
         }
     }
     $dbh->disconnect;
