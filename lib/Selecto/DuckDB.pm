@@ -374,7 +374,10 @@ sub _compile_rfc3339_instant_sql {
 
 sub _compile_timezone_offset_sql {
     my ($self, $sql, $timezone, $params) = @_;
-    return q{CAST('+00:00' AS TEXT)} unless defined($timezone) && $timezone ne 'UTC';
+    unless (defined($timezone) && $timezone ne 'UTC') {
+        my $instant = $sql->();
+        return q{CASE WHEN } . $instant . q{ IS NULL THEN NULL ELSE CAST('+00:00' AS TEXT) END};
+    }
     my $localized = sub {
         my $instant = $sql->();
         push @$params, $timezone;

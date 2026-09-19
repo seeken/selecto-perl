@@ -285,7 +285,8 @@ sub _compile_rfc3339_instant_sql {
 
 sub _compile_timezone_offset_sql {
     my ($self, $sql, $timezone, $params, $placeholder) = @_;
-    return q{CAST('+00:00' AS TEXT)} unless defined($timezone) && $timezone ne 'UTC';
+    return q{CASE WHEN } . $sql . q{ IS NULL THEN NULL ELSE CAST('+00:00' AS TEXT) END}
+        unless defined($timezone) && $timezone ne 'UTC';
     unless (defined $placeholder) {
         push @$params, $timezone;
         $placeholder = $self->placeholder(scalar @$params);
