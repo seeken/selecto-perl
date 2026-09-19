@@ -6,6 +6,7 @@ use warnings;
 
 use Mojo::Base -base, -signatures;
 use Digest::SHA qw(sha256_hex);
+use Encode qw(decode encode FB_CROAK);
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Text::CSV ();
@@ -51,6 +52,9 @@ sub domain_fingerprint ($self) {
 sub inspect_csv ($self, $content, %options) {
     Selecto::Error->throw('invalid_import_file', 'CSV content must be a scalar')
         if !defined($content) || ref($content);
+    my $bytes = eval { utf8::is_utf8($content) ? encode('UTF-8', "$content", FB_CROAK) : "$content" };
+    Selecto::Error->throw('invalid_import_file', 'CSV content must be UTF-8')
+        if $@ || !eval { decode('UTF-8', "$bytes", FB_CROAK); 1 };
     my $delimiter = $options{delimiter} // ',';
     Selecto::Error->throw('invalid_import_file', 'CSV delimiter must be one character')
         if ref($delimiter) || length($delimiter) != 1;
@@ -64,7 +68,7 @@ sub inspect_csv ($self, $content, %options) {
         sep_char => $delimiter,
         allow_whitespace => 0,
     }) or Selecto::Error->throw('invalid_import_file', 'CSV parser could not be initialized');
-    open my $fh, '<:encoding(UTF-8)', \$content
+    open my $fh, '<:encoding(UTF-8)', \$bytes
         or Selecto::Error->throw('invalid_import_file', 'CSV content cannot be read');
 
     my @records;
@@ -80,8 +84,8 @@ sub inspect_csv ($self, $content, %options) {
             maximum => $self->max_rows,
         }) if @records > $self->max_rows + ($header ? 1 : 0);
     }
-    if (!$csv->eof) {
-        my ($code, $message, $position, $record, $field) = $csv->error_diag;
+    my ($code, $message, $position, $record, $field) = $csv->error_diag;
+    if (defined($code) && $code != 0 && $code != 2012) {
         Selecto::Error->throw('import_parser_error', 'CSV parsing failed', {
             parser => 'Text::CSV', code => "$code", message => "$message",
             physical_line => $record,
@@ -119,7 +123,7 @@ sub inspect_csv ($self, $content, %options) {
     }
     return {
         format => 'csv', delimiter => $delimiter, header => $header ? JSON::PP::true : JSON::PP::false,
-        sha256 => 'sha256:' . sha256_hex($content), columns => \@columns,
+        sha256 => 'sha256:' . sha256_hex($bytes), columns => \@columns,
         rows => \@rows,
         sample_rows => [@rows[0 .. ($#rows < $self->max_sample_rows - 1 ? $#rows : $self->max_sample_rows - 1)]],
         row_count => scalar(@rows),
