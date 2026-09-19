@@ -446,6 +446,7 @@ sub _compile_lateral_joins {
             : $spec->{type} eq 'inner' ? 'INNER JOIN LATERAL' : 'LEFT JOIN LATERAL';
         push @joins,
             $keyword . ' (' . $sql . ') AS ' . $self->quote_identifier($spec->{name}) .
+            ' (' . join(', ', map { $self->quote_identifier($_) } @{$spec->{columns}}) . ')' .
             ($spec->{type} eq 'cross' ? '' : ' ON TRUE');
     }
     return \@joins;
