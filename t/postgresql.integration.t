@@ -123,6 +123,18 @@ my $lateral_result = $engine->all(
 );
 is_deeply($lateral_result->{rows}, [[1, 'status']],
     'PostgreSQL executes a correlated lateral subquery');
+my $renamed_lateral_result = $engine->all(
+    $engine->query
+        ->lateral_join(
+            'events', $events_domain, $event_query,
+            columns => [qw(item_id event_kind)],
+            correlations => {item_id => 'id'},
+            type => 'inner',
+        )
+        ->select('id', 'events.event_kind'),
+);
+is_deeply($renamed_lateral_result->{rows}, [[1, 'status']],
+    'PostgreSQL executes declared lateral output column renames');
 
 my $json_result = $engine->all(
     $engine->query

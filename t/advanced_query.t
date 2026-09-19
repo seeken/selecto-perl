@@ -292,13 +292,26 @@ my $lateral_statement = $advanced_engine->compile(
         ->where(Selecto::Expression->eq('id', 7)),
 );
 like($lateral_statement->sql,
-    qr/LEFT JOIN LATERAL \(SELECT .* FROM "order_events" AS "l_events" WHERE \("l_events"\."kind" = \$1\) AND \("l_events"\."order_id" = "s0"\."id"\)\) AS "events" ON TRUE/,
+    qr/LEFT JOIN LATERAL \(SELECT .* FROM "order_events" AS "l_events" WHERE \("l_events"\."kind" = \$1\) AND \("l_events"\."order_id" = "s0"\."id"\)\) AS "events" \("order_id", "kind"\) ON TRUE/,
     'lateral subqueries correlate through explicit child-to-parent fields');
 like($lateral_statement->sql, qr/WHERE "s0"\."id" = \$2\z/,
     'lateral parameters retain textual order before the outer predicate');
 is_deeply($lateral_statement->params, ['status', 7],
     'lateral and outer values remain independently bound');
 ok($adapter->supports('lateral_join'), 'PostgreSQL declares lateral-join support');
+my $renamed_lateral = $advanced_engine->compile(
+    $advanced_engine->query
+        ->lateral_join(
+            'events', $events_domain, $event_query,
+            columns => [qw(order_id event_kind)],
+            correlations => {order_id => 'id'},
+            type => 'inner',
+        )
+        ->select('id', 'events.event_kind'),
+);
+like($renamed_lateral->sql,
+    qr/INNER JOIN LATERAL \(SELECT .*\) AS "events" \("order_id", "event_kind"\) ON TRUE/,
+    'declared lateral output names rename the actual derived-table columns');
 my $lateral_copy_query = $advanced_engine->query
     ->lateral_join(
         'events_copy', $events_domain, $event_query,
