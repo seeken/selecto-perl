@@ -369,6 +369,7 @@ sub upload {
     my $digest = sha256_hex(join("\0", $role, $name, $media, length($bytes), $content_sha256));
     my $operation_key = join('|', $self->{scope}, $key);
     if (my $existing = $service->{operations}{$operation_key}) {
+        Selecto::Files::_error('not_found') unless $self->_owned($existing->{attachment});
         Selecto::Files::_error('conflict') unless $existing->{digest} eq $digest;
         return $self->_project($existing->{attachment});
     }
@@ -397,6 +398,7 @@ sub upload_handle {
         if defined($declared_sha256) && $declared_sha256 !~ /\A[0-9a-f]{64}\z/;
     my $operation_key = join('|', $self->{scope}, $key);
     if (my $existing = $self->{service}{operations}{$operation_key}) {
+        Selecto::Files::_error('not_found') unless $self->_owned($existing->{attachment});
         Selecto::Files::_error('invalid_request') unless defined $declared_sha256;
         my $digest = sha256_hex(join("\0", $role, $name, $media, $declared_size, $declared_sha256));
         Selecto::Files::_error('conflict') unless $existing->{digest} eq $digest;
