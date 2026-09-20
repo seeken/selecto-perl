@@ -548,6 +548,32 @@ The runtime retains both the physical left-join behavior and the semantic
 dimension metadata. Aggregate consumers can therefore present the description
 while grouping and filtering by the stable fact-table key.
 
+Small reference sets that do not have a physical database table can use a
+canonical `values` schema. Each row must provide every declared field, and a
+schema must declare exactly one of `source_table` or `values`:
+
+```perl
+schemas => {
+    status_names => {
+        values => [
+            {id => 'at', description => 'Active'},
+            {id => 'm',  description => 'Maintenance'},
+        ],
+        primary_key => 'id',
+        fields => [qw(id description)],
+        columns => {
+            id => {type => 'string'},
+            description => {type => 'string'},
+        },
+        associations => {},
+    },
+},
+```
+
+Selecto compiles a referenced values schema as a generated CTE and binds every
+cell through the adapter. It can be used by an ordinary association or by a
+`star_dimension`; unreferenced values schemas add no SQL to the query.
+
 Canonical associations infer `cardinality => 'one'` when `related_key` targets
 the joined schema's primary key and `cardinality => 'many'` otherwise. Domains
 can override that inference explicitly. A detail consumer can keep one root row

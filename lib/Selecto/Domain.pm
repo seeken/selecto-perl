@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use Digest::SHA qw(sha256_hex);
+use Encode qw(encode_utf8);
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
@@ -20,12 +21,14 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
 my %RELATION = map { $_ => 1 } qw(
-    source_table primary_key fields columns associations tenant_field redact_fields
+    source_table values primary_key fields columns associations tenant_field redact_fields
 );
 my %ASSOCIATION = map { $_ => 1 } qw(
     queryable owner_key related_key cardinality through source_scope_key target_scope_key where
 );
-my %JOIN = map { $_ => 1 } qw(type name display_field dimension_key);
+my %JOIN = map { $_ => 1 } qw(
+    type name display_field dimension_key display_fallback
+);
 my %THROUGH = map { $_ => 1 } qw(
     table owner_key related_key source_scope_key through_scope_key target_scope_key
     where target_key_cast
@@ -37,10 +40,14 @@ my %DETAIL_ACTION = map { $_ => 1 } qw(
 my %DETAIL_ACTION_PAYLOAD = map { $_ => 1 } qw(
     url_template target title size allow referrer_policy sandbox navigation_enabled editor target_field
 );
-my %EDITOR = map { $_ => 1 } qw(label description fields actions submit_label);
+my %EDITOR = map { $_ => 1 } qw(label description fields actions collections submit_label);
 my %EDITOR_FIELD = map { $_ => 1 } qw(
-    field label control required nullable rows placeholder options
+    field label control required nullable readonly rows placeholder help section options
 );
+my %EDITOR_COLLECTION = map { $_ => 1 } qw(
+    id label fields order_by limit empty_label
+);
+my %EDITOR_COLLECTION_FIELD = map { $_ => 1 } qw(field label);
 
 sub new {
     my ($class, %args) = @_;
@@ -163,7 +170,7 @@ sub _refresh_fingerprint {
     $fingerprint_value->{detail_actions} = $self->{detail_actions}
         if keys %{$self->{detail_actions}};
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
-    $self->{fingerprint} = 'sha256:' . sha256_hex($json);
+    $self->{fingerprint} = 'sha256:' . sha256_hex(encode_utf8($json));
     return $self;
 }
 
@@ -219,12 +226,18 @@ sub _parse_canonical {
     $raw = dclone($raw);
     $source = $raw->{source};
     _reject_unknown($source, \%RELATION, 'source') if $strict;
+    Selecto::Error->throw(
+        'invalid_domain', 'root source must use source_table rather than values',
+    ) if exists $source->{values};
     my $schemas = $raw->{schemas} // {};
     my $joins = $raw->{joins} // {};
     _object($schemas, 'schemas');
     _object($joins, 'joins');
     my $associations = _canonical_associations(
         $source, $schemas, $joins, $strict, '',
+    );
+    _apply_values_foreign_key_metadata(
+        $source, $associations, $raw->{writes},
     );
     _validate_computed_columns($source, $associations);
     _validate_action_eligibility($raw, $source);
@@ -258,9 +271,62 @@ sub _parse_canonical {
     my $fingerprint_document = dclone($raw);
     delete $fingerprint_document->{domain_fingerprint};
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
-        JSON::PP->new->canonical(1)->encode($fingerprint_document)
+        encode_utf8(JSON::PP->new->canonical(1)->encode($fingerprint_document))
     );
     return $domain;
+}
+
+sub _apply_values_foreign_key_metadata {
+    my ($source, $associations, $writes) = @_;
+    my %owner_association;
+    for my $name (sort keys %$associations) {
+        my $association = $associations->{$name};
+        my $values = $association->values;
+        next unless defined($values)
+            && $association->cardinality eq 'one'
+            && !defined($association->through);
+        my $owner_key = $association->owner_key;
+        next unless ref($source->{columns}{$owner_key}) eq 'HASH';
+        Selecto::Error->throw(
+            'invalid_domain',
+            'a root field cannot reference multiple inline-values associations',
+            {
+                field => $owner_key,
+                associations => [$owner_association{$owner_key}, $name],
+            },
+        ) if exists $owner_association{$owner_key};
+        $owner_association{$owner_key} = $name;
+
+        my $value_field = $association->related_key;
+        my $label_field = $association->join_mode eq 'star_dimension'
+            ? $association->display_field : $value_field;
+        my @options;
+        for my $row (@$values) {
+            my $value = $row->{$value_field};
+            Selecto::Error->throw(
+                'invalid_domain',
+                'inline-values foreign key values cannot be null',
+                {association => $name, field => $value_field},
+            ) unless defined $value;
+            my $label = $row->{$label_field};
+            $label = $value unless defined($label) && !ref($label);
+            push @options, {value => $value, label => "$label"};
+        }
+        next unless @options;
+        my $foreign_key = {
+            kind => 'values',
+            association => $name,
+            value_field => $value_field,
+            label_field => $label_field,
+        };
+        $source->{columns}{$owner_key}{foreign_key} = dclone($foreign_key);
+        $source->{columns}{$owner_key}{options} = \@options;
+        my $write_field = ref($writes) eq 'HASH'
+            && ref($writes->{fields}) eq 'HASH'
+                ? $writes->{fields}{$owner_key} : undef;
+        $write_field->{foreign_key} = dclone($foreign_key)
+            if ref($write_field) eq 'HASH' && $write_field->{insertable};
+    }
 }
 
 sub _canonical_associations {
@@ -286,20 +352,63 @@ sub _canonical_associations {
         for my $key (qw(owner_key related_key)) {
             _required_key($association, $key, "association $path");
         }
-        _required_key($target, 'source_table', "schema $queryable");
+        my $has_table = exists $target->{source_table};
+        my $has_values = exists $target->{values};
+        Selecto::Error->throw(
+            'invalid_domain', "schema $queryable must declare exactly one of source_table or values",
+        ) unless $has_table != $has_values;
+        my $target_fields = _canonical_fields($target);
+        my $values = $has_values
+            ? _canonical_relation_values($target, "schema $queryable")
+            : undef;
         my $join_mode = lc(_required_string($join->{type} // 'left', 'join type'));
         Selecto::Error->throw('invalid_domain', "unsupported join type $join_mode")
             unless $join_mode eq 'left' || $join_mode eq 'inner'
                 || $join_mode eq 'star_dimension';
         my $target_primary_key = $target->{primary_key} // 'id';
+        my $display_fallback;
+        if (exists $join->{display_fallback}) {
+            Selecto::Error->throw(
+                'invalid_domain',
+                'display fallback is available only for star dimensions',
+                {association => $path},
+            ) unless $join_mode eq 'star_dimension';
+            $display_fallback = lc(_required_string(
+                $join->{display_fallback}, 'star dimension display fallback'
+            ));
+            Selecto::Error->throw(
+                'invalid_domain',
+                'star dimension display fallback must be dimension_key',
+                {association => $path},
+            ) unless $display_fallback eq 'dimension_key';
+            my $display_field = $join->{display_field} // 'name';
+            my $owner_column = ref($relation->{columns}) eq 'HASH'
+                ? $relation->{columns}{$association->{owner_key}} : undef;
+            my $display_column = ref($target->{columns}) eq 'HASH'
+                ? $target->{columns}{$display_field} : undef;
+            my $owner_type = ref($owner_column) eq 'HASH'
+                ? $owner_column->{type} : undef;
+            my $display_type = ref($display_column) eq 'HASH'
+                ? $display_column->{type} : undef;
+            Selecto::Error->throw(
+                'invalid_domain',
+                'star dimension display fallback requires matching display and key types',
+                {association => $path},
+            ) unless defined($owner_type) && defined($display_type)
+                && $owner_type eq $display_type;
+        }
         my $cardinality = $association->{cardinality};
         $cardinality = $association->{related_key} eq $target_primary_key ? 'one' : 'many'
             unless defined $cardinality;
         $associations{$name} = Selecto::Domain::Association->new(
             name => $name,
             value => {
-                table => $target->{source_table},
-                fields => _canonical_fields($target),
+                table => $target->{source_table} // "__selecto_values_$queryable",
+                fields => $target_fields,
+                (defined($values) ? (
+                    values => $values,
+                    value_fields => [@{$target->{fields}}],
+                ) : ()),
                 owner_key => $association->{owner_key},
                 related_key => $association->{related_key},
                 target_primary_key => $target_primary_key,
@@ -317,11 +426,47 @@ sub _canonical_associations {
                     display_field => $join->{display_field} // 'name',
                     dimension_key => $join->{dimension_key} // $association->{owner_key},
                     display_name => $join->{name} // $name,
+                    (defined($display_fallback)
+                        ? (display_fallback => $display_fallback) : ()),
                 ) : ()),
             },
         );
     }
     return \%associations;
+}
+
+sub _canonical_relation_values {
+    my ($relation, $label) = @_;
+    my $rows = $relation->{values};
+    Selecto::Error->throw('invalid_domain', "$label values must be a non-empty array")
+        unless ref($rows) eq 'ARRAY' && @$rows;
+    my %expected = map { $_ => 1 } @{$relation->{fields}};
+    my @normalized;
+    for my $index (0 .. $#$rows) {
+        my $row = $rows->[$index];
+        _object($row, "$label values row $index");
+        my @unknown = sort grep { !$expected{$_} } keys %$row;
+        Selecto::Error->throw(
+            'invalid_domain', "$label values row has unknown fields",
+            {row => $index, fields => \@unknown},
+        ) if @unknown;
+        my @missing = grep { !exists $row->{$_} } @{$relation->{fields}};
+        Selecto::Error->throw(
+            'invalid_domain', "$label values row is missing fields",
+            {row => $index, fields => \@missing},
+        ) if @missing;
+        my %copy;
+        for my $field (@{$relation->{fields}}) {
+            my $value = $row->{$field};
+            Selecto::Error->throw(
+                'invalid_domain', "$label values must contain only scalar literals",
+                {row => $index, field => $field},
+            ) if ref($value) && !JSON::PP::is_bool($value);
+            $copy{$field} = JSON::PP::is_bool($value) ? ($value ? 1 : 0) : $value;
+        }
+        push @normalized, \%copy;
+    }
+    return \@normalized;
 }
 
 sub _canonical_fields {
@@ -343,6 +488,22 @@ sub _canonical_fields {
         $column = Selecto::Analytics::UnitRegistry->normalize_column_metadata(
             $column, "column $field",
         );
+        if (exists $column->{text_case}) {
+            my $text_case = lc(_required_string(
+                $column->{text_case}, "column $field text_case",
+            ));
+            Selecto::Error->throw(
+                'invalid_domain',
+                'column text_case must be uppercase or lowercase',
+                {field => $field},
+            ) unless $text_case eq 'uppercase' || $text_case eq 'lowercase';
+            Selecto::Error->throw(
+                'invalid_domain',
+                'column text_case is available only for string fields',
+                {field => $field},
+            ) unless ($column->{type} // '') eq 'string';
+            $column->{text_case} = $text_case;
+        }
         $relation->{columns}{$field} = $column;
         $result{$field} = $column->{type};
     }
@@ -659,7 +820,9 @@ sub _portable_associations {
             $_ => {type => $fields->{$_}}
         } sort keys %$fields;
         $schemas->{$schema_name} = {
-            source_table => $association->table,
+            (defined($association->values)
+                ? (values => $association->values)
+                : (source_table => $association->table)),
             primary_key => $target_primary_key,
             fields => [sort keys %$fields],
             columns => \%target_columns,
@@ -685,6 +848,9 @@ sub _portable_associations {
                 name => $association->display_name,
                 display_field => $association->display_field,
                 dimension_key => $association->dimension_key,
+                (defined($association->display_fallback) ? (
+                    display_fallback => $association->display_fallback,
+                ) : ()),
             ) : ()),
         };
     }
@@ -720,6 +886,47 @@ sub field_metadata {
             && ref($contract->{schemas}{$queryable}{columns}) eq 'HASH';
     }
     return ref($column) eq 'HASH' ? dclone($column) : {};
+}
+
+sub values_foreign_keys {
+    my ($self) = @_;
+    my %foreign_keys;
+    for my $name (sort keys %{$self->{associations}}) {
+        my $association = $self->{associations}{$name};
+        my $values = $association->values;
+        next unless defined($values)
+            && $association->cardinality eq 'one'
+            && !defined($association->through);
+        my $field = $association->owner_key;
+        $foreign_keys{$field} = {
+            association => $name,
+            display_name => $association->join_mode eq 'star_dimension'
+                ? $association->display_name : $name,
+            value_field => $association->related_key,
+            values => [
+                map { $_->{$association->related_key} } @$values
+            ],
+        };
+    }
+    return dclone(\%foreign_keys);
+}
+
+sub normalize_field_value {
+    my ($self, $path, $value) = @_;
+    return $value unless defined($value) && !ref($value);
+    my $text_case = $self->field_metadata($path)->{text_case};
+    return uc("$value") if defined($text_case) && $text_case eq 'uppercase';
+    return lc("$value") if defined($text_case) && $text_case eq 'lowercase';
+    return $value;
+}
+
+sub normalize_write_assignments {
+    my ($self, $assignments) = @_;
+    return {} unless ref($assignments) eq 'HASH';
+    return {
+        map { $_ => $self->normalize_field_value($_, $assignments->{$_}) }
+            keys %$assignments
+    };
 }
 
 sub field_unit {
@@ -1221,22 +1428,22 @@ sub _validate_editors {
             $entry = {field => $entry} if defined($entry) && !ref($entry);
             _object($entry, "editor $id field $index");
             _reject_unknown($entry, \%EDITOR_FIELD, "editor $id field $index");
-            my $field = _identifier($entry->{field}, "editor $id field");
+            my $field = _required_string($entry->{field}, "editor $id field");
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id field path is invalid",
+                {editor => $id, field => $field},
+            ) unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
             Selecto::Error->throw(
                 'invalid_domain', "editor $id field is duplicated",
                 {editor => $id, field => $field},
             ) if $seen{$field}++;
+            my $resolved = $domain->resolve($field);
             Selecto::Error->throw(
-                'invalid_domain', "editor $id field is not a public root field",
+                'invalid_domain', "editor $id field is not public",
                 {editor => $id, field => $field},
-            ) unless exists($domain->{fields}{$field}) && $domain->field_is_public($field);
-            Selecto::Error->throw(
-                'invalid_domain', "editor $id field is not updatable",
-                {editor => $id, field => $field},
-            ) unless ref($write_fields->{$field}) eq 'HASH'
-                && $write_fields->{$field}{updatable};
+            ) unless $domain->field_is_public($field);
             my %normalized = (field => $field);
-            for my $key (qw(label placeholder)) {
+            for my $key (qw(label placeholder help section)) {
                 $normalized{$key} = _required_string(
                     $entry->{$key}, "editor $id field $field $key",
                 ) if exists $entry->{$key};
@@ -1249,7 +1456,7 @@ sub _validate_editors {
             ) if length($control)
                 && $control !~ /\A(?:text|textarea|number|date|datetime-local|checkbox|select)\z/;
             $normalized{control} = $control if length $control;
-            for my $key (qw(required nullable)) {
+            for my $key (qw(required nullable readonly)) {
                 next unless exists $entry->{$key};
                 my $setting = $entry->{$key};
                 my $boolean = JSON::PP::is_bool($setting)
@@ -1259,6 +1466,17 @@ sub _validate_editors {
                 ) unless $boolean;
                 $normalized{$key} = $setting ? 1 : 0;
             }
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id field is not updatable",
+                {editor => $id, field => $field},
+            ) unless $normalized{readonly}
+                || !$resolved->{association}
+                    && ref($write_fields->{$field}) eq 'HASH'
+                    && $write_fields->{$field}{updatable};
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id readonly field cannot be required",
+                {editor => $id, field => $field},
+            ) if $normalized{readonly} && $normalized{required};
             if (exists $entry->{rows}) {
                 my $rows = $entry->{rows};
                 Selecto::Error->throw(
@@ -1309,10 +1527,118 @@ sub _validate_editors {
             ) if ref($selection) eq 'HASH' && ($selection->{mode} // 'rows') eq 'groups';
             push @normalized_actions, $action;
         }
+        my $editor_collections = $editor->{collections} // [];
+        Selecto::Error->throw(
+            'invalid_domain', "editor $id collections must be an array",
+        ) unless ref($editor_collections) eq 'ARRAY';
+        my (@normalized_collections, %seen_collection);
+        for my $index (0 .. $#$editor_collections) {
+            my $collection = $editor_collections->[$index];
+            _object($collection, "editor $id collection $index");
+            _reject_unknown($collection, \%EDITOR_COLLECTION, "editor $id collection $index");
+            my $collection_id = _identifier(
+                $collection->{id}, "editor $id collection",
+            );
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id collection is duplicated",
+                {editor => $id, collection => $collection_id},
+            ) if $seen_collection{$collection_id}++;
+            my $collection_fields = $collection->{fields};
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id collection $collection_id fields must be a non-empty array",
+            ) unless ref($collection_fields) eq 'ARRAY' && @$collection_fields;
+            my (@fields, $association_name);
+            for my $field_index (0 .. $#$collection_fields) {
+                my $field_spec = $collection_fields->[$field_index];
+                $field_spec = {field => $field_spec}
+                    if defined($field_spec) && !ref($field_spec);
+                _object($field_spec, "editor $id collection $collection_id field $field_index");
+                _reject_unknown(
+                    $field_spec, \%EDITOR_COLLECTION_FIELD,
+                    "editor $id collection $collection_id field $field_index",
+                );
+                my $path = _required_string(
+                    $field_spec->{field}, "editor $id collection $collection_id field",
+                );
+                my $resolved = $domain->resolve($path);
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id collection field is not public",
+                    {editor => $id, collection => $collection_id, field => $path},
+                ) unless $domain->field_is_public($path);
+                my $associations = $resolved->{associations};
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id collection field must belong to a to-many association",
+                    {editor => $id, collection => $collection_id, field => $path},
+                ) unless ref($associations) eq 'ARRAY' && @$associations
+                    && $associations->[0]->cardinality eq 'many';
+                my ($root_association) = split /\./, $path, 2;
+                $association_name //= $root_association;
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id collection fields must share one association",
+                    {editor => $id, collection => $collection_id, field => $path},
+                ) unless $association_name eq $root_association;
+                push @fields, {
+                    field => $path,
+                    (exists($field_spec->{label}) ? (
+                        label => _required_string(
+                            $field_spec->{label},
+                            "editor $id collection $collection_id field label",
+                        ),
+                    ) : ()),
+                };
+            }
+            my @orders;
+            for my $order (@{$collection->{order_by} // []}) {
+                if (ref($order) eq 'HASH') {
+                    _reject_unknown(
+                        $order, {field => 1, direction => 1},
+                        "editor $id collection $collection_id order",
+                    );
+                    $order = [$order->{field}, $order->{direction}];
+                }
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id collection $collection_id order_by entries must be arrays",
+                ) unless ref($order) eq 'ARRAY' && @$order >= 1 && @$order <= 2;
+                my $field = _required_string(
+                    $order->[0], "editor $id collection $collection_id order field",
+                );
+                $domain->resolve($field);
+                my ($root_association) = split /\./, $field, 2;
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id collection order must use its association",
+                ) unless $root_association eq $association_name;
+                my $direction = lc($order->[1] // 'asc');
+                Selecto::Error->throw(
+                    'invalid_domain', "editor $id collection order direction must be asc or desc",
+                ) unless $direction eq 'asc' || $direction eq 'desc';
+                push @orders, {field => $field, direction => $direction};
+            }
+            my $limit = $collection->{limit} // 50;
+            Selecto::Error->throw(
+                'invalid_domain', "editor $id collection $collection_id limit must be from 1 to 100",
+            ) if ref($limit) || "$limit" !~ /\A\d+\z/ || $limit < 1 || $limit > 100;
+            push @normalized_collections, {
+                id => $collection_id,
+                label => _required_string(
+                    $collection->{label} // $collection_id,
+                    "editor $id collection $collection_id label",
+                ),
+                fields => \@fields,
+                order_by => \@orders,
+                limit => 0 + $limit,
+                (exists($collection->{empty_label}) ? (
+                    empty_label => _required_string(
+                        $collection->{empty_label},
+                        "editor $id collection $collection_id empty_label",
+                    ),
+                ) : ()),
+            };
+        }
         $editors{$id} = {
             label => $label,
             fields => \@normalized_fields,
             actions => \@normalized_actions,
+            collections => \@normalized_collections,
             (exists($editor->{description}) ? (
                 description => _required_string($editor->{description}, "editor $id description"),
             ) : ()),
@@ -1463,6 +1789,7 @@ sub new {
     my $display_field;
     my $dimension_key;
     my $display_name;
+    my $display_fallback;
     if ($join_mode eq 'star_dimension') {
         $display_field = Selecto::Domain::_identifier(
             $value->{display_field} // 'name', 'star dimension display field'
@@ -1476,6 +1803,15 @@ sub new {
         $display_name = Selecto::Domain::_required_string(
             $value->{display_name} // $args{name}, 'star dimension name'
         );
+        if (defined $value->{display_fallback}) {
+            $display_fallback = lc(Selecto::Domain::_required_string(
+                $value->{display_fallback}, 'star dimension display fallback'
+            ));
+            Selecto::Error->throw(
+                'invalid_domain',
+                'star dimension display fallback must be dimension_key',
+            ) unless $display_fallback eq 'dimension_key';
+        }
     }
     my ($source_scope_key, $target_scope_key);
     my $direct_scope_count = grep { exists $value->{$_} }
@@ -1541,6 +1877,10 @@ sub new {
         name => Selecto::Domain::_identifier($args{name}, 'association'),
         table => Selecto::Domain::_identifier($value->{table}, 'association table'),
         fields => $fields,
+        (defined($value->{values}) ? (
+            values => [map { {%$_} } @{$value->{values}}],
+            value_fields => [@{$value->{value_fields}}],
+        ) : ()),
         associations => \%associations,
         (defined($value->{queryable}) ? (queryable => "$value->{queryable}") : ()),
         owner_key => Selecto::Domain::_identifier($value->{owner_key}, 'owner key'),
@@ -1559,6 +1899,8 @@ sub new {
             display_field => $display_field,
             dimension_key => $dimension_key,
             display_name => $display_name,
+            (defined($display_fallback)
+                ? (display_fallback => $display_fallback) : ()),
         ) : ()),
     }, $class;
 }
@@ -1568,6 +1910,10 @@ sub fingerprint_value {
     return {
         table => $self->{table},
         fields => { %{$self->{fields}} },
+        (defined($self->{values}) ? (
+            values => [map { {%$_} } @{$self->{values}}],
+            value_fields => [@{$self->{value_fields}}],
+        ) : ()),
         (defined($self->{queryable}) ? (queryable => $self->{queryable}) : ()),
         (keys(%{$self->{associations} // {}}) ? (
             associations => {
@@ -1592,6 +1938,8 @@ sub fingerprint_value {
             display_field => $self->{display_field},
             dimension_key => $self->{dimension_key},
             display_name => $self->{display_name},
+            (defined($self->{display_fallback})
+                ? (display_fallback => $self->{display_fallback}) : ()),
         ) : ()),
     };
 }
@@ -1599,6 +1947,8 @@ sub fingerprint_value {
 sub name        { return $_[0]->{name}; }
 sub table       { return $_[0]->{table}; }
 sub fields      { return { %{$_[0]->{fields}} }; }
+sub values      { return defined($_[0]->{values}) ? [map { {%$_} } @{$_[0]->{values}}] : undef; }
+sub value_fields { return defined($_[0]->{value_fields}) ? [@{$_[0]->{value_fields}}] : undef; }
 sub associations { return { %{$_[0]->{associations} // {}} }; }
 sub queryable   { return $_[0]->{queryable}; }
 sub owner_key   { return $_[0]->{owner_key}; }
@@ -1610,6 +1960,7 @@ sub join_mode   { return $_[0]->{join_mode}; }
 sub display_field { return $_[0]->{display_field}; }
 sub dimension_key { return $_[0]->{dimension_key}; }
 sub display_name { return $_[0]->{display_name}; }
+sub display_fallback { return $_[0]->{display_fallback}; }
 sub through { return defined($_[0]->{through}) ? {%{$_[0]->{through}}} : undef; }
 sub where { return defined($_[0]->{where}) ? {%{$_[0]->{where}}} : {}; }
 sub source_scope_key { return $_[0]->{source_scope_key}; }
