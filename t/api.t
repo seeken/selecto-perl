@@ -59,6 +59,17 @@ is(
     'queryDomain',
     'OpenAPI exposes the canonical query operation',
 );
+is_deeply(
+    $api->openapi->{paths}{'/api/v1/certification/query'}{post}{parameters}[0]{schema}{enum},
+    [qw(json csv tsv xlsx)],
+    'canonical OpenAPI exposes all implemented query representations',
+);
+is(
+    $api->openapi->{paths}{'/api/v1/certification/query'}{post}{responses}{200}{content}
+        {'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}{schema}{format},
+    'binary',
+    'canonical OpenAPI exposes the binary XLSX response',
+);
 
 my $response = $api->request(
     { method => 'POST', path => '/api/v1/certification/query', body => {} },
