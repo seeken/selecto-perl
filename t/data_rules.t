@@ -1,6 +1,7 @@
 use 5.034;
 use strict;
 use warnings;
+use utf8;
 use Test::More;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
@@ -27,6 +28,13 @@ for my $probe (@{$cases->{cases}}) {
     is $result->{code}, $probe->{expected}{code}, "$probe->{id} has the expected code" if exists $probe->{expected}{code};
     is_deeply $result->{normalized}, $probe->{expected}{normalized}, "$probe->{id} has normalized output" if exists $probe->{expected}{normalized};
 }
+
+my $non_ascii = Selecto::DataRules->parse($contract)->evaluate(
+    stage => 'candidate', operation => 'update', subject => {reference => '  éfoo  '},
+);
+is $non_ascii->{state}, 'failed', 'non-ASCII uppercase fails the portable normalizer';
+is $non_ascii->{code}, 'normalization_error', 'non-ASCII uppercase keeps the Perl error code';
+is_deeply $non_ascii->{normalized}, {reference => '  éfoo  '}, 'failed normalization preserves the submitted value';
 
 for my $probe (@{$invalid->{cases}}) {
     my $patched = _merge(dclone($contract), $probe->{patch});
