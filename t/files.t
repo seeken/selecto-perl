@@ -33,6 +33,10 @@ my %upload = (role => 'documents', bytes => '%PDF-perl', name => 'invoice.pdf',
 my $first = $a->upload(%upload);
 my $retry = $a->upload(%upload);
 is($retry->{attachment_id}, $first->{attachment_id}, 'same operation returns stable attachment');
+eval { $other_record->upload(%upload) };
+is($@->code, 'not_found', 'another record cannot replay a matching operation key');
+eval { $other_record->upload(%upload, bytes => '%PDF-other') };
+is($@->code, 'not_found', 'another record cannot probe a mismatched operation key');
 is($a->download($first->{attachment_id}), '%PDF-perl', 'downloads through record facade');
 is_deeply($b->list(role => 'documents'), [], 'tenant collision is isolated');
 eval { $b->download($first->{attachment_id}) };
@@ -65,9 +69,13 @@ ok($boolean_owner->{key}{active}, 'canonical boolean owner value accepted');
 
 my $root = tempdir(CLEANUP => 1);
 my $local = Selecto::Files::LocalStorage->new(root => $root);
-my $local_record = service(storage => $local)->bind(
+my $local_service = service(storage => $local);
+my $local_record = $local_service->bind(
     tenant => 'tenant-local', actor => 'user-1',
 )->for_record($owner);
+my $local_other = $local_service->bind(
+    tenant => 'tenant-local', actor => 'user-1',
+)->for_record({ domain_fingerprint => 'invoice-v1', key => { id => 43 } });
 my $stream_bytes = '%PDF-streamed-perl';
 open(my $upload_handle, '<', \$stream_bytes) or die $!;
 binmode($upload_handle);
@@ -92,6 +100,15 @@ my $stream_retry = $local_record->upload_handle(
 is($stream_retry->{attachment_id}, $streamed->{attachment_id},
     'stream retry with declared digest returns the stable attachment');
 is(tell($retry_handle), 0, 'stable retry does not consume a caller-owned stream');
+eval {
+    $local_other->upload_handle(
+        role => 'documents', handle => $retry_handle, name => 'streamed.pdf',
+        media_type => 'application/pdf', idempotency_key => 'stream-1',
+        declared_size => length($stream_bytes), declared_sha256 => sha256_hex($stream_bytes),
+    );
+};
+is($@->code, 'not_found', 'another record cannot replay a streamed operation key');
+is(tell($retry_handle), 0, 'foreign stream replay does not consume the handle');
 close($retry_handle) or die $!;
 
 my $large = 'x' x 131_073;
