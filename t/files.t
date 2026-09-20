@@ -90,6 +90,12 @@ is($local_record->download($streamed->{attachment_id}), $stream_bytes,
 my $facade_stream = '';
 $local_record->download_stream($streamed->{attachment_id}, sub { $facade_stream .= $_[0] });
 is($facade_stream, $stream_bytes, 'authorized record facade exposes bounded download callbacks');
+my $reentered_attachment;
+$local_record->download_stream($streamed->{attachment_id}, sub {
+    $reentered_attachment = $local_record->list(role => 'documents')->[0]{attachment_id};
+});
+is($reentered_attachment, $streamed->{attachment_id},
+    'download callback can reenter the record facade');
 close($upload_handle) or die $!;
 open(my $retry_handle, '<', \$stream_bytes) or die $!;
 my $stream_retry = $local_record->upload_handle(
