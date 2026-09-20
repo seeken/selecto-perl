@@ -137,6 +137,39 @@ is($no_digest_retry->{attachment_id}, $no_digest->{attachment_id},
     'first upload without declared digest can be retried with observed digest');
 close($no_digest_retry_handle) or die $!;
 
+for my $case (
+    ['memory', Selecto::Files::MemoryStorage->new],
+    ['local', $local],
+) {
+    my ($name, $storage) = @$case;
+    my $record = service(storage => $storage)->bind(
+        tenant => "tenant-mismatch-$name", actor => 'user-1',
+    )->for_record($owner);
+    my $bytes = '%PDF-digest-probe';
+    open(my $bad_handle, '<', \$bytes) or die $!;
+    binmode($bad_handle);
+    eval {
+        $record->upload_handle(
+            role => 'documents', handle => $bad_handle, name => 'probe.pdf',
+            media_type => 'application/pdf', idempotency_key => 'digest-probe',
+            declared_size => length($bytes), declared_sha256 => sha256_hex('other bytes'),
+        );
+    };
+    is($@->code, 'invalid_request', "$name digest mismatch is an invalid request");
+    close($bad_handle) or die $!;
+    is_deeply($record->list(role => 'documents'), [], "$name mismatch publishes no attachment");
+    open(my $good_handle, '<', \$bytes) or die $!;
+    binmode($good_handle);
+    my $attachment = $record->upload_handle(
+        role => 'documents', handle => $good_handle, name => 'probe.pdf',
+        media_type => 'application/pdf', idempotency_key => 'digest-probe',
+        declared_size => length($bytes), declared_sha256 => sha256_hex($bytes),
+    );
+    is($record->download($attachment->{attachment_id}), $bytes,
+        "$name failed digest attempt releases the operation key");
+    close($good_handle) or die $!;
+}
+
 my $large = 'x' x 131_073;
 open(my $large_handle, '<', \$large) or die $!;
 binmode($large_handle);
