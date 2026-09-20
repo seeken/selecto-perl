@@ -393,6 +393,11 @@ sub _openapi ($identity, $base_path) {
                 schema => { type => 'string' },
             }];
         }
+        if ($route->{operation_id} eq 'queryDomain') {
+            $operation->{parameters} = Selecto::API::ResultFormatter->openapi_parameters;
+            $operation->{responses}{200}{content} =
+                Selecto::API::ResultFormatter->openapi_content;
+        }
         $paths{$route->{path}} = { lc($route->{method}) => $operation };
     }
     return {

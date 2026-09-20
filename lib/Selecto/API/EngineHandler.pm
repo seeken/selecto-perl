@@ -7,6 +7,7 @@ use warnings;
 use Mojo::Base -base, -signatures;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
+use Selecto::API::ResultFormatter ();
 use Selecto::Engine ();
 use Selecto::Error ();
 use Selecto::DateShortcut ();
@@ -375,26 +376,10 @@ sub describe_openapi ($self, $api) {
     my $openapi = $api->openapi_document;
     my $query_path = $api->base_path . '/query';
     $openapi->{paths}{$query_path}{post}{summary} = 'Run a domain read query';
-    $openapi->{paths}{$query_path}{post}{parameters} = [
-        {
-            in => 'query', name => 'format', required => JSON::PP::false,
-            description => 'Response representation. The Accept header may be used instead.',
-            schema => {type => 'string', enum => [qw(json csv tsv xlsx)], default => 'json'},
-        },
-        {
-            in => 'query', name => 'filename', required => JSON::PP::false,
-            description => 'Safe download filename for CSV, TSV, or XLSX; the matching extension is required.',
-            schema => {type => 'string', maxLength => 160, pattern => '^[A-Za-z0-9][A-Za-z0-9._ ()-]*\\.(csv|tsv|xlsx)$'},
-        },
-    ];
-    $openapi->{paths}{$query_path}{post}{responses}{200}{content} = {
-        'application/json' => {},
-        'text/csv' => {schema => {type => 'string'}},
-        'text/tab-separated-values' => {schema => {type => 'string'}},
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' => {
-            schema => {type => 'string', format => 'binary'},
-        },
-    };
+    $openapi->{paths}{$query_path}{post}{parameters} =
+        Selecto::API::ResultFormatter->openapi_parameters;
+    $openapi->{paths}{$query_path}{post}{responses}{200}{content} =
+        Selecto::API::ResultFormatter->openapi_content;
     $openapi->{paths}{$query_path}{post}{requestBody} = {
         required => JSON::PP::true,
         content => {
