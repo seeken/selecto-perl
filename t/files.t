@@ -111,6 +111,32 @@ is($@->code, 'not_found', 'another record cannot replay a streamed operation key
 is(tell($retry_handle), 0, 'foreign stream replay does not consume the handle');
 close($retry_handle) or die $!;
 
+open(my $no_digest_handle, '<', \$stream_bytes) or die $!;
+my $no_digest = $local_record->upload_handle(
+    role => 'documents', handle => $no_digest_handle, name => 'no-digest.pdf',
+    media_type => 'application/pdf', idempotency_key => 'stream-2',
+    declared_size => length($stream_bytes),
+);
+close($no_digest_handle) or die $!;
+open(my $no_digest_retry_handle, '<', \$stream_bytes) or die $!;
+eval {
+    $local_record->upload_handle(
+        role => 'documents', handle => $no_digest_retry_handle, name => 'no-digest.pdf',
+        media_type => 'application/pdf', idempotency_key => 'stream-2',
+        declared_size => length($stream_bytes),
+    );
+};
+is($@->code, 'invalid_request', 'digestless stream retry is rejected without reading');
+is(tell($no_digest_retry_handle), 0, 'rejected digestless retry preserves caller handle');
+my $no_digest_retry = $local_record->upload_handle(
+    role => 'documents', handle => $no_digest_retry_handle, name => 'no-digest.pdf',
+    media_type => 'application/pdf', idempotency_key => 'stream-2',
+    declared_size => length($stream_bytes), declared_sha256 => sha256_hex($stream_bytes),
+);
+is($no_digest_retry->{attachment_id}, $no_digest->{attachment_id},
+    'first upload without declared digest can be retried with observed digest');
+close($no_digest_retry_handle) or die $!;
+
 my $large = 'x' x 131_073;
 open(my $large_handle, '<', \$large) or die $!;
 binmode($large_handle);
