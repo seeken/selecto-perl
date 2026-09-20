@@ -25,6 +25,9 @@ my $service = service();
 my $owner = { domain_fingerprint => 'invoice-v1', key => { id => 42 } };
 my $a = $service->bind(tenant => 'tenant-a', actor => 'user-1')->for_record($owner);
 my $b = $service->bind(tenant => 'tenant-b', actor => 'user-1')->for_record($owner);
+my $other_record = $service->bind(tenant => 'tenant-a', actor => 'user-1')->for_record({
+    domain_fingerprint => 'invoice-v1', key => { id => 43 },
+});
 my %upload = (role => 'documents', bytes => '%PDF-perl', name => 'invoice.pdf',
     media_type => 'application/pdf', idempotency_key => 'upload-1');
 my $first = $a->upload(%upload);
@@ -41,6 +44,12 @@ $a->detach($first->{attachment_id}, expected_revision => $first->{revision});
 $a->place_hold($first->{version_id}, authority => 'legal-case');
 eval { $a->purge($first->{version_id}) };
 is($@->code, 'conflict', 'active hold blocks purge');
+eval { $b->release_hold($first->{version_id}, authority => 'legal-case') };
+is($@->code, 'not_found', 'another tenant cannot release the hold');
+eval { $other_record->release_hold($first->{version_id}, authority => 'legal-case') };
+is($@->code, 'not_found', 'another record cannot release the hold');
+eval { $a->purge($first->{version_id}) };
+is($@->code, 'conflict', 'foreign release attempt leaves the hold active');
 $a->release_hold($first->{version_id}, authority => 'legal-case');
 $a->purge($first->{version_id});
 pass('released exact version purges');

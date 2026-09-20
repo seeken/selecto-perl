@@ -497,6 +497,8 @@ sub place_hold {
 sub release_hold {
     my ($self, $version_id, %args) = @_;
     $self->_allow('hold', undef);
+    my $version = $self->{service}{versions}{Selecto::Files::_text($version_id)};
+    Selecto::Files::_error('not_found') unless $self->_owned($version);
     delete $self->{service}{holds}{$version_id}{Selecto::Files::_text($args{authority})};
     return;
 }
