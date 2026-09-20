@@ -120,6 +120,9 @@ sub _compile_single {
     local $self->{_join_aliases} = $join_aliases;
     local $self->{_through_aliases} = $through_aliases;
     $self->_validate_query_aliases($sources, @association_paths);
+    $with_sql = $self->_append_values_ctes(
+        $with_sql, \@params, $domain, $sources, @association_paths,
+    );
     for my $path (@association_paths) {
         my $resolved = $domain->resolve_association($path);
         my $association = $resolved->{association};
@@ -163,8 +166,20 @@ sub _compile_single {
                 ' ON ' . join(' AND ', @target_on) . ')' .
                 ' ON ' . join(' AND ', @bridge_on);
         } else {
+            my $owner_sql = $self->_qualified(
+                $parent_alias, $association->owner_key,
+            );
+            if (defined($association->values)) {
+                my $owner_path = @segments
+                    ? join('.', @segments, $association->owner_key)
+                    : $association->owner_key;
+                $owner_sql = _text_case_sql(
+                    $owner_sql,
+                    $domain->field_metadata($owner_path)->{text_case},
+                );
+            }
             my @target_on = (
-                $self->_qualified($parent_alias, $association->owner_key) . ' = ' .
+                $owner_sql . ' = ' .
                     $self->_qualified($target_alias, $association->related_key),
             );
             push @target_on, $self->_constant_join_predicates(
@@ -176,7 +191,7 @@ sub _compile_single {
                     $self->_qualified($target_alias, $association->target_scope_key);
             }
             push @joins,
-                $keyword . ' ' . $self->quote_identifier($association->table) .
+                $keyword . ' ' . $self->_association_source_sql($association) .
                 ' AS ' . $self->quote_identifier($target_alias) .
                 ' ON ' . join(' AND ', @target_on);
         }
@@ -287,6 +302,54 @@ sub _compile_single {
         columns => \@columns,
         adapter_name => $self->name,
     );
+}
+
+sub _association_source_sql {
+    my ($self, $association) = @_;
+    return $self->quote_identifier($association->table);
+}
+
+sub _append_values_ctes {
+    my ($self, $with_sql, $params, $domain, $sources, @paths) = @_;
+    my (@entries, %seen);
+    for my $path (@paths) {
+        my $association = $domain->resolve_association($path)->{association};
+        my $rows = $association->values;
+        next unless defined $rows;
+        my $table = $association->table;
+        next if $seen{$table}++;
+        Selecto::Error->throw(
+            'invalid_query',
+            "query source $table conflicts with an inline values relation",
+        ) if exists $sources->{$table};
+        Selecto::Error->throw('unsupported_feature', 'adapter does not support values relations')
+            unless $self->supports('cte');
+        my $fields = $association->value_fields;
+        Selecto::Error->throw('invalid_domain', 'values relation has no fields')
+            unless ref($fields) eq 'ARRAY' && @$fields;
+        my @selects;
+        for my $row_index (0 .. $#$rows) {
+            my $row = $rows->[$row_index];
+            my @values;
+            for my $field (@$fields) {
+                push @$params, $row->{$field};
+                my $value = $self->placeholder(scalar @$params);
+                $value .= ' AS ' . $self->quote_identifier($field)
+                    if $row_index == 0;
+                push @values, $value;
+            }
+            push @selects, 'SELECT ' . join(', ', @values);
+        }
+        push @entries,
+            $self->quote_identifier($table) . ' AS (' .
+            join(' UNION ALL ', @selects) . ')';
+    }
+    return $with_sql unless @entries;
+    if (length $with_sql) {
+        $with_sql =~ s/\s+\z//;
+        return $with_sql . ', ' . join(', ', @entries) . ' ';
+    }
+    return 'WITH ' . join(', ', @entries) . ' ';
 }
 
 sub _shift_placeholders {
@@ -1001,12 +1064,40 @@ sub _field_sql {
         ? $self->_join_alias($resolved->{association_path})
         : $self->_root_alias;
     my $sql = $self->quote_identifier($table_alias) . '.' . $self->quote_identifier($resolved->{field});
+    my $association = $resolved->{association};
+    if ($association
+        && $association->join_mode eq 'star_dimension'
+        && defined($association->display_fallback)
+        && $association->display_fallback eq 'dimension_key'
+        && $resolved->{field} eq $association->display_field) {
+        my @association_path = split /\./, $resolved->{association_path};
+        pop @association_path;
+        my $owner_alias = @association_path
+            ? $self->_join_alias(join('.', @association_path))
+            : $self->_root_alias;
+        my $key_sql = $self->quote_identifier($owner_alias) . '.'
+            . $self->quote_identifier($association->dimension_key);
+        my $key_path = @association_path
+            ? join('.', @association_path, $association->dimension_key)
+            : $association->dimension_key;
+        $key_sql = _text_case_sql(
+            $key_sql, $domain->field_metadata($key_path)->{text_case},
+        );
+        $sql = "COALESCE($sql, $key_sql)";
+    }
     return $sql unless defined($self->{_timezone})
         && ($resolved->{type} eq 'utc_datetime' || $resolved->{type} eq 'epoch_datetime')
         && !$self->{_suppress_field_timezone};
     return $self->_compile_timezone_sql(
         $sql, $resolved->{type}, $self->{_timezone}, $params,
     );
+}
+
+sub _text_case_sql {
+    my ($sql, $text_case) = @_;
+    return "UPPER($sql)" if defined($text_case) && $text_case eq 'uppercase';
+    return "LOWER($sql)" if defined($text_case) && $text_case eq 'lowercase';
+    return $sql;
 }
 
 sub _compile_computed_field {

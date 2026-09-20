@@ -38,6 +38,25 @@ isnt($scoped->fingerprint, $domain->fingerprint,
 is_deeply($scoped->contract, $domain->contract,
     'a scoped domain retains its canonical contract metadata');
 
+my $case_domain = Selecto::Domain->parse({
+    schema_version => 1, name => 'Case normalization',
+    source => {
+        source_table => 'case_values', primary_key => 'id',
+        fields => [qw(id upper_code lower_code)],
+        columns => {
+            id => {type => 'integer'},
+            upper_code => {type => 'string', text_case => 'uppercase'},
+            lower_code => {type => 'string', text_case => 'lowercase'},
+        },
+        associations => {},
+    },
+    schemas => {}, joins => {},
+}, strict => 1);
+is $case_domain->normalize_field_value('upper_code', 'co'), 'CO',
+    'uppercase field metadata canonicalizes a scalar value';
+is $case_domain->normalize_field_value('lower_code', 'US'), 'us',
+    'lowercase field metadata canonicalizes a scalar value';
+
 my $canonical = Selecto::Domain->parse(JSON::PP->new->encode({
     schema_version => 1,
     domain_version => '1.0.0',
@@ -348,6 +367,48 @@ is $person_dimension->dimension_key, 'person_id',
     'a star dimension exposes its fact-table key';
 is $person_dimension->display_name, 'Person',
     'a star dimension retains its presentation name';
+
+my $fallback_star_contract = dclone($star_contract);
+$fallback_star_contract->{joins}{person}{display_fallback} = 'dimension_key';
+$fallback_star_contract->{schemas}{people}{columns}{name}{type} = 'integer';
+my $fallback_star = Selecto::Domain->parse($fallback_star_contract, strict => 1);
+is $fallback_star->associations->{person}->display_fallback, 'dimension_key',
+    'a star dimension can explicitly fall back to its stored key for display';
+
+my $values_contract = $canonical->contract;
+delete $values_contract->{schemas}{people}{source_table};
+$values_contract->{schemas}{people}{values} = [
+    {id => 1, name => 'Ada'},
+    {id => 2, name => 'Grace'},
+];
+my $values_domain = Selecto::Domain->parse($values_contract, strict => 1);
+is_deeply $values_domain->associations->{person}->values,
+    [{id => 1, name => 'Ada'}, {id => 2, name => 'Grace'}],
+    'canonical values schemas retain their governed rows';
+
+my $unicode_values_contract = dclone($values_contract);
+$unicode_values_contract->{schemas}{people}{values} = [
+    {id => 1, name => "Plateau d\x{2019}Essai"},
+];
+my $unicode_values_domain = Selecto::Domain->parse(
+    $unicode_values_contract, strict => 1,
+);
+like $unicode_values_domain->fingerprint, qr/\Asha256:[0-9a-f]{64}\z/,
+    'Unicode values participate safely in the domain fingerprint';
+
+my $ambiguous_values_contract = $canonical->contract;
+$ambiguous_values_contract->{schemas}{people}{values} = [{id => 1, name => 'Ada'}];
+eval { Selecto::Domain->parse($ambiguous_values_contract, strict => 1) };
+$error = $@;
+is $error->code, 'invalid_domain',
+    'a canonical schema cannot combine a table and inline values';
+
+my $incomplete_values_contract = $values_contract;
+$incomplete_values_contract->{schemas}{people}{values} = [{id => 1}];
+eval { Selecto::Domain->parse($incomplete_values_contract, strict => 1) };
+$error = $@;
+is $error->code, 'invalid_domain',
+    'every canonical values row must provide every declared field';
 
 my $bad_star_contract = $canonical->contract;
 $bad_star_contract->{joins}{person} = {
