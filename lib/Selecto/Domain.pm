@@ -1282,10 +1282,12 @@ sub _validate_detail_actions {
         my $url_template = _required_string(
             $payload->{url_template}, "detail action $id payload url_template",
         );
+        my $url_safety = $url_template;
+        $url_safety =~ s/\{\{ *[A-Za-z_][A-Za-z0-9_.]* *\}\}/field/g;
         Selecto::Error->throw(
             'invalid_domain', "detail action $id URL template is not safe",
             {action => $id},
-        ) if $url_template =~ /\x00/
+        ) if $url_safety =~ /[\x00-\x20\x7f\\]/
             || $url_template =~ m{\A//}
             || $url_template =~ /\A(?:javascript|data|vbscript):/i
             || $url_template =~ /\A(?!https?:)[A-Za-z][A-Za-z0-9+.-]*:/i;

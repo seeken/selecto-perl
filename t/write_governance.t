@@ -19,8 +19,9 @@ sub exception (&) {
 my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', undef, undef, {
     RaiseError => 1, PrintError => 0, AutoCommit => 1,
 });
-$dbh->do(q{CREATE TABLE items (id integer primary key, tenant_id integer not null, status text, total decimal not null)});
+$dbh->do(q{CREATE TABLE items (id integer primary key, tenant_id integer not null default 7, status text, total decimal not null default 0)});
 $dbh->do(q{CREATE TABLE item_notes (id integer primary key, item_id integer not null, note text)});
+$dbh->do(q{CREATE TABLE item_note_tags (id integer primary key, item_note_id integer not null, tag text)});
 $dbh->do(q{INSERT INTO items VALUES (1, 7, 'active', 10.5)});
 
 my $domain = Selecto::Domain->new(
@@ -284,9 +285,13 @@ my $form_graph = Selecto::Write::Graph->new(nodes => [
     ), bindings => [{field => 'item_id', from => 'root', key => 'id'}] },
 ]);
 my $capability_error = exception { $form_engine->execute_graph($form_graph) };
-# SQLite cannot execute write graphs; reaching the capability error proves
-# every forms-contract governance check passed.
-is($capability_error->code, 'write_capability_missing', 'forms-contract nested graphs pass governance');
+if ($engine->adapter->write_capabilities->{write_graph}) {
+    is($capability_error, undef, 'forms-contract graph executes on modern SQLite');
+    is($dbh->selectrow_array(q{SELECT count(*) FROM item_notes n JOIN items i ON i.id=n.item_id WHERE n.note='hello' AND i.status='open'}),
+        1, 'child is bound to the inserted governed parent');
+} else {
+    is($capability_error->code, 'write_capability_missing', 'older SQLite rejects graph execution');
+}
 
 # A genuine root -> child -> grandchild graph passes every level of the
 # nested contract tree.
@@ -307,8 +312,13 @@ my $deep_error;
     local $SIG{__WARN__} = sub { die "warning escaped governance: @_" };
     $deep_error = exception { $form_engine->execute_graph($deep_graph) };
 }
-is($deep_error->code, 'write_capability_missing', 'root-to-child-to-grandchild graphs pass governance');
-like("$deep_error", qr/write_capability_missing|adapter does not support/, 'no uninitialized-value warnings at depth');
+if ($engine->adapter->write_capabilities->{write_graph}) {
+    is($deep_error, undef, 'root-to-child-to-grandchild graph executes without warnings');
+    is($dbh->selectrow_array(q{SELECT count(*) FROM item_note_tags t JOIN item_notes n ON n.id=t.item_note_id JOIN items i ON i.id=n.item_id WHERE t.tag='keep' AND n.note='hi' AND i.status='open'}),
+        1, 'grandchild bindings persist through the declared parent');
+} else {
+    is($deep_error->code, 'write_capability_missing', 'older SQLite rejects deep graphs');
+}
 
 # The grandchild cannot skip its parent and bind straight from the root.
 my $skipped_grandchild = Selecto::Write::Graph->new(nodes => [

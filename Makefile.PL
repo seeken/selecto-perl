@@ -21,7 +21,7 @@ WriteMakefile(
         'File::Temp'  => 0,
         'JSON::PP'    => '4.06',
         'Math::BigInt' => 0,
-        'Mojolicious' => '9.40',
+        'Mojolicious' => '9.49',
         'Scalar::Util'=> 0,
         'Storable'    => 0,
         'Text::CSV'   => '2.04',
