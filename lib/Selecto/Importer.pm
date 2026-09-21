@@ -6,7 +6,7 @@ use warnings;
 
 use Mojo::Base -base, -signatures;
 use Digest::SHA qw(sha256_hex);
-use Encode qw(decode encode FB_CROAK);
+use Encode qw(decode encode FB_CROAK LEAVE_SRC);
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Text::CSV ();
@@ -18,12 +18,13 @@ has 'domain';
 has max_columns => 200;
 has max_rows => 50_000;
 has max_sample_rows => 25;
+has max_cell_bytes => 1_048_576;
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
     Selecto::Error->throw('invalid_importer', 'importer requires a Selecto domain')
         unless blessed($self->domain) && $self->domain->isa('Selecto::Domain');
-    for my $name (qw(max_columns max_rows max_sample_rows)) {
+    for my $name (qw(max_columns max_rows max_sample_rows max_cell_bytes)) {
         my $value = $self->$name;
         Selecto::Error->throw('invalid_importer', "$name must be a positive integer")
             unless defined($value) && !ref($value) && "$value" =~ /\A[1-9][0-9]*\z/;
@@ -79,6 +80,16 @@ sub inspect_csv ($self, $content, %options) {
             maximum => $self->max_columns,
             columns => scalar(@$row),
         }) if @$row > $self->max_columns;
+        for my $index (0 .. $#$row) {
+            next unless defined $row->[$index];
+            my $cell_bytes = eval { encode('UTF-8', $row->[$index], FB_CROAK | LEAVE_SRC) };
+            Selecto::Error->throw('invalid_import_file', 'CSV content must be UTF-8') if $@;
+            Selecto::Error->throw('import_cell_limit_exceeded', 'Import file contains a cell that is too large', {
+                maximum_bytes => $self->max_cell_bytes,
+                row => $record_number,
+                column => $index + 1,
+            }) if length($cell_bytes) > $self->max_cell_bytes;
+        }
         push @records, {values => [@$row], physical_line => $csv->record_number};
         Selecto::Error->throw('import_row_limit_exceeded', 'Import file has too many rows', {
             maximum => $self->max_rows,

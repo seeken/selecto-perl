@@ -99,6 +99,12 @@ my $utf8_text = $importer->inspect_csv($decoded_text);
 is $utf8_text->{rows}[0]{values}{c2}, "Caf\x{E9}", 'decoded Unicode text is preserved';
 is $utf8_text->{sha256}, $utf8_bytes->{sha256}, 'Unicode text and equivalent bytes have the same digest';
 
+my $small_cell_importer = Selecto::Importer->new(domain => $domain, max_cell_bytes => 4);
+my $large_cell_error = eval { $small_cell_importer->inspect_csv("VIN\n12345\n"); undef } // $@;
+is $large_cell_error->code, 'import_cell_limit_exceeded', 'oversized CSV cells are rejected';
+is_deeply $large_cell_error->details, {maximum_bytes => 4, row => 2, column => 1},
+    'oversized cell error identifies its limit and location';
+
 my $configuration = {
     config_version => 1, domain_fingerprint => $importer->domain_fingerprint,
     mappings => [
