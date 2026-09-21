@@ -120,8 +120,10 @@ my $deep = Selecto::Domain->parse({
             associations => {},
         },
     },
-    joins => {customer => {type => 'left'}, 'customer.region' => {type => 'inner'}},
-});
+    joins => {
+        customer => {type => 'left', joins => {region => {type => 'inner'}}},
+    },
+}, strict => 1);
 is($deep->resolve('customer.region.name')->{type}, 'string',
     'canonical fields resolve through more than one relationship');
 is_deeply(
@@ -129,6 +131,8 @@ is_deeply(
     [qw(customer region)],
     'deep resolution retains the exact relationship lineage',
 );
+is($deep->resolve_association('customer.region')->{association}->join_type, 'inner',
+    'nested canonical join metadata applies to the exact child association');
 is($canonical->writes->{version}, 1, 'canonical write metadata remains available to governed consumers');
 is($canonical->components->{query_params}, 0, 'canonical component URL-state policy is retained');
 is($canonical->domain_dependencies->[0]{contract}, 'invoice_summary_v1',

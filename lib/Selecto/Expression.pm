@@ -89,6 +89,9 @@ sub dimension_display {
 }
 sub related_collection {
     my ($class, $association, $fields) = @_;
+    Selecto::Error->throw('invalid_query', 'related collection association is invalid')
+        unless defined($association) && !ref($association)
+        && "$association" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
     Selecto::Error->throw('invalid_query', 'related collection fields must be an array')
         unless ref($fields) eq 'ARRAY';
     my @fields = map {
