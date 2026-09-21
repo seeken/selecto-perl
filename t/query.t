@@ -353,6 +353,54 @@ like $named_line_statement->sql,
 unlike $named_line_statement->sql, qr{JOIN "invoice_lines"},
     'a structured related collection expression remains correlated, not joined';
 
+my $nested_collection_domain = Selecto::Domain->new(
+    name => 'Scoped nested invoices',
+    table => 'invoices',
+    fields => {id => 'integer', tenant_id => 'integer'},
+    associations => {
+        lines => {
+            table => 'invoice_lines',
+            fields => {id => 'integer', invoice_id => 'integer', tenant_id => 'integer', sku => 'string'},
+            owner_key => 'id', related_key => 'invoice_id', target_primary_key => 'id',
+            cardinality => 'many', source_scope_key => 'tenant_id', target_scope_key => 'tenant_id',
+            associations => {
+                allocations => {
+                    table => 'line_allocations',
+                    fields => {id => 'integer', line_id => 'integer', tenant_id => 'integer', bin => 'string'},
+                    owner_key => 'id', related_key => 'line_id', target_primary_key => 'id',
+                    cardinality => 'many', source_scope_key => 'tenant_id', target_scope_key => 'tenant_id',
+                },
+            },
+        },
+    },
+);
+my $nested_collection_engine = Selecto::Engine->new(
+    domain => $nested_collection_domain,
+    adapter => $adapter,
+);
+my $nested_collection_statement = $nested_collection_engine->compile(
+    $nested_collection_engine->query->select(
+        'id',
+        Selecto::Expression->related_collection('lines', [
+            'id', 'sku',
+            {
+                key => 'allocations',
+                expression => Selecto::Expression->related_collection(
+                    'lines.allocations', ['id', 'bin'],
+                ),
+            },
+        ])->as('lines'),
+    )
+);
+like $nested_collection_statement->sql,
+    qr{'allocations', COALESCE\(\(SELECT JSON_AGG\(JSON_BUILD_OBJECT\('id', "c_lines_allocations"\."id", 'bin', "c_lines_allocations"\."bin"\) ORDER BY "c_lines_allocations"\."id"\) FROM "line_allocations" AS "c_lines_allocations" WHERE "c_lines_allocations"\."line_id" = "c_lines"\."id" AND "c_lines_allocations"\."tenant_id" = "c_lines"\."tenant_id"\), '\[\]'::json\)},
+    'nested related collections compile recursively inside their parent JSON object';
+like $nested_collection_statement->sql,
+    qr{"c_lines"\."invoice_id" = "s0"\."id" AND "c_lines"\."tenant_id" = "s0"\."tenant_id"},
+    'nested related collections retain root and child tenant correlations';
+unlike $nested_collection_statement->sql, qr{JOIN "invoice_lines"},
+    'nested related collections do not multiply outer result rows';
+
 my $flag_domain = Selecto::Domain->parse({
     schema_version => 1,
     domain_version => '1.0.0',

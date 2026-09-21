@@ -27,7 +27,7 @@ my %ASSOCIATION = map { $_ => 1 } qw(
     queryable owner_key related_key cardinality through source_scope_key target_scope_key where
 );
 my %JOIN = map { $_ => 1 } qw(
-    type name display_field dimension_key display_fallback
+    type name display_field dimension_key display_fallback joins
 );
 my %THROUGH = map { $_ => 1 } qw(
     table owner_key related_key source_scope_key through_scope_key target_scope_key
@@ -346,7 +346,7 @@ sub _canonical_associations {
         my $target = $schemas->{$queryable};
         _object($target, "schema $queryable");
         _reject_unknown($target, \%RELATION, "schema $queryable") if $strict;
-        my $join = $joins->{$path} // $joins->{$name} // {};
+        my $join = _canonical_join($joins, $path, $name);
         _object($join, "join $path");
         _reject_unknown($join, \%JOIN, "join $path") if $strict;
         for my $key (qw(owner_key related_key)) {
@@ -433,6 +433,24 @@ sub _canonical_associations {
         );
     }
     return \%associations;
+}
+
+sub _canonical_join {
+    my ($joins, $path, $name) = @_;
+    return $joins->{$path} if ref($joins->{$path}) eq 'HASH';
+    return $joins->{$name} if $path eq $name && ref($joins->{$name}) eq 'HASH';
+
+    my $current = $joins;
+    my @segments = split /\./, $path;
+    for my $index (0 .. $#segments) {
+        my $segment = $segments[$index];
+        return {} unless ref($current) eq 'HASH'
+            && ref($current->{$segment}) eq 'HASH';
+        my $join = $current->{$segment};
+        return $join if $index == $#segments;
+        $current = $join->{joins};
+    }
+    return {};
 }
 
 sub _canonical_relation_values {

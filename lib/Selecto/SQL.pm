@@ -893,18 +893,43 @@ sub _window_boundary {
 
 sub _compile_related_collection {
     my ($self, $domain, $expression, $params) = @_;
+    return $self->_compile_related_collection_at(
+        $domain,
+        $expression,
+        $params,
+        undef,
+        $self->_root_alias,
+    );
+}
+
+sub _compile_related_collection_at {
+    my ($self, $domain, $expression, $params, $parent_path, $parent_alias) = @_;
     my ($association_name, $fields) = @{$expression->arguments};
     Selecto::Error->throw('invalid_query', 'related collection association is invalid')
         unless defined($association_name) && !ref($association_name)
-            && "$association_name" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+            && "$association_name" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+    if (defined $parent_path) {
+        my $prefix = "$parent_path.";
+        my $relative = index($association_name, $prefix) == 0
+            ? substr($association_name, length($prefix)) : '';
+        Selecto::Error->throw(
+            'invalid_query', 'nested related collections must traverse one child association',
+        ) unless $relative =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+    }
+    else {
+        Selecto::Error->throw(
+            'invalid_query', 'related collections must start at a direct association',
+        ) if $association_name =~ /\./;
+    }
     Selecto::Error->throw('invalid_query', 'related collection fields are required')
         unless ref($fields) eq 'ARRAY' && @$fields;
-    my $association = $domain->associations->{$association_name};
-    Selecto::Error->throw('unknown_association', "unknown association $association_name")
-        unless $association;
+    my $resolved_association = $domain->resolve_association($association_name);
+    my $association = $resolved_association->{association};
     Selecto::Error->throw('invalid_query', 'related collections require a to-many association')
         unless $association->cardinality eq 'many';
-    my $alias = 'c_' . $association_name;
+    my $alias_suffix = $association_name;
+    $alias_suffix =~ s/\./_/g;
+    my $alias = 'c_' . $alias_suffix;
     my $association_fields = $association->fields;
     my @collection_fields;
     for my $field (@$fields) {
@@ -924,6 +949,19 @@ sub _compile_related_collection {
                 && defined($field->{key}) && !ref($field->{key}) && length("$field->{key}")
                 && blessed($field->{expression})
                 && $field->{expression}->isa('Selecto::Expression');
+        if ($field->{expression}->kind eq 'related_collection') {
+            push @collection_fields, {
+                key => "$field->{key}",
+                sql => $self->_compile_related_collection_at(
+                    $domain,
+                    $field->{expression},
+                    $params,
+                    $association_name,
+                    $alias,
+                ),
+            };
+            next;
+        }
         my @paths = $self->_expression_field_paths($field->{expression});
         Selecto::Error->throw(
             'invalid_query', 'related collection expressions must reference one child field',
@@ -944,14 +982,14 @@ sub _compile_related_collection {
     my $quoted_alias = $self->quote_identifier($alias);
     my $table = $self->quote_identifier($association->table);
     my $related_key = $quoted_alias . '.' . $self->quote_identifier($association->related_key);
-    my $owner_key = $self->quote_identifier($self->_root_alias) . '.' .
+    my $owner_key = $self->quote_identifier($parent_alias) . '.' .
         $self->quote_identifier($association->owner_key);
     my $from = "$table AS $quoted_alias";
     my @predicates = ("$related_key = $owner_key");
     if (defined $association->source_scope_key) {
         push @predicates,
             $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key) .
-            ' = ' . $self->_qualified($self->_root_alias, $association->source_scope_key);
+            ' = ' . $self->_qualified($parent_alias, $association->source_scope_key);
     }
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
@@ -968,7 +1006,7 @@ sub _compile_related_collection {
         if (defined $through->{source_scope_key}) {
             push @predicates,
                 $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
-                ' = ' . $self->_qualified($self->_root_alias, $through->{source_scope_key});
+                ' = ' . $self->_qualified($parent_alias, $through->{source_scope_key});
             push @target_on,
                 $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
                 ' = ' . $quoted_alias . '.' . $self->quote_identifier($through->{target_scope_key});
