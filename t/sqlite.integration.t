@@ -29,7 +29,17 @@ is_deeply(
 is($adapter->placeholder(2), '?', 'SQLite uses DBI positional placeholders');
 is($adapter->normalize_type('datetime'), 'naive_datetime', 'SQLite types normalize portably');
 ok($adapter->supports('transactions'), 'SQLite declares transaction support');
-ok(!$adapter->supports('returning'), 'SQLite does not overclaim unimplemented returning support');
+if ($adapter->supports('returning')) {
+    my $written = $engine->execute_write(Selecto::Write::Command->new(
+        operation => 'update', relation => 'selecto_perl_test_items',
+        assignments => {amount => 10.5}, predicate => Selecto::Expression->eq('id', 1),
+        metadata => {returning => ['id']},
+    ));
+    is($written->affected_rows, 1, 'advertised SQLite RETURNING executes a real write');
+    is_deeply($written->values, {id => 1}, 'SQLite returns the requested persisted identity');
+} else {
+    pass('older SQLite does not advertise RETURNING');
+}
 
 my $unsupported = $engine->query->select(Selecto::Expression->datetime_format('name', 'month'));
 eval { $engine->compile($unsupported) };

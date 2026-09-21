@@ -543,6 +543,14 @@ eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };
 $error = $@;
 is($error->code, 'invalid_domain', 'executable detail-action URLs fail closed');
 
+for my $unsafe ("java\tscript:alert({{id}})", "java\nscript:alert({{id}})",
+    "java\rscript:alert({{id}})", " / /evil.test/{{id}}", "/\\evil.test/{{id}}") {
+    my $contract = dclone($action_contract);
+    $contract->{detail_actions}{open_order}{payload}{url_template} = $unsafe;
+    my $accepted = eval { Selecto::Domain->parse($contract, strict => 1); 1 };
+    ok !$accepted, 'browser-normalized unsafe detail-action URL rejected';
+}
+
 $bad_action_contract = dclone($action_contract);
 $bad_action_contract->{detail_actions}{open_order}{required_fields} = ['person.name'];
 eval { Selecto::Domain->parse($bad_action_contract, strict => 1) };

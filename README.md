@@ -86,7 +86,7 @@ HTTP-neutral.
 
 ## Install for development
 
-Perl 5.34 or newer and Mojolicious 9.40 or newer are required. PostgreSQL
+Perl 5.34 or newer and Mojolicious 9.49 or newer are required. PostgreSQL
 execution and certification additionally require `DBD::Pg`; SQLite execution
 and certification require `DBD::SQLite`; MySQL and MariaDB use
 `DBD::MariaDB`; Microsoft SQL Server uses a Unicode-enabled `DBD::ODBC` build
