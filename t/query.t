@@ -387,19 +387,22 @@ my $nested_collection_statement = $nested_collection_engine->compile(
                 key => 'allocations',
                 expression => Selecto::Expression->related_collection(
                     'lines.allocations', ['id', 'bin'],
+                    filters => [['bin', 'A1']],
                 ),
             },
         ])->as('lines'),
     )
 );
 like $nested_collection_statement->sql,
-    qr{'allocations', COALESCE\(\(SELECT JSON_AGG\(JSON_BUILD_OBJECT\('id', "c_lines_allocations"\."id", 'bin', "c_lines_allocations"\."bin"\) ORDER BY "c_lines_allocations"\."id"\) FROM "line_allocations" AS "c_lines_allocations" WHERE "c_lines_allocations"\."line_id" = "c_lines"\."id" AND "c_lines_allocations"\."tenant_id" = "c_lines"\."tenant_id"\), '\[\]'::json\)},
+    qr{'allocations', COALESCE\(\(SELECT JSON_AGG\(JSON_BUILD_OBJECT\('id', "c_lines_allocations"\."id", 'bin', "c_lines_allocations"\."bin"\) ORDER BY "c_lines_allocations"\."id"\) FROM "line_allocations" AS "c_lines_allocations" WHERE "c_lines_allocations"\."line_id" = "c_lines"\."id" AND "c_lines_allocations"\."tenant_id" = "c_lines"\."tenant_id" AND "c_lines_allocations"\."bin" = \$1\), '\[\]'::json\)},
     'nested related collections compile recursively inside their parent JSON object';
 like $nested_collection_statement->sql,
     qr{"c_lines"\."invoice_id" = "s0"\."id" AND "c_lines"\."tenant_id" = "s0"\."tenant_id"},
     'nested related collections retain root and child tenant correlations';
 unlike $nested_collection_statement->sql, qr{JOIN "invoice_lines"},
     'nested related collections do not multiply outer result rows';
+is_deeply $nested_collection_statement->params, ['A1'],
+    'nested related collection filters remain adapter-bound parameters';
 
 my $flag_domain = Selecto::Domain->parse({
     schema_version => 1,
