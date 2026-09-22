@@ -192,6 +192,7 @@ sub _expression_numeric_type {
     return '' unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $kind = $expression->kind;
     return 'integer' if $kind =~ /\A(?:count|count_field|count_distinct|true_count|false_count)\z/;
+    return 'decimal' if $kind eq 'true_percentage';
     return $self->_expression_numeric_type($domain, $expression->arguments->[0])
         if $kind =~ /\A(?:min|max|sum|sum_zero|avg)\z/;
     return '' unless $kind eq 'field';

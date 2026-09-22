@@ -815,9 +815,11 @@ sub _compile_expression {
             " = $value THEN 1 END)";
     }
     if ($kind eq 'true_percentage') {
-        my $field_sql = $self->_compile_expression($domain, $arguments->[0], $params);
-        return '(100.0 * COUNT(CASE WHEN ' . $field_sql .
-            ' = TRUE THEN 1 END) / NULLIF(COUNT(' . $field_sql . '), 0))';
+        my $numerator = $self->_compile_expression($domain, $arguments->[0], $params);
+        my $denominator = $self->_compile_expression($domain, $arguments->[0], $params);
+        $numerator = "($numerator)" if $arguments->[0]->kind ne 'field';
+        return "(100.0 * COUNT(CASE WHEN $numerator = TRUE THEN 1 END) / " .
+            "NULLIF(COUNT($denominator), 0))";
     }
     return $self->_compile_dialect_expression($domain, $expression, $params)
         if $kind eq 'count_bucket' || $kind eq 'bucket' || $kind eq 'datetime_format'

@@ -26,6 +26,31 @@ is_deeply(
     'public query API executes through DBD::SQLite',
 );
 
+$dbh->do('CREATE TABLE selecto_perl_test_flags (id integer primary key, batch text, active boolean)');
+$dbh->do(q{INSERT INTO selecto_perl_test_flags VALUES
+    (1, 'mixed', 1), (2, 'mixed', 0), (3, 'mixed', NULL), (4, 'nulls', NULL)});
+my $flags_domain = Selecto::Domain->new(
+    name => 'Flags', table => 'selecto_perl_test_flags',
+    fields => {id => 'integer', batch => 'string', active => 'boolean'},
+);
+my $flags_engine = Selecto::Engine->new(domain => $flags_domain, adapter => $adapter);
+my $percentage = Selecto::Expression->true_percentage('active')->as('active_percentage');
+is_deeply(
+    $flags_engine->all(
+        $flags_engine->query->select('batch', $percentage)->group_by('batch')->order_by('batch'),
+    )->{rows},
+    [['mixed', 50], ['nulls', undef]],
+    'percent-true uses non-null booleans and returns null for an all-null group',
+);
+is_deeply(
+    $flags_engine->all(
+        $flags_engine->query->select($percentage)
+            ->where(Selecto::Expression->eq('batch', 'missing')),
+    )->{rows},
+    [[undef]],
+    'percent-true returns null for an empty result set',
+);
+
 is($adapter->placeholder(2), '?', 'SQLite uses DBI positional placeholders');
 is($adapter->normalize_type('datetime'), 'naive_datetime', 'SQLite types normalize portably');
 ok($adapter->supports('transactions'), 'SQLite declares transaction support');

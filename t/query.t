@@ -862,6 +862,18 @@ like($bucket_statement->sql, qr/COUNT\(CASE WHEN "s0"\."active" = TRUE THEN 1 EN
 like($bucket_statement->sql,
     qr/100\.0 \* COUNT\(CASE WHEN "s0"\."active" = TRUE THEN 1 END\) \/ NULLIF\(COUNT\("s0"\."active"\), 0\)/,
     'boolean true-percentage aggregate compiles with a zero-safe denominator');
+my $parameterized_percentage = $numeric_engine->compile(
+    $numeric_engine->query->select(
+        Selecto::Expression->true_percentage(
+            Selecto::Expression->eq('active', 'true'),
+        )->as('active_percentage'),
+    ),
+);
+like($parameterized_percentage->sql,
+    qr/CASE WHEN \("s0"\."active" = \$1\) = TRUE THEN 1 END\) \/ NULLIF\(COUNT\("s0"\."active" = \$2\), 0\)/,
+    'parameterized percentage expressions bind both occurrences independently');
+is_deeply($parameterized_percentage->params, ['true', 'true'],
+    'parameterized percentage expressions retain both bound values');
 is_deeply([@{$bucket_statement->params}[0 .. 5]], [0, 9, '0-9', 10, '10+', 'Other'],
     'bucket boundaries and labels remain bound values');
 is scalar(@{$bucket_statement->params}), 8,
