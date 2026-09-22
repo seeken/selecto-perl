@@ -178,22 +178,42 @@ sub _compile_single {
                     $domain->field_metadata($owner_path)->{text_case},
                 );
             }
+            my $lateral_lookup = ($association->join_strategy // '') eq 'lateral_lookup';
+            Selecto::Error->throw(
+                'unsupported_feature',
+                'lateral lookup join strategy requires PostgreSQL',
+            ) if $lateral_lookup && $self->name ne 'postgresql';
+            my $lookup_alias = $lateral_lookup
+                ? '__selecto_lookup_' . $target_alias : $target_alias;
             my @target_on = (
                 $owner_sql . ' = ' .
-                    $self->_qualified($target_alias, $association->related_key),
+                    $self->_qualified($lookup_alias, $association->related_key),
             );
             push @target_on, $self->_constant_join_predicates(
-                $target_alias, $association->where, \@params
+                $lookup_alias, $association->where, \@params
             );
             if (defined $association->source_scope_key) {
                 push @target_on,
                     $self->_qualified($parent_alias, $association->source_scope_key) . ' = ' .
-                    $self->_qualified($target_alias, $association->target_scope_key);
+                    $self->_qualified($lookup_alias, $association->target_scope_key);
             }
-            push @joins,
-                $keyword . ' ' . $self->_association_source_sql($association) .
-                ' AS ' . $self->quote_identifier($target_alias) .
-                ' ON ' . join(' AND ', @target_on);
+            if ($lateral_lookup) {
+                # OFFSET 0 keeps PostgreSQL from flattening this correlated
+                # lookup into a join plan that repeatedly scans the relation.
+                # It does not limit rows or change the association's cardinality.
+                push @joins,
+                    $keyword . ' LATERAL (SELECT * FROM ' .
+                    $self->_association_source_sql($association) .
+                    ' AS ' . $self->quote_identifier($lookup_alias) .
+                    ' WHERE ' . join(' AND ', @target_on) .
+                    ' OFFSET 0) AS ' . $self->quote_identifier($target_alias) .
+                    ' ON TRUE';
+            } else {
+                push @joins,
+                    $keyword . ' ' . $self->_association_source_sql($association) .
+                    ' AS ' . $self->quote_identifier($target_alias) .
+                    ' ON ' . join(' AND ', @target_on);
+            }
         }
     }
     my @columns = map { $self->_selection_name($_) } @$selections;

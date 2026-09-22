@@ -612,6 +612,15 @@ are required together, validated against their respective schemas, included in
 the domain fingerprint, and compiled into ordinary joins and related
 collections. This prevents a foreign-key match from bypassing tenant scope.
 
+For a PostgreSQL direct table association whose filtered lookup is badly
+misplanned as a repeated table scan, `join_strategy => 'lateral_lookup'` keeps
+the owner-key equality, constant `where` predicates, and optional tenant scope
+inside a parameterized lookup. PostgreSQL can then use an index on the related
+key and constant filter columns. This is an explicit, PostgreSQL-only plan hint:
+it does not limit matching rows or change cardinality, and it should be used
+only after checking the query plan and providing the supporting index. Through
+and inline-values associations cannot use this strategy.
+
 PostgreSQL hierarchical aggregates use `group_by_rollup`. Select the same
 governed group expressions first, then add `Selecto::Expression->grouping(...)`
 when the caller needs to distinguish detail, subtotal, and grand-total rows:

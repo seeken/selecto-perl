@@ -572,6 +572,48 @@ like(
 );
 is_deeply($direct_scoped_join->params, [6],
     'direct association constants remain bound parameters');
+my $lookup_domain = Selecto::Domain->new(
+    name => 'Indexed option lookup',
+    table => 'quotes',
+    fields => {id => 'integer', client_id => 'integer', tenant_id => 'integer'},
+    associations => {
+        option => {
+            table => 'client_options',
+            fields => {
+                id => 'integer', client_id => 'integer', tenant_id => 'integer',
+                group_id => 'integer', name => 'string',
+            },
+            owner_key => 'client_id', related_key => 'client_id',
+            source_scope_key => 'tenant_id', target_scope_key => 'tenant_id',
+            where => {group_id => 2}, join_strategy => 'lateral_lookup',
+        },
+    },
+);
+is $lookup_domain->associations->{option}->join_strategy, 'lateral_lookup',
+    'an association can opt into an indexed lateral lookup';
+my $lookup_engine = Selecto::Engine->new(domain => $lookup_domain, adapter => $adapter);
+my $lookup_statement = $lookup_engine->compile(
+    $lookup_engine->query->select('id', 'option.name')
+);
+like $lookup_statement->sql,
+    qr{LEFT JOIN LATERAL \(SELECT \* FROM "client_options" AS "__selecto_lookup_j_option" WHERE "s0"\."client_id" = "__selecto_lookup_j_option"\."client_id" AND "__selecto_lookup_j_option"\."group_id" = \$1 AND "s0"\."tenant_id" = "__selecto_lookup_j_option"\."tenant_id" OFFSET 0\) AS "j_option" ON TRUE},
+    'indexed lookup keeps owner, constant and tenant predicates inside the lateral query';
+is_deeply $lookup_statement->params, [2],
+    'indexed lookup still binds constant predicates';
+is $lookup_domain->associations->{option}->fingerprint_value->{join_strategy},
+    'lateral_lookup', 'join strategy participates in domain identity';
+is(
+    Selecto::Domain->parse($lookup_domain->as_contract)
+        ->associations->{option}->join_strategy,
+    'lateral_lookup', 'join strategy survives portable domain serialization',
+);
+my $sqlite_lookup = Selecto::Engine->new(
+    domain => $lookup_domain,
+    adapter => Selecto::SQLite->new(dbh => $dbh),
+);
+eval { $sqlite_lookup->compile($sqlite_lookup->query->select('option.name')) };
+is $@->code, 'unsupported_feature',
+    'dialects without PostgreSQL lookup semantics reject the explicit strategy';
 my $direct_scoped_collection = $through_engine->compile(
     $through_engine->query->select(
         'id', Selecto::Expression->related_collection('notes', ['body'])->as('notes'),
