@@ -379,6 +379,18 @@ sub _filter_expression {
     return Selecto::Expression->is_null($field) if $operator eq 'is_null';
     return Selecto::Expression->not_null($field) if $operator eq 'not_null';
     return Selecto::Expression->in($field, $value) if $operator eq 'in';
+    if ($operator eq 'csv_in') {
+        Selecto::Error->throw('invalid_query_library', 'csv_in requires a scalar value')
+            if ref($value);
+        my @values = grep { length } map {
+            my $item = "$_";
+            $item =~ s/\A\s+|\s+\z//g;
+            $item;
+        } split /,/, defined($value) ? "$value" : '';
+        Selecto::Error->throw('invalid_query_library', 'csv_in requires at least one value')
+            unless @values;
+        return Selecto::Expression->in($field, \@values);
+    }
     return Selecto::Expression->between($field, $value, _substitute($raw_end, $values))
         if $operator eq 'between';
     Selecto::Error->throw('invalid_query_library', "unsupported segment filter operator $operator")

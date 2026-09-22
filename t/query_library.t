@@ -40,6 +40,10 @@ my $domain = Selecto::Domain->parse({
                 filters => [['eq', 'status', ['param', 'code']]],
                 parameters => {code => {type => 'application/status', required => 1}},
             },
+            status_list => {
+                filters => [['csv_in', 'status', ['param', 'codes']]],
+                parameters => {codes => {type => 'string', required => 1}},
+            },
             conflicting_minimum => {
                 filters => [['gte', 'priority', ['param', 'minimum']]],
                 parameters => {minimum => {type => 'float', required => 1}},
@@ -137,5 +141,14 @@ like $matching_fields_statement->sql, qr/"s0"\."id" = "s0"\."priority"/,
     'segment filters may compare two declared fields without treating the right side as a literal';
 is_deeply $matching_fields_statement->params, [],
     'field-to-field segment comparisons do not create bound values';
+
+my $status_list = $engine->apply_segment(
+    $engine->query->select('id'), 'status_list', {codes => 'active, review'},
+);
+my $status_list_statement = $engine->compile($status_list);
+like $status_list_statement->sql, qr/"s0"\."status" IN \(\$1, \$2\)/,
+    'csv_in expands a scalar query-library parameter into a governed membership filter';
+is_deeply $status_list_statement->params, [qw(active review)],
+    'csv_in trims and binds each member independently';
 
 done_testing;

@@ -30,8 +30,12 @@ my @CHOICES = (
     { group => 'Years', id => 'ytd', label => 'Year to Date' },
     { group => 'Years', id => 'ytd_all_years', label => 'Year to Date (All Years)' },
     { group => 'Relative periods', id => 'last_7_days', label => 'Last 7 Days' },
+    { group => 'Relative periods', id => 'last_14_days', label => 'Last 14 Days' },
     { group => 'Relative periods', id => 'last_30_days', label => 'Last 30 Days' },
     { group => 'Relative periods', id => 'last_90_days', label => 'Last 90 Days' },
+    { group => 'Relative periods', id => 'last_3_months', label => 'Last 3 Months' },
+    { group => 'Combined periods', id => 'this_and_last_month', label => 'This Month and Last Month' },
+    { group => 'Combined periods', id => 'this_and_last_year', label => 'This Year and Last Year' },
     { group => 'Relative periods', id => 'next_7_days', label => 'Next 7 Days' },
     { group => 'Relative periods', id => 'next_30_days', label => 'Next 30 Days' },
 );
@@ -109,8 +113,15 @@ sub plan {
     ($start, $end) = (sprintf('%04d-01-01', $year + 1), sprintf('%04d-01-01', $year + 2)) if $shortcut eq 'next_year';
     ($start, $end) = ($year_start, $tomorrow) if $shortcut eq 'ytd';
     ($start, $end) = (_add_days($today, -6), $tomorrow) if $shortcut eq 'last_7_days';
+    ($start, $end) = (_add_days($today, -13), $tomorrow) if $shortcut eq 'last_14_days';
     ($start, $end) = (_add_days($today, -29), $tomorrow) if $shortcut eq 'last_30_days';
     ($start, $end) = (_add_days($today, -89), $tomorrow) if $shortcut eq 'last_90_days';
+    ($start, $end) = (_add_months($month_start, -3), $tomorrow)
+        if $shortcut eq 'last_3_months';
+    ($start, $end) = (_add_months($month_start, -1), _add_months($month_start, 1))
+        if $shortcut eq 'this_and_last_month';
+    ($start, $end) = (sprintf('%04d-01-01', $year - 1), sprintf('%04d-01-01', $year + 1))
+        if $shortcut eq 'this_and_last_year';
     ($start, $end) = ($tomorrow, _add_days($today, 8)) if $shortcut eq 'next_7_days';
     ($start, $end) = ($tomorrow, _add_days($today, 31)) if $shortcut eq 'next_30_days';
     return {kind => 'range', start => $start, end => $end}
