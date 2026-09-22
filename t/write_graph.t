@@ -42,6 +42,20 @@ is_deeply($prepared->[1]->params, [41, 'SKU-1'], 'child graph node receives decl
 is_deeply($graph->nodes->[0]{command}->metadata->{returning}, ['id'],
     'graph normalization derives source RETURNING keys from downstream bindings');
 
+my $failed_dbh = TestSelecto::DBH->new(
+    { affected => 1, rows => [[41]] },
+    { execute_error => 'synthetic child constraint failure' },
+);
+my $failed_adapter = Selecto::PostgreSQL->new(dbh => $failed_dbh);
+my $failed = eval { $failed_adapter->execute_graph($graph); undef } // $@;
+isa_ok($failed, 'Selecto::Error');
+is($failed->code, 'query_error',
+    'a child database failure retains its normalized public code');
+is($failed->details->{graph_node}, 'line_item',
+    'a child database failure identifies its stable graph node');
+is_deeply($failed_dbh->events, ['BEGIN', 'ROLLBACK'],
+    'a node-attributed graph failure still rolls back the managed transaction');
+
 my $unsupported = Selecto::MSSQL->new(dbh => TestSelecto::DBH->new);
 eval { $unsupported->execute_graph($graph) };
 is($@->code, 'write_capability_missing', 'non-graph adapters fail closed before a transaction begins');
