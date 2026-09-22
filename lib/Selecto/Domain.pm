@@ -25,6 +25,7 @@ my %RELATION = map { $_ => 1 } qw(
 );
 my %ASSOCIATION = map { $_ => 1 } qw(
     queryable owner_key related_key cardinality through source_scope_key target_scope_key where
+    join_strategy
 );
 my %JOIN = map { $_ => 1 } qw(
     type name display_field dimension_key display_fallback joins
@@ -422,6 +423,9 @@ sub _canonical_associations {
                 ) : ()),
                 (exists($association->{through}) ? (through => $association->{through}) : ()),
                 (exists($association->{where}) ? (where => $association->{where}) : ()),
+                (exists($association->{join_strategy}) ? (
+                    join_strategy => $association->{join_strategy},
+                ) : ()),
                 ($join_mode eq 'star_dimension' ? (
                     display_field => $join->{display_field} // 'name',
                     dimension_key => $join->{dimension_key} // $association->{owner_key},
@@ -853,6 +857,9 @@ sub _portable_associations {
             owner_key => $association->owner_key,
             related_key => $association->related_key,
             cardinality => $association->cardinality,
+            (defined($association->join_strategy) ? (
+                join_strategy => $association->join_strategy,
+            ) : ()),
             (defined($association->source_scope_key) ? (
                 source_scope_key => $association->source_scope_key,
                 target_scope_key => $association->target_scope_key,
@@ -1798,6 +1805,17 @@ sub new {
     ));
     Selecto::Error->throw('invalid_domain', "unsupported association cardinality $cardinality")
         unless $cardinality eq 'one' || $cardinality eq 'many';
+    my $join_strategy;
+    if (exists $value->{join_strategy}) {
+        $join_strategy = lc(Selecto::Domain::_required_string(
+            $value->{join_strategy}, 'association join strategy'
+        ));
+        Selecto::Error->throw('invalid_domain', 'unsupported association join strategy')
+            unless $join_strategy eq 'lateral_lookup';
+        Selecto::Error->throw(
+            'invalid_domain', 'lateral lookup requires a direct table association'
+        ) if exists($value->{through}) || defined($value->{values});
+    }
     my $target_primary_key;
     if (defined $value->{target_primary_key}) {
         $target_primary_key = Selecto::Domain::_identifier(
@@ -1909,6 +1927,7 @@ sub new {
         target_primary_key => $target_primary_key,
         join_type => $join_type,
         join_mode => $join_mode,
+        (defined($join_strategy) ? (join_strategy => $join_strategy) : ()),
         (defined($source_scope_key) ? (
             source_scope_key => $source_scope_key,
             target_scope_key => $target_scope_key,
@@ -1944,6 +1963,9 @@ sub fingerprint_value {
         owner_key => $self->{owner_key},
         related_key => $self->{related_key},
         join_type => $self->{join_type},
+        (defined($self->{join_strategy}) ? (
+            join_strategy => $self->{join_strategy},
+        ) : ()),
         ($self->{cardinality} eq 'many' ? (cardinality => 'many') : ()),
         (defined($self->{target_primary_key}) && $self->{cardinality} eq 'many'
             ? (target_primary_key => $self->{target_primary_key}) : ()),
@@ -1974,6 +1996,7 @@ sub queryable   { return $_[0]->{queryable}; }
 sub owner_key   { return $_[0]->{owner_key}; }
 sub related_key { return $_[0]->{related_key}; }
 sub join_type   { return $_[0]->{join_type}; }
+sub join_strategy { return $_[0]->{join_strategy}; }
 sub cardinality { return $_[0]->{cardinality}; }
 sub target_primary_key { return $_[0]->{target_primary_key}; }
 sub join_mode   { return $_[0]->{join_mode}; }
