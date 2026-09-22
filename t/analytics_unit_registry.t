@@ -38,6 +38,11 @@ is_deeply(
     {kind => 'count'},
     'count aggregates produce a count unit',
 );
+is_deeply(
+    $registry->aggregate_unit(undef, 'true_percentage'),
+    {kind => 'percentage', scale => 'whole'},
+    'boolean true-percentage aggregates produce whole-percent units',
+);
 ok $registry->compatible(
     {kind => 'currency', code => 'USD'}, {kind => 'currency', code => 'usd'},
 ), 'normalized matching units are axis-compatible';

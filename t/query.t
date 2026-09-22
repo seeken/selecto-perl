@@ -805,6 +805,7 @@ my $bucket_statement = $numeric_engine->compile(
         Selecto::Expression->count_distinct('quantity')->as('distinct_quantities'),
         Selecto::Expression->count_bucket('quantity', 0, 9)->as('low_quantity'),
         Selecto::Expression->true_count('active')->as('active_count'),
+        Selecto::Expression->true_percentage('active')->as('active_percentage'),
     )->group_by($quantity_bucket)
 );
 like($bucket_statement->sql, qr/CASE WHEN "s0"\."quantity" >= \$1 AND "s0"\."quantity" <= \$2 THEN \$3/,
@@ -816,6 +817,9 @@ like($bucket_statement->sql, qr/COUNT\(CASE WHEN "s0"\."quantity" >= \$7 AND "s0
     'numeric measure bucket compiles as a governed conditional count');
 like($bucket_statement->sql, qr/COUNT\(CASE WHEN "s0"\."active" = TRUE THEN 1 END\)/,
     'boolean true-count aggregate compiles');
+like($bucket_statement->sql,
+    qr/100\.0 \* COUNT\(CASE WHEN "s0"\."active" = TRUE THEN 1 END\) \/ NULLIF\(COUNT\("s0"\."active"\), 0\)/,
+    'boolean true-percentage aggregate compiles with a zero-safe denominator');
 is_deeply([@{$bucket_statement->params}[0 .. 5]], [0, 9, '0-9', 10, '10+', 'Other'],
     'bucket boundaries and labels remain bound values');
 is scalar(@{$bucket_statement->params}), 8,

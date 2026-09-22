@@ -118,6 +118,7 @@ sub aggregate_unit {
     my ($class, $source_unit, $aggregate) = @_;
     $aggregate = lc _required_scalar($aggregate, 'aggregate');
     return {kind => 'count'} if $COUNT_AGGREGATES{$aggregate};
+    return {kind => 'percentage', scale => 'whole'} if $aggregate eq 'true_percentage';
     Selecto::Error->throw(
         'invalid_analytics', 'aggregate result unit is not available',
         {aggregate => $aggregate},
