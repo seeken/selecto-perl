@@ -71,6 +71,7 @@ t/co_domain.t
 t/domain.t
 t/domain_overlay.t
 t/domain_registry.t
+t/date_shortcut.t
 t/document_contract.t
 t/duckdb.integration.t
 t/duckdb_result_transport.t
