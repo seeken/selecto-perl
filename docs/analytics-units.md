@@ -16,6 +16,8 @@ The optional behaviors are `flow`, `stock`, `ratio`, and `rate`. They distinguis
 
 Unannotated numeric columns infer the generic `scalar` unit. Counts always produce `count`. `SUM`, `AVG`, `MIN`, and `MAX` preserve the source unit. Analytical transformations use `Selecto::Analytics::TransformRegistry` to derive their output unit and applicability centrally.
 
+`true_percentage` counts true values among non-null booleans and produces a whole-percentage unit; an empty or all-null group yields SQL `NULL`.
+
 Domains must not use unit metadata for chart type, axis placement, color, or other presentation settings. Those choices belong to graph series and frames.
 
 ## Server-side transformations
