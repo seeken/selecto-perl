@@ -643,11 +643,32 @@ sub execute_graph {
                 @scopes == 1 ? $scopes[0] : Selecto::Expression->all(@scopes)
             ) if @scopes;
             my $compiled = $self->_compile_write($command);
-            $results{$node->{id}} = $self->_execute_compiled_write_in_transaction($command, $compiled);
+            my ($result, $ok);
+            $ok = eval {
+                $result = $self->_execute_compiled_write_in_transaction(
+                    $command, $compiled,
+                );
+                1;
+            };
+            die _graph_node_error($self, $@, $node->{id}) unless $ok;
+            $results{$node->{id}} = $result;
         }
         my $root = $graph->nodes->[0]{id};
         return Selecto::Write::Graph::Result->new(nodes => \%results, root => $results{$root});
     });
+}
+
+sub _graph_node_error {
+    my ($self, $error, $node_id) = @_;
+    $error = $self->normalize_error($error)
+        unless blessed($error) && $error->isa('Selecto::Error');
+    my $details = $error->details;
+    $details->{graph_node} = "$node_id" unless exists $details->{graph_node};
+    return Selecto::Error->new(
+        code => $error->code,
+        message => $error->message,
+        details => $details,
+    );
 }
 
 sub _compile_selection {
