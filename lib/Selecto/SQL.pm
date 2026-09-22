@@ -794,6 +794,11 @@ sub _compile_expression {
         return 'COUNT(CASE WHEN ' . $self->_compile_expression($domain, $arguments->[0], $params) .
             " = $value THEN 1 END)";
     }
+    if ($kind eq 'true_percentage') {
+        my $field_sql = $self->_compile_expression($domain, $arguments->[0], $params);
+        return '(100.0 * COUNT(CASE WHEN ' . $field_sql .
+            ' = TRUE THEN 1 END) / NULLIF(COUNT(' . $field_sql . '), 0))';
+    }
     return $self->_compile_dialect_expression($domain, $expression, $params)
         if $kind eq 'count_bucket' || $kind eq 'bucket' || $kind eq 'datetime_format'
             || $kind eq 'epoch_datetime' || $kind eq 'text_search' || $kind eq 'text_rank';
