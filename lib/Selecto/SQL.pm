@@ -904,7 +904,11 @@ sub _compile_related_collection {
 
 sub _compile_related_collection_at {
     my ($self, $domain, $expression, $params, $parent_path, $parent_alias) = @_;
-    my ($association_name, $fields) = @{$expression->arguments};
+    my ($association_name, $fields, $options) = @{$expression->arguments};
+    $options //= {};
+    Selecto::Error->throw('invalid_query', 'related collection options are invalid')
+        unless ref($options) eq 'HASH'
+        && !grep { $_ ne 'filters' } keys %$options;
     Selecto::Error->throw('invalid_query', 'related collection association is invalid')
         unless defined($association_name) && !ref($association_name)
             && "$association_name" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
@@ -1025,6 +1029,19 @@ sub _compile_related_collection_at {
         push @predicates, $self->_constant_join_predicates(
             $alias, $association->where, $params
         );
+    }
+    my $filters = $options->{filters} // [];
+    Selecto::Error->throw('invalid_query', 'related collection filters are invalid')
+        unless ref($filters) eq 'ARRAY';
+    for my $filter (@$filters) {
+        Selecto::Error->throw('invalid_query', 'related collection filter is invalid')
+            unless ref($filter) eq 'ARRAY' && @$filter == 2
+            && defined($filter->[0]) && !ref($filter->[0])
+            && exists($association_fields->{$filter->[0]});
+        push @$params, $filter->[1];
+        push @predicates,
+            $self->_qualified($alias, $filter->[0]) . ' = ' .
+            $self->placeholder(scalar @$params);
     }
     my $where = join(' AND ', @predicates);
     my $order = defined($association->target_primary_key)

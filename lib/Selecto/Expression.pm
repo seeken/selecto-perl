@@ -88,7 +88,8 @@ sub dimension_display {
     );
 }
 sub related_collection {
-    my ($class, $association, $fields) = @_;
+    my ($class, $association, $fields, %options) = @_;
+    _known_options(\%options, [qw(filters)], 'related collection');
     Selecto::Error->throw('invalid_query', 'related collection association is invalid')
         unless defined($association) && !ref($association)
         && "$association" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
@@ -108,7 +109,20 @@ sub related_collection {
             Selecto::Error->throw('invalid_query', 'related collection field is invalid');
         }
     } @$fields;
-    return $class->new('related_collection', "$association", \@fields);
+    my $filters = $options{filters} // [];
+    Selecto::Error->throw('invalid_query', 'related collection filters must be an array')
+        unless ref($filters) eq 'ARRAY';
+    my @filters = map {
+        my ($field, $value) = ref($_) eq 'ARRAY' ? @$_ : ();
+        Selecto::Error->throw('invalid_query', 'related collection filter is invalid')
+            unless ref($_) eq 'ARRAY' && @$_ == 2
+            && defined($field) && !ref($field)
+            && "$field" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+        ["$field", $value];
+    } @$filters;
+    return @filters
+        ? $class->new('related_collection', "$association", \@fields, {filters => \@filters})
+        : $class->new('related_collection', "$association", \@fields);
 }
 sub text_search {
     my ($class, $fields, $query, %options) = @_;
