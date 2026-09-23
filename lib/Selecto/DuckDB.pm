@@ -402,6 +402,11 @@ sub _compile_related_collection_sql {
     );
 }
 
+sub _related_collection_text_sql {
+    my ($self, $sql) = @_;
+    return "CAST($sql AS VARCHAR)";
+}
+
 sub _transaction {
     my ($self, $operation) = @_;
     my $value;
