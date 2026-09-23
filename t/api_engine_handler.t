@@ -129,6 +129,49 @@ my $handler = Selecto::API::EngineHandler->new(
     default_limit => 12,
 );
 
+my $conditional_domain = Selecto::Domain->parse({
+    schema_version => 1, name => 'Conditional filter API',
+    source => {
+        source_table => 'quoted_items', primary_key => 'id',
+        fields => [qw(id customer_id quote_choice customer_choice)],
+        columns => {
+            id => {type => 'integer'}, customer_id => {type => 'integer'},
+            quote_choice => {type => 'integer', internal => 1},
+            customer_choice => {type => 'integer', internal => 1},
+        },
+        associations => {},
+    },
+    schemas => {}, joins => {},
+    components => {filter_choices => {effective_choice => {
+        label => 'Effective choice', choices => [
+            {value => 14, label => 'Private'}, {value => 15, label => 'Corporate'},
+        ],
+        conditional => {
+            when_field => 'customer_id', present_field => 'customer_choice',
+            absent_field => 'quote_choice',
+        },
+    }}},
+}, strict => 1);
+my $conditional_adapter = TestAPIEngineHandler::Adapter->new(
+    dbh => bless({}, 'TestAPIEngineHandler::DBH'),
+);
+my $conditional_engine = Selecto::Engine->new(
+    domain => $conditional_domain, adapter => $conditional_adapter,
+);
+my $conditional_result = $handler->query($conditional_engine, {
+    select => ['id'], filters => [
+        {field => 'effective_choice', op => 'in', value => ['14', '15']},
+    ],
+});
+is_deeply $conditional_result->{columns}, ['id'],
+    'API accepts a governed conditional choice filter';
+like $conditional_adapter->{last_statement}->sql,
+    qr/"customer_id" IS NOT NULL.*"customer_choice" IN.*"customer_id" IS NULL.*"quote_choice" IN/s,
+    'API filters the customer side only when a Customer ID exists';
+is_deeply $conditional_adapter->{last_statement}->params,
+    ['14', '15', '14', '15'],
+    'conditional API filter binds its selected IDs in both branches';
+
 my $write_result = $handler->write($engine, {
     operation => 'update',
     assignments => {status => 'closed'},
