@@ -5,6 +5,7 @@ use Test::More;
 use lib 't/lib';
 use TestSelecto;
 use Selecto::Identifier ();
+use Selecto::DuckDB ();
 use Selecto::MSSQL ();
 use Selecto::MySQL ();
 use Selecto::PostgreSQL ();
@@ -990,5 +991,25 @@ like(
     qr/FOR JSON PATH/,
     'SQL Server related collections use FOR JSON PATH',
 );
+
+my $string_collection_query = $line_engine->query->select(
+    'id', Selecto::Expression->related_collection('lines', [{
+        key => 'sku', expression => Selecto::Expression->field('lines.sku'),
+        stringify => 1,
+    }])->as('lines'),
+);
+for my $case (
+    [Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new), qr/CAST\("c_lines"\."sku" AS TEXT\)/, 'PostgreSQL'],
+    [Selecto::SQLite->new(dbh => TestSelecto::DBH->new), qr/CAST\("c_lines"\."sku" AS TEXT\)/, 'SQLite'],
+    [Selecto::MySQL->new(dbh => TestSelecto::DBH->new), qr/CAST\(`c_lines`\.`sku` AS CHAR\)/, 'MySQL'],
+    [Selecto::MSSQL->new(dbh => TestSelecto::DBH->new), qr/CAST\(\[c_lines\]\.\[sku\] AS NVARCHAR\(MAX\)\)/, 'SQL Server'],
+    [Selecto::DuckDB->new(dbh => TestSelecto::DBH->new), qr/CAST\("c_lines"\."sku" AS VARCHAR\)/, 'DuckDB'],
+) {
+    my ($compiler, $cast, $dialect) = @$case;
+    my $sql = Selecto::Engine->new(
+        domain => $line_domain, adapter => $compiler,
+    )->compile($string_collection_query)->sql;
+    like $sql, $cast, "$dialect preserves selected nested values as JSON strings";
+}
 
 done_testing;

@@ -22,7 +22,8 @@ use Selecto::Write ();
             rows => [[map {
                 $_ eq 'id' ? 7
                     : $_ eq 'lines'
-                        ? '[{"lines.sku":"ABC","line_day":"2026-09-11"}]'
+                        ? ($self->{nested_payload}
+                            // '[{"lines.sku":"ABC","line_day":"2026-09-11"}]')
                         : "value:$_"
             } @{$statement->columns}]],
         };
@@ -65,12 +66,14 @@ my $domain = Selecto::Domain->parse({
     schemas => {
         record_lines => {
             source_table => 'record_lines', primary_key => 'id',
-            fields => [qw(id record_id sku occurred_at)],
+            fields => [qw(id record_id sku occurred_at price weight)],
             columns => {
                 id => {type => 'integer'},
                 record_id => {type => 'integer'},
                 sku => {type => 'string'},
                 occurred_at => {type => 'epoch_datetime'},
+                price => {type => 'decimal'},
+                weight => {type => 'decimal'},
             },
             associations => {},
         },
@@ -380,6 +383,25 @@ is_deeply $result->{rows}, [{
     lines => [{'lines.sku' => 'ABC', line_day => '2026-09-11'}],
 }], 'object row format is applied to the root and its related collection';
 is $result->{row_format}, 'objects', 'the response reports its effective row format';
+
+{
+    local $adapter->{nested_payload} =
+        '[{"lines.price":"12345678901234567890.123456789",'
+        . '"lines.weight":"0.00000000000000000001"}]';
+    $result = $handler->query($engine, {
+        select => ['id', ['lines.price', 'lines.weight']],
+        row_format => 'objects',
+    });
+    is_deeply $result->{rows}[0]{lines}, [{
+        'lines.price' => '12345678901234567890.123456789',
+        'lines.weight' => '0.00000000000000000001',
+    }], 'nested decimals retain their exact text, including high precision';
+    like $adapter->{last_statement}->sql,
+        qr/JSON_BUILD_OBJECT\('lines\.price', CAST\("c_lines"\."price" AS TEXT\), 'lines\.weight', CAST\("c_lines"\."weight" AS TEXT\)\)/,
+        'nested decimal values are cast to text before database JSON aggregation';
+    my $json = eval { Selecto::API::canonical_json($result) };
+    ok !$@ && defined($json), 'nested decimal query result meets canonical JSON rules';
+}
 
 my $subtable_error = eval {
     $handler->query($engine, {select => ['id', ['lines.sku', 'name']]});

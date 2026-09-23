@@ -838,6 +838,10 @@ sub _api_selections ($domain, $value, $maximum) {
             ) if $nested_names{$selection->{result_name}}++;
             push @fields, {
                 key => $selection->{result_name}, expression => $selection->{expression},
+                # JSON decoders turn numeric literals into inexact native floats.
+                # Preserve the database's decimal text before JSON aggregation.
+                ($definition->{type} =~ /\A(?:decimal|numeric|number|float|double|real)\z/i
+                    ? (stringify => 1) : ()),
             };
         }
         Selecto::Error->throw(

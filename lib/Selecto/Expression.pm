@@ -104,8 +104,12 @@ sub related_collection {
                 'invalid_query', 'related collection field requires key and expression',
             ) unless defined($_->{key}) && !ref($_->{key}) && length("$_->{key}")
                 && blessed($_->{expression}) && $_->{expression}->isa(__PACKAGE__)
-                && !grep { $_ ne 'key' && $_ ne 'expression' } keys %$_;
-            {key => "$_->{key}", expression => $_->{expression}};
+                && !grep { $_ ne 'key' && $_ ne 'expression' && $_ ne 'stringify' } keys %$_;
+            Selecto::Error->throw(
+                'invalid_query', 'related collection stringify must be boolean',
+            ) if exists($_->{stringify}) && ref($_->{stringify});
+            {key => "$_->{key}", expression => $_->{expression},
+                (exists($_->{stringify}) ? (stringify => !!$_->{stringify}) : ())};
         } else {
             Selecto::Error->throw('invalid_query', 'related collection field is invalid');
         }

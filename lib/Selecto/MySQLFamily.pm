@@ -81,4 +81,9 @@ sub _compile_related_collection_sql {
     );
 }
 
+sub _related_collection_text_sql {
+    my ($self, $sql) = @_;
+    return "CAST($sql AS CHAR)";
+}
+
 1;
