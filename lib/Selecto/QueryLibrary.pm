@@ -15,7 +15,54 @@ sub library {
     Selecto::Error->throw('invalid_domain', 'query library requires a Selecto::Domain')
         unless blessed($domain) && $domain->isa('Selecto::Domain');
     my $raw = $domain->query_library;
-    return { map { $_ => dclone($raw->{$_} // {}) } @REGISTRIES };
+    return {
+        (map { $_ => dclone($raw->{$_} // {}) } @REGISTRIES),
+        segment_picker_groups => dclone($raw->{segment_picker_groups} // {}),
+    };
+}
+
+sub segment_picker_groups {
+    my ($class, $domain) = @_;
+    my $library = $class->library($domain);
+    my $groups = $library->{segment_picker_groups};
+    Selecto::Error->throw('invalid_query_library', 'segment picker groups must be an object')
+        unless ref($groups) eq 'HASH';
+    my %used;
+    my @result;
+    for my $id (sort keys %$groups) {
+        Selecto::Error->throw('invalid_query_library', 'segment picker group ID must use letters, digits, or underscores')
+            unless $id =~ /\A[A-Za-z][A-Za-z0-9_]*\z/;
+        my $group = $groups->{$id};
+        Selecto::Error->throw('invalid_query_library', "segment picker group $id must be an object")
+            unless ref($group) eq 'HASH';
+        my $label = $group->{label};
+        Selecto::Error->throw('invalid_query_library', "segment picker group $id needs a label")
+            unless defined($label) && !ref($label) && "$label" =~ /\S/;
+        my $choices = $group->{choices};
+        Selecto::Error->throw('invalid_query_library', "segment picker group $id needs at least two choices")
+            unless ref($choices) eq 'ARRAY' && @$choices >= 2;
+        my @choices;
+        for my $choice (@$choices) {
+            Selecto::Error->throw('invalid_query_library', "segment picker group $id choices must be objects")
+                unless ref($choice) eq 'HASH';
+            my $segment = _id($choice->{segment}, 'segment picker choice');
+            _definition($library->{segments}, 'segments', $segment);
+            Selecto::Error->throw('invalid_query_library', "segment $segment is in more than one picker group")
+                if $used{$segment}++;
+            my $choice_label = $choice->{label};
+            Selecto::Error->throw('invalid_query_library', "segment picker choice $segment needs a label")
+                unless defined($choice_label) && !ref($choice_label) && "$choice_label" =~ /\S/;
+            push @choices, {segment => $segment, label => "$choice_label"};
+        }
+        my $off_label = $group->{off_label} // 'Off';
+        Selecto::Error->throw('invalid_query_library', "segment picker group $id needs an off label")
+            unless !ref($off_label) && "$off_label" =~ /\S/;
+        push @result, {
+            id => $id, label => "$label", description => $group->{description} // '',
+            off_label => "$off_label", choices => \@choices,
+        };
+    }
+    return \@result;
 }
 
 sub definitions {
@@ -101,6 +148,16 @@ sub apply_segments {
     my $library = $class->library($domain);
     my $resolved = {filters => [], parameters => {}, ids => []};
     _merge_segment($resolved, _resolve_segment($library, $_, [])) for @$segment_ids;
+    my %selected = map { $_ => 1 } (
+        @{$query->applied_query_library->{segments} // []}, @{$resolved->{ids}},
+    );
+    for my $group (@{$class->segment_picker_groups($domain)}) {
+        my @chosen = grep { $selected{$_->{segment}} } @{$group->{choices}};
+        Selecto::Error->throw(
+            'invalid_query_library', "segment picker group $group->{label} allows only one choice",
+            {group => $group->{id}, segments => [map { $_->{segment} } @chosen]},
+        ) if @chosen > 1;
+    }
     my $values = _normalize_parameters($resolved->{parameters}, $params);
     my @predicates = map { _filter_expression($_, $values) } @{$resolved->{filters}};
     my $predicate = @predicates == 1 ? $predicates[0]

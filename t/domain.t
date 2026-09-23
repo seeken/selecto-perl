@@ -38,6 +38,60 @@ isnt($scoped->fingerprint, $domain->fingerprint,
 is_deeply($scoped->contract, $domain->contract,
     'a scoped domain retains its canonical contract metadata');
 
+my $choice_contract = {
+    schema_version => 1, name => 'People with choices',
+    source => {
+        source_table => 'people', primary_key => 'id', fields => ['id'],
+        columns => {id => {type => 'integer'}}, associations => {},
+    },
+    schemas => {}, joins => {},
+    components => {
+        filter_choices => {
+            id => {
+                label => 'Person',
+                choices => [{value => 7, label => 'Alice'}, {value => 11, label => 'Bob'}],
+            },
+            selected_person => {
+                label => 'Selected Person',
+                choices => [{value => 7, label => 'Alice'}],
+                conditional => {
+                    when_field => 'id', present_field => 'id', absent_field => 'id',
+                },
+            },
+        },
+        filter_picker_hidden_paths => ['id'],
+        picker_visible_id_paths => ['id'],
+    },
+};
+my $choice_domain = Selecto::Domain->parse($choice_contract, strict => 1);
+is_deeply $choice_domain->components->{filter_choices}{'id'}{choices}, [
+    {value => '7', label => 'Alice'}, {value => '11', label => 'Bob'},
+], 'domain filter choices retain stable IDs and human-readable labels';
+is_deeply $choice_domain->components->{filter_choices}{selected_person}{conditional}, {
+    when_field => 'id', present_field => 'id', absent_field => 'id',
+}, 'conditional filter choices retain governed branch paths';
+is_deeply $choice_domain->components->{filter_picker_hidden_paths}, ['id'],
+    'old filter fields can remain valid while hidden from the picker';
+is_deeply $choice_domain->components->{picker_visible_id_paths}, ['id'],
+    'explicit picker-visible ID paths survive canonical parsing';
+my $invalid_picker_id = dclone($choice_contract);
+$invalid_picker_id->{components}{picker_visible_id_paths} = ['missing_field'];
+eval { Selecto::Domain->parse($invalid_picker_id, strict => 1) };
+like "$@", qr/picker visible ID path missing_field is not a domain field/,
+    'picker ID overrides must resolve in the domain';
+my $invalid_choice_contract = dclone($choice_contract);
+push @{$invalid_choice_contract->{components}{filter_choices}{'id'}{choices}},
+    {value => 7, label => 'Duplicate'};
+eval { Selecto::Domain->parse($invalid_choice_contract, strict => 1) };
+like "$@", qr/duplicate filter choice value/,
+    'a filter choice list cannot ambiguously reuse an ID';
+my $invalid_conditional = dclone($choice_contract);
+$invalid_conditional->{components}{filter_choices}{selected_person}{conditional}{absent_field}
+    = 'missing_field';
+eval { Selecto::Domain->parse($invalid_conditional, strict => 1) };
+like "$@", qr/references unavailable absent_field missing_field/,
+    'conditional filter branches must reference governed fields';
+
 my $case_domain = Selecto::Domain->parse({
     schema_version => 1, name => 'Case normalization',
     source => {
