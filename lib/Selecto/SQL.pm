@@ -38,6 +38,8 @@ sub quote_identifier {
 sub compile {
     my ($self, $domain, $query) = @_;
     my $operations = $query->set_operations;
+    Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')
+        if @$operations && defined($query->row_lock);
     return $self->_compile_single($domain, $query) unless @$operations;
     Selecto::Error->throw('unsupported_feature', 'adapter does not support set operations')
         unless $self->supports('set_operations');
@@ -316,6 +318,13 @@ sub _compile_single {
         $query->offset_value,
         @$orders ? 1 : 0,
     );
+    if (defined($query->row_lock)) {
+        Selecto::Error->throw('unsupported_feature', 'adapter does not support row locks')
+            unless $self->supports('row_locks');
+        Selecto::Error->throw('invalid_query', 'row locks require an ungrouped row query')
+            if @$groups;
+        $sql .= $self->_compile_row_lock($query->row_lock);
+    }
     return Selecto::Statement->new(
         sql => $with_sql . $sql,
         params => \@params,
@@ -970,7 +979,7 @@ sub _compile_related_collection_at {
     $options //= {};
     Selecto::Error->throw('invalid_query', 'related collection options are invalid')
         unless ref($options) eq 'HASH'
-        && !grep { $_ ne 'filters' } keys %$options;
+        && !grep { $_ ne 'filters' && $_ ne 'order_by' && $_ ne 'limit' && $_ ne 'after' && $_ ne 'aggregate' } keys %$options;
     Selecto::Error->throw('invalid_query', 'related collection association is invalid')
         unless defined($association_name) && !ref($association_name)
             && "$association_name" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
@@ -1007,6 +1016,7 @@ sub _compile_related_collection_at {
             push @collection_fields, {
                 key => "$field",
                 sql => $self->_qualified($alias, $field),
+                type => $association_fields->{$field},
             };
             next;
         }
@@ -1107,9 +1117,81 @@ sub _compile_related_collection_at {
             $self->placeholder(scalar @$params);
     }
     my $where = join(' AND ', @predicates);
-    my $order = defined($association->target_primary_key)
-        ? $quoted_alias . '.' . $self->quote_identifier($association->target_primary_key)
-        : undef;
+    if (defined $options->{aggregate}) {
+        my $metadata = $association_fields->{$fields->[0]};
+        my $type = ref($metadata) eq 'HASH' ? $metadata->{type} : $metadata;
+        Selecto::Error->throw('invalid_query', 'related aggregate is invalid')
+            unless ($options->{aggregate} eq 'sum' || $options->{aggregate} eq 'count')
+            && @collection_fields == 1
+            && !ref($fields->[0])
+            && defined($type)
+            && ($options->{aggregate} eq 'count'
+                || "$type" =~ /\A(?:integer|decimal|float|number|numeric)\z/)
+            && !@{$options->{order_by} // []}
+            && !defined($options->{limit}) && !defined($options->{after});
+        return '(SELECT COUNT(' . $collection_fields[0]{sql} .
+            ') FROM ' . $from . ' WHERE ' . $where . ')'
+            if $options->{aggregate} eq 'count';
+        return '(SELECT COALESCE(SUM(' . $collection_fields[0]{sql} .
+            '), 0) FROM ' . $from . ' WHERE ' . $where . ')';
+    }
+    my $orders = $options->{order_by} // [];
+    Selecto::Error->throw('invalid_query', 'related collection ordering is invalid')
+        unless ref($orders) eq 'ARRAY';
+    Selecto::Error->throw(
+        'unsupported_feature', 'ordered related collections require a certified dialect',
+    ) if @$orders && $self->name ne 'postgresql';
+    my @order_sql;
+    for my $spec (@$orders) {
+        my ($field, $direction) = ref($spec) eq 'ARRAY' ? @$spec : ();
+        Selecto::Error->throw('invalid_query', 'related collection ordering is invalid')
+            unless ref($spec) eq 'ARRAY' && @$spec == 2
+            && defined($field) && !ref($field)
+            && exists($association_fields->{$field})
+            && defined($direction) && !ref($direction)
+            && "$direction" =~ /\A(?:asc|desc)\z/i;
+        push @order_sql, $self->_qualified($alias, $field) . ' ' . uc($direction);
+    }
+    my $order = @order_sql ? join(', ', @order_sql)
+        : defined($association->target_primary_key)
+            ? $quoted_alias . '.' . $self->quote_identifier($association->target_primary_key)
+            : undef;
+    my $limit = $options->{limit};
+    Selecto::Error->throw('invalid_query', 'per-parent collection cursor requires a limit')
+        if defined($options->{after}) && !defined($limit);
+    if (defined $limit) {
+        Selecto::Error->throw('invalid_query', 'per-parent collection limit is invalid')
+            unless !ref($limit) && "$limit" =~ /\A[1-9][0-9]*\z/ && @order_sql;
+        Selecto::Error->throw(
+            'unsupported_feature', 'per-parent collection limits require PostgreSQL',
+        ) unless $self->name eq 'postgresql';
+        my $primary_key = $association->target_primary_key;
+        Selecto::Error->throw(
+            'invalid_query', 'per-parent collection limit requires a target primary key',
+        ) unless defined($primary_key) && exists($association_fields->{$primary_key});
+        my @stable_orders = map { [$_->[0], lc($_->[1])] } @$orders;
+        if (!grep { $_->[0] eq $primary_key } @$orders) {
+            push @order_sql, $self->_qualified($alias, $primary_key) . ' ASC';
+            push @stable_orders, [$primary_key, 'asc'];
+            $order = join(', ', @order_sql);
+        }
+        if (defined $options->{after}) {
+            my $parent_primary_key = defined($parent_path)
+                ? $domain->resolve_association($parent_path)->{association}->target_primary_key
+                : $domain->primary_key;
+            Selecto::Error->throw(
+                'invalid_query', 'per-parent collection cursor requires a parent primary key',
+            ) unless defined $parent_primary_key;
+            my $parent_identity = $self->_qualified($parent_alias, $parent_primary_key);
+            $where .= ' AND ' . $self->_related_collection_cursor_predicate(
+                $params, $alias, $parent_identity, \@stable_orders, $options->{after}
+            );
+        }
+        $from = '(SELECT ' . $quoted_alias . '.* FROM ' . $from .
+            ' WHERE ' . $where . ' ORDER BY ' . $order .
+            ' LIMIT ' . int($limit) . ') AS ' . $quoted_alias;
+        $where = 'TRUE';
+    }
     return $self->_compile_related_collection_sql({
         fields => \@collection_fields,
         quoted_alias => $quoted_alias,
@@ -1119,12 +1201,63 @@ sub _compile_related_collection_at {
     });
 }
 
+sub _related_collection_cursor_predicate {
+    my ($self, $params, $alias, $owner_key, $orders, $cursor) = @_;
+    Selecto::Error->throw('invalid_query', 'per-parent collection cursor is invalid')
+        unless ref($cursor) eq 'HASH' && keys(%$cursor) == 2
+        && exists($cursor->{parent_key}) && exists($cursor->{values})
+        && defined($cursor->{parent_key}) && !ref($cursor->{parent_key})
+        && ref($cursor->{values}) eq 'ARRAY'
+        && @{$cursor->{values}} == @$orders
+        && !grep { ref($_) } @{$cursor->{values}};
+
+    push @$params, $cursor->{parent_key};
+    my $parent_marker = $self->placeholder(scalar @$params);
+    my @terms;
+    for my $index (0 .. $#$orders) {
+        my @prefix;
+        for my $prior (0 .. $index - 1) {
+            my $column = $self->_qualified($alias, $orders->[$prior][0]);
+            my $value = $cursor->{values}[$prior];
+            if (defined $value) {
+                push @$params, $value;
+                push @prefix, $column . ' IS NOT DISTINCT FROM ' .
+                    $self->placeholder(scalar @$params);
+            }
+            else {
+                push @prefix, $column . ' IS NULL';
+            }
+        }
+        my ($field, $direction) = @{$orders->[$index]};
+        my $column = $self->_qualified($alias, $field);
+        my $value = $cursor->{values}[$index];
+        my $comparison;
+        if (!defined $value) {
+            $comparison = $direction eq 'desc' ? "$column IS NOT NULL" : 'FALSE';
+        }
+        else {
+            push @$params, $value;
+            my $marker = $self->placeholder(scalar @$params);
+            $comparison = $direction eq 'desc' ? "$column < $marker"
+                : "($column > $marker OR $column IS NULL)";
+        }
+        push @terms, '(' . join(' AND ', @prefix, $comparison) . ')';
+    }
+    return '(' . $owner_key . ' IS DISTINCT FROM ' . $parent_marker .
+        ' OR (' . join(' OR ', @terms) . '))';
+}
+
 sub _related_collection_json_pairs {
-    my ($self, $fields, $quoted_alias) = @_;
+    my ($self, $fields, $quoted_alias, $exact_decimals_as_text) = @_;
     return map {
         my $key = $_->{key};
         $key =~ s/'/''/g;
-        "'$key', " . $self->_related_collection_value_sql($_)
+        my $sql = $self->_related_collection_value_sql($_);
+        $sql = "($sql)::text"
+            if $exact_decimals_as_text
+                && defined($_->{type})
+                && $_->{type} =~ /\A(?:decimal|numeric|number)\z/;
+        "'$key', $sql"
     } @$fields;
 }
 
@@ -1687,6 +1820,10 @@ sub _compile_pagination {
     $sql .= ' LIMIT ' . int($limit) if defined $limit;
     $sql .= ' OFFSET ' . int($offset) if defined $offset;
     return $sql;
+}
+
+sub _compile_row_lock {
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support row locks');
 }
 
 sub _rollup_sort_fix_enabled { return 1; }

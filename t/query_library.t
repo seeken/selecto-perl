@@ -1,6 +1,7 @@
 use 5.034;
 use strict;
 use warnings;
+use JSON::PP ();
 use Test::More;
 use Selecto;
 use Selecto::PostgreSQL ();
@@ -12,10 +13,11 @@ my $domain = Selecto::Domain->parse({
     source => {
         source_table => 'projects',
         primary_key => 'id',
-        fields => [qw(id name status priority)],
+        fields => [qw(id name status priority enabled)],
         columns => {
             id => {type => 'integer'}, name => {type => 'string'},
             status => {type => 'string'}, priority => {type => 'integer'},
+            enabled => {type => 'boolean'},
         },
         associations => {},
     },
@@ -53,6 +55,14 @@ my $domain = Selecto::Domain->parse({
             status_list => {
                 filters => [['csv_in', 'status', ['param', 'codes']]],
                 parameters => {codes => {type => 'string', required => 1}},
+            },
+            name_prefix => {
+                filters => [['starts_with', 'name', ['param', 'value']]],
+                parameters => {value => {type => 'string', required => 1}},
+            },
+            enabled_exact => {
+                filters => [['eq', 'enabled', ['param', 'value']]],
+                parameters => {value => {type => 'boolean', required => 1}},
             },
             conflicting_minimum => {
                 filters => [['gte', 'priority', ['param', 'minimum']]],
@@ -179,5 +189,33 @@ like $status_list_statement->sql, qr/"s0"\."status" IN \(\$1, \$2\)/,
     'csv_in expands a scalar query-library parameter into a governed membership filter';
 is_deeply $status_list_statement->params, [qw(active review)],
     'csv_in trims and binds each member independently';
+
+my $empty_prefix = $engine->apply_segment(
+    $engine->query->select('id'), 'name_prefix', {value => ''},
+);
+like $engine->compile($empty_prefix)->sql, qr/"s0"\."name" LIKE \$1 ESCAPE '!'/,
+    'empty prefix keeps the governed string predicate';
+is_deeply $engine->compile($empty_prefix)->params, ['%'],
+    'empty prefix matches all non-null names';
+my $literal_prefix = $engine->apply_segment(
+    $engine->query->select('id'), 'name_prefix', {value => 'A%_!\\'},
+);
+is_deeply $engine->compile($literal_prefix)->params, ['A!%!_!!\\%'],
+    'prefix wildcard characters are escaped before binding';
+
+for my $case ([JSON::PP::true(), 1], [JSON::PP::false(), 0]) {
+    my $filtered = $engine->apply_segment(
+        $engine->query->select('id'), 'enabled_exact', {value => $case->[0]},
+    );
+    is_deeply $engine->compile($filtered)->params, [$case->[1]],
+        'a template JSON boolean becomes one bound native boolean parameter';
+}
+
+eval {
+    $engine->apply_segment(
+        $engine->query->select('id'), 'enabled_exact', {value => {}},
+    );
+};
+like "$@", qr/must be boolean/, 'arbitrary references remain invalid boolean parameters';
 
 done_testing;

@@ -4,6 +4,8 @@ use Mojo::Base 'Selecto::SQL';
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::Identifier ();
+use Selecto::Statement ();
 
 has rollup_sort_fix => 'auto';
 
@@ -76,7 +78,34 @@ sub supports {
         || "$feature" eq 'window_functions' || "$feature" eq 'text_search'
         || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
         || "$feature" eq 'lateral_join' || "$feature" eq 'json_rowset'
-        || "$feature" eq 'stream' ? 1 : 0;
+        || "$feature" eq 'stream' || "$feature" eq 'projection_sum'
+        || "$feature" eq 'row_locks' ? 1 : 0;
+}
+
+sub _compile_row_lock {
+    my ($self, $mode) = @_;
+    Selecto::Error->throw('invalid_query', 'unsupported row lock mode')
+        unless $mode eq 'share';
+    return ' FOR SHARE OF ' . $self->quote_identifier($self->_root_alias);
+}
+
+sub projection_sum_statement {
+    my ($self, $statement, $column) = @_;
+    Selecto::Error->throw('invalid_query', 'projection sum requires a compiled Selecto statement')
+        unless blessed($statement) && $statement->isa('Selecto::Statement');
+    Selecto::Identifier::checked($column);
+    Selecto::Error->throw('invalid_query', 'projection sum requires a selected result column')
+        unless grep { $_ eq $column } @{$statement->columns};
+    my $source = $self->quote_identifier('selecto_projection_source');
+    my $quoted_column = $self->quote_identifier($column);
+    my $sql = 'SELECT COALESCE(SUM(' . $source . '.' . $quoted_column .
+        '), 0) AS "selecto_projection_sum" FROM (' . $statement->sql . ') AS ' . $source;
+    return Selecto::Statement->new(
+        sql => $sql,
+        params => $statement->params,
+        columns => ['selecto_projection_sum'],
+        adapter_name => $self->name,
+    );
 }
 
 sub _rollup_sort_fix_enabled {
@@ -105,7 +134,7 @@ sub _renumber_placeholders {
 
 sub _compile_related_collection_sql {
     my ($self, $spec) = @_;
-    my @pairs = $self->_related_collection_json_pairs($spec->{fields}, $spec->{quoted_alias});
+    my @pairs = $self->_related_collection_json_pairs($spec->{fields}, $spec->{quoted_alias}, 1);
     my $aggregate = 'JSON_AGG(JSON_BUILD_OBJECT(' . join(', ', @pairs) . ')' .
         (defined($spec->{order}) ? " ORDER BY $spec->{order}" : '') . ')';
     return $self->_related_collection_aggregate_sql(
