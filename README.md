@@ -449,6 +449,47 @@ accepts `['array_overlap', field, [values]]` and `['json_contains', field,
 {...}]`. Other adapters report `array_predicates`, `array_rowset`, and
 `json_contains` as unsupported and fail before SQL is built.
 
+### Query members declared in the domain
+
+Reusable CTE, recursive CTE, lateral, and array-expansion sources can be
+declared as data under `query_members` and activated by name. A member query is
+rooted at a relation in the domain's own `schemas` section and is written as
+data: `select` entries are field names, `{as => ..., value => VALUE_AST}`, or
+`{as => ..., aggregate => 'count'|'sum'|'avg'|'min'|'max', field => ...}`;
+`filter` is the filter AST; `group_by`, `order_by` (`[[field, 'asc']]`), and
+`limit` are optional.
+
+```perl
+query_members => {
+    ctes => {
+        usage_totals => {source => 'usage_session',
+            query => {select => ['equipment_id', {as => 'sessions', aggregate => 'count'}],
+                      group_by => ['equipment_id']},
+            join => {owner_key => 'id', related_key => 'equipment_id', type => 'left'}},
+        category_tree => {kind => 'recursive', source => 'category',
+            base => {select => ['id', 'code', {as => 'depth', value => ['literal', 0, 'integer']}],
+                     filter => ['is_null', 'parent_id']},
+            step => {select => ['id', 'code',
+                     {as => 'depth', value => ['add', ['previous', 'depth'], ['literal', 1]]}]},
+            step_join => {owner_key => 'parent_id', related_key => 'id'},
+            join => {owner_key => 'category_id', related_key => 'id', type => 'inner'}},
+    },
+    laterals => {latest_ticket => {source => 'ticket',
+        query => {select => ['summary'], order_by => [['opened_at', 'desc']], limit => 1},
+        correlations => {equipment_id => 'id'}, join_type => 'left'}},
+    unnests => {legacy_tags => {array_field => 'legacy_tags', as => 'tag_rows', ordinality => 'position'}},
+},
+
+my $query = $engine->query->with_member('category_tree')->select('name', 'category_tree.depth');
+```
+
+`['previous', column]` reads the previous level's row and is accepted only in a
+recursive `step`; its type comes from the base selection in the same position.
+Members are validated when the domain is parsed, are part of the fingerprint,
+and fail with `unknown_query_member` when a query names one the domain does not
+declare. The same data runs in the Elixir runtime. Groups Perl does not execute
+(for example `values`) are left for the runtime that does.
+
 PostgreSQL and DuckDB reuse the parameter identities of governed grouping
 expressions in selections, `GROUPING` metadata, and ordering. This includes
 timezone-adjusted fields and date formats; equal values bound under different

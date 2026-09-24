@@ -107,6 +107,10 @@ sub compile {
 
 sub _compile_single {
     my ($self, $domain, $query, %options) = @_;
+    if (@{$query->members}) {
+        require Selecto::QueryMember;
+        $query = Selecto::QueryMember->expand($domain, $query);
+    }
     local $self->{_root_alias} = $options{root_alias} // 's0';
     local $self->{_timezone} = $query->timezone;
     my $selections = $query->selections;
@@ -510,6 +514,12 @@ sub _compile_cte_prefix {
                 ' AS ' . $self->quote_identifier('p_' . $spec->{name}) .
                 ' ON ' . $self->_qualified($root_alias, $join->{owner_key}) . ' = ' .
                 $self->_qualified('p_' . $spec->{name}, $join->{related_key});
+            # ['previous', column] in the member reads the previous level's row,
+            # typed from the anchor's selection in the same position.
+            local $self->{_previous} = {
+                alias => 'p_' . $spec->{name},
+                types => $self->_selection_types($spec->{domain}, $spec->{anchor}, $columns),
+            };
             my $member = $self->_compile_single(
                 $spec->{domain}, $spec->{recursive_query},
                 root_alias => $root_alias,
@@ -538,6 +548,31 @@ sub _compile_cte_prefix {
         'WITH ' . ($recursive ? 'RECURSIVE ' : '') . join(', ', @entries) . ' ',
         \@params,
     );
+}
+
+# Declared or inferred types of a query's selections, keyed by column name.
+sub _selection_types {
+    my ($self, $domain, $query, $columns) = @_;
+    my $selections = $query->selections;
+    my %types;
+    for my $index (0 .. $#$selections) {
+        my $selection = $selections->[$index];
+        my $column = $columns->[$index] // next;
+        my $kind = $selection->kind;
+        if ($kind eq 'field') {
+            my $resolved = eval { $domain->resolve($selection->arguments->[0]) };
+            $types{$column} = $resolved->{type} if $resolved;
+        } elsif ($kind eq 'value') {
+            require Selecto::ValueExpression;
+            $types{$column} = Selecto::ValueExpression->infer(
+                $selection->arguments->[0],
+                resolve => sub { return $self->_value_field_type($domain, $_[0]); },
+            );
+        } elsif ($kind eq 'count' || $kind eq 'count_field' || $kind eq 'count_distinct') {
+            $types{$column} = 'integer';
+        }
+    }
+    return \%types;
 }
 
 sub _compile_cte_joins {
@@ -1482,6 +1517,15 @@ sub _field_sql {
 
 sub _value_field_type {
     my ($self, $domain, $path) = @_;
+    if (ref($path) eq 'ARRAY') {
+        my $column = $path->[1];
+        my $type = ref($self->{_previous}) eq 'HASH' ? $self->{_previous}{types}{$column} : undef;
+        Selecto::Error->throw(
+            'invalid_value_expression', 'previous must name a typed column of the recursive member',
+            {column => $column},
+        ) unless defined $type;
+        return $type;
+    }
     my @segments = split /\./, "$path", -1;
     if (@segments == 2 && ref($self->{_query_sources}) eq 'HASH'
         && exists($self->{_query_sources}{$segments[0]})) {
@@ -1543,6 +1587,12 @@ sub _compile_value_expression {
         unless $self->supports('value_expressions');
     my ($operator, @arguments) = @$node;
     return $self->_field_sql($domain, $arguments[0], $params) if $operator eq 'field';
+    if ($operator eq 'previous') {
+        Selecto::Error->throw('invalid_value_expression', 'previous is available only in a recursive member step')
+            unless ref($self->{_previous}) eq 'HASH'
+                && exists $self->{_previous}{types}{$arguments[0]};
+        return $self->_qualified($self->{_previous}{alias}, $arguments[0]);
+    }
     if ($operator eq 'literal') {
         push @$params, $arguments[0];
         return 'CAST(' . $self->placeholder(scalar @$params) . ' AS '

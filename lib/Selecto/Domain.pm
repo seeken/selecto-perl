@@ -174,7 +174,7 @@ sub _refresh_fingerprint {
     # Derived domains keep the governed write surface of their contract.
     my $contract = $self->{contract};
     if (ref($contract) eq 'HASH') {
-        for my $key (qw(writes actions capabilities choice_sources)) {
+        for my $key (qw(writes actions capabilities choice_sources query_members)) {
             $fingerprint_value->{$key} = $contract->{$key} if defined $contract->{$key};
         }
     }
@@ -273,6 +273,8 @@ sub _parse_canonical {
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
     _validate_value_expressions($domain, $source, $raw->{writes});
+    require Selecto::QueryMember;
+    Selecto::QueryMember->validate($domain);
     $domain->{write_tenant_scope} = Selecto::Write::Scope->parse_tenant(
         $raw->{writes}, fields => $domain->fields, tenant_field => $source->{tenant_field},
     );

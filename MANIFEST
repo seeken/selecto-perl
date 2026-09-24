@@ -48,6 +48,7 @@ lib/Selecto/PostgreSQL.pm
 lib/Selecto/Query.pm
 lib/Selecto/QueryEnforcement.pm
 lib/Selecto/QueryLibrary.pm
+lib/Selecto/QueryMember.pm
 lib/Selecto/SQL.pm
 lib/Selecto/SQLite.pm
 lib/Selecto/Statement.pm
@@ -97,6 +98,7 @@ t/query_enforcement_scalar.t
 t/fixtures/query_enforced_scalar_v1.json
 t/fixtures/query_enforced_scalar_edges_v1.json
 t/query_library.t
+t/query_member.t
 t/sqlite.integration.t
 t/stream.t
 t/write.t

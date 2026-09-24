@@ -536,6 +536,69 @@ is_deeply($array_engine->all($array_engine->query
     'a left array_rowset keeps rows with empty and NULL arrays');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_arrays');
 
+# Query members declared as domain data.
+$dbh->do($_) for (
+    'DROP TABLE IF EXISTS selecto_perl_test_m_orders',
+    'DROP TABLE IF EXISTS selecto_perl_test_m_people',
+    'DROP TABLE IF EXISTS selecto_perl_test_m_teams',
+    'CREATE TABLE selecto_perl_test_m_teams (id integer primary key, parent_id integer, name text not null)',
+    'CREATE TABLE selecto_perl_test_m_people (id integer primary key, name text not null, team_id integer)',
+    'CREATE TABLE selecto_perl_test_m_orders (id integer primary key, person_id integer not null, total numeric not null, state text not null)',
+    q{INSERT INTO selecto_perl_test_m_teams VALUES (1, NULL, 'Root'), (2, 1, 'Ops'), (3, 2, 'Night'), (4, NULL, 'Other')},
+    q{INSERT INTO selecto_perl_test_m_people VALUES (1, 'Ada', 3), (2, 'Bo', 2), (3, 'Cy', 4)},
+    q{INSERT INTO selecto_perl_test_m_orders VALUES (1, 1, 10, 'open'), (2, 1, 5, 'void'), (3, 1, 7, 'open'), (4, 2, 3, 'open')},
+);
+my $m_relation = sub {
+    my ($table, %types) = @_;
+    return {source_table => $table, primary_key => 'id', fields => [sort keys %types],
+        columns => {map { ($_ => {type => $types{$_}}) } keys %types}, associations => {}};
+};
+my $member_engine = Selecto::Engine->new(
+    domain => Selecto::Domain->parse({
+        schema_version => 1, name => 'MemberPeople',
+        source => $m_relation->('selecto_perl_test_m_people', id => 'integer', name => 'string', team_id => 'integer'),
+        schemas => {
+            order => $m_relation->('selecto_perl_test_m_orders', id => 'integer', person_id => 'integer',
+                total => 'decimal', state => 'string'),
+            team => $m_relation->('selecto_perl_test_m_teams', id => 'integer', parent_id => 'integer', name => 'string'),
+        },
+        joins => {},
+        query_members => {
+            ctes => {
+                order_totals => {source => 'order',
+                    query => {select => ['person_id', {as => 'orders', aggregate => 'count'},
+                        {as => 'spent', aggregate => 'sum', field => 'total'}],
+                        filter => ['ne', 'state', 'void'], group_by => ['person_id']},
+                    join => {owner_key => 'id', related_key => 'person_id', type => 'left'}},
+                team_tree => {kind => 'recursive', source => 'team',
+                    base => {select => ['id', 'parent_id', 'name', {as => 'depth', value => ['literal', 0, 'integer']}],
+                        filter => ['is_null', 'parent_id']},
+                    step => {select => ['id', 'parent_id', 'name',
+                        {as => 'depth', value => ['add', ['previous', 'depth'], ['literal', 1]]}]},
+                    step_join => {owner_key => 'parent_id', related_key => 'id'},
+                    join => {owner_key => 'team_id', related_key => 'id', type => 'inner'}},
+            },
+            laterals => {latest_order => {source => 'order',
+                query => {select => ['id', 'total'], order_by => [['id', 'desc']], limit => 1},
+                correlations => {person_id => 'id'}, join_type => 'left'}},
+        },
+    }),
+    adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+);
+is_deeply($member_engine->all($member_engine->query->with_member('order_totals')
+    ->select('name', 'order_totals.orders', 'order_totals.spent')->order_by('name', 'asc'))->{rows},
+    [['Ada', 2, '17'], ['Bo', 1, '3'], ['Cy', undef, undef]],
+    'PostgreSQL CTE member aggregates before joining');
+is_deeply($member_engine->all($member_engine->query->with_member('team_tree')
+    ->select('name', 'team_tree.name', 'team_tree.depth')->order_by('name', 'asc'))->{rows},
+    [['Ada', 'Night', 2], ['Bo', 'Ops', 1], ['Cy', 'Other', 0]],
+    'PostgreSQL recursive member computes depth from the previous level');
+is_deeply($member_engine->all($member_engine->query->with_member('latest_order')
+    ->select('name', 'latest_order.id')->order_by('name', 'asc'))->{rows},
+    [['Ada', 3], ['Bo', 4], ['Cy', undef]],
+    'PostgreSQL lateral member reads the latest correlated row');
+$dbh->do("DROP TABLE IF EXISTS selecto_perl_test_m_$_") for qw(orders people teams);
+
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_grandchildren');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_children');

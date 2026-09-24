@@ -24,6 +24,7 @@ use Selecto::Error ();
 #   ['json_text', FIELD_PATH, [SEGMENT, ...]]
 #   ['lower' | 'upper', VALUE]
 #   ['concat', VALUE, VALUE, ...]
+#   ['previous', COLUMN]   (recursive member steps only: the previous level's row)
 #
 # FILTER is the portable filter AST accepted by
 # Selecto::Expression->from_filter_ast.
@@ -55,10 +56,14 @@ sub _category_of_cast {
 }
 
 # Structural validation that needs no domain. Returns a normalized deep copy.
+our $_ALLOW_PREVIOUS = 0;
+
 sub parse {
-    my ($class, $ast) = @_;
+    my ($class, $ast, %options) = @_;
+    local $_ALLOW_PREVIOUS = $options{allow_previous} ? 1 : 0;
     return _parse($ast, 'value expression');
 }
+
 
 sub _parse {
     my ($node, $label) = @_;
@@ -71,6 +76,14 @@ sub _parse {
             unless @arguments == 1 && defined($arguments[0]) && !ref($arguments[0])
                 && "$arguments[0]" =~ $PATH;
         return ['field', "$arguments[0]"];
+    }
+    if ($operator eq 'previous') {
+        _fail("$label previous is available only in a recursive member step")
+            unless $_ALLOW_PREVIOUS;
+        _fail("$label previous requires one column name")
+            unless @arguments == 1 && defined($arguments[0]) && !ref($arguments[0])
+                && "$arguments[0]" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+        return ['previous', "$arguments[0]"];
     }
     if ($operator eq 'literal') {
         _fail("$label literal requires a value and an optional type")
@@ -161,7 +174,7 @@ sub _dependencies {
     my ($node) = @_;
     my ($operator, @arguments) = @$node;
     return ($arguments[0]) if $operator eq 'field' || $operator eq 'json_text';
-    return () if $operator eq 'literal';
+    return () if $operator eq 'literal' || $operator eq 'previous';
     if ($operator eq 'case') {
         my @paths;
         for my $branch (@arguments) {
@@ -214,6 +227,9 @@ sub _infer {
     }
     if ($operator eq 'literal') {
         return _category_of_cast($arguments[1]);
+    }
+    if ($operator eq 'previous') {
+        return __PACKAGE__->category($resolve->(['previous', $arguments[0]]));
     }
     if ($operator eq 'coalesce') {
         my @categories = map { _infer($_, $resolve) } @arguments;
