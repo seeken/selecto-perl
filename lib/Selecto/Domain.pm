@@ -263,6 +263,7 @@ sub _parse_canonical {
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
+    _validate_value_expressions($domain, $source, $raw->{writes});
     _validate_conditional_filter_choices($domain);
     _validate_picker_visible_id_paths($domain);
     $domain->{editors} = _validate_editors($domain, $raw->{editors});
@@ -543,11 +544,31 @@ sub _validate_computed_columns {
         my $computed = $column->{computed};
         _object($computed, "computed column $field");
         my $kind = _required_string($computed->{kind}, "computed column $field kind");
-        my %allowed = map { $_ => 1 } $kind eq 'predicate'
+        my %allowed = map { $_ => 1 } $kind eq 'predicate' || $kind eq 'expression'
             ? qw(kind expression) : qw(kind association);
         _reject_unknown($computed, \%allowed, "computed column $field");
         Selecto::Error->throw('invalid_domain', "unsupported computed column kind $kind")
-            unless $kind eq 'association_exists' || $kind eq 'predicate';
+            unless $kind eq 'association_exists' || $kind eq 'predicate' || $kind eq 'expression';
+        if ($kind eq 'expression') {
+            Selecto::Error->throw(
+                'invalid_domain', 'expression computed columns require an expression', {field => $field},
+            ) unless exists $computed->{expression};
+            require Selecto::ValueExpression;
+            my ($ast, $error);
+            my $ok = eval { $ast = Selecto::ValueExpression->parse($computed->{expression}); 1 };
+            $error = $@;
+            Selecto::Error->throw(
+                'invalid_domain', 'computed value expression is invalid',
+                {field => $field, reason => (blessed($error) ? $error->message : 'invalid')},
+            ) unless $ok;
+            $computed->{expression} = $ast;
+            # Root-level dependencies take part in cycle detection; association
+            # paths are type-checked once the domain is complete.
+            $predicate_dependencies{$field} = [
+                grep { !/\./ } Selecto::ValueExpression->dependencies($ast)
+            ];
+            next;
+        }
         if ($kind eq 'predicate') {
             Selecto::Error->throw(
                 'invalid_domain', 'predicate computed columns must be boolean', {field => $field},
@@ -591,6 +612,41 @@ sub _validate_computed_columns {
         ) if $associations->{$association}->through;
     }
     _validate_computed_predicate_cycles(\%predicate_dependencies, $source);
+}
+
+# Type-check expression computed columns against the complete domain. Paths
+# may cross associations; the declared column type must match the result.
+sub _validate_value_expressions {
+    my ($domain, $source, $writes) = @_;
+    my $write_fields = ref($writes) eq 'HASH' && ref($writes->{fields}) eq 'HASH'
+        ? $writes->{fields} : {};
+    for my $field (@{$source->{fields} // []}) {
+        my $column = $source->{columns}{$field};
+        next unless ref($column) eq 'HASH' && ref($column->{computed}) eq 'HASH';
+        my $write = $write_fields->{$field};
+        Selecto::Error->throw(
+            'invalid_domain', 'computed columns cannot be insertable or updatable', {field => $field},
+        ) if ref($write) eq 'HASH' && ($write->{insertable} || $write->{updatable});
+        next unless $column->{computed}{kind} eq 'expression';
+        require Selecto::ValueExpression;
+        my ($category, $ok, $error);
+        $ok = eval {
+            $category = Selecto::ValueExpression->infer(
+                $column->{computed}{expression},
+                resolve => sub { return $domain->resolve($_[0])->{type}; },
+            );
+            1;
+        };
+        $error = $@;
+        Selecto::Error->throw(
+            'invalid_domain', 'computed value expression does not type-check',
+            {field => $field, reason => (blessed($error) ? $error->message : 'invalid')},
+        ) unless $ok;
+        Selecto::Error->throw(
+            'invalid_domain', 'computed value expression type does not match the declared column type',
+            {field => $field, declared => $column->{type}, inferred => $category},
+        ) unless Selecto::ValueExpression->compatible($column->{type}, $category);
+    }
 }
 
 sub _validate_action_eligibility {

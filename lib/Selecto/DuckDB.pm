@@ -38,7 +38,23 @@ sub supports {
         || "$feature" eq 'rollup' || "$feature" eq 'set_operations'
         || "$feature" eq 'window_functions'
         || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
-        || "$feature" eq 'stream' ? 1 : 0;
+        || "$feature" eq 'stream' || "$feature" eq 'value_expressions'
+        || "$feature" eq 'json_text' ? 1 : 0;
+}
+
+# Value expressions cast to fixed targets; bare DECIMAL would round to three
+# places, so computed decimals use a wide fixed scale.
+sub _value_type_sql {
+    my ($self, $type) = @_;
+    return 'DECIMAL(38, 10)' if lc("$type") eq 'decimal';
+    return $self->SUPER::_value_type_sql($type);
+}
+
+sub _compile_json_text {
+    my ($self, $field_sql, $segments, $params) = @_;
+    my $path = '$' . join('', map { /\A\d+\z/ ? "[$_]" : ".$_" } @$segments);
+    push @$params, $path;
+    return 'JSON_EXTRACT_STRING(' . $field_sql . ', ' . $self->placeholder(scalar @$params) . ')';
 }
 
 sub _values_cast_types {

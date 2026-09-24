@@ -232,6 +232,13 @@ sub epoch_datetime {
     my ($class, $field) = @_;
     return $class->new('epoch_datetime', $class->_operand($field));
 }
+# A governed computed value built from the closed Selecto::ValueExpression AST,
+# for example ['divide', ['field', 'hourly_rate_cents'], ['literal', 100]].
+sub value {
+    my ($class, $ast) = @_;
+    require Selecto::ValueExpression;
+    return $class->new('value', Selecto::ValueExpression->parse($ast));
+}
 sub is_null { my ($class, $field) = @_; return $class->new('is_null', $class->_operand($field)); }
 sub not_null { my ($class, $field) = @_; return $class->new('not_null', $class->_operand($field)); }
 

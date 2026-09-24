@@ -231,6 +231,12 @@ sub _validate_write_command {
         Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
             if defined($tenant_field) && !_has_tenant_conjunct($command->scope_predicate, $tenant_field);
     }
+    # Computed fields are derived by the adapter; they never have storage.
+    for my $field (sort keys %{$command->assignments}) {
+        Selecto::Error->throw(
+            'write_field_not_writable', 'computed fields are read-only', {field => $field},
+        ) if ref($self->{domain}->field_metadata($field)->{computed}) eq 'HASH';
+    }
     return $self->_validate_command_against_contract(
         $command,
         fields      => $self->{domain}->fields,

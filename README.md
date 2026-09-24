@@ -315,6 +315,63 @@ through the adapter. Raw SQL is not accepted. They may compose other computed
 root fields, including `association_exists` fields, provided the dependency
 graph is acyclic.
 
+Computed value fields return strings, numbers, dates, or extracted JSON text.
+They are written in a closed, typed AST (`Selecto::ValueExpression`), never as
+SQL text:
+
+```perl
+effective_location => {
+    type => 'string', label => 'Effective location',
+    computed => {kind => 'expression', expression => [
+        'coalesce', ['field', 'site.name'], ['field', 'location_text'],
+        ['literal', 'Location unknown'],
+    ]},
+},
+attention_state => {
+    type => 'string',
+    computed => {kind => 'expression', expression => [
+        'case',
+        [['not_null', 'retired_at'], ['literal', 'Retired']],
+        [['in', 'status', ['maintenance', 'missing']], ['literal', 'Needs attention']],
+        ['else', ['literal', 'Ready to reserve']],
+    ]},
+},
+hourly_rate_dollars => {
+    type => 'decimal',
+    computed => {kind => 'expression',
+        expression => ['divide', ['field', 'hourly_rate_cents'], ['literal', 100]]},
+},
+manufacturer => {
+    type => 'string',
+    computed => {kind => 'expression', expression => ['json_text', 'metadata', ['manufacturer']]},
+},
+```
+
+The node set is `field`, `literal` (optionally typed), `coalesce`, `case`
+(conditions use the portable filter AST), `add`, `subtract`, `multiply`,
+`divide`, `cast` (to `string`, `integer`, `decimal`, `boolean`, `date`, or
+`utc_datetime`), `json_text` (path segments of letters, digits, and
+underscores), `lower`, `upper`, and `concat`. Anything else is rejected when the
+domain is parsed.
+
+- Fields may cross associations (`site.name`); selecting, filtering, grouping,
+  or ordering by a computed field introduces the joins its expression reads.
+- Computed fields may build on other computed fields; cycles are rejected.
+- The expression is type-checked against the finished domain and must match the
+  declared column type (an integer result satisfies a declared `decimal`).
+- Literals are bound and cast to their type; JSON path segments are bound;
+  `divide` is always decimal so integer operands never truncate; `concat` casts
+  each operand to text and treats NULL as empty.
+- Computed fields are read-only: write contracts cannot mark them insertable or
+  updatable, and governed writes reject assignments to them.
+- The same AST is available per query as
+  `Selecto::Expression->value([...])->as('name')`, type-checked against the
+  engine's domain.
+
+PostgreSQL and DuckDB declare the `value_expressions` and `json_text`
+capabilities. Other adapters fail closed with `unsupported_feature` until they
+implement and certify the node set.
+
 ## Advanced queries and streaming
 
 Advanced sources remain domain-owned. A CTE or lateral subquery receives its
