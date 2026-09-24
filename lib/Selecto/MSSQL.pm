@@ -39,6 +39,15 @@ sub supports {
         || "$feature" eq 'stream' ? 1 : 0;
 }
 
+sub _values_cast_types {
+    return {
+        integer => 'BIGINT', int => 'BIGINT', bigint => 'BIGINT',
+        decimal => \&Selecto::SQL::_values_decimal_sql,
+        numeric => \&Selecto::SQL::_values_decimal_sql,
+        boolean => 'BIT', date => 'DATE',
+    };
+}
+
 sub _compile_pagination {
     my ($self, $limit, $offset, $ordered) = @_;
     return '' unless defined($limit) || defined($offset);

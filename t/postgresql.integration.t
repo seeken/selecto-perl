@@ -340,6 +340,51 @@ my $skipped = Selecto::Write::Graph->new(nodes => [
 ]);
 eval { $form_engine->execute_graph($skipped); 1 };
 is($@->code, 'write_relation_mismatch', 'a grandchild bound directly from the root is rejected');
+my $typed_values_domain = Selecto::Domain->parse({
+    schema_version => 1,
+    name => 'Events with typed inline kinds',
+    source => {
+        source_table => 'selecto_perl_test_events', primary_key => 'id',
+        fields => [qw(id kind)],
+        columns => {id => {type => 'integer'}, kind => {type => 'string'}},
+        associations => {
+            kind_labels => {queryable => 'kind_labels', owner_key => 'kind', related_key => 'kind'},
+        },
+    },
+    schemas => {
+        kind_labels => {
+            values => [
+                {kind => 'status', sort_order => 10, weight => '1.50', opened_on => '2026-01-02'},
+                {kind => 'note', sort_order => 2, weight => '0.25', opened_on => '2026-01-03'},
+            ],
+            primary_key => 'kind', fields => [qw(kind sort_order weight opened_on)],
+            columns => {
+                kind => {type => 'string'}, sort_order => {type => 'integer'},
+                weight => {type => 'decimal'}, opened_on => {type => 'date'},
+            },
+            associations => {},
+        },
+    },
+    joins => {kind_labels => {type => 'left', name => 'Kind labels'}},
+}, strict => 1);
+my $typed_values_engine = Selecto::Engine->new(
+    domain => $typed_values_domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+);
+$dbh->do(q{INSERT INTO selecto_perl_test_events VALUES (2, 1, 'note')});
+my $typed_values = $typed_values_engine->all($typed_values_engine->query->select(
+    'id', 'kind_labels.sort_order', 'kind_labels.weight', 'kind_labels.opened_on',
+)->order_by('kind_labels.sort_order'));
+is_deeply($typed_values->{rows}, [[2, 2, '0.25', '2026-01-03'], [1, 10, '1.5', '2026-01-02']],
+    'PostgreSQL values cells decode as their declared types and order numerically');
+unlike(JSON::PP->new->canonical->encode($typed_values->{rows}), qr/"(?:2|10)"/,
+    'integer values cells are returned as numbers, not strings');
+my $filtered_values = $typed_values_engine->all($typed_values_engine->query
+    ->select('id')->where(Selecto::Expression->gt(
+        Selecto::Expression->field('kind_labels.sort_order'), Selecto::Expression->literal(9),
+    )));
+is_deeply($filtered_values->{rows}, [[1]],
+    'PostgreSQL compares integer values cells numerically');
+
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_grandchildren');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_children');

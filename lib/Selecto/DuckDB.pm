@@ -41,6 +41,18 @@ sub supports {
         || "$feature" eq 'stream' ? 1 : 0;
 }
 
+sub _values_cast_types {
+    return {
+        integer => 'BIGINT', int => 'BIGINT', bigint => 'BIGINT',
+        # Bare DECIMAL is DECIMAL(18,3) and would round wider scales.
+        decimal => \&Selecto::SQL::_values_decimal_sql,
+        numeric => \&Selecto::SQL::_values_decimal_sql,
+        string => 'VARCHAR', text => 'VARCHAR', boolean => 'BOOLEAN',
+        date => 'DATE', datetime => 'TIMESTAMP', naive_datetime => 'TIMESTAMP',
+        utc_datetime => 'TIMESTAMPTZ',
+    };
+}
+
 sub write_capabilities {
     return { %{$_[0]->SUPER::write_capabilities}, returning => 1, write_graph => 1 };
 }

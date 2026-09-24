@@ -82,6 +82,16 @@ sub supports {
         || "$feature" eq 'row_locks' ? 1 : 0;
 }
 
+sub _values_cast_types {
+    return {
+        integer => 'BIGINT', int => 'BIGINT', bigint => 'BIGINT',
+        decimal => 'NUMERIC', numeric => 'NUMERIC',
+        string => 'TEXT', text => 'TEXT', boolean => 'BOOLEAN',
+        date => 'DATE', datetime => 'TIMESTAMP', naive_datetime => 'TIMESTAMP',
+        utc_datetime => 'TIMESTAMPTZ',
+    };
+}
+
 sub _compile_row_lock {
     my ($self, $mode) = @_;
     Selecto::Error->throw('invalid_query', 'unsupported row lock mode')

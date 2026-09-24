@@ -110,6 +110,7 @@ t/grouped_expression_bindings.t
 t/importer.t
 t/field_policy.t
 t/data_rules.t
+t/values_types.t
 t/fixtures/data_rules/baseline.contract.json
 t/fixtures/data_rules/baseline.cases.json
 t/fixtures/data_rules/invalid.cases.json
