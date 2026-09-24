@@ -60,6 +60,8 @@ lib/Selecto/Write/Scope.pm
 script/with-local-deps
 t/00-load.t
 t/canned_page.integration.t
+t/canned_page_case_insensitive.t
+t/computed_coalesce.t
 t/action.t
 t/analytics_unit_registry.t
 t/analytics_pipeline.t

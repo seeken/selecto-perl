@@ -909,17 +909,20 @@ sub _compile_expression {
         return $self->_compile_expression($domain, $arguments->[0], $params) . " $operator " .
             $self->_compile_expression($domain, $arguments->[1], $params);
     }
-    if ($kind eq 'starts_with') {
+    if ($kind eq 'starts_with' || $kind eq 'starts_with_ci') {
         my $literal = $arguments->[1];
-        Selecto::Error->throw('invalid_query', 'starts_with requires a literal string prefix')
+        Selecto::Error->throw('invalid_query', "$kind requires a literal string prefix")
             unless blessed($literal) && $literal->isa('Selecto::Expression')
             && $literal->kind eq 'literal';
         my $prefix = $literal->arguments->[0];
-        Selecto::Error->throw('invalid_query', 'starts_with requires a literal string prefix')
+        Selecto::Error->throw('invalid_query', "$kind requires a literal string prefix")
             if !defined($prefix) || ref($prefix);
         $prefix =~ s/([!%_])/!$1/g;
         my $field_sql = $self->_compile_expression($domain, $arguments->[0], $params);
         push @$params, "$prefix%";
+        return 'LOWER(' . $field_sql . ') LIKE LOWER(' .
+            $self->placeholder(scalar @$params) . q{) ESCAPE '!'}
+            if $kind eq 'starts_with_ci';
         return $field_sql . ' LIKE ' . $self->placeholder(scalar @$params)
             . q{ ESCAPE '!'};
     }
@@ -1548,9 +1551,14 @@ sub _compile_computed_field {
     my ($self, $domain, $path, $computed, $params) = @_;
     Selecto::Error->throw('invalid_domain', 'unsupported computed field')
         unless $computed->{kind} eq 'association_exists' || $computed->{kind} eq 'predicate'
-            || $computed->{kind} eq 'expression';
+            || $computed->{kind} eq 'expression' || $computed->{kind} eq 'coalesce_fields';
     if ($computed->{kind} eq 'expression') {
         return '(' . $self->_compile_value_expression($domain, $computed->{expression}, $params) . ')';
+    }
+    if ($computed->{kind} eq 'coalesce_fields') {
+        return 'COALESCE(' . join(', ', map {
+            $self->_field_sql($domain, $_, $params)
+        } @{$computed->{fields}}) . ')';
     }
     if ($computed->{kind} eq 'predicate') {
         my $expression = Selecto::Expression->from_filter_ast($computed->{expression});
@@ -1673,14 +1681,14 @@ sub _referenced_associations {
         Selecto::Expression->field($_->{source_field})
     } @{$query->json_rowsets}, @{$query->array_rowsets};
     my %names;
-    $names{$_} = 1 for map { $self->_expression_associations($_) } @expressions;
+    $names{$_} = 1 for map { $self->_expression_associations($_, $domain) } @expressions;
     return sort {
         scalar(split(/\./, $a)) <=> scalar(split(/\./, $b)) || $a cmp $b
     } keys %names;
 }
 
 sub _expression_associations {
-    my ($self, $expression) = @_;
+    my ($self, $expression, $domain) = @_;
     return () unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $arguments = $expression->arguments;
     return () if $expression->kind eq 'related_collection';
@@ -1695,13 +1703,19 @@ sub _expression_associations {
             && exists($self->{_query_sources}{$segments[0]});
         if (@segments == 1) {
             # A computed root field brings the joins its expression reads.
-            my $domain = $self->{_association_domain};
+            $domain //= $self->{_association_domain};
             my $computed = $domain ? $domain->field_metadata($segments[0])->{computed} : undef;
-            return () unless ref($computed) eq 'HASH' && $computed->{kind} eq 'expression';
+            return () unless ref($computed) eq 'HASH';
+            if ($computed->{kind} eq 'coalesce_fields') {
+                return map {
+                    $self->_expression_associations(Selecto::Expression->field($_), $domain)
+                } @{$computed->{fields}};
+            }
+            return () unless $computed->{kind} eq 'expression';
             local $self->{_computed_visiting} = {%{$self->{_computed_visiting} // {}}};
             return () if $self->{_computed_visiting}{$segments[0]}++;
             require Selecto::ValueExpression;
-            return map { $self->_expression_associations(Selecto::Expression->field($_)) }
+            return map { $self->_expression_associations(Selecto::Expression->field($_), $domain) }
                 Selecto::ValueExpression->dependencies($computed->{expression});
         }
         pop @segments;
@@ -1714,11 +1728,11 @@ sub _expression_associations {
     my @names;
     for my $argument (@$arguments) {
         if (blessed($argument) && $argument->isa('Selecto::Expression')) {
-            push @names, $self->_expression_associations($argument);
+            push @names, $self->_expression_associations($argument, $domain);
         } elsif (ref($argument) eq 'ARRAY') {
-            push @names, map { $self->_expression_associations($_) } @$argument;
+            push @names, map { $self->_expression_associations($_, $domain) } @$argument;
         } elsif (ref($argument) eq 'HASH') {
-            push @names, map { $self->_expression_associations($argument->{$_}) }
+            push @names, map { $self->_expression_associations($argument->{$_}, $domain) }
                 sort keys %$argument;
         }
     }

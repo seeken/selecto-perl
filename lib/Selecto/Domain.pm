@@ -248,7 +248,7 @@ sub _parse_canonical {
     _apply_values_foreign_key_metadata(
         $source, $associations, $raw->{writes},
     );
-    _validate_computed_columns($source, $associations);
+    _validate_computed_columns($source, $associations, $schemas);
     _validate_array_columns($source, $schemas);
     _validate_action_eligibility($raw, $source);
 
@@ -573,7 +573,7 @@ sub _canonical_fields {
 }
 
 sub _validate_computed_columns {
-    my ($source, $associations) = @_;
+    my ($source, $associations, $schemas) = @_;
     my %predicate_dependencies;
     for my $field (@{$source->{fields} // []}) {
         my $column = $source->{columns}{$field};
@@ -582,10 +582,12 @@ sub _validate_computed_columns {
         _object($computed, "computed column $field");
         my $kind = _required_string($computed->{kind}, "computed column $field kind");
         my %allowed = map { $_ => 1 } $kind eq 'predicate' || $kind eq 'expression'
-            ? qw(kind expression) : qw(kind association);
+            ? qw(kind expression) : $kind eq 'coalesce_fields'
+                ? qw(kind fields) : qw(kind association);
         _reject_unknown($computed, \%allowed, "computed column $field");
         Selecto::Error->throw('invalid_domain', "unsupported computed column kind $kind")
-            unless $kind eq 'association_exists' || $kind eq 'predicate' || $kind eq 'expression';
+            unless $kind eq 'association_exists' || $kind eq 'predicate'
+                || $kind eq 'expression' || $kind eq 'coalesce_fields';
         if ($kind eq 'expression') {
             Selecto::Error->throw(
                 'invalid_domain', 'expression computed columns require an expression', {field => $field},
@@ -604,6 +606,38 @@ sub _validate_computed_columns {
             $predicate_dependencies{$field} = [
                 grep { !/\./ } Selecto::ValueExpression->dependencies($ast)
             ];
+            next;
+        }
+        if ($kind eq 'coalesce_fields') {
+            my $fields = $computed->{fields};
+            Selecto::Error->throw(
+                'invalid_domain', 'coalesced computed columns require one direct association field and one root fallback field',
+                {field => $field},
+            ) unless ref($fields) eq 'ARRAY' && @$fields == 2
+                && defined($fields->[0]) && !ref($fields->[0])
+                && defined($fields->[1]) && !ref($fields->[1])
+                && $fields->[0] =~ /\A([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\z/
+                && $fields->[1] =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+            my ($association_name, $preferred_field) = split /\./, $fields->[0];
+            my $association = $associations->{$association_name};
+            Selecto::Error->throw(
+                'invalid_domain', 'coalesced computed column requires a left-joined one-to-one association',
+                {field => $field, association => $association_name},
+            ) unless $association && $association->cardinality eq 'one'
+                && $association->join_type eq 'left' && !$association->through;
+            my $fallback = $source->{columns}{$fields->[1]};
+            my $schema = $schemas->{$association->queryable};
+            my $preferred = ref($schema) eq 'HASH'
+                ? $schema->{columns}{$preferred_field} : undef;
+            Selecto::Error->throw(
+                'invalid_domain', 'coalesced computed column fields must exist and have the declared type',
+                {field => $field},
+            ) unless $fields->[1] ne $field
+                && exists($association->fields->{$preferred_field})
+                && ref($preferred) eq 'HASH' && !exists($preferred->{computed})
+                && ref($fallback) eq 'HASH' && !exists($fallback->{computed})
+                && ($preferred->{type} // '') eq $column->{type}
+                && ($fallback->{type} // '') eq $column->{type};
             next;
         }
         if ($kind eq 'predicate') {

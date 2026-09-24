@@ -374,6 +374,22 @@ PostgreSQL and DuckDB declare the `value_expressions` and `json_text`
 capabilities. Other adapters fail closed with `unsupported_feature` until they
 implement and certify the node set.
 
+A canonical string column can expose a joined display value with a root-field
+fallback, and that same value is available for selection and filtering:
+
+```perl
+customer_display_name => {
+    type => 'string',
+    computed => {kind => 'coalesce_fields',
+        fields => ['customer.co_name', 'cust_name']},
+},
+```
+
+The preferred field must belong to a direct, left-joined one-to-one association;
+the fallback must be a physical root column of the same declared type. Selecto
+adds the governed join when this computed field is used. If the joined value is
+null or the association is absent, SQL `COALESCE` returns the root fallback.
+
 ## Advanced queries and streaming
 
 Advanced sources remain domain-owned. A CTE or lateral subquery receives its
@@ -543,7 +559,7 @@ my $page = Selecto::CannedPage->new(
         {id => 'brand', kind => 'facet', field => 'brand',
             values => {source => 'dataset', limit => 30, searchable => 1}},
         {id => 'price', kind => 'range', field => 'price'},
-        {id => 'name', kind => 'text', field => 'name'},
+        {id => 'name', kind => 'text', field => 'name', ignore_case => 1},
     ],
     initial_state => {view => 'list', filters => {}},
 );
@@ -561,12 +577,18 @@ is added to the existing dataset and control predicates. Fixed options use
 `values => {source => 'fixed', options =>
 [{value => 'A', label => 'A'}]}`. Facet values within a control use OR; controls
 combine with AND. Dataset and Domain restrictions remain in every query.
+Detail views may also select an aliased, direct to-many
+`Selecto::Expression->related_collection(...)`. Like Explorer's nested detail
+columns, it returns child records without multiplying parent rows or changing
+the exact entity count used for pagination.
 The optional request scope predicate is applied to results, totals, facets,
 and drilldowns; excluding a facet's own selection never excludes that scope.
 
 The first profile requires one root primary key as entity identity. Detail
 selections are entity-grain fields; aggregate selections are group fields or a distinct
-count of the entity key. Text controls use `starts_with`. Null facet buckets,
+count of the entity key. Text controls use literal-prefix `starts_with` matching;
+`ignore_case => 1` applies case-insensitive matching to that control without
+turning `%` or `_` in user input into wildcards. Null facet buckets,
 composite identities, ordinary sums across many-valued joins, and snapshot
 consistency across the separate queries are not yet supported. Use the
 Components plugin's `pages` option for a rendered page.

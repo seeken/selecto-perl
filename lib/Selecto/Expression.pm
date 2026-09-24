@@ -254,6 +254,12 @@ sub starts_with {
         if !defined($prefix) || ref($prefix);
     return $class->_binary('starts_with', $field, "$prefix");
 }
+sub starts_with_ci {
+    my ($class, $field, $prefix) = @_;
+    Selecto::Error->throw('invalid_query', 'starts_with_ci requires a string prefix')
+        if !defined($prefix) || ref($prefix);
+    return $class->_binary('starts_with_ci', $field, "$prefix");
+}
 
 sub between {
     my ($class, $field, $start, $end) = @_;
@@ -362,13 +368,13 @@ sub from_filter_ast {
         return $class->between($field, $value, $end);
     }
     Selecto::Error->throw('invalid_query', "unsupported filter operator $operator")
-        unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte|starts_with)\z/;
+        unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte|starts_with|starts_with_ci)\z/;
     Selecto::Error->throw('invalid_query', "$operator filter requires a value")
         unless @arguments == 2;
-    if ($operator eq 'starts_with') {
-        Selecto::Error->throw('invalid_query', 'starts_with requires a string prefix')
+    if ($operator eq 'starts_with' || $operator eq 'starts_with_ci') {
+        Selecto::Error->throw('invalid_query', "$operator requires a string prefix")
             if !defined($value) || ref($value);
-        return $class->starts_with($field, $value);
+        return $class->$operator($field, $value);
     }
     my $right;
     if (ref($value) eq 'ARRAY' && @$value == 2
