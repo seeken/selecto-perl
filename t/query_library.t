@@ -24,8 +24,18 @@ my $domain = Selecto::Domain->parse({
     schemas => {},
     joins => {},
     query_library => {
+        segment_picker_groups => {
+            activity => {
+                label => 'Active project',
+                choices => [
+                    {segment => 'active', label => 'Yes'},
+                    {segment => 'inactive', label => 'No'},
+                ],
+            },
+        },
         segments => {
             active => {filters => [['eq', 'status', 'active']]},
+            inactive => {filters => [['eq', 'status', 'inactive']]},
             matching_fields => {filters => [['eq', 'id', ['field', 'priority']]]},
             priority_at_least => {
                 filters => [['gte', 'priority', ['param', 'minimum']]],
@@ -82,9 +92,28 @@ my $domain = Selecto::Domain->parse({
 is_deeply [sort keys %{$domain->query_library->{views}}],
     [qw(active_projects direct_active_projects)],
     'strict domains retain the portable query library';
+is_deeply(Selecto::QueryLibrary->segment_picker_groups($domain), [{
+    id => 'activity', label => 'Active project', description => '', off_label => 'Off',
+    choices => [
+        {segment => 'active', label => 'Yes'},
+        {segment => 'inactive', label => 'No'},
+    ],
+}], 'domain picker groups describe mutually exclusive choices with an implicit Off');
+my $invalid_group_contract = $domain->as_contract;
+$invalid_group_contract->{query_library}{segment_picker_groups}{activity}{choices}[1]{segment} = 'missing';
+eval { Selecto::Domain->parse($invalid_group_contract, strict => 1) };
+like "$@", qr/references unknown segment missing/,
+    'strict domain validation rejects picker groups with missing segment IDs';
 
 my $adapter = Selecto::PostgreSQL->new(dbh => bless({}, 'QueryLibraryDBH'));
 my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+eval { $engine->apply_segments($engine->query, [qw(active inactive)]) };
+like "$@", qr/Active project allows only one choice/,
+    'the core query contract rejects conflicting segment-group choices';
+my $active_query = $engine->apply_segment($engine->query, 'active');
+eval { $engine->apply_segment($active_query, 'inactive') };
+like "$@", qr/Active project allows only one choice/,
+    'a later API segment cannot contradict an already applied group choice';
 my $query = $engine->apply_view($engine->query, 'active_projects', {minimum => '3'});
 my $statement = $engine->compile($query);
 

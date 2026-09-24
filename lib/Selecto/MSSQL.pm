@@ -210,12 +210,17 @@ sub _compile_related_collection_sql {
     my ($self, $spec) = @_;
     my $quoted_alias = $spec->{quoted_alias};
     my $projection = join(', ', map {
-        $_->{sql} . ' AS ' . $self->quote_identifier($_->{key})
+        $self->_related_collection_value_sql($_) . ' AS ' . $self->quote_identifier($_->{key})
     } @{$spec->{fields}});
     return "COALESCE((SELECT $projection FROM $spec->{from} " .
         "WHERE $spec->{where}" .
         (defined($spec->{order}) ? " ORDER BY $spec->{order}" : '') .
         " FOR JSON PATH), '[]')";
+}
+
+sub _related_collection_text_sql {
+    my ($self, $sql) = @_;
+    return "CAST($sql AS NVARCHAR(MAX))";
 }
 
 1;
