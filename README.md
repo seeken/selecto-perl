@@ -382,6 +382,72 @@ $stream->close;
 This keeps Selecto itself row-wise. Actual driver and server buffering remains
 a DBI-driver concern rather than a promise of a server-side cursor.
 
+## Canned pages and facets
+
+`Selecto::CannedPage` plans a programmer-defined search page without HTTP or
+browser dependencies. The host supplies a request-authorized `Selecto::Engine`.
+Its dataset query carries fixed scope; detail and aggregate view queries carry
+selections, grouping, and ordering. Every selected control predicate is added
+to the dataset predicate explicitly. A facet's own selection is excluded only
+from that facet's count query.
+
+```perl
+use Selecto::CannedPage;
+
+my $page = Selecto::CannedPage->new(
+    id => 'products', domain => $domain,
+    dataset => {
+        query => $engine->query->where(Selecto::Expression->eq('visible', 1)),
+        entity_key => ['id'],
+    },
+    views => [
+        {id => 'list', kind => 'detail',
+            query => $engine->query->select('id', 'name', 'brand')->order_by('id')},
+        {id => 'categories', kind => 'aggregate',
+            query => $engine->query->select('category',
+                Selecto::Expression->count_distinct('id')->as('items'))
+                ->group_by('category')},
+    ],
+    controls => [
+        {id => 'brand', kind => 'facet', field => 'brand',
+            values => {source => 'dataset', limit => 30, searchable => 1}},
+        {id => 'price', kind => 'range', field => 'price'},
+        {id => 'name', kind => 'text', field => 'name'},
+    ],
+    initial_state => {view => 'list', filters => {}},
+);
+
+my $result = $page->run($authorized_engine, {
+    view => 'list', filters => {brand => ['Acme', 'North']},
+}, $request_scope_predicate);
+```
+
+`plan` returns the selected view, total, and facet queries without executing
+them. `run` returns rows, matching-entity total, bounded facet options, and
+pagination state. An aggregate row can drill into a detail view with
+`drilldown => {view => 'categories', values => ['Shoes']}`; the group predicate
+is added to the existing dataset and control predicates. Fixed options use
+`values => {source => 'fixed', options =>
+[{value => 'A', label => 'A'}]}`. Facet values within a control use OR; controls
+combine with AND. Dataset and Domain restrictions remain in every query.
+The optional request scope predicate is applied to results, totals, facets,
+and drilldowns; excluding a facet's own selection never excludes that scope.
+
+The first profile requires one root primary key as entity identity. Detail
+selections are entity-grain fields; aggregate selections are group fields or a distinct
+count of the entity key. Text controls use `starts_with`. Null facet buckets,
+composite identities, ordinary sums across many-valued joins, and snapshot
+consistency across the separate queries are not yet supported. Use the
+Components plugin's `pages` option for a rendered page.
+
+The executable facet fixtures run on SQLite. The Northwind Components example
+has also been exercised against a local PostgreSQL database. MySQL, MariaDB,
+MSSQL, and DuckDB have not had live canned-page fixture runs. A response
+executes one bounded query per facet plus results and total, with an extra
+bounded selected-value lookup
+when that facet has selections. Separate statements may observe different data
+under concurrent writes unless the host gives them a suitable transaction.
+
 ## Query libraries
 
 Domains may own reusable query intent under `query_library`. A view composes
