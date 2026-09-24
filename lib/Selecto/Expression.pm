@@ -90,7 +90,7 @@ sub dimension_display {
 }
 sub related_collection {
     my ($class, $association, $fields, %options) = @_;
-    _known_options(\%options, [qw(filters)], 'related collection');
+    _known_options(\%options, [qw(filters order_by limit after aggregate)], 'related collection');
     Selecto::Error->throw('invalid_query', 'related collection association is invalid')
         unless defined($association) && !ref($association)
         && "$association" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
@@ -125,9 +125,64 @@ sub related_collection {
             && "$field" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
         ["$field", $value];
     } @$filters;
-    return @filters
-        ? $class->new('related_collection', "$association", \@fields, {filters => \@filters})
+    my $orders = $options{order_by} // [];
+    Selecto::Error->throw('invalid_query', 'related collection ordering must be an array')
+        unless ref($orders) eq 'ARRAY';
+    my @orders = map {
+        my ($field, $direction) = ref($_) eq 'ARRAY' ? @$_ : ();
+        Selecto::Error->throw('invalid_query', 'related collection ordering is invalid')
+            unless ref($_) eq 'ARRAY' && @$_ == 2
+            && defined($field) && !ref($field)
+            && "$field" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/
+            && defined($direction) && !ref($direction)
+            && "$direction" =~ /\A(?:asc|desc)\z/i;
+        ["$field", lc("$direction")];
+    } @$orders;
+    my $limit = $options{limit};
+    if (defined $limit) {
+        Selecto::Error->throw('invalid_query', 'per-parent collection limit is invalid')
+            unless !ref($limit) && "$limit" =~ /\A[1-9][0-9]*\z/;
+        Selecto::Error->throw('invalid_query', 'per-parent collection limit requires ordering')
+            unless @orders;
+        $limit = int($limit);
+    }
+    my $after = $options{after};
+    if (defined $after) {
+        Selecto::Error->throw('invalid_query', 'per-parent collection cursor requires a limit, parent key, and ordering values')
+            unless defined($limit) && ref($after) eq 'HASH'
+            && keys(%$after) == 2 && exists($after->{parent_key}) && exists($after->{values})
+            && defined($after->{parent_key}) && !ref($after->{parent_key})
+            && ref($after->{values}) eq 'ARRAY';
+        $after = {
+            parent_key => $after->{parent_key},
+            values => [@{$after->{values}}],
+        };
+    }
+    my $aggregate = $options{aggregate};
+    if (defined $aggregate) {
+        Selecto::Error->throw('invalid_query', 'related aggregate requires one scalar field and no ordering or limit')
+            unless !ref($aggregate) && ($aggregate eq 'sum' || $aggregate eq 'count')
+            && @fields == 1 && !ref($fields[0]) && !@orders && !defined($limit)
+            && !defined($after);
+    }
+    return @filters || @orders || defined($limit) || defined($after) || defined($aggregate)
+        ? $class->new('related_collection', "$association", \@fields, {
+            (@filters ? (filters => \@filters) : ()),
+            (@orders ? (order_by => \@orders) : ()),
+            (defined($limit) ? (limit => $limit) : ()),
+            (defined($after) ? (after => $after) : ()),
+            (defined($aggregate) ? (aggregate => $aggregate) : ()),
+        })
         : $class->new('related_collection', "$association", \@fields);
+}
+
+sub related_sum {
+    my ($class, $association, $field, %options) = @_;
+    return $class->related_collection($association, [$field], %options, aggregate => 'sum');
+}
+sub related_count {
+    my ($class, $association, $field, %options) = @_;
+    return $class->related_collection($association, [$field], %options, aggregate => 'count');
 }
 sub text_search {
     my ($class, $fields, $query, %options) = @_;
@@ -186,7 +241,6 @@ sub gt  { my ($class, $field, $value) = @_; return $class->_binary('gt',  $field
 sub gte { my ($class, $field, $value) = @_; return $class->_binary('gte', $field, $value); }
 sub lt  { my ($class, $field, $value) = @_; return $class->_binary('lt',  $field, $value); }
 sub lte { my ($class, $field, $value) = @_; return $class->_binary('lte', $field, $value); }
-
 sub starts_with {
     my ($class, $field, $prefix) = @_;
     Selecto::Error->throw('invalid_query', 'starts_with requires a string prefix')
@@ -268,9 +322,14 @@ sub from_filter_ast {
         return $class->between($field, $value, $end);
     }
     Selecto::Error->throw('invalid_query', "unsupported filter operator $operator")
-        unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/;
+        unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte|starts_with)\z/;
     Selecto::Error->throw('invalid_query', "$operator filter requires a value")
         unless @arguments == 2;
+    if ($operator eq 'starts_with') {
+        Selecto::Error->throw('invalid_query', 'starts_with requires a string prefix')
+            if !defined($value) || ref($value);
+        return $class->starts_with($field, $value);
+    }
     my $right;
     if (ref($value) eq 'ARRAY' && @$value == 2
         && defined($value->[0]) && !ref($value->[0]) && "$value->[0]" eq 'field') {

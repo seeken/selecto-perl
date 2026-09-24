@@ -269,6 +269,12 @@ date/time projection or grouping, use an allowlisted expression such as
 accepted. Portable comparison intents include `eq`, `ne`, `gt`, `gte`, `lt`,
 `lte`, and `between`; their values compile as adapter-bound parameters.
 
+For a PostgreSQL eligibility read that must stay valid through a host-owned
+write transaction, call `for_share` on the governed query. It locks only the
+domain root rows returned by that query. Use the same DBI connection for the
+read and write with `transaction_mode => 'external'`; the lock lasts until the
+host commits or rolls back. Other adapters reject this query before execution.
+
 Relationship paths are not limited to one join. If the domain declares the
 lineage, the same dotted path works in selections, predicates, grouping, and
 ordering:
@@ -558,6 +564,11 @@ other ID paths and star-dimension keys remain queryable for existing views but
 are hidden from new selections. A domain can explicitly expose an ID with
 `components => {picker_visible_id_paths => ['association.id']}`.
 
+A segment may use `['starts_with', 'name', ['param', 'value']]` for a
+bound text prefix. The empty prefix matches non-null text; `%`, `_`, and the
+SQL escape character in user input remain literal characters. Matching follows
+the database collation.
+
 Co-domains let one domain declare a bounded lookup owned and governed by
 another domain. The portable contract names the target domain, its reusable
 view or projection, searchable fields, and the result mapping; the host still
@@ -724,6 +735,10 @@ Selecto::Expression->related_collection('load_det', [qw(vin)])
 
 The adapter emits a native JSON array of child objects, ordered by the child
 primary key where supported, without adding the association to the outer query.
+`related_sum('load_det', 'quantity')` and `related_count('load_det', 'id')`
+produce separate correlated scalar aggregates over the authorized child set.
+They can appear beside a limited JSON collection without changing its rows or
+being multiplied by nested associations.
 
 Keyless bridge tables are modeled explicitly rather than pretending the bridge
 has an identity. Add `through` to a to-many association with the bridge table's
