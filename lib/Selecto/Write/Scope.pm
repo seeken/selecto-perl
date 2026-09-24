@@ -92,16 +92,16 @@ sub apply {
     my ($class, $command, $scope, $trusted, %args) = @_;
     return $command unless $scope;
     my $field = $scope->{field};
-    my $label = $args{label} // $command->relation;
+    my $label = {relation => $args{label} // $command->relation, %{$args{details} // {}}};
     Selecto::Error->throw(
         'unsupported_tenant_scope_source',
         'this runtime satisfies tenant scope from trusted context only',
-        {relation => $label, satisfied_by => [@{$scope->{satisfied_by}}]},
+        {%$label, satisfied_by => [@{$scope->{satisfied_by}}]},
     ) unless grep { $_ eq 'trusted_context' } @{$scope->{satisfied_by}};
     Selecto::Error->throw(
         'missing_tenant_scope',
         'tenant-scoped writes require a trusted tenant from the host',
-        {relation => $label, field => $field},
+        {%$label, field => $field},
     ) unless defined $trusted;
 
     for my $expression (grep { defined } $command->predicate, $command->scope_predicate) {
@@ -121,7 +121,7 @@ sub apply {
         Selecto::Error->throw(
             'tenant_scope_conflict_target',
             'tenant-scoped upsert must resolve conflicts on a target that includes the tenant field',
-            {relation => $label, field => $field},
+            {%$label, field => $field},
         ) unless ref($target) eq 'ARRAY' && grep { defined($_) && !ref($_) && "$_" eq $field } @$target;
     }
 
@@ -180,7 +180,7 @@ sub _mismatch {
     Selecto::Error->throw(
         'tenant_mismatch',
         'tenant value must match the trusted tenant scope',
-        {relation => $label, field => $field},
+        {%$label, field => $field},
     );
 }
 

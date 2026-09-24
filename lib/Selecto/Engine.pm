@@ -133,7 +133,7 @@ sub execute_graph {
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
     my @nodes = @{$graph->nodes};
-    $nodes[0]{command} = $self->governed_write($nodes[0]{command});
+    $nodes[0]{command} = $self->governed_write($nodes[0]{command}, graph_node => $nodes[0]{id});
     my $writes = _checked_writes($self->{domain}->writes);
     my %contexts = ($nodes[0]{id} => {
         table         => $self->{domain}->table,
@@ -156,7 +156,7 @@ sub execute_graph {
 # normalize assignments, apply the domain's tenant scope with the engine's
 # trusted tenant, then validate against the domain contract.
 sub governed_write {
-    my ($self, $command) = @_;
+    my ($self, $command, %details) = @_;
     Selecto::Error->throw('invalid_write', 'write command required')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
     Selecto::Error->throw(
@@ -167,7 +167,7 @@ sub governed_write {
     $command = $self->_normalize_write_command($command);
     my $scope = $self->{domain}->write_tenant_scope;
     $command = Selecto::Write::Scope->apply(
-        $command, $scope, $self->{scope}{tenant}, label => $command->relation,
+        $command, $scope, $self->{scope}{tenant}, label => $command->relation, details => \%details,
     );
     $self->_validate_write_command($command, trusted_field => $scope ? $scope->{field} : undef);
     return $command;
@@ -665,7 +665,8 @@ sub _validate_graph_node {
         ) if exists $edge->{fields}{$root_scope->{field}};
     }
     $command = Selecto::Write::Scope->apply(
-        $command, $scope, $self->{scope}{tenant}, label => $command->relation,
+        $command, $scope, $self->{scope}{tenant},
+        label => $command->relation, details => {graph_node => $node->{id}},
     );
     my %nested_fields = %{$edge->{fields} // {}};
     $self->_validate_command_against_contract($command,
