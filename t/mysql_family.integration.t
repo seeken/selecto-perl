@@ -41,7 +41,8 @@ for my $specification (
         $dbh->do(q{INSERT INTO selecto_perl_mysql_products VALUES (1, 'Renée 東京', 10.50)});
 
         my $adapter = Selecto->adapter($backend => (dbh => $dbh));
-        my $engine = Selecto::Engine->new(domain => product_domain(), adapter => $adapter);
+        my $engine = Selecto::Engine->new(domain => product_domain(), adapter => $adapter,
+            write_policy => 'permissive');    # legacy domain without a write policy
         my $result = $engine->all($engine->query->select('id', 'name', 'amount')->order_by('id'));
         is_deeply(
             $result,

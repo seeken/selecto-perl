@@ -41,7 +41,8 @@ my $domain = Selecto::Domain->new(
     },
 );
 my $adapter = Selecto->adapter(mssql => (dbh => $dbh));
-my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter,
+    write_policy => 'permissive');    # legacy domain without a write policy
 
 my $result = $engine->all(
     $engine->query->select('id', 'name', 'active', 'amount')

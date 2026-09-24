@@ -37,7 +37,8 @@ my $domain = Selecto::Domain->new(
     name => 'Items', table => 'selecto_perl_test_items',
     fields => { id => 'integer', name => 'string', amount => 'decimal', payload => 'jsonb' },
 );
-my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+    write_policy => 'permissive');    # legacy domain without a write policy
 my $result = $engine->all($engine->query->select('id', 'name')->order_by('id'));
 is_deeply($result, { columns => ['id', 'name'], rows => [[1, 'baseline']] }, 'public query API executes through DBD::Pg');
 is_deeply(
@@ -214,6 +215,16 @@ my $graph_domain = Selecto::Domain->parse({
                 ownership   => 'owned',
                 foreign_key => 'parent_id',
                 table       => 'selecto_perl_test_graph_children',
+                domain      => {
+                    name => 'GraphChildren',
+                    source => {
+                        source_table => 'selecto_perl_test_graph_children', primary_key => 'id',
+                        fields => ['id', 'label', 'parent_id'],
+                        columns => {id => {type => 'integer'}, label => {type => 'string'},
+                            parent_id => {type => 'integer'}},
+                    },
+                    writes => {fields => {label => {insertable => JSON::PP::true}}},
+                },
             },
         },
     },
