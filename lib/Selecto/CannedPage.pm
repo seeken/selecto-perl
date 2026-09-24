@@ -453,7 +453,7 @@ sub _plain_query {
     my ($query, $label) = @_;
     _fail("$label cannot use advanced query sources or set operations")
         if @{$query->set_operations} || @{$query->ctes}
-            || @{$query->lateral_joins} || @{$query->json_rowsets}
+            || @{$query->lateral_joins} || @{$query->json_rowsets} || @{$query->array_rowsets}
             || defined($query->timezone)
             || ($query->can('row_lock') && defined($query->row_lock));
 }

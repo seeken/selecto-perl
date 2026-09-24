@@ -1,6 +1,7 @@
 package Selecto::SQL;
 
 use Mojo::Base 'Selecto::Adapter';
+use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::Expression ();
@@ -261,6 +262,7 @@ sub _compile_single {
     push @joins, @{$self->_compile_cte_joins($domain, $query)};
     push @joins, @{$self->_compile_lateral_joins($domain, $query, \@params)};
     push @joins, @{$self->_compile_json_rowsets($domain, $query, \@params)};
+    push @joins, @{$self->_compile_array_rowsets($domain, $query, \@params)};
     push @joins, @{$options{extra_joins} // []};
     my $sql = 'SELECT ' . join(', ', @selection_sql) .
         ' FROM ' . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier($self->_root_alias);
@@ -462,6 +464,11 @@ sub _query_sources {
             if exists $domain_associations->{$spec->{name}};
         $sources{$spec->{name}} = {map { $_ => 1 } keys %{$spec->{columns}}};
     }
+    for my $spec (@{$query->array_rowsets}) {
+        Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
+            if exists $domain_associations->{$spec->{name}};
+        $sources{$spec->{name}} = {value => 1, (defined($spec->{ordinality}) ? ($spec->{ordinality} => 1) : ())};
+    }
     return \%sources;
 }
 
@@ -604,6 +611,48 @@ sub _compile_json_rowsets {
 sub _compile_json_rowset_join {
     my ($self, $domain, $spec, $params) = @_;
     Selecto::Error->throw('unsupported_feature', 'JSON rowsets are not supported by this SQL dialect');
+}
+
+sub _compile_array_rowsets {
+    my ($self, $domain, $query, $params) = @_;
+    my $rowsets = $query->array_rowsets;
+    return [] unless @$rowsets;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support array rowsets')
+        unless $self->supports('array_rowset');
+    return [map {
+        my $spec = $_;
+        $self->_array_element_type($domain, $spec->{source_field}, 'array rowset source');
+        $self->_compile_array_rowset_join(
+            $spec,
+            $self->_compile_expression($domain, Selecto::Expression->field($spec->{source_field}), $params),
+        );
+    } @$rowsets];
+}
+
+sub _compile_array_rowset_join {
+    Selecto::Error->throw('unsupported_feature', 'array rowsets are not supported by this SQL dialect');
+}
+
+my %ARRAY_ELEMENT_TYPE = map { $_ => 1 } qw(string integer decimal boolean date uuid);
+
+# The declared element type of an array field; array SQL binds values with it.
+sub _array_element_type {
+    my ($self, $domain, $path, $label) = @_;
+    my $resolved = $domain->resolve($path);
+    Selecto::Error->throw('invalid_query', "$label must be an array field", {field => "$path"})
+        unless lc($resolved->{type} // '') eq 'array';
+    my $items = $domain->field_metadata($path)->{items};
+    Selecto::Error->throw('invalid_query', "$label must declare its element type (items)", {field => "$path"})
+        unless defined($items) && !ref($items) && $ARRAY_ELEMENT_TYPE{$items};
+    return "$items";
+}
+
+sub _compile_array_predicate {
+    Selecto::Error->throw('unsupported_feature', 'array predicates are not supported by this SQL dialect');
+}
+
+sub _compile_json_contains {
+    Selecto::Error->throw('unsupported_feature', 'JSON containment is not supported by this SQL dialect');
 }
 
 sub _single_rollup_grouping_position {
@@ -846,6 +895,29 @@ sub _compile_expression {
     }
     return $self->_compile_expression($domain, $arguments->[0], $params) . ' IS NULL' if $kind eq 'is_null';
     return $self->_compile_expression($domain, $arguments->[0], $params) . ' IS NOT NULL' if $kind eq 'not_null';
+    if ($kind eq 'array_contains' || $kind eq 'array_contained' || $kind eq 'array_overlap') {
+        Selecto::Error->throw('unsupported_feature', 'adapter does not support array predicates')
+            unless $self->supports('array_predicates');
+        my $operand = $arguments->[0];
+        Selecto::Error->throw('invalid_query', "$kind requires an array field")
+            unless blessed($operand) && $operand->kind eq 'field';
+        my $element = $self->_array_element_type($domain, $operand->arguments->[0], "$kind field");
+        return $self->_compile_array_predicate(
+            $kind, $self->_compile_expression($domain, $operand, $params), $element, $arguments->[1], $params,
+        );
+    }
+    if ($kind eq 'json_contains') {
+        Selecto::Error->throw('unsupported_feature', 'adapter does not support JSON containment')
+            unless $self->supports('json_contains');
+        my $operand = $arguments->[0];
+        Selecto::Error->throw('invalid_query', 'json_contains requires a JSON field')
+            unless blessed($operand) && $operand->kind eq 'field'
+                && ($domain->resolve($operand->arguments->[0])->{type} // '') =~ /\Ajsonb?\z/i;
+        push @$params, JSON::PP->new->canonical(1)->encode($arguments->[1]);
+        return $self->_compile_json_contains(
+            $self->_compile_expression($domain, $operand, $params), $self->placeholder(scalar @$params),
+        );
+    }
     if ($kind eq 'in') {
         my $values = $arguments->[1];
         Selecto::Error->throw('invalid_query', 'IN requires at least one value') unless ref($values) eq 'ARRAY' && @$values;
@@ -1549,7 +1621,7 @@ sub _referenced_associations {
     push @expressions, map { $_->[0] } @{$query->orders};
     push @expressions, map {
         Selecto::Expression->field($_->{source_field})
-    } @{$query->json_rowsets};
+    } @{$query->json_rowsets}, @{$query->array_rowsets};
     my %names;
     $names{$_} = 1 for map { $self->_expression_associations($_) } @expressions;
     return sort {

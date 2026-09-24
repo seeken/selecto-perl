@@ -249,6 +249,7 @@ sub _parse_canonical {
         $source, $associations, $raw->{writes},
     );
     _validate_computed_columns($source, $associations);
+    _validate_array_columns($source, $schemas);
     _validate_action_eligibility($raw, $source);
 
     _required_key($raw, 'name', 'domain');
@@ -289,6 +290,29 @@ sub _parse_canonical {
         encode_utf8(JSON::PP->new->canonical(1)->encode($fingerprint_document))
     );
     return $domain;
+}
+
+my %ARRAY_ITEMS = map { $_ => 1 } qw(string integer decimal boolean date uuid);
+
+# An array column may declare its element type with `items`; array predicates
+# and rowsets require it. `items` on any other column type is a mistake.
+sub _validate_array_columns {
+    my ($source, $schemas) = @_;
+    my @relations = (['source', $source], map { ["schemas.$_", $schemas->{$_}] } sort keys %{$schemas // {}});
+    for my $relation (@relations) {
+        my ($label, $spec) = @$relation;
+        next unless ref($spec) eq 'HASH' && ref($spec->{columns}) eq 'HASH';
+        for my $name (sort keys %{$spec->{columns}}) {
+            my $column = $spec->{columns}{$name};
+            next unless ref($column) eq 'HASH' && exists $column->{items};
+            my $items = $column->{items};
+            Selecto::Error->throw('invalid_domain', "$label column $name declares items but is not an array",
+                {field => $name}) unless lc($column->{type} // '') eq 'array';
+            Selecto::Error->throw('invalid_domain',
+                "$label column $name items must be one of " . join(', ', sort keys %ARRAY_ITEMS),
+                {field => $name}) unless defined($items) && !ref($items) && $ARRAY_ITEMS{$items};
+        }
+    }
 }
 
 sub _apply_values_foreign_key_metadata {

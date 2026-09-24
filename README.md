@@ -424,6 +424,31 @@ configurations and modes are allowlisted; search strings and JSON paths remain
 bound parameters. Rollups continue to use `group_by_rollup` and grouping
 metadata as described below.
 
+PostgreSQL also governs array columns and JSON containment. An array column
+declares its element type (`{type => 'array', items => 'string'}`; items are
+`string`, `integer`, `decimal`, `boolean`, `date`, or `uuid`):
+
+```perl
+my $query = $engine->query
+    ->array_rowset('legacy_tags', 'tag_rows', ordinality => 'position')   # UNNEST ... WITH ORDINALITY
+    ->select('asset_tag', 'tag_rows.value', 'tag_rows.position')
+    ->where(Selecto::Expression->all(
+        Selecto::Expression->array_overlap('legacy_tags', ['three-phase', 'dust-collection']),
+        Selecto::Expression->json_contains('metadata', {power => 'three_phase'}),
+    ))
+    ->order_by('asset_tag', 'asc')->order_by('tag_rows.position', 'asc');
+```
+
+`array_contains` (every value present), `array_contained` (every element is a
+value), and `array_overlap` (any value present) bind each value and cast the
+list to the declared element type; NULL arrays never match. `json_contains`
+binds the document as canonical JSON. `array_rowset` exposes `value` and,
+when requested, the 1-based ordinality column; `type` is `cross` (default),
+`inner`, or `left` (keeps rows with empty or NULL arrays). The filter AST
+accepts `['array_overlap', field, [values]]` and `['json_contains', field,
+{...}]`. Other adapters report `array_predicates`, `array_rowset`, and
+`json_contains` as unsupported and fail before SQL is built.
+
 PostgreSQL and DuckDB reuse the parameter identities of governed grouping
 expressions in selections, `GROUPING` metadata, and ordering. This includes
 timezone-adjusted fields and date formats; equal values bound under different

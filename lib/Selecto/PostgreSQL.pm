@@ -80,7 +80,40 @@ sub supports {
         || "$feature" eq 'lateral_join' || "$feature" eq 'json_rowset'
         || "$feature" eq 'stream' || "$feature" eq 'projection_sum'
         || "$feature" eq 'row_locks' || "$feature" eq 'value_expressions'
-        || "$feature" eq 'json_text' ? 1 : 0;
+        || "$feature" eq 'json_text' || "$feature" eq 'array_rowset'
+        || "$feature" eq 'array_predicates' || "$feature" eq 'json_contains' ? 1 : 0;
+}
+
+my %ARRAY_SQL_TYPE = (
+    string => 'TEXT', integer => 'BIGINT', decimal => 'NUMERIC',
+    boolean => 'BOOLEAN', date => 'DATE', uuid => 'UUID',
+);
+my %ARRAY_OPERATOR = (array_contains => '@>', array_contained => '<@', array_overlap => '&&');
+
+# Each value is its own bound parameter; the list is cast to the declared
+# element type, so no driver array encoding is involved.
+sub _compile_array_predicate {
+    my ($self, $kind, $field_sql, $element, $values, $params) = @_;
+    my $type = $ARRAY_SQL_TYPE{$element};
+    my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
+    return "$field_sql $ARRAY_OPERATOR{$kind} CAST(ARRAY[" . join(', ', @markers) . "] AS $type\[\])";
+}
+
+sub _compile_json_contains {
+    my ($self, $field_sql, $placeholder) = @_;
+    return "CAST($field_sql AS JSONB)" . ' @> ' . "CAST($placeholder AS JSONB)";
+}
+
+sub _compile_array_rowset_join {
+    my ($self, $spec, $source_sql) = @_;
+    my $columns = $self->quote_identifier('value')
+        . (defined($spec->{ordinality}) ? ', ' . $self->quote_identifier($spec->{ordinality}) : '');
+    my $keyword = $spec->{type} eq 'cross' ? 'CROSS JOIN LATERAL'
+        : $spec->{type} eq 'inner' ? 'INNER JOIN LATERAL' : 'LEFT JOIN LATERAL';
+    return "$keyword UNNEST($source_sql)"
+        . (defined($spec->{ordinality}) ? ' WITH ORDINALITY' : '')
+        . ' AS ' . $self->quote_identifier($spec->{name}) . " ($columns)"
+        . ($spec->{type} eq 'cross' ? '' : ' ON TRUE');
 }
 
 sub _values_cast_types {
