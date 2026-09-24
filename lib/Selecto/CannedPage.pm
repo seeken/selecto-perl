@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use Scalar::Util qw(blessed);
+use Time::HiRes qw(time);
 use Selecto::Domain ();
 use Selecto::Error ();
 use Selecto::Expression ();
@@ -57,7 +58,23 @@ sub new {
             if $view->{kind} eq 'aggregate' && !@{$view->{query}->groups};
         if ($view->{kind} eq 'detail') {
             for my $selection (@{$view->{query}->selections}) {
-                _fail('detail selections must be entity-grain fields')
+                if ($selection->kind eq 'related_collection') {
+                    my ($association_path, $fields, $options) = @{$selection->arguments};
+                    _fail('detail collection selections need a simple alias and direct plural association')
+                        unless defined($selection->alias_name)
+                            && $selection->alias_name =~ /\A[a-z][a-z0-9_]*\z/
+                            && $association_path =~ /\A[a-z][a-z0-9_]*\z/
+                            && $domain->resolve_association($association_path)->{association}->cardinality eq 'many';
+                    _fail('detail collection selections need one or more scalar child fields')
+                        unless ref($fields) eq 'ARRAY' && @$fields
+                            && !grep { ref($_) || $_ !~ /\A[a-z][a-z0-9_]*\z/ } @$fields;
+                    _fail('detail collection selections cannot use filters, limits, cursors, or aggregates')
+                        if ref($options) eq 'HASH'
+                            && grep { $_ ne 'order_by' } keys %$options;
+                    $domain->resolve("$association_path.$_") for @$fields;
+                    next;
+                }
+                _fail('detail selections must be entity-grain fields or related collections')
                     unless $selection->kind eq 'field';
                 my $resolved = $domain->resolve($selection->arguments->[0]);
                 _fail('detail selections cannot traverse a many association')
@@ -149,6 +166,10 @@ sub new {
             _fail('text control needs a string field and starts_with operator')
                 unless ($resolved->{type} // '') =~ /\A(?:string|text|varchar)\z/i
                     && ($control->{op} // 'starts_with') eq 'starts_with';
+            _fail('text control ignore_case must be a boolean')
+                if exists($control->{ignore_case})
+                    && (!defined($control->{ignore_case}) || ref($control->{ignore_case})
+                        || "$control->{ignore_case}" !~ /\A[01]\z/);
         } else {
             _fail('range control needs a numeric field')
                 unless ($resolved->{type} // '')
@@ -286,7 +307,8 @@ sub plan {
         selections => $template->selections,
         predicate => $predicate,
         groups => $view->{kind} eq 'detail'
-            ? [Selecto::Expression->field($key), @{$template->selections},
+            ? [Selecto::Expression->field($key),
+                grep { $_->kind eq 'field' } @{$template->selections},
                 map { $_->[0] } @{$template->orders}]
             : $template->groups,
         orders => \@orders,
@@ -354,6 +376,7 @@ sub run {
         unless blessed($engine) && $engine->can('domain') && $engine->can('all')
             && $engine->domain->fingerprint eq $self->domain->fingerprint;
     my $plan = $self->plan($input, $scope);
+    my $query_started = time;
     my $rows = $engine->all($plan->{query});
     my $has_more = @{$rows->{rows}} > $plan->{state}{limit} ? 1 : 0;
     pop @{$rows->{rows}} if $has_more;
@@ -392,7 +415,8 @@ sub run {
     }
     return {state => $plan->{state}, view => $plan->{view},
         columns => $rows->{columns}, rows => $rows->{rows},
-        total => $total_rows->[0][0] // 0, has_more => $has_more, facets => \%facets};
+        total => $total_rows->[0][0] // 0, has_more => $has_more, facets => \%facets,
+        elapsed_ms => int((time - $query_started) * 1000 + 0.5)};
 }
 
 sub _predicate {
@@ -423,7 +447,9 @@ sub _predicate {
             push @expressions, Selecto::Expression->gte($field, $value->{min}) if exists $value->{min};
             push @expressions, Selecto::Expression->lte($field, $value->{max}) if exists $value->{max};
         } elsif (length $value) {
-            push @expressions, Selecto::Expression->starts_with($field, $value);
+            push @expressions, $control->{ignore_case}
+                ? Selecto::Expression->starts_with_ci($field, $value)
+                : Selecto::Expression->starts_with($field, $value);
         }
     }
     return @expressions == 1 ? $expressions[0]
