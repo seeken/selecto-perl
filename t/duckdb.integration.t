@@ -220,5 +220,47 @@ eval { $engine->execute_batch(Selecto::Write::Batch->new($insert, $missing)); 1 
 is($@->code, 'cardinality_mismatch', 'DuckDB reports portable batch cardinality errors');
 is($dbh->selectrow_array('SELECT count(*) FROM selecto_perl_duckdb_items'), 1, 'DuckDB rolls back the batch atomically');
 
+# Governed value expressions execute on DuckDB with typed results.
+$dbh->do('CREATE TABLE selecto_perl_duckdb_value_sites (id integer primary key, name varchar not null)');
+$dbh->do(q{INSERT INTO selecto_perl_duckdb_value_sites VALUES (1, 'North')});
+$dbh->do('CREATE TABLE selecto_perl_duckdb_value_assets (id integer primary key, site_id integer, location_text varchar, rate_cents integer not null, metadata json not null)');
+$dbh->do(q{INSERT INTO selecto_perl_duckdb_value_assets VALUES
+    (1, 1, 'Bay 4', 1850, '{"manufacturer":"Bridgeport"}'),
+    (2, NULL, 'Annex closet', 900, '{}'),
+    (3, NULL, NULL, 12000, '{"manufacturer":"Epson"}')});
+my $value_domain = Selecto::Domain->parse({
+    name => 'DuckDB value assets',
+    source => {
+        source_table => 'selecto_perl_duckdb_value_assets', primary_key => 'id',
+        fields => [qw(id site_id location_text rate_cents metadata effective_location rate_dollars manufacturer)],
+        columns => {
+            id => {type => 'integer'}, site_id => {type => 'integer'},
+            location_text => {type => 'string'}, rate_cents => {type => 'integer'},
+            metadata => {type => 'json'},
+            effective_location => {type => 'string', computed => {kind => 'expression', expression =>
+                ['coalesce', ['field', 'site.name'], ['field', 'location_text'], ['literal', 'Location unknown']]}},
+            rate_dollars => {type => 'decimal', computed => {kind => 'expression', expression =>
+                ['divide', ['field', 'rate_cents'], ['literal', 100]]}},
+            manufacturer => {type => 'string', computed => {kind => 'expression', expression =>
+                ['json_text', 'metadata', ['manufacturer']]}},
+        },
+        associations => {site => {queryable => 'site', owner_key => 'site_id', related_key => 'id'}},
+    },
+    schemas => {site => {
+        source_table => 'selecto_perl_duckdb_value_sites', primary_key => 'id', fields => [qw(id name)],
+        columns => {id => {type => 'integer'}, name => {type => 'string'}}, associations => {},
+    }},
+    joins => {site => {type => 'left'}},
+});
+my $value_engine = Selecto::Engine->new(domain => $value_domain, adapter => $adapter);
+is_deeply($value_engine->all($value_engine->query
+    ->select(qw(id effective_location rate_dollars manufacturer))->order_by('id'))->{rows},
+    [
+        [1, 'North', '18.5', 'Bridgeport'],
+        [2, 'Annex closet', '9', undef],
+        [3, 'Location unknown', '120', 'Epson'],
+    ],
+    'DuckDB executes coalesce, decimal division, and JSON text value expressions');
+
 $dbh->disconnect;
 done_testing;

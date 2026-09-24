@@ -385,6 +385,70 @@ my $filtered_values = $typed_values_engine->all($typed_values_engine->query
 is_deeply($filtered_values->{rows}, [[1]],
     'PostgreSQL compares integer values cells numerically');
 
+# Governed value expressions execute on PostgreSQL with typed results.
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_value_assets');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_value_sites');
+$dbh->do('CREATE TABLE selecto_perl_test_value_sites (id integer primary key, name text not null)');
+$dbh->do(q{INSERT INTO selecto_perl_test_value_sites VALUES (1, 'North')});
+$dbh->do(q{CREATE TABLE selecto_perl_test_value_assets (
+    id integer primary key, site_id integer, location_text text, status text not null,
+    rate_cents integer not null, metadata jsonb not null default '{}'::jsonb)});
+$dbh->do(q{INSERT INTO selecto_perl_test_value_assets VALUES
+    (1, 1, 'Bay 4', 'available', 1850, '{"manufacturer":"Bridgeport"}'),
+    (2, NULL, 'Annex closet', 'maintenance', 900, '{}'),
+    (3, NULL, NULL, 'missing', 12000, '{"manufacturer":"Epson"}')});
+my $value_domain = Selecto::Domain->parse({
+    name => 'Value assets',
+    source => {
+        source_table => 'selecto_perl_test_value_assets', primary_key => 'id',
+        fields => [qw(id site_id location_text status rate_cents metadata
+            effective_location attention_state rate_dollars manufacturer)],
+        columns => {
+            id => {type => 'integer'}, site_id => {type => 'integer'},
+            location_text => {type => 'string'}, status => {type => 'string'},
+            rate_cents => {type => 'integer'}, metadata => {type => 'jsonb'},
+            effective_location => {type => 'string', computed => {kind => 'expression', expression =>
+                ['coalesce', ['field', 'site.name'], ['field', 'location_text'], ['literal', 'Location unknown']]}},
+            attention_state => {type => 'string', computed => {kind => 'expression', expression =>
+                ['case', [['in', 'status', ['maintenance', 'missing']], ['literal', 'Needs attention']],
+                    ['else', ['literal', 'Ready']]]}},
+            rate_dollars => {type => 'decimal', computed => {kind => 'expression', expression =>
+                ['divide', ['field', 'rate_cents'], ['literal', 100]]}},
+            manufacturer => {type => 'string', computed => {kind => 'expression', expression =>
+                ['json_text', 'metadata', ['manufacturer']]}},
+        },
+        associations => {site => {queryable => 'site', owner_key => 'site_id', related_key => 'id'}},
+    },
+    schemas => {site => {
+        source_table => 'selecto_perl_test_value_sites', primary_key => 'id', fields => [qw(id name)],
+        columns => {id => {type => 'integer'}, name => {type => 'string'}}, associations => {},
+    }},
+    joins => {site => {type => 'left'}},
+});
+my $value_engine = Selecto::Engine->new(
+    domain => $value_domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+);
+my $value_rows = $value_engine->all($value_engine->query
+    ->select(qw(id effective_location attention_state rate_dollars manufacturer))->order_by('id'));
+is_deeply($value_rows, {
+    columns => [qw(id effective_location attention_state rate_dollars manufacturer)],
+    rows => [
+        [1, 'North', 'Ready', '18.5', 'Bridgeport'],
+        [2, 'Annex closet', 'Needs attention', '9', undef],
+        [3, 'Location unknown', 'Needs attention', '120', 'Epson'],
+    ],
+}, 'PostgreSQL executes coalesce, case, decimal division, and JSON text value expressions');
+is_deeply($value_engine->all($value_engine->query
+    ->select('attention_state', Selecto::Expression->count->as('assets'))
+    ->group_by('attention_state')->order_by('attention_state'))->{rows},
+    [['Needs attention', 2], ['Ready', 1]],
+    'PostgreSQL groups and orders by a computed value field');
+is_deeply($value_engine->all($value_engine->query->select('id')
+    ->where(Selecto::Expression->gte('rate_dollars', '100'))->order_by('id'))->{rows},
+    [[3]], 'PostgreSQL filters numerically by a computed decimal');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_value_assets');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_value_sites');
+
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_grandchildren');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_children');

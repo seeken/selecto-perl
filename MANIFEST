@@ -52,6 +52,7 @@ lib/Selecto/SQL.pm
 lib/Selecto/SQLite.pm
 lib/Selecto/Statement.pm
 lib/Selecto/Stream.pm
+lib/Selecto/ValueExpression.pm
 lib/Selecto/Write.pm
 lib/Selecto/Write/Expression.pm
 script/with-local-deps
@@ -110,6 +111,7 @@ t/grouped_expression_bindings.t
 t/importer.t
 t/field_policy.t
 t/data_rules.t
+t/value_expression.t
 t/values_types.t
 t/fixtures/data_rules/baseline.contract.json
 t/fixtures/data_rules/baseline.cases.json

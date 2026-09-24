@@ -117,7 +117,7 @@ sub _compile_single {
     my @joins;
     my $predicate = Selecto::QueryEnforcement::combine(
         $domain->required_predicate, $query->predicate);
-    my @association_paths = $self->_referenced_associations($query, $predicate);
+    my @association_paths = $self->_referenced_associations($query, $predicate, $domain);
     my ($join_aliases, $through_aliases) = _association_alias_maps(@association_paths);
     local $self->{_join_aliases} = $join_aliases;
     local $self->{_through_aliases} = $through_aliases;
@@ -251,7 +251,9 @@ sub _compile_single {
         $compiled_selections{_expression_key($_)} //= $expression_sql;
         $selection_positions{_expression_key($_)} //= $selection_position;
         my $needs_result_alias = defined($_->alias_name)
-            || ($_->kind eq 'field' && $_->arguments->[0] =~ /\./);
+            || ($_->kind eq 'field' && $_->arguments->[0] =~ /\./)
+            || ($_->kind eq 'field'
+                && ref($domain->field_metadata($_->arguments->[0])->{computed}) eq 'HASH');
         $needs_result_alias
             ? $expression_sql . ' AS ' . $self->quote_identifier($columns[$selection_position - 1])
             : $expression_sql
@@ -804,6 +806,13 @@ sub _compile_expression {
     my $kind = $expression->kind;
     my $arguments = $expression->arguments;
     return $self->_field_sql($domain, $arguments->[0], $params) if $kind eq 'field';
+    if ($kind eq 'value') {
+        require Selecto::ValueExpression;
+        Selecto::ValueExpression->infer(
+            $arguments->[0], resolve => sub { return $self->_value_field_type($domain, $_[0]); },
+        );
+        return '(' . $self->_compile_value_expression($domain, $arguments->[0], $params) . ')';
+    }
     if ($kind eq 'literal') {
         push @$params, $arguments->[0];
         return $self->placeholder(scalar @$params);
@@ -1399,6 +1408,19 @@ sub _field_sql {
     );
 }
 
+sub _value_field_type {
+    my ($self, $domain, $path) = @_;
+    my @segments = split /\./, "$path", -1;
+    if (@segments == 2 && ref($self->{_query_sources}) eq 'HASH'
+        && exists($self->{_query_sources}{$segments[0]})) {
+        Selecto::Error->throw(
+            'invalid_value_expression', 'value expressions may reference only governed domain fields',
+            {field => $path},
+        );
+    }
+    return $domain->resolve($path)->{type};
+}
+
 sub _text_case_sql {
     my ($sql, $text_case) = @_;
     return "UPPER($sql)" if defined($text_case) && $text_case eq 'uppercase';
@@ -1409,7 +1431,11 @@ sub _text_case_sql {
 sub _compile_computed_field {
     my ($self, $domain, $path, $computed, $params) = @_;
     Selecto::Error->throw('invalid_domain', 'unsupported computed field')
-        unless $computed->{kind} eq 'association_exists' || $computed->{kind} eq 'predicate';
+        unless $computed->{kind} eq 'association_exists' || $computed->{kind} eq 'predicate'
+            || $computed->{kind} eq 'expression';
+    if ($computed->{kind} eq 'expression') {
+        return '(' . $self->_compile_value_expression($domain, $computed->{expression}, $params) . ')';
+    }
     if ($computed->{kind} eq 'predicate') {
         my $expression = Selecto::Expression->from_filter_ast($computed->{expression});
         return '(' . $self->_compile_expression($domain, $expression, $params) . ')';
@@ -1437,8 +1463,86 @@ sub _compile_computed_field {
         join(' AND ', @predicates) . ')';
 }
 
+# Compiles a governed value expression (see Selecto::ValueExpression). Every
+# literal and JSON path segment is bound; literals are cast to their type.
+sub _compile_value_expression {
+    my ($self, $domain, $node, $params) = @_;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support value expressions')
+        unless $self->supports('value_expressions');
+    my ($operator, @arguments) = @$node;
+    return $self->_field_sql($domain, $arguments[0], $params) if $operator eq 'field';
+    if ($operator eq 'literal') {
+        push @$params, $arguments[0];
+        return 'CAST(' . $self->placeholder(scalar @$params) . ' AS '
+            . $self->_value_type_sql($arguments[1]) . ')';
+    }
+    if ($operator eq 'coalesce') {
+        return 'COALESCE(' . join(', ', map {
+            $self->_compile_value_expression($domain, $_, $params)
+        } @arguments) . ')';
+    }
+    if ($operator eq 'add' || $operator eq 'subtract' || $operator eq 'multiply') {
+        my $symbol = {add => '+', subtract => '-', multiply => '*'}->{$operator};
+        return '(' . $self->_compile_value_expression($domain, $arguments[0], $params)
+            . " $symbol " . $self->_compile_value_expression($domain, $arguments[1], $params) . ')';
+    }
+    if ($operator eq 'divide') {
+        # Division is always decimal: integer operands would otherwise truncate.
+        my $decimal = $self->_value_type_sql('decimal');
+        return '(CAST(' . $self->_compile_value_expression($domain, $arguments[0], $params)
+            . " AS $decimal) / CAST("
+            . $self->_compile_value_expression($domain, $arguments[1], $params) . " AS $decimal))";
+    }
+    if ($operator eq 'lower' || $operator eq 'upper') {
+        return uc($operator) . '(' . $self->_compile_value_expression($domain, $arguments[0], $params) . ')';
+    }
+    if ($operator eq 'concat') {
+        my $text = $self->_value_type_sql('string');
+        return 'CONCAT(' . join(', ', map {
+            'CAST(' . $self->_compile_value_expression($domain, $_, $params) . " AS $text)"
+        } @arguments) . ')';
+    }
+    if ($operator eq 'cast') {
+        return 'CAST(' . $self->_compile_value_expression($domain, $arguments[0], $params)
+            . ' AS ' . $self->_value_type_sql($arguments[1]) . ')';
+    }
+    if ($operator eq 'json_text') {
+        my $field_sql = $self->_field_sql($domain, $arguments[0], $params);
+        return $self->_compile_json_text($field_sql, $arguments[1], $params);
+    }
+    if ($operator eq 'case') {
+        my @parts;
+        for my $branch (@arguments) {
+            if ($branch->[0] eq 'else') {
+                push @parts, 'ELSE ' . $self->_compile_value_expression($domain, $branch->[1], $params);
+                next;
+            }
+            my $condition = Selecto::Expression->from_filter_ast($branch->[0]);
+            push @parts, 'WHEN ' . $self->_compile_expression($domain, $condition, $params)
+                . ' THEN ' . $self->_compile_value_expression($domain, $branch->[1], $params);
+        }
+        return 'CASE ' . join(' ', @parts) . ' END';
+    }
+    Selecto::Error->throw('invalid_query', "unsupported value expression operator $operator");
+}
+
+# Adapter-owned allowlist mapping a value type to a SQL cast target.
+sub _value_type_sql {
+    my ($self, $type) = @_;
+    my $cast = $self->_values_cast_types->{lc "$type"};
+    Selecto::Error->throw(
+        'unsupported_feature', "adapter cannot cast value expressions to $type",
+    ) unless defined($cast) && !ref($cast);
+    return $cast;
+}
+
+sub _compile_json_text {
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support JSON text extraction');
+}
+
 sub _referenced_associations {
-    my ($self, $query, $predicate) = @_;
+    my ($self, $query, $predicate, $domain) = @_;
+    local $self->{_association_domain} = $domain;
     my @expressions = (@{$query->selections});
     push @expressions, $predicate if $predicate;
     push @expressions, @{$query->groups};
@@ -1458,10 +1562,26 @@ sub _expression_associations {
     return () unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $arguments = $expression->arguments;
     return () if $expression->kind eq 'related_collection';
+    if ($expression->kind eq 'value') {
+        require Selecto::ValueExpression;
+        return map { $self->_expression_associations(Selecto::Expression->field($_)) }
+            Selecto::ValueExpression->dependencies($arguments->[0]);
+    }
     if ($expression->kind eq 'field') {
         my @segments = split /\./, $arguments->[0];
         return () if @segments == 2 && ref($self->{_query_sources}) eq 'HASH'
             && exists($self->{_query_sources}{$segments[0]});
+        if (@segments == 1) {
+            # A computed root field brings the joins its expression reads.
+            my $domain = $self->{_association_domain};
+            my $computed = $domain ? $domain->field_metadata($segments[0])->{computed} : undef;
+            return () unless ref($computed) eq 'HASH' && $computed->{kind} eq 'expression';
+            local $self->{_computed_visiting} = {%{$self->{_computed_visiting} // {}}};
+            return () if $self->{_computed_visiting}{$segments[0]}++;
+            require Selecto::ValueExpression;
+            return map { $self->_expression_associations(Selecto::Expression->field($_)) }
+                Selecto::ValueExpression->dependencies($computed->{expression});
+        }
         pop @segments;
         my @paths;
         for my $index (0 .. $#segments) {

@@ -610,7 +610,7 @@ my $eligibility_statement = $eligibility_engine->compile(
     $eligibility_engine->query->select('id', 'eligible'),
 );
 like $eligibility_statement->sql,
-    qr{SELECT "s0"\."id", \(\("s0"\."id" > \$1\) AND \(EXISTS \(SELECT 1 FROM "invoice_flags" AS "e_rush_flags".*\) = \$3\)\) FROM}s,
+    qr{SELECT "s0"\."id", \(\("s0"\."id" > \$1\) AND \(EXISTS \(SELECT 1 FROM "invoice_flags" AS "e_rush_flags".*\) = \$3\)\) AS "eligible" FROM}s,
     'predicate computed fields compile governed boolean logic into the data query';
 is_deeply $eligibility_statement->params, [0, 'R', 1],
     'predicate computed fields keep nested literals adapter-bound';

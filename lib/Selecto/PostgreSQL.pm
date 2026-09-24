@@ -79,7 +79,8 @@ sub supports {
         || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
         || "$feature" eq 'lateral_join' || "$feature" eq 'json_rowset'
         || "$feature" eq 'stream' || "$feature" eq 'projection_sum'
-        || "$feature" eq 'row_locks' ? 1 : 0;
+        || "$feature" eq 'row_locks' || "$feature" eq 'value_expressions'
+        || "$feature" eq 'json_text' ? 1 : 0;
 }
 
 sub _values_cast_types {
@@ -90,6 +91,12 @@ sub _values_cast_types {
         date => 'DATE', datetime => 'TIMESTAMP', naive_datetime => 'TIMESTAMP',
         utc_datetime => 'TIMESTAMPTZ',
     };
+}
+
+sub _compile_json_text {
+    my ($self, $field_sql, $segments, $params) = @_;
+    my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$segments;
+    return 'JSONB_EXTRACT_PATH_TEXT(CAST(' . $field_sql . ' AS JSONB), ' . join(', ', @markers) . ')';
 }
 
 sub _compile_row_lock {
