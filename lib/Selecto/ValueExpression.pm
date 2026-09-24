@@ -4,7 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use JSON::PP ();
-use Scalar::Util qw(blessed looks_like_number);
+use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Error ();
 
@@ -76,7 +76,10 @@ sub _parse {
         _fail("$label literal requires a value and an optional type")
             unless @arguments == 1 || @arguments == 2;
         my ($value, $type) = @arguments;
-        $value = $value ? 1 : 0 if JSON::PP::is_bool($value);
+        if (JSON::PP::is_bool($value)) {
+            $type //= 'boolean';
+            $value = $value ? 1 : 0;
+        }
         _fail("$label literal value must be a scalar") if ref($value);
         _fail("$label literal value must not be null; use a nullable field or case")
             unless defined $value;
@@ -84,8 +87,10 @@ sub _parse {
             _fail("$label literal type must be one of " . join(', ', sort keys %CAST_TYPE))
                 unless !ref($type) && $CAST_TYPE{$type};
         } else {
-            $type = looks_like_number($value)
-                ? ("$value" =~ /\A-?\d+\z/ ? 'integer' : 'decimal')
+            # The same rule in every runtime: digits are integer, digits with a
+            # fractional part are decimal, and anything else is a string.
+            $type = "$value" =~ /\A-?\d+\z/ ? 'integer'
+                : "$value" =~ /\A-?\d+\.\d+\z/ ? 'decimal'
                 : 'string';
         }
         return ['literal', $value, "$type"];
