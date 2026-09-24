@@ -178,6 +178,36 @@ sub execute_graph {
     return $self->_execute_governed(execute_graph => Selecto::Write::Graph->new(nodes => \@nodes));
 }
 
+# A write command bound to this engine's domain, checked now for earlier
+# feedback. Execution governs it again: this check is advice, not authority.
+#
+#   my $command = $engine->write_command(
+#       operation => 'update', assignments => {title => 'x'},
+#       filter => ['eq', 'id', 42],       # filter AST, or predicate => Selecto::Expression
+#   );
+sub write_command {
+    my ($self, %args) = @_;
+    my @unknown = sort grep {
+        !/\A(?:operation|assignments|filter|predicate|expected_count|metadata)\z/
+    } keys %args;
+    Selecto::Error->throw('invalid_write', 'write_command received unsupported arguments', {keys => \@unknown})
+        if @unknown;
+    Selecto::Error->throw('invalid_write', 'write_command takes filter or predicate, not both')
+        if exists($args{filter}) && exists($args{predicate});
+    my $predicate = exists($args{filter}) ? Selecto::Expression->from_filter_ast($args{filter})
+        : $args{predicate};
+    my $command = Selecto::Write::Command->new(
+        operation => $args{operation},
+        relation => $self->{domain}->table,
+        assignments => $args{assignments} // {},
+        (defined($predicate) ? (predicate => $predicate) : ()),
+        (exists($args{expected_count}) ? (expected_count => $args{expected_count}) : ()),
+        metadata => $args{metadata} // {},
+    );
+    $self->governed_write($command);
+    return $command;
+}
+
 # The single path from a caller's command to the command an adapter receives:
 # normalize assignments, apply the domain's tenant scope with the engine's
 # trusted tenant, then validate against the domain contract.

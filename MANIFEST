@@ -107,6 +107,7 @@ t/sqlite.integration.t
 t/stream.t
 t/write.t
 t/write_authority.t
+t/write_contract_retention.t
 t/write_governance.t
 t/write_graph.t
 lib/Selecto/Document/Integer.pm

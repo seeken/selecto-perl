@@ -1047,6 +1047,14 @@ command, batch, or graph to the adapter with a single-use
 adapter methods skip domain governance and exist for trusted internal tooling
 and adapter tests only.
 
+`$engine->write_command(operation => ..., assignments => {...}, filter =>
+[...])` builds a command bound to the engine's domain table and checks it
+immediately, for earlier feedback in forms and APIs. The check is advice:
+execution governs the command again. Registry-resolved, overlay-composed, and
+derived domains keep their canonical `writes` contract; a registry provider
+that returns a hand-built domain without one has no write policy, so strict
+engines deny its writes.
+
 ### Tenant scope
 
 A domain that declares `writes.scope.tenant` cannot be written without a
@@ -1242,8 +1250,8 @@ my $done = $engine->execute_action($plan, grant => $grant, context => $ctx);
 A grant is opaque and bound to its phase, the plan's content, the domain
 fingerprint, the engine's trusted tenant, and the context's actor. It works
 once and only before it expires; a different binding fails with
-`action_grant_mismatch`, and a used, expired, or forged grant with
-`action_grant_invalid`. A denied capability issues no grant.
+`action_grant_mismatch` and revokes the grant, and a used, revoked, expired,
+or forged grant fails with `action_grant_invalid`. A denied capability issues no grant.
 
 An action can further constrain selected-ID requests with domain metadata:
 

@@ -395,14 +395,20 @@ my $grant_plan = $site10->plan_action({action => 'archive', target => 9});
 my $grant = $site10->grant_action($grant_plan, phase => 'execute', resolver => $resolver, context => $alice);
 like($grant->id, qr/\A[0-9a-f]{32}\z/, 'a grant has an opaque id for audit correlation');
 
-is(code_of(sub { $site10->execute_action($grant_plan, grant => $grant, context => {actor => {id => 'bob'}}) }),
-    'action_grant_mismatch', 'a grant is bound to its actor');
-is(code_of(sub { $site10->execute_action($site10->plan_action({action => 'archive', target => 1}),
-    grant => $grant, context => $alice) }), 'action_grant_mismatch', 'a grant is bound to its plan');
-is(code_of(sub { $unscoped->with_scope(tenant => 20)->execute_action($grant_plan, grant => $grant, context => $alice) }),
-    'action_grant_mismatch', 'a grant is bound to its tenant');
-is(code_of(sub { $site10->preview_action($grant_plan, grant => $grant, context => $alice) }),
-    'action_grant_mismatch', 'a grant is bound to its phase');
+my $fresh = sub { $site10->grant_action($grant_plan, phase => 'execute', resolver => $resolver, context => $alice) };
+my %mismatch = (
+    actor => sub { $site10->execute_action($grant_plan, grant => $_[0], context => {actor => {id => 'bob'}}) },
+    plan => sub { $site10->execute_action($site10->plan_action({action => 'archive', target => 1}),
+        grant => $_[0], context => $alice) },
+    tenant => sub { $unscoped->with_scope(tenant => 20)->execute_action($grant_plan, grant => $_[0], context => $alice) },
+    phase => sub { $site10->preview_action($grant_plan, grant => $_[0], context => $alice) },
+);
+for my $binding (sort keys %mismatch) {
+    my $probe = $fresh->();
+    is(code_of(sub { $mismatch{$binding}->($probe) }), 'action_grant_mismatch', "a grant is bound to its $binding");
+    is(code_of(sub { $site10->execute_action($grant_plan, grant => $probe, context => $alice) }),
+        'action_grant_invalid', "a grant presented for another $binding is revoked");
+}
 
 my $granted = $site10->execute_action($grant_plan, grant => $grant, context => $alice);
 is($granted->{result}->affected_rows, 1, 'a matching grant executes the plan');
@@ -419,6 +425,18 @@ is(code_of(sub { $site10->execute_action($grant_plan, grant => bless(\(my $y = 1
     context => $alice) }), 'action_grant_invalid', 'a forged grant authorizes nothing');
 is(code_of(sub { $site10->grant_action($grant_plan, resolver => sub { 'disabled' }, context => $alice) }),
     'action_capability_denied', 'a denied capability issues no grant');
+
+# --- write_command ---------------------------------------------------------------------
+
+my $built = $site10->write_command(operation => 'update', assignments => {title => 'built'}, filter => ['eq', 'id', 3]);
+is($built->relation, 'work_orders', 'write_command binds the domain table');
+ok(!defined($built->scope_predicate), 'write_command returns the caller command; execution applies scope');
+is(code_of(sub { $site10->write_command(operation => 'update', assignments => {owner => 1}, filter => ['eq', 'id', 3]) }),
+    'unknown_field', 'write_command reports contract errors early');
+is(code_of(sub { $unscoped->write_command(operation => 'update', assignments => {title => 'x'}, filter => ['eq', 'id', 3]) }),
+    'missing_tenant_scope', 'write_command applies the same scope checks');
+$site10->execute_write($built);
+is(title_of(3), 'built', 'the built command executes through the engine');
 
 # --- fingerprints -----------------------------------------------------------------------
 
