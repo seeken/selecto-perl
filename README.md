@@ -492,6 +492,78 @@ my $query = $engine->apply_view(
 my $applied = $query->applied_query_library;
 ```
 
+`segment_picker_groups` declares mutually exclusive choices without changing
+the segment IDs used by saved views and API requests. Each group offers an
+implicit Off choice (customizable with `off_label`); only one listed segment
+may be applied, including when segments come from a named view:
+
+```perl
+segment_picker_groups => {
+    pdf_sent_to_customer => {
+        label => 'PDF sent to customer',
+        description => 'Filter by whether a PDF-sent event exists. Off includes both.',
+        choices => [
+            {segment => 'pdf_sent', label => 'Yes'},
+            {segment => 'pdf_not_sent', label => 'No'},
+        ],
+    },
+},
+```
+
+For an ordinary field filter backed by a known option catalog, declare
+`components.filter_choices` instead of a parameterized segment. The key is
+the queryable field path; each choice pairs a stable stored value with its
+display name. Hosts can use this to render a multi-select while keeping the
+same governed `in` filter and canonical query URL:
+
+```perl
+components => {
+    filter_choices => {
+        'billing_class.option_item_id' => {
+            label => 'Billing Class',
+            choices => [
+                {value => 191, label => 'Corporate'},
+                {value => 192, label => 'Retail'},
+            ],
+        },
+    },
+},
+```
+
+When a value lives on one of two relationships, a virtual choice filter may
+declare `conditional` with a root `when_field`, plus `present_field` and
+`absent_field`. The selected field is chosen solely by whether `when_field`
+is null; a missing value on the chosen side does not fall back to the other.
+For example, Quote Billing Class uses the customer's option when `cust_id`
+exists, otherwise the quote's option. `filter_picker_hidden_paths` can remove
+older physical fields from the Available list without invalidating saved
+queries that use them:
+
+```perl
+components => {
+    filter_choices => {
+        lhf_billing_class => {
+            label => 'Billing Class',
+            choices => [{value => 14, label => 'Private'}],
+            conditional => {
+                when_field => 'cust_id',
+                present_field => 'lhf_customer_option_2.option_item_id',
+                absent_field => 'lhf_option_2.option_item_id',
+            },
+        },
+    },
+    filter_picker_hidden_paths => [
+        'lhf_customer_option_2.', 'lhf_option_2.',
+    ],
+},
+```
+
+Explorer's column and aggregate pickers prefer descriptive relationship fields
+over numeric IDs. The root record ID and `client_profile` IDs remain visible;
+other ID paths and star-dimension keys remain queryable for existing views but
+are hidden from new selections. A domain can explicitly expose an ID with
+`components => {picker_visible_id_paths => ['association.id']}`.
+
 A segment may use `['starts_with', 'name', ['param', 'value']]` for a
 bound text prefix. The empty prefix matches non-null text; `%`, `_`, and the
 SQL escape character in user input remain literal characters. Matching follows

@@ -34,7 +34,7 @@ my %THROUGH = map { $_ => 1 } qw(
     table owner_key related_key source_scope_key through_scope_key target_scope_key
     where target_key_cast
 );
-my %COMPONENTS = map { $_ => 1 } qw(query_params);
+my %COMPONENTS = map { $_ => 1 } qw(query_params filter_choices filter_picker_hidden_paths picker_visible_id_paths);
 my %DETAIL_ACTION = map { $_ => 1 } qw(
     name description type required_fields payload capability
 );
@@ -263,6 +263,8 @@ sub _parse_canonical {
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
+    _validate_conditional_filter_choices($domain);
+    _validate_picker_visible_id_paths($domain);
     $domain->{editors} = _validate_editors($domain, $raw->{editors});
     $domain->{contract}{editors} = dclone($domain->{editors})
         if keys %{$domain->{editors}};
@@ -1001,20 +1003,175 @@ sub _normalize_components {
             unless $boolean;
         $components{query_params} = $query_params ? 1 : 0;
     }
+    if (exists $value->{filter_choices}) {
+        my $filters = $value->{filter_choices};
+        _object($filters, 'components filter_choices');
+        my %normalized;
+        for my $path (sort keys %$filters) {
+            Selecto::Error->throw('invalid_domain', 'filter choice field path is invalid')
+                unless $path =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+            my $spec = $filters->{$path};
+            _object($spec, "filter choices for $path");
+            _reject_unknown($spec, {label => 1, choices => 1, conditional => 1,
+                picker_hidden => 1}, "filter choices for $path");
+            my $label = _nonblank_string($spec->{label}, "filter choices for $path label");
+            my $choices = $spec->{choices};
+            Selecto::Error->throw('invalid_domain', "filter choices for $path need 1-500 items")
+                unless ref($choices) eq 'ARRAY' && @$choices >= 1 && @$choices <= 500;
+            my (%seen, @items);
+            for my $choice (@$choices) {
+                _object($choice, "filter choice for $path");
+                _reject_unknown($choice, {value => 1, label => 1}, "filter choice for $path");
+                my $item_value = _nonblank_string($choice->{value}, "filter choice value for $path");
+                Selecto::Error->throw('invalid_domain', "filter choice value for $path cannot contain a comma")
+                    if $item_value =~ /,/;
+                Selecto::Error->throw('invalid_domain', "duplicate filter choice value for $path")
+                    if $seen{$item_value}++;
+                push @items, {
+                    value => $item_value,
+                    label => _nonblank_string($choice->{label}, "filter choice label for $path"),
+                };
+            }
+            my %normalized_spec = (label => $label, choices => \@items);
+            if (exists $spec->{conditional}) {
+                my $conditional = $spec->{conditional};
+                _object($conditional, "conditional filter choices for $path");
+                _reject_unknown($conditional, {map { $_ => 1 }
+                    qw(when_field present_field absent_field)},
+                    "conditional filter choices for $path");
+                for my $key (qw(when_field present_field absent_field)) {
+                    my $field = _nonblank_string($conditional->{$key},
+                        "conditional filter choices for $path $key");
+                    Selecto::Error->throw('invalid_domain',
+                        "conditional filter choices for $path $key is not a field path")
+                        unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+                }
+                $normalized_spec{conditional} = {%$conditional};
+            }
+            if (exists $spec->{picker_hidden}) {
+                my $hidden = $spec->{picker_hidden};
+                Selecto::Error->throw('invalid_domain',
+                    "filter choices for $path picker_hidden must be a boolean")
+                    unless JSON::PP::is_bool($hidden)
+                        || (!ref($hidden) && "$hidden" =~ /\A(?:0|1)\z/);
+                $normalized_spec{picker_hidden} = $hidden ? 1 : 0;
+            }
+            $normalized{$path} = \%normalized_spec;
+        }
+        $components{filter_choices} = \%normalized;
+    }
+    if (exists $value->{filter_picker_hidden_paths}) {
+        my $paths = $value->{filter_picker_hidden_paths};
+        Selecto::Error->throw('invalid_domain',
+            'components filter_picker_hidden_paths must be an array')
+            unless ref($paths) eq 'ARRAY';
+        my @paths;
+        for my $path (@$paths) {
+            Selecto::Error->throw('invalid_domain',
+                'filter picker hidden path must be a field path or dotted prefix')
+                unless defined($path) && !ref($path)
+                    && $path =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.?\z/;
+            push @paths, "$path";
+        }
+        $components{filter_picker_hidden_paths} = \@paths;
+    }
+    if (exists $value->{picker_visible_id_paths}) {
+        my $paths = $value->{picker_visible_id_paths};
+        Selecto::Error->throw('invalid_domain',
+            'components picker_visible_id_paths must be an array')
+            unless ref($paths) eq 'ARRAY';
+        my @paths;
+        for my $path (@$paths) {
+            Selecto::Error->throw('invalid_domain',
+                'picker visible ID path must be a field path')
+                unless defined($path) && !ref($path)
+                    && $path =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+            push @paths, "$path";
+        }
+        $components{picker_visible_id_paths} = \@paths;
+    }
     return \%components;
+}
+
+sub _validate_conditional_filter_choices {
+    my ($domain) = @_;
+    my $choices = $domain->components->{filter_choices} // {};
+    for my $path (sort keys %$choices) {
+        my $conditional = $choices->{$path}{conditional};
+        next unless ref($conditional) eq 'HASH';
+        Selecto::Error->throw('invalid_domain',
+            "conditional filter $path conflicts with a domain field")
+            if eval { $domain->resolve($path) };
+        my %resolved;
+        for my $key (qw(when_field present_field absent_field)) {
+            my $field = $conditional->{$key};
+            my $entry = eval { $domain->resolve($field) };
+            Selecto::Error->throw('invalid_domain',
+                "conditional filter $path references unavailable $key $field")
+                unless $entry;
+            Selecto::Error->throw('invalid_domain',
+                "conditional filter $path cannot use a to-many $key")
+                if grep { $_->cardinality eq 'many' }
+                    @{$entry->{associations} // []};
+            $resolved{$key} = $entry;
+        }
+        Selecto::Error->throw('invalid_domain',
+            "conditional filter $path must compare the same field type")
+            unless $resolved{present_field}{type} eq $resolved{absent_field}{type};
+    }
+}
+
+sub _validate_picker_visible_id_paths {
+    my ($domain) = @_;
+    for my $path (@{$domain->components->{picker_visible_id_paths} // []}) {
+        Selecto::Error->throw('invalid_domain',
+            "picker visible ID path $path is not a domain field")
+            unless eval { $domain->resolve($path) };
+    }
 }
 
 sub _normalize_query_library {
     my ($value) = @_;
     return {} unless defined $value;
     _object($value, 'query_library');
-    my %known = map { $_ => 1 } qw(segments projections orderings views);
+    my %known = map { $_ => 1 } qw(segments projections orderings views segment_picker_groups);
     _reject_unknown($value, \%known, 'query_library');
     my %library;
     for my $registry (qw(segments projections orderings views)) {
         my $definitions = $value->{$registry} // {};
         _object($definitions, "query_library $registry");
         $library{$registry} = dclone($definitions);
+    }
+    if (exists $value->{segment_picker_groups}) {
+        my $groups = $value->{segment_picker_groups};
+        _object($groups, 'query_library segment_picker_groups');
+        my %used_segment;
+        for my $id (sort keys %$groups) {
+            Selecto::Error->throw('invalid_domain', 'segment picker group ID must use letters, digits, or underscores')
+                unless $id =~ /\A[A-Za-z][A-Za-z0-9_]*\z/;
+            my $group = $groups->{$id};
+            _object($group, "segment picker group $id");
+            _reject_unknown($group, {map { $_ => 1 } qw(label description off_label choices)}, "segment picker group $id");
+            _nonblank_string($group->{label}, "segment picker group $id label");
+            Selecto::Error->throw('invalid_domain', "segment picker group $id description must be a string")
+                if exists($group->{description}) && (!defined($group->{description}) || ref($group->{description}));
+            _nonblank_string($group->{off_label}, "segment picker group $id off_label")
+                if exists $group->{off_label};
+            my $choices = $group->{choices};
+            Selecto::Error->throw('invalid_domain', "segment picker group $id needs at least two choices")
+                unless ref($choices) eq 'ARRAY' && @$choices >= 2;
+            for my $choice (@$choices) {
+                _object($choice, "segment picker group $id choice");
+                _reject_unknown($choice, {segment => 1, label => 1}, "segment picker group $id choice");
+                my $segment = _nonblank_string($choice->{segment}, "segment picker group $id choice segment");
+                _nonblank_string($choice->{label}, "segment picker group $id choice label");
+                Selecto::Error->throw('invalid_domain', "segment picker group $id references unknown segment $segment")
+                    unless ref($library{segments}{$segment}) eq 'HASH';
+                Selecto::Error->throw('invalid_domain', "segment $segment belongs to more than one picker group")
+                    if $used_segment{$segment}++;
+            }
+        }
+        $library{segment_picker_groups} = dclone($groups);
     }
     return \%library;
 }

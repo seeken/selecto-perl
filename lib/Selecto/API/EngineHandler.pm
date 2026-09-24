@@ -476,7 +476,7 @@ sub describe_openapi ($self, $api) {
             field => {type => 'string'},
             op => {
                 type => 'string',
-                enum => [qw(eq ne gt gte lt lte between date_shortcut in is_null not_null)],
+                enum => [qw(eq ne gt gte lt lte between date_shortcut in not_in is_null not_null)],
             },
             value => {}, end => {},
         },
@@ -669,61 +669,84 @@ sub _filters ($self, $domain, $filters) {
         _reject_unknown($filter, [qw(field op value end)], 'filter');
         my $field = _required_string($filter->{field}, 'filter field');
         my $operator = lc _required_string($filter->{op}, 'filter operator');
+        my $choice = $domain->components->{filter_choices}{$field};
+        my $conditional = ref($choice) eq 'HASH' ? $choice->{conditional} : undef;
+        if (ref($conditional) eq 'HASH') {
+            Selecto::Error->throw('invalid_api_query',
+                "Unsupported filter operator $operator")
+                unless $operator =~ /\A(?:eq|ne|in|not_in|is_null|not_null)\z/;
+            my $definition = $domain->resolve($conditional->{present_field});
+            my $present = $self->_query_filter_expression(
+                $filter, $operator, $definition,
+                Selecto::Expression->field($conditional->{present_field}),
+            );
+            my $absent = $self->_query_filter_expression(
+                $filter, $operator, $definition,
+                Selecto::Expression->field($conditional->{absent_field}),
+            );
+            my $when = Selecto::Expression->field($conditional->{when_field});
+            push @expressions, Selecto::Expression->any([
+                Selecto::Expression->all([
+                    Selecto::Expression->not_null($when), $present,
+                ]),
+                Selecto::Expression->all([
+                    Selecto::Expression->is_null($when), $absent,
+                ]),
+            ]);
+            next;
+        }
         my $definition = _public_field_definition($domain, $field);
         my $operand = $definition->{type} eq 'epoch_datetime'
             ? Selecto::Expression->epoch_datetime($field)
             : Selecto::Expression->field($field);
-
-        if ($operator eq 'is_null' || $operator eq 'not_null') {
-            push @expressions, Selecto::Expression->can($operator)->(
-                'Selecto::Expression', $operand,
-            );
-            next;
-        }
-        if ($operator eq 'in') {
-            my $values = $filter->{value};
-            Selecto::Error->throw(
-                'invalid_api_query',
-                'in filter value must be a non-empty array',
-            ) unless ref($values) eq 'ARRAY' && @$values;
-            Selecto::Error->throw(
-                'invalid_api_query', 'Too many in filter values',
-            ) if @$values > $self->max_filter_values;
-            my @values = map { _literal_value($_, 'in filter value') } @$values;
-            push @expressions, Selecto::Expression->in($operand, \@values);
-            next;
-        }
-        if ($operator eq 'between') {
-            push @expressions, Selecto::Expression->between(
-                $operand,
-                _literal_value($filter->{value}, 'between start'),
-                _literal_value($filter->{end}, 'between end'),
-            );
-            next;
-        }
-        if ($operator eq 'date_shortcut') {
-            Selecto::Error->throw(
-                'invalid_api_query', 'date_shortcut requires a temporal field',
-            ) unless ($definition->{type} // '') =~ /\A(?:date|datetime|naive_datetime|utc_datetime|epoch_datetime)\z/;
-            my $shortcut = _required_string(
-                $filter->{value}, 'date shortcut value',
-            );
-            Selecto::Error->throw(
-                'invalid_api_query', 'Date shortcut is not available',
-                {value => $shortcut},
-            ) unless Selecto::DateShortcut->valid($shortcut);
-            push @expressions, Selecto::DateShortcut->expression($operand, $shortcut);
-            next;
-        }
-        Selecto::Error->throw(
-            'invalid_api_query', "Unsupported filter operator $operator",
-        ) unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/;
-        push @expressions, Selecto::Expression->can($operator)->(
-            'Selecto::Expression', $operand,
-            _literal_value($filter->{value}, 'filter value'),
+        push @expressions, $self->_query_filter_expression(
+            $filter, $operator, $definition, $operand,
         );
     }
     return @expressions;
+}
+
+sub _query_filter_expression ($self, $filter, $operator, $definition, $operand) {
+    if ($operator eq 'is_null' || $operator eq 'not_null') {
+        return Selecto::Expression->can($operator)->(
+            'Selecto::Expression', $operand,
+        );
+    }
+    if ($operator eq 'in' || $operator eq 'not_in') {
+        my $values = $filter->{value};
+        Selecto::Error->throw('invalid_api_query',
+            "$operator filter value must be a non-empty array")
+            unless ref($values) eq 'ARRAY' && @$values;
+        Selecto::Error->throw('invalid_api_query', 'Too many in filter values')
+            if @$values > $self->max_filter_values;
+        my @values = map { _literal_value($_, 'in filter value') } @$values;
+        my $expression = Selecto::Expression->in($operand, \@values);
+        return $operator eq 'not_in' ? Selecto::Expression->not($expression) : $expression;
+    }
+    if ($operator eq 'between') {
+        return Selecto::Expression->between(
+            $operand,
+            _literal_value($filter->{value}, 'between start'),
+            _literal_value($filter->{end}, 'between end'),
+        );
+    }
+    if ($operator eq 'date_shortcut') {
+        Selecto::Error->throw('invalid_api_query',
+            'date_shortcut requires a temporal field')
+            unless ($definition->{type} // '')
+                =~ /\A(?:date|datetime|naive_datetime|utc_datetime|epoch_datetime)\z/;
+        my $shortcut = _required_string($filter->{value}, 'date shortcut value');
+        Selecto::Error->throw('invalid_api_query', 'Date shortcut is not available',
+            {value => $shortcut}) unless Selecto::DateShortcut->valid($shortcut);
+        return Selecto::DateShortcut->expression($operand, $shortcut);
+    }
+    Selecto::Error->throw('invalid_api_query',
+        "Unsupported filter operator $operator")
+        unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/;
+    return Selecto::Expression->can($operator)->(
+        'Selecto::Expression', $operand,
+        _literal_value($filter->{value}, 'filter value'),
+    );
 }
 
 sub _literal_value ($value, $label) {
@@ -815,6 +838,10 @@ sub _api_selections ($domain, $value, $maximum) {
             ) if $nested_names{$selection->{result_name}}++;
             push @fields, {
                 key => $selection->{result_name}, expression => $selection->{expression},
+                # JSON decoders turn numeric literals into inexact native floats.
+                # Preserve the database's decimal text before JSON aggregation.
+                ($definition->{type} =~ /\A(?:decimal|numeric|number|float|double|real)\z/i
+                    ? (stringify => 1) : ()),
             };
         }
         Selecto::Error->throw(

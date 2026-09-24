@@ -1052,6 +1052,7 @@ sub _compile_related_collection_at {
         push @collection_fields, {
             key => "$field->{key}",
             sql => $self->_compile_expression($domain, $field->{expression}, $params),
+            (exists($field->{stringify}) ? (stringify => $field->{stringify}) : ()),
         };
     }
 
@@ -1251,13 +1252,24 @@ sub _related_collection_json_pairs {
     return map {
         my $key = $_->{key};
         $key =~ s/'/''/g;
-        my $sql = $_->{sql};
+        my $sql = $self->_related_collection_value_sql($_);
         $sql = "($sql)::text"
             if $exact_decimals_as_text
                 && defined($_->{type})
                 && $_->{type} =~ /\A(?:decimal|numeric|number)\z/;
         "'$key', $sql"
     } @$fields;
+}
+
+sub _related_collection_value_sql {
+    my ($self, $field) = @_;
+    return $field->{stringify}
+        ? $self->_related_collection_text_sql($field->{sql}) : $field->{sql};
+}
+
+sub _related_collection_text_sql {
+    my ($self, $sql) = @_;
+    return "CAST($sql AS TEXT)";
 }
 
 sub _expression_field_paths {

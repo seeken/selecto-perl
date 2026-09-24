@@ -22,7 +22,8 @@ use Selecto::Write ();
             rows => [[map {
                 $_ eq 'id' ? 7
                     : $_ eq 'lines'
-                        ? '[{"lines.sku":"ABC","line_day":"2026-09-11"}]'
+                        ? ($self->{nested_payload}
+                            // '[{"lines.sku":"ABC","line_day":"2026-09-11"}]')
                         : "value:$_"
             } @{$statement->columns}]],
         };
@@ -65,12 +66,14 @@ my $domain = Selecto::Domain->parse({
     schemas => {
         record_lines => {
             source_table => 'record_lines', primary_key => 'id',
-            fields => [qw(id record_id sku occurred_at)],
+            fields => [qw(id record_id sku occurred_at price weight)],
             columns => {
                 id => {type => 'integer'},
                 record_id => {type => 'integer'},
                 sku => {type => 'string'},
                 occurred_at => {type => 'epoch_datetime'},
+                price => {type => 'decimal'},
+                weight => {type => 'decimal'},
             },
             associations => {},
         },
@@ -128,6 +131,49 @@ my $handler = Selecto::API::EngineHandler->new(
     max_limit => 50,
     default_limit => 12,
 );
+
+my $conditional_domain = Selecto::Domain->parse({
+    schema_version => 1, name => 'Conditional filter API',
+    source => {
+        source_table => 'quoted_items', primary_key => 'id',
+        fields => [qw(id customer_id quote_choice customer_choice)],
+        columns => {
+            id => {type => 'integer'}, customer_id => {type => 'integer'},
+            quote_choice => {type => 'integer', internal => 1},
+            customer_choice => {type => 'integer', internal => 1},
+        },
+        associations => {},
+    },
+    schemas => {}, joins => {},
+    components => {filter_choices => {effective_choice => {
+        label => 'Effective choice', choices => [
+            {value => 14, label => 'Private'}, {value => 15, label => 'Corporate'},
+        ],
+        conditional => {
+            when_field => 'customer_id', present_field => 'customer_choice',
+            absent_field => 'quote_choice',
+        },
+    }}},
+}, strict => 1);
+my $conditional_adapter = TestAPIEngineHandler::Adapter->new(
+    dbh => bless({}, 'TestAPIEngineHandler::DBH'),
+);
+my $conditional_engine = Selecto::Engine->new(
+    domain => $conditional_domain, adapter => $conditional_adapter,
+);
+my $conditional_result = $handler->query($conditional_engine, {
+    select => ['id'], filters => [
+        {field => 'effective_choice', op => 'in', value => ['14', '15']},
+    ],
+});
+is_deeply $conditional_result->{columns}, ['id'],
+    'API accepts a governed conditional choice filter';
+like $conditional_adapter->{last_statement}->sql,
+    qr/"customer_id" IS NOT NULL.*"customer_choice" IN.*"customer_id" IS NULL.*"quote_choice" IN/s,
+    'API filters the customer side only when a Customer ID exists';
+is_deeply $conditional_adapter->{last_statement}->params,
+    ['14', '15', '14', '15'],
+    'conditional API filter binds its selected IDs in both branches';
 
 my $write_result = $handler->write($engine, {
     operation => 'update',
@@ -337,6 +383,25 @@ is_deeply $result->{rows}, [{
     lines => [{'lines.sku' => 'ABC', line_day => '2026-09-11'}],
 }], 'object row format is applied to the root and its related collection';
 is $result->{row_format}, 'objects', 'the response reports its effective row format';
+
+{
+    local $adapter->{nested_payload} =
+        '[{"lines.price":"12345678901234567890.123456789",'
+        . '"lines.weight":"0.00000000000000000001"}]';
+    $result = $handler->query($engine, {
+        select => ['id', ['lines.price', 'lines.weight']],
+        row_format => 'objects',
+    });
+    is_deeply $result->{rows}[0]{lines}, [{
+        'lines.price' => '12345678901234567890.123456789',
+        'lines.weight' => '0.00000000000000000001',
+    }], 'nested decimals retain their exact text, including high precision';
+    like $adapter->{last_statement}->sql,
+        qr/JSON_BUILD_OBJECT\('lines\.price', CAST\("c_lines"\."price" AS TEXT\), 'lines\.weight', CAST\("c_lines"\."weight" AS TEXT\)\)/,
+        'nested decimal values are cast to text before database JSON aggregation';
+    my $json = eval { Selecto::API::canonical_json($result) };
+    ok !$@ && defined($json), 'nested decimal query result meets canonical JSON rules';
+}
 
 my $subtable_error = eval {
     $handler->query($engine, {select => ['id', ['lines.sku', 'name']]});
