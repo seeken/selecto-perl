@@ -164,7 +164,7 @@ my $values_statement = $values_engine->compile(
     $values_engine->query->select('id', 'status_name.name'),
 );
 like $values_statement->sql,
-    qr{WITH "__selecto_values_status_values" AS \(SELECT \$1 AS "id", \$2 AS "name" UNION ALL SELECT \$3, \$4\).*LEFT JOIN "__selecto_values_status_values" AS "j_status_name"}s,
+    qr{WITH "__selecto_values_status_values" AS \(SELECT CAST\(\$1 AS TEXT\) AS "id", CAST\(\$2 AS TEXT\) AS "name" UNION ALL SELECT CAST\(\$3 AS TEXT\), CAST\(\$4 AS TEXT\)\).*LEFT JOIN "__selecto_values_status_values" AS "j_status_name"}s,
     'inline values relations compile as governed joined rows';
 like $values_statement->sql,
     qr{LOWER\("s0"\."status"\) = "j_status_name"\."id"},

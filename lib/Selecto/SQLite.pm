@@ -32,6 +32,11 @@ sub supports {
         || "$feature" eq 'stream' ? 1 : 0;
 }
 
+# SQLite stores bound text as TEXT; only integer affinity changes ordering.
+sub _values_cast_types {
+    return { integer => 'INTEGER', int => 'INTEGER', bigint => 'INTEGER' };
+}
+
 sub write_capabilities {
     my ($self) = @_;
     my $capabilities = $self->SUPER::write_capabilities;

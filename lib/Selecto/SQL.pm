@@ -356,6 +356,16 @@ sub _append_values_ctes {
         my $fields = $association->value_fields;
         Selecto::Error->throw('invalid_domain', 'values relation has no fields')
             unless ref($fields) eq 'ARRAY' && @$fields;
+        # Bound cells have no type of their own; without a cast the database
+        # infers one (PostgreSQL: text), so integers would sort as strings.
+        my $field_types = $association->fields;
+        my %casts = map {
+            my $field = $_;
+            my $cast = $self->_values_column_type_sql(
+                $field_types->{$field}, [map { $_->{$field} } @$rows],
+            );
+            defined($cast) ? ($field => $cast) : ();
+        } @$fields;
         my @selects;
         for my $row_index (0 .. $#$rows) {
             my $row = $rows->[$row_index];
@@ -363,6 +373,8 @@ sub _append_values_ctes {
             for my $field (@$fields) {
                 push @$params, $row->{$field};
                 my $value = $self->placeholder(scalar @$params);
+                $value = 'CAST(' . $value . ' AS ' . $casts{$field} . ')'
+                    if exists $casts{$field};
                 $value .= ' AS ' . $self->quote_identifier($field)
                     if $row_index == 0;
                 push @values, $value;
@@ -379,6 +391,38 @@ sub _append_values_ctes {
         return $with_sql . ', ' . join(', ', @entries) . ' ';
     }
     return 'WITH ' . join(', ', @entries) . ' ';
+}
+
+# Adapter-owned allowlist mapping a declared values column type to a SQL cast
+# target. Types outside an adapter's allowlist stay untyped, as before.
+sub _values_column_type_sql {
+    my ($self, $type, $values) = @_;
+    return undef unless defined $type;
+    my $cast = $self->_values_cast_types->{lc "$type"};
+    return undef unless defined $cast;
+    return ref($cast) eq 'CODE' ? $self->$cast($values) : $cast;
+}
+
+sub _values_cast_types { return {}; }
+
+# Exact DECIMAL(38, s) target wide enough for every value in the column, for
+# dialects whose bare DECIMAL has a small default scale.
+sub _values_decimal_sql {
+    my ($self, $values) = @_;
+    my ($digits, $scale) = (0, 0);
+    for my $value (grep { defined } @$values) {
+        Selecto::Error->throw('invalid_domain', 'decimal values must be exact base-10 text')
+            if ref($value) || "$value" !~ /\A-?\d+(?:\.\d+)?\z/;
+        my ($whole, $fraction) = split /\./, "$value", 2;
+        $whole =~ s/\A-?0*//;
+        $fraction //= '';
+        $fraction =~ s/0+\z//;
+        $digits = length($whole) if length($whole) > $digits;
+        $scale = length($fraction) if length($fraction) > $scale;
+    }
+    Selecto::Error->throw('unsupported_precision', 'decimal values exceed 38 digits')
+        if $digits + $scale > 38;
+    return 'DECIMAL(38,' . $scale . ')';
 }
 
 sub _shift_placeholders {
