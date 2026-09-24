@@ -16,7 +16,7 @@ is_deeply($adapter->preview_write($command), {
     sql => 'UPDATE "items" SET "name" = $1 WHERE "id" = $2',
     params => ['after', 7],
 }, 'portable update preview separates SQL and params');
-my $result = $adapter->execute_write($command);
+my $result = $adapter->execute_write_unsafe($command);
 is_deeply($result->to_hash, { operation => 'update', affected_rows => 1 }, 'write result reports logical affected rows');
 is_deeply($dbh->events, ['BEGIN', 'COMMIT'], 'single write is transactional');
 
@@ -25,7 +25,7 @@ $existing_transaction_dbh->{AutoCommit} = 0;
 my $existing_transaction_adapter = Selecto::PostgreSQL->new(
     dbh => $existing_transaction_dbh,
 );
-$existing_transaction_adapter->execute_write($command);
+$existing_transaction_adapter->execute_write_unsafe($command);
 is_deeply $existing_transaction_dbh->events, ['COMMIT'],
     'managed writes reuse an already-open DBI transaction without begin_work noise';
 
@@ -34,7 +34,7 @@ my $failed_write_dbh = TestSelecto::DBH->new({
 });
 my $failed_write_adapter = Selecto::PostgreSQL->new(dbh => $failed_write_dbh);
 my $execution_error = eval {
-    $failed_write_adapter->execute_write(Selecto::Write::Command->new(
+    $failed_write_adapter->execute_write_unsafe(Selecto::Write::Command->new(
         operation => 'insert', relation => 'items', assignments => {id => 9},
         metadata => {returning => ['id']},
     ));
@@ -70,7 +70,7 @@ is_deeply $unique_error->details, {
 my $external_dbh = TestSelecto::DBH->new({ affected => 1 });
 $external_dbh->{AutoCommit} = 0;
 my $external = Selecto::PostgreSQL->new(dbh => $external_dbh, transaction_mode => 'external');
-my $external_result = $external->execute_write($command);
+my $external_result = $external->execute_write_unsafe($command);
 is($external_result->affected_rows, 1, 'external transaction mode executes the write');
 is_deeply($external_dbh->events, [],
     'external transaction mode leaves begin, commit, and rollback to the caller');
@@ -80,12 +80,12 @@ $autocommit_dbh->{AutoCommit} = 1;
 my $unsafe_external = Selecto::PostgreSQL->new(
     dbh => $autocommit_dbh, transaction_mode => 'external',
 );
-eval { $unsafe_external->execute_write($command) };
+eval { $unsafe_external->execute_write_unsafe($command) };
 is($@->code, 'invalid_adapter', 'external mode fails closed when AutoCommit is enabled');
 is_deeply($autocommit_dbh->events, [], 'rejected external transaction dispatches nothing');
 
 my $invalid_mode = Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new, transaction_mode => 'sometimes');
-eval { $invalid_mode->execute_write($command) };
+eval { $invalid_mode->execute_write_unsafe($command) };
 is($@->code, 'invalid_adapter', 'unknown transaction mode fails closed');
 
 my $rollback_dbh = TestSelecto::DBH->new({ affected => 1 }, { affected => 0 });
@@ -97,7 +97,7 @@ my $missing = Selecto::Write::Command->new(
     operation => 'update', relation => 'items', assignments => { name => 'never' },
     predicate => Selecto::Expression->eq('id', 999),
 );
-eval { $rollback_adapter->execute_batch(Selecto::Write::Batch->new($insert, $missing)) };
+eval { $rollback_adapter->execute_batch_unsafe(Selecto::Write::Batch->new($insert, $missing)) };
 is($@->code, 'cardinality_mismatch', 'batch rejects an unexpected row count');
 is_deeply($rollback_dbh->events, ['BEGIN', 'ROLLBACK'], 'failed batch rolls back atomically');
 
@@ -131,7 +131,7 @@ for my $expected (2, 1) {
         predicate => Selecto::Expression->gt('id', 0), expected_count => $expected,
         metadata => { returning => ['id'] },
     );
-    my $returned = eval { $returning_adapter->execute_write($returning_command) };
+    my $returned = eval { $returning_adapter->execute_write_unsafe($returning_command) };
     if ($expected == 2) {
         is_deeply($returned->to_hash, {operation => 'update', affected_rows => 2, values => {id => 7}},
             'returning counts all returned rows rather than a provisional driver count');

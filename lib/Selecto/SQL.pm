@@ -11,6 +11,7 @@ use Selecto::Statement ();
 use Selecto::Stream ();
 use Selecto::Write ();
 use Selecto::Write::Expression ();
+use Selecto::Write::Authorization ();
 
 our @FEATURE_INVENTORY = qw(
     cte recursive_cte window_functions set_operations transactions returning rollup stream
@@ -756,13 +757,34 @@ sub preview_write {
     return { sql => $statement->{sql}, params => [@{$statement->{params}}] };
 }
 
+# Execution requires the engine's authorization for the exact object; see
+# Selecto::Write::Authorization. The *_unsafe variants skip domain governance
+# and exist for trusted internal tooling and adapter tests only.
 sub execute_write {
+    my ($self, $command, $authorization) = @_;
+    Selecto::Write::Authorization->require_for($command, $authorization);
+    return $self->execute_write_unsafe($command);
+}
+
+sub execute_batch {
+    my ($self, $batch, $authorization) = @_;
+    Selecto::Write::Authorization->require_for($batch, $authorization);
+    return $self->execute_batch_unsafe($batch);
+}
+
+sub execute_graph {
+    my ($self, $graph, $authorization) = @_;
+    Selecto::Write::Authorization->require_for($graph, $authorization);
+    return $self->execute_graph_unsafe($graph);
+}
+
+sub execute_write_unsafe {
     my ($self, $command) = @_;
     my $compiled = $self->_compile_write($command);
     return $self->_transaction(sub { return $self->_execute_compiled_write_in_transaction($command, $compiled); });
 }
 
-sub execute_batch {
+sub execute_batch_unsafe {
     my ($self, $batch) = @_;
     my @commands = @{$batch->commands};
     my @compiled = map { $self->_compile_write($_) } @commands;
@@ -772,7 +794,7 @@ sub execute_batch {
     });
 }
 
-sub execute_graph {
+sub execute_graph_unsafe {
     my ($self, $graph) = @_;
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');

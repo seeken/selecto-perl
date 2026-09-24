@@ -310,6 +310,21 @@ is(code_of(sub { $unscoped->execute_action($other, resolver => $resolver) }), 'm
 is(code_of(sub { $site10->execute_action($other, resolver => sub { 'disabled' }) }),
     'action_capability_denied', 'a denied capability stops execution before any write');
 
+# --- the adapter boundary ---------------------------------------------------------------
+
+my $raw = update(id => 3, assignments => {title => 'bypass'});
+is(code_of(sub { $adapter->execute_write($raw) }), 'ungoverned_write',
+    'an adapter refuses a raw command');
+is(code_of(sub { $adapter->execute_write($raw, bless(\(my $x = 1), 'Selecto::Write::Authorization')) }),
+    'ungoverned_write', 'a forged authorization authorizes nothing');
+is(code_of(sub { Selecto::Write::Authorization->_issue($raw) }), 'ungoverned_write',
+    'only the engine issues authorizations');
+is(code_of(sub { $adapter->execute_batch(Selecto::Write::Batch->new($raw)) }), 'ungoverned_write',
+    'an adapter refuses a raw batch');
+is(code_of(sub { $adapter->execute_graph(Selecto::Write::Graph->new(nodes => [{id => 'r', command => $raw}])) }),
+    'ungoverned_write', 'an adapter refuses a raw graph');
+is(title_of(3), 'Belt', 'no bypass attempt wrote anything');
+
 # --- fingerprints -----------------------------------------------------------------------
 
 my $scoped_predicate = Selecto::Expression->eq('site_id', 10);

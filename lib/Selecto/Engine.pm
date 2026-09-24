@@ -15,6 +15,7 @@ use Selecto::QueryLibrary ();
 use Selecto::Write ();
 use Selecto::Write::Expression ();
 use Selecto::Write::Scope ();
+use Selecto::Write::Authorization ();
 use Selecto::Action::Capability ();
 use Selecto::Action::Planner ();
 
@@ -119,14 +120,21 @@ sub preview_write {
 }
 sub execute_write {
     my ($self, $command) = @_;
-    return $self->{adapter}->execute_write($self->governed_write($command));
+    return $self->_execute_governed(execute_write => $self->governed_write($command));
+}
+
+# Hands a governed write object to the adapter with the engine's single-use
+# authorization for it.
+sub _execute_governed {
+    my ($self, $method, $subject) = @_;
+    return $self->{adapter}->$method($subject, Selecto::Write::Authorization->_issue($subject));
 }
 sub execute_batch {
     my ($self, $batch) = @_;
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
     my @commands = map { $self->governed_write($_) } @{$batch->commands};
-    return $self->{adapter}->execute_batch(Selecto::Write::Batch->new(@commands));
+    return $self->_execute_governed(execute_batch => Selecto::Write::Batch->new(@commands));
 }
 sub execute_graph {
     my ($self, $graph) = @_;
@@ -149,7 +157,7 @@ sub execute_graph {
         ($contexts{$node->{id}}, $node->{command}) =
             $self->_validate_graph_node($node, \%contexts, $root_scope);
     }
-    return $self->{adapter}->execute_graph(Selecto::Write::Graph->new(nodes => \@nodes));
+    return $self->_execute_governed(execute_graph => Selecto::Write::Graph->new(nodes => \@nodes));
 }
 
 # The single path from a caller's command to the command an adapter receives:
@@ -244,7 +252,7 @@ sub execute_action {
         phase => 'execute',
         action => $plan->action,
         decision => $decision,
-        result => $self->{adapter}->execute_write($command),
+        result => $self->_execute_governed(execute_write => $command),
     };
 }
 
