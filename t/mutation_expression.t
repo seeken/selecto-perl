@@ -198,7 +198,7 @@ my $graph = Selecto::Write::Graph->new(nodes => [
         bindings => [{ field => 'parent_id', from => 'parent', key => 'id' }],
     },
 ]);
-$graph_adapter->execute_graph($graph);
+$graph_adapter->execute_graph_unsafe($graph);
 is(
     $graph_dbh->prepared->[1]->sql,
     'INSERT INTO "children" ("created_at", "parent_id") VALUES (CURRENT_TIMESTAMP, $1) RETURNING "id"',

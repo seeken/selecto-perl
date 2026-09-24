@@ -55,6 +55,7 @@ lib/Selecto/Statement.pm
 lib/Selecto/Stream.pm
 lib/Selecto/ValueExpression.pm
 lib/Selecto/Write.pm
+lib/Selecto/Write/Authorization.pm
 lib/Selecto/Write/Expression.pm
 lib/Selecto/Write/Scope.pm
 script/with-local-deps

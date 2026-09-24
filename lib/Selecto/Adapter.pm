@@ -5,6 +5,12 @@ use Scalar::Util qw(blessed);
 use Selecto::Error ();
 
 our $CONTRACT_VERSION = 1;
+
+# Write execution: Selecto::Engine calls execute_write, execute_batch, and
+# execute_graph with a second argument, a Selecto::Write::Authorization for the
+# exact governed object. Adapters that execute writes must pass both to
+# Selecto::Write::Authorization->require_for before running anything, so a raw
+# command cannot skip domain governance. preview_write compiles only.
 our @REQUIRED_METHODS = qw(
     name dialect compile execute_query preview_write execute_write execute_batch
 );

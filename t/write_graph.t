@@ -31,7 +31,7 @@ my $graph = Selecto::Write::Graph->new(nodes => [
     },
 ]);
 
-my $result = $adapter->execute_graph($graph);
+my $result = $adapter->execute_graph_unsafe($graph);
 is($result->root->values->{id}, 41, 'graph exposes root returned values');
 is($result->nodes->{line_item}->values->{id}, 99, 'graph exposes child returned values');
 is_deeply($dbh->events, ['BEGIN', 'COMMIT'], 'graph executes in one transaction');
@@ -47,7 +47,7 @@ my $failed_dbh = TestSelecto::DBH->new(
     { execute_error => 'synthetic child constraint failure' },
 );
 my $failed_adapter = Selecto::PostgreSQL->new(dbh => $failed_dbh);
-my $failed = eval { $failed_adapter->execute_graph($graph); undef } // $@;
+my $failed = eval { $failed_adapter->execute_graph_unsafe($graph); undef } // $@;
 isa_ok($failed, 'Selecto::Error');
 is($failed->code, 'query_error',
     'a child database failure retains its normalized public code');
@@ -57,7 +57,7 @@ is_deeply($failed_dbh->events, ['BEGIN', 'ROLLBACK'],
     'a node-attributed graph failure still rolls back the managed transaction');
 
 my $unsupported = Selecto::MSSQL->new(dbh => TestSelecto::DBH->new);
-eval { $unsupported->execute_graph($graph) };
+eval { $unsupported->execute_graph_unsafe($graph) };
 is($@->code, 'write_capability_missing', 'non-graph adapters fail closed before a transaction begins');
 
 eval {
@@ -132,7 +132,7 @@ my $deep_graph = Selecto::Write::Graph->new(nodes => [
         bindings => [{ field => 'child_id', from => 'child', key => 'id' }],
     },
 ]);
-my $deep_result = $sqlite->execute_graph($deep_graph);
+my $deep_result = $sqlite->execute_graph_unsafe($deep_graph);
 is($deep_result->nodes->{grandchild}->values->{id}, 503,
     'the portable graph executor carries generated keys through three SQLite nodes');
 is_deeply(

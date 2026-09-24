@@ -29,7 +29,7 @@ use Selecto::Write ();
         };
     }
 
-    sub execute_write ($self, $command) {
+    sub execute_write ($self, $command, $authorization = undef) {
         $self->{last_write} = $self->preview_write($command);
         return Selecto::Write::Result->new(
             operation => $command->operation,
