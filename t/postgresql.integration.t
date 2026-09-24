@@ -449,6 +449,48 @@ is_deeply($value_engine->all($value_engine->query->select('id')
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_value_assets');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_value_sites');
 
+# Tenant-scoped graph: the engine's trusted tenant reaches every node.
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_scope_steps');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_scope_orders');
+$dbh->do('CREATE TABLE selecto_perl_test_scope_orders (id serial primary key, site_id integer not null, title text not null)');
+$dbh->do('CREATE TABLE selecto_perl_test_scope_steps (id serial primary key, site_id integer not null,
+    order_id integer not null references selecto_perl_test_scope_orders(id), instruction text not null)');
+my $scoped_contract = sub {
+    my ($table, $fields, $writable, %extra) = @_;
+    return {
+        schema_version => 1, name => $table,
+        source => {source_table => $table, primary_key => 'id', fields => $fields,
+            columns => {map { ($_ => {type => /id\z/ ? 'integer' : 'string'}) } @$fields},
+            associations => {}},
+        schemas => {}, joins => {},
+        writes => {operations => {insert => {enabled => 1}},
+            fields => {map { ($_ => {insertable => 1}) } @$writable},
+            scope => {tenant => {field => 'site_id'}}, %extra},
+    };
+};
+my $scoped_orders = Selecto::Domain->parse($scoped_contract->(
+    'selecto_perl_test_scope_orders', [qw(id site_id title)], ['title'],
+    relationships => {steps => {writable => 1, table => 'selecto_perl_test_scope_steps',
+        parent_key => 'id', child_key => 'order_id', allowed_ops => ['insert'],
+        domain => $scoped_contract->('selecto_perl_test_scope_steps',
+            [qw(id site_id order_id instruction)], ['instruction'])}},
+));
+my $scoped_engine = Selecto::Engine->new(domain => $scoped_orders,
+    adapter => Selecto->adapter(postgresql => (dbh => $dbh)), scope => {tenant => 7});
+my $scoped_result = $scoped_engine->execute_graph(Selecto::Write::Graph->new(nodes => [
+    {id => 'order', command => Selecto::Write::Command->new(operation => 'insert',
+        relation => 'selecto_perl_test_scope_orders', assignments => {title => 'Pump'},
+        metadata => {returning => ['site_id']})},
+    {id => 'step', command => Selecto::Write::Command->new(operation => 'insert',
+        relation => 'selecto_perl_test_scope_steps', assignments => {instruction => 'Isolate'},
+        metadata => {returning => ['site_id']}),
+        bindings => [{field => 'order_id', from => 'order', key => 'id'}]},
+]));
+is_deeply([map { $scoped_result->nodes->{$_}->values->{site_id} } qw(order step)], [7, 7],
+    'PostgreSQL graph nodes are assigned the trusted tenant');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_scope_steps');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_scope_orders');
+
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_grandchildren');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_children');

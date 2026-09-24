@@ -10,6 +10,7 @@ use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Error ();
 use Selecto::DataRules ();
+use Selecto::Write::Scope ();
 
 my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
@@ -170,6 +171,13 @@ sub _refresh_fingerprint {
         if keys %{$self->{experiences}};
     $fingerprint_value->{detail_actions} = $self->{detail_actions}
         if keys %{$self->{detail_actions}};
+    # Derived domains keep the governed write surface of their contract.
+    my $contract = $self->{contract};
+    if (ref($contract) eq 'HASH') {
+        for my $key (qw(writes actions capabilities choice_sources)) {
+            $fingerprint_value->{$key} = $contract->{$key} if defined $contract->{$key};
+        }
+    }
     my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
     $self->{fingerprint} = 'sha256:' . sha256_hex(encode_utf8($json));
     return $self;
@@ -264,6 +272,9 @@ sub _parse_canonical {
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
     _validate_value_expressions($domain, $source, $raw->{writes});
+    $domain->{write_tenant_scope} = Selecto::Write::Scope->parse_tenant(
+        $raw->{writes}, fields => $domain->fields, tenant_field => $source->{tenant_field},
+    );
     _validate_conditional_filter_choices($domain);
     _validate_picker_visible_id_paths($domain);
     $domain->{editors} = _validate_editors($domain, $raw->{editors});
@@ -1954,6 +1965,10 @@ sub required_predicate { return $_[0]->{required_predicate}; }
 sub tenant_field { return $_[0]->{tenant_field}; }
 sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
 sub rules        { return $_[0]->{rules}; }
+sub write_tenant_scope {
+    my $scope = $_[0]->{write_tenant_scope};
+    return $scope ? dclone($scope) : undef;
+}
 sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
 sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
 sub imports      { my $contract = $_[0]->contract // {}; return dclone($contract->{imports} // {}); }

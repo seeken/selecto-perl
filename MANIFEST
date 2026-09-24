@@ -55,6 +55,7 @@ lib/Selecto/Stream.pm
 lib/Selecto/ValueExpression.pm
 lib/Selecto/Write.pm
 lib/Selecto/Write/Expression.pm
+lib/Selecto/Write/Scope.pm
 script/with-local-deps
 t/00-load.t
 t/canned_page.integration.t
@@ -98,6 +99,7 @@ t/query_library.t
 t/sqlite.integration.t
 t/stream.t
 t/write.t
+t/write_authority.t
 t/write_governance.t
 t/write_graph.t
 lib/Selecto/Document/Integer.pm

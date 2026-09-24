@@ -939,8 +939,47 @@ my $result = $engine->execute_write($command);
 
 The command is portable data; Engine preview and execution validate its table,
 fields, and any declared `writes.*` policy against the governing domain before
-adapter dispatch. Direct adapter calls are the low-level compiler and execution
+adapter dispatch. Predicate fields resolve through the domain too: an undeclared
+field, an association path, or a computed field in a write predicate fails with
+`unknown_field`. Direct adapter calls are the low-level compiler and execution
 boundary and do not replace Engine governance.
+
+### Tenant scope
+
+A domain that declares `writes.scope.tenant` cannot be written without a
+trusted tenant, and the tenant always comes from the host that builds the
+engine, never from the command:
+
+```perl
+writes => {
+    scope => {tenant => {field => 'site_id', satisfied_by => ['trusted_context']}},
+    ...
+},
+
+my $engine = Selecto::Engine->new(
+    domain => $domain, adapter => $adapter,
+    scope => {tenant => $session->site_id},    # or $engine->with_scope(tenant => ...)
+);
+```
+
+`field` defaults to `source.tenant_field`, `required` may only be true, and
+`satisfied_by` lists the sources the contract accepts. Perl satisfies scope from
+`trusted_context` only; a contract that omits it cannot be written here. For
+every single write, batch command, and graph node governed by a scoped domain:
+
+- update and delete add `field = tenant` to their scope predicate;
+- insert and upsert are assigned the trusted tenant (the tenant field needs no
+  `insertable` grant);
+- a caller may restate the trusted tenant, but naming another tenant in an
+  assignment or predicate, or comparing the tenant field any other way, fails
+  with `tenant_mismatch`;
+- an upsert must resolve conflicts on a target that includes the tenant field
+  (`tenant_scope_conflict_target`);
+- an engine without a trusted tenant fails with `missing_tenant_scope`, and so
+  does a graph under a scoped root that reaches a nested domain storing the
+  tenant field without declaring its own `writes.scope.tenant`.
+
+A scoped engine cannot be re-scoped to another tenant.
 
 Assignments may use an adapter-independent mutation AST. Literal operands stay
 bound, identifiers are checked separately, and field references are validated
@@ -1058,9 +1097,26 @@ add source-state preconditions. Input declarations normalize booleans and
 defaults before deterministic variant or execution-case selection; selected
 variants can bind collection-patch metadata and input-backed assignments into
 the returned plan. Missing resolvers and hidden or disabled policy decisions
-fail closed in both preview and execute phases. Applying the plan through a host
-execution adapter and issuing or consuming opaque authorization grants remain
-separate future boundaries.
+fail closed in both preview and execute phases.
+
+The engine executes update and delete plans itself:
+
+```perl
+my $plan = $engine->plan_action({action => 'archive', target => 42});
+my $preview = $engine->preview_action($plan, resolver => $policy, context => $ctx);
+# {phase => 'preview', action => 'archive', decision => {...}, statement => {sql, params}}
+my $done = $engine->execute_action($plan, resolver => $policy, context => $ctx);
+# {phase => 'execute', action => 'archive', decision => {...}, result => Selecto::Write::Result}
+```
+
+Both phases authorize through the same capability path and build the command
+from the plan once (`$engine->action_command($plan)`): plan filters, including
+the target, transition source state, and declared preconditions, become the
+predicate; changes become assignments (`['system', 'now']` becomes
+`CURRENT_TIMESTAMP`); and the planned cardinality becomes the expected row
+count. The command then passes through the same governance and tenant scope as
+any other write. Insert and upsert plans, collection patches, and opaque
+single-use authorization grants remain host responsibilities.
 
 An action can further constrain selected-ID requests with domain metadata:
 
