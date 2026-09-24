@@ -19,7 +19,7 @@ sub new {
     _require(ref($fields) eq 'HASH' && keys(%$fields), 'invalid_shape_release', 'Published fields required');
     for my $id (keys %$fields) {
         my $field = $fields->{$id};
-        _require(_identifier($id) && ref($field) eq 'HASH' && _path($field->{path}) && ($field->{type} // '') =~ /\A(?:string|integer|boolean)\z/, 'invalid_shape_release', 'Invalid published scalar field');
+        _require(!!(_identifier($id) && ref($field) eq 'HASH' && _path($field->{path}) && ($field->{type} // '') =~ /\A(?:string|integer|boolean)\z/), 'invalid_shape_release', 'Invalid published scalar field');
     }
     _require(keys(%{$a->{relations}}), 'invalid_shape_release', 'Published relations required');
     for my $id (keys %{$a->{relations}}) {
@@ -28,7 +28,7 @@ sub new {
         _require(ref($r->{access_patterns}) eq 'HASH' && keys(%{$r->{access_patterns}}), 'invalid_access_pattern', 'Named access patterns required');
         for my $name (keys %{$r->{access_patterns}}) {
             my $p = $r->{access_patterns}{$name};
-            _require(_identifier($name) && ref($p) eq 'HASH' && _identifier($p->{index}), 'invalid_access_pattern', 'Invalid named index');
+            _require(!!(_identifier($name) && ref($p) eq 'HASH' && _identifier($p->{index})), 'invalid_access_pattern', 'Invalid named index');
             for my $key (qw(filter_fields order_fields)) {
                 _require(ref($p->{$key}) eq 'ARRAY' && !(grep { !_identifier($_) || !exists($fields->{$_}) } @{$p->{$key}}), 'invalid_access_pattern', 'Access pattern references unpublished fields');
             }
@@ -57,6 +57,6 @@ sub access_pattern {
     return dclone($r->{access_patterns}{$id});
 }
 sub _require { Selecto::Error->throw($_[1], $_[2]) unless $_[0] }
-sub _identifier { defined($_[0]) && !ref($_[0]) && $_[0] =~ /\A[a-z_][a-z0-9_]{0,63}\z/ }
-sub _path { ref($_[0]) eq 'ARRAY' && @{$_[0]} && @{$_[0]} <= 32 && !grep { !_identifier($_) } @{$_[0]} }
+sub _identifier { !!(defined($_[0]) && !ref($_[0]) && $_[0] =~ /\A[a-z_][a-z0-9_]{0,63}\z/) }
+sub _path { !!(ref($_[0]) eq 'ARRAY' && @{$_[0]} && @{$_[0]} <= 32 && !grep { !_identifier($_) } @{$_[0]}) }
 1;

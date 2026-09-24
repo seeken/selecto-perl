@@ -550,7 +550,7 @@ sub _project {
     my @actions = grep { $self->{service}{authorize}->($_, $self->{actor}, $self->{owner}, $value->{role}) }
         qw(download replace reorder detach);
     return {
-        map { $_ => $value->{$_} } qw(attachment_id file_id version_id name media_type byte_size caption role position primary state revision created_at),
+        (map { $_ => $value->{$_} } qw(attachment_id file_id version_id name media_type byte_size caption role position primary state revision created_at)),
         actions => \@actions,
         content_url => "/attachments/$value->{attachment_id}/content",
     };

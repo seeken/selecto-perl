@@ -33,7 +33,7 @@ sub new {
     my @fields = map { $release->field($_) } @$select;
     my $where = $args{where};
     if (defined $where) {
-        _require(ref($where) eq 'HASH' && keys(%$where) == 3 && ($where->{op} // '') =~ /\A(?:eq|gt|gte|lt|lte)\z/, 'invalid_predicate', 'Typed scalar comparison required');
+        _require(!!(ref($where) eq 'HASH' && keys(%$where) == 3 && ($where->{op} // '') =~ /\A(?:eq|gt|gte|lt|lte)\z/), 'invalid_predicate', 'Typed scalar comparison required');
         my $field = $release->field($where->{field});
         my %allowed = map { $_ => 1 } @{$pattern->{filter_fields}};
         _require($allowed{$where->{field}}, 'unsupported_access_pattern_predicate', 'Predicate is not allowed by access pattern');
@@ -48,7 +48,7 @@ sub new {
     _require(ref($order) eq 'ARRAY' && @$order <= 1, 'invalid_order', 'At most one order field allowed');
     if (@$order) {
         my %allowed = map { $_ => 1 } @{$pattern->{order_fields}};
-        _require(ref($order->[0]) eq 'ARRAY' && @{$order->[0]} == 2 && ($order->[0][1] // '') =~ /\A(?:asc|desc)\z/, 'invalid_order', 'Order entry requires field and direction');
+        _require(!!(ref($order->[0]) eq 'ARRAY' && @{$order->[0]} == 2 && ($order->[0][1] // '') =~ /\A(?:asc|desc)\z/), 'invalid_order', 'Order entry requires field and direction');
         $release->field($order->[0][0]);
         _require($allowed{$order->[0][0]}, 'unsupported_access_pattern_order', 'Order is not allowed by access pattern');
     }
