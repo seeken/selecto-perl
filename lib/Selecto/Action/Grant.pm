@@ -52,8 +52,11 @@ sub consume {
     for my $key (qw(phase plan domain tenant actor)) {
         my ($have, $want) = ($record->{$key}, $expected{$key});
         next if !defined($have) && !defined($want);
+        next if defined($have) && defined($want) && "$have" eq "$want";
+        # A grant presented for another binding may have leaked; revoke it.
+        $record->{used} = 1;
         Selecto::Error->throw('action_grant_mismatch', "action grant was issued for a different $key",
-            {binding => $key}) unless defined($have) && defined($want) && "$have" eq "$want";
+            {binding => $key});
     }
     $record->{used} = 1;
     return {%{$record->{decision}}, grant => $record->{id}};
