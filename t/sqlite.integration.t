@@ -18,7 +18,7 @@ my $domain = Selecto::Domain->new(
     fields => { id => 'integer', name => 'string', amount => 'decimal' },
 );
 my $adapter = Selecto->adapter(sqlite => (dbh => $dbh));
-my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter, write_policy => 'permissive');
 my $result = $engine->all($engine->query->select('id', 'name', 'amount')->order_by('id'));
 is_deeply(
     $result,

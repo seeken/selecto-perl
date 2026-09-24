@@ -1029,8 +1029,23 @@ The command is portable data; Engine preview and execution validate its table,
 fields, and any declared `writes.*` policy against the governing domain before
 adapter dispatch. Predicate fields resolve through the domain too: an undeclared
 field, an association path, or a computed field in a write predicate fails with
-`unknown_field`. Direct adapter calls are the low-level compiler and execution
-boundary and do not replace Engine governance.
+`unknown_field`.
+
+Engines are **strict** by default: a domain must declare `writes.operations`
+(with the operation enabled) and, for anything but deletes, `writes.fields`
+before the engine writes it; otherwise the write fails with
+`write_policy_missing`. A graph edge grants its operations through the
+relationship's `allowed_ops`. Legacy domains without a write policy need an
+explicit `Selecto::Engine->new(..., write_policy => 'permissive')`.
+
+Adapters execute only governed writes. The engine passes each validated
+command, batch, or graph to the adapter with a single-use
+`Selecto::Write::Authorization` for that exact object, and SQL adapters refuse
+`execute_write`, `execute_batch`, and `execute_graph` without one
+(`ungoverned_write`). `preview_write` still compiles without executing. The
+`execute_write_unsafe`, `execute_batch_unsafe`, and `execute_graph_unsafe`
+adapter methods skip domain governance and exist for trusted internal tooling
+and adapter tests only.
 
 ### Tenant scope
 

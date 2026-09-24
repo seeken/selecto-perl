@@ -34,6 +34,7 @@ sub new {
         adapter => $args{adapter},
         domain_ref => $args{domain_ref},
         scope => _trusted_scope($args{scope}),
+        write_policy => _write_policy($args{write_policy}),
     }, $class;
 }
 
@@ -50,6 +51,20 @@ sub _trusted_scope {
     my $tenant = Selecto::Write::Scope->trusted_tenant($scope->{tenant});
     return defined($tenant) ? {tenant => $tenant} : {};
 }
+
+# strict (default): a domain must declare writes.operations, and writes.fields
+# for anything but deletes, before this engine writes it. permissive keeps the
+# earlier behavior, where absent sections allow the write; it must be chosen
+# explicitly.
+sub _write_policy {
+    my ($policy) = @_;
+    $policy //= 'strict';
+    Selecto::Error->throw('invalid_write_policy', 'write_policy must be strict or permissive')
+        unless !ref($policy) && ($policy eq 'strict' || $policy eq 'permissive');
+    return $policy;
+}
+
+sub write_policy { return $_[0]->{write_policy}; }
 
 sub scope { return {%{$_[0]->{scope}}}; }
 
@@ -85,6 +100,7 @@ sub from_registry {
         domain_ref => $ref,
         adapter => $args{adapter},
         (defined($args{scope}) ? (scope => $args{scope}) : ()),
+        (defined($args{write_policy}) ? (write_policy => $args{write_policy}) : ()),
     );
 }
 
@@ -449,6 +465,7 @@ sub _checked_writes {
 sub _validate_command_against_contract {
     my ($self, $command, %context) = @_;
     my $operation = $command->operation;
+    my $label = $context{label} // $command->relation;
     if ($context{allowed_ops}) {
         my %allowed = map { ("$_" => 1) } @{$context{allowed_ops}};
         Selecto::Error->throw(
@@ -458,6 +475,21 @@ sub _validate_command_against_contract {
     }
     my $writes = _checked_writes($context{writes});
     my $fields_spec = ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : undef;
+    if ($self->{write_policy} eq 'strict') {
+        # A strict engine writes only what a domain explicitly grants. A graph
+        # edge grants its operations through the relationship's allowed_ops.
+        Selecto::Error->throw(
+            'write_policy_missing',
+            "the $label write contract declares no writes.operations",
+            {relation => $context{label} // $command->relation, operation => $operation},
+        ) unless ref($writes->{operations}) eq 'HASH'
+            || (ref($context{allowed_ops}) eq 'ARRAY' && @{$context{allowed_ops}});
+        Selecto::Error->throw(
+            'write_policy_missing',
+            "the $label write contract declares no writes.fields",
+            {relation => $context{label} // $command->relation, operation => $operation},
+        ) unless defined($fields_spec) || $operation eq 'delete';
+    }
     if (ref($writes->{operations}) eq 'HASH') {
         my $op_spec = $writes->{operations}{$operation};
         Selecto::Error->throw(
@@ -466,7 +498,6 @@ sub _validate_command_against_contract {
         ) unless ref($op_spec) eq 'HASH' && $op_spec->{enabled};
     }
     my $domain_fields = $context{fields};
-    my $label = $context{label} // $command->relation;
     my $permission = $operation eq 'insert' || $operation eq 'upsert' ? 'insertable' : 'updatable';
     if (defined($fields_spec) && ($operation eq 'insert' || $operation eq 'upsert')) {
         my @missing = sort grep {

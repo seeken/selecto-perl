@@ -26,7 +26,10 @@ my $domain = Selecto::Domain->new(
     fields => { id => 'integer', tenant_id => 'integer', status => 'string', total => 'decimal' },
     required_predicate => Selecto::Expression->eq('tenant_id', 7),
 );
-my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => $dbh)));
+my $engine = Selecto::Engine->new(
+    domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => $dbh)),
+    write_policy => 'permissive',    # legacy domain with no declared write policy
+);
 my $query = $engine->query->select('id')->where(Selecto::Expression->all(
     Selecto::Expression->eq('id', 1), Selecto::Expression->eq('status', 'active'),
 ))->limit(1);
@@ -72,7 +75,9 @@ my $tenant_domain = Selecto::Domain->new(
     name => 'Scoped Items', table => 'items', fields => $domain->fields,
     tenant_field => 'tenant_id',
 );
-my $tenant_engine = Selecto::Engine->new(domain => $tenant_domain, adapter => $engine->adapter);
+my $tenant_engine = Selecto::Engine->new(
+    domain => $tenant_domain, adapter => $engine->adapter, write_policy => 'permissive',
+);
 my $tenant_query = $tenant_engine->query->where(Selecto::Expression->eq('tenant_id', 7));
 for my $scope (
     undef,
