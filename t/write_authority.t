@@ -79,7 +79,7 @@ sub work_order_contract {
                 insert => {enabled => 1},
                 update => {enabled => 1, bulk => 1},
                 delete => {enabled => 1},
-                upsert => {enabled => 1},
+                upsert => {enabled => 1, conflict_targets => [[qw(site_id work_order_no)]]},
             },
             fields => {
                 work_order_no => {insertable => 1, required => 1},
@@ -99,6 +99,16 @@ sub work_order_contract {
             },
         },
         actions => {
+            open_order => {
+                type => 'create', label => 'Open order',
+                execution => {kind => 'updato', operation => 'insert',
+                    set => {work_order_no => 'WO-NEW', title => 'Opened by action', state => 'open'}},
+            },
+            sync_order => {
+                type => 'create', label => 'Sync order',
+                execution => {kind => 'updato', operation => 'upsert',
+                    set => {work_order_no => 'WO-2', title => 'Synced by action', state => 'open'}},
+            },
             archive => {
                 type => 'transition', scope => 'row', capability => 'work_orders.archive',
                 transition => {field => 'state', from => 'done', to => 'archived'},
@@ -352,6 +362,30 @@ is(code_of(sub { $adapter->execute_batch(Selecto::Write::Batch->new($raw)) }), '
 is(code_of(sub { $adapter->execute_graph(Selecto::Write::Graph->new(nodes => [{id => 'r', command => $raw}])) }),
     'ungoverned_write', 'an adapter refuses a raw graph');
 is(title_of(3), 'Belt', 'no bypass attempt wrote anything');
+
+# --- insert and upsert actions --------------------------------------------------------
+
+my $open = $site10->plan_action({action => 'open_order'});
+is($open->scope, 'create', 'an insert action plans a create');
+my $opened = $site10->execute_action($open);
+is($opened->{result}->affected_rows, 1, 'an insert action writes one row');
+is($dbh->selectrow_array(q{SELECT site_id FROM work_orders WHERE work_order_no = 'WO-NEW'}), 10,
+    'an insert action is assigned the trusted tenant');
+is(code_of(sub { $site10->plan_action({action => 'open_order', target => 1}) }), 'action_scope_mismatch',
+    'insert actions take no target');
+is(code_of(sub { $unscoped->execute_action($open) }), 'missing_tenant_scope',
+    'insert actions on a scoped domain require trusted scope');
+
+my $sync_command = $site10->action_command($site10->plan_action({action => 'sync_order'}));
+is_deeply($sync_command->metadata->{conflict_target}, [qw(site_id work_order_no)],
+    'an upsert action resolves conflicts on the declared target');
+is_deeply($sync_command->metadata->{upsert_update_fields}, [qw(state title)],
+    'an upsert action updates only updatable changes, never conflict keys');
+$site10->execute_action($site10->plan_action({action => 'sync_order'}));
+is($dbh->selectrow_array(q{SELECT title FROM work_orders WHERE site_id = 10 AND work_order_no = 'WO-2'}),
+    'Synced by action', 'the upsert updated the conflicting row within the tenant');
+is($dbh->selectrow_array(q{SELECT title FROM work_orders WHERE site_id = 20}), 'Other site pump',
+    "another tenant's row with the same number is untouched");
 
 # --- fingerprints -----------------------------------------------------------------------
 
