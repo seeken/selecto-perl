@@ -13,6 +13,7 @@ lib/Selecto/API/EngineHandler.pm
 lib/Selecto/API/ResultFormatter.pm
 lib/Selecto/Action.pm
 lib/Selecto/Action/Capability.pm
+lib/Selecto/Action/Grant.pm
 lib/Selecto/Action/Plan.pm
 lib/Selecto/Action/Planner.pm
 lib/Selecto/Analytics/UnitRegistry.pm

@@ -1227,6 +1227,24 @@ target. An upsert resolves conflicts on a target declared under
 changed fields the write contract marks `updatable`. Collection patches remain
 a host responsibility.
 
+When authorization and execution happen at different moments (a confirmation
+dialog, a queued job), issue a single-use grant instead of passing the resolver
+again:
+
+```perl
+my $grant = $engine->grant_action($plan, phase => 'execute',
+    resolver => $policy, context => $ctx, expires_in => 300);
+# later, on the same trusted tenant:
+my $done = $engine->execute_action($plan, grant => $grant, context => $ctx);
+# $done->{decision}{grant} eq $grant->id, for the audit record
+```
+
+A grant is opaque and bound to its phase, the plan's content, the domain
+fingerprint, the engine's trusted tenant, and the context's actor. It works
+once and only before it expires; a different binding fails with
+`action_grant_mismatch`, and a used, expired, or forged grant with
+`action_grant_invalid`. A denied capability issues no grant.
+
 An action can further constrain selected-ID requests with domain metadata:
 
 ```perl
