@@ -14,6 +14,9 @@ use Selecto::QueryEnforcement ();
 use Selecto::QueryLibrary ();
 use Selecto::Write ();
 use Selecto::Write::Expression ();
+use Selecto::Write::Scope ();
+use Selecto::Action::Capability ();
+use Selecto::Action::Planner ();
 
 sub new {
     my ($class, %args) = @_;
@@ -29,7 +32,37 @@ sub new {
         domain => $args{domain},
         adapter => $args{adapter},
         domain_ref => $args{domain_ref},
+        scope => _trusted_scope($args{scope}),
     }, $class;
+}
+
+# Trusted scope comes from the host that built the engine (for example from an
+# authenticated request), never from a write command or an action intent.
+sub _trusted_scope {
+    my ($scope) = @_;
+    return {} unless defined $scope;
+    Selecto::Error->throw('invalid_tenant_scope', 'engine scope must be an object')
+        unless ref($scope) eq 'HASH';
+    my @unknown = sort grep { $_ ne 'tenant' } keys %$scope;
+    Selecto::Error->throw('invalid_tenant_scope', 'engine scope contains unsupported keys', {keys => \@unknown})
+        if @unknown;
+    my $tenant = Selecto::Write::Scope->trusted_tenant($scope->{tenant});
+    return defined($tenant) ? {tenant => $tenant} : {};
+}
+
+sub scope { return {%{$_[0]->{scope}}}; }
+
+# A copy of this engine bound to trusted scope. An engine that already holds a
+# tenant cannot be re-scoped to a different one.
+sub with_scope {
+    my ($self, %scope) = @_;
+    my $next = _trusted_scope(\%scope);
+    my $current = $self->{scope}{tenant};
+    Selecto::Error->throw('tenant_mismatch', 'engine is already scoped to a different tenant')
+        if defined($current) && defined($next->{tenant}) && "$current" ne "$next->{tenant}";
+    my $copy = bless {%$self}, ref($self);
+    $copy->{scope} = {%{$self->{scope}}, %$next};
+    return $copy;
 }
 
 sub from_registry {
@@ -50,6 +83,7 @@ sub from_registry {
         domain => $domain,
         domain_ref => $ref,
         adapter => $args{adapter},
+        (defined($args{scope}) ? (scope => $args{scope}) : ()),
     );
 }
 
@@ -81,22 +115,17 @@ sub stream {
 }
 sub preview_write {
     my ($self, $command) = @_;
-    $command = $self->_normalize_write_command($command);
-    $self->_validate_write_command($command);
-    return $self->{adapter}->preview_write($command);
+    return $self->{adapter}->preview_write($self->governed_write($command));
 }
 sub execute_write {
     my ($self, $command) = @_;
-    $command = $self->_normalize_write_command($command);
-    $self->_validate_write_command($command);
-    return $self->{adapter}->execute_write($command);
+    return $self->{adapter}->execute_write($self->governed_write($command));
 }
 sub execute_batch {
     my ($self, $batch) = @_;
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
-    my @commands = map { $self->_normalize_write_command($_) } @{$batch->commands};
-    $self->_validate_write_command($_) for @commands;
+    my @commands = map { $self->governed_write($_) } @{$batch->commands};
     return $self->{adapter}->execute_batch(Selecto::Write::Batch->new(@commands));
 }
 sub execute_graph {
@@ -104,22 +133,160 @@ sub execute_graph {
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
     my @nodes = @{$graph->nodes};
-    $nodes[0]{command} = $self->_normalize_write_command($nodes[0]{command});
-    $graph = Selecto::Write::Graph->new(nodes => \@nodes);
-    @nodes = @{$graph->nodes};
-    $self->_validate_write_command($nodes[0]{command});
+    $nodes[0]{command} = $self->governed_write($nodes[0]{command});
+    my $writes = _checked_writes($self->{domain}->writes);
     my %contexts = ($nodes[0]{id} => {
         table         => $self->{domain}->table,
         primary_key   => $self->{domain}->primary_key,
         fields        => $self->{domain}->fields,
         fields_known  => 1,
-        writes        => _checked_writes($self->{domain}->writes),
-        relationships => _checked_writes($self->{domain}->writes)->{relationships},
+        writes        => $writes,
+        relationships => $writes->{relationships},
+        tenant_scope  => $self->{domain}->write_tenant_scope,
     });
+    my $root_scope = $self->{domain}->write_tenant_scope;
     for my $node (@nodes[1 .. $#nodes]) {
-        $contexts{$node->{id}} = $self->_validate_graph_node($node, \%contexts);
+        ($contexts{$node->{id}}, $node->{command}) =
+            $self->_validate_graph_node($node, \%contexts, $root_scope);
     }
-    return $self->{adapter}->execute_graph($graph);
+    return $self->{adapter}->execute_graph(Selecto::Write::Graph->new(nodes => \@nodes));
+}
+
+# The single path from a caller's command to the command an adapter receives:
+# normalize assignments, apply the domain's tenant scope with the engine's
+# trusted tenant, then validate against the domain contract.
+sub governed_write {
+    my ($self, $command) = @_;
+    Selecto::Error->throw('invalid_write', 'write command required')
+        unless blessed($command) && $command->isa('Selecto::Write::Command');
+    Selecto::Error->throw(
+        'write_relation_mismatch',
+        'write relation must be the domain table',
+        { relation => $command->relation, expected => $self->{domain}->table },
+    ) unless $command->relation eq $self->{domain}->table;
+    $command = $self->_normalize_write_command($command);
+    my $scope = $self->{domain}->write_tenant_scope;
+    $command = Selecto::Write::Scope->apply(
+        $command, $scope, $self->{scope}{tenant}, label => $command->relation,
+    );
+    $self->_validate_write_command($command, trusted_field => $scope ? $scope->{field} : undef);
+    return $command;
+}
+
+# ---------------------------------------------------------------------------
+# Domain actions: plan -> authorize -> governed write.
+#
+# preview_action and execute_action authorize the plan through the same
+# capability path with their own phase, then build the command from the plan
+# exactly once, so preview shows the statement execute would run.
+
+sub plan_action {
+    my ($self, $intent) = @_;
+    return Selecto::Action::Planner->plan($self->{domain}, $intent);
+}
+
+my %ACTION_COMPARATOR = (eq => 'eq', neq => 'ne', gt => 'gt', gte => 'gte', lt => 'lt', lte => 'lte');
+
+# The write command for an action plan, before tenant scope. Plan filters
+# already carry the target, transition source state, and declared
+# preconditions; the planned cardinality becomes the expected row count.
+sub action_command {
+    my ($self, $plan, %options) = @_;
+    Selecto::Error->throw('invalid_action_plan', 'action plan is required')
+        unless blessed($plan) && $plan->isa('Selecto::Action::Plan');
+    Selecto::Error->throw('invalid_action_plan', 'action plan belongs to a different domain')
+        unless ref($self->{domain}->actions) eq 'HASH' && $self->{domain}->actions->{$plan->action};
+    my $operation = $plan->operation // '';
+    Selecto::Error->throw(
+        'unsupported_action_operation',
+        'core action execution supports update and delete plans',
+        {operation => $operation},
+    ) unless $operation eq 'update' || $operation eq 'delete';
+    Selecto::Error->throw(
+        'unsupported_action_collection_patch',
+        'collection patches require a host executor',
+    ) if ref($plan->collection_patches) eq 'ARRAY' && @{$plan->collection_patches}
+        || ref($plan->collection_patches) eq 'HASH' && keys %{$plan->collection_patches};
+    my ($kind, $count) = @{$plan->expected_cardinality // []};
+    Selecto::Error->throw(
+        'unsupported_action_cardinality',
+        'action plans must declare an exact cardinality',
+    ) unless defined($kind) && $kind eq 'exactly' && defined($count) && "$count" =~ /\A[1-9][0-9]*\z/;
+    my @filters = map { _action_filter($_) } @{$plan->filters // []};
+    Selecto::Error->throw('invalid_action_plan', 'action plans must filter their target') unless @filters;
+    return Selecto::Write::Command->new(
+        operation => $operation,
+        relation => $self->{domain}->table,
+        assignments => $operation eq 'delete' ? {} : _action_assignments($plan->changes),
+        predicate => @filters == 1 ? $filters[0] : Selecto::Expression->all(@filters),
+        expected_count => 0 + $count,
+        metadata => {$options{returning} ? (returning => [@{$options{returning}}]) : ()},
+    );
+}
+
+sub preview_action {
+    my ($self, $plan, %options) = @_;
+    my $decision = $self->_authorize_action($plan, 'preview', %options);
+    my $command = $self->governed_write($self->action_command($plan, %options));
+    return {
+        phase => 'preview',
+        action => $plan->action,
+        decision => $decision,
+        statement => $self->{adapter}->preview_write($command),
+    };
+}
+
+sub execute_action {
+    my ($self, $plan, %options) = @_;
+    my $decision = $self->_authorize_action($plan, 'execute', %options);
+    my $command = $self->governed_write($self->action_command($plan, %options));
+    return {
+        phase => 'execute',
+        action => $plan->action,
+        decision => $decision,
+        result => $self->{adapter}->execute_write($command),
+    };
+}
+
+sub _authorize_action {
+    my ($self, $plan, $phase, %options) = @_;
+    return Selecto::Action::Capability->authorize(
+        $plan, $phase,
+        resolver => $options{resolver},
+        context => $options{context} // {},
+    );
+}
+
+# Plan filters are field-first: [field, value] or [field, comparator, value].
+sub _action_filter {
+    my ($filter) = @_;
+    Selecto::Error->throw('invalid_action_plan', 'action filters must be arrays')
+        unless ref($filter) eq 'ARRAY' && (@$filter == 2 || @$filter == 3);
+    my ($field, @rest) = @$filter;
+    return Selecto::Expression->eq($field, $rest[0]) if @rest == 1;
+    my ($comparator, $value) = @rest;
+    return Selecto::Expression->in($field, $value) if $comparator eq 'in';
+    my $method = $ACTION_COMPARATOR{$comparator}
+        // Selecto::Error->throw('invalid_action_plan', 'unsupported action filter comparator',
+            {comparator => $comparator});
+    return Selecto::Expression->$method($field, $value);
+}
+
+# ['system', 'now'] is the one portable system value an action may assign.
+sub _action_assignments {
+    my ($changes) = @_;
+    my %assignments;
+    for my $field (keys %{$changes // {}}) {
+        my $value = $changes->{$field};
+        if (ref($value) eq 'ARRAY') {
+            Selecto::Error->throw('invalid_action_changes', 'action change value is not portable',
+                {field => $field})
+                unless @$value == 2 && ($value->[0] // '') eq 'system' && ($value->[1] // '') eq 'now';
+            $value = Selecto::Write::Expression->current_timestamp;
+        }
+        $assignments{$field} = $value;
+    }
+    return \%assignments;
 }
 
 sub _normalize_write_command {
@@ -169,8 +336,16 @@ sub enforce_query_evidence {
     Selecto::QueryEnforcement::validate_source($self->domain, $command->relation, $evidence);
     my $tenant_field = $self->domain->tenant_field;
     Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
-        if defined($tenant_field) && !_has_tenant_conjunct($command->scope_predicate, $tenant_field);
+        if defined($tenant_field) && !_has_tenant_conjunct($command->scope_predicate, $tenant_field)
+            && !$self->_scopes_tenant_field($tenant_field);
     return $command->with_query_enforcement($evidence);
+}
+
+# True when execution will add the trusted tenant for this field itself.
+sub _scopes_tenant_field {
+    my ($self, $field) = @_;
+    my $scope = $self->{domain}->write_tenant_scope;
+    return $scope && $scope->{field} eq $field && defined($self->{scope}{tenant});
 }
 
 # A scope counts as tenant-scoped only when a positive conjunct (eq or in over
@@ -217,7 +392,7 @@ sub _is_tenant_comparison {
 # the contract declares a writes section its per-operation switches and
 # per-field permissions are enforced. enforce_query remains the row-guard.
 sub _validate_write_command {
-    my ($self, $command) = @_;
+    my ($self, $command, %options) = @_;
     Selecto::Error->throw('invalid_write', 'write command required')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
     Selecto::Error->throw(
@@ -244,6 +419,8 @@ sub _validate_write_command {
         values_foreign_keys => $self->{domain}->values_foreign_keys,
         allowed_ops => undef,
         label       => $command->relation,
+        trusted_field => $options{trusted_field},
+        computed    => sub { ref($self->{domain}->field_metadata($_[0])->{computed}) eq 'HASH' },
     );
 }
 
@@ -300,6 +477,9 @@ sub _validate_command_against_contract {
             Selecto::Error->throw('unknown_field', "write field is not declared by $label", { field => $field })
                 unless exists $domain_fields->{$field};
             next unless defined($fields_spec);
+            # The trusted tenant is assigned by scope, not granted to callers.
+            next if $permission eq 'insertable' && defined($context{trusted_field})
+                && $field eq $context{trusted_field};
             my $spec = $fields_spec->{$field};
             Selecto::Error->throw(
                 'write_field_not_writable',
@@ -313,6 +493,16 @@ sub _validate_command_against_contract {
                 "mutation expression field is not declared by $label",
                 { field => $field },
             ) unless exists $domain_fields->{$field};
+        }
+    }
+    if ($domain_fields) {
+        for my $field (_predicate_fields($command->predicate, $command->scope_predicate)) {
+            Selecto::Error->throw(
+                'unknown_field',
+                "write predicate field is not a stored field of $label",
+                { field => $field },
+            ) unless exists($domain_fields->{$field})
+                && !($context{computed} && $context{computed}->($field));
         }
     }
     _validate_values_foreign_keys(
@@ -382,6 +572,27 @@ sub _validate_values_foreign_keys {
     }
 }
 
+# Every governed field a write predicate reads. Write predicates address the
+# written relation only, so association paths never resolve.
+sub _predicate_fields {
+    my %fields;
+    my @pending = grep { defined } @_;
+    while (@pending) {
+        my $node = shift @pending;
+        if (ref($node) eq 'ARRAY') {
+            push @pending, @$node;
+            next;
+        }
+        next unless blessed($node) && $node->isa('Selecto::Expression');
+        if ($node->kind eq 'field') {
+            $fields{$node->arguments->[0]} = 1;
+            next;
+        }
+        push @pending, @{$node->arguments};
+    }
+    return sort keys %fields;
+}
+
 sub _required_write_value_missing {
     my ($assignments, $field) = @_;
     return 1 unless exists $assignments->{$field};
@@ -405,7 +616,7 @@ sub _mutation_reference_fields {
 # writable relationship declared on the exact parent node it references, and
 # the binding must name that relationship's parent_key and child_key.
 sub _validate_graph_node {
-    my ($self, $node, $contexts) = @_;
+    my ($self, $node, $contexts, $root_scope) = @_;
     my $command = $node->{command};
     Selecto::Error->throw('invalid_write_graph', 'graph node requires a write command')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
@@ -439,21 +650,40 @@ sub _validate_graph_node {
             $edge_id = $found->{edge_id};
         }
     }
+    my $scope = $edge->{tenant_scope};
+    if (!$scope && $root_scope) {
+        # A tenant-scoped graph cannot reach a node whose tenant it cannot see.
+        Selecto::Error->throw(
+            'missing_tenant_scope',
+            'nested writes under a tenant-scoped domain must declare their domain',
+            {relation => $command->relation, graph_node => $node->{id}},
+        ) unless $edge->{fields_known};
+        Selecto::Error->throw(
+            'missing_tenant_scope',
+            'nested domain stores the tenant field but declares no writes.scope.tenant',
+            {relation => $command->relation, graph_node => $node->{id}, field => $root_scope->{field}},
+        ) if exists $edge->{fields}{$root_scope->{field}};
+    }
+    $command = Selecto::Write::Scope->apply(
+        $command, $scope, $self->{scope}{tenant}, label => $command->relation,
+    );
     my %nested_fields = %{$edge->{fields} // {}};
     $self->_validate_command_against_contract($command,
         ($edge->{fields_known} ? (fields => \%nested_fields) : (fields => undef)),
         writes      => $edge->{writes},
         allowed_ops => $edge->{allowed_ops},
         label       => $command->relation,
+        trusted_field => $scope ? $scope->{field} : undef,
     );
-    return {
+    return ({
         table         => $edge->{table},
         primary_key   => $edge->{primary_key},
         fields_known  => $edge->{fields_known},
         fields        => $edge->{fields},
         writes        => $edge->{writes},
         relationships => $edge->{relationships},
-    };
+        tenant_scope  => $scope,
+    }, $command);
 }
 
 sub _match_relationship {
@@ -524,6 +754,11 @@ sub _relationship_context {
     my $nested = ref($spec->{domain}) eq 'HASH' ? $spec->{domain} : {};
     my $nested_writes = _checked_writes($nested->{writes});
     my $fields_known = ref($nested->{source}) eq 'HASH' && ref($nested->{source}{fields}) eq 'ARRAY';
+    my $tenant_scope = Selecto::Write::Scope->parse_tenant(
+        $nested->{writes},
+        ($fields_known ? (fields => { map { ("$_" => 1) } @{$nested->{source}{fields}} }) : ()),
+        tenant_field => ref($nested->{source}) eq 'HASH' ? $nested->{source}{tenant_field} : undef,
+    );
     return {
         ($edge_id ? (edge_id => $edge_id) : ()),
         ($table ? (table => $table) : ()),
@@ -535,6 +770,7 @@ sub _relationship_context {
         writes        => $nested_writes,
         relationships => $nested_writes->{relationships},
         allowed_ops   => [map { "$_" } @{$spec->{allowed_ops} // []}],
+        ($tenant_scope ? (tenant_scope => $tenant_scope) : ()),
     };
 }
 
