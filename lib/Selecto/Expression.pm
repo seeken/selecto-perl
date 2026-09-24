@@ -187,6 +187,13 @@ sub gte { my ($class, $field, $value) = @_; return $class->_binary('gte', $field
 sub lt  { my ($class, $field, $value) = @_; return $class->_binary('lt',  $field, $value); }
 sub lte { my ($class, $field, $value) = @_; return $class->_binary('lte', $field, $value); }
 
+sub starts_with {
+    my ($class, $field, $prefix) = @_;
+    Selecto::Error->throw('invalid_query', 'starts_with requires a string prefix')
+        if !defined($prefix) || ref($prefix);
+    return $class->_binary('starts_with', $field, "$prefix");
+}
+
 sub between {
     my ($class, $field, $start, $end) = @_;
     return $class->new(

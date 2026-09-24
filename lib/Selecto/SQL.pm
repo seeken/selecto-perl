@@ -763,6 +763,20 @@ sub _compile_expression {
         return $self->_compile_expression($domain, $arguments->[0], $params) . " $operator " .
             $self->_compile_expression($domain, $arguments->[1], $params);
     }
+    if ($kind eq 'starts_with') {
+        my $literal = $arguments->[1];
+        Selecto::Error->throw('invalid_query', 'starts_with requires a literal string prefix')
+            unless blessed($literal) && $literal->isa('Selecto::Expression')
+            && $literal->kind eq 'literal';
+        my $prefix = $literal->arguments->[0];
+        Selecto::Error->throw('invalid_query', 'starts_with requires a literal string prefix')
+            if !defined($prefix) || ref($prefix);
+        $prefix =~ s/([!%_])/!$1/g;
+        my $field_sql = $self->_compile_expression($domain, $arguments->[0], $params);
+        push @$params, "$prefix%";
+        return $field_sql . ' LIKE ' . $self->placeholder(scalar @$params)
+            . q{ ESCAPE '!'};
+    }
     if ($kind eq 'between') {
         return $self->_compile_expression($domain, $arguments->[0], $params) . ' BETWEEN ' .
             $self->_compile_expression($domain, $arguments->[1], $params) . ' AND ' .

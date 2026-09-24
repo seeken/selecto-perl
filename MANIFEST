@@ -19,6 +19,7 @@ lib/Selecto/Analytics/TransformRegistry.pm
 lib/Selecto/Analytics/Pipeline.pm
 lib/Selecto/Adapter.pm
 lib/Selecto/Adapter/Registry.pm
+lib/Selecto/CannedPage.pm
 lib/Selecto/CoDomain.pm
 lib/Selecto/DateShortcut.pm
 lib/Selecto/Domain.pm
@@ -54,6 +55,7 @@ lib/Selecto/Write.pm
 lib/Selecto/Write/Expression.pm
 script/with-local-deps
 t/00-load.t
+t/canned_page.integration.t
 t/action.t
 t/analytics_unit_registry.t
 t/analytics_pipeline.t
