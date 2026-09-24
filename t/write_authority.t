@@ -310,6 +310,34 @@ is(code_of(sub { $unscoped->execute_action($other, resolver => $resolver) }), 'm
 is(code_of(sub { $site10->execute_action($other, resolver => sub { 'disabled' }) }),
     'action_capability_denied', 'a denied capability stops execution before any write');
 
+# --- write policy ----------------------------------------------------------------------
+
+{
+    my $legacy = Selecto::Domain->new(
+        name => 'Legacy', table => 'work_orders',
+        fields => {id => 'integer', title => 'string', site_id => 'integer'},
+    );
+    my $strict = Selecto::Engine->new(domain => $legacy, adapter => $adapter);
+    is($strict->write_policy, 'strict', 'engines are strict by default');
+    is(code_of(sub { $strict->preview_write(update(assignments => {title => 'x'})) }), 'write_policy_missing',
+        'a domain without a write policy is denied');
+    my $permissive = Selecto::Engine->new(domain => $legacy, adapter => $adapter, write_policy => 'permissive');
+    is(code_of(sub { $permissive->preview_write(update(assignments => {title => 'x'})) }), 'ok',
+        'permissive must be chosen explicitly');
+    is(code_of(sub { Selecto::Engine->new(domain => $legacy, adapter => $adapter, write_policy => 'lax') }),
+        'invalid_write_policy', 'only strict and permissive exist');
+
+    my $no_fields = work_order_contract();
+    delete $no_fields->{writes}{fields};
+    my $partial = Selecto::Engine->new(domain => Selecto::Domain->parse($no_fields), adapter => $adapter,
+        scope => {tenant => 10});
+    is(code_of(sub { $partial->preview_write(update(assignments => {title => 'x'})) }), 'write_policy_missing',
+        'strict engines also require writes.fields for anything but deletes');
+    is(code_of(sub { $partial->preview_write(Selecto::Write::Command->new(
+        operation => 'delete', relation => 'work_orders', predicate => Selecto::Expression->eq('id', 3),
+    )) }), 'ok', 'a declared delete needs no field grants');
+}
+
 # --- the adapter boundary ---------------------------------------------------------------
 
 my $raw = update(id => 3, assignments => {title => 'bypass'});

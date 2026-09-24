@@ -29,7 +29,10 @@ my $domain = Selecto::Domain->new(
     fields => { id => 'integer', tenant_id => 'integer', status => 'string', total => 'decimal' },
     tenant_field => 'tenant_id',
 );
-my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => $dbh)));
+my $engine = Selecto::Engine->new(
+    domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => $dbh)),
+    write_policy => 'permissive',    # legacy domain with no declared write policy
+);
 
 # Direct constructor cannot smuggle hostile order directions or pagination values.
 for my $direction ('desc; drop table items', 'DESCENDING', '') {
