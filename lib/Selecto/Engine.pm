@@ -223,9 +223,9 @@ sub action_command {
     my $operation = $plan->operation // '';
     Selecto::Error->throw(
         'unsupported_action_operation',
-        'core action execution supports update and delete plans',
+        'core action execution supports insert, update, upsert, and delete plans',
         {operation => $operation},
-    ) unless $operation eq 'update' || $operation eq 'delete';
+    ) unless $operation =~ /\A(?:insert|update|upsert|delete)\z/;
     Selecto::Error->throw(
         'unsupported_action_collection_patch',
         'collection patches require a host executor',
@@ -236,6 +236,20 @@ sub action_command {
         'unsupported_action_cardinality',
         'action plans must declare an exact cardinality',
     ) unless defined($kind) && $kind eq 'exactly' && defined($count) && "$count" =~ /\A[1-9][0-9]*\z/;
+    if ($operation eq 'insert' || $operation eq 'upsert') {
+        Selecto::Error->throw('invalid_action_plan', 'insert and upsert plans create exactly one row')
+            unless $count == 1 && !@{$plan->filters // []};
+        return Selecto::Write::Command->new(
+            operation => $operation,
+            relation => $self->{domain}->table,
+            assignments => _action_assignments($plan->changes),
+            expected_count => 1,
+            metadata => {
+                ($operation eq 'upsert' ? $self->_action_upsert_metadata($plan) : ()),
+                ($options{returning} ? (returning => [@{$options{returning}}]) : ()),
+            },
+        );
+    }
     my @filters = map { _action_filter($_) } @{$plan->filters // []};
     Selecto::Error->throw('invalid_action_plan', 'action plans must filter their target') unless @filters;
     return Selecto::Write::Command->new(
@@ -246,6 +260,35 @@ sub action_command {
         expected_count => 0 + $count,
         metadata => {$options{returning} ? (returning => [@{$options{returning}}]) : ()},
     );
+}
+
+# An upsert action resolves conflicts on a target the domain declares under
+# writes.operations.upsert.conflict_targets: the action's execution.conflict_target,
+# or the only declared target. DO UPDATE sets the changed fields the write
+# contract marks updatable, never the conflict keys.
+sub _action_upsert_metadata {
+    my ($self, $plan) = @_;
+    my $writes = _checked_writes($self->{domain}->writes);
+    my $upsert = ref($writes->{operations}) eq 'HASH' ? $writes->{operations}{upsert} : undef;
+    my $declared = ref($upsert) eq 'HASH' && ref($upsert->{conflict_targets}) eq 'ARRAY'
+        ? $upsert->{conflict_targets} : [];
+    my $action = $self->{domain}->actions->{$plan->action} // {};
+    my $execution = ref($action->{execution}) eq 'HASH' ? $action->{execution} : {};
+    my $target = $execution->{conflict_target} // (@$declared == 1 ? $declared->[0] : undef);
+    Selecto::Error->throw(
+        'conflict_target_not_declared',
+        'upsert actions resolve conflicts on a target declared by writes.operations.upsert.conflict_targets',
+        {action => $plan->action},
+    ) unless ref($target) eq 'ARRAY' && @$target
+        && grep { ref($_) eq 'ARRAY' && join("\0", @$_) eq join("\0", @$target) } @$declared;
+    my %key = map { ("$_" => 1) } @$target;
+    my $fields = ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : {};
+    my @updates = sort grep {
+        !$key{$_} && ref($fields->{$_}) eq 'HASH' && $fields->{$_}{updatable}
+    } keys %{$plan->changes // {}};
+    Selecto::Error->throw('invalid_action_plan', 'upsert actions need at least one updatable change',
+        {action => $plan->action}) unless @updates;
+    return (conflict_target => [map { "$_" } @$target], upsert_update_fields => \@updates);
 }
 
 sub preview_action {

@@ -43,7 +43,11 @@ sub plan {
     _validate_changes($writes, $changes, $operation);
     my $collection_patches = _collection_patches($execution, $inputs);
 
-    my ($scope, $filters, $expected, $target) = _target($contract, $action, $operation_spec, $intent->{target});
+    # Guards cannot apply to a create; report that before the target shape.
+    _declared_preconditions($contract, $action, $operation) if $operation eq 'insert' || $operation eq 'upsert';
+    my ($scope, $filters, $expected, $target) = $operation eq 'insert' || $operation eq 'upsert'
+        ? _create_target($action, $intent->{target})
+        : _target($contract, $action, $operation_spec, $intent->{target});
     my ($transition, $preconditions) = _transition($writes, $action, $changes);
     $preconditions = [@{_declared_preconditions($contract, $action, $operation)}, @$preconditions];
     push @$filters, map {
@@ -320,6 +324,17 @@ sub _contract {
     return dclone($input);
 }
 
+# Insert and upsert actions create one row from their changes; they name no
+# existing row, so a submitted target is refused rather than ignored.
+sub _create_target {
+    my ($action, $target) = @_;
+    Selecto::Error->throw('action_scope_mismatch', 'insert and upsert actions take no target')
+        if defined($target) && !(ref($target) eq 'HASH' && !keys %$target);
+    Selecto::Error->throw('action_scope_mismatch', 'insert and upsert actions cannot be bulk actions')
+        if _id($action->{scope}) eq 'bulk' || _id($action->{type}) eq 'bulk_action';
+    return ('create', [], ['exactly', 1], undef);
+}
+
 sub _target {
     my ($contract, $action, $operation_spec, $target) = @_;
     my $primary_key = "$contract->{source}{primary_key}";
@@ -395,7 +410,7 @@ sub _validate_changes {
     Selecto::Error->throw('invalid_action_changes', 'action changes must not be empty') unless keys %$changes;
     for my $field (keys %$changes) {
         my $field_spec = $writes->{fields}{$field};
-        my $permission = $operation eq 'insert' ? 'insertable' : 'updatable';
+        my $permission = $operation eq 'insert' || $operation eq 'upsert' ? 'insertable' : 'updatable';
         Selecto::Error->throw('action_field_not_writable', 'action changes an undeclared write field', { field => $field })
             unless ref($field_spec) eq 'HASH' && $field_spec->{$permission};
     }

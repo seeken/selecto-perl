@@ -1218,8 +1218,14 @@ the target, transition source state, and declared preconditions, become the
 predicate; changes become assignments (`['system', 'now']` becomes
 `CURRENT_TIMESTAMP`); and the planned cardinality becomes the expected row
 count. The command then passes through the same governance and tenant scope as
-any other write. Insert and upsert plans, collection patches, and opaque
-single-use authorization grants remain host responsibilities.
+any other write.
+
+Insert and upsert actions create one row from their changes and take no
+target. An upsert resolves conflicts on a target declared under
+`writes.operations.upsert.conflict_targets` (the action's
+`execution.conflict_target`, or the only declared target) and updates only the
+changed fields the write contract marks `updatable`. Collection patches remain
+a host responsibility.
 
 An action can further constrain selected-ID requests with domain metadata:
 
