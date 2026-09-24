@@ -14,7 +14,7 @@ sub new {
     my ($class, %args) = @_;
     my %allowed = map { $_ => 1 } qw(
         selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
-        set_operations ctes lateral_joins json_rowsets timezone row_lock
+        set_operations ctes lateral_joins json_rowsets array_rowsets timezone row_lock
     );
     my @unknown = sort grep { !$allowed{$_} } keys %args;
     Selecto::Error->throw(
@@ -64,6 +64,7 @@ sub new {
     my $ctes = $args{ctes} // [];
     my $lateral_joins = $args{lateral_joins} // [];
     my $json_rowsets = $args{json_rowsets} // [];
+    my $array_rowsets = $args{array_rowsets} // [];
     my $timezone = $args{timezone};
     my $row_lock = $args{row_lock};
     Selecto::Error->throw('invalid_query', 'row lock must be share')
@@ -77,8 +78,10 @@ sub new {
         unless ref($lateral_joins) eq 'ARRAY';
     Selecto::Error->throw('invalid_query', 'JSON rowsets must be an array')
         unless ref($json_rowsets) eq 'ARRAY';
+    Selecto::Error->throw('invalid_query', 'array rowsets must be an array')
+        unless ref($array_rowsets) eq 'ARRAY';
     Selecto::Error->throw('invalid_query', 'advanced query source entries must be objects')
-        if grep { ref($_) ne 'HASH' } (@$ctes, @$lateral_joins, @$json_rowsets);
+        if grep { ref($_) ne 'HASH' } (@$ctes, @$lateral_joins, @$json_rowsets, @$array_rowsets);
     return bless {
         selections  => [@{$args{selections} // []}],
         predicate   => $args{predicate},
@@ -95,6 +98,7 @@ sub new {
         ctes => [map { _clone_cte_spec($_) } @$ctes],
         lateral_joins => [map { _clone_lateral_spec($_) } @$lateral_joins],
         json_rowsets => [map { _clone_json_rowset_spec($_) } @$json_rowsets],
+        array_rowsets => [map { {%$_} } @$array_rowsets],
         timezone => defined($timezone) ? "$timezone" : undef,
         row_lock => $row_lock,
         applied_query_library => dclone($args{applied_query_library} // {
@@ -301,6 +305,31 @@ sub json_rowset {
     }]);
 }
 
+# Expands an array field into one row per element. The source exposes `value`
+# and, with ordinality => 'position', the element's 1-based position.
+sub array_rowset {
+    my ($self, $source_field, $name, %opts) = @_;
+    $self->_ensure_pre_set_mutation('array_rowset');
+    _known_options(\%opts, [qw(ordinality type)], 'array rowset');
+    _source_name($name, 'array rowset alias');
+    _unique_source_name($self, $name);
+    Selecto::Error->throw('invalid_query', 'array rowset source field is required')
+        unless defined($source_field) && !ref($source_field) && "$source_field" ne '';
+    my $ordinality = $opts{ordinality};
+    if (defined $ordinality) {
+        _source_name($ordinality, 'array rowset ordinality column');
+        Selecto::Error->throw('invalid_query', 'array rowset ordinality column must differ from value')
+            if $ordinality eq 'value';
+    }
+    my $type = lc($opts{type} // 'cross');
+    Selecto::Error->throw('invalid_query', 'array rowset join type must be cross, inner, or left')
+        unless $type eq 'left' || $type eq 'inner' || $type eq 'cross';
+    return $self->_copy(array_rowsets => [@{$self->{array_rowsets}}, {
+        name => "$name", source_field => "$source_field", type => $type,
+        (defined($ordinality) ? (ordinality => "$ordinality") : ()),
+    }]);
+}
+
 sub _source_name {
     my ($value, $label) = @_;
     Selecto::Error->throw('invalid_query', "$label must be a valid identifier")
@@ -370,7 +399,8 @@ sub _join_spec {
 sub _unique_source_name {
     my ($self, $name) = @_;
     my %names = map { $_->{name} => 1 }
-        (@{$self->{ctes}}, @{$self->{lateral_joins}}, @{$self->{json_rowsets}});
+        (@{$self->{ctes}}, @{$self->{lateral_joins}}, @{$self->{json_rowsets}},
+            @{$self->{array_rowsets}});
     Selecto::Error->throw('invalid_query', "duplicate query source $name") if $names{$name};
 }
 
@@ -445,6 +475,7 @@ sub _copy {
         ctes => $self->{ctes},
         lateral_joins => $self->{lateral_joins},
         json_rowsets => $self->{json_rowsets},
+        array_rowsets => $self->{array_rowsets},
         timezone => $self->{timezone},
         row_lock => $self->{row_lock},
         applied_query_library => $self->{applied_query_library},
@@ -466,6 +497,7 @@ sub set_operations { return [map {{%$_}} @{$_[0]->{set_operations}}]; }
 sub ctes { return [map { _clone_cte_spec($_) } @{$_[0]->{ctes}}]; }
 sub lateral_joins { return [map { _clone_lateral_spec($_) } @{$_[0]->{lateral_joins}}]; }
 sub json_rowsets { return [map { _clone_json_rowset_spec($_) } @{$_[0]->{json_rowsets}}]; }
+sub array_rowsets { return [map { {%$_} } @{$_[0]->{array_rowsets}}]; }
 sub applied_query_library { return dclone($_[0]->{applied_query_library}); }
 
 sub _clone_cte_spec {

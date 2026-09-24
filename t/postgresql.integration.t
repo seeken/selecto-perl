@@ -491,6 +491,51 @@ is_deeply([map { $scoped_result->nodes->{$_}->values->{site_id} } qw(order step)
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_scope_steps');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_scope_orders');
 
+# Arrays and JSON containment.
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_arrays');
+$dbh->do('CREATE TABLE selecto_perl_test_arrays (id integer primary key, tags text[], metadata jsonb)');
+$dbh->do(q{INSERT INTO selecto_perl_test_arrays VALUES
+    (1, ARRAY['b','a','c'], '{"power":"three_phase","ports":[1,2]}'),
+    (2, ARRAY['a'], '{"power":"single_phase"}'),
+    (3, ARRAY[]::text[], '{}'),
+    (4, NULL, NULL)});
+my $array_engine = Selecto::Engine->new(
+    domain => Selecto::Domain->parse({
+        schema_version => 1, name => 'ArrayAssets',
+        source => {source_table => 'selecto_perl_test_arrays', primary_key => 'id',
+            fields => [qw(id metadata tags)],
+            columns => {id => {type => 'integer'}, tags => {type => 'array', items => 'string'},
+                metadata => {type => 'jsonb'}},
+            associations => {}},
+        schemas => {}, joins => {},
+    }),
+    adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+);
+my $ids = sub {
+    my ($predicate) = @_;
+    return [map { $_->[0] } @{$array_engine->all(
+        $array_engine->query->select('id')->where($predicate)->order_by('id', 'asc'))->{rows}}];
+};
+my $X = 'Selecto::Expression';
+is_deeply($ids->($X->array_contains('tags', ['a', 'c'])), [1], 'PostgreSQL array_contains needs every value');
+is_deeply($ids->($X->array_overlap('tags', ['c', 'a'])), [1, 2], 'PostgreSQL array_overlap needs any value');
+is_deeply($ids->($X->array_contained('tags', ['a', 'z'])), [2, 3], 'PostgreSQL array_contained admits empty arrays, never NULL');
+is_deeply($ids->($X->json_contains('metadata', {ports => [2]})), [1], 'PostgreSQL json_contains matches nested containment');
+is_deeply($ids->($X->not($X->json_contains('metadata', {power => 'three_phase'}))), [2, 3],
+    'NOT json_contains keeps SQL NULL semantics');
+is_deeply($array_engine->all($array_engine->query
+    ->array_rowset('tags', 'tag_rows', ordinality => 'position')
+    ->select('id', 'tag_rows.value', 'tag_rows.position')
+    ->order_by('id', 'asc')->order_by('tag_rows.position', 'asc'))->{rows},
+    [[1, 'b', 1], [1, 'a', 2], [1, 'c', 3], [2, 'a', 1]],
+    'PostgreSQL array_rowset preserves element order');
+is_deeply($array_engine->all($array_engine->query
+    ->array_rowset('tags', 'tag_rows', type => 'left')
+    ->select('id', 'tag_rows.value')->where($X->gte('id', 2))->order_by('id', 'asc'))->{rows},
+    [[2, 'a'], [3, undef], [4, undef]],
+    'a left array_rowset keeps rows with empty and NULL arrays');
+$dbh->do('DROP TABLE IF EXISTS selecto_perl_test_arrays');
+
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_grandchildren');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_form_children');
 $dbh->do('DROP TABLE IF EXISTS selecto_perl_test_graph_children');

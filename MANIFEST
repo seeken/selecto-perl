@@ -69,6 +69,7 @@ t/advanced_query.t
 t/api.t
 t/api_engine_handler.t
 t/api_result_formatter.t
+t/array_json.t
 t/api_query_library_parity_live.t
 t/api_through_association_parity_live.t
 t/api_write_parity_live.t

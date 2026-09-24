@@ -271,6 +271,29 @@ sub in {
     return $class->new('in', $class->_operand($field), [@values]);
 }
 
+# Array predicates compare an array field with a bound, element-typed list:
+# contains (field has every value), contained (every element is a value), and
+# overlap (field has at least one value). NULL arrays never match.
+sub array_contains  { my ($class, $field, @values) = @_; return $class->_array_predicate('array_contains', $field, @values); }
+sub array_contained { my ($class, $field, @values) = @_; return $class->_array_predicate('array_contained', $field, @values); }
+sub array_overlap   { my ($class, $field, @values) = @_; return $class->_array_predicate('array_overlap', $field, @values); }
+
+sub _array_predicate {
+    my ($class, $kind, $field, @values) = @_;
+    @values = @{$values[0]} if @values == 1 && ref($values[0]) eq 'ARRAY';
+    Selecto::Error->throw('invalid_query', "$kind requires a non-empty list of scalar values")
+        unless @values && !grep { !defined($_) || ref($_) } @values;
+    return $class->new($kind, $class->_operand($field), [@values]);
+}
+
+# JSON containment: the field's document contains the bound document.
+sub json_contains {
+    my ($class, $field, $document) = @_;
+    Selecto::Error->throw('invalid_query', 'json_contains requires an object or array document')
+        unless ref($document) eq 'HASH' || ref($document) eq 'ARRAY';
+    return $class->new('json_contains', $class->_operand($field), $document);
+}
+
 sub all {
     my ($class, @expressions) = @_;
     @expressions = @{$expressions[0]} if @expressions == 1 && ref($expressions[0]) eq 'ARRAY';
@@ -309,6 +332,16 @@ sub from_filter_ast {
     }
 
     my ($field, $value, $end) = @arguments;
+    if ($operator =~ /\A(?:array_contains|array_contained|array_overlap)\z/) {
+        Selecto::Error->throw('invalid_query', "$operator filter requires a field and a value list")
+            unless @arguments == 2 && ref($value) eq 'ARRAY';
+        return $class->can($operator)->($class, _filter_field($field), $value);
+    }
+    if ($operator eq 'json_contains') {
+        Selecto::Error->throw('invalid_query', 'json_contains filter requires a field and a document')
+            unless @arguments == 2;
+        return $class->json_contains(_filter_field($field), $value);
+    }
     Selecto::Error->throw('invalid_query', 'filter field must be a governed field name')
         unless defined($field) && !ref($field)
             && "$field" =~ /\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*\z/;
@@ -350,6 +383,14 @@ sub from_filter_ast {
         $right = $class->literal($value);
     }
     return $class->can($operator)->($class, $field, $right);
+}
+
+sub _filter_field {
+    my ($field) = @_;
+    Selecto::Error->throw('invalid_query', 'filter field must be a governed field name')
+        unless defined($field) && !ref($field)
+            && "$field" =~ /\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*\z/;
+    return "$field";
 }
 
 sub _binary {
