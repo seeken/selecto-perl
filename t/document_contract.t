@@ -62,6 +62,44 @@ for my $args (
     eval { Selecto::Document::Plan->new(release=>$release,tenant=>'tenant-a',relation=>'work_orders',access_pattern=>'by_tenant',select=>['id'],%$args) };
     isa_ok($@, 'Selecto::Error', 'invalid intent rejected by public plan boundary');
 }
+sub plan_error {
+    my (%args) = @_;
+    eval { Selecto::Document::Plan->new(release=>$release,tenant=>'tenant-a',relation=>'work_orders',access_pattern=>'by_tenant',select=>['id'],%args) };
+    return ref($@) ? $@->code : "no error: $@";
+}
+for my $op (qw(like in nin ne regex), '') {
+    is(plan_error(where=>{field=>'id',op=>$op,value=>'wo-1'}), 'invalid_predicate', "unsupported predicate op '$op' fails as invalid_predicate");
+}
+is(plan_error(where=>{field=>'id',value=>'wo-1'}), 'invalid_predicate', 'missing predicate op fails as invalid_predicate');
+is(plan_error(order=>[['id','sideways']]), 'invalid_order', 'unknown order direction fails as invalid_order');
+is(plan_error(order=>[['id']]), 'invalid_order', 'order entry without direction fails as invalid_order');
+
+sub release_error {
+    my ($mutate) = @_;
+    my $copy = {
+        status => 'approved',
+        source => {id => 'mongo_work_orders', collection => 'work_orders', tenant_path => ['tenant_id']},
+        shape => {fields => {id => {path => ['_id'], type => 'string'}, tenant_id => {path => ['tenant_id'], type => 'string'}}},
+        relations => {work_orders => {kind => 'root', access_patterns => {
+            by_tenant => {index => 'tenant_id_1__id_1', filter_fields => ['id'], order_fields => ['id']},
+        }}},
+    };
+    $mutate->($copy);
+    eval { Selecto::Document::ShapeRelease->new(artifact => $copy) };
+    return ref($@) ? $@->code : "no error: $@";
+}
+is(release_error(sub { $_[0]{shape}{fields}{amount} = {path => ['amount'], type => 'decimal'} }),
+    'invalid_shape_release', 'unsupported decimal field type fails closed');
+is(release_error(sub { $_[0]{shape}{fields}{amount} = {path => ['amount']} }),
+    'invalid_shape_release', 'missing field type fails closed');
+is(release_error(sub { $_[0]{shape}{fields}{amount} = {path => ['Bad-Path'], type => 'string'} }),
+    'invalid_shape_release', 'invalid field path fails closed');
+is(release_error(sub { $_[0]{relations}{work_orders}{access_patterns}{by_tenant}{index} = 'Not An Index' }),
+    'invalid_access_pattern', 'invalid access-pattern index fails closed');
+is(release_error(sub { delete $_[0]{relations}{work_orders}{access_patterns}{by_tenant}{index} }),
+    'invalid_access_pattern', 'missing access-pattern index fails closed');
+is(release_error(sub { $_[0]{source}{collection} = 'Bad Collection' }),
+    'invalid_shape_release', 'invalid source collection fails closed');
 my $forged = bless {}, 'Selecto::Document::Plan';
 eval { $forged->validate_scope($release, 'tenant-a') };
 is($@->code, 'invalid_document_plan', 'forged native plan rejected');

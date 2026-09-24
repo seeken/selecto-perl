@@ -41,6 +41,10 @@ is($a->download($first->{attachment_id}), '%PDF-perl', 'downloads through record
 is_deeply($b->list(role => 'documents'), [], 'tenant collision is isolated');
 eval { $b->download($first->{attachment_id}) };
 isa_ok($@, 'Selecto::Error', 'cross-tenant attachment is hidden');
+is_deeply([sort keys %$first], [sort qw(attachment_id file_id version_id name media_type byte_size caption role position primary state revision created_at actions content_url)],
+    'projection keys are exactly the public attachment fields');
+is_deeply($first->{actions}, [qw(download replace reorder detach)], 'projection lists authorized actions');
+is($first->{content_url}, "/attachments/$first->{attachment_id}/content", 'projection exposes content URL');
 my $public = JSON::PP->new->encode($first);
 unlike($public, qr/(?:tenant|scope|bucket|object_key|storage_ref|credentials|provider)/, 'projection hides infrastructure');
 
