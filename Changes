@@ -1,0 +1,7 @@
+Revision history for Selecto
+
+0.2.0  2026-09-21
+    - First stable CPAN release of the governed domain, query, portable-write,
+      and database-adapter contracts.
+    - Require Mojolicious 9.49 or newer and harden domain URL validation.
+    - Bound importer cell sizes.
