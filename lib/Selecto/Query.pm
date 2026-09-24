@@ -14,7 +14,7 @@ sub new {
     my ($class, %args) = @_;
     my %allowed = map { $_ => 1 } qw(
         selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
-        set_operations ctes lateral_joins json_rowsets array_rowsets timezone row_lock
+        set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
     );
     my @unknown = sort grep { !$allowed{$_} } keys %args;
     Selecto::Error->throw(
@@ -65,6 +65,9 @@ sub new {
     my $lateral_joins = $args{lateral_joins} // [];
     my $json_rowsets = $args{json_rowsets} // [];
     my $array_rowsets = $args{array_rowsets} // [];
+    my $members = $args{members} // [];
+    Selecto::Error->throw('invalid_query', 'query members must be an array of names')
+        unless ref($members) eq 'ARRAY' && !grep { !defined($_) || ref($_) } @$members;
     my $timezone = $args{timezone};
     my $row_lock = $args{row_lock};
     Selecto::Error->throw('invalid_query', 'row lock must be share')
@@ -99,6 +102,7 @@ sub new {
         lateral_joins => [map { _clone_lateral_spec($_) } @$lateral_joins],
         json_rowsets => [map { _clone_json_rowset_spec($_) } @$json_rowsets],
         array_rowsets => [map { {%$_} } @$array_rowsets],
+        members => [map { "$_" } @$members],
         timezone => defined($timezone) ? "$timezone" : undef,
         row_lock => $row_lock,
         applied_query_library => dclone($args{applied_query_library} // {
@@ -305,6 +309,19 @@ sub json_rowset {
     }]);
 }
 
+# Activates a query member the domain declares; the compiler expands it into a
+# CTE, lateral, or array rowset source.
+sub with_member {
+    my ($self, $name) = @_;
+    $self->_ensure_pre_set_mutation('with_member');
+    _source_name($name, 'query member');
+    Selecto::Error->throw('invalid_query', "query member $name is already active")
+        if grep { $_ eq $name } @{$self->{members}};
+    return $self->_copy(members => [@{$self->{members}}, "$name"]);
+}
+
+sub without_members { return $_[0]->_copy(members => []); }
+
 # Expands an array field into one row per element. The source exposes `value`
 # and, with ordinality => 'position', the element's 1-based position.
 sub array_rowset {
@@ -476,6 +493,7 @@ sub _copy {
         lateral_joins => $self->{lateral_joins},
         json_rowsets => $self->{json_rowsets},
         array_rowsets => $self->{array_rowsets},
+        members => $self->{members},
         timezone => $self->{timezone},
         row_lock => $self->{row_lock},
         applied_query_library => $self->{applied_query_library},
@@ -498,6 +516,7 @@ sub ctes { return [map { _clone_cte_spec($_) } @{$_[0]->{ctes}}]; }
 sub lateral_joins { return [map { _clone_lateral_spec($_) } @{$_[0]->{lateral_joins}}]; }
 sub json_rowsets { return [map { _clone_json_rowset_spec($_) } @{$_[0]->{json_rowsets}}]; }
 sub array_rowsets { return [map { {%$_} } @{$_[0]->{array_rowsets}}]; }
+sub members { return [@{$_[0]->{members}}]; }
 sub applied_query_library { return dclone($_[0]->{applied_query_library}); }
 
 sub _clone_cte_spec {
