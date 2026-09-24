@@ -37,7 +37,8 @@ my $domain = Selecto::Domain->new(
         },
     },
 );
-my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter,
+    write_policy => 'permissive');    # legacy domain without a write policy
 my $query = $engine->query->select(qw(id name active total))
     ->where(Selecto::Expression->eq(name => q{baseline' OR 1=1 --}));
 
