@@ -2,6 +2,7 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
+use JSON::PP ();
 use Storable qw(dclone);
 use lib 't/lib';
 use TestSelecto;
@@ -230,6 +231,10 @@ like($duck_json->sql, qr/AS DECIMAL\(38, 10\)/, 'DuckDB divides at a wide fixed 
 is($duck_json->params->[0], '$.manufacturer', 'DuckDB binds its JSON path');
 
 is(Selecto::ValueExpression->category('utc_datetime'), 'datetime', 'type categories normalize timestamps');
+is_deeply(Selecto::ValueExpression->parse(['literal', JSON::PP::true]), ['literal', 1, 'boolean'],
+    'JSON boolean literals are typed boolean, as in every runtime');
+is_deeply(Selecto::ValueExpression->parse(['literal', 2.5]), ['literal', 2.5, 'decimal'],
+    'fractional literals are typed decimal');
 is_deeply([Selecto::ValueExpression->dependencies($domain->field_metadata('attention_state')->{computed}{expression})],
     [qw(retired_at status)], 'dependencies include case condition fields');
 
