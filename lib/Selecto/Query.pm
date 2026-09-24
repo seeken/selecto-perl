@@ -14,7 +14,7 @@ sub new {
     my ($class, %args) = @_;
     my %allowed = map { $_ => 1 } qw(
         selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
-        set_operations ctes lateral_joins json_rowsets timezone
+        set_operations ctes lateral_joins json_rowsets timezone row_lock
     );
     my @unknown = sort grep { !$allowed{$_} } keys %args;
     Selecto::Error->throw(
@@ -65,6 +65,9 @@ sub new {
     my $lateral_joins = $args{lateral_joins} // [];
     my $json_rowsets = $args{json_rowsets} // [];
     my $timezone = $args{timezone};
+    my $row_lock = $args{row_lock};
+    Selecto::Error->throw('invalid_query', 'row lock must be share')
+        if defined($row_lock) && (ref($row_lock) || $row_lock ne 'share');
     Selecto::Error->throw('invalid_query', 'timezone must be a valid IANA timezone name')
         if defined($timezone) && (
             ref($timezone) || !DateTime::TimeZone->is_valid_name("$timezone")
@@ -93,6 +96,7 @@ sub new {
         lateral_joins => [map { _clone_lateral_spec($_) } @$lateral_joins],
         json_rowsets => [map { _clone_json_rowset_spec($_) } @$json_rowsets],
         timezone => defined($timezone) ? "$timezone" : undef,
+        row_lock => $row_lock,
         applied_query_library => dclone($args{applied_query_library} // {
             segments => [], projections => [], projection => undef,
             ordering => undef, views => [],
@@ -194,6 +198,8 @@ sub _set_operation {
         if exists($opts{all}) && ref($opts{all});
     Selecto::Error->throw('invalid_query', 'portable ALL semantics are available only for UNION')
         if $operation ne 'union' && $opts{all};
+    Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')
+        if defined($self->{row_lock}) || defined($query->row_lock);
     return $self->_copy(set_operations => [
         @{$self->{set_operations}},
         {operation => $operation, all => $opts{all} ? 1 : 0, query => $query},
@@ -381,6 +387,7 @@ sub _set_base_query {
     my ($self) = @_;
     return $self->_copy(
         set_operations => [], orders => [], limit_value => undef, offset_value => undef,
+        row_lock => undef,
     );
 }
 
@@ -398,6 +405,7 @@ sub count_query {
         orders => [],
         limit_value => undef,
         offset_value => undef,
+        row_lock => undef,
     );
     if (@values) {
         $changes{selections} = [map {
@@ -410,6 +418,11 @@ sub count_query {
 sub limit  { my ($self, $value) = @_; return $self->_copy(limit_value  => _nonnegative($value, 'limit')); }
 sub offset { my ($self, $value) = @_; return $self->_copy(offset_value => _nonnegative($value, 'offset')); }
 sub use_timezone { my ($self, $value) = @_; return $self->_copy(timezone => $value); }
+sub for_share {
+    my ($self) = @_;
+    $self->_ensure_pre_set_mutation('for_share');
+    return $self->_copy(row_lock => 'share');
+}
 
 sub _nonnegative {
     my ($value, $label) = @_;
@@ -433,6 +446,7 @@ sub _copy {
         lateral_joins => $self->{lateral_joins},
         json_rowsets => $self->{json_rowsets},
         timezone => $self->{timezone},
+        row_lock => $self->{row_lock},
         applied_query_library => $self->{applied_query_library},
         %changes,
     );
@@ -447,6 +461,7 @@ sub orders       { return [map { [@$_] } @{$_[0]->{orders}}]; }
 sub limit_value  { return $_[0]->{limit_value}; }
 sub offset_value { return $_[0]->{offset_value}; }
 sub timezone { return $_[0]->{timezone}; }
+sub row_lock { return $_[0]->{row_lock}; }
 sub set_operations { return [map {{%$_}} @{$_[0]->{set_operations}}]; }
 sub ctes { return [map { _clone_cte_spec($_) } @{$_[0]->{ctes}}]; }
 sub lateral_joins { return [map { _clone_lateral_spec($_) } @{$_[0]->{lateral_joins}}]; }

@@ -59,6 +59,20 @@ sub domain_ref { return $_[0]->{domain_ref}; }
 sub query   { return Selecto::Query->new; }
 sub compile { my ($self, $query) = @_; return $self->{adapter}->compile($self->{domain}, $query); }
 sub all     { my ($self, $query) = @_; return $self->{adapter}->execute_query($self->compile($query)); }
+sub projection_sum {
+    my ($self, $query, $column) = @_;
+    Selecto::Error->throw('unsupported_feature', 'configured adapter does not support projection sums')
+        unless $self->{adapter}->supports('projection_sum')
+            && $self->{adapter}->can('projection_sum_statement');
+    my $statement = $self->{adapter}->projection_sum_statement($self->compile($query), $column);
+    my $result = $self->{adapter}->execute_query($statement);
+    my $rows = $result->{rows};
+    Selecto::Error->throw('invalid_query', 'projection sum returned an invalid result')
+        unless ref($rows) eq 'ARRAY' && @$rows == 1
+            && ref($rows->[0]) eq 'ARRAY' && @{$rows->[0]} == 1
+            && defined($rows->[0][0]);
+    return $rows->[0][0];
+}
 sub stream {
     my ($self, $query, %options) = @_;
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not support streaming')
