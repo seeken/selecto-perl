@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use JSON::PP ();
+use Time::HiRes ();
 use Scalar::Util qw(blessed);
 use Selecto::Domain ();
 use Selecto::Domain::Ref ();
@@ -17,6 +18,7 @@ use Selecto::Write::Expression ();
 use Selecto::Write::Scope ();
 use Selecto::Write::Authorization ();
 use Selecto::Action::Capability ();
+use Selecto::Action::Grant ();
 use Selecto::Action::Planner ();
 
 sub new {
@@ -315,8 +317,47 @@ sub execute_action {
     };
 }
 
+# Issues a single-use grant for one phase of $plan after the host's resolver
+# enables it. The grant is bound to the phase, the plan's content, this
+# engine's domain and trusted tenant, and the actor in the context.
+sub grant_action {
+    my ($self, $plan, %options) = @_;
+    my $phase = $options{phase} // 'execute';
+    my $decision = Selecto::Action::Capability->authorize(
+        $plan, $phase, resolver => $options{resolver}, context => $options{context} // {},
+    );
+    my $expires_in = $options{expires_in};
+    Selecto::Error->throw('invalid_action_grant', 'expires_in must be a positive number of seconds')
+        if defined($expires_in) && !($expires_in =~ /\A\d+(?:\.\d+)?\z/ && $expires_in > 0);
+    return Selecto::Action::Grant->_issue(
+        $self->_grant_binding($plan, $phase, $options{context}),
+        decision => $decision,
+        (defined($expires_in) ? (expires_at => Time::HiRes::time() + $expires_in) : ()),
+    );
+}
+
+sub _grant_binding {
+    my ($self, $plan, $phase, $context) = @_;
+    my $actor = ref($context) eq 'HASH' ? $context->{actor} : undef;
+    $actor = $actor->{id} if ref($actor) eq 'HASH';
+    return (
+        phase => "$phase",
+        plan => Selecto::Action::Grant->plan_digest($plan),
+        domain => $self->{domain}->fingerprint,
+        tenant => $self->{scope}{tenant},
+        actor => defined($actor) && !ref($actor) ? "$actor" : undef,
+    );
+}
+
+# With grant => $grant the phase consumes that grant; otherwise it asks the
+# resolver directly, which is the same as issuing and consuming a grant.
 sub _authorize_action {
     my ($self, $plan, $phase, %options) = @_;
+    Selecto::Error->throw('invalid_action_plan', 'action plan is required')
+        unless blessed($plan) && $plan->isa('Selecto::Action::Plan');
+    return Selecto::Action::Grant->consume(
+        $options{grant}, $self->_grant_binding($plan, $phase, $options{context}),
+    ) if exists $options{grant};
     return Selecto::Action::Capability->authorize(
         $plan, $phase,
         resolver => $options{resolver},

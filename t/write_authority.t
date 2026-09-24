@@ -387,6 +387,39 @@ is($dbh->selectrow_array(q{SELECT title FROM work_orders WHERE site_id = 10 AND 
 is($dbh->selectrow_array(q{SELECT title FROM work_orders WHERE site_id = 20}), 'Other site pump',
     "another tenant's row with the same number is untouched");
 
+# --- single-use action grants ----------------------------------------------------------
+
+$dbh->do(q{INSERT INTO work_orders VALUES (9, 10, 'WO-G', 'Granted', 'done')});
+my $alice = {actor => {id => 'alice'}};
+my $grant_plan = $site10->plan_action({action => 'archive', target => 9});
+my $grant = $site10->grant_action($grant_plan, phase => 'execute', resolver => $resolver, context => $alice);
+like($grant->id, qr/\A[0-9a-f]{32}\z/, 'a grant has an opaque id for audit correlation');
+
+is(code_of(sub { $site10->execute_action($grant_plan, grant => $grant, context => {actor => {id => 'bob'}}) }),
+    'action_grant_mismatch', 'a grant is bound to its actor');
+is(code_of(sub { $site10->execute_action($site10->plan_action({action => 'archive', target => 1}),
+    grant => $grant, context => $alice) }), 'action_grant_mismatch', 'a grant is bound to its plan');
+is(code_of(sub { $unscoped->with_scope(tenant => 20)->execute_action($grant_plan, grant => $grant, context => $alice) }),
+    'action_grant_mismatch', 'a grant is bound to its tenant');
+is(code_of(sub { $site10->preview_action($grant_plan, grant => $grant, context => $alice) }),
+    'action_grant_mismatch', 'a grant is bound to its phase');
+
+my $granted = $site10->execute_action($grant_plan, grant => $grant, context => $alice);
+is($granted->{result}->affected_rows, 1, 'a matching grant executes the plan');
+is($granted->{decision}{grant}, $grant->id, 'the decision names the grant it consumed');
+is(code_of(sub { $site10->execute_action($grant_plan, grant => $grant, context => $alice) }),
+    'action_grant_invalid', 'a grant is used once');
+
+my $short = $site10->grant_action($grant_plan, phase => 'preview', resolver => $resolver,
+    context => $alice, expires_in => 0.01);
+select(undef, undef, undef, 0.05);
+is(code_of(sub { $site10->preview_action($grant_plan, grant => $short, context => $alice) }),
+    'action_grant_invalid', 'an expired grant authorizes nothing');
+is(code_of(sub { $site10->execute_action($grant_plan, grant => bless(\(my $y = 1), 'Selecto::Action::Grant'),
+    context => $alice) }), 'action_grant_invalid', 'a forged grant authorizes nothing');
+is(code_of(sub { $site10->grant_action($grant_plan, resolver => sub { 'disabled' }, context => $alice) }),
+    'action_capability_denied', 'a denied capability issues no grant');
+
 # --- fingerprints -----------------------------------------------------------------------
 
 my $scoped_predicate = Selecto::Expression->eq('site_id', 10);
