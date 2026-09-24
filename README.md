@@ -8,7 +8,9 @@ code remain in consumer applications.
 
 This is an alpha library. Its current compatibility target is observation
 protocol 1 and certification specifications 2.7.0 and 2.8.0. PostgreSQL is
-centrally certified for the 2.8 governed co-domain/computed-eligibility profile.
+centrally certified for the 2.8 governed co-domain/computed-eligibility profile
+and, with the Elixir reference, for the 2.15 `computed_value_columns` profile
+(CV001-CV005: computed value expressions executed from shared fixture data).
 
 ## Current surface
 
