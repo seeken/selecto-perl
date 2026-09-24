@@ -317,7 +317,7 @@ my $line_domain = Selecto::Domain->new(
     associations => {
         lines => {
             table => 'invoice_lines',
-            fields => {id => 'integer', invoice_id => 'integer', sku => 'string'},
+            fields => {id => 'integer', invoice_id => 'integer', sku => 'string', quantity => 'integer'},
             owner_key => 'id',
             related_key => 'invoice_id',
             target_primary_key => 'id',
@@ -333,11 +333,148 @@ my $line_statement = $line_engine->compile(
         Selecto::Expression->related_collection('lines', ['sku'])->as('lines'),
     )
 );
+my $line_total_statement = $line_engine->compile(
+    $line_engine->query->select(
+        'id',
+        Selecto::Expression->related_sum('lines', 'quantity')->as('total_quantity'),
+        Selecto::Expression->related_count('lines', 'id')->as('line_count'),
+        Selecto::Expression->related_collection('lines', ['sku'])->as('lines'),
+    )
+);
+like $line_total_statement->sql,
+    qr{\(SELECT COALESCE\(SUM\("c_lines"\."quantity"\), 0\) FROM "invoice_lines" AS "c_lines" WHERE "c_lines"\."invoice_id" = "s0"\."id"\)},
+    'related numeric sum is correlated independently from its collection';
+unlike $line_total_statement->sql, qr{JOIN "invoice_lines"},
+    'related sum and collection do not join or multiply outer rows';
+like $line_total_statement->sql,
+    qr{\(SELECT COUNT\("c_lines"\."id"\) FROM "invoice_lines" AS "c_lines" WHERE "c_lines"\."invoice_id" = "s0"\."id"\)},
+    'related count is independently correlated beside sum and collection';
+my $invalid_related_sum = eval {
+    $line_engine->compile($line_engine->query->select(
+        Selecto::Expression->related_sum('lines', 'sku')->as('invalid_total'),
+    ));
+    1;
+};
+ok !$invalid_related_sum, 'related sum rejects a nonnumeric field';
+is $@->code, 'invalid_query', 'nonnumeric related sum has a governed error';
 like $line_statement->sql,
     qr{COALESCE\(\(SELECT JSON_AGG\(JSON_BUILD_OBJECT\('sku', "c_lines"\."sku"\) ORDER BY "c_lines"\."id"\) FROM "invoice_lines" AS "c_lines" WHERE "c_lines"\."invoice_id" = "s0"\."id"\), '\[\]'::json\)},
     'a to-many selection compiles as a correlated ordered JSON collection';
 unlike $line_statement->sql, qr{JOIN "invoice_lines"},
     'a related collection does not multiply outer result rows';
+
+my $line_ordered_statement = $line_engine->compile(
+    $line_engine->query->select(
+        'id',
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['sku', 'desc'], ['id', 'asc']],
+        )->as('lines'),
+    )
+);
+like $line_ordered_statement->sql,
+    qr{JSON_AGG\(JSON_BUILD_OBJECT\('sku', "c_lines"\."sku"\) ORDER BY "c_lines"\."sku" DESC, "c_lines"\."id" ASC\)},
+    'governed related collection ordering reaches the PostgreSQL aggregate';
+my $line_limited_statement = $line_engine->compile(
+    $line_engine->query->select(
+        'id',
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['id', 'asc']], limit => 2,
+        )->as('lines'),
+    )
+);
+like $line_limited_statement->sql,
+    qr{FROM \(SELECT "c_lines"\.\* FROM "invoice_lines" AS "c_lines" WHERE "c_lines"\."invoice_id" = "s0"\."id" ORDER BY "c_lines"\."id" ASC LIMIT 2\) AS "c_lines"},
+    'per-parent limit selects ordered child rows before JSON aggregation';
+my $line_tie_statement = $line_engine->compile(
+    $line_engine->query->select(
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['sku', 'desc']], limit => 2,
+        )->as('lines'),
+    )
+);
+like $line_tie_statement->sql,
+    qr{ORDER BY "c_lines"\."sku" DESC, "c_lines"\."id" ASC LIMIT 2},
+    'per-parent limit breaks sort ties with the related primary key';
+my $line_cursor_statement = $line_engine->compile(
+    $line_engine->query->select(
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['sku', 'asc']], limit => 2,
+            after => {parent_key => 7, values => ['Apple', 12]},
+        )->as('lines'),
+    )
+);
+like $line_cursor_statement->sql,
+    qr{"s0"\."id" IS DISTINCT FROM \$1},
+    'collection cursor only changes the selected parent';
+like $line_cursor_statement->sql,
+    qr{"c_lines"\."sku" > \$2 OR "c_lines"\."sku" IS NULL},
+    'ascending cursor handles PostgreSQL null-last ordering';
+like $line_cursor_statement->sql,
+    qr{"c_lines"\."sku" IS NOT DISTINCT FROM \$3 AND \("c_lines"\."id" > \$4},
+    'cursor uses the primary-key tie breaker';
+is_deeply $line_cursor_statement->params, [7, 'Apple', 'Apple', 12],
+    'cursor parent and ordering values are bound parameters';
+my $line_null_cursor_statement = $line_engine->compile(
+    $line_engine->query->select(
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['sku', 'desc']], limit => 2,
+            after => {parent_key => 7, values => [undef, 12]},
+        )->as('lines'),
+    )
+);
+like $line_null_cursor_statement->sql, qr{"c_lines"\."sku" IS NOT NULL},
+    'descending cursor continues after null';
+my $short_collection_cursor = eval {
+    $line_engine->compile($line_engine->query->select(
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['sku', 'asc']], limit => 2,
+            after => {parent_key => 7, values => ['Apple']},
+        )->as('lines'),
+    ));
+    1;
+};
+ok !$short_collection_cursor, 'collection cursor rejects a missing tie-breaker';
+is $@->code, 'invalid_query', 'invalid cursor has a governed query error';
+my $invalid_collection_limit = eval {
+    Selecto::Expression->related_collection(
+        'lines', ['sku'], order_by => [['id', 'asc']], limit => 0,
+    );
+    1;
+};
+my $collection_limit_error = $@;
+ok !$invalid_collection_limit, 'related collection rejects a zero per-parent limit';
+is $collection_limit_error->code, 'invalid_query',
+    'invalid per-parent limit returns a governed query error';
+my $unordered_collection_limit = eval {
+    Selecto::Expression->related_collection('lines', ['sku'], limit => 2);
+    1;
+};
+my $unordered_limit_error = $@;
+ok !$unordered_collection_limit, 'related collection limit requires ordering';
+is $unordered_limit_error->code, 'invalid_query',
+    'unordered per-parent limit returns a governed query error';
+my $invalid_collection_order = eval {
+    $line_engine->compile($line_engine->query->select(
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['missing', 'asc']],
+        )->as('lines'),
+    ));
+    1;
+};
+my $collection_order_error = $@;
+ok !$invalid_collection_order, 'related collection ordering rejects an unknown target field';
+is $collection_order_error->code, 'invalid_query',
+    'unknown collection ordering field has a typed rejection';
+my $invalid_collection_direction = eval {
+    Selecto::Expression->related_collection(
+        'lines', ['sku'], order_by => [['sku', 'sideways']],
+    );
+    1;
+};
+my $collection_direction_error = $@;
+ok !$invalid_collection_direction, 'related collection ordering rejects an unknown direction';
+is $collection_direction_error->code, 'invalid_query',
+    'unknown collection ordering direction has a typed rejection';
 
 my $named_line_statement = $line_engine->compile(
     $line_engine->query->select(
@@ -956,6 +1093,28 @@ is($paged->limit_value, 25, 'count_query does not mutate the source query');
 is($paged->count_query('id')->selections->[0]->arguments->[0], 'id',
     'count_query can replace selections');
 
+my $projection_dbh = TestSelecto::DBH->new({rows => [[5]]});
+my $projection_engine = Selecto::Engine->new(
+    domain => TestSelecto::people_domain(),
+    adapter => Selecto::PostgreSQL->new(dbh => $projection_dbh),
+);
+my $projection_query = $projection_engine->query->select('score')
+    ->where(Selecto::Expression->eq('active', 1))->order_by('id')->limit(2);
+is($projection_engine->projection_sum($projection_query, 'score'), 5,
+    'projection sum returns one database-computed scalar');
+my $projection_call = $projection_dbh->prepared->[0];
+like($projection_call->sql,
+    qr/SELECT COALESCE\(SUM\("selecto_projection_source"\."score"\), 0\).*FROM \(SELECT /,
+    'projection sum folds the governed page query in a derived table');
+like($projection_call->sql, qr/LIMIT 2/, 'projection sum retains the requested page limit');
+is_deeply($projection_call->params, [1], 'projection sum retains bound predicate values');
+my $missing_projection = eval { $projection_engine->projection_sum($projection_query, 'missing'); 1 };
+ok(!$missing_projection, 'projection sum rejects an unselected column');
+is($@->code, 'invalid_query', 'unselected projection returns a governed query error');
+my $unsafe_projection = eval { $projection_engine->projection_sum($projection_query, 'score);DROP'); 1 };
+ok(!$unsafe_projection, 'projection sum rejects an unsafe column');
+is($@->code, 'invalid_identifier', 'unsafe projection fails identifier validation');
+
 my $applied = {segments => ['live'], views => []};
 my $with_library = $engine->query->select('id')->with_applied_query_library($applied);
 $applied->{segments}[0] = 'mutated';
@@ -974,6 +1133,36 @@ like(
     qr/JSON_GROUP_ARRAY\(JSON_OBJECT\('sku', "c_lines"\."sku"\)\)/,
     'SQLite related collections use JSON_GROUP_ARRAY',
 );
+my $sqlite_ordered = eval {
+    Selecto::Engine->new(
+        domain => $line_domain,
+        adapter => Selecto::SQLite->new(dbh => TestSelecto::DBH->new),
+    )->compile($line_engine->query->select(
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['sku', 'desc']],
+        )->as('lines'),
+    ));
+    1;
+};
+my $sqlite_order_error = $@;
+ok !$sqlite_ordered, 'uncertified SQLite collection ordering fails closed';
+is $sqlite_order_error->code, 'unsupported_feature',
+    'uncertified collection ordering reports a capability failure';
+my $sqlite_limited = eval {
+    Selecto::Engine->new(
+        domain => $line_domain,
+        adapter => Selecto::SQLite->new(dbh => TestSelecto::DBH->new),
+    )->compile($line_engine->query->select(
+        Selecto::Expression->related_collection(
+            'lines', ['sku'], order_by => [['id', 'asc']], limit => 2,
+        )->as('lines'),
+    ));
+    1;
+};
+my $sqlite_limit_error = $@;
+ok !$sqlite_limited, 'uncertified SQLite per-parent limit fails closed';
+is $sqlite_limit_error->code, 'unsupported_feature',
+    'uncertified per-parent limit reports a capability failure';
 like(
     Selecto::Engine->new(
         domain => $line_domain,

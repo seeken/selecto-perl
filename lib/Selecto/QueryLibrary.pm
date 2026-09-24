@@ -3,6 +3,7 @@ package Selecto::QueryLibrary;
 use 5.034;
 use strict;
 use warnings;
+use JSON::PP ();
 use Scalar::Util qw(blessed looks_like_number);
 use Storable qw(dclone);
 use Selecto::Error ();
@@ -339,6 +340,7 @@ sub _cast_parameter {
         return "$value";
     }
     if ($type eq 'boolean') {
+        return $value ? 1 : 0 if JSON::PP::is_bool($value);
         return 1 if !ref($value) && "$value" =~ /\A(?:1|true|yes|on)\z/i;
         return 0 if !ref($value) && "$value" =~ /\A(?:0|false|no|off)\z/i;
         Selecto::Error->throw('invalid_query_library', "segment parameter $id must be boolean");
@@ -393,6 +395,8 @@ sub _filter_expression {
     }
     return Selecto::Expression->between($field, $value, _substitute($raw_end, $values))
         if $operator eq 'between';
+    return Selecto::Expression->starts_with($field, $value)
+        if $operator eq 'starts_with';
     Selecto::Error->throw('invalid_query_library', "unsupported segment filter operator $operator")
         unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/;
     return Selecto::Expression->can($operator)->('Selecto::Expression', $field, $value);

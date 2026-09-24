@@ -40,6 +40,21 @@ my $domain = Selecto::Domain->new(
 my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
 my $result = $engine->all($engine->query->select('id', 'name')->order_by('id'));
 is_deeply($result, { columns => ['id', 'name'], rows => [[1, 'baseline']] }, 'public query API executes through DBD::Pg');
+is_deeply(
+    $engine->all($engine->query->select('id')
+        ->where(Selecto::Expression->starts_with('name', 'base')))->{rows},
+    [[1]], 'PostgreSQL executes a bound prefix predicate',
+);
+is_deeply(
+    $engine->all($engine->query->select('id')
+        ->where(Selecto::Expression->starts_with('name', 'base%')))->{rows},
+    [], 'PostgreSQL treats a prefix wildcard as literal text',
+);
+is_deeply(
+    $engine->all($engine->query->select('id')
+        ->where(Selecto::Expression->starts_with('name', 'base_')))->{rows},
+    [], 'PostgreSQL treats a single-character wildcard as literal text',
+);
 
 my $set_result = $engine->all(
     $engine->query->select('id')->where(Selecto::Expression->eq('id', 1))
