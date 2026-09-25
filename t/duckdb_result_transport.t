@@ -30,7 +30,8 @@ my $domain = Selecto::Domain->new(name=>'Transport values', table=>'transport_va
     id=>'integer', happened=>'naive_datetime', instant=>'utc_datetime', nano=>'naive_datetime',
     amount=>'decimal', label=>'string', active=>'boolean',
 });
-my $engine = Selecto::Engine->new(domain=>$domain, adapter=>$adapter);
+my $engine = Selecto::Engine->new(domain=>$domain, adapter=>$adapter,
+    write_policy=>'permissive');    # legacy domain without a write policy
 my $query = $engine->query->select(qw(id happened instant nano amount label active))->order_by('id');
 my $expected = [
     [1,'1969-12-31T23:59:59.999999','1969-12-31T23:59:59.999999',
