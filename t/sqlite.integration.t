@@ -1,6 +1,8 @@
 use 5.034;
 use strict;
 use warnings;
+use feature 'signatures';
+no warnings 'experimental::signatures';
 use Test::More;
 use DBI ();
 use Selecto;
@@ -25,6 +27,24 @@ is_deeply(
     { columns => ['id', 'name', 'amount'], rows => [[1, 'Renée 東京', 10.5]] },
     'public query API executes through DBD::SQLite',
 );
+
+$dbh->do(q{INSERT INTO selecto_perl_test_items VALUES
+    (2, 'dock light', 1), (3, 'lightbulb 50%_off', 2), (4, 'spotlight', 3)});
+my $matched = sub ($expression) {
+    [map { $_->[0] } @{$engine->all(
+        $engine->query->select('id')->where($expression)->order_by('id'))->{rows}}];
+};
+is_deeply($matched->(Selecto::Expression->text_contains('name', 'light')), [2, 3, 4],
+    'text_contains matches a literal substring');
+is_deeply($matched->(Selecto::Expression->text_contains('name', '50%_')), [3],
+    'text_contains binds LIKE wildcards literally');
+is_deeply($matched->(Selecto::Expression->ends_with('name', 'light')), [2, 4],
+    'ends_with matches a literal suffix');
+is_deeply($matched->(Selecto::Expression->from_filter_ast(['text_contains', 'name', 'bulb'])), [3],
+    'filter AST accepts text_contains');
+is_deeply($matched->(Selecto::Expression->from_filter_ast(['ends_with', 'name', '%off'])), [],
+    'filter AST ends_with escapes wildcards');
+$dbh->do('DELETE FROM selecto_perl_test_items WHERE id > 1');
 
 $dbh->do('CREATE TABLE selecto_perl_test_flags (id integer primary key, batch text, active boolean)');
 $dbh->do(q{INSERT INTO selecto_perl_test_flags VALUES

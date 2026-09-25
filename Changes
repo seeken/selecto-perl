@@ -1,6 +1,9 @@
 Revision history for Selecto
 
 Unreleased
+    - Selecto::Expression->text_contains and ->ends_with build literal
+      substring and suffix filters with LIKE wildcards escaped, like
+      starts_with; the filter AST accepts both operators.
     - Security: write graph update and delete children are confined to their
       bound parent row; the parent key is a WHERE condition, never a SET.
       Upsert children must include the parent key in their conflict target.
