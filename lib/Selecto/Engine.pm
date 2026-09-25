@@ -5,7 +5,7 @@ use strict;
 use warnings;
 use JSON::PP ();
 use Time::HiRes ();
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed refaddr);
 use Selecto::Domain ();
 use Selecto::Domain::Ref ();
 use Selecto::Domain::Registry ();
@@ -221,6 +221,28 @@ sub governed_write {
         { relation => $command->relation, expected => $self->{domain}->table },
     ) unless $command->relation eq $self->{domain}->table;
     $command = $self->_normalize_write_command($command);
+    # A domain that names a tenant_field without declaring writes.scope.tenant
+    # relies on its request-scoped required predicate as the tenant boundary
+    # (the legacy pattern EngineHandler also enforces). Engine writes honor
+    # that boundary too: updates and deletes match only rows inside it and
+    # inserts must satisfy it. Upsert conflicts can resolve to rows outside
+    # it, so upsert is refused. Other required predicates are read scopes and
+    # leave writes to the write contract, as the shared protocol specifies.
+    my $required = defined($self->{domain}->tenant_field) && !defined($self->{domain}->write_tenant_scope)
+        ? $self->{domain}->required_predicate : undef;
+    if (defined $required) {
+        Selecto::Error->throw(
+            'query_enforcement_unsupported_operation',
+            'upsert is not supported on a domain with a required predicate',
+            { relation => $command->relation, %details },
+        ) if $command->operation eq 'upsert';
+        my $existing = $command->scope_predicate;
+        $command = $command->with_scope_predicate(
+            !defined($existing) ? $required
+                : refaddr($existing) == refaddr($required) ? $existing
+                : Selecto::Expression->all($existing, $required)
+        );
+    }
     my $scope = $self->{domain}->write_tenant_scope;
     $command = Selecto::Write::Scope->apply(
         $command, $scope, $self->{scope}{tenant}, label => $command->relation, details => \%details,
@@ -803,6 +825,13 @@ sub _validate_graph_node {
             $edge_id = $found->{edge_id};
         }
     }
+    # Without a nested domain no predicate, returning, or conflict field of
+    # the child can be checked, so a strict engine refuses the edge.
+    Selecto::Error->throw(
+        'write_policy_missing',
+        'nested writes under a strict write policy must declare their relationship domain',
+        {relation => $command->relation, graph_node => $node->{id}},
+    ) if $self->{write_policy} eq 'strict' && !$edge->{fields_known};
     my $scope = $edge->{tenant_scope};
     if (!$scope && $root_scope) {
         # A tenant-scoped graph cannot reach a node whose tenant it cannot see.

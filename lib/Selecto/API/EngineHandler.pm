@@ -23,6 +23,8 @@ has max_filter_values => 100;
 has max_orders        => 10;
 has max_segments      => 20;
 has max_limit         => 1000;
+# Deep offsets make the database scan and discard every earlier row.
+has max_offset        => 100_000;
 has default_limit     => 100;
 has max_write_count   => 1000;
 
@@ -30,7 +32,7 @@ sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
     for my $name (qw(
         max_fields max_filters max_filter_values max_orders max_segments
-        max_limit default_limit max_write_count
+        max_limit max_offset default_limit max_write_count
     )) {
         my $value = $self->$name;
         Selecto::Error->throw(
@@ -166,8 +168,13 @@ sub write_command ($self, $engine, $body) {
     my $scope = $domain->required_predicate;
     Selecto::Error->throw('query_enforcement_unsupported_operation', 'query-scoped API upsert is not supported')
         if $operation eq 'upsert' && defined($scope);
+    # Tenancy is satisfied by a required predicate on the request domain, or
+    # by a declared writes.scope.tenant together with an engine that holds the
+    # trusted tenant; the engine then applies that scope to the command.
+    my $engine_scoped = defined($domain->write_tenant_scope)
+        && defined($engine->scope->{tenant});
     Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
-        if defined($domain->tenant_field) && !defined($scope);
+        if defined($domain->tenant_field) && !defined($scope) && !$engine_scoped;
     my $command = Selecto::Write::Command->new(
         operation => $operation,
         relation => $domain->table,
@@ -329,7 +336,7 @@ sub query ($self, $engine, $body) {
         ? _bounded_integer($body->{limit}, 'limit', 0, $self->max_limit)
         : $self->default_limit;
     my $offset = exists($body->{offset})
-        ? _bounded_integer($body->{offset}, 'offset', 0, undef)
+        ? _bounded_integer($body->{offset}, 'offset', 0, $self->max_offset)
         : 0;
     $query = $query->limit($limit)->offset($offset);
     if (defined $timezone) {
@@ -432,7 +439,7 @@ sub describe_openapi ($self, $api) {
                 type => 'integer', minimum => 0, maximum => $self->max_limit,
                 default => $self->default_limit,
             },
-            offset => {type => 'integer', minimum => 0, default => 0},
+            offset => {type => 'integer', minimum => 0, maximum => $self->max_offset, default => 0},
             timezone => {
                 type => 'string',
                 description => 'IANA timezone applied to UTC and epoch datetime fields and filters.',

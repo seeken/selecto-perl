@@ -34,6 +34,8 @@ my %GROUPS = map { $_ => 1 } qw(ctes laterals unnests);
 my %QUERY_KEYS = map { $_ => 1 } qw(select filter group_by order_by limit);
 my %AGGREGATES = map { $_ => 1 } qw(count sum avg min max);
 my $IDENTIFIER = qr/\A[A-Za-z_][A-Za-z0-9_]*\z/;
+our $DEFAULT_MAX_DEPTH = 100;
+my $MAX_DEPTH_LIMIT = 10_000;
 
 # Validates every data member of a domain. Groups this runtime does not
 # execute (for example Elixir `values` or function members) are left alone and
@@ -116,7 +118,13 @@ sub _source {
     my $kind = $spec->{kind} // 'plain';
     my $join = _join($domain, $spec->{join}, $label);
     if ($kind eq 'recursive') {
-        _keys($spec, [qw(kind source base step step_join columns join)], $label);
+        _keys($spec, [qw(kind source base step step_join columns join max_depth)], $label);
+        my $max_depth = $spec->{max_depth} // $DEFAULT_MAX_DEPTH;
+        _fail("$label max_depth must be an integer from 1 to $MAX_DEPTH_LIMIT")
+            unless !ref($max_depth) && "$max_depth" =~ /\A[1-9][0-9]*\z/ && $max_depth <= $MAX_DEPTH_LIMIT;
+        # Every recursive member is depth-bounded so a cyclic or
+        # attacker-shaped hierarchy stops at max_depth instead of running
+        # until the database gives up.
         my $base = build_query($member_domain, $spec->{base}, "$label base");
         my $step = build_query($member_domain, $spec->{step}, "$label step", allow_previous => 1);
         my $step_join = $spec->{step_join};
@@ -128,6 +136,7 @@ sub _source {
         return $query->with_recursive_cte($name, $member_domain, $base, $step,
             (defined($spec->{columns}) ? (columns => [@{$spec->{columns}}]) : ()),
             join => $join,
+            max_depth => 0 + $max_depth,
             recursive_join => {
                 owner_key => $step_join->{owner_key}, related_key => $step_join->{related_key},
                 type => 'inner',
@@ -154,13 +163,60 @@ sub _source_domain {
     _fail("$label source $source is not a schema of this domain", {source => "$source"})
         unless ref($relation) eq 'HASH';
     require Selecto::Domain;
-    return Selecto::Domain->parse({
+    my $member = Selecto::Domain->parse({
         schema_version => 1,
         name => "$source",
         source => {%{dclone($relation)}, associations => {}},
         schemas => {},
         joins => {},
     });
+    return _scoped_member_domain($domain, $member, $relation, $label);
+}
+
+# A member reads its own relation, so the root's request scope does not reach
+# it through any join. When the member relation declares a tenant_field, the
+# root's tenant conditions are re-expressed on that field and required of the
+# member too. A scoped root whose tenant condition cannot be carried over
+# fails closed rather than reading every tenant's rows.
+sub _scoped_member_domain {
+    my ($domain, $member, $relation, $label) = @_;
+    my $required = $domain->required_predicate;
+    my $member_tenant = $relation->{tenant_field};
+    return $member unless defined($required) && defined($member_tenant);
+    my $root_tenant = $domain->tenant_field;
+    my @conjuncts = $required->kind eq 'and' ? @{$required->arguments->[0]} : ($required);
+    my @carried;
+    if (defined $root_tenant) {
+        for my $conjunct (@conjuncts) {
+            my $rewritten = eval { _rename_fields($conjunct, {"$root_tenant" => "$member_tenant"}) };
+            push @carried, $rewritten if $rewritten;
+        }
+    }
+    Selecto::Error->throw(
+        'missing_tenant_scope',
+        "$label reads a tenant-scoped relation but the root tenant scope cannot be applied to it",
+        {tenant_field => "$member_tenant"},
+    ) unless @carried;
+    return $member->with_required_predicate(@carried == 1 ? $carried[0] : Selecto::Expression->all(@carried));
+}
+
+# Copies an expression tree, renaming field references by $map. Dies when the
+# tree references a field outside $map, so partial rewrites never survive.
+sub _rename_fields {
+    my ($value, $map) = @_;
+    if (Scalar::Util::blessed($value) && $value->isa('Selecto::Expression')) {
+        if ($value->kind eq 'field') {
+            my $name = $value->arguments->[0];
+            die "unmapped field\n" unless exists $map->{$name};
+            return Selecto::Expression->field($map->{$name});
+        }
+        my $copy = Selecto::Expression->new($value->kind, map { _rename_fields($_, $map) } @{$value->arguments});
+        return defined($value->alias_name) ? $copy->as($value->alias_name) : $copy;
+    }
+    return [map { _rename_fields($_, $map) } @$value] if ref($value) eq 'ARRAY';
+    return {map { ($_ => _rename_fields($value->{$_}, $map)) } keys %$value} if ref($value) eq 'HASH';
+    die "unsupported expression node\n" if ref($value);
+    return $value;
 }
 
 sub _join {

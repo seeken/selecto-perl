@@ -1021,25 +1021,45 @@ sub field_metadata {
     return {} unless ref($contract) eq 'HASH';
     my @segments = split /\./, "$path", -1;
     my $column;
+    my @redacted;
     if (@segments == 1) {
         $column = $contract->{source}{columns}{$segments[0]}
             if ref($contract->{source}) eq 'HASH'
             && ref($contract->{source}{columns}) eq 'HASH';
+        push @redacted, _redacted($contract, $segments[0]),
+            (ref($contract->{source}) eq 'HASH' ? _redacted($contract->{source}, $segments[0]) : ());
     }
-    elsif (@segments == 2) {
-        my ($association, $field) = @segments;
-        my $association_spec = $contract->{source}{associations}{$association}
-            if ref($contract->{source}) eq 'HASH'
-            && ref($contract->{source}{associations}) eq 'HASH';
-        my $queryable = ref($association_spec) eq 'HASH'
-            ? $association_spec->{queryable} : undef;
+    elsif (@segments >= 2) {
+        # Walk the whole association chain so column metadata such as
+        # internal applies at every path depth, not only one hop away.
+        my $field = pop @segments;
+        my $resolved = eval { $self->resolve_association(join('.', @segments)) };
+        my $association = ref($resolved) eq 'HASH' ? $resolved->{association} : undef;
+        my $queryable = blessed($association) && $association->can('queryable')
+            ? $association->queryable : undef;
         $column = $contract->{schemas}{$queryable}{columns}{$field}
             if defined($queryable)
             && ref($contract->{schemas}) eq 'HASH'
             && ref($contract->{schemas}{$queryable}) eq 'HASH'
             && ref($contract->{schemas}{$queryable}{columns}) eq 'HASH';
+        push @redacted, _redacted($contract->{schemas}{$queryable}, $field)
+            if defined($queryable) && ref($contract->{schemas}) eq 'HASH';
+        push @redacted, _redacted($contract, join('.', @segments, $field));
     }
-    return ref($column) eq 'HASH' ? dclone($column) : {};
+    my $metadata = ref($column) eq 'HASH' ? dclone($column) : {};
+    # Redacted fields are withheld from every untrusted surface exactly like
+    # internal columns: field_is_public is false, so API, component, and
+    # template catalogs refuse to select, filter, or order on them.
+    @$metadata{qw(internal redacted)} = (1, 1) if grep { $_ } @redacted;
+    return $metadata;
+}
+
+# Top-level redact_fields names root fields or dotted paths; a relation's
+# redact_fields names that relation's own fields.
+sub _redacted {
+    my ($spec, $name) = @_;
+    return 0 unless ref($spec) eq 'HASH' && ref($spec->{redact_fields}) eq 'ARRAY';
+    return scalar grep { defined($_) && !ref($_) && "$_" eq $name } @{$spec->{redact_fields}};
 }
 
 sub values_foreign_keys {

@@ -177,6 +177,7 @@ my $api = Selecto::API->new(
 my $handler = Selecto::API::EngineHandler->new(
     default_limit => 100,
     max_limit => 1000,
+    max_offset => 100_000,
 );
 $handler->describe_openapi($api);
 
@@ -191,7 +192,14 @@ my $result = $handler->query($engine, {
 `EngineHandler` does not construct an engine, authenticate users, choose a
 tenant, or modify the domain. It validates every field and query-library name
 against the supplied engine's governed domain, so internal fields and
-host-pruned definitions remain unavailable.
+host-pruned definitions remain unavailable. Visibility applies at every
+association depth, and a field named by `redact_fields` (top level, `source`,
+or a schema) is treated exactly like an `internal` column: it cannot be
+selected, filtered, or ordered through the API, Explorer catalogs, or template
+surfaces. Trusted host code can still reference it. `offset` is capped by
+`max_offset` (100,000 by default) because deep offsets scan and discard every
+earlier row. A rolled-back write with the wrong row count reports
+`cardinality_mismatch` and the expected count, never the matched count.
 
 Query responses default to canonical JSON. HTTP hosts can pass the request's
 `Accept` header as `accept`, or an explicit `?format=` value as
@@ -501,6 +509,19 @@ my $query = $engine->query->with_member('category_tree')->select('name', 'catego
 
 `['previous', column]` reads the previous level's row and is accepted only in a
 recursive `step`; its type comes from the base selection in the same position.
+
+Every recursive member is depth-bounded. `max_depth` (default 100, at most
+10,000) stops the recursion so a cyclic or attacker-shaped hierarchy cannot run
+until the database gives up. The bound adds a trailing `selecto_depth` column,
+1 at the base level, which a member may not declare itself.
+
+A member reads its own relation, so the root's request scope does not reach it
+through a join. When the root domain carries a required predicate and the
+member's source schema declares `tenant_field`, the root's tenant conditions
+are re-expressed on the member's tenant field and required of the member's
+CTE, recursive, or lateral body. A scoped root whose predicate has no tenant
+condition fails with `missing_tenant_scope` for such a member. Declare
+`tenant_field` on every schema that holds tenant data.
 Members are validated when the domain is parsed, are part of the fingerprint,
 and fail with `unknown_query_member` when a query names one the domain does not
 declare. The same data runs in the Elixir runtime. Groups Perl does not execute
@@ -1092,6 +1113,17 @@ every single write, batch command, and graph node governed by a scoped domain:
 
 A scoped engine cannot be re-scoped to another tenant.
 
+A domain that names `source.tenant_field` but declares no
+`writes.scope.tenant` relies on its required predicate
+(`with_required_predicate`) as the tenant boundary. Engine writes honor that
+boundary: updates and deletes match only rows inside it, inserts must satisfy
+it, and upserts are refused with `query_enforcement_unsupported_operation`
+because a conflict can resolve to a row outside it. Prefer declaring
+`writes.scope.tenant`, which fails closed without a trusted tenant. On a
+domain without a tenant field, a required predicate is a read scope only.
+`EngineHandler` writes accept either a required predicate or a declared
+`writes.scope.tenant` with an engine that holds the trusted tenant.
+
 Assignments may use an adapter-independent mutation AST. Literal operands stay
 bound, identifiers are checked separately, and field references are validated
 against the governing domain:
@@ -1136,6 +1168,16 @@ my $graph = Selecto::Write::Graph->new(nodes => [
 ]);
 my $result = $engine->execute_graph($graph);
 ```
+
+A child node belongs to the parent row it binds to. Update and delete children
+receive the parent key as a WHERE condition, never as an assignment, so a
+child predicate naming a row under another parent matches nothing and the
+graph rolls back with `cardinality_mismatch`. An update child cannot assign its
+parent key. An upsert child's `conflict_target` must include the parent key,
+and its `upsert_update_fields` must not. Insert children receive the parent key
+as an assignment. Under the default strict write policy every writable
+relationship used by a graph must declare its nested `domain`, so no child
+predicate, returning, or conflict field goes unchecked.
 
 PostgreSQL and DuckDB advertise native-returning graph execution. SQLite does
 so when its runtime library is 3.35 or newer; older SQLite versions fail the
