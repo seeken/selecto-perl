@@ -389,7 +389,7 @@ is($dbh->selectrow_array(q{SELECT title FROM work_orders WHERE site_id = 20}), '
 
 # --- single-use action grants ----------------------------------------------------------
 
-$dbh->do(q{INSERT INTO work_orders VALUES (9, 10, 'WO-G', 'Granted', 'done')});
+$dbh->do(q{INSERT INTO work_orders VALUES (9, 10, 'WO-GRANT', 'Granted', 'done')});
 my $alice = {actor => {id => 'alice'}};
 my $grant_plan = $site10->plan_action({action => 'archive', target => 9});
 my $grant = $site10->grant_action($grant_plan, phase => 'execute', resolver => $resolver, context => $alice);
