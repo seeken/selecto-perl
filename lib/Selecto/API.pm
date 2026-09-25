@@ -295,6 +295,13 @@ sub _success ($data, $status = 200) {
 }
 
 sub _error_response ($status, $code, $message, $details = {}) {
+    # The affected-row count of a rolled-back write tells a client how many
+    # rows matched a predicate it could not otherwise run, so it stays
+    # server-side.
+    if ($code eq 'cardinality_mismatch' && ref($details) eq 'HASH' && exists $details->{actual}) {
+        $details = { %$details };
+        delete $details->{actual};
+    }
     return _response($status, {
         error => { code => $code, details => $details, message => $message },
         ok => JSON::PP::false,

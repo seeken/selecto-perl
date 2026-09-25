@@ -89,6 +89,7 @@ t/duckdb_result_transport.t
 docs/duckdb-result-transport.md
 t/files.t
 t/lib/TestSelecto.pm
+t/governance_hardening.t
 t/mssql.integration.t
 t/mssql.t
 t/mysql_family.integration.t
@@ -110,6 +111,7 @@ t/write_authority.t
 t/write_contract_retention.t
 t/write_governance.t
 t/write_graph.t
+t/write_graph_child_scope.t
 lib/Selecto/Document/Integer.pm
 lib/Selecto/DataRules.pm
 lib/Selecto/FieldPolicy.pm

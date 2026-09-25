@@ -10,6 +10,8 @@ use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
 
+our $RECURSION_DEPTH_COLUMN = 'selecto_depth';
+
 sub new {
     my ($class, %args) = @_;
     my %allowed = map { $_ => 1 } qw(
@@ -241,13 +243,29 @@ sub with_cte {
 sub with_recursive_cte {
     my ($self, $name, $domain, $anchor, $recursive, %opts) = @_;
     $self->_ensure_pre_set_mutation('with_recursive_cte');
-    _known_options(\%opts, [qw(columns join recursive_join)], 'recursive CTE');
+    _known_options(\%opts, [qw(columns join recursive_join max_depth)], 'recursive CTE');
+    my $max_depth = $opts{max_depth};
+    Selecto::Error->throw('invalid_query', 'recursive CTE max_depth must be a positive integer')
+        if defined($max_depth) && (ref($max_depth) || "$max_depth" !~ /\A[1-9][0-9]*\z/);
     _source_name($name, 'recursive CTE');
     _domain_query($domain, $anchor, 'recursive CTE anchor');
     _domain_query($domain, $recursive, 'recursive CTE member');
     _unique_source_name($self, $name);
     my $columns = $opts{columns} // _query_columns($anchor);
     _columns($columns, 'recursive CTE');
+    if (defined $max_depth) {
+        # A bounded recursion carries its level in a reserved trailing column:
+        # 1 in the anchor, previous level + 1 in the step, and the step join
+        # stops at max_depth. The SQL layer renders it without value
+        # expressions so every recursive-CTE dialect supports it.
+        Selecto::Error->throw('invalid_query', "recursive CTE column $RECURSION_DEPTH_COLUMN is reserved")
+            if grep { $_ eq $RECURSION_DEPTH_COLUMN } @$columns;
+        $columns = [@$columns, $RECURSION_DEPTH_COLUMN];
+        $anchor = $anchor->_copy(selections => [@{$anchor->selections},
+            Selecto::Expression->new('recursion_depth', 'seed')->as($RECURSION_DEPTH_COLUMN)]);
+        $recursive = $recursive->_copy(selections => [@{$recursive->selections},
+            Selecto::Expression->new('recursion_depth', 'step')->as($RECURSION_DEPTH_COLUMN)]);
+    }
     my $join = _join_spec($opts{join}, $columns, 'recursive CTE');
     my $recursive_join = _join_spec($opts{recursive_join}, $columns, 'recursive CTE member');
     Selecto::Error->throw('invalid_query', 'recursive CTE member join must be inner')
@@ -256,6 +274,7 @@ sub with_recursive_cte {
         name => "$name", recursive => 1, domain => $domain,
         anchor => $anchor, recursive_query => $recursive,
         columns => [@$columns], join => $join, recursive_join => $recursive_join,
+        (defined($max_depth) ? (max_depth => 0 + $max_depth, depth_column => $RECURSION_DEPTH_COLUMN) : ()),
         dependencies => [],
     }]);
 }

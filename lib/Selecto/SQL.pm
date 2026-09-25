@@ -515,12 +515,21 @@ sub _compile_cte_prefix {
                 ' AS ' . $self->quote_identifier('p_' . $spec->{name}) .
                 ' ON ' . $self->_qualified($root_alias, $join->{owner_key}) . ' = ' .
                 $self->_qualified('p_' . $spec->{name}, $join->{related_key});
+            if (defined $spec->{max_depth}) {
+                my $max_depth = "$spec->{max_depth}";
+                Selecto::Error->throw('invalid_query', 'recursive CTE max_depth must be a positive integer')
+                    unless $max_depth =~ /\A[1-9][0-9]*\z/;
+                $recursive_join .= ' AND ' . $self->_qualified('p_' . $spec->{name}, $spec->{depth_column}) .
+                    ' < ' . $max_depth;
+            }
             # ['previous', column] in the member reads the previous level's row,
             # typed from the anchor's selection in the same position.
             local $self->{_previous} = {
                 alias => 'p_' . $spec->{name},
                 types => $self->_selection_types($spec->{domain}, $spec->{anchor}, $columns),
             };
+            local $self->{_recursion_depth} = defined($spec->{max_depth})
+                ? {alias => 'p_' . $spec->{name}, column => $spec->{depth_column}} : undef;
             my $member = $self->_compile_single(
                 $spec->{domain}, $spec->{recursive_query},
                 root_alias => $root_alias,
@@ -804,6 +813,7 @@ sub execute_graph_unsafe {
     return $self->_transaction(sub {
         my %results;
         for my $node (@{$graph->nodes}) {
+            my $operation = $node->{command}->operation;
             my $assignments = $node->{command}->assignments;
             my @scopes = grep { defined } ($node->{command}->scope_predicate);
             for my $binding (@{$node->{bindings}}) {
@@ -813,10 +823,45 @@ sub execute_graph_unsafe {
                 my $values = $source->values;
                 Selecto::Error->throw('invalid_write_graph', "graph binding value $binding->{from}.$binding->{key} is unavailable")
                     unless exists $values->{$binding->{key}};
-                $assignments->{$binding->{field}} = $values->{$binding->{key}};
+                my $field = $binding->{field};
+                my $parent_value = $values->{$binding->{key}};
+                # A bound child row belongs to exactly one parent. Update and
+                # delete children must address a row already under that
+                # parent: the binding confines the WHERE clause and never
+                # moves the row by assignment.
+                if ($operation eq 'update' || $operation eq 'delete') {
+                    Selecto::Error->throw(
+                        'write_field_not_writable',
+                        "graph child cannot reassign its parent binding field $field",
+                        { field => $field, graph_node => $node->{id} },
+                    ) if exists $assignments->{$field};
+                    push @scopes, Selecto::Expression->eq(
+                        Selecto::Expression->field($field),
+                        Selecto::Expression->literal($parent_value),
+                    );
+                    next;
+                }
+                if ($operation eq 'upsert') {
+                    # A conflict must only resolve to a row under the same
+                    # parent, so the parent binding joins the conflict target.
+                    my $metadata = $node->{command}->metadata;
+                    my $conflict = $metadata->{conflict_target};
+                    Selecto::Error->throw(
+                        'invalid_write_graph',
+                        "graph child upsert conflict target must include its parent binding field $field",
+                        { field => $field, graph_node => $node->{id} },
+                    ) unless ref($conflict) eq 'ARRAY' && grep { !ref($_) && $_ eq $field } @$conflict;
+                    my $updates = $metadata->{upsert_update_fields};
+                    Selecto::Error->throw(
+                        'write_field_not_writable',
+                        "graph child upsert cannot update its parent binding field $field",
+                        { field => $field, graph_node => $node->{id} },
+                    ) if ref($updates) eq 'ARRAY' && grep { !ref($_) && $_ eq $field } @$updates;
+                }
+                $assignments->{$field} = $parent_value;
                 push @scopes, Selecto::Expression->eq(
                     Selecto::Expression->field($binding->{scope_field}),
-                    Selecto::Expression->literal($values->{$binding->{key}}),
+                    Selecto::Expression->literal($parent_value),
                 ) if defined $binding->{scope_field};
             }
             my $command = $node->{command}->with_assignments($assignments);
@@ -912,6 +957,13 @@ sub _compile_expression {
     my $kind = $expression->kind;
     my $arguments = $expression->arguments;
     return $self->_field_sql($domain, $arguments->[0], $params) if $kind eq 'field';
+    if ($kind eq 'recursion_depth') {
+        # Internal level counter of a depth-bounded recursive CTE.
+        return '1' if $arguments->[0] eq 'seed';
+        Selecto::Error->throw('invalid_query', 'recursion depth is available only in a recursive CTE step')
+            unless $arguments->[0] eq 'step' && ref($self->{_recursion_depth}) eq 'HASH';
+        return '(' . $self->_qualified($self->{_recursion_depth}{alias}, $self->{_recursion_depth}{column}) . ' + 1)';
+    }
     if ($kind eq 'value') {
         require Selecto::ValueExpression;
         Selecto::ValueExpression->infer(
@@ -1436,7 +1488,9 @@ sub _related_collection_json_pairs {
     my ($self, $fields, $quoted_alias, $exact_decimals_as_text) = @_;
     return map {
         my $key = $_->{key};
-        $key =~ s/'/''/g;
+        Selecto::Error->throw('invalid_query', 'related collection key must be an identifier path')
+            unless defined($key) && !ref($key)
+                && "$key" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
         my $sql = $self->_related_collection_value_sql($_);
         $sql = "($sql)::text"
             if $exact_decimals_as_text

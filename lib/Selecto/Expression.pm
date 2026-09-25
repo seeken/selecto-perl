@@ -105,6 +105,11 @@ sub related_collection {
             ) unless defined($_->{key}) && !ref($_->{key}) && length("$_->{key}")
                 && blessed($_->{expression}) && $_->{expression}->isa(__PACKAGE__)
                 && !grep { $_ ne 'key' && $_ ne 'expression' && $_ ne 'stringify' } keys %$_;
+            # Keys become JSON object keys in SQL text; only identifier paths
+            # are accepted so no quoting rule of any dialect is relied upon.
+            Selecto::Error->throw(
+                'invalid_query', 'related collection key must be an identifier path',
+            ) unless "$_->{key}" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
             Selecto::Error->throw(
                 'invalid_query', 'related collection stringify must be boolean',
             ) if exists($_->{stringify}) && ref($_->{stringify});

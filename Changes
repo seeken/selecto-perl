@@ -1,5 +1,25 @@
 Revision history for Selecto
 
+Unreleased
+    - Security: write graph update and delete children are confined to their
+      bound parent row; the parent key is a WHERE condition, never a SET.
+      Upsert children must include the parent key in their conflict target.
+    - Security: strict engines refuse graph relationships without a nested
+      domain.
+    - Security: internal column policy applies at every association depth.
+    - Security: redact_fields entries are withheld from untrusted surfaces
+      like internal columns.
+    - Security: related-collection keys must be identifier paths.
+    - Security: on a domain that names tenant_field without declaring
+      writes.scope.tenant, engine writes honor the domain's required
+      predicate and upsert is refused.
+    - Security: query members inherit the root tenant condition when their
+      schema declares tenant_field, and recursive members are depth-bounded
+      by max_depth (default 100).
+    - EngineHandler caps offset with max_offset (default 100,000), accepts
+      engine-held tenant scope for writes, and API cardinality errors no
+      longer report the matched row count.
+
 0.2.0  2026-09-21
     - First stable CPAN release of the governed domain, query, portable-write,
       and database-adapter contracts.
