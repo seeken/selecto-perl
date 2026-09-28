@@ -120,17 +120,40 @@ sub _declared_preconditions {
 
 sub _select_variant {
     my ($action, $submitted) = @_;
+    my $form = __PACKAGE__->input_form($action, $submitted);
+    return (_normalize_inputs($form->{inputs}, $submitted // {}, 0),
+        $form->{variant}, $form->{execution});
+}
+
+sub input_form {
+    my ($class, $action, $submitted) = @_;
+    _object($action, 'action');
     $submitted //= {};
     _object($submitted, 'action inputs');
 
     my $base_specs = _input_specs($action->{inputs});
-    my $base_inputs = _normalize_inputs($base_specs, $submitted, 1);
     my $variants = $action->{variants};
-    return (_normalize_inputs($base_specs, $submitted, 0), undef, $action->{execution})
+    return {inputs => $base_specs, variant => undef, execution => _clone($action->{execution})}
         unless defined $variants;
     Selecto::Error->throw('invalid_action_variants', 'action variants must be a non-empty list')
         unless ref($variants) eq 'ARRAY' && @$variants;
 
+    my (%selectors, %seen);
+    for my $variant (@$variants) {
+        _object($variant, 'action variant');
+        my $id = _id($variant->{id});
+        Selecto::Error->throw('invalid_action_variant', 'action variants require unique ids')
+            if $id eq '' || $seen{$id}++;
+        _object($variant->{when}, 'action selection condition');
+        for my $field (keys %{$variant->{when}}) {
+            Selecto::Error->throw('invalid_action_variant', 'variant conditions must reference base inputs')
+                unless exists $base_specs->{$field};
+            $selectors{$field} = $base_specs->{$field};
+        }
+    }
+    # Other required fields may be empty while choosing a variant, and a
+    # variant can override their requirements. Only selectors are needed here.
+    my $base_inputs = _normalize_inputs(\%selectors, $submitted, 1);
     my @matches = grep { _condition_matches($_->{when}, $base_inputs) } @$variants;
     Selecto::Error->throw('action_variant_not_found', 'normalized action inputs do not select an action variant')
         unless @matches;
@@ -142,8 +165,12 @@ sub _select_variant {
     my $variant_id = _id($variant->{id});
     Selecto::Error->throw('invalid_action_variant', 'action variant must include an id') if $variant_id eq '';
     my $specs = { %$base_specs, %{_input_specs($variant->{inputs})} };
-    my $inputs = _normalize_inputs($specs, $submitted, 0);
-    return ($inputs, $variant_id, $variant->{execution} // $action->{execution});
+    for my $field (keys %selectors) {
+        Selecto::Error->throw('invalid_action_variant', 'a variant cannot override its selector input')
+            unless _same_value($specs->{$field}, $base_specs->{$field});
+    }
+    return {inputs => $specs, variant => $variant_id,
+        execution => _clone($variant->{execution} // $action->{execution})};
 }
 
 sub _select_execution_case {

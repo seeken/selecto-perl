@@ -732,6 +732,14 @@ other ID paths and star-dimension keys remain queryable for existing views but
 are hidden from new selections. A domain can explicitly expose an ID with
 `components => {picker_visible_id_paths => ['association.id']}`.
 
+A text filter may use `text_contains` (substring), `starts_with` (prefix), or
+`ends_with` (suffix). Each has an explicit `_ci` variant for case-insensitive
+matching. These predicates bind literal text, escaping `%`, `_`, and `!`;
+they do not accept a LIKE pattern or arbitrary SQL. The canonical API query
+handler accepts the same operators for public `string`/`text` fields and
+advertises them in OpenAPI. Write filters retain their stricter operator set.
+Database collation/case-folding rules determine language-specific matching.
+
 A segment may use `['starts_with', 'name', ['param', 'value']]` for a
 bound text prefix. The empty prefix matches non-null text; `%`, `_`, and the
 SQL escape character in user input remain literal characters. Matching follows
@@ -1251,6 +1259,23 @@ defaults before deterministic variant or execution-case selection; selected
 variants can bind collection-patch metadata and input-backed assignments into
 the returned plan. Missing resolvers and hidden or disabled policy decisions
 fail closed in both preview and execute phases.
+
+Hosts can resolve a partial action form without running or authorizing a write:
+
+```perl
+my $form = Selecto::Action->input_form($domain->actions->{check_in}, {
+    documents_complete => 'false',
+});
+# {variant => 'missing_documents', inputs => { ...effective input specs... }, ...}
+```
+
+The resolver uses the same variant selection as `plan`: conditions reference
+base inputs, booleans normalize before matching, and exactly one variant must
+match. Only condition inputs are needed for form discovery. Variant inputs
+override other base input specifications, but cannot redefine their selectors.
+This is metadata discovery, not permission to execute: the planner still
+validates the complete submission and rejects undeclared/inactive inputs, and
+the host must still authorize the target and execute through its governed path.
 
 The engine executes update and delete plans itself:
 

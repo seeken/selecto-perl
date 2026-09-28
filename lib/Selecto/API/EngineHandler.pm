@@ -483,7 +483,8 @@ sub describe_openapi ($self, $api) {
             field => {type => 'string'},
             op => {
                 type => 'string',
-                enum => [qw(eq ne gt gte lt lte between date_shortcut in not_in is_null not_null)],
+                enum => [qw(eq ne gt gte lt lte between date_shortcut in not_in is_null not_null
+                    starts_with starts_with_ci text_contains text_contains_ci ends_with ends_with_ci)],
             },
             value => {}, end => {},
         },
@@ -714,6 +715,13 @@ sub _filters ($self, $domain, $filters) {
 }
 
 sub _query_filter_expression ($self, $filter, $operator, $definition, $operand) {
+    if ($operator =~ /\A(?:starts_with|text_contains|ends_with)(?:_ci)?\z/) {
+        Selecto::Error->throw('invalid_api_query', "$operator requires a text field")
+            unless ($definition->{type} // '') =~ /\A(?:string|text)\z/;
+        return Selecto::Expression->can($operator)->(
+            'Selecto::Expression', $operand, _literal_value($filter->{value}, 'text filter value'),
+        );
+    }
     if ($operator eq 'is_null' || $operator eq 'not_null') {
         return Selecto::Expression->can($operator)->(
             'Selecto::Expression', $operand,

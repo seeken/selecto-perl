@@ -582,6 +582,12 @@ my $api = Selecto::API->new(domain => $domain, base_path => '/api/v1/records');
 is $handler->describe_openapi($api), $api,
     'OpenAPI decoration returns the same API object';
 my $schema = $api->openapi_document->{components}{schemas}{SelectoQuery};
+for my $op (qw(starts_with starts_with_ci text_contains text_contains_ci ends_with ends_with_ci)) {
+    ok grep({ $_ eq $op } @{$api->openapi_document->{components}{schemas}{SelectoFilter}{properties}{op}{enum}}),
+        "OpenAPI advertises $op query filters";
+    ok !grep({ $_ eq $op } @{$api->openapi_document->{components}{schemas}{SelectoWriteFilter}{properties}{op}{enum}}),
+        "query text matching does not broaden write filters";
+}
 is $schema->{properties}{select}{maxItems}, 4,
     'OpenAPI field limits come from handler configuration';
 is_deeply $schema->{properties}{select}{items}{oneOf}[1],

@@ -983,7 +983,7 @@ sub _compile_expression {
         return $self->_compile_expression($domain, $arguments->[0], $params) . " $operator " .
             $self->_compile_expression($domain, $arguments->[1], $params);
     }
-    if ($kind =~ /\A(?:starts_with|starts_with_ci|text_contains|ends_with)\z/) {
+    if ($kind =~ /\A(?:starts_with|text_contains|ends_with)(?:_ci)?\z/) {
         my $literal = $arguments->[1];
         Selecto::Error->throw('invalid_query', "$kind requires a literal string value")
             unless blessed($literal) && $literal->isa('Selecto::Expression')
@@ -993,11 +993,11 @@ sub _compile_expression {
             if !defined($text) || ref($text);
         $text =~ s/([!%_])/!$1/g;
         my $field_sql = $self->_compile_expression($domain, $arguments->[0], $params);
-        push @$params, $kind eq 'text_contains' ? "%$text%"
-            : $kind eq 'ends_with' ? "%$text" : "$text%";
+        push @$params, $kind =~ /\Atext_contains/ ? "%$text%"
+            : $kind =~ /\Aends_with/ ? "%$text" : "$text%";
         return 'LOWER(' . $field_sql . ') LIKE LOWER(' .
             $self->placeholder(scalar @$params) . q{) ESCAPE '!'}
-            if $kind eq 'starts_with_ci';
+            if $kind =~ /_ci\z/;
         return $field_sql . ' LIKE ' . $self->placeholder(scalar @$params)
             . q{ ESCAPE '!'};
     }
