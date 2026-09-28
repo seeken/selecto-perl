@@ -272,11 +272,23 @@ sub text_contains {
         if !defined($text) || ref($text);
     return $class->_binary('text_contains', $field, "$text");
 }
+sub text_contains_ci {
+    my ($class, $field, $text) = @_;
+    Selecto::Error->throw('invalid_query', 'text_contains_ci requires a string value')
+        if !defined($text) || ref($text);
+    return $class->_binary('text_contains_ci', $field, "$text");
+}
 sub ends_with {
     my ($class, $field, $suffix) = @_;
     Selecto::Error->throw('invalid_query', 'ends_with requires a string suffix')
         if !defined($suffix) || ref($suffix);
     return $class->_binary('ends_with', $field, "$suffix");
+}
+sub ends_with_ci {
+    my ($class, $field, $suffix) = @_;
+    Selecto::Error->throw('invalid_query', 'ends_with_ci requires a string suffix')
+        if !defined($suffix) || ref($suffix);
+    return $class->_binary('ends_with_ci', $field, "$suffix");
 }
 
 sub between {
@@ -386,10 +398,10 @@ sub from_filter_ast {
         return $class->between($field, $value, $end);
     }
     Selecto::Error->throw('invalid_query', "unsupported filter operator $operator")
-        unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte|starts_with|starts_with_ci|text_contains|ends_with)\z/;
+        unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte|(?:starts_with|text_contains|ends_with)(?:_ci)?)\z/;
     Selecto::Error->throw('invalid_query', "$operator filter requires a value")
         unless @arguments == 2;
-    if ($operator =~ /\A(?:starts_with|starts_with_ci|text_contains|ends_with)\z/) {
+    if ($operator =~ /\A(?:starts_with|text_contains|ends_with)(?:_ci)?\z/) {
         Selecto::Error->throw('invalid_query', "$operator requires a string value")
             if !defined($value) || ref($value);
         return $class->$operator($field, $value);
