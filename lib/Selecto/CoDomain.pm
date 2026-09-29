@@ -27,7 +27,7 @@ sub lookup {
     _domain($source_domain, 'source domain');
     Selecto::Error->throw('invalid_co_domain', 'co-domain lookup requires an engine')
         unless blessed($engine) && $engine->isa('Selecto::Engine');
-    $engine->assert_read_scope(host_predicate => $args{predicate});
+    $engine->assert_tenant_boundary(access => 'read', host_predicate => $args{predicate});
     my $definition = $class->definition($source_domain, $args{co_domain});
     my $target_domain = $engine->domain;
     my $text = $args{query};

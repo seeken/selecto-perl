@@ -166,15 +166,12 @@ sub write_command ($self, $engine, $body) {
     }
 
     my $scope = $domain->required_predicate;
+    # An upsert's conflict branch updates whichever row the key hits, which
+    # can lie outside a required predicate, so it is refused under one.
+    # Tenant upserts go through an engine tenant and writes.scope.tenant.
     Selecto::Error->throw('query_enforcement_unsupported_operation', 'query-scoped API upsert is not supported')
         if $operation eq 'upsert' && defined($scope);
-    # Tenancy is satisfied by a required predicate on the request domain, or
-    # by a declared writes.scope.tenant together with an engine that holds the
-    # trusted tenant; the engine then applies that scope to the command.
-    my $engine_scoped = defined($domain->write_tenant_scope)
-        && defined($engine->scope->{tenant});
-    Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
-        if defined($domain->tenant_field) && !defined($scope) && !$engine_scoped;
+    $engine->assert_tenant_boundary(access => 'write');
     my $command = Selecto::Write::Command->new(
         operation => $operation,
         relation => $domain->table,
@@ -191,7 +188,7 @@ sub query ($self, $engine, $body) {
     Selecto::Error->throw(
         'invalid_api_host', 'API query handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
-    $engine->assert_read_scope;
+    $engine->assert_tenant_boundary(access => 'read');
     _object($body, 'query body');
     _reject_unknown($body, [qw(
         select projection view segments parameters filters ordering order_by limit offset timezone row_format
