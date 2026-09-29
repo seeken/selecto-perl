@@ -38,6 +38,24 @@ isnt($scoped->fingerprint, $domain->fingerprint,
 is_deeply($scoped->contract, $domain->contract,
     'a scoped domain retains its canonical contract metadata');
 
+my $tenant_domain = Selecto::Domain->new(
+    name => 'Role-scoped orders', table => 'orders',
+    fields => {id => 'integer', shipper_id => 'integer', customer_id => 'integer'},
+    tenant_field => 'shipper_id',
+);
+my $customer_tenant = $tenant_domain->with_tenant_field('customer_id');
+is($tenant_domain->tenant_field, 'shipper_id',
+    'deriving a tenant field does not mutate the shared domain');
+is($customer_tenant->tenant_field, 'customer_id',
+    'a trusted host can derive a role-specific tenant boundary');
+isnt($customer_tenant->fingerprint, $tenant_domain->fingerprint,
+    'the role-specific tenant boundary participates in the fingerprint');
+is_deeply($customer_tenant->contract, $tenant_domain->contract,
+    'a runtime tenant boundary retains canonical contract metadata');
+eval { $tenant_domain->with_tenant_field('missing') };
+like("$@", qr/tenant field must be a source field/,
+    'a runtime tenant boundary must name a root source field');
+
 my $choice_contract = {
     schema_version => 1, name => 'People with choices',
     source => {

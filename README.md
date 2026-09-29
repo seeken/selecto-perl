@@ -1122,15 +1122,30 @@ every single write, batch command, and graph node governed by a scoped domain:
 A scoped engine cannot be re-scoped to another tenant.
 
 A domain that names `source.tenant_field` but declares no
-`writes.scope.tenant` relies on its required predicate
-(`with_required_predicate`) as the tenant boundary. Engine writes honor that
-boundary: updates and deletes match only rows inside it, inserts must satisfy
-it, and upserts are refused with `query_enforcement_unsupported_operation`
-because a conflict can resolve to a row outside it. Prefer declaring
-`writes.scope.tenant`, which fails closed without a trusted tenant. On a
-domain without a tenant field, a required predicate is a read scope only.
-`EngineHandler` writes accept either a required predicate or a declared
-`writes.scope.tenant` with an engine that holds the trusted tenant.
+`writes.scope.tenant` relies on a positive equality or `IN` conjunct on that
+field in its required predicate (`with_required_predicate`) as the tenant
+boundary. A status, record-ID, negated, or OR-branched predicate is not tenant
+authority. Public API, canned-page, and co-domain surfaces fail closed with
+`missing_tenant_scope` unless this boundary or a trusted engine tenant is
+present.
+
+When ownership is role-dependent, a trusted host may derive the request-local
+boundary before adding its mandatory predicate:
+
+```perl
+my $customer_domain = $domain
+    ->with_tenant_field('customer_id')
+    ->with_required_predicate(Selecto::Expression->in('customer_id', \@ids));
+```
+
+This does not mutate the shared domain or its canonical contract, and the
+derived tenant field participates in the runtime fingerprint. Engine writes
+honor the resulting boundary: updates and deletes match only rows inside it,
+inserts must satisfy it, and upserts are refused with
+`query_enforcement_unsupported_operation` because a conflict can resolve to a
+row outside it. Prefer declaring `writes.scope.tenant`, which fails closed
+without a trusted tenant. On a domain without a tenant field, a required
+predicate is a read scope only.
 
 Assignments may use an adapter-independent mutation AST. Literal operands stay
 bound, identifiers are checked separately, and field references are validated
