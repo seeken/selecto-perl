@@ -1,5 +1,5 @@
 requires 'perl', '5.034';
-requires 'DBI', '1.643';
+requires 'DBI', '1.652';
 requires 'DateTime::TimeZone';
 requires 'DateTime';
 requires 'Encode';

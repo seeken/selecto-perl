@@ -201,4 +201,30 @@ $error = $@;
 is $error->code, 'invalid_domain',
     'co-domain query-library composition cannot be ambiguous';
 
+# A tenant_field co-domain with no tenant boundary is refused. A host lookup
+# predicate or a trusted engine tenant is a boundary.
+{
+    my $contract = $clients->as_contract;
+    $contract->{source}{tenant_field} = 'parent_id';
+    my $tenanted = Selecto::Domain->parse($contract, strict => 1);
+    my $adapter = CoDomainTest::Adapter->new(dbh => bless({}, 'CoDomainTest::DBH'));
+    my $lookup_code = sub {
+        my ($engine, @extra) = @_;
+        return eval {
+            Selecto::CoDomain->lookup(source_domain => $loads, co_domain => 'carriers',
+                engine => $engine, query => 'acme', limit => 5, @extra);
+            1;
+        } ? 'ok' : blessed($@) ? $@->code : "died: $@";
+    };
+    is $lookup_code->(Selecto::Engine->new(domain => $tenanted, adapter => $adapter)),
+        'missing_tenant_scope', 'an unscoped tenant_field co-domain lookup is refused';
+    is $lookup_code->(Selecto::Engine->new(domain => $tenanted, adapter => $adapter),
+        predicate => Selecto::Expression->eq('parent_id', 9)),
+        'ok', 'a host lookup predicate is a tenant boundary';
+    is $lookup_code->(Selecto::Engine->new(domain => $tenanted, adapter => $adapter, scope => {tenant => 9})),
+        'ok', 'a trusted engine tenant is a tenant boundary';
+    like $CoDomainTest::Adapter::LAST_STATEMENT->sql, qr/parent_id/,
+        'the trusted tenant reaches the lookup SQL';
+}
+
 done_testing;

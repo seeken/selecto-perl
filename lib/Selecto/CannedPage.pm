@@ -375,6 +375,7 @@ sub run {
     _fail('page engine uses a different domain')
         unless blessed($engine) && $engine->can('domain') && $engine->can('all')
             && $engine->domain->fingerprint eq $self->domain->fingerprint;
+    $engine->assert_read_scope(host_predicate => $scope) if $engine->isa('Selecto::Engine');
     my $plan = $self->plan($input, $scope);
     my $query_started = time;
     my $rows = $engine->all($plan->{query});

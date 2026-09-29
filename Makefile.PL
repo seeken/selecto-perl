@@ -12,7 +12,7 @@ WriteMakefile(
     MIN_PERL_VERSION => '5.034',
     EXE_FILES        => ['bin/selecto-certify'],
     PREREQ_PM        => {
-        'DBI'         => '1.643',
+        'DBI'         => '1.652',
         'DateTime::TimeZone' => 0,
         'DateTime' => 0,
         'Digest::SHA' => 0,
