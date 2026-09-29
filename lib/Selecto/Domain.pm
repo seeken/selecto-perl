@@ -190,6 +190,19 @@ sub with_required_predicate {
     return $copy->_refresh_fingerprint;
 }
 
+# Some hosts have role-dependent ownership boundaries over the same relation.
+# Derive a request-local domain with the boundary selected by trusted host
+# context; never mutate the portable domain shared by other requests.
+sub with_tenant_field {
+    my ($self, $field) = @_;
+    $field = _identifier($field, 'tenant field');
+    Selecto::Error->throw('invalid_domain', 'tenant field must be a source field')
+        unless exists $self->{fields}{$field};
+    my $copy = bless {%$self}, ref($self);
+    $copy->{tenant_field} = $field;
+    return $copy->_refresh_fingerprint;
+}
+
 sub parse {
     my ($class, $document, %options) = @_;
     my $strict = exists($options{strict}) ? $options{strict} : 1;
