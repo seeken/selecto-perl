@@ -220,7 +220,10 @@ is $error->code, 'invalid_domain',
         'missing_tenant_scope', 'an unscoped tenant_field co-domain lookup is refused';
     is $lookup_code->(Selecto::Engine->new(domain => $tenanted, adapter => $adapter),
         predicate => Selecto::Expression->eq('parent_id', 9)),
-        'ok', 'a host lookup predicate is a tenant boundary';
+        'ok', 'a host lookup predicate on the tenant field is a tenant boundary';
+    is $lookup_code->(Selecto::Engine->new(domain => $tenanted, adapter => $adapter),
+        predicate => Selecto::Expression->in('id', [501, 777])),
+        'missing_tenant_scope', 'a host lookup predicate on another field is not a tenant boundary';
     is $lookup_code->(Selecto::Engine->new(domain => $tenanted, adapter => $adapter, scope => {tenant => 9})),
         'ok', 'a trusted engine tenant is a tenant boundary';
     like $CoDomainTest::Adapter::LAST_STATEMENT->sql, qr/parent_id/,

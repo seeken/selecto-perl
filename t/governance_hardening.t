@@ -241,7 +241,52 @@ sub work_order_dbh {
 }
 
 SKIP: {
-    skip 'DBD::SQLite is not installed', 4 unless eval { require DBD::SQLite; 1 };
+    skip 'DBD::SQLite is not installed', 5 unless eval { require DBD::SQLite; 1 };
+
+    subtest 'public surfaces require a tenant boundary, not any host predicate' => sub {
+        my $dbh = work_order_dbh();
+        my $adapter = Selecto->adapter(sqlite => (dbh => $dbh));
+        my $E = 'Selecto::Expression';
+        my $engine_for = sub {
+            my ($predicate, %args) = @_;
+            my $domain = work_order_domain(scoped => $args{scoped});
+            $domain = $domain->with_required_predicate($predicate) if defined $predicate;
+            return Selecto::Engine->new(domain => $domain, adapter => $adapter,
+                ($args{tenant} ? (scope => {tenant => $args{tenant}}) : ()));
+        };
+        my $update = sub {
+            my ($engine, $id) = @_;
+            return code_of(sub { $handler->write($engine, {operation => 'update', assignments => {title => 'x'},
+                filters => [{field => 'id', op => 'eq', value => $id}]}) });
+        };
+        my $read = sub { my ($engine) = @_; code_of(sub { $handler->query($engine, {select => ['id']}) }) };
+
+        my %boundary = (
+            'a status predicate' => [$E->eq('state', 'done'), 'missing_tenant_scope'],
+            'an id predicate' => [$E->eq('id', 2), 'missing_tenant_scope'],
+            'an OR with the tenant' => [$E->any($E->eq('site_id', 10), $E->eq('id', 2)), 'missing_tenant_scope'],
+            'a negated tenant' => [$E->not($E->eq('site_id', 20)), 'missing_tenant_scope'],
+            'a tenant equality' => [$E->eq('site_id', 10), 'ok'],
+            'a tenant IN list' => [$E->in('site_id', [10]), 'ok'],
+            'a tenant equality beneath AND' => [$E->all($E->eq('state', 'done'), $E->eq('site_id', 10)), 'ok'],
+        );
+        for my $name (sort keys %boundary) {
+            my ($predicate, $expected) = @{$boundary{$name}};
+            is($read->($engine_for->($predicate)), $expected, "API query under $name: $expected");
+            is($update->($engine_for->($predicate), 1), $expected, "API write under $name: $expected");
+        }
+        is($dbh->selectrow_array('SELECT title FROM work_orders WHERE id = 2'), 'theirs',
+            'no refused write touched the other tenant');
+
+        is($update->($engine_for->(undef, tenant => 10), 1), 'missing_tenant_scope',
+            'an engine tenant without writes.scope.tenant is not a write boundary');
+        is($read->($engine_for->(undef, tenant => 10)), 'ok', 'an engine tenant is a read boundary');
+        is($update->($engine_for->(undef, tenant => 10, scoped => 1), 1), 'ok',
+            'an engine tenant with writes.scope.tenant is a write boundary');
+        is(code_of(sub { $handler->write($engine_for->($E->eq('site_id', 10)), {operation => 'upsert',
+            assignments => {id => 1, title => 'x'}, conflict_target => ['id'], upsert_update_fields => ['title']}) }),
+            'query_enforcement_unsupported_operation', 'upsert stays refused under a tenant predicate');
+    };
 
     subtest 'an engine tenant scopes reads as well as writes' => sub {
         my $dbh = work_order_dbh();

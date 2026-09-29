@@ -140,19 +140,26 @@ sub read_domain {
     };
 }
 
-# Request-facing read surfaces (the API query handler, canned pages, co-domain
-# lookups) refuse a tenant_field domain with no tenant boundary at all: no
-# trusted tenant on the engine and no host required predicate. This is the
-# rule the API write handler applies. A surface that takes its own trusted
-# host predicate passes it as host_predicate. Engine::all itself stays
-# available for trusted host reads that deliberately span tenants.
-sub assert_read_scope {
+# The tenant boundary public surfaces (the API write and query handlers,
+# canned pages, co-domain lookups) require on a tenant_field domain. Either the
+# engine holds a trusted tenant (for writes, on the field writes.scope.tenant
+# declares, since execution applies it there), or the trusted host scope has a
+# positive tenant conjunct: the required predicate ANDed with any host
+# predicate the surface accepts. Any other host predicate, such as a status
+# filter, is not a boundary. Engine::all itself stays available for trusted
+# host reads that deliberately span tenants.
+sub assert_tenant_boundary {
     my ($self, %args) = @_;
-    my $domain = $self->{domain};
-    Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
-        if defined($domain->tenant_field) && !defined($domain->required_predicate)
-            && !defined($self->{scope}{tenant}) && !defined($args{host_predicate});
-    return $self;
+    my $access = $args{access} // '';
+    Selecto::Error->throw('invalid_tenant_scope', 'tenant boundary access must be read or write')
+        unless $access eq 'read' || $access eq 'write';
+    my $field = $self->{domain}->tenant_field;
+    return $self unless defined $field;
+    return $self if $access eq 'write' ? $self->_scopes_tenant_field($field) : defined($self->{scope}{tenant});
+    return $self if grep { _has_tenant_conjunct($_, $field) }
+        grep { defined } $self->{domain}->required_predicate, $args{host_predicate};
+    Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required',
+        {tenant_field => "$field"});
 }
 
 # True when a top-level positive tenant conjunct (eq or in over literals) on
