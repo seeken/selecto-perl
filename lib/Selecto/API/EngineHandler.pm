@@ -191,6 +191,7 @@ sub query ($self, $engine, $body) {
     Selecto::Error->throw(
         'invalid_api_host', 'API query handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
+    $engine->assert_read_scope;
     _object($body, 'query body');
     _reject_unknown($body, [qw(
         select projection view segments parameters filters ordering order_by limit offset timezone row_format

@@ -241,7 +241,45 @@ sub work_order_dbh {
 }
 
 SKIP: {
-    skip 'DBD::SQLite is not installed', 3 unless eval { require DBD::SQLite; 1 };
+    skip 'DBD::SQLite is not installed', 4 unless eval { require DBD::SQLite; 1 };
+
+    subtest 'an engine tenant scopes reads as well as writes' => sub {
+        my $dbh = work_order_dbh();
+        my $adapter = Selecto->adapter(sqlite => (dbh => $dbh));
+        my $site_ids = sub { [sort map { $_->[1] } @{$_[0]->{rows}}] };
+        my $engine = Selecto::Engine->new(domain => work_order_domain(scoped => 1),
+            adapter => $adapter, scope => {tenant => 10});
+        is_deeply($site_ids->($engine->all($engine->query->select('id', 'site_id'))), [10, 10],
+            'engine->all returns only the trusted tenant');
+        is_deeply($site_ids->($handler->query($engine, {select => ['id', 'site_id']})), [10, 10],
+            'the API query handler returns only the trusted tenant');
+        like($engine->compile($engine->query->select('id'))->sql, qr/site_id/,
+            'compiled SQL carries the tenant condition');
+
+        my $same = Selecto::Engine->new(adapter => $adapter, scope => {tenant => 10},
+            domain => work_order_domain()->with_required_predicate(Selecto::Expression->eq('site_id', 10)));
+        is_deeply($site_ids->($same->all($same->query->select('id', 'site_id'))), [10, 10],
+            'a required predicate naming the same tenant still reads');
+        my $other = Selecto::Engine->new(adapter => $adapter, scope => {tenant => 10},
+            domain => work_order_domain()->with_required_predicate(Selecto::Expression->eq('site_id', 20)));
+        is(code_of(sub { $other->all($other->query->select('id')) }), 'tenant_mismatch',
+            'a required predicate naming another tenant is refused, not read as empty');
+        my $outside = Selecto::Engine->new(adapter => $adapter, scope => {tenant => 10},
+            domain => work_order_domain()->with_required_predicate(Selecto::Expression->in('site_id', [20, 30])));
+        is(code_of(sub { $outside->all($outside->query->select('id')) }), 'tenant_mismatch',
+            'an in-list that excludes the engine tenant is refused');
+
+        my $unscoped = Selecto::Engine->new(domain => work_order_domain(), adapter => $adapter);
+        is(scalar @{$unscoped->all($unscoped->query->select('id'))->{rows}}, 3,
+            'a trusted host read without scope still spans tenants');
+        is(code_of(sub { $handler->query($unscoped, {select => ['id']}) }), 'missing_tenant_scope',
+            'the API query handler refuses a tenant_field domain with no tenant boundary');
+        my $rescoped = $unscoped->with_scope(tenant => 20);
+        is_deeply($site_ids->($rescoped->all($rescoped->query->select('id', 'site_id'))), [20],
+            'with_scope applies the new tenant to reads');
+        is(scalar @{$unscoped->all($unscoped->query->select('id'))->{rows}}, 3,
+            'with_scope leaves the original engine unchanged');
+    };
 
     subtest 'engine writes honor the domain required predicate' => sub {
         my $dbh = work_order_dbh();

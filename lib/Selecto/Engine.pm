@@ -80,6 +80,7 @@ sub with_scope {
         if defined($current) && defined($next->{tenant}) && "$current" ne "$next->{tenant}";
     my $copy = bless {%$self}, ref($self);
     $copy->{scope} = {%{$self->{scope}}, %$next};
+    delete $copy->{_read_domain};
     return $copy;
 }
 
@@ -110,8 +111,67 @@ sub domain  { return $_[0]->{domain}; }
 sub adapter { return $_[0]->{adapter}; }
 sub domain_ref { return $_[0]->{domain_ref}; }
 sub query   { return Selecto::Query->new; }
-sub compile { my ($self, $query) = @_; return $self->{adapter}->compile($self->{domain}, $query); }
+sub compile { my ($self, $query) = @_; return $self->{adapter}->compile($self->read_domain, $query); }
 sub all     { my ($self, $query) = @_; return $self->{adapter}->execute_query($self->compile($query)); }
+
+# The domain reads compile against. An engine holding a trusted tenant scopes
+# every read of a tenant_field domain to that tenant, as it already scopes
+# writes, so a read path that forgets with_required_predicate cannot see other
+# tenants' rows. Query members inherit the added condition through the
+# required predicate. A required predicate whose tenant condition excludes the
+# trusted tenant is a host error rather than an empty result.
+sub read_domain {
+    my ($self) = @_;
+    return $self->{_read_domain} //= do {
+        my $domain = $self->{domain};
+        my $tenant = $self->{scope}{tenant};
+        my $field = $domain->tenant_field;
+        if (defined($tenant) && defined($field)) {
+            my $required = $domain->required_predicate;
+            Selecto::Error->throw(
+                'tenant_mismatch', 'required predicate excludes the engine tenant',
+                {tenant_field => "$field"},
+            ) if _excludes_tenant($required, $field, $tenant);
+            my $trusted = Selecto::Expression->eq($field, $tenant);
+            $domain = $domain->with_required_predicate(
+                defined($required) ? Selecto::Expression->all($required, $trusted) : $trusted);
+        }
+        $domain;
+    };
+}
+
+# Request-facing read surfaces (the API query handler, canned pages, co-domain
+# lookups) refuse a tenant_field domain with no tenant boundary at all: no
+# trusted tenant on the engine and no host required predicate. This is the
+# rule the API write handler applies. A surface that takes its own trusted
+# host predicate passes it as host_predicate. Engine::all itself stays
+# available for trusted host reads that deliberately span tenants.
+sub assert_read_scope {
+    my ($self, %args) = @_;
+    my $domain = $self->{domain};
+    Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required')
+        if defined($domain->tenant_field) && !defined($domain->required_predicate)
+            && !defined($self->{scope}{tenant}) && !defined($args{host_predicate});
+    return $self;
+}
+
+# True when a top-level positive tenant conjunct (eq or in over literals) on
+# the field cannot match the trusted tenant.
+sub _excludes_tenant {
+    my ($expression, $field, $tenant) = @_;
+    return 0 unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $kind = $expression->kind;
+    if ($kind eq 'and') {
+        for my $conjunct (@{$expression->arguments->[0] // []}) {
+            return 1 if _excludes_tenant($conjunct, $field, $tenant);
+        }
+        return 0;
+    }
+    return 0 unless ($kind eq 'eq' || $kind eq 'in') && _is_tenant_comparison($expression, $field);
+    my $value = $expression->arguments->[1];
+    my @allowed = $kind eq 'eq' ? ($value->arguments->[0]) : @$value;
+    return !grep { "$_" eq "$tenant" } @allowed;
+}
 sub projection_sum {
     my ($self, $query, $column) = @_;
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not support projection sums')
