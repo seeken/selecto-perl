@@ -804,3 +804,137 @@ sub _error_hash ($error, $field) {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Importer - CSV inspection and governed import previews
+
+=head1 SYNOPSIS
+
+  use Selecto::Importer;
+
+  my $importer = Selecto::Importer->new(domain => $domain);   # the domain declares `imports`
+
+  my $inspection = $importer->inspect_csv($uploaded_bytes);
+  # {columns => [{id => 'c1', header => 'VIN', label => 'VIN', ...}, ...],
+  #  rows => [{row_number => 1, values => {c1 => ...}}, ...], row_count => 2, sha256 => ...}
+
+  my $preview = $importer->preview_rows($inspection, {
+      config_version     => 1,
+      domain_fingerprint => $importer->domain_fingerprint,
+      mappings => [
+          {target => 'client_id', source => {kind => 'trusted'}},
+          {target => 'vin', source => {kind => 'column', column_id => 'c1'},
+           transforms => [qw(trim uppercase)]},
+          {target => 'lic_state', source => {kind => 'static', value => 'CO'}},
+      ],
+      match => {key_set => 'vin', on_match => 'update', on_missing => 'insert'},
+  },
+      trusted_values => {current_client_id => $session->client_id},
+      key_resolver   => sub {
+          my ($key_values) = @_;
+          return {matches => [find_ids_by_vin($key_values->{vin})]};  # [{id => 19}, ...]
+      },
+  );
+
+  for my $row (@{$preview->{rows}}) {
+      next if $row->{decision} eq 'error';        # see $row->{errors}
+      $api_handler->write($engine, $row->{write}) if $row->{write};
+  }
+
+=head1 DESCRIPTION
+
+The importer turns an uploaded CSV file into per-row write plans without
+writing anything. What may be imported is declared by the domain's
+C<imports> contract: which fields can come from a file column, a static
+value or a trusted host value, which transforms are allowed, which key sets
+identify existing records, and which actions may run per row. A browser can
+author the mapping configuration, but the server re-validates it against
+that contract and the current domain fingerprint.
+
+Each preview row carries a C<decision> (C<insert>, C<update>, C<skip> or
+C<error>), the resolved C<assignments>, C<errors>, and when applicable a
+C<write> body in the shape accepted by
+L<Selecto::API::EngineHandler/write> and planned C<actions>. Values from
+C<trusted_values> (such as the tenant) are supplied by the host, never by
+the file or the configuration. The host decides whether and how to execute
+the plans, through a governed engine.
+
+=head1 CONSTRUCTOR
+
+=head2 new
+
+  my $importer = Selecto::Importer->new(
+      domain          => $domain,
+      max_columns     => 200,
+      max_rows        => 50_000,
+      max_sample_rows => 25,
+      max_cell_bytes  => 1_048_576,
+  );
+
+Throws C<import_not_enabled> when the domain does not publish an enabled
+C<imports> contract, C<invalid_import_contract> when that contract is
+malformed (it must declare C<< contract_version => 1 >> and
+C<< field_policy => "declared_only" >>), and C<invalid_importer> for invalid
+limits.
+
+=head1 METHODS
+
+=head2 inspect_csv
+
+  my $inspection = $importer->inspect_csv($content, delimiter => ',', header => 1);
+
+Parses UTF-8 CSV (bytes or decoded text) and returns its columns, rows,
+C<sample_rows>, C<row_count> and a C<sha256> digest. Errors:
+C<invalid_import_file>, C<import_parser_error>, C<import_file_empty>,
+C<import_column_limit_exceeded>, C<import_row_limit_exceeded>,
+C<import_cell_limit_exceeded>.
+
+=head2 normalize_configuration
+
+  my $normalized = $importer->normalize_configuration($configuration, columns => $inspection->{columns});
+
+Validates a mapping configuration against the contract. Throws
+C<import_domain_changed> when C<domain_fingerprint> no longer matches, and
+C<invalid_import_configuration> for other problems. Transforms are
+C<trim>, C<uppercase>, C<lowercase>, C<normalize_whitespace> and
+C<empty_to_null>, each only where the contract allows it.
+
+=head2 preview_rows
+
+  my $preview = $importer->preview_rows($inspection, $configuration,
+      key_resolver => $callback, trusted_values => \%values);
+
+Returns C<< {configuration => ..., rows => [...], returned => $n} >>. The
+C<key_resolver> receives the row's key-set values and returns
+C<< {matches => [{id => ...}, ...]} >>; the contract's key-set cardinality
+decides how many matches are acceptable.
+
+=head2 contract
+
+A copy of the normalized C<imports> contract.
+
+=head2 domain_fingerprint
+
+The domain's published C<domain_fingerprint> when it has one, otherwise its
+computed fingerprint. Request-scoped predicates do not change it.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::API::EngineHandler>, L<Selecto::Engine>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

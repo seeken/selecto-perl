@@ -207,3 +207,38 @@ sub _number_or_undef {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Analytics::Pipeline - apply allowlisted analytics transforms to an aggregate series
+
+=head1 DESCRIPTION
+
+Applies the transforms catalogued by L<Selecto::Analytics::TransformRegistry>
+to a bounded, ordered aggregate series after database execution, keeping raw
+values, units and derivation metadata. See F<docs/analytics-units.md> in the
+distribution.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Analytics::TransformRegistry>, L<Selecto::Analytics::UnitRegistry>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

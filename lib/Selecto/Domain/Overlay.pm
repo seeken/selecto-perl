@@ -235,8 +235,31 @@ Selecto::Domain::Overlay - deterministic composition of Selecto domain contracts
 
 =head1 DESCRIPTION
 
-Maps deep-merge, redaction and extension lists union uniquely, and other lists
-and scalar values are replaced by later overlays. The complete result crosses
-the strict C<Selecto::Domain> parser before it is returned.
+Implements L<Selecto::Domain/compose>. Maps deep-merge, C<redact_fields> and
+C<extensions> lists union uniquely, and other lists and scalar values are
+replaced by later overlays. Updates to existing C<actions>, C<capabilities>,
+C<source_relationships> and C<choice_sources> entries are reported as
+collision diagnostics. The complete result crosses the strict
+L<Selecto::Domain> parser before it is returned.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; call C<< Selecto::Domain->compose >> and build
+overlays with L<Selecto::Domain::DSL>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Domain>, L<Selecto::Domain::DSL>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut

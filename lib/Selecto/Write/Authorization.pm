@@ -57,9 +57,29 @@ Selecto::Write::Authorization - single-use proof that a write was governed
 
 =head1 DESCRIPTION
 
-Issued only by L<Selecto::Engine> for the exact command, batch, or graph it
-validated. SQL adapters require one for C<execute_write>, C<execute_batch>,
+Issued only by L<Selecto::Engine> for the exact command, batch or graph it
+validated. SQL adapters require one for C<execute_write>, C<execute_batch>
 and C<execute_graph>. The C<*_unsafe> adapter methods skip the check and are
 reserved for trusted internal tooling and adapter tests.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Engine>, L<Selecto::Write>, L<Selecto::SQL>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut

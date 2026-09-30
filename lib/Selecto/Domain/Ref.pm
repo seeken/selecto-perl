@@ -54,10 +54,47 @@ __END__
 
 Selecto::Domain::Ref - opaque provenance for a registered Selecto domain
 
+=head1 SYNOPSIS
+
+  my ($domain, $ref) = $registry->resolve(orders => \%context);
+  $ref->id;            # 'orders'
+  $ref->version;       # from provider metadata or domain_version
+  $ref->fingerprint;
+  my $data = $ref->to_hash;
+
 =head1 DESCRIPTION
 
-References carry a registry-owned id and version/fingerprint metadata without
-embedding the authored domain contract. C<to_hash> returns a data-only
-projection suitable for diagnostics or transport.
+A reference names a domain inside a L<Selecto::Domain::Registry> and
+records where it came from, without embedding the domain contract. Engines
+built with L<Selecto::Engine/from_registry> keep it as C<domain_ref>, so
+downstream code can inspect provenance without accepting a caller-supplied
+domain.
+
+=head1 METHODS
+
+C<id>, C<registry> (the registry object), C<registry_name>, C<version>,
+C<fingerprint> and C<metadata> (a copy).
+
+=head2 to_hash
+
+Returns C<< {id, registry, version, fingerprint, metadata} >>, a data-only
+projection suitable for diagnostics or transport. It cannot be turned back
+into a domain without the registry.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Domain::Registry>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut

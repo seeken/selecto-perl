@@ -453,3 +453,54 @@ sub _transaction {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::DuckDB - DuckDB adapter
+
+=head1 SYNOPSIS
+
+  my $dbh = DBI->connect('dbi:DuckDB:dbname=:memory:', '', '',
+      {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+  my $adapter = Selecto->adapter(duckdb => (dbh => $dbh));
+
+=head1 DESCRIPTION
+
+Registered as C<duckdb>; needs L<DBD::DuckDB> 0.16 or newer. It uses
+double-quoted identifiers and numbered C<$1> parameters.
+
+Supported: transactions, CTEs and recursive CTEs, window functions, set
+operations, C<ROLLUP>, streaming, computed value expressions and
+C<json_text>, and writes with C<RETURNING> and write graphs. Lateral joins,
+JSON and array rowsets, array predicates, full-text search and row locks fail
+closed.
+
+DBD::DuckDB 0.16 decodes some timestamps and decimals inexactly and infers
+numeric-looking strings as floating point. The adapter works around this
+without patching the driver: scalar parameters are bound as C<VARCHAR>,
+governed numeric comparisons cast each parameter to its own exact
+C<DECIMAL> scale, and results pass through an adapter-owned final projection
+that carries dates, timestamps and decimals as server-rendered text. Scalar
+booleans are returned as 0 or 1. Values inside nested list or struct values
+are not repaired. The
+details are in F<docs/duckdb-result-transport.md> in the distribution.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::SQL>, L<DBD::DuckDB>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

@@ -260,3 +260,38 @@ sub _not_evaluable {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::QueryEnforcement - query-derived evidence that guards a later write
+
+=head1 DESCRIPTION
+
+Captures the predicate of a governed query so that
+L<Selecto::Engine/enforce_query> can require it again, in the same statement,
+when a write executes. For inserts it evaluates the candidate row against the
+captured rule with SQL three-valued logic and exact decimal comparison.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Engine>, L<Selecto::Write>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

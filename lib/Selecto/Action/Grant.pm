@@ -72,4 +72,71 @@ __END__
 
 Selecto::Action::Grant - single-use, phase-bound action authorization
 
+=head1 SYNOPSIS
+
+  my $grant = $engine->grant_action($plan, phase => 'execute',
+      resolver => $policy, context => $ctx, expires_in => 300);
+
+  # later, on the same engine tenant and actor:
+  my $done = $engine->execute_action($plan, grant => $grant, context => $ctx);
+  audit($done->{decision}{grant} eq $grant->id);
+
+=head1 DESCRIPTION
+
+A grant records that a host resolver approved one phase of one action plan,
+so that authorization and execution can happen at different moments (for
+example across a confirmation step). Grants are issued only by
+L<Selecto::Engine/grant_action> and are bound to the phase, a digest of the
+plan's content, the domain fingerprint, the engine's trusted tenant and the
+context's actor.
+
+A grant works once and only before it expires. Using it with a different
+binding fails with C<action_grant_mismatch> and revokes it; a used, revoked,
+expired or forged grant fails with C<action_grant_invalid>. A denied
+capability issues no grant.
+
+Grants are opaque in-process objects: the record of what was issued lives in
+the Perl process that issued it, so a grant cannot be serialized, stored or
+used from another process. Letting the grant object go out of scope revokes
+it.
+
+=head1 METHODS
+
+=over 4
+
+=item C<id>
+
+An opaque identifier for audit records; also returned as
+C<< $result->{decision}{grant} >> when the grant is consumed.
+
+=item C<phase>
+
+C<preview> or C<execute>.
+
+=item C<decision>
+
+A copy of the resolver decision.
+
+=item C<plan_digest($plan)>
+
+Class method: the stable SHA-256 digest of a plan's content.
+
+=back
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Engine/grant_action>, L<Selecto::Action>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
 =cut

@@ -479,3 +479,259 @@ sub _clone {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Expression - fields, predicates, aggregates and other query expressions
+
+=head1 SYNOPSIS
+
+  use Selecto::Expression;
+
+  my $recent = Selecto::Expression->all(
+      Selecto::Expression->eq('status', 'shipped'),
+      Selecto::Expression->between('ordered_on', '2026-01-01', '2026-03-31'),
+      Selecto::Expression->any(
+          Selecto::Expression->in('region', [qw(north east)]),
+          Selecto::Expression->starts_with_ci('customer.name', 'acme'),
+      ),
+  );
+
+  my $revenue = Selecto::Expression->sum('total')->as('revenue');
+
+  # The same predicate from portable data, e.g. a JSON request body:
+  my $filter = Selecto::Expression->from_filter_ast(
+      ['and', [['eq', 'status', 'shipped'], ['gte', 'total', 100]]]);
+
+=head1 DESCRIPTION
+
+Expressions are small immutable trees. They name fields by dotted path and
+carry literal values separately, so adapters always emit placeholders and
+pass values as bound parameters. Nothing in an expression is ever pasted
+into SQL text.
+
+All constructors are class methods. Where an argument is a field, you can
+pass a field path string or another expression; the right-hand side of a
+comparison is a literal unless you pass an expression, which lets you compare
+two governed fields (C<< Selecto::Expression->ne('id', Selecto::Expression->field('parent_id')) >>).
+
+Some expressions need adapter capabilities. An adapter that cannot compile
+one fails with C<unsupported_feature> or C<invalid_query> before execution.
+
+=head1 OPERANDS
+
+=head2 field
+
+  Selecto::Expression->field('customer.name')
+
+=head2 literal
+
+  Selecto::Expression->literal(42)
+
+=head2 as
+
+  my $aliased = $expression->as('total_freight');
+
+Returns a copy with a result-column alias.
+
+=head1 PREDICATES
+
+=head2 eq, ne, gt, gte, lt, lte
+
+  Selecto::Expression->gte('total', '100.00')
+
+=head2 between
+
+  Selecto::Expression->between('ordered_on', $from, $to)
+
+=head2 in
+
+  Selecto::Expression->in('status', [qw(open pending)])
+  Selecto::Expression->in('status', 'open', 'pending')
+
+=head2 is_null, not_null
+
+  Selecto::Expression->is_null('shipped_at')
+
+=head2 starts_with, text_contains, ends_with
+
+  Selecto::Expression->text_contains('name', '50%_off')
+
+Literal prefix, substring and suffix matches. C<%>, C<_> and the escape
+character in the value are escaped, so user input is never a LIKE pattern.
+Each has a case-insensitive C<_ci> variant (C<starts_with_ci>,
+C<text_contains_ci>, C<ends_with_ci>). Matching follows the database
+collation. An empty prefix matches every non-null value.
+
+=head2 all, any, not
+
+  Selecto::Expression->all(@predicates)    # AND
+  Selecto::Expression->any(@predicates)    # OR
+  Selecto::Expression->not($predicate)
+
+C<all> and C<any> also accept a single array reference.
+
+=head2 from_filter_ast
+
+  my $predicate = Selecto::Expression->from_filter_ast($ast);
+
+Builds a predicate from the portable filter AST used by query-library
+segments, computed predicate columns and API clients:
+
+  ['and', [AST, ...]]           ['or', [AST, ...]]           ['not', AST]
+  ['eq', FIELD, VALUE]          # also ne gt gte lt lte
+  ['between', FIELD, LOW, HIGH]
+  ['in', FIELD, [VALUE, ...]]
+  ['is_null', FIELD]            ['not_null', FIELD]
+  ['starts_with', FIELD, TEXT]  # also text_contains, ends_with and the _ci forms
+  ['array_contains', FIELD, [VALUE, ...]]   # also array_contained, array_overlap
+  ['json_contains', FIELD, {DOCUMENT}]
+
+A comparison VALUE may be C<['field', PATH]> to compare two fields. Field
+names must be dotted identifiers; anything else throws C<invalid_query>.
+
+=head1 AGGREGATES
+
+=over 4
+
+=item C<count> - C<COUNT(*)>
+
+=item C<count_field($field)>, C<count_distinct($field)>
+
+=item C<sum($field)>, C<sum_zero($field)> (null-safe sum), C<avg>, C<min>, C<max>
+
+=item C<true_count($field)>, C<false_count($field)>
+
+=item C<true_percentage($field)>
+
+Percentage of true values among non-null booleans; null for an empty or
+all-null group.
+
+=item C<grouping(@expressions)>
+
+The SQL C<GROUPING()> marker for rollup queries; see
+L<Selecto::Query/group_by_rollup>.
+
+=back
+
+=head1 WINDOW FUNCTIONS
+
+  Selecto::Expression->window_sum('total',
+      partition_by => ['customer_id'],
+      order_by     => [['id', 'asc']],
+      frame        => {type => 'rows', start => 'unbounded_preceding', end => 'current_row'},
+  )->as('running_total');
+
+C<row_number>, C<rank>, C<dense_rank>, C<window_sum>, C<window_avg>,
+C<lag($field, $offset, $default, %over)> and C<lead(...)> are shortcuts for
+C<< window($function, \@arguments, %over) >>, which accepts the allowlisted
+functions C<row_number rank dense_rank percent_rank cume_dist ntile lag lead
+first_value last_value nth_value count sum avg min max>. Frames take
+C<type> (C<rows>, C<range> or C<groups>) and C<start>/C<end> boundaries:
+C<unbounded_preceding>, C<current_row>, C<unbounded_following>,
+C<< {preceding => N} >> or C<< {following => N} >>. Requires the
+C<window_functions> capability.
+
+=head1 RELATED COLLECTIONS
+
+  Selecto::Expression->related_collection('lines', [qw(sku quantity)],
+      order_by => [['sku', 'asc']], limit => 20)->as('lines');
+  Selecto::Expression->related_sum('lines', 'quantity')->as('units');
+  Selecto::Expression->related_count('lines', 'id')->as('line_count');
+
+A correlated JSON array of child rows, or a correlated scalar aggregate, over
+a to-many association. The outer query keeps one row per root record and the
+association is not joined into it. Options: C<filters> (C<[[field, value]]>
+equalities), C<order_by> (C<[[field, direction]]>), C<limit> (per parent,
+requires C<order_by>) and C<after> (a keyset cursor). Field entries may also
+be C<< {key => 'name', expression => $expression} >>.
+
+=head1 DATES AND TIMES
+
+=head2 datetime_format
+
+  Selecto::Expression->datetime_format('ordered_at', 'month')
+
+Formats a date or time with an allowlisted format name (C<iso8601>,
+C<rfc3339_millis>, C<epoch_seconds>, C<epoch_milliseconds>, C<day>,
+C<time>, C<day_hour>, C<week>, C<iso_week>, C<iso_week_date>, C<month>,
+C<quarter>, C<year>, C<month_of_year>, C<day_of_month>, C<day_of_week>,
+C<day_of_week_num>, C<day_of_year>, C<hour>, C<timezone_offset>). Use the
+same expression in C<select>, C<group_by> and C<order_by>. PostgreSQL and
+DuckDB implement these; other adapters fail closed.
+
+=head2 epoch_datetime
+
+Treats a numeric epoch column as an instant.
+
+=head2 bucket, count_bucket
+
+  Selecto::Expression->bucket('price', {kind => 'numeric_increment', increment => 50})
+
+Adapter-compiled bucketing for aggregate views. Bucket kinds include
+C<numeric_increment>, C<year_increment>, C<text_prefix>, C<numeric_ranges>,
+C<elapsed_days_ranges>, C<date_relative_ranges> and C<year_ranges>.
+C<count_bucket($field, $minimum, $maximum)> counts values within bounds.
+
+=head1 POSTGRESQL-ONLY EXPRESSIONS
+
+=over 4
+
+=item C<text_search($fields, $query, configuration => 'simple', mode => 'plain')>
+
+=item C<text_rank($fields, $query, ...)>
+
+Full-text search and rank. Configurations and modes are allowlisted; the
+search text is bound.
+
+=item C<array_contains($field, @values)>, C<array_contained(...)>, C<array_overlap(...)>
+
+Array predicates over a column declared with an C<items> type. Each value is
+bound and the list is cast to the element type. Null arrays never match.
+
+=item C<json_contains($field, \%document)>
+
+JSON containment with the document bound as canonical JSON.
+
+=back
+
+=head1 OTHER EXPRESSIONS
+
+=head2 value
+
+  Selecto::Expression->value(['divide', ['field', 'cents'], ['literal', 100]])->as('dollars')
+
+A computed value from the closed AST in L<Selecto::ValueExpression>,
+type-checked against the engine's domain. Requires the C<value_expressions>
+capability (PostgreSQL, DuckDB).
+
+=head2 dimension_display
+
+  Selecto::Expression->dimension_display('ref_status.description', 'status_id')
+
+Displays a star-dimension label while grouping by its key.
+
+=head1 INSPECTION
+
+C<kind>, C<arguments> (a deep copy) and C<alias_name> expose an expression's
+structure for adapters and tools.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Query>, L<Selecto::ValueExpression>, L<Selecto::DateFormat>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

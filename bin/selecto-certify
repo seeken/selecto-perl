@@ -23,3 +23,56 @@ if (!$ok) {
     warn "selecto-certify: $error\n";
     exit 1;
 }
+
+__END__
+=head1 NAME
+
+selecto-certify - run the Selecto certification observation protocol
+
+=head1 SYNOPSIS
+
+  selecto-certify --request /path/to/request.json
+
+  # Use a certification runner checkout that is not next to this one:
+  SELECTO_LIVE_SELECTO_PERL_CERTIFICATION=/path/to/selecto-perl-certification \
+      selecto-certify --request request.json
+
+=head1 DESCRIPTION
+
+C<selecto-certify> is a thin workspace wrapper around the observation
+runner in the separate C<selecto-perl-certification> checkout. The central,
+cross-language Selecto certification harness writes a request file naming a
+target backend and the cases to observe, invokes this command, and compares
+the observations it writes against its own expected results. The runner
+exercises only public Selecto APIs.
+
+The runner is looked up in C<../selecto-perl-certification> relative to
+this distribution, or in the directory named by
+C<SELECTO_LIVE_SELECTO_PERL_CERTIFICATION>; the command exits with an error
+if it cannot be found. It is not needed to use Selecto in an application.
+
+Database connection URLs come from environment variables named in the
+request and are never written to output. Run it only against disposable
+databases: the runner creates and removes its own fixture tables.
+
+=head1 EXIT STATUS
+
+0 on success; 1 with a one-line message on standard error on failure.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<https://github.com/seeken/selecto-perl>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

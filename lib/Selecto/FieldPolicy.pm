@@ -263,3 +263,95 @@ sub _scalar ($value) {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::FieldPolicy - resolve form fields to hidden, read-only, editable or action-backed
+
+=head1 SYNOPSIS
+
+  use Selecto::FieldPolicy;
+
+  my $policy = Selecto::FieldPolicy->new(
+      domain    => $domain,
+      authorize => sub {
+          my ($request) = @_;   # {capability, phase, field, operation, context, snapshot}
+          return {status => can($request) ? 'enabled' : 'hidden'};
+      },
+  );
+
+  my $fields = $policy->resolve(
+      operation => 'update',                 # insert, update, upsert or view
+      profile   => [
+          'name',
+          {field => 'status', mode => 'action', action => 'close'},
+          {field => 'notes', control => 'textarea', rows => 4,
+           edit_capability => 'orders.edit_notes'},
+      ],
+      snapshot  => $current_row,             # values, and eligibility context
+      context   => {actor => $user},
+  );
+  # [{field => 'name', label => 'Name', type => 'string', state => 'editable',
+  #   control => 'text', required => 0, writable => 1, value => ...}, ...]
+
+  my $accepted = $policy->accepted_fields(%same_args);   # names that may be submitted
+
+=head1 DESCRIPTION
+
+A field policy intersects the domain's public field metadata, its C<writes>
+permissions, a form I<profile> chosen by the host, host capability decisions
+and record-state eligibility, and returns one descriptor per profile field
+with a C<state> of C<hidden>, C<read-only>, C<editable> or
+C<action-backed>. Hidden and read-only descriptors carry a C<reason_code>
+such as C<field_not_public>, C<write_not_permitted>, C<state_ineligible> or
+C<edit_denied>.
+
+It is HTTP-neutral and does not write anything. Use L</accepted_fields> to
+filter a submission, then write through L<Selecto::Engine>, which enforces
+the contract again.
+
+=head1 METHODS
+
+=head2 new
+
+C<domain> is required. C<authorize> receives a request hash and returns
+C<< {status => 'enabled'|'disabled'|'hidden', reason => ..., reason_code => ...} >>;
+it is only called for profile entries that name a C<view_capability> or
+C<edit_capability>. The default allows everything.
+
+=head2 resolve
+
+Arguments: C<operation> (default C<update>), C<profile> (field names or
+entry hashes), C<snapshot> and C<context>. Entry keys: C<field>, C<label>,
+C<control>, C<required>, C<nullable>, C<placeholder>, C<rows>, C<options>,
+C<mode> (C<auto>, C<hidden>, C<read_only>, C<editable> or C<action>),
+C<action>, C<view_capability>, C<edit_capability>, C<eligible> and
+C<reason>. Throws C<invalid_field_policy>.
+
+=head2 visible
+
+The descriptors from L</resolve> whose state is not C<hidden>.
+
+=head2 accepted_fields
+
+The names of the C<editable> fields.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Domain>, L<Selecto::Engine>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

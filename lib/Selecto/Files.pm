@@ -557,3 +557,145 @@ sub _project {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Files - HTTP-neutral attachment facade with hidden tenant authority (experimental)
+
+=head1 SYNOPSIS
+
+  use Selecto::Files;
+
+  my $files = Selecto::Files->new(
+      secret     => $server_secret,             # used to derive opaque tenant scopes
+      descriptor => {
+          id                 => 'invoice-files',
+          domain_fingerprint => 'invoice-v1',
+          roles => {
+              documents => {max_files => 5, max_bytes => 10_000_000,
+                            media_types => ['application/pdf']},
+          },
+      },
+      storage   => Selecto::Files::LocalStorage->new(root => '/var/lib/app/files'),
+      authorize => sub {
+          my ($action, $actor, $owner, $role) = @_;   # upload, download, replace, ...
+          return can_touch($actor, $owner, $action);
+      },
+  );
+
+  # Per request, with tenant and actor from your session:
+  my $record = $files->bind(tenant => $tenant_id, actor => $user_id)
+      ->for_record({domain_fingerprint => 'invoice-v1', key => {id => 42}});
+
+  my $attachment = $record->upload(
+      role => 'documents', bytes => $pdf, name => 'invoice.pdf',
+      media_type => 'application/pdf', idempotency_key => $request_id,
+  );
+  # {attachment_id, file_id, version_id, name, media_type, byte_size, role,
+  #  revision, actions => [...], content_url => '/attachments/.../content', ...}
+
+  my $bytes = $record->download($attachment->{attachment_id});
+  $record->detach($attachment->{attachment_id}, expected_revision => $attachment->{revision});
+
+=head1 DESCRIPTION
+
+This is an initial, experimental implementation of the Selecto files
+profile (C<files.attachments.v1>). Trusted host code binds tenant and actor
+authority; callers then work with attachments of one record. Projected
+values contain only authorized display metadata and an application-owned
+content route, never the tenant, storage provider, bucket, object key or
+credentials. Cross-tenant and cross-record access behaves as C<not_found>.
+
+Attachment metadata is kept in the C<Selecto::Files> object's memory.
+Persistent metadata, Mojolicious routes, cloud storage adapters and workers
+are not part of this release.
+
+If C<authorize> is omitted every action is allowed; production hosts should
+always supply one.
+
+=head1 METHODS
+
+=head2 new
+
+Arguments: C<secret>, C<descriptor> (C<id>, C<domain_fingerprint> and
+C<roles>, each with positive C<max_files>, C<max_bytes> and a non-empty
+C<media_types> list), C<storage> (default L</Selecto::Files::MemoryStorage>)
+and C<authorize>.
+
+=head2 bind
+
+  my $bound = $files->bind(tenant => $tenant, actor => $actor);
+
+Returns an object whose C<for_record(\%owner)> method returns the record
+facade. C<%owner> must contain exactly C<domain_fingerprint> and a non-empty
+C<key> hash.
+
+=head1 RECORD METHODS
+
+=over 4
+
+=item C<upload(role, bytes, name, media_type, idempotency_key)>
+
+Stores a new attachment. Repeating the same idempotency key returns the same
+attachment.
+
+=item C<upload_handle(role, handle, name, media_type, idempotency_key, declared_size, declared_sha256, cancelled)>
+
+Reads a caller-owned filehandle in 64 KiB chunks, checks the declared size
+and optional SHA-256, and never closes the handle.
+
+=item C<list(role => $role)>
+
+=item C<download($attachment_id)>, C<download_stream($attachment_id, $consumer, cancelled => $cb)>
+
+=item C<detach($attachment_id, expected_revision => $n)>
+
+=item C<place_hold($version_id, authority => $name)>, C<release_hold($version_id, authority => $name)>
+
+=item C<purge($version_id)>
+
+Removes a detached version's content; active holds block it with
+C<conflict>.
+
+=back
+
+Errors use the codes C<invalid_request>, C<not_found>, C<conflict>,
+C<quota_exceeded>, C<unsupported> and C<storage_error>.
+
+=head1 STORAGE
+
+=head2 Selecto::Files::MemoryStorage
+
+In-process storage for tests and examples.
+
+=head2 Selecto::Files::LocalStorage
+
+  Selecto::Files::LocalStorage->new(root => $directory);
+
+Stores content under a private (mode 0700) directory. Publication writes a
+same-directory staging file, C<fsync>s the file and directory, and links it
+into place so an existing object is never replaced; cancelled or failed
+uploads remove the staging file. References accept only portable segments,
+and reads refuse symbolic-link final components where C<O_NOFOLLOW> is
+available. Tested on macOS; directory-swap races, crash recovery, other
+operating systems and multi-node storage are not yet certified.
+
+=head1 SEE ALSO
+
+L<Selecto>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

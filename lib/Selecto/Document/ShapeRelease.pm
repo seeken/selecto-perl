@@ -60,3 +60,36 @@ sub _require { Selecto::Error->throw($_[1], $_[2]) unless $_[0] }
 sub _identifier { !!(defined($_[0]) && !ref($_[0]) && $_[0] =~ /\A[a-z_][a-z0-9_]{0,63}\z/) }
 sub _path { !!(ref($_[0]) eq 'ARRAY' && @{$_[0]} && @{$_[0]} <= 32 && !grep { !_identifier($_) } @{$_[0]}) }
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Document::ShapeRelease - approved document shape: fields, relations and access patterns
+
+=head1 DESCRIPTION
+
+Publishes the fields, relations and named access patterns a document adapter
+may serve. State is private and copied on access.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Document::Engine>, L<Selecto::Document::Plan>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

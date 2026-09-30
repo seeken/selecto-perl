@@ -50,3 +50,37 @@ sub _evaluate { my($t,$v,$present)=@_; return(0,'invalid_type') unless $present&
 sub _normalize { my($v,$present,$n)=@_;return(undef,'invalid_type')unless$present;my$c=$v;for my$s(@{$n->{steps}}){return(undef,'invalid_type')if ref$c;if($s->{op}eq'text.trim'){$c=~s/\A[ \t\r\n\f\v]+|[ \t\r\n\f\v]+\z//g}else{return(undef,'normalization_error')unless$c=~/\A[\x00-\x7F]*\z/;$c=$s->{op}eq'text.uppercase'?uc$c:lc$c}}return($c,undef) }
 sub _hash { my($v,$code,$label)=@_;_fail($code,"$label must be an object")unless ref$v eq'HASH';return$v } sub _keys {my($v,$a,$l)=@_;my%a=map{$_=>1}@$a;_fail('unknown_rule_option',"unknown member in $l")if grep{!$a{$_}}keys%$v} sub _id{defined($_[0])&&!ref($_[0])&&$_[0]=~/\A[A-Za-z_][A-Za-z0-9_]*\z/} sub _positive{_fail('invalid_rule_version','version must be a positive integer')unless defined($_[0])&&!ref($_[0])&&$_[0]=~/\A[1-9][0-9]*\z/;$_[0]} sub _nonneg{defined($_[0])&&!ref($_[0])&&$_[0]=~/\A(?:0|[1-9][0-9]*)\z/?$_[0]:undef} sub _ref{my$v=_hash($_[0],'invalid_data_rules_contract','reference');_keys($v,[qw(id version)],'reference');_fail('invalid_data_rules_contract','reference id is invalid')unless _id($v->{id});{id=>$v->{id},version=>_positive($v->{version})}} sub _path{my$v=$_[0];_fail('invalid_data_rules_contract','path is invalid')unless ref$v eq'ARRAY'&&@$v&&!grep{!defined($_)||ref($_)||$_ eq''}@$v;[@$v]} sub _pattern{my$v=$_[0];return 0 unless defined$v&&!ref$v&&length$v&&length$v<=256&&$v=~/\A[\x00-\x7F]*\z/;return 0 if$v=~/\(\?|\^|\$|\\[pP]|\[\[:|&&|\*\?|\+\?|\?\?|\*\+|\+\+|\?\+|\\[1-9]/;while($v=~/\\(.)/g){return 0 unless index('dDsSwWtrn\\.[]{}()|?*+-',$1)>=0}1} sub _at{my($r,$p)=@_;my$c=$r;for(@$p){return(undef,0)unless ref$c eq'HASH'&&exists$c->{$_};$c=$c->{$_}}($c,1)}sub _set{my($r,$p,$v)=@_;my$c=$r;for my$k(@$p[0..$#$p-1]){$c->{$k}={}unless ref$c->{$k}eq'HASH';$c=$c->{$k}}$c->{$p->[-1]}=$v}sub _decimal{my$v=$_[0];return undef unless defined$v&&!ref$v&&"$v"=~/\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/;Math::BigRat->new("$v")}sub _stable{JSON::PP->new->canonical(1)->encode($_[0])}sub _result{my($s,$n,$c,$p)=@_;{state=>$s,normalized=>dclone($n),(defined$c?(code=>$c):()),(defined$p?(path=>[@$p]):())}}sub _fail{Selecto::Error->throw(@_)}
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::DataRules - versioned validation rules declared in a domain
+
+=head1 DESCRIPTION
+
+Parses the C<rules> section of a domain contract (schema
+C<selecto.data_rules.v1>: rule definitions, normalizers and bindings to write
+inputs) and evaluates a subject against the bindings for one stage.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Domain>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

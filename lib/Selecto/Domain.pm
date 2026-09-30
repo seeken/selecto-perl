@@ -2331,3 +2331,519 @@ sub source_scope_key { return $_[0]->{source_scope_key}; }
 sub target_scope_key { return $_[0]->{target_scope_key}; }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Domain - the governed contract for one root relation
+
+=head1 SYNOPSIS
+
+  use Selecto::Domain;
+
+  # Canonical form: a hash or a JSON string.
+  my $orders = Selecto::Domain->parse({
+      schema_version => 1,
+      name   => 'Orders',
+      source => {
+          source_table => 'orders',
+          primary_key  => 'id',
+          tenant_field => 'shop_id',
+          fields  => [qw(id shop_id customer_id status total)],
+          columns => {
+              id          => {type => 'integer'},
+              shop_id     => {type => 'integer', internal => 1},
+              customer_id => {type => 'integer'},
+              status      => {type => 'string'},
+              total       => {type => 'decimal'},
+          },
+          associations => {
+              customer => {queryable => 'customers',
+                  owner_key => 'customer_id', related_key => 'id'},
+          },
+      },
+      schemas => {
+          customers => {
+              source_table => 'customers', primary_key => 'id',
+              fields  => [qw(id name)],
+              columns => {id => {type => 'integer'}, name => {type => 'string'}},
+              associations => {},
+          },
+      },
+      joins  => {customer => {type => 'left'}},
+      writes => {
+          operations => {update => {enabled => 1}},
+          fields     => {status => {updatable => 1}},
+      },
+  });
+
+  # Constructor form: read-only, no portable contract.
+  my $items = Selecto::Domain->new(
+      name   => 'Items',
+      table  => 'items',
+      fields => {id => 'integer', name => 'string', price => 'decimal'},
+  );
+
+  my $resolved = $orders->resolve('customer.name');   # {field => 'name', type => 'string', ...}
+
+  # A request-local copy that only sees one customer's rows.
+  my $mine = $orders->with_required_predicate(
+      Selecto::Expression->eq('customer_id', $customer_id));
+
+=head1 DESCRIPTION
+
+A domain describes one root table (the I<source>), the related tables
+reachable from it, which fields are public, and what may be written. Every
+field path used by a query, filter, write or API request is resolved against
+the domain. Anything the domain does not declare is an error.
+
+Domains are immutable. Methods that "change" a domain, such as
+L</with_required_predicate>, return a new object. Every domain has a
+deterministic SHA-256 C<fingerprint> of its governed content.
+
+There are three ways to build one:
+
+=over 4
+
+=item Canonical form (L</parse> with C<source.source_table>)
+
+The portable, cross-language format. It carries the full contract: related
+C<schemas>, C<joins>, C<writes>, C<actions>, C<capabilities>, C<imports>,
+C<query_library> and the other sections below. Only canonical domains can be
+written through a strict engine or hosted by L<Selecto::API>.
+
+=item Simple form (L</parse> with C<source.table>)
+
+  {name => 'Items', source => {table => 'items', fields => {id => 'integer'}}}
+
+A compact JSON form equivalent to the constructor form.
+
+=item Constructor form (L</new>)
+
+A Perl-only shortcut for read-only use. It has no contract, so a strict
+engine refuses its writes with C<write_policy_missing>.
+
+=back
+
+=head1 CONSTRUCTORS
+
+=head2 parse
+
+  my $domain = Selecto::Domain->parse($json_string_or_hashref, strict => 1);
+
+Parses and validates a domain document. Strict mode, the default, rejects
+unknown keys at every level with C<unknown_domain_key>;
+C<< strict => 0 >> ignores them. Other problems throw C<invalid_domain> with
+a message and details describing the first one found.
+
+=head2 new
+
+  my $domain = Selecto::Domain->new(
+      name         => 'Orders',
+      table        => 'orders',
+      fields       => {id => 'integer', customer_id => 'integer', total => 'decimal'},
+      primary_key  => 'id',                 # default: id, else the first field
+      tenant_field => 'shop_id',            # optional
+      associations => {
+          customer => {
+              table => 'customers', fields => {id => 'integer', name => 'string'},
+              owner_key => 'customer_id', related_key => 'id',
+              cardinality => 'one',          # or many
+              join_type   => 'left',         # or inner
+          },
+      },
+      required_predicate => $expression,    # optional
+  );
+
+Builds a domain directly. Associations may nest their own C<associations>.
+C<components>, C<query_library>, C<co_domains>, C<detail_actions> and C<rules>
+are also accepted and validated as in the canonical form.
+
+=head2 compose
+
+  my ($domain, $diagnostics) = Selecto::Domain->compose($base, @overlays);
+  my ($domain, $diagnostics) = $base_domain->compose(@overlays);
+
+Merges overlay hashes (usually built with L<Selecto::Domain::DSL>) into a base
+contract and parses the result strictly. Maps deep-merge, C<redact_fields> and
+C<extensions> append uniquely, other lists and scalars are replaced by later
+overlays. C<$diagnostics> reports collisions with existing C<actions>,
+C<capabilities>, C<source_relationships> and C<choice_sources> entries. See
+L<Selecto::Domain::Overlay>.
+
+=head1 METHODS
+
+=head2 resolve
+
+  my $info = $domain->resolve('customer.region.name');
+
+Resolves a dotted field path. Returns a hash with C<field>, C<type>,
+C<association> (the last L</Selecto::Domain::Association> or C<undef>),
+C<associations> (the chain) and C<association_path>. Throws C<unknown_field>
+or C<unknown_association>.
+
+=head2 resolve_association
+
+  my $info = $domain->resolve_association('customer.region');
+
+Resolves an association path; returns C<association>, C<associations> and
+C<association_path>.
+
+=head2 with_required_predicate
+
+  my $scoped = $domain->with_required_predicate($expression);
+
+Returns a copy whose every read (and, on tenant-field domains without
+C<writes.scope.tenant>, every write) is ANDed with C<$expression>, a
+L<Selecto::Expression>. Use this for request-level visibility such as "only
+this customer's rows". The copy has its own fingerprint; the original is not
+changed.
+
+When the domain has a C<tenant_field>, a positive C<eq> or C<in> conjunct on
+that field in the required predicate is the tenant boundary that public
+surfaces look for. Status filters, negations and C<OR> branches never count.
+Under such a boundary, engine updates and deletes match only rows inside it,
+inserts must satisfy it, and upserts are refused with
+C<query_enforcement_unsupported_operation>. On a domain without a tenant
+field, a required predicate is a read scope only.
+
+=head2 with_tenant_field
+
+  my $by_customer = $domain->with_tenant_field('customer_id')
+      ->with_required_predicate(Selecto::Expression->in('customer_id', \@ids));
+
+Returns a copy that treats another root field as the tenant field. This is
+for role-dependent ownership where the trusted host picks the boundary per
+request. It never changes the shared domain.
+
+=head2 as_contract
+
+  my $hash = $domain->as_contract;
+
+Returns the canonical contract as a new hash. Constructor-form domains are
+converted to canonical form; a domain carrying a required predicate cannot be
+converted and throws C<invalid_domain_overlay>.
+
+=head2 field_metadata
+
+  my $meta = $domain->field_metadata('customer.name');
+
+Returns a copy of the canonical column metadata for a path (empty for
+constructor-form domains). Fields listed in C<redact_fields> report
+C<< internal => 1, redacted => 1 >>.
+
+=head2 field_is_public
+
+True unless the field is C<internal> or redacted. Public surfaces (the API
+handler, canned pages, catalogs) accept only public fields; trusted host code
+may still use internal ones.
+
+=head2 normalize_field_value, normalize_write_assignments
+
+Apply a column's C<text_case> (C<uppercase> or C<lowercase>) to a value or to
+every value of an assignment hash. The engine does this for every write.
+
+=head2 field_unit, field_behavior
+
+Return the normalized analytics C<unit> and C<behavior> of a column; see
+L<Selecto::Analytics::UnitRegistry> and F<docs/analytics-units.md>.
+
+=head2 values_foreign_keys
+
+Returns, per root field, the allowed values of a one-to-one association to an
+inline C<values> schema.
+
+=head2 Accessors
+
+C<name>, C<table>, C<primary_key>, C<tenant_field>, C<fingerprint>,
+C<required_predicate>, C<fields> (hash of field name to type),
+C<associations> (hash of name to L</Selecto::Domain::Association>),
+C<contract> (a copy, or C<undef>), C<rules>, C<write_tenant_scope>.
+
+Copies of contract sections: C<writes>, C<actions>, C<capabilities>,
+C<imports>, C<editors>, C<detail_actions>, C<components>, C<query_library>,
+C<co_domains>, C<domain_dependencies>, C<operations>, C<experiences>.
+
+=head1 CANONICAL FORMAT
+
+=head2 Top level
+
+  {
+      schema_version     => 1,
+      name               => 'Orders',
+      domain_version     => '1.2.0',          # required by Selecto::API
+      domain_fingerprint => 'sha256:...',     # published identity, required by Selecto::API
+      source   => {...},                      # the root relation
+      schemas  => {name => {...}, ...},       # related relations
+      joins    => {association => {...}},     # join settings per association path
+      writes   => {...},
+      actions  => {...},  capabilities => {...},
+      query_library => {...}, query_members => {...}, co_domains => {...},
+      imports => {...}, components => {...}, detail_actions => {...}, editors => {...},
+      redact_fields => [...], required_selected => [...], ...
+  }
+
+=head2 Relations
+
+C<source> and each entry of C<schemas> is a relation:
+
+=over 4
+
+=item C<source_table> or C<values>
+
+Exactly one. C<values> declares a small inline reference set (a list of row
+hashes providing every declared field). A referenced values schema is compiled
+as a generated CTE with every cell bound; unreferenced ones add no SQL. The
+root C<source> must use C<source_table>.
+
+=item C<primary_key>
+
+Defaults to C<id>.
+
+=item C<fields> and C<columns>
+
+C<fields> lists the field names in order; C<columns> maps each to its
+metadata. C<type> is required. The portable types are C<string> (also
+C<text>), C<integer>, C<decimal>, C<boolean>, C<date>, C<utc_datetime>,
+C<naive_datetime>, C<epoch_datetime> (numeric epoch storage), C<json> or
+C<jsonb>, C<uuid> and C<array>. Other keys include C<internal>,
+C<label>, C<format>, C<text_case>, C<unit>, C<behavior>, C<computed>, and
+for arrays C<items> (C<string>, C<integer>, C<decimal>, C<boolean>, C<date>
+or C<uuid>).
+
+=item C<associations>
+
+Relationships from this relation; see L</Associations>.
+
+=item C<tenant_field>
+
+The column holding the tenant key. Declare it on every relation that stores
+tenant data.
+
+=item C<redact_fields>
+
+Fields of this relation withheld from untrusted surfaces exactly like
+C<internal> columns.
+
+=back
+
+=head2 Associations
+
+  associations => {
+      customer => {
+          queryable   => 'customers',   # a key of schemas
+          owner_key   => 'customer_id', # field on this relation
+          related_key => 'id',          # field on the target
+          cardinality => 'one',         # inferred when omitted
+      },
+  },
+  joins => {customer => {type => 'left'}},  # left (default), inner, star_dimension
+
+Cardinality is inferred as C<one> when C<related_key> is the target's primary
+key and C<many> otherwise. Paths may be arbitrarily deep
+(C<customer.region.name>); nested join settings go in a C<joins> key inside
+the parent's join entry, or under the full dotted path.
+
+A to-many association can be read without multiplying root rows through
+L<Selecto::Expression/RELATED COLLECTIONS>, C<related_sum> and
+C<related_count>.
+
+Further association keys:
+
+=over 4
+
+=item C<through>
+
+A keyless bridge table for many-to-many relationships:
+
+  through => {
+      table => 'invoice_tags', owner_key => 'invoice_id', related_key => 'tag_id',
+      source_scope_key => 'tenant_id', through_scope_key => 'tenant_id',
+      target_scope_key => 'tenant_id',
+  }
+
+The three scope keys are all-or-nothing; when present, both scope equalities
+are enforced in joins and correlated collections.
+
+=item C<source_scope_key>, C<target_scope_key>
+
+For direct associations whose child rows repeat the tenant key. Both are
+required together and are compiled into joins and related collections, so a
+foreign-key match cannot cross tenants.
+
+=item C<where>
+
+Constant equality predicates on target fields that every join must satisfy.
+
+=item C<join_strategy>
+
+C<lateral_lookup> (PostgreSQL only) keeps the owner-key equality, constant
+C<where> predicates and tenant scope inside a parameterized lateral lookup,
+so PostgreSQL can use an index on the related key. It is a plan hint for
+misplanned joins; it does not change results. Not available for C<through>
+or C<values> associations.
+
+=back
+
+=head2 Star dimensions
+
+  joins => {
+      ref_status => {type => 'star_dimension', name => 'Status',
+          display_field => 'description', dimension_key => 'status_id'},
+  },
+
+Marks a fact-to-reference join. The dimension key must be the association's
+C<owner_key>. The join stays a left join; aggregate consumers display
+C<display_field> while grouping and filtering by the stable key.
+C<< display_fallback => 'dimension_key' >> shows the key when the display
+value is missing (the two columns must share a type).
+
+=head2 Computed columns
+
+A column may be derived instead of stored. Computed columns are read-only:
+write contracts cannot grant them and writes that assign them fail.
+
+=over 4
+
+=item C<< {kind => 'expression', expression => VALUE_AST} >>
+
+A typed value built from the closed AST in L<Selecto::ValueExpression>, for
+example:
+
+  effective_location => {type => 'string', computed => {kind => 'expression',
+      expression => ['coalesce', ['field', 'site.name'], ['field', 'location_text'],
+                     ['literal', 'Location unknown']]}},
+
+The result type must match the declared type. Using the column adds the joins
+its expression reads. Requires the C<value_expressions> adapter capability
+(PostgreSQL and DuckDB); other adapters fail with C<unsupported_feature>.
+
+=item C<< {kind => 'predicate', expression => FILTER_AST} >>
+
+A boolean computed from the portable filter AST
+(L<Selecto::Expression/from_filter_ast>) over root fields, for row-state
+decisions such as action eligibility:
+
+  ready => {type => 'boolean', internal => 1, computed => {kind => 'predicate',
+      expression => ['and', [['in', 'status', ['A', 'O']], ['eq', 'has_payload', 1]]]}},
+
+=item C<< {kind => 'coalesce_fields', fields => ['assoc.field', 'root_field']} >>
+
+The joined value, falling back to a root column of the same type. The
+association must be a direct, left-joined one-to-one association.
+
+=item C<< {kind => 'association_exists', association => 'name'} >>
+
+A boolean that is true when the direct association has a matching row.
+
+=back
+
+Computed columns may build on each other; cycles are rejected.
+
+=head2 writes
+
+  writes => {
+      operations => {
+          insert => {enabled => 1},
+          update => {enabled => 1, bulk => 1, require_filter => 1},
+          upsert => {enabled => 1, conflict_targets => [['sku']]},
+          delete => {enabled => 1},
+      },
+      fields => {
+          name   => {insertable => 1, updatable => 1, required => 1},
+          status => {updatable => 1},
+      },
+      transitions   => {status => {open => ['closed'], closed => ['archived']}},
+      scope         => {tenant => {field => 'shop_id', satisfied_by => ['trusted_context']}},
+      relationships => {...},   # writable child relationships for write graphs
+  },
+
+An engine with the default strict policy writes only what this section
+grants. C<required> fields must be supplied by inserts and upserts
+(C<missing_required_write_fields>). A count greater than one needs C<bulk>.
+See L<Selecto::Write> and L<Selecto::Engine>.
+
+=head2 Other sections
+
+=over 4
+
+=item C<actions>, C<capabilities>
+
+Declared actions and the capabilities that authorize them; see
+L<Selecto::Action> and F<docs/action-preconditions.md>.
+
+=item C<query_library>
+
+Named segments, projections, orderings and views; see
+L<Selecto::QueryLibrary>.
+
+=item C<query_members>
+
+Reusable CTE, lateral and array-expansion sources; see
+L<Selecto::QueryMember>.
+
+=item C<co_domains>
+
+Lookups into another domain; see L<Selecto::CoDomain>.
+
+=item C<imports>
+
+Import field mappings and key sets; see L<Selecto::Importer>.
+
+=item C<components>
+
+Hints for exploration user interfaces: C<filter_choices> (option catalogs for
+a field, optionally C<conditional> on whether a root field is null),
+C<filter_picker_hidden_paths>, C<picker_visible_id_paths> and
+C<query_params>.
+
+=item C<detail_actions>, C<editors>
+
+Row actions for user interfaces: C<external_link> and C<iframe_modal> URL
+templates, and C<record_editor> dialogs backed by an C<editors> entry that
+allowlists public fields already declared C<updatable>. Applications must
+still authorize each action before rendering it.
+
+=item Top-level C<redact_fields>
+
+Root fields or dotted paths withheld from untrusted surfaces.
+
+=back
+
+=head1 Selecto::Domain::Association
+
+Association objects are returned by L</associations> and L</resolve>. Their
+read-only accessors are C<name>, C<table>, C<fields>, C<associations>,
+C<queryable>, C<owner_key>, C<related_key>, C<cardinality>, C<join_type>,
+C<join_mode>, C<join_strategy>, C<target_primary_key>, C<through>, C<where>,
+C<values>, C<value_fields>, C<display_field>, C<dimension_key>,
+C<display_name>, C<display_fallback>, C<source_scope_key> and
+C<target_scope_key>.
+
+=head1 ERRORS
+
+C<invalid_domain> for malformed or inconsistent domains; C<unknown_domain_key>
+for unknown keys in strict mode; C<unknown_field>,
+C<unknown_association> and C<invalid_field> from path resolution;
+C<invalid_domain_overlay> from composition. All are L<Selecto::Error>
+objects.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Engine>, L<Selecto::Query>, L<Selecto::ValueExpression>,
+L<Selecto::Domain::DSL>, L<Selecto::Domain::Registry>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

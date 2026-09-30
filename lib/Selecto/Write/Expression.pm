@@ -112,3 +112,92 @@ sub _clone {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Write::Expression - adapter-independent assignment expressions
+
+=head1 SYNOPSIS
+
+  use Selecto::Write::Expression;
+
+  my $command = $engine->write_command(
+      operation   => 'update',
+      assignments => {
+          quantity   => Selecto::Write::Expression->decrement('quantity', 1),
+          price      => Selecto::Write::Expression->multiply(
+                            Selecto::Write::Expression->field('price'), '1.05'),
+          nickname   => Selecto::Write::Expression->coalesce(
+                            Selecto::Write::Expression->field('nickname'), 'none'),
+          updated_at => Selecto::Write::Expression->current_timestamp,
+      },
+      filter => ['eq', 'id', 42],
+  );
+
+=head1 DESCRIPTION
+
+A closed AST for computed assignments in L<Selecto::Write::Command>s. Each
+adapter compiles it to its own SQL, literals stay bound parameters, and field
+references are validated against the governing domain.
+
+Operands that are not already expressions are treated as literals.
+
+=head1 CONSTRUCTORS
+
+=over 4
+
+=item C<literal($value)>
+
+=item C<field($name)>
+
+A root field of the row being updated. Field references are only valid in
+updates, because an inserted row does not exist yet.
+
+=item C<add($left, $right)>, C<subtract>, C<multiply>, C<divide>
+
+=item C<increment($field, $amount)>, C<decrement($field, $amount)>
+
+Shortcuts for C<< add(field($field), literal($amount)) >> and the
+subtraction equivalent; C<$amount> defaults to 1.
+
+=item C<coalesce(@operands)>
+
+The first non-null operand; at least two are required.
+
+=item C<current_timestamp>
+
+=item C<default>
+
+The column's database default. Dialects that cannot express an individual
+C<DEFAULT> assignment (SQLite) fail with C<invalid_write>.
+
+=back
+
+=head1 METHODS
+
+C<kind>, C<arguments> and C<referenced_fields> (the sorted field names the
+expression reads).
+
+=head1 ERRORS
+
+Malformed expressions throw C<invalid_write>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Write>, L<Selecto::Engine>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

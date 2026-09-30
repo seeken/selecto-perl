@@ -440,3 +440,145 @@ sub _error_string ($value, $key, $default) {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::API - HTTP-neutral host for the canonical Selecto API
+
+=head1 SYNOPSIS
+
+  use Selecto::API;
+  use Selecto::API::EngineHandler;
+
+  my $api = Selecto::API->new(domain => $domain, base_path => '/api/v1/orders');
+  my $handler = Selecto::API::EngineHandler->new;
+  $handler->describe_openapi($api);
+
+  # In your framework's route for "$base_path/*":
+  my $response = $api->request(
+      {
+          method            => $request_method,          # 'GET' or 'POST'
+          path              => $request_path,
+          body              => $decoded_json_body,        # hash or undef
+          accept            => $accept_header,            # optional
+          response_format   => $query_param_format,       # optional: json csv tsv xlsx
+          download_filename => $query_param_filename,     # optional
+      },
+      {
+          query => sub { my ($body) = @_; ... return ['ok', $data] },
+          write => sub { my ($body) = @_; ... return ['ok', $data] },
+          action => sub { my ($body, $params) = @_; ... },  # $params->{action}
+      },
+  );
+  # $response = {status => 200, headers => {...}, body => $bytes}
+
+=head1 DESCRIPTION
+
+C<Selecto::API> implements the routing, content negotiation and byte-stable
+encoding of the canonical Selecto HTTP contract without depending on any web
+framework. It is a pure function from a request hash to a response hash;
+your framework supplies the method, path and decoded body and sends back the
+status, headers and body it returns.
+
+The object never touches a database. Query and write work is delegated to
+the handler callbacks you pass to L</request>, normally thin wrappers around
+L<Selecto::API::EngineHandler> using an engine built from the authenticated
+request.
+
+=head1 ROUTES
+
+Relative to C<base_path> (default C</api/v1/selecto>):
+
+  GET  /domain          the canonical domain contract (JSON)
+  GET  /openapi.json    the OpenAPI 3.1 document
+  POST /query           handlers->{query}
+  POST /write           handlers->{write}
+  POST /actions/NAME    handlers->{action}, with {action => NAME}
+
+Unknown routes return 404 C<route_not_found>; a route without a handler
+returns 501 C<operation_not_implemented>.
+
+=head1 METHODS
+
+=head2 new
+
+  my $api = Selecto::API->new(domain => $domain, base_path => '/api/v1/orders');
+
+C<domain> must be a canonical L<Selecto::Domain> whose contract includes
+C<name>, C<schema_version>, C<domain_version> and C<domain_fingerprint>
+(C<canonical_api_requires_domain_contract>,
+C<canonical_api_requires_domain_identity>). After construction C<domain>
+holds the contract hash, and C<manifest> and C<openapi> hold the generated
+documents.
+
+=head2 request
+
+  my $response = $api->request(\%request, \%handlers);
+
+Routes the request and returns C<< {status => ..., headers => {...}, body => $bytes} >>.
+The body is UTF-8 encoded bytes; C<content-length> is exact.
+
+A handler returns C<['ok', $data]> or C<['error', \%error]>, where
+C<%error> may contain C<status> (default 422), C<code>, C<message> and
+C<details>. If a handler dies, the response is a 500 C<handler_failed>
+without the exception text, so convert expected L<Selecto::Error>s into
+C<['error', ...]> yourself:
+
+  my $guard = sub {
+      my ($code) = @_;
+      my $data = eval { $code->() };
+      return ['ok', $data] unless $@;
+      my $e = $@;
+      die $e unless blessed($e) && $e->isa('Selecto::Error');
+      return ['error', {status => 422, code => $e->code,
+          message => $e->message, details => $e->details}];
+  };
+
+Successful JSON responses are C<< {"ok": true, "data": ...} >> and errors
+C<< {"ok": false, "error": {"code", "message", "details"}} >>, encoded as
+canonical JSON (sorted keys, fixed escaping). Canonical JSON has no floating
+point numbers: exact decimals must be strings, and a float anywhere in a
+handler result produces a 500 C<non_canonical_value>.
+
+=head2 Response formats
+
+Query responses default to JSON. Pass the C<Accept> header as C<accept>, or
+an explicit C<?format=> value as C<response_format> (which wins), to get
+C<csv>, C<tsv> or C<xlsx>. CSV and TSV start with a header row, encode nested
+subtables as JSON cells and guard formula-leading values; XLSX writes text
+as strings, never formulas. Other routes answer only JSON (406
+C<response_format_not_acceptable>). C<download_filename> must be a safe
+basename of at most 160 characters ending in the format's extension.
+
+=head2 openapi_document, manifest
+
+The generated OpenAPI document and the API manifest (domain identity and
+route list).
+
+=head2 canonical_json
+
+  my $bytes = Selecto::API::canonical_json($value);
+
+A function (not a method) that encodes a value as Selecto Canonical JSON v1
+bytes, throwing C<non_canonical_value> for floats and other values it cannot
+represent exactly.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::API::EngineHandler>, L<Selecto::API::ResultFormatter>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

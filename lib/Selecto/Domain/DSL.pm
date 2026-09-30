@@ -222,16 +222,93 @@ Selecto::Domain::DSL - fluent builder for portable Selecto domain overlays
 
 =head1 SYNOPSIS
 
+  use Selecto;
+
   my $overlay = Selecto::Domain::DSL->define(sub {
       my ($dsl) = @_;
-      $dsl->source_column(total => {label => 'Total'})
-          ->write_field(status => {updatable => 1});
+      $dsl->source_column(total => {label => 'Order total', format => 'currency'})
+          ->source_redact_fields('internal_margin')
+          ->write_field(status => {updatable => 1})
+          ->capability('orders.export' => {operations => ['read']});
   });
+
+  my ($orders, $diagnostics) = Selecto::Domain->compose($generated_contract, $overlay);
+  # $diagnostics = {overlay_count => 1, warnings => [...], errors => []}
 
 =head1 DESCRIPTION
 
-The builder emits an ordinary hash contract consumed by
-C<Selecto::Domain-E<gt>compose>. It stores configuration data only; it does not
-execute SQL or callbacks.
+Overlays keep application-owned customization separate from generated or
+shared domain contracts. An overlay is an ordinary hash in the canonical
+domain format containing only what it changes; this module is a
+convenience for building one. It stores data only and never runs SQL or
+callbacks.
+
+L<Selecto::Domain/compose> merges overlays deterministically: maps
+deep-merge (so the C<source_column> above adds a label to the existing
+C<total> column), C<redact_fields> and C<extensions> append uniquely, and
+other lists and scalar values are replaced by later overlays. The result is
+parsed strictly, and invalid shapes fail with C<invalid_domain_overlay>.
+
+=head1 CONSTRUCTORS
+
+=head2 define
+
+  my $hash = Selecto::Domain::DSL->define(sub { my ($dsl) = @_; ... });
+
+Runs the callback with a new builder and returns the overlay hash.
+
+=head2 new, overlay, build
+
+C<new> returns an empty builder; C<overlay> (alias C<build>) returns a copy
+of the hash built so far.
+
+=head1 BUILDER METHODS
+
+Every method returns the builder. Methods taking C<($name, %config)> or
+C<($name, \%config)> set the named entry at the path shown, replacing an
+earlier entry of the same name within this overlay.
+
+  source(%config)                     source (deep-merged)
+  source_column($name, ...)           source.columns.NAME
+  source_association($name, ...)      source.associations.NAME
+  schema($name, ...)                  schemas.NAME
+  schema_association($schema, $name, ...)  schemas.SCHEMA.associations.NAME
+  join($name, ...)                    joins.NAME
+  column($name, ...)                  columns.NAME
+  filter, function, detail_action, source_relationship, choice_source,
+  action, capability, jsonb_schema    the section of the same name
+  component($name, $value)            components.NAME
+  query_member($kind, $name, ...)     query_members.KIND.NAME
+  query_segment, query_projection, query_ordering, query_view
+                                      query_library.segments/... .NAME
+  co_domain($name, ...)               co_domains.NAME
+  imports(%config)                    imports (deep-merged)
+  write_operation, write_field, write_relationship, write_transition,
+  write_hook                          writes.operations/fields/... .NAME
+  write_tenant_scope(%config)         writes.scope.tenant (deep-merged)
+  write_validation(\%rule), write_constraint(\%rule)
+                                      appended to writes.validations/constraints
+  redact_fields(@fields), source_redact_fields(@fields), extensions(@values)
+                                      appended uniquely
+  default_selected(@fields), required_selected(@fields), required_order_by(@entries)
+                                      replaced
+  section($name, $value)              any top-level key
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Domain>, L<Selecto::Domain::Overlay>,
+L<Selecto::Domain::Registry>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut

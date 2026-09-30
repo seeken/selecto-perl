@@ -306,11 +306,89 @@ __END__
 
 Selecto::ValueExpression - closed, typed AST for governed computed values
 
+=head1 SYNOPSIS
+
+  # A computed domain column:
+  hourly_rate_dollars => {
+      type => 'decimal',
+      computed => {kind => 'expression',
+          expression => ['divide', ['field', 'hourly_rate_cents'], ['literal', 100]]},
+  },
+
+  # The same AST in a single query:
+  $engine->query->select('id',
+      Selecto::Expression->value(['upper', ['field', 'name']])->as('shout'));
+
 =head1 DESCRIPTION
 
-Parses, type-checks, and reports dependencies for value expressions used by
-C<computed =E<gt> {kind =E<gt> 'expression'}> domain columns and by
-C<Selecto::Expression-E<gt>value> query selections. Adapters compile the
-nodes; this package never produces SQL.
+Computed value expressions are written in a small, closed AST rather than SQL.
+The AST is parsed and type-checked against the finished domain, every
+literal and JSON path segment is bound, and adapters compile it to their own
+dialect. Anything outside the node set is rejected when the domain is
+parsed.
+
+=head1 NODES
+
+  ['field', PATH]                      a governed field, may cross associations
+  ['literal', VALUE]                   bound; optionally ['literal', VALUE, TYPE]
+  ['coalesce', NODE, NODE, ...]
+  ['case', [CONDITION, NODE], ..., ['else', NODE]]   conditions use the filter AST
+  ['add' | 'subtract' | 'multiply' | 'divide', NODE, NODE]
+  ['cast', NODE, TYPE]                 string integer decimal boolean date utc_datetime
+  ['json_text', FIELD, [SEGMENT, ...]] segments of letters, digits and underscores
+  ['lower' | 'upper', NODE]
+  ['concat', NODE, NODE, ...]
+  ['previous', COLUMN]                 only in recursive query-member steps
+
+=head1 RULES
+
+=over 4
+
+=item *
+
+Using a computed field in a selection, filter, grouping or ordering adds the
+joins its expression reads. Computed fields may build on other computed
+fields; cycles are rejected.
+
+=item *
+
+The result type must match the declared column type (an integer result
+satisfies a declared C<decimal>).
+
+=item *
+
+C<divide> always produces a decimal, so integer operands never truncate.
+C<concat> casts each operand to text and treats null as empty.
+
+=item *
+
+Computed fields are read-only; write contracts cannot grant them.
+
+=item *
+
+The adapter needs the C<value_expressions> capability (and C<json_text> for
+that node): PostgreSQL and DuckDB. Others fail with C<unsupported_feature>.
+
+=back
+
+The Perl interface (C<parse>, C<infer>, C<dependencies>, C<category>,
+C<compatible>) is used by L<Selecto::Domain> and the adapters and may change;
+the AST is the public contract.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Domain/Computed columns>, L<Selecto::Expression/value>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut

@@ -199,7 +199,28 @@ Selecto::Write::Scope - enforced tenant scope for governed writes
 
 =head1 DESCRIPTION
 
-Parses C<writes.scope.tenant> and applies it, with a trusted tenant supplied
-by the host engine, to every governed write command.
+Parses C<writes.scope.tenant> and applies it, with the trusted tenant
+supplied by the engine, to every governed write command. See
+L<Selecto::Write/TENANT SCOPE>.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Engine>, L<Selecto::Write>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut
