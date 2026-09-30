@@ -478,7 +478,7 @@ sub _compile_bucket {
             unless "$length" =~ /\A\d+\z/ && $length >= 1 && $length <= 10;
         my $normalized = "BTRIM(COALESCE(CAST($field_sql AS TEXT), ''))";
         if ($specification->{exclude_articles}) {
-            $normalized = "REGEXP_REPLACE($normalized, '^(a|an|the)([[:space:]]+|$)', '', 'i')";
+            $normalized = "REGEXP_REPLACE($normalized, '^(a|an|the)([[:space:]]+|\$)', '', 'i')";
         }
         $normalized = "LOWER($normalized)" unless exists($specification->{ignore_case}) && !$specification->{ignore_case};
         return "CASE WHEN $normalized = '' THEN 'Other' ELSE UPPER(LEFT($normalized, " . int($length) . ')) END';

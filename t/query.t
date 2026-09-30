@@ -1043,6 +1043,20 @@ my $age_statement = $dated_engine->compile(
 like($age_statement->sql, qr/CURRENT_DATE - DATE\("s0"\."occurred_on"\)/,
     'elapsed-day buckets remain a governed temporal expression');
 
+my $prefix_bucket = Selecto::Expression->bucket('category', {
+    kind => 'text_prefix', prefix_length => 1, exclude_articles => 1,
+});
+my $prefix_statement = $numeric_engine->compile(
+    $numeric_engine->query->select($prefix_bucket->as('initial'))->group_by($prefix_bucket)
+);
+like($prefix_statement->sql,
+    qr/REGEXP_REPLACE\(BTRIM\(COALESCE\(CAST\("s0"\."category" AS TEXT\), ''\)\), '\^\(a\|an\|the\)\(\[\[:space:\]\]\+\|\$\)', '', 'i'\)/,
+    'leading-article removal anchors the article to whitespace or the end of the value');
+unlike($prefix_statement->sql, qr/\|\$\)[^']/,
+    'the article pattern is not interpolated by Perl');
+like($prefix_statement->sql, qr/UPPER\(LEFT\(LOWER\(REGEXP_REPLACE/,
+    'text prefixes compare case-insensitively after removing articles');
+
 my $bad_bucket = eval {
     $numeric_engine->compile($numeric_engine->query->select(
         Selecto::Expression->bucket('quantity', { kind => 'raw_sql', ranges => [] })
