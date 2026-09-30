@@ -2212,3 +2212,108 @@ sub _column_types { return (); }
 sub _decode { return $_[1]; }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::SQL - shared implementation for SQL database adapters
+
+=head1 SYNOPSIS
+
+  # Every bundled SQL adapter accepts these attributes:
+  my $adapter = Selecto->adapter(postgresql => (
+      dbh              => $dbh,         # a connected DBI handle you own
+      transaction_mode => 'managed',    # or 'external'
+  ));
+
+  # Subclassing for a new database:
+  package MyApp::Selecto::FutureDB;
+  use Mojo::Base 'Selecto::SQL';
+  sub name        { 'futuredb' }
+  sub dialect     { __PACKAGE__ }
+  sub placeholder { '?' }
+
+=head1 DESCRIPTION
+
+C<Selecto::SQL> inherits L<Selecto::Adapter> and implements query
+compilation (joins, computed fields, CTEs, set operations, windows, related
+collections), eager and streaming execution, portable writes, write graphs
+and transactions. The bundled adapters (L<Selecto::PostgreSQL>,
+L<Selecto::SQLite>, L<Selecto::MySQL>, L<Selecto::MariaDB>,
+L<Selecto::MSSQL>, L<Selecto::DuckDB>) subclass it and override only what
+differs in their dialect.
+
+Identifiers are validated and quoted separately from values; every value is
+a bound parameter.
+
+=head1 ATTRIBUTES
+
+=head2 dbh
+
+The DBI handle. Selecto never connects, reconnects or disconnects it.
+
+=head2 transaction_mode
+
+C<managed> (default): each write, batch and graph runs in its own
+transaction. If the handle has C<AutoCommit> enabled the adapter begins a
+transaction; either way it commits on success and rolls back on failure.
+Note that with C<AutoCommit> disabled, C<managed> mode commits whatever the
+handle's current transaction contains.
+
+C<external>: for hosts that already own a unit-of-work transaction. The
+handle must have C<AutoCommit> disabled (otherwise C<invalid_adapter>) and
+the adapter never begins, commits or rolls back. The host must commit on
+success and roll back on every exception. Use this mode with
+L<Selecto::Query/for_share> to keep an eligibility read valid until the
+write commits.
+
+=head1 METHODS
+
+C<compile>, C<execute_query>, C<stream_query>, C<preview_write>,
+C<execute_write>, C<execute_batch> and C<execute_graph> implement the
+L<Selecto::Adapter> contract. C<quote_identifier> uses double quotes by
+default. C<feature_inventory> and C<write_capabilities> describe the SQL
+family; subclasses narrow them through C<supports> and
+C<write_capabilities>.
+
+=head2 execute_write_unsafe, execute_batch_unsafe, execute_graph_unsafe
+
+Execute without an engine authorization, skipping all domain governance.
+They exist for trusted internal tooling and adapter tests; application code
+should always write through L<Selecto::Engine>.
+
+=head1 WRITING A SUBCLASS
+
+A subclass must provide C<name>, C<dialect> and C<placeholder($index)>
+(returning the SQL text for the 1-based parameter C<$index>, such as C<?> or
+C<$1>), and should override C<supports> to declare its features and
+C<write_capabilities> when it adds C<returning> or C<write_graph>. Dialects
+that differ in quoting override C<quote_identifier>.
+
+Result decoding, upsert syntax, pagination and dialect-only expressions are
+customized through methods whose names begin with an underscore (for example
+C<_decode>, C<_column_types>, C<_compile_upsert_clause>,
+C<_compile_pagination>). Those hooks are not yet a stable interface; study
+the bundled adapters and expect changes between releases.
+
+Register the class with L<Selecto::Adapter::Registry> under a lowercase
+name.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Adapter>, L<Selecto::Adapter::Registry>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

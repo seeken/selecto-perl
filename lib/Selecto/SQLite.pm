@@ -82,3 +82,66 @@ sub _compile_related_collection_sql {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::SQLite - SQLite adapter
+
+=head1 SYNOPSIS
+
+  my $dbh = DBI->connect('dbi:SQLite:dbname=app.db', '', '',
+      {RaiseError => 1, PrintError => 0, AutoCommit => 1, sqlite_unicode => 1});
+  my $adapter = Selecto->adapter(sqlite => (dbh => $dbh));
+
+=head1 DESCRIPTION
+
+Registered as C<sqlite>; needs L<DBD::SQLite> 1.64 or newer. It uses
+double-quoted identifiers and C<?> parameters. Features depend on the SQLite
+library version, which the adapter checks once per feature:
+
+=over 4
+
+=item *
+
+CTEs and recursive CTEs need SQLite 3.8, window functions 3.25, and
+C<RETURNING> and write graphs 3.35. Older libraries report the feature as
+unsupported rather than emulating it.
+
+=item *
+
+Transactions, set operations and streaming are always available.
+
+=item *
+
+Rollups, lateral joins, JSON and array rowsets, full-text search, value
+expressions, row locks and the PostgreSQL date/time format expressions fail
+closed.
+
+=item *
+
+C<DEFAULT> cannot be used as an individual assignment expression.
+
+=back
+
+Related collections use C<JSON_GROUP_ARRAY>, so the SQLite JSON functions
+must be available (they are built in to modern DBD::SQLite).
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::SQL>, L<DBD::SQLite>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

@@ -36,3 +36,37 @@ sub compile {
 sub all { my ($self, $plan) = @_; return $self->{adapter}->execute_query($self->compile($plan)); }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Document::Engine - engine for approved document-database access patterns
+
+=head1 DESCRIPTION
+
+The document-database counterpart of L<Selecto::Engine>. It compiles a
+L<Selecto::Document::Plan> through an adapter supplied by a separate
+distribution (for example a MongoDB adapter).
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Document::Plan>, L<Selecto::Document::ShapeRelease>, L<Selecto::Adapter>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

@@ -550,3 +550,174 @@ sub _canonical {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::QueryLibrary - named segments, projections, orderings and views
+
+=head1 SYNOPSIS
+
+  my $domain = Selecto::Domain->new(
+      name   => 'Products',
+      table  => 'products',
+      fields => {id => 'integer', name => 'string', stock => 'integer'},
+      query_library => {
+          segments => {
+              low_stock => {
+                  filters    => [['lt', 'stock', ['param', 'threshold']]],
+                  parameters => {threshold => {type => 'integer', required => 1}},
+              },
+          },
+          projections => {summary => {fields => [qw(id name stock)]}},
+          orderings   => {stock_first => {order_by => [['stock', 'asc']]}},
+          views       => {
+              replenishment => {
+                  segments   => ['low_stock'],
+                  projection => 'summary',
+                  ordering   => 'stock_first',
+              },
+          },
+      },
+  );
+  my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+
+  my $query = $engine->apply_view($engine->query, 'replenishment', {threshold => '8'});
+  my $rows  = $engine->all($query)->{rows};
+  my $applied = $query->applied_query_library;
+  # {segments => ['low_stock'], projection => 'summary', ordering => 'stock_first',
+  #  views => ['replenishment'], projections => ['summary']}
+
+=head1 DESCRIPTION
+
+A domain can own reusable query intent under C<query_library>. Definitions
+are data, not SQL: segments use the portable filter AST, parameters are
+typed and always bound, and every field is resolved against the domain.
+Applying definitions records their names on the query
+(C<applied_query_library>) so saved views and API responses can report what
+was used.
+
+Query-library C<capability> values are descriptive metadata only; they do
+not replace application authorization or database row-level security.
+
+The engine methods C<apply_segment>, C<apply_segments>,
+C<apply_projection>, C<apply_ordering> and C<apply_view> delegate to the
+class methods below with the engine's domain.
+
+=head1 DEFINITIONS
+
+=over 4
+
+=item C<segments>
+
+  segments => {
+      active    => {filters => [['eq', 'status', 'A']]},
+      named     => {filters => [['starts_with', 'name', ['param', 'prefix']]],
+                    parameters => {prefix => {type => 'string', required => 1}}},
+      active_or_new => {segment_groups => [{operator => 'or', segments => ['active', 'new']}]},
+      composite => {segments => ['active', 'named']},
+  }
+
+C<filters> is a list of filter ASTs (see
+L<Selecto::Expression/from_filter_ast>), ANDed together, where
+C<['param', NAME]> stands for a parameter value. C<segments> includes other
+segments. C<segment_groups> combine segments with C<and>, C<or>, C<not> (one
+segment), C<nor> or C<xor> (exactly two). Cycles are rejected.
+
+Parameter types C<string>, C<integer>, C<decimal>, C<float>, C<boolean>,
+C<date>, C<datetime>, C<naive_datetime>, C<utc_datetime> and C<uuid> are
+validated; other type names pass values through for the host to interpret.
+Parameters are required unless they declare a C<default>.
+
+=item C<projections>
+
+C<< {fields => [...], projections => [...], associations => [{name => 'customer', fields => [...]}]} >>.
+Associations expand to dotted field paths. The domain's
+C<required_selected> fields are always included.
+
+=item C<orderings>
+
+C<< {order_by => [['field', 'asc'], ...]} >>, after the domain's
+C<required_order_by>.
+
+=item C<views>
+
+C<< {segments => [...], projection => ..., ordering => ...} >>.
+
+=item C<segment_picker_groups>
+
+  segment_picker_groups => {
+      pdf_sent => {label => 'PDF sent', off_label => 'Either',
+          choices => [{segment => 'pdf_sent', label => 'Yes'},
+                      {segment => 'pdf_not_sent', label => 'No'}]},
+  }
+
+Mutually exclusive segments for user interfaces. At most one choice of a
+group may be applied, including through views.
+
+=back
+
+=head1 CLASS METHODS
+
+All take the domain as their first argument.
+
+=over 4
+
+=item C<library($domain)>
+
+The four registries plus C<segment_picker_groups>, as copies.
+
+=item C<definitions($domain, $registry)>, C<definition($domain, $registry, $id)>
+
+One registry (C<segments>, C<projections>, C<orderings> or C<views>), or one
+definition. Unknown names throw C<invalid_query_library>.
+
+=item C<segment_picker_groups($domain)>
+
+The validated picker groups as a sorted list.
+
+=item C<apply_segment($domain, $query, $id, \%params)>, C<apply_segments($domain, $query, \@ids, \%params)>
+
+AND the segments' filters into the query's predicate. The combined parameter
+contract is validated before the query changes.
+
+=item C<apply_projection($domain, $query, $id_or_ids)>
+
+Replace the selections.
+
+=item C<apply_ordering($domain, $query, $id)>
+
+Replace the orderings.
+
+=item C<apply_view($domain, $query, $id, \%params)>
+
+Apply a view's segments, projection and ordering.
+
+=item C<view_segments>, C<parameter_specs>, C<normalize_parameters_for_selection>, C<projection_fields>, C<ordering_entries>
+
+Introspection helpers for user interfaces and API handlers.
+
+=back
+
+=head1 ERRORS
+
+C<invalid_query_library> and C<query_library_cycle>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Engine>, L<Selecto::API::EngineHandler>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

@@ -329,10 +329,96 @@ __END__
 
 Selecto::QueryMember - named query members declared as domain data
 
+=head1 SYNOPSIS
+
+  # In a canonical domain:
+  query_members => {
+      ctes => {
+          usage_totals => {
+              source => 'usage_session',   # a key of the domain's schemas
+              query  => {select => ['equipment_id', {as => 'sessions', aggregate => 'count'}],
+                         group_by => ['equipment_id']},
+              join   => {owner_key => 'id', related_key => 'equipment_id', type => 'left'},
+          },
+          category_tree => {
+              kind   => 'recursive', source => 'category',
+              base   => {select => ['id', 'code', {as => 'depth', value => ['literal', 0, 'integer']}],
+                         filter => ['is_null', 'parent_id']},
+              step   => {select => ['id', 'code',
+                         {as => 'depth', value => ['add', ['previous', 'depth'], ['literal', 1]]}]},
+              step_join => {owner_key => 'parent_id', related_key => 'id'},
+              join      => {owner_key => 'category_id', related_key => 'id', type => 'inner'},
+              max_depth => 50,
+          },
+      },
+      laterals => {
+          latest_ticket => {
+              source => 'ticket',
+              query  => {select => ['summary'], order_by => [['opened_at', 'desc']], limit => 1},
+              correlations => {equipment_id => 'id'},
+              join_type    => 'left',
+          },
+      },
+      unnests => {
+          legacy_tags => {array_field => 'legacy_tags', as => 'tag_rows', ordinality => 'position'},
+      },
+  },
+
+  # In a query:
+  my $query = $engine->query
+      ->with_member('category_tree')
+      ->select('name', 'category_tree.depth');
+
 =head1 DESCRIPTION
 
-Validates the C<ctes>, C<laterals>, and C<unnests> groups of a domain's
-C<query_members> section and expands members a query activates with
-C<Selecto::Query-E<gt>with_member> into CTE, lateral, and array rowset sources.
+Query members are reusable CTE, recursive CTE, lateral and array-expansion
+sources declared as data in the domain, activated by name with
+L<Selecto::Query/with_member>. A member's query is rooted at a relation in
+the domain's own C<schemas> and is written as data, never SQL, so the same
+contract runs in every Selecto runtime.
+
+Member queries accept C<select> (field names,
+C<< {as => ..., value => VALUE_AST} >> using L<Selecto::ValueExpression>, or
+C<< {as => ..., aggregate => 'count'|'sum'|'avg'|'min'|'max', field => ...} >>),
+C<filter> (a filter AST), C<group_by>, C<order_by> (C<[[field, 'asc']]>) and
+C<limit>. C<['previous', column]> reads the previous level's row and is
+accepted only in a recursive C<step>.
+
+Every recursive member is depth-bounded: C<max_depth> defaults to 100 (at
+most 10,000) and adds a trailing C<selecto_depth> column, which a member may
+not declare itself.
+
+A member reads its own relation, so the root's request scope does not reach
+it through a join. When the root domain carries a required predicate and the
+member's source schema declares C<tenant_field>, the root's tenant
+conditions are re-expressed on the member's tenant field. A scoped root
+whose predicate has no tenant condition fails with C<missing_tenant_scope>
+for such a member, so declare C<tenant_field> on every schema holding tenant
+data.
+
+Members are validated when the domain is parsed and are part of its
+fingerprint. Naming an undeclared member fails with C<unknown_query_member>.
+Member groups this runtime does not execute are ignored until a query
+activates them.
+
+This module's Perl interface (C<validate>, C<expand>, C<build_query>) is
+used internally by L<Selecto::Domain> and the SQL compiler and may change;
+the data format above is the public contract.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Query>, L<Selecto::Domain>, L<Selecto::ValueExpression>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut

@@ -254,3 +254,221 @@ sub to_hash {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Write - portable write commands, batches, graphs and results
+
+=head1 SYNOPSIS
+
+  use Selecto;
+
+  # Usually built and checked by the engine:
+  my $command = $engine->write_command(
+      operation   => 'update',
+      assignments => {
+          quantity   => Selecto::Write::Expression->decrement('quantity', 1),
+          updated_at => Selecto::Write::Expression->current_timestamp,
+      },
+      filter => ['eq', 'id', 42],
+  );
+  my $result = $engine->execute_write($command);
+  print $result->affected_rows;
+
+  # Or constructed directly:
+  my $insert = Selecto::Write::Command->new(
+      operation   => 'insert',
+      relation    => 'orders',          # must be the engine domain's table
+      assignments => {order_no => 'PO-41'},
+      metadata    => {returning => ['id']},
+  );
+
+  my $results = $engine->execute_batch(Selecto::Write::Batch->new($insert, $command));
+
+=head1 DESCRIPTION
+
+Writes in Selecto are data. A L</Selecto::Write::Command> says what to
+change; the L<Selecto::Engine> checks it against the domain's C<writes>
+contract, applies trusted tenant scope, and passes it to the adapter with a
+single-use L<Selecto::Write::Authorization>. SQL adapters refuse to execute
+a command, batch or graph that did not come through an engine
+(C<ungoverned_write>).
+
+Every write, batch and graph runs in a transaction. When a command's
+affected-row count differs from C<expected_count> the transaction rolls back
+and C<cardinality_mismatch> is thrown with the expected count in its details
+(never the matched count).
+
+Loading C<Selecto::Write> loads all the packages below and
+L<Selecto::Write::Expression>.
+
+=head1 Selecto::Write::Command
+
+=head2 new
+
+  my $command = Selecto::Write::Command->new(
+      operation      => 'update',       # insert, update, upsert or delete
+      relation       => 'orders',       # the domain's table
+      assignments    => {status => 'closed'},
+      predicate      => Selecto::Expression->eq('id', 42),
+      expected_count => 1,              # default 1; pass undef to skip the check
+      metadata       => {returning => ['id', 'status']},
+  );
+
+Assignment values are plain scalars or L<Selecto::Write::Expression>
+objects. The C<predicate> is a L<Selecto::Expression> over root fields only;
+association paths and computed fields fail with C<unknown_field>.
+
+C<metadata> keys:
+
+=over 4
+
+=item C<returning>
+
+Root fields to return; they appear in C<values> of the result. Requires the
+adapter's C<returning> write capability.
+
+=item C<conflict_target>, C<upsert_update_fields>
+
+Required for upserts: the unique key columns, and the fields to update when
+the row exists.
+
+=back
+
+The engine's rules for each operation:
+
+=over 4
+
+=item *
+
+Only root fields granted in C<writes.fields> (C<insertable>,
+C<updatable>) can be assigned (C<write_field_not_writable>).
+
+=item *
+
+C<required> fields must be present on inserts and upserts; all omissions are
+reported together as C<missing_required_write_fields>.
+
+=item *
+
+An C<expected_count> above one needs C<bulk> on the operation.
+
+=item *
+
+Date assignments must be C<YYYY-MM-DD> or C<undef>.
+
+=item *
+
+Operations the contract does not enable fail with
+C<write_operation_not_enabled>.
+
+=back
+
+=head2 Accessors and copies
+
+C<operation>, C<relation>, C<assignments>, C<predicate>,
+C<scope_predicate>, C<query_enforcement>, C<expected_count>, C<metadata>.
+C<with_assignments>, C<with_metadata>, C<with_scope_predicate> and
+C<with_query_enforcement> return modified copies. Commands are never changed
+in place.
+
+=head1 Selecto::Write::Batch
+
+  my $batch = Selecto::Write::Batch->new(@commands);   # or \@commands
+  my $results = $engine->execute_batch($batch);        # array of results
+
+Runs several commands atomically: if any fails or misses its expected count,
+all are rolled back. C<commands> returns the list.
+
+=head1 WRITE GRAPHS
+
+  my $graph = Selecto::Write::Graph->new(nodes => [
+      {id => 'order', command => $insert_order},
+      {id => 'line',  command => $insert_line,
+       bindings => [{field => 'order_id', from => 'order', key => 'id'}]},
+  ]);
+  my $result = $engine->execute_graph($graph);
+  my $order_id = $result->root->values->{id};
+  my $line_id  = $result->nodes->{line}->values->{id};
+
+A C<Selecto::Write::Graph> is an ordered list of nodes executed in one
+transaction. The first node is the root and has no bindings; every later
+node binds at least one field to a value returned by an earlier node.
+Construction rejects missing, forward or duplicate bindings and bindings that
+would overwrite an authored assignment, and adds the keys later nodes need to
+their source node's C<returning>.
+
+The engine checks each child against a writable relationship declared by its
+parent's domain:
+
+  writes => {
+      relationships => {
+          lines => {
+              writable => 1, table => 'order_lines',
+              parent_key => 'id', child_key => 'order_id',
+              allowed_ops => [qw(insert update delete)],
+              domain => {...},   # the child's canonical domain; required when strict
+          },
+      },
+  }
+
+Children stay under the parent row they bind to. Update and delete children
+receive the parent key as a C<WHERE> condition, never as an assignment; an
+upsert child's C<conflict_target> must include the parent key. Graph
+execution requires the adapter's C<write_graph> capability (PostgreSQL,
+DuckDB, and SQLite 3.35 or newer).
+
+C<Selecto::Write::Graph::Result> has C<root> and C<nodes> (a hash of node id
+to L</Selecto::Write::Result>).
+
+=head1 Selecto::Write::Result
+
+C<operation>, C<affected_rows>, C<values> (a hash of the C<returning>
+fields), and C<to_hash>, which returns
+C<< {operation => ..., affected_rows => ..., values => {...}} >> for JSON
+responses.
+
+=head1 TENANT SCOPE
+
+Declare C<< writes.scope.tenant => {field => ..., satisfied_by => ['trusted_context']} >>
+and construct the engine with C<< scope => {tenant => $tenant} >>. The
+tenant is then added to every update and delete predicate and assigned on
+every insert, and commands naming another tenant fail. The full rules are in
+L<Selecto::Engine/TENANT SCOPE>.
+
+=head1 QUERY-GUARDED WRITES
+
+L<Selecto::Engine/enforce_query> attaches the predicate of the query that
+selected a row to the write that changes it, so a row that stopped matching
+between read and write is not changed. The adapter combines the command
+predicate, trusted scope and captured predicate in one statement; SQL
+three-valued logic is preserved and domain drift fails closed.
+
+=head1 TRANSACTIONS
+
+Adapters open and commit their own transactions by default. A host that
+already owns a transaction constructs the adapter with
+C<< transaction_mode => 'external' >> and an C<< AutoCommit => 0 >> DBI
+handle; the adapter then never begins, commits or rolls back, and the host
+must commit on success and roll back on every exception. See L<Selecto::SQL>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Engine>, L<Selecto::Write::Expression>,
+L<Selecto::Domain/writes>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

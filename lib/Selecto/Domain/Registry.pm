@@ -249,16 +249,119 @@ Selecto::Domain::Registry - trusted, fail-closed named domain resolution
 
 =head1 SYNOPSIS
 
-  my $registry = Selecto::Domain::Registry->new(name => 'MyApp::Domains')
-      ->register(orders => $orders_domain);
+  use Selecto;
 
-  my ($domain, $ref) = $registry->resolve('orders');
+  my $registry = Selecto->domain_registry(name => 'MyApp::Domains')
+      ->register(orders => $orders_domain)
+      ->register_provider(tenant_orders => sub {
+          my ($id, $context) = @_;
+          return Selecto::Domain::Registry->forbidden
+              unless $context->{can_read_orders};
+          return Selecto::Domain::Registry->ok(
+              tenant_orders_domain($context->{tenant_id}),
+              {version => '2026-08', tenant_id => $context->{tenant_id}},
+          );
+      });
+
+  my ($domain, $ref) = $registry->resolve(
+      tenant_orders => {can_read_orders => 1, tenant_id => 42});
+
+  my $engine = Selecto->engine_registered(
+      domain  => $ref,
+      context => {can_read_orders => 1, tenant_id => 42},
+      adapter => $adapter,
+  );
+  $engine->domain_ref->to_hash;   # {id, registry, version, fingerprint, metadata}
 
 =head1 DESCRIPTION
 
-Static registrations are validated immediately. Dynamic providers must return
-an explicit C<ok>, C<not_found>, or C<forbidden> result. Provider exceptions,
-bare return values, invalid contracts, and registry substitution fail with
-typed C<Selecto::Error> values.
+A registry keeps the mapping from domain names to domains on the server, so
+clients can refer to a domain by name without ever supplying one. Static
+registrations are validated immediately. Dynamic providers are called with
+the id and a copy of a trusted context hash and must return an explicit
+C<ok>, C<not_found> or C<forbidden> result.
+
+Everything else fails closed: bare return values (C<invalid_registry_result>),
+invalid contracts (C<invalid_registered_domain>), provider exceptions
+(C<domain_registry_failed>, without the exception text), unknown ids
+(C<domain_not_found>), and references from another registry
+(C<domain_registry_mismatch>). A forbidden result throws
+C<domain_forbidden>.
+
+Resolution also returns a L<Selecto::Domain::Ref>: opaque provenance (id,
+registry name, version, fingerprint, metadata) that engines keep as
+C<domain_ref>.
+
+=head1 METHODS
+
+=head2 new
+
+  my $registry = Selecto::Domain::Registry->new(name => 'MyApp::Domains');
+
+=head2 define
+
+  my $registry = Selecto::Domain::Registry->define(
+      name => 'MyApp::Domains', domains => sub { my ($r) = @_; $r->register(...) });
+
+=head2 register
+
+  $registry->register($id, $domain_or_contract, metadata => \%metadata);
+  $registry->register($id, sub { ... });   # a provider
+
+Registers a L<Selecto::Domain>, a canonical contract hash, or a provider
+callback. Duplicate ids throw C<duplicate_domain>. Returns the registry.
+
+=head2 register_provider
+
+Same as L</register> with a callback.
+
+=head2 resolve
+
+  my ($domain, $ref) = $registry->resolve($id, \%context);
+  my $domain = $registry->resolve($id, \%context);
+
+The version comes from the result metadata's C<version> or the contract's
+C<domain_version>; the fingerprint from metadata C<fingerprint>, the
+contract's C<domain_fingerprint> or the computed fingerprint.
+
+=head2 resolve_ref
+
+  my $domain = $registry->resolve_ref($ref, \%context);
+
+Resolves a reference issued by this registry again. Providers are called
+again, so pass the same trusted context.
+
+=head2 ref
+
+  my $ref = $registry->ref($id);
+
+A bare reference to a registered id, without resolving it.
+
+=head2 ids, name
+
+The registered ids (sorted) and the registry name.
+
+=head2 ok, not_found, forbidden, error
+
+  return Selecto::Domain::Registry->ok($domain, \%metadata);
+  return Selecto::Domain::Registry->not_found;
+
+Result constructors for providers.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Domain::Ref>, L<Selecto::Engine/from_registry>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut

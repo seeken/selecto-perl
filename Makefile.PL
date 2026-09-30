@@ -7,10 +7,9 @@ WriteMakefile(
     NAME             => 'Selecto',
     VERSION_FROM     => 'lib/Selecto.pm',
     ABSTRACT_FROM    => 'lib/Selecto.pm',
-    AUTHOR           => 'Chris Rohlfs',
-    LICENSE          => 'artistic_1',
+    AUTHOR           => 'Chris Rohlfs <seeken@gmail.com>',
+    LICENSE          => 'artistic_2',
     MIN_PERL_VERSION => '5.034',
-    EXE_FILES        => ['bin/selecto-certify'],
     PREREQ_PM        => {
         'DBI'         => '1.652',
         'DateTime::TimeZone' => 0,
@@ -25,7 +24,9 @@ WriteMakefile(
         'Scalar::Util'=> 0,
         'Storable'    => 0,
         'Text::CSV'   => '2.04',
-        'URI::Escape' => 0,
+    },
+    CONFIGURE_REQUIRES => {
+        'ExtUtils::MakeMaker' => '6.64',
     },
     TEST_REQUIRES => {
         'Test::More' => 0,
@@ -38,8 +39,13 @@ WriteMakefile(
                 url  => 'https://github.com/seeken/selecto-perl.git',
                 web  => 'https://github.com/seeken/selecto-perl',
             },
+            bugtracker => {
+                web => 'https://github.com/seeken/selecto-perl/issues',
+            },
         },
-        x_license => 'Artistic-1.0',
+        no_index => {
+            directory => [qw(t docs script)],
+        },
         optional_features => {
             postgresql => {
                 description => 'PostgreSQL execution and certification',

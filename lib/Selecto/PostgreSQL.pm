@@ -570,3 +570,77 @@ sub _decode {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::PostgreSQL - PostgreSQL adapter
+
+=head1 SYNOPSIS
+
+  use DBI;
+  use Selecto;
+
+  my $dbh = DBI->connect('dbi:Pg:dbname=app;host=db', $user, $password,
+      {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+  my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+
+  # Optional attributes:
+  my $adapter = Selecto->adapter(postgresql => (
+      dbh              => $dbh,
+      transaction_mode => 'external',  # see Selecto::SQL
+      rollup_sort_fix  => 'auto',      # 'auto' (default), 1 or 0
+  ));
+
+=head1 DESCRIPTION
+
+The reference adapter, registered as C<postgresql>. It needs L<DBD::Pg>
+3.016 or newer and is the adapter certified against the shared Selecto
+specification suite.
+
+It compiles to double-quoted identifiers and numbered C<$1> parameters, and
+reuses a parameter's identity when the same governed expression appears in
+selections, grouping and ordering. It supports every query feature in this
+distribution: CTEs and recursive CTEs, window functions, set operations,
+C<ROLLUP>, lateral joins, JSON rowsets, array rowsets and array predicates,
+JSON containment, full-text search, computed value expressions, C<FOR SHARE>
+row locks, streaming and projection sums. Writes support C<RETURNING> and
+write graphs.
+
+=head1 ATTRIBUTES
+
+=head2 rollup_sort_fix
+
+Selecto sorts rollup results so the grand total precedes the values of a
+one-level rollup while a real C<NULL> bucket stays last, using
+C<NULLS FIRST> ordering for multi-level hierarchies. PostgreSQL 17 and older
+need that ordering and pagination wrapped around a C<rollupfix> subquery.
+With C<auto> the adapter reads C<server_version_num> once and disables the
+wrapper on PostgreSQL 18 and newer; C<1> or C<0> force it on or off.
+
+=head1 ERRORS
+
+Constraint failures are reported with portable codes and without the
+driver's message: C<database_not_null_violation> (with the field when
+known), C<database_unique_violation> (with the key fields),
+C<database_foreign_key_violation> and C<database_check_violation>. Other
+failures become C<query_error>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::SQL>, L<Selecto::Adapter>, L<DBD::Pg>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

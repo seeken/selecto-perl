@@ -233,3 +233,70 @@ sub _related_collection_text_sql {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::MSSQL - Microsoft SQL Server adapter
+
+=head1 SYNOPSIS
+
+  my $dbh = DBI->connect(
+      'dbi:ODBC:Driver={ODBC Driver 18 for SQL Server};Server=db,1433;Database=app',
+      $user, $password,
+      {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+  my $adapter = Selecto->adapter(mssql => (dbh => $dbh));
+
+=head1 DESCRIPTION
+
+Registered as C<mssql>. It uses a Unicode-enabled L<DBD::ODBC> 1.61 or
+newer build and an installed ODBC driver (Microsoft's driver or FreeTDS).
+Keep the user name and password out of the DSN and pass them to C<connect>
+separately.
+
+The adapter quotes identifiers with brackets and uses C<?> parameters.
+
+=over 4
+
+=item *
+
+Pagination uses C<OFFSET ... FETCH>, which requires an order; a paginated
+query without C<order_by> fails with C<invalid_query>.
+
+=item *
+
+Upserts use a guarded C<MERGE ... WITH (HOLDLOCK)>. C<DEFAULT> is not
+available in the merge source row.
+
+=item *
+
+Comparisons against C<decimal> fields bind each value with its own exact
+scale through generated C<DECIMAL> casts; precision beyond 38 digits fails
+explicitly.
+
+=item *
+
+Transactions, CTEs, window functions, set operations and streaming are
+supported. Recursive CTEs, rollups, lateral joins, JSON features, row locks,
+C<RETURNING> and write graphs are not.
+
+=back
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::SQL>, L<DBD::ODBC>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

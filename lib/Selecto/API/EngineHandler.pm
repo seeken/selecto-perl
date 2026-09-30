@@ -1000,3 +1000,211 @@ sub _bounded_integer ($value, $label, $minimum, $maximum) {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::API::EngineHandler - governed query and write handler for the canonical API
+
+=head1 SYNOPSIS
+
+  use Selecto::API::EngineHandler;
+
+  my $handler = Selecto::API::EngineHandler->new(
+      default_limit => 100,
+      max_limit     => 1000,
+      max_offset    => 100_000,
+  );
+
+  # $engine is built per request from trusted context (tenant, required predicate).
+  my $data = $handler->query($engine, {
+      select   => ['id', 'name', {field => 'created_on', alias => 'month', format => 'month'}],
+      filters  => [{field => 'stock', op => 'gte', value => 1}],
+      order_by => [{field => 'name', direction => 'asc'}],
+      limit    => 50,
+  });
+  # {columns => [...], rows => [[...]], returned => 3, limit => 50, offset => 0,
+  #  row_format => 'arrays', subtables => {}, query_library => {...}}
+
+  my $written = $handler->write($engine, {
+      operation      => 'update',
+      assignments    => {status => 'closed'},
+      filters        => [{field => 'id', op => 'eq', value => 17}],
+      expected_count => 1,
+      returning      => ['id', 'status'],
+  });
+
+=head1 DESCRIPTION
+
+The handler turns canonical API request bodies into governed engine calls.
+It does not construct engines, authenticate users, choose tenants or modify
+domains: the host supplies an engine whose domain already carries every
+required scope and restriction, and the handler validates every field,
+operator and query-library name against that engine's domain.
+
+Only public fields are accepted. Columns marked C<internal> and fields
+listed in C<redact_fields> cannot be selected, filtered, ordered, assigned
+or returned (C<field_not_public>), at any association depth. Trusted host
+code can still use them directly through the engine.
+
+Both entry points fail with C<missing_tenant_scope> when the domain has a
+tenant field but the engine has no tenant boundary; see
+L<Selecto::Engine/assert_tenant_boundary>.
+
+=head1 CONSTRUCTOR
+
+=head2 new
+
+All limits are optional non-negative integers:
+
+  max_fields        100      selections, projections and returning fields
+  max_filters       20
+  max_filter_values 100      values in one in/not_in filter
+  max_orders        10
+  max_segments      20
+  max_limit         1000
+  default_limit     100      must not exceed max_limit
+  max_offset        100_000  deep offsets scan and discard earlier rows
+  max_write_count   1000     largest expected_count
+
+Throws C<invalid_api_handler> for invalid limits.
+
+=head1 METHODS
+
+=head2 query
+
+  my $data = $handler->query($engine, \%body);
+
+Body keys:
+
+=over 4
+
+=item C<select>, C<projection> or C<view>
+
+Exactly one. C<select> is an array of field paths or
+C<< {field => ..., alias => ..., format => ...} >> objects, where C<format>
+is an allowlisted date/time format (see L<Selecto::DateFormat>). A nested
+array groups fields of one direct to-many association into a subtable: the
+root row is returned once, and the association's rows are returned in a
+column named after the association:
+
+  select => ['id', ['lines.sku', {field => 'lines.shipped_on', alias => 'day', format => 'day'}]]
+
+C<projection> names one or more query-library projections; C<view> names a
+query-library view (its segments and ordering apply too). Domain
+C<required_selected> fields are always included.
+
+=item C<segments>, C<parameters>
+
+Query-library segments to apply and their typed parameters.
+
+=item C<filters>
+
+An array of C<< {field, op, value} >> objects, ANDed together. Operators:
+C<eq>, C<ne>, C<gt>, C<gte>, C<lt>, C<lte>, C<between> (with C<value> and
+C<end>), C<in>, C<not_in>, C<is_null>, C<not_null>, C<starts_with>,
+C<text_contains>, C<ends_with> and their C<_ci> forms (text fields only), and
+C<date_shortcut> (temporal fields; values such as C<this_month>, see
+L<Selecto::DateShortcut>). Values are JSON scalars and are always bound.
+
+=item C<ordering> or C<order_by>
+
+A query-library ordering name, or an array of C<< {field, direction} >>.
+
+=item C<limit>, C<offset>
+
+Bounded by C<max_limit> and C<max_offset>; C<limit> defaults to
+C<default_limit>.
+
+=item C<timezone>
+
+An IANA zone name for date/time interpretation.
+
+=item C<row_format>
+
+C<arrays> (default) or C<objects>, applied to root rows and subtable rows
+alike.
+
+=back
+
+The result has C<columns>, C<rows>, C<returned>, C<limit>, C<offset>,
+C<row_format>, C<subtables> (per association, its C<columns>) and
+C<query_library> (the applied definitions).
+
+=head2 write
+
+  my $data = $handler->write($engine, \%body);   # Selecto::Write::Result->to_hash
+
+Validates the body with L</write_command> and executes it through the
+engine.
+
+=head2 write_command
+
+  my $command = $handler->write_command($engine, \%body);
+
+Normalizes a write body into a L<Selecto::Write::Command> without executing
+it, for hosts that compose their own transaction. The command must still be
+executed through a governed engine. Body keys:
+
+=over 4
+
+=item C<operation>
+
+C<insert>, C<update>, C<upsert> or C<delete>; must be enabled in the
+domain's C<writes.operations>.
+
+=item C<assignments>
+
+Public root fields to values. Required fields are enforced for inserts and
+upserts (C<missing_required_write_fields>); deletes take none.
+
+=item C<filters> (write)
+
+Required for updates and deletes, rejected otherwise. Root fields only, with
+C<eq>, C<ne>, C<gt>, C<gte>, C<lt>, C<lte>, C<in>, C<is_null> and
+C<not_null>. The engine's required predicate is always added.
+
+=item C<expected_count>
+
+Default 1; values above 1 need C<bulk> on the operation.
+
+=item C<returning>, C<conflict_target>, C<upsert_update_fields>
+
+Root field lists. Upserts require the last two and are refused on domains
+with a required predicate (C<query_enforcement_unsupported_operation>).
+
+=back
+
+A rolled-back write reports C<cardinality_mismatch> with the expected count
+only.
+
+=head2 describe_openapi
+
+  $handler->describe_openapi($api);
+
+Adds this handler's request schemas and limits to a L<Selecto::API>
+object's OpenAPI document.
+
+=head1 ERRORS
+
+C<invalid_api_query>, C<invalid_api_write>, C<field_not_public>,
+C<missing_tenant_scope>, plus any engine or query-library error.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::API>, L<Selecto::Engine>, L<Selecto::QueryLibrary>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

@@ -480,3 +480,37 @@ sub _id {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Action::Planner - turn a domain action and caller intent into a constrained plan
+
+=head1 DESCRIPTION
+
+Implements L<Selecto::Action/plan> and L<Selecto::Action/input_form>: variant
+and execution-case selection, input normalization, targets, transitions and
+declared preconditions.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Action>, L<Selecto::Action::Plan>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

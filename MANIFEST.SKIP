@@ -1,0 +1,22 @@
+# Version control and CI
+^\.git/
+^\.github/
+^\.gitignore$
+^\.gitattributes$
+# Build products
+^blib/
+^local/
+^cover_db/
+^Makefile$
+^Makefile\.old$
+^MANIFEST\.bak$
+^MYMETA\.
+^pm_to_blib$
+^Selecto-\d
+\.bak$
+\.old$
+# Developer tooling not needed to build, test, or install from CPAN
+^AGENTS\.md$
+^mise\.toml$
+^script/
+^bin/

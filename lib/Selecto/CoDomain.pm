@@ -161,13 +161,94 @@ __END__
 
 =head1 NAME
 
-Selecto::CoDomain - governed cross-domain lookup execution
+Selecto::CoDomain - governed lookups into another domain
+
+=head1 SYNOPSIS
+
+  # In the source (for example "loads") domain contract:
+  co_domains => {
+      carriers => {
+          domain => 'client',
+          view   => 'carrier_lookup',          # or projection/segments/ordering
+          search => {fields => [qw(co_name cl_key city)], mode => 'prefix', rank => 1},
+          result => {
+              value_field        => 'id',
+              label_field        => 'co_name',
+              description_fields => [qw(cl_key city state)],
+          },
+      },
+  },
+
+  # In the host, with an engine for the target domain built from trusted context:
+  my $found = Selecto::CoDomain->lookup(
+      source_domain => $loads_domain,
+      co_domain     => 'carriers',
+      engine        => $tenant_scoped_client_engine,
+      query         => $search_text,
+      predicate     => $selection_specific_scope,   # optional, can only narrow
+      limit         => 20,
+  );
+  # {results => [{value => '17', label => 'Acme Freight', description => '...'}, ...],
+  #  query => $selecto_query}
 
 =head1 DESCRIPTION
 
-A co-domain contract lets one domain name a reusable projection, segment/view,
-search, and result mapping owned by another domain. The host supplies the target
-engine and any request-specific scope predicate; Selecto validates and executes
-the resulting query through the target domain.
+A co-domain lets one domain declare a bounded lookup that is owned and
+governed by another domain, such as a "choose a carrier" picker on a load
+form. The contract names the target domain, the target's query-library view
+or projection, the searchable fields and how rows map to options. It never
+carries connection details, SQL or a client-selected engine: the host
+resolves the target domain and supplies an engine for it.
+
+The target engine's required predicate and tenant are preserved, and the
+optional C<predicate> can only restrict the lookup further (for example to
+rows eligible for the current action). On a tenant-field domain the lookup
+requires a tenant boundary (C<missing_tenant_scope>).
+
+Searching uses full-text search, so the target adapter needs the
+C<text_search> capability (PostgreSQL); others fail with
+C<unsupported_feature>.
+
+=head1 CLASS METHODS
+
+=head2 definition
+
+  my $definition = Selecto::CoDomain->definition($source_domain, 'carriers');
+
+Returns a copy of one declared co-domain; throws C<unknown_co_domain>.
+
+=head2 lookup
+
+Arguments: C<source_domain>, C<co_domain>, C<engine>, C<query> (1 to 200
+characters), optional C<predicate>, C<limit> (1 to 100, default 20) and
+C<parameters> for the target's segments. Returns C<results>, a list of
+C<< {value, label, description} >> with values and labels as strings, and
+the executed C<query>.
+
+C<search> takes C<fields>, C<mode> (C<prefix> turns the text into prefix
+terms; other modes pass it to the text search), optional
+C<configuration>, and C<rank> to order by relevance. Result fields must be
+selected by the view or projection.
+
+=head1 ERRORS
+
+C<unknown_co_domain>, C<invalid_co_domain>, C<invalid_co_domain_lookup>,
+C<missing_tenant_scope>, C<unsupported_feature>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::QueryLibrary>, L<Selecto::Engine>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
 
 =cut

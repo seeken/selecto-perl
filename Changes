@@ -1,30 +1,7 @@
 Revision history for Selecto
 
-Unreleased
-    - Selecto::Expression->text_contains and ->ends_with build literal
-      substring and suffix filters with LIKE wildcards escaped, like
-      starts_with; the filter AST accepts both operators.
-    - Security: write graph update and delete children are confined to their
-      bound parent row; the parent key is a WHERE condition, never a SET.
-      Upsert children must include the parent key in their conflict target.
-    - Security: strict engines refuse graph relationships without a nested
-      domain.
-    - Security: internal column policy applies at every association depth.
-    - Security: redact_fields entries are withheld from untrusted surfaces
-      like internal columns.
-    - Security: related-collection keys must be identifier paths.
-    - Security: on a domain that names tenant_field without declaring
-      writes.scope.tenant, engine writes honor the domain's required
-      predicate and upsert is refused.
-    - Security: query members inherit the root tenant condition when their
-      schema declares tenant_field, and recursive members are depth-bounded
-      by max_depth (default 100).
-    - EngineHandler caps offset with max_offset (default 100,000), accepts
-      engine-held tenant scope for writes, and API cardinality errors no
-      longer report the matched row count.
-
-0.2.0  2026-09-21
-    - First stable CPAN release of the governed domain, query, portable-write,
-      and database-adapter contracts.
-    - Require Mojolicious 9.49 or newer and harden domain URL validation.
-    - Bound importer cell sizes.
+0.2.0  2026-09-30
+    - First CPAN release: governed domains, queries, portable writes,
+      governed actions, and database adapters for PostgreSQL, MySQL,
+      MariaDB, SQL Server, SQLite, and DuckDB.
+    - Licensed under the Artistic License 2.0.

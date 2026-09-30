@@ -87,3 +87,37 @@ sub _related_collection_text_sql {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::MySQLFamily - shared DBD::MariaDB mechanics for the MySQL and MariaDB adapters
+
+=head1 DESCRIPTION
+
+Common base class of L<Selecto::MySQL> and L<Selecto::MariaDB>: placeholders,
+backtick quoting, C<ON DUPLICATE KEY UPDATE> upserts and value decoding. The
+two public adapters stay separate classes with separate identities.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::MySQL>, L<Selecto::MariaDB>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

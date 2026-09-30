@@ -124,3 +124,36 @@ sub _accepts {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Analytics::TransformRegistry - catalog of allowlisted analytics transforms
+
+=head1 DESCRIPTION
+
+Lists the analytics transforms Selecto understands, which column units each
+accepts, and the unit each produces.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Analytics::Pipeline>, L<Selecto::Analytics::UnitRegistry>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

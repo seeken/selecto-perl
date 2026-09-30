@@ -1025,3 +1025,355 @@ sub _relationship_context {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Engine - run governed queries, writes and actions for one domain
+
+=head1 SYNOPSIS
+
+  my $engine = Selecto::Engine->new(
+      domain  => $domain,
+      adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+      scope   => {tenant => $session->tenant_id},   # trusted, from your auth layer
+  );
+
+  # Reads
+  my $result = $engine->all($engine->query->select('id', 'name')->order_by('id'));
+  my $stream = $engine->stream($query, fetch_size => 500);
+  my $sql    = $engine->compile($query);            # Selecto::Statement
+
+  # Writes
+  my $command = $engine->write_command(
+      operation   => 'update',
+      assignments => {status => 'closed'},
+      filter      => ['eq', 'id', 42],
+  );
+  my $preview = $engine->preview_write($command);   # {sql => ..., params => [...]}
+  my $written = $engine->execute_write($command);   # Selecto::Write::Result
+
+  # Actions
+  my $plan = $engine->plan_action({action => 'archive', target => 42});
+  my $done = $engine->execute_action($plan, resolver => $policy, context => $ctx);
+
+=head1 DESCRIPTION
+
+An engine binds one L<Selecto::Domain> to one L<Selecto::Adapter> and is the
+object applications use. It compiles queries against the domain, applies
+the domain's required predicate and the engine's trusted tenant to every
+read, and validates every write against the domain's C<writes> contract
+before handing it to the adapter with a single-use
+L<Selecto::Write::Authorization>.
+
+Engines are cheap. Build one per request with the tenant taken from your
+authenticated session, and never accept the tenant, the domain or the adapter
+from a client.
+
+=head1 CONSTRUCTORS
+
+=head2 new
+
+  my $engine = Selecto::Engine->new(
+      domain       => $domain,          # required, a Selecto::Domain
+      adapter      => $adapter,         # required, a Selecto::Adapter
+      scope        => {tenant => 42},   # optional trusted scope
+      write_policy => 'strict',         # or 'permissive'
+      domain_ref   => $ref,             # optional Selecto::Domain::Ref
+  );
+
+C<scope> accepts only a C<tenant> key. When the domain has a C<tenant_field>,
+reads are restricted to that tenant, inserts receive it, and updates and
+deletes are confined to it (see L</TENANT SCOPE>).
+
+C<write_policy> is C<strict> by default: a domain must declare
+C<writes.operations> (with the operation enabled) and, for everything except
+deletes, C<writes.fields> before anything is written; otherwise writes fail
+with C<write_policy_missing>. C<permissive> lets domains without a C<writes>
+section be written and exists for legacy tooling.
+
+Throws C<invalid_domain>, C<invalid_adapter>, C<invalid_tenant_scope> or
+C<invalid_write_policy>.
+
+=head2 from_registry
+
+  my $engine = Selecto::Engine->from_registry(
+      domain   => 'orders',       # an id, or a Selecto::Domain::Ref
+      registry => $registry,      # optional when domain is a Ref
+      context  => \%context,      # passed to registry providers
+      adapter  => $adapter,
+      scope    => {tenant => 42},
+  );
+
+Resolves the domain through a L<Selecto::Domain::Registry> and records the
+provenance reference as C<domain_ref>. See also
+L<Selecto/engine_registered>.
+
+=head1 READING
+
+=head2 query
+
+Returns a new empty L<Selecto::Query>.
+
+=head2 all
+
+  my $result = $engine->all($query);
+  # {columns => ['id', 'name'], rows => [[1, 'Anvil'], ...]}
+
+Compiles and executes the query and returns every row. Values are
+normalized by the adapter (integers as numbers, exact decimals without
+trailing zeros, timestamps in ISO form).
+
+C<all> applies the domain's required predicate and the engine's tenant, but
+it does not require a tenant boundary: it is meant for trusted host code,
+including deliberate cross-tenant reads. Public surfaces call
+L</assert_tenant_boundary> first.
+
+=head2 stream
+
+  my $stream = $engine->stream($query, fetch_size => 500);
+  while (my $row = $stream->next) { ... }
+  $stream->close;
+
+Returns a L<Selecto::Stream> that decodes one row at a time. Requires the
+adapter's C<stream> capability. Server-side cursor behavior is up to the
+DBI driver.
+
+=head2 compile
+
+Returns the L<Selecto::Statement> the adapter would execute for a query.
+
+=head2 projection_sum
+
+  my $total = $engine->projection_sum($query, 'total');
+
+Wraps the compiled query and returns the sum of one selected result column
+over the rows it returns (zero when there are none). Requires the adapter's
+C<projection_sum> capability (PostgreSQL); remove C<limit> and C<offset>
+first to sum the whole result.
+
+=head2 read_domain
+
+The domain reads compile against: the engine's domain with the trusted
+tenant added to its required predicate. Throws C<tenant_mismatch> if the
+domain's own required predicate excludes the engine's tenant.
+
+=head2 assert_tenant_boundary
+
+  $engine->assert_tenant_boundary(access => 'read', host_predicate => $predicate);
+
+Throws C<missing_tenant_scope> unless a domain with a C<tenant_field> has a
+tenant boundary: a trusted engine tenant, or a positive C<eq>/C<in> conjunct
+on the tenant field in the required predicate or in C<host_predicate>. With
+C<< access => 'write' >> only a trusted tenant on the field
+C<writes.scope.tenant> names counts. Returns the engine.
+
+=head1 WRITING
+
+=head2 write_command
+
+  my $command = $engine->write_command(
+      operation      => 'insert',          # insert, update, upsert, delete
+      assignments    => {name => 'Anvil'},
+      filter         => ['eq', 'id', 42],  # filter AST, or
+      predicate      => $expression,       # a Selecto::Expression, not both
+      expected_count => 1,                 # default 1; undef disables the check
+      metadata       => {returning => ['id']},
+  );
+
+Builds a L<Selecto::Write::Command> for the domain's table and validates it
+immediately, so forms and APIs get early errors. Validation is advice:
+execution validates again.
+
+=head2 preview_write
+
+Validates the command and returns C<< {sql => $sql, params => \@params} >>
+without executing anything.
+
+=head2 execute_write
+
+Validates and executes a command in a transaction, returning a
+L<Selecto::Write::Result>. The affected-row count must equal
+C<expected_count> or the transaction rolls back with C<cardinality_mismatch>.
+
+=head2 execute_batch
+
+  my $results = $engine->execute_batch(Selecto::Write::Batch->new(@commands));
+
+Validates every command, then runs them in one transaction.
+
+=head2 execute_graph
+
+  my $result = $engine->execute_graph($graph);   # Selecto::Write::Graph
+
+Runs an ordered multi-table write graph in one transaction, checking each
+child node against the writable relationship and nested domain its parent
+declares. See L<Selecto::Write/WRITE GRAPHS>.
+
+=head2 governed_write
+
+The single path from a caller's command to what the adapter receives:
+normalizes assignments, applies tenant scope and the required-predicate
+boundary, then validates against the contract. Returns the governed command.
+Used by the methods above; call it directly only to inspect the result.
+
+=head2 enforce_query
+
+  my $eligible = $engine->query->where(Selecto::Expression->all(
+      Selecto::Expression->eq('id', 42), Selecto::Expression->eq('status', 'active')));
+  my $guarded = $engine->enforce_query($command, $eligible);
+  $engine->execute_write($guarded);
+
+Attaches the predicate of a read query to a write so the database applies
+it again in the same statement. For inserts the candidate row is checked
+against the captured predicate before the transaction opens. Upserts and
+predicates that reach into associations are rejected, and on a tenant-field
+domain the command must be tenant-scoped (C<missing_tenant_scope>).
+
+=head2 enforce_query_evidence
+
+  my $guarded = $engine->enforce_query_evidence($command, $evidence);
+
+Like L</enforce_query>, with evidence captured earlier by
+C<< Selecto::QueryEnforcement->capture($domain, $query) >>.
+
+=head1 ACTIONS
+
+See L<Selecto::Action> for how actions are declared.
+
+=head2 plan_action
+
+  my $plan = $engine->plan_action({action => 'archive', target => 42, inputs => {...}});
+
+Returns a L<Selecto::Action::Plan>. C<target> is a primary-key value for row
+actions or C<< {ids => [...]} >> for bulk actions.
+
+=head2 preview_action, execute_action
+
+  my $preview = $engine->preview_action($plan, resolver => $policy, context => $ctx);
+  # {phase => 'preview', action => 'archive', decision => {...}, statement => {sql, params}}
+
+  my $done = $engine->execute_action($plan, resolver => $policy, context => $ctx);
+  # {phase => 'execute', action => 'archive', decision => {...}, result => Selecto::Write::Result}
+
+Both authorize the plan through the capability resolver (or a C<grant>, see
+below), then build the write command from the plan: the plan's filters
+(target, transition source state, declared preconditions) become the
+predicate, its changes become assignments (C<['system', 'now']> becomes the
+current timestamp) and its cardinality becomes C<expected_count>. The command
+then passes through the same governance and tenant scope as any other write.
+Pass C<< returning => [...] >> to request values back.
+
+The resolver is called as C<< $resolver->($request, $context, \%options) >>
+and returns C<enabled>, C<disabled>, C<hidden> or a hash with a C<status>. A
+missing resolver fails with C<missing_capability_resolver>; a denial fails
+with C<action_capability_denied>. Insert and upsert actions create one row;
+upserts resolve conflicts on a target declared under
+C<writes.operations.upsert.conflict_targets>. Collection patches require a
+host executor (C<unsupported_action_collection_patch>).
+
+=head2 grant_action
+
+  my $grant = $engine->grant_action($plan, phase => 'execute',
+      resolver => $policy, context => $ctx, expires_in => 300);
+  # later, e.g. after a confirmation dialog:
+  my $done = $engine->execute_action($plan, grant => $grant, context => $ctx);
+
+Authorizes now and returns a single-use L<Selecto::Action::Grant> bound to
+the phase, the plan's content, the domain fingerprint, the engine's tenant
+and C<< $context->{actor} >>. A mismatched use fails with
+C<action_grant_mismatch> and revokes the grant; a used, expired, revoked or
+forged grant fails with C<action_grant_invalid>.
+
+=head2 action_command
+
+Returns the L<Selecto::Write::Command> an action plan would execute, before
+tenant scope, without authorizing it.
+
+=head1 QUERY LIBRARY
+
+C<query_library>, C<apply_segment($query, $id, \%params)>,
+C<apply_segments($query, \@ids, \%params)>,
+C<apply_projection($query, $id_or_ids)>, C<apply_ordering($query, $id)> and
+C<apply_view($query, $id, \%params)> apply the domain's named definitions to
+a query. See L<Selecto::QueryLibrary>.
+
+=head1 ACCESSORS
+
+C<domain>, C<adapter>, C<domain_ref>, C<write_policy>, and C<scope> (a copy
+of the trusted scope).
+
+=head2 with_scope
+
+  my $scoped = $engine->with_scope(tenant => 42);
+
+Returns a copy bound to a trusted tenant. An engine that already has a
+different tenant throws C<tenant_mismatch>.
+
+=head1 TENANT SCOPE
+
+A domain that declares C<writes.scope.tenant> cannot be written without a
+trusted tenant. For every command, batch member and graph node:
+
+=over 4
+
+=item *
+
+updates and deletes add C<< tenant_field = tenant >> to their predicate;
+
+=item *
+
+inserts and upserts are assigned the tenant (the field needs no
+C<insertable> grant);
+
+=item *
+
+restating the same tenant is allowed; naming another tenant, or comparing the
+tenant field in any other way, fails with C<tenant_mismatch>;
+
+=item *
+
+upserts must use a conflict target that includes the tenant field
+(C<tenant_scope_conflict_target>);
+
+=item *
+
+an engine without a tenant fails with C<missing_tenant_scope>, as does a
+graph whose nested domain stores the tenant field without declaring its own
+C<writes.scope.tenant>.
+
+=back
+
+Reads of a domain with a C<tenant_field> are always restricted to the
+engine's tenant. Domains that rely on a required predicate as their tenant
+boundary are described under L<Selecto::Domain/with_required_predicate>.
+
+=head1 ERRORS
+
+All failures are L<Selecto::Error> exceptions. Codes you are likely to
+handle: C<unknown_field>, C<invalid_query>, C<unsupported_feature>,
+C<query_error> (database failure, message withheld), C<write_policy_missing>,
+C<write_operation_not_enabled>, C<write_field_not_writable>,
+C<write_relation_mismatch>, C<missing_required_write_fields>,
+C<cardinality_mismatch>, C<tenant_mismatch>, C<missing_tenant_scope>,
+C<action_capability_denied>, C<missing_capability_resolver>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Domain>, L<Selecto::Query>, L<Selecto::Write>,
+L<Selecto::Action>, L<Selecto::Adapter>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

@@ -487,3 +487,166 @@ sub _plain_query {
 sub _fail { Selecto::Error->throw('invalid_canned_page', $_[0]) }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::CannedPage - faceted search pages with totals and drill-down
+
+=head1 SYNOPSIS
+
+  use Selecto::CannedPage;
+
+  my $page = Selecto::CannedPage->new(
+      id      => 'products',
+      domain  => $domain,
+      dataset => {
+          query      => $engine->query->where(Selecto::Expression->eq('visible', 1)),
+          entity_key => ['id'],
+      },
+      views => [
+          {id => 'list', kind => 'detail',
+           query => $engine->query->select('id', 'name', 'brand')->order_by('id')},
+          {id => 'categories', kind => 'aggregate',
+           query => $engine->query->select('category',
+               Selecto::Expression->count_distinct('id')->as('items'))
+               ->group_by('category')},
+      ],
+      controls => [
+          {id => 'brand', kind => 'facet', field => 'brand',
+           values => {source => 'dataset', limit => 30, searchable => 1}},
+          {id => 'price', kind => 'range', field => 'price'},
+          {id => 'name',  kind => 'text',  field => 'name', ignore_case => 1},
+      ],
+      initial_state => {view => 'list', filters => {}},
+  );
+
+  # Per request, with an engine built from trusted context:
+  my $result = $page->run($engine, {
+      view    => 'list',
+      filters => {brand => ['North'], price => {max => 100}},
+      page    => 1, limit => 25,
+  }, $request_scope_predicate);
+  # {rows => [...], columns => [...], total => 1, has_more => 0,
+  #  facets => {brand => {options => [{value, label, count}, ...], truncated => 0}},
+  #  state => {...}, view => {...}, elapsed_ms => 3}
+
+=head1 DESCRIPTION
+
+A canned page is a programmer-defined search page: a fixed dataset, one or
+more result views, and a set of filter controls. It is HTTP-neutral. The host
+supplies an authorized L<Selecto::Engine> for every request; the page never
+accepts a client-selected adapter or domain.
+
+Every selected control adds its predicate to the dataset predicate. Facet
+values within one control are ORed, and controls are ANDed. When counting
+the options of a facet, that facet's own selection is left out (so the
+counts show what selecting another value would give), but the dataset
+predicate, the domain's restrictions and the request scope always stay in.
+
+The Selecto::Components distribution can render canned pages in
+Mojolicious through its C<pages> option.
+
+=head1 DEFINITION
+
+=over 4
+
+=item C<id>
+
+A lowercase identifier.
+
+=item C<dataset>
+
+C<query> is a query with only a predicate (no selections, grouping,
+ordering or pagination). C<entity_key> must be the root primary key;
+composite identities are not supported.
+
+=item C<views>
+
+C<detail> views select entity-grain fields (no to-many paths) or an aliased
+direct to-many L<Selecto::Expression/RELATED COLLECTIONS>, and may order by
+entity-grain fields. C<aggregate> views group by fields, project the group
+fields first, and may only add C<count_distinct> of the entity key (ordinary
+sums could be multiplied by joins).
+
+=item C<controls>
+
+Up to 20. C<facet> controls (checkbox OR facets) take
+C<< values => {source => 'dataset', limit => 1..100, searchable => 1} >> or
+C<< values => {source => 'fixed', options => [{value => ..., label => ...}]} >>
+and an optional C<label_field>. C<range> controls need a numeric field and
+accept C<min> and C<max>. C<text> controls need a string field and match a
+literal prefix (C<starts_with>), case-insensitively with
+C<< ignore_case => 1 >>; C<%> and C<_> in user input are never wildcards.
+
+=item C<initial_state>
+
+The default C<view> and C<filters>.
+
+=back
+
+=head1 METHODS
+
+=head2 run
+
+  my $result = $page->run($engine, \%state, $scope_predicate);
+
+Validates the state, runs the result, total and facet queries, and returns
+C<rows>, C<columns>, C<total> (distinct matching entities), C<has_more>,
+C<facets>, the normalized C<state>, the C<view> and C<elapsed_ms>. The engine
+must use the page's domain. C<$scope_predicate> is an optional
+L<Selecto::Expression> added to every query; on a tenant-field domain the
+page requires a tenant boundary (C<missing_tenant_scope>).
+
+State keys: C<view>, C<filters> (by control id), C<page> (1 to 100000),
+C<limit> (1 to 100, default 25), C<facet_search> (prefix search for
+searchable facets) and
+C<< drilldown => {view => $aggregate_view, values => [...]} >>, which filters
+by one aggregate row's group values.
+
+Each response runs one bounded query per facet plus the result and total
+queries (and a lookup of selected values that fell outside a facet's top
+options). The queries are separate statements, so under concurrent writes
+they may see different data unless the host wraps them in a suitable
+transaction.
+
+=head2 plan
+
+  my $plan = $page->plan(\%state, $scope_predicate);
+
+Returns the queries C<run> would execute (C<query>, C<total_query>,
+C<facet_queries>, C<selected_facet_queries>) with C<state> and C<view>,
+without executing them.
+
+=head2 normalize_state
+
+Validates and normalizes a state hash. Throws C<invalid_canned_page>.
+
+=head2 id, domain, version, views, controls
+
+Accessors.
+
+=head1 LIMITATIONS
+
+The first profile does not support null facet buckets, composite entity
+identities, ordinary sums across many-valued joins, or snapshot consistency
+across the separate queries. Live fixture runs cover SQLite and PostgreSQL.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Engine>, L<Selecto::Query>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

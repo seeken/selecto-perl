@@ -28,3 +28,36 @@ sub result_name {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Identifier - SQL identifier validation
+
+=head1 DESCRIPTION
+
+Validates identifiers separately from bound values, so no caller-supplied
+text reaches SQL unchecked.
+
+This module is an internal part of the L<Selecto> distribution. Its interface
+may change without notice; applications should use the public entry points
+listed in L<Selecto>.
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::SQL>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

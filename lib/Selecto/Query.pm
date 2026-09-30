@@ -570,3 +570,276 @@ sub _clone_json_rowset_spec {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Query - immutable, domain-relative query builder
+
+=head1 SYNOPSIS
+
+  my $query = $engine->query
+      ->select('id', 'customer.name',
+          Selecto::Expression->sum('total')->as('revenue'))
+      ->where(Selecto::Expression->all(
+          Selecto::Expression->eq('status', 'shipped'),
+          Selecto::Expression->gte('total', '10.00'),
+      ))
+      ->group_by('id', 'customer.name')
+      ->order_by('revenue', 'desc')
+      ->limit(25)
+      ->offset(50);
+
+  my $result = $engine->all($query);    # {columns => [...], rows => [[...], ...]}
+  my $sql    = $engine->compile($query); # a Selecto::Statement
+
+=head1 DESCRIPTION
+
+A query records intent: what to select, filter, group, order and paginate.
+It never names a table. The root relation always comes from the engine's
+domain, and every field path is resolved against that domain when the query
+is compiled, so a query can be built before the engine that runs it.
+
+Queries are immutable. Every builder method returns a new query and leaves
+the original unchanged, so partially built queries can be shared and
+extended safely.
+
+Wherever a method takes a field, it accepts either a dotted field path such
+as C<'customer.region.name'> or a L<Selecto::Expression>.
+
+=head1 CONSTRUCTOR
+
+=head2 new
+
+  my $query = Selecto::Query->new;
+
+Returns an empty query. C<< $engine->query >> is the usual way to get one.
+C<new> also accepts the internal state keys (C<selections>, C<predicate>,
+C<groups>, C<orders>, C<limit_value>, and so on) and validates them; that
+form exists for tools that rebuild queries and is rarely needed.
+
+=head1 BUILDER METHODS
+
+=head2 select
+
+  $query->select('id', 'name', Selecto::Expression->count->as('n'));
+  $query->select([qw(id name)]);
+
+Sets the selections, replacing any previous ones. Result columns are named by
+the alias (C<as>) or, for plain fields, by the field path.
+
+=head2 replace_selections
+
+Same as L</select>; provided for code that wants to make replacement
+explicit.
+
+=head2 where
+
+  $query->where(Selecto::Expression->eq('status', 'open'));
+
+Sets the predicate. B<Calling C<where> again replaces the previous
+predicate>; combine conditions with C<< Selecto::Expression->all(...) >> or
+C<any(...)>. The domain's required predicate and the engine's tenant are
+added at compile time and cannot be removed by a query.
+
+=head2 group_by
+
+  $query->group_by('customer.name', Selecto::Expression->datetime_format('ordered_at', 'month'));
+
+Sets plain grouping expressions.
+
+=head2 group_by_rollup
+
+  my $status = Selecto::Expression->field('status');
+  $query->select($status->as('status'),
+          Selecto::Expression->count->as('orders'),
+          Selecto::Expression->grouping($status)->as('grouping_mask'))
+      ->group_by_rollup($status)
+      ->order_by($status);
+
+Groups with C<ROLLUP> to add subtotal and grand-total rows. Use
+L<Selecto::Expression/AGGREGATES> to tell detail rows from subtotal rows.
+Requires the C<rollup> capability (PostgreSQL, DuckDB). See
+L<Selecto::PostgreSQL> for rollup ordering behavior.
+
+=head2 order_by
+
+  $query->order_by('name')->order_by('id', 'desc');
+
+Appends one ordering; direction is C<asc> (default) or C<desc>. Call it
+repeatedly for multi-column ordering.
+
+=head2 replace_orders
+
+  $query->replace_orders([['name', 'asc'], ['id', 'desc']]);
+
+Replaces all orderings.
+
+=head2 limit, offset
+
+Non-negative integers. Adapters that need an order for pagination (Microsoft
+SQL Server) reject an unordered paginated query.
+
+=head2 use_timezone
+
+  $query->use_timezone('America/Chicago');
+
+Interprets date/time selections, filters and formats in an IANA time zone.
+On PostgreSQL and DuckDB, raw C<epoch_datetime> fields are converted to an
+instant before the zone is applied.
+
+=head2 for_share
+
+  my $eligible = $engine->query->where(...)->for_share;
+
+PostgreSQL only: locks the returned root rows with C<FOR SHARE>. Use it for
+an eligibility read that must stay valid through a host-owned write
+transaction on the same handle (see C<transaction_mode> in L<Selecto::SQL>).
+Other adapters reject the query before execution.
+
+=head2 count_query
+
+  my $count = $query->count_query(Selecto::Expression->count->as('total'));
+
+Returns a copy without ordering, pagination or row lock, optionally with new
+selections, for computing totals over the same filter.
+
+=head1 SET OPERATIONS
+
+  my $both = $engine->query->select('id')->where($a)
+      ->union($engine->query->select('id')->where($b))
+      ->order_by('id');
+
+C<union>, C<union_all>, C<intersect> and C<except> combine queries.
+Chained operations are evaluated left to right on every dialect, and outer
+ordering and pagination apply to the combined result. Operands may not carry
+their own ordering or pagination. C<INTERSECT ALL> and C<EXCEPT ALL> are not
+offered because the supported databases disagree about them. After a set
+operation, only ordering and pagination may be added.
+
+=head1 ADVANCED SOURCES
+
+Extra row sources are always domain-owned: each receives a domain and a
+query plus an explicit join contract, and callers cannot inject a table name
+or SQL fragment. Source names must be identifiers and unique within a query;
+their columns are addressed as C<name.column>.
+
+=head2 with_cte
+
+  my $recent = Selecto::Query->new
+      ->select(qw(order_id kind))
+      ->where(Selecto::Expression->eq('kind', 'status'));
+
+  $query = $engine->query
+      ->with_cte(recent_events => $events_domain, $recent,
+          columns => [qw(order_id kind)],
+          join    => {owner_key => 'id', related_key => 'order_id', type => 'left'})
+      ->select('id', 'recent_events.kind');
+
+Adds a common table expression. C<columns> defaults to the aliases or field
+names of the CTE query's selections. C<join> is required;
+C<related_key> must be one of the columns and C<type> is C<left> or
+C<inner>. C<depends_on> names earlier CTEs this one reads.
+
+=head2 with_recursive_cte
+
+  $query->with_recursive_cte(tree => $employees, $anchor, $step,
+      columns        => [qw(id manager_id name)],
+      join           => {owner_key => 'id', related_key => 'id', type => 'inner'},
+      recursive_join => {owner_key => 'manager_id', related_key => 'id', type => 'inner'},
+      max_depth      => 50);
+
+Adds a recursive CTE built from an anchor query and a recursive member query.
+C<recursive_join> must be an inner join. With C<max_depth> the recursion
+stops at that depth and a trailing C<selecto_depth> column (1 for the anchor)
+is added.
+
+=head2 lateral_join
+
+  $query->lateral_join(latest => $tickets, $latest_ticket_query,
+      correlations => {equipment_id => 'id'},  # child field => parent field
+      type         => 'left');                 # left, inner or cross
+
+A correlated lateral subquery (PostgreSQL).
+
+=head2 json_rowset
+
+  $query->json_rowset('payload', 'items', {sku => 'string', quantity => 'integer'},
+      path => '$.items[*]', type => 'left')
+      ->select('id', 'items.sku', 'items.quantity');
+
+Expands a JSON column into typed rows through a lateral
+C<JSONB_TO_RECORDSET> (PostgreSQL). Column types are allowlisted; the
+optional SQL/JSON C<path> is a bound parameter.
+
+=head2 array_rowset
+
+  $query->array_rowset('legacy_tags', 'tag_rows', ordinality => 'position')
+      ->select('asset_tag', 'tag_rows.value', 'tag_rows.position');
+
+Expands an array column into one row per element with C<value> and, when
+requested, a 1-based ordinality column. C<type> is C<cross> (default),
+C<inner> or C<left> (which keeps rows with empty or null arrays). Requires a
+declared C<items> type on the column (PostgreSQL).
+
+=head2 with_member
+
+  $query->with_member('category_tree')->select('name', 'category_tree.depth');
+
+Activates a source the domain declares under C<query_members>; see
+L<Selecto::QueryMember>. Naming an undeclared member fails at compile time
+with C<unknown_query_member>.
+
+=head2 without_members
+
+Returns a copy with no activated members.
+
+=head1 ADAPTER SUPPORT
+
+Adapters declare what they can compile, and a query using an unsupported
+feature fails before any SQL is sent. At the time of writing:
+
+  feature           postgresql  duckdb  sqlite    mssql  mysql/mariadb
+  cte, recursive    yes         yes     3.8+      cte    no
+  window functions  yes         yes     3.25+     yes    no
+  set operations    yes         yes     yes       yes    no
+  rollup            yes         yes     no        no     no
+  lateral, json     yes         no      no        no     no
+  array rowsets     yes         no      no        no     no
+  for_share         yes         no      no        no     no
+
+Ask the adapter with C<< $adapter->supports($feature) >>.
+
+=head1 ACCESSORS
+
+C<selections>, C<predicate>, C<groups>, C<grouping_mode>, C<orders>,
+C<limit_value>, C<offset_value>, C<timezone>, C<row_lock>,
+C<set_operations>, C<ctes>, C<lateral_joins>, C<json_rowsets>,
+C<array_rowsets>, C<members> and C<applied_query_library> return copies of
+the query's state. C<with_applied_query_library> is used by
+L<Selecto::QueryLibrary> to record which named definitions were applied.
+
+=head1 ERRORS
+
+Invalid builder arguments throw C<invalid_query>. Unknown fields are
+reported when the query is compiled (C<unknown_field>).
+
+=head1 SEE ALSO
+
+L<Selecto>, L<Selecto::Expression>, L<Selecto::Engine>,
+L<Selecto::QueryLibrary>, L<Selecto::Stream>
+
+=head1 AUTHOR
+
+Chris Rohlfs <seeken@gmail.com>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is Copyright (c) 2026 by Chris Rohlfs.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut
