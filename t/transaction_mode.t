@@ -3,13 +3,15 @@ use strict;
 use warnings;
 use Test::More;
 use DBI ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 
 # How a write's transaction meets the host's: begin/commit on an idle handle,
 # a savepoint inside an open transaction, nothing at all in external mode,
 # and the host's own transaction API through transaction_handler.
 
-my $domain = Selecto::Domain->new(
+my $domain = TestSelecto::writable_domain(
     name => 'Items', table => 'items', fields => { id => 'integer', name => 'string' },
 );
 
@@ -23,7 +25,7 @@ sub insert_command {
 
 sub engine_for {
     my ($adapter) = @_;
-    return Selecto::Engine->new(domain => $domain, adapter => $adapter, write_policy => 'permissive');
+    return Selecto::Engine->new(domain => $domain, adapter => $adapter);
 }
 
 sub error_of {

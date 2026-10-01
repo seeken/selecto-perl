@@ -457,8 +457,11 @@ my $external = Selecto->adapter(postgresql => (
   anything an adapter cannot express fails with an error.
 - Mark columns `internal` or list them in `redact_fields` to keep them out of
   API selections, filters and catalogs.
-- Keep the default strict write policy. `write_policy => 'permissive'` and the
-  adapters' `execute_*_unsafe` methods exist for trusted tooling and tests.
+- Declare a `writes` contract for every domain you write. Engines refuse writes
+  to a domain without `writes.operations`, or without `writes.fields` for
+  anything but a delete, with `write_policy_missing`; there is no permissive
+  mode. The adapters' `execute_*_unsafe` methods skip governance and exist for
+  trusted tooling and adapter tests only.
 - Keep credentials in the DBI handle. Selecto's errors and JSON output do not
   include connection details, and yours should not either.
 

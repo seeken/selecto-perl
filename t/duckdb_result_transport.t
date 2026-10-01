@@ -4,6 +4,8 @@ use warnings;
 use utf8;
 use Test::More;
 use DBI ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 use Selecto::Write ();
 
@@ -26,12 +28,11 @@ $dbh->do(q{INSERT INTO transport_values VALUES
     (5,'1970-01-01 00:00:00.000001','1970-01-01 00:00:00.000001+00',
        '1970-01-01 00:00:00.000000001',10.000001,'duplicate',true)});
 my $adapter = Selecto->adapter(duckdb => (dbh=>$dbh));
-my $domain = Selecto::Domain->new(name=>'Transport values', table=>'transport_values', fields=>{
+my $domain = TestSelecto::writable_domain(name=>'Transport values', table=>'transport_values', fields=>{
     id=>'integer', happened=>'naive_datetime', instant=>'utc_datetime', nano=>'naive_datetime',
     amount=>'decimal', label=>'string', active=>'boolean',
 });
-my $engine = Selecto::Engine->new(domain=>$domain, adapter=>$adapter,
-    write_policy=>'permissive');    # legacy domain without a write policy
+my $engine = Selecto::Engine->new(domain=>$domain, adapter=>$adapter);
 my $query = $engine->query->select(qw(id happened instant nano amount label active))->order_by('id');
 my $expected = [
     [1,'1969-12-31T23:59:59.999999','1969-12-31T23:59:59.999999',

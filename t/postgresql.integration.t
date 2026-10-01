@@ -4,6 +4,8 @@ use warnings;
 use Test::More;
 use DBI ();
 use JSON::PP ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 
 eval { require Selecto::Certification; 1 }
@@ -33,12 +35,11 @@ $dbh->do(q{INSERT INTO selecto_perl_test_events VALUES (1, 1, 'status')});
 $dbh->do('CREATE TABLE selecto_perl_test_employees (id integer primary key, manager_id integer, name text not null)');
 $dbh->do(q{INSERT INTO selecto_perl_test_employees VALUES (1, NULL, 'CEO'), (2, 1, 'Lead'), (3, 2, 'Engineer')});
 
-my $domain = Selecto::Domain->new(
+my $domain = TestSelecto::writable_domain(
     name => 'Items', table => 'selecto_perl_test_items',
     fields => { id => 'integer', name => 'string', amount => 'decimal', payload => 'jsonb' },
 );
-my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
-    write_policy => 'permissive');    # legacy domain without a write policy
+my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
 my $result = $engine->all($engine->query->select('id', 'name')->order_by('id'));
 is_deeply($result, { columns => ['id', 'name'], rows => [[1, 'baseline']] }, 'public query API executes through DBD::Pg');
 is_deeply(

@@ -5,6 +5,8 @@ use warnings;
 use Test::More;
 use DBI ();
 use JSON::PP ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 
 plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
@@ -24,14 +26,13 @@ $dbh->do(q{CREATE TABLE item_notes (id integer primary key, item_id integer not 
 $dbh->do(q{CREATE TABLE item_note_tags (id integer primary key, item_note_id integer not null, tag text)});
 $dbh->do(q{INSERT INTO items VALUES (1, 7, 'active', 10.5)});
 
-my $domain = Selecto::Domain->new(
+my $domain = TestSelecto::writable_domain(
     name => 'Items', table => 'items',
     fields => { id => 'integer', tenant_id => 'integer', status => 'string', total => 'decimal' },
     tenant_field => 'tenant_id',
 );
 my $engine = Selecto::Engine->new(
     domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => $dbh)),
-    write_policy => 'permissive',    # legacy domain with no declared write policy
 );
 
 # Direct constructor cannot smuggle hostile order directions or pagination values.
