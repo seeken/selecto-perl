@@ -221,6 +221,15 @@ eval { $engine->write_command(operation => 'update',
 print $@->code, "\n";                                  # write_field_not_writable
 ```
 
+A domain's required predicate (see `with_required_predicate`) guards writes
+as well as reads. Updates and deletes match only rows inside it, inserted
+rows must satisfy it (`query_rule_violation`), and upserts are refused
+(`query_enforcement_unsupported_operation`). A required predicate that reads
+an association field, such as `team.region`, has no portable write form, so
+every write on that domain is refused with `query_rule_unsupported_field`.
+This goes beyond the shared protocol's earlier rule that required predicates
+are read scopes.
+
 Batches, multi-table write graphs, arithmetic assignments and query-guarded
 writes are described in `perldoc Selecto::Write`.
 
@@ -426,6 +435,11 @@ my $external = Selecto->adapter(postgresql => (
 - Build the engine per request from trusted context. Take the tenant from
   your session and pass it as `scope => {tenant => ...}`, or narrow the domain
   with `with_required_predicate`; never read either from the request body.
+- A required predicate guards every engine write, batch, graph root, action
+  and API write, not only reads. Keep it to root fields on domains you write:
+  one that reads an association field refuses all writes
+  (`query_rule_unsupported_field`), and any required predicate refuses
+  upserts.
 - The public surfaces (`Selecto::API::EngineHandler`, `Selecto::CannedPage`,
   `Selecto::CoDomain`) fail closed with `missing_tenant_scope` when a domain
   declares a tenant field but the engine carries no tenant boundary.

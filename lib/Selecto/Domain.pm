@@ -2544,19 +2544,48 @@ C<association_path>.
 
   my $scoped = $domain->with_required_predicate($expression);
 
-Returns a copy whose every read (and, on tenant-field domains without
-C<writes.scope.tenant>, every write) is ANDed with C<$expression>, a
-L<Selecto::Expression>. Use this for request-level visibility such as "only
-this customer's rows". The copy has its own fingerprint; the original is not
-changed.
+Returns a copy whose every read and every engine write is guarded by
+C<$expression>, a L<Selecto::Expression>. Use this for request-level
+visibility such as "only this customer's rows". The copy has its own
+fingerprint; the original is not changed.
+
+Every required predicate guards writes made through L<Selecto::Engine>
+(C<execute_write>, C<execute_batch>, the root of C<execute_graph>,
+C<preview_action> and C<execute_action>, and L<Selecto::API::EngineHandler>
+writes), whether or not the domain has a C<tenant_field>:
+
+=over 4
+
+=item *
+
+When the predicate reads only root fields, updates and deletes are ANDed with
+it and match only rows inside it (so C<expected_count> counts only those
+rows); inserted rows must satisfy it (C<query_rule_violation>, or
+C<query_rule_not_evaluable> when an inserted value it reads is missing); and
+upserts are refused with C<query_enforcement_unsupported_operation>, because a
+conflict can resolve to a row outside the predicate.
+
+=item *
+
+When the predicate reads any association field (such as C<team.region>), it
+has no portable write form, so every write on the domain is refused with
+C<query_rule_unsupported_field> ("association fields are not portable write
+guards"); the error details carry C<relation>, the offending C<fields> paths
+and their C<associations>. Reads are unaffected.
+
+=item *
+
+C<writes.scope.tenant> still applies on top: both boundaries must hold.
+
+=back
+
+This deliberately goes beyond the shared protocol's earlier rule that
+required predicates are read scopes. Graph children are already confined to
+their parent row and are not guarded separately.
 
 When the domain has a C<tenant_field>, a positive C<eq> or C<in> conjunct on
 that field in the required predicate is the tenant boundary that public
 surfaces look for. Status filters, negations and C<OR> branches never count.
-Under such a boundary, engine updates and deletes match only rows inside it,
-inserts must satisfy it, and upserts are refused with
-C<query_enforcement_unsupported_operation>. On a domain without a tenant
-field, a required predicate is a read scope only.
 
 =head2 with_tenant_field
 

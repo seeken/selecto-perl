@@ -27,3 +27,25 @@ Revision history for Selecto
       honours transaction_mode => 'external'.
     - SQL adapters accept transaction_handler, a code reference that runs
       each managed write in the host's own transaction API.
+    - Every required predicate now guards engine writes, not only reads.
+      This deliberately goes beyond the shared protocol's earlier rule
+      that required predicates are read scopes (previously only a
+      tenant_field domain without writes.scope.tenant applied its required
+      predicate to writes). A predicate over root fields is ANDed into
+      every update and delete, so they match only rows inside it and
+      expected_count counts only those rows; inserted rows must satisfy it
+      (query_rule_violation, or query_rule_not_evaluable when a value it
+      reads is not assigned); and upsert is refused with
+      query_enforcement_unsupported_operation ("upsert is not supported on
+      a domain with a required predicate"). A predicate that reads any
+      association field refuses every write on the domain with
+      query_rule_unsupported_field ("association fields are not portable
+      write guards", details relation, fields and associations); reads
+      are unaffected. writes.scope.tenant still applies and both must
+      hold. This covers execute_write, preview_write, write_command,
+      execute_batch, the root of execute_graph, preview_action and
+      execute_action. The new Engine::required_write_guard exposes the
+      check, and Selecto::API::EngineHandler now defers to it: its upsert
+      refusal uses the engine message, and write_command no longer puts
+      the required predicate on the returned command, so the engine
+      applies it exactly once.

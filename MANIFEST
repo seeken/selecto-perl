@@ -120,6 +120,7 @@ t/query_enforcement.t
 t/query_enforcement_scalar.t
 t/query_library.t
 t/query_member.t
+t/required_predicate_write_guard.t
 t/sqlite.integration.t
 t/stream.t
 t/temporal_format_bindings.t
