@@ -183,6 +183,7 @@ sub new {
     _fail('initial view is unknown') unless $view_ids{$initial_view};
     _fail('initial filters must be an object')
         if defined($initial->{filters}) && ref($initial->{filters}) ne 'HASH';
+    _refuse_withheld_fields($domain, $key->[0], $base, \@views, \@controls);
     my $page = bless {
         id => $args{id}, version => 1, domain => $domain,
         dataset => {query => $base, entity_key => $key->[0]},
@@ -457,6 +458,79 @@ sub _predicate {
         : @expressions ? Selecto::Expression->all(\@expressions) : undef;
 }
 
+# A page is a public surface: its users see every selected, grouped, ordered
+# and faceted field, and filters and orders reveal values indirectly. So no
+# part of a definition may name a field the domain withholds (an internal
+# column or one listed in redact_fields; see Selecto::Domain field_is_public),
+# exactly as the API handler refuses them. The check runs once the
+# definition is otherwise valid, in a fixed order (dataset entity key,
+# dataset predicate, then each view's selections, groups and orders, then
+# each control's field and label field) so both cores report the same field.
+# Trusted host predicates (the run scope, the domain's required predicate)
+# are not part of the definition and may still use withheld fields.
+sub _refuse_withheld_fields {
+    my ($domain, $key, $base, $views, $controls) = @_;
+    my $check = sub {
+        my ($part, $id, @paths) = @_;
+        for my $path (@paths) {
+            my $metadata = eval { $domain->field_metadata($path) } // {};
+            my $withheld = $metadata->{redacted} ? 'redacted'
+                : $metadata->{internal} ? 'internal' : undef;
+            next unless defined $withheld;
+            Selecto::Error->throw('invalid_canned_page',
+                "$part $id references $withheld field $path",
+                {field => "$path", $part => $id});
+        }
+    };
+    $check->('dataset', 'entity_key', $key);
+    $check->('dataset', 'query', _field_references($base->predicate));
+    for my $view (@$views) {
+        my $query = $view->{query};
+        $check->('view', $view->{id}, map { _field_references($_) }
+            @{$query->selections}, @{$query->groups}, map { $_->[0] } @{$query->orders});
+    }
+    for my $control (@$controls) {
+        $check->('control', $control->{id}, $control->{field},
+            (defined($control->{label_field}) ? $control->{label_field} : ()));
+    }
+}
+
+# Every field path an expression reads, in argument order: field operands,
+# value-expression dependencies and related-collection children (whose
+# named fields, filters and orderings are relative to the association;
+# expression fields carry full paths).
+sub _field_references {
+    my ($value) = @_;
+    if (blessed($value) && $value->isa('Selecto::Expression')) {
+        my ($kind, $arguments) = ($value->kind, $value->arguments);
+        return ($arguments->[0]) if $kind eq 'field';
+        return () if $kind eq 'literal';
+        if ($kind eq 'value') {
+            require Selecto::ValueExpression;
+            return Selecto::ValueExpression->dependencies($arguments->[0]);
+        }
+        if ($kind eq 'related_collection') {
+            my ($association, $fields, $options) = @$arguments;
+            $options = {} unless ref($options) eq 'HASH';
+            return (
+                (map {
+                    !ref($_) ? "$association.$_"
+                        # A nested collection's association is relative to this one.
+                        : $_->{expression}->kind eq 'related_collection'
+                            ? (map { "$association.$_" } _field_references($_->{expression}))
+                        : _field_references($_->{expression})
+                } @{ref($fields) eq 'ARRAY' ? $fields : []}),
+                (map { "$association.$_->[0]" }
+                    @{$options->{filters} // []}, @{$options->{order_by} // []}),
+            );
+        }
+        return map { _field_references($_) } @$arguments;
+    }
+    return map { _field_references($_) } @$value if ref($value) eq 'ARRAY';
+    return map { _field_references($value->{$_}) } sort keys %$value if ref($value) eq 'HASH';
+    return ();
+}
+
 sub _query { blessed($_[0]) && $_[0]->isa('Selecto::Query') }
 sub _id { defined($_[0]) && !ref($_[0]) && $_[0] =~ /\A[a-z][a-z0-9_]*\z/ }
 sub _scalar {
@@ -586,6 +660,33 @@ The default C<view> and C<filters>.
 
 =back
 
+=head2 Withheld fields
+
+A page is a public surface, so no part of its definition may name a field
+the domain withholds: a column marked C<internal> or listed in
+C<redact_fields> (top-level paths, C<source.redact_fields> or a schema's
+C<redact_fields>), the fields L<Selecto::Domain/field_is_public> reports as
+not public. C<new> checks, in this order, the entity key, every field the
+dataset predicate reads, each view's selections (including aliased fields,
+expressions over fields and related-collection children, filters and
+orderings), groups and orderings, and each control's C<field> and
+C<label_field>. The first withheld field throws C<invalid_canned_page>:
+
+  dataset entity_key references redacted field id
+  dataset query references internal field shop_id
+  view list references redacted field secret_token
+  control brand references redacted field maker.code
+
+with details C<< {field => $path, view => $id} >> (or C<< control => $id >>,
+or C<< dataset => 'entity_key' | 'query' >>). The check runs after the
+structural checks, so a definition with both problems reports the
+structural one.
+
+Request state can only choose among the authored views, controls and values,
+so a page that passes this check never reads a withheld field at request
+time. Trusted host predicates are not part of the definition: the C<run>
+scope and the domain's required predicate may still use withheld fields.
+
 =head1 METHODS
 
 =head2 run
@@ -618,6 +719,14 @@ transaction.
 Returns the queries C<run> would execute (C<query>, C<total_query>,
 C<facet_queries>, C<selected_facet_queries>) with C<state> and C<view>,
 without executing them.
+
+=head2 new
+
+  my $page = Selecto::CannedPage->new(%definition);
+
+Validates the definition (see L</DEFINITION> and L</Withheld fields>) and
+the authored initial state. Throws C<invalid_canned_page>, or the domain's
+C<unknown_field> / C<unknown_association> for paths it cannot resolve.
 
 =head2 normalize_state
 

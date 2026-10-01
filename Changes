@@ -11,6 +11,16 @@ Unreleased
     - The domain retarget section may declare targets (with label and
       default_selected) and a default_target; declared targets form an
       allow-list. Selecto::Retarget exposes the target and relation domains.
+    - Security: Selecto::CannedPage->new refuses (invalid_canned_page) a
+      definition that names a field the domain withholds from public
+      surfaces (redact_fields at any level, or an internal column; see
+      Domain::field_is_public) anywhere: the entity key, the dataset
+      predicate, view selections (aliases, expressions and collection
+      children, filters and orderings), groups and orderings, and control
+      fields and label fields. The message names the part and the field
+      ("view list references redacted field secret_token") and details
+      carry {field, view | control | dataset}. Previously such a page ran
+      and showed the field.
 
 0.2.0  2026-09-30
     - First CPAN release: governed domains, queries, portable writes,
