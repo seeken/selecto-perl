@@ -124,6 +124,27 @@ sub _server_transaction_open {
     return defined($value) && "$value" =~ /\A[01]\z/ ? 0 + $value : undef;
 }
 
+
+# The query's own transaction is opened read-only with SQL, so it refuses
+# writes; DBI's begin_work would cost two more round trips. Inside the
+# host's transaction the characteristic cannot change, so the query's
+# savepoint is only rolled back.
+sub _begin_query_transaction { return $_[0]->_query_control('START TRANSACTION READ ONLY'); }
+sub _end_query_transaction { return $_[0]->_query_control('ROLLBACK'); }
+
+# DBD::MariaDB stores the whole result client-side unless use_result is on.
+sub _stream_result_buffered {
+    my ($self, $sth) = @_;
+    my $use_result = eval { $sth->{mariadb_use_result} } || eval { $self->{dbh}{mariadb_use_result} };
+    return $use_result ? 0 : 1;
+}
+
+# ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
+sub _read_only_violation {
+    my ($self) = @_;
+    my $code = eval { $self->{dbh}->err } // 0;
+    return "$code" eq '1792' ? 1 : 0;
+}
 1;
 
 __END__

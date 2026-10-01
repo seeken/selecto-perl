@@ -292,6 +292,26 @@ sub _savepoint_transaction {
     return $value;
 }
 
+
+# SQL Server has no read-only transaction; the rollback discards the query's
+# writes. In implicit-transaction mode (AutoCommit off) with nothing pending,
+# SAVE TRANSACTION is refused, so the query opens the transaction and the
+# whole of it is rolled back, which undoes only the query.
+sub _begin_query_savepoint {
+    my ($self, $guard) = @_;
+    my $count = $self->_transaction_count;
+    return $self->SUPER::_begin_query_savepoint($guard)
+        unless defined($count) && $count == 0;
+    $guard->{implicit} = 1;
+    return;
+}
+
+sub _end_query_savepoint {
+    my ($self, $guard) = @_;
+    return $self->SUPER::_end_query_savepoint($guard) unless $guard->{implicit};
+    $self->_rollback_transaction;
+    return;
+}
 1;
 
 __END__

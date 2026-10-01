@@ -124,6 +124,7 @@ t/query_enforcement.t
 t/query_enforcement_scalar.t
 t/query_library.t
 t/query_member.t
+t/query_path_write_refusal.t
 t/required_predicate_write_guard.t
 t/retarget.t
 t/sqlite.integration.t

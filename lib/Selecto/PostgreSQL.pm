@@ -586,6 +586,45 @@ sub _server_transaction_open {
     return $status >= 3 ? 1 : 0;
 }
 
+
+# PostgreSQL refuses every write in a read-only transaction, data-modifying
+# CTEs and SELECT INTO included. Inside the host's transaction the setting
+# is made in the query's savepoint, so rolling the savepoint back restores
+# the host's read-write mode. Each guard step is one round trip: the query's
+# own transaction is opened with SQL (DBD::Pg's begin_work would add one),
+# and DBD::Pg sends a parameterless do() as one simple-protocol message.
+sub _begin_query_transaction {
+    my ($self, $guard) = @_;
+    $self->_query_control($guard->{read_only} ? 'BEGIN READ ONLY' : 'BEGIN');
+    return;
+}
+
+sub _end_query_transaction { return $_[0]->_query_control('ROLLBACK'); }
+
+sub _begin_query_savepoint {
+    my ($self, $guard) = @_;
+    $guard->{savepoint} = 'selecto_query';
+    $self->_query_control('SAVEPOINT selecto_query'
+        . ($guard->{read_only} ? '; SET TRANSACTION READ ONLY' : ''));
+    $guard->{savepoint_open} = 1;
+    return;
+}
+
+sub _end_query_savepoint {
+    my ($self, $guard) = @_;
+    return unless $guard->{savepoint_open};
+    $self->_query_control('ROLLBACK TO SAVEPOINT selecto_query; RELEASE SAVEPOINT selecto_query');
+    return;
+}
+
+# DBD::Pg reads the whole result when the statement executes.
+sub _stream_result_buffered { return 1; }
+
+sub _read_only_violation {
+    my ($self) = @_;
+    my $state = eval { $self->{dbh}->state } // '';
+    return $state eq '25006' ? 1 : 0;
+}
 1;
 
 __END__

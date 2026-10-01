@@ -14,12 +14,15 @@ sub new {
         unless ref($args{columns}) eq 'ARRAY' && ref($args{types}) eq 'ARRAY';
     Selecto::Error->throw('invalid_stream', 'stream decoder and error normalizer must be callbacks')
         unless ref($args{decode}) eq 'CODE' && ref($args{normalize_error}) eq 'CODE';
+    Selecto::Error->throw('invalid_stream', 'stream on_close must be a callback')
+        if defined($args{on_close}) && ref($args{on_close}) ne 'CODE';
     return bless {
         sth => $args{sth},
         columns => [@{$args{columns}}],
         types => [@{$args{types}}],
         decode => $args{decode},
         normalize_error => $args{normalize_error},
+        on_close => $args{on_close},
         closed => 0,
     }, $class;
 }
@@ -37,9 +40,11 @@ sub next {
         1;
     };
     if (!$ok) {
-        my $error = $@;
-        $self->close;
-        die $self->{normalize_error}->($error);
+        # Normalize first: closing ends the adapter's guard, which clears the
+        # handle's error state.
+        my $error = $self->{normalize_error}->($@);
+        eval { $self->close };
+        die $error;
     }
     if (!$available) {
         $self->close;
@@ -56,10 +61,13 @@ sub close {
     return $self if $self->{closed};
     $self->{closed} = 1;
     eval { $self->{sth}->finish if $self->{sth}->can('finish') };
+    if (my $on_close = delete $self->{on_close}) {
+        $on_close->();
+    }
     return $self;
 }
 
-sub DESTROY { $_[0]->close if ref($_[0]); }
+sub DESTROY { eval { $_[0]->close } if ref($_[0]); }
 
 1;
 
@@ -102,12 +110,15 @@ The result column names.
 
 =head2 close, closed
 
-Finishes the statement handle; C<closed> reports whether that has happened.
+Finishes the statement handle and ends the adapter's query guard (see
+L<Selecto::SQL/"The query path">); C<closed> reports whether that has
+happened. A failure to end the guard is thrown as a L<Selecto::Error>.
 
 =head2 new
 
 Called by adapters with C<sth>, C<columns>, C<types>, C<decode> and
-C<normalize_error>.
+C<normalize_error>, and optionally C<on_close>, a callback run once when the
+stream closes.
 
 =head1 SEE ALSO
 
