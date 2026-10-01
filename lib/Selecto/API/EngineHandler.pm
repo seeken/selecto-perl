@@ -1180,8 +1180,11 @@ with a required predicate (C<query_enforcement_unsupported_operation>).
 =back
 
 On a domain whose required predicate reads an association field every write
-is refused with C<query_rule_unsupported_field>, and inserts must satisfy a
-root-field required predicate (C<query_rule_violation>).
+is refused with C<query_rule_unsupported_field> (details C<relation> and
+C<fields>), and inserts must satisfy a root-field required predicate
+(C<query_rule_violation>). Like the other write refusals these are client
+errors: return them through L<Selecto::API> as C<['error', {...}]>, which
+responds 422 with the error code unless you set another status.
 
 A rolled-back write reports C<cardinality_mismatch> with the expected count
 only.

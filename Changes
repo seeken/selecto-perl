@@ -40,7 +40,8 @@ Revision history for Selecto
       a domain with a required predicate"). A predicate that reads any
       association field refuses every write on the domain with
       query_rule_unsupported_field ("association fields are not portable
-      write guards", details relation, fields and associations); reads
+      write guards", details relation and the sorted association field
+      paths); reads
       are unaffected. writes.scope.tenant still applies and both must
       hold. This covers execute_write, preview_write, write_command,
       execute_batch, the root of execute_graph, preview_action and

@@ -323,23 +323,11 @@ sub required_write_guard {
     return undef unless defined $required;
     my $relation = $self->{domain}->table;
     my @paths = _association_paths($required);
-    if (@paths) {
-        my %associations;
-        for my $path (@paths) {
-            (my $association = $path) =~ s/\.[^.]*\z//;
-            $associations{$association} = 1;
-        }
-        Selecto::Error->throw(
-            'query_rule_unsupported_field',
-            'association fields are not portable write guards',
-            {
-                relation => $relation,
-                fields => \@paths,
-                associations => [sort keys %associations],
-                %details,
-            },
-        );
-    }
+    Selecto::Error->throw(
+        'query_rule_unsupported_field',
+        'association fields are not portable write guards',
+        { relation => $relation, fields => \@paths, %details },
+    ) if @paths;
     Selecto::Error->throw(
         'query_enforcement_unsupported_operation',
         'upsert is not supported on a domain with a required predicate',
@@ -348,8 +336,8 @@ sub required_write_guard {
     return $required;
 }
 
-# Dotted field paths (and related-collection associations) an expression
-# reads, sorted and unique.
+# Dotted (association) field paths an expression reads anywhere in its tree,
+# including beneath AND, OR and NOT; sorted and unique.
 sub _association_paths {
     my %paths;
     my @pending = grep { defined } @_;
@@ -365,13 +353,6 @@ sub _association_paths {
         if ($kind eq 'field') {
             $paths{"$arguments->[0]"} = 1 if "$arguments->[0]" =~ /\./;
             next;
-        }
-        if ($kind =~ /\Arelated_/ && defined($arguments->[0]) && !ref($arguments->[0])) {
-            my $association = "$arguments->[0]";
-            my $fields = ref($arguments->[1]) eq 'ARRAY' ? $arguments->[1] : [];
-            my @named = grep { defined($_) && !ref($_) } @$fields;
-            my @related = @named ? (map { "$association.$_" } @named) : ("$association.*");
-            $paths{$_} = 1 for @related;
         }
         push @pending, @$arguments;
     }
@@ -1461,8 +1442,8 @@ upserts are refused with C<query_enforcement_unsupported_operation>;
 =item *
 
 a predicate that reads any association field refuses every write with
-C<query_rule_unsupported_field> (details: C<relation>, C<fields>,
-C<associations>); reads are unaffected;
+C<query_rule_unsupported_field> (details: C<relation> and the sorted
+association C<fields> paths); reads are unaffected;
 
 =item *
 

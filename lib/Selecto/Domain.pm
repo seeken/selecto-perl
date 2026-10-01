@@ -2570,8 +2570,8 @@ conflict can resolve to a row outside the predicate.
 When the predicate reads any association field (such as C<team.region>), it
 has no portable write form, so every write on the domain is refused with
 C<query_rule_unsupported_field> ("association fields are not portable write
-guards"); the error details carry C<relation>, the offending C<fields> paths
-and their C<associations>. Reads are unaffected.
+guards"); the error details carry C<relation> and the sorted offending
+association C<fields> paths. Reads are unaffected.
 
 =item *
 
