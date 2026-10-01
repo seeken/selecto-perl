@@ -109,6 +109,8 @@ sub compile {
 
 sub _compile_single {
     my ($self, $domain, $query, %options) = @_;
+    return $self->_compile_retargeted($domain, $query, %options)
+        if defined $query->retarget_spec;
     if (@{$query->members}) {
         require Selecto::QueryMember;
         $query = Selecto::QueryMember->expand($domain, $query);
@@ -275,7 +277,14 @@ sub _compile_single {
     $sql .= ' ' . join(' ', @joins) if @joins;
     my @predicates;
     push @predicates, $self->_compile_expression($domain, $predicate, \@params) if $predicate;
-    push @predicates, @{$options{extra_predicates} // []};
+    # An extra predicate is SQL, or a code reference that compiles a nested
+    # statement into the parameter list at its position in the WHERE clause.
+    push @predicates, map {
+        ref($_) eq 'CODE' ? $_->(\@params) : $_
+    } @{$options{extra_predicates} // []};
+    push @predicates, map {
+        $self->_compile_expression($domain, $_->[0], \@params) . ' = ' . $_->[1]
+    } @{$options{correlations} // []};
     if (@predicates) {
         $sql .= ' WHERE ' . (@predicates == 1
             ? $predicates[0]
@@ -340,6 +349,42 @@ sub _compile_single {
         params => \@params,
         columns => \@columns,
         adapter_name => $self->name,
+    );
+}
+
+# A retargeted query compiles on a domain rooted at the target relation. Its
+# context is an ordinary query on the original domain, under the original
+# required predicate, that selects the target's primary key through the full
+# association path; the target rows are those whose key it produces.
+sub _compile_retargeted {
+    my ($self, $domain, $query, %options) = @_;
+    require Selecto::Query;
+    require Selecto::Retarget;
+    my $spec = $query->retarget_spec;
+    my $target = Selecto::Retarget->target($domain, $spec->{path});
+    my $target_domain = Selecto::Retarget->target_domain($domain, $target);
+    my $key = Selecto::Expression->field("$target->{path}.$target->{primary_key}");
+    my $context = Selecto::Query->new(
+        selections => [$key],
+        (defined($spec->{context}) ? (predicate => $spec->{context}) : ()),
+    );
+    my $outer_key = $self->_qualified($options{root_alias} // 's0', $target->{primary_key});
+    my $exists = $spec->{strategy} eq 'exists';
+    my $context_predicate = sub {
+        my ($params) = @_;
+        my $statement = $self->_compile_single(
+            $domain, $context,
+            root_alias => 'r0',
+            ($exists ? (correlations => [[$key, $outer_key]]) : ()),
+        );
+        my $sql = $self->_shift_placeholders($statement->sql, scalar @$params);
+        push @$params, @{$statement->params};
+        return $exists ? "EXISTS ($sql)" : "$outer_key IN ($sql)";
+    };
+    return $self->_compile_single(
+        $target_domain, $query->_copy(retarget => undef),
+        %options,
+        extra_predicates => [@{$options{extra_predicates} // []}, $context_predicate],
     );
 }
 

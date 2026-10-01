@@ -49,6 +49,7 @@ lib/Selecto/Query.pm
 lib/Selecto/QueryEnforcement.pm
 lib/Selecto/QueryLibrary.pm
 lib/Selecto/QueryMember.pm
+lib/Selecto/Retarget.pm
 lib/Selecto/SQL.pm
 lib/Selecto/SQLite.pm
 lib/Selecto/Statement.pm
@@ -121,6 +122,7 @@ t/query_enforcement_scalar.t
 t/query_library.t
 t/query_member.t
 t/required_predicate_write_guard.t
+t/retarget.t
 t/sqlite.integration.t
 t/stream.t
 t/temporal_format_bindings.t

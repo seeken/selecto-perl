@@ -1,5 +1,17 @@
 Revision history for Selecto
 
+Unreleased
+    - Selecto::Query->retarget($path, strategy => 'in' | 'exists') moves a
+      query's row grain from the domain root to the relation at an
+      association path. Earlier filters become the context: the result is
+      the distinct target rows the root query's joined read reaches under
+      them and the domain's required predicate. Later filters, grouping,
+      ordering, and pagination apply to the target. A tenant-scoped target
+      carries the root tenant condition or fails closed.
+    - The domain retarget section may declare targets (with label and
+      default_selected) and a default_target; declared targets form an
+      allow-list. Selecto::Retarget exposes the target and relation domains.
+
 0.2.0  2026-09-30
     - First CPAN release: governed domains, queries, portable writes,
       governed actions, and database adapters for PostgreSQL, MySQL,

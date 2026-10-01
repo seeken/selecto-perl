@@ -294,6 +294,8 @@ sub _parse_canonical {
     );
     _validate_conditional_filter_choices($domain);
     _validate_picker_visible_id_paths($domain);
+    require Selecto::Retarget;
+    Selecto::Retarget->validate_config($domain, $raw->{retarget}, strict => $strict);
     $domain->{editors} = _validate_editors($domain, $raw->{editors});
     $domain->{contract}{editors} = dclone($domain->{editors})
         if keys %{$domain->{editors}};
@@ -2107,6 +2109,12 @@ sub primary_key  { return $_[0]->{primary_key}; }
 sub required_predicate { return $_[0]->{required_predicate}; }
 sub tenant_field { return $_[0]->{tenant_field}; }
 sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
+sub retarget_config {
+    my ($self) = @_;
+    my $contract = $self->{contract};
+    return ref($contract) eq 'HASH' && defined($contract->{retarget})
+        ? dclone($contract->{retarget}) : undef;
+}
 sub rules        { return $_[0]->{rules}; }
 sub write_tenant_scope {
     my $scope = $_[0]->{write_tenant_scope};
