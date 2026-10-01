@@ -660,7 +660,11 @@ C<time>, C<day_hour>, C<week>, C<iso_week>, C<iso_week_date>, C<month>,
 C<quarter>, C<year>, C<month_of_year>, C<day_of_month>, C<day_of_week>,
 C<day_of_week_num>, C<day_of_year>, C<hour>, C<timezone_offset>). Use the
 same expression in C<select>, C<group_by> and C<order_by>. PostgreSQL and
-DuckDB implement these; other adapters fail closed.
+DuckDB implement these; other adapters fail closed. The instant formats
+(C<iso8601> of a C<utc_datetime>, C<rfc3339_millis>, the epochs and
+C<timezone_offset>) read a C<utc_datetime> column declared
+C<< storage => 'naive_utc' >> as C<(column AT TIME ZONE 'UTC')>, with or
+without L<Selecto::Query/use_timezone>.
 
 =head2 epoch_datetime
 

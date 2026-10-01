@@ -374,6 +374,12 @@ sub _compile_dialect_expression {
     return $self->SUPER::_compile_dialect_expression($domain, $expression, $params);
 }
 
+# A naive TIMESTAMP holding UTC becomes TIMESTAMPTZ.
+sub _compile_naive_utc_instant_sql {
+    my ($self, $sql) = @_;
+    return '(' . $sql . q{ AT TIME ZONE 'UTC')};
+}
+
 sub _compile_timezone_sql {
     my ($self, $sql, $type, $timezone, $params) = @_;
     # Keep storage conversion separate from presentation-zone conversion.

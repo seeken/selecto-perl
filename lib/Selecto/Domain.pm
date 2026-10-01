@@ -263,6 +263,7 @@ sub _parse_canonical {
     );
     _validate_computed_columns($source, $associations, $schemas);
     _validate_array_columns($source, $schemas);
+    _validate_storage_columns($source, $schemas);
     _validate_action_eligibility($raw, $source);
 
     _required_key($raw, 'name', 'domain');
@@ -326,6 +327,32 @@ sub _validate_array_columns {
             Selecto::Error->throw('invalid_domain',
                 "$label column $name items must be one of " . join(', ', sort keys %ARRAY_ITEMS),
                 {field => $name}) unless defined($items) && !ref($items) && $ARRAY_ITEMS{$items};
+        }
+    }
+}
+
+# A utc_datetime column may declare how the instant is stored. The default is
+# a zone-aware column (PostgreSQL timestamptz, DuckDB TIMESTAMPTZ); naive_utc
+# is a zone-less column holding UTC wall time, such as a Rails datetime.
+sub _validate_storage_columns {
+    my ($source, $schemas) = @_;
+    my @relations = (['source', $source], map { ["schemas.$_", $schemas->{$_}] } sort keys %{$schemas // {}});
+    for my $relation (@relations) {
+        my ($label, $spec) = @$relation;
+        next unless ref($spec) eq 'HASH' && ref($spec->{columns}) eq 'HASH';
+        for my $name (sort keys %{$spec->{columns}}) {
+            my $column = $spec->{columns}{$name};
+            next unless ref($column) eq 'HASH' && exists $column->{storage};
+            Selecto::Error->throw('invalid_domain',
+                "$label column $name declares storage but is not a utc_datetime column",
+                {field => $name}) unless lc($column->{type} // '') eq 'utc_datetime';
+            Selecto::Error->throw('invalid_domain',
+                "$label column $name declares storage but is computed",
+                {field => $name}) if exists $column->{computed};
+            my $storage = $column->{storage};
+            Selecto::Error->throw('invalid_domain',
+                "$label column $name storage must be naive_utc",
+                {field => $name}) unless defined($storage) && !ref($storage) && $storage eq 'naive_utc';
         }
     }
 }
@@ -1114,6 +1141,29 @@ sub normalize_write_assignments {
         map { $_ => $self->normalize_field_value($_, $assignments->{$_}) }
             keys %$assignments
     };
+}
+
+sub field_storage {
+    my ($self, $path) = @_;
+    my $contract = $self->{contract};
+    return undef unless ref($contract) eq 'HASH';
+    my @segments = split /\./, "$path", -1;
+    my $columns;
+    if (@segments == 1) {
+        $columns = $contract->{source}{columns} if ref($contract->{source}) eq 'HASH';
+    } elsif (@segments >= 2) {
+        my $field = pop @segments;
+        my $resolved = eval { $self->resolve_association(join('.', @segments)) };
+        my $association = ref($resolved) eq 'HASH' ? $resolved->{association} : undef;
+        my $queryable = blessed($association) && $association->can('queryable')
+            ? $association->queryable : undef;
+        $columns = $contract->{schemas}{$queryable}{columns}
+            if defined($queryable) && ref($contract->{schemas}) eq 'HASH'
+            && ref($contract->{schemas}{$queryable}) eq 'HASH';
+        @segments = ($field);
+    }
+    return undef unless ref($columns) eq 'HASH' && ref($columns->{$segments[0]}) eq 'HASH';
+    return $columns->{$segments[0]}{storage};
 }
 
 sub field_unit {
@@ -2533,6 +2583,14 @@ Returns a copy of the canonical column metadata for a path (empty for
 constructor-form domains). Fields listed in C<redact_fields> report
 C<< internal => 1, redacted => 1 >>.
 
+=head2 field_storage
+
+  my $storage = $domain->field_storage('created_at');   # 'naive_utc' or undef
+
+Returns the declared C<storage> of a canonical column, or C<undef> for the
+default zone-aware storage and for constructor-form domains. See the
+C<storage> column key under L</CANONICAL FORMAT>.
+
 =head2 field_is_public
 
 True unless the field is C<internal> or redacted. Public surfaces (the API
@@ -2608,9 +2666,27 @@ metadata. C<type> is required. The portable types are C<string> (also
 C<text>), C<integer>, C<decimal>, C<boolean>, C<date>, C<utc_datetime>,
 C<naive_datetime>, C<epoch_datetime> (numeric epoch storage), C<json> or
 C<jsonb>, C<uuid> and C<array>. Other keys include C<internal>,
-C<label>, C<format>, C<text_case>, C<unit>, C<behavior>, C<computed>, and
-for arrays C<items> (C<string>, C<integer>, C<decimal>, C<boolean>, C<date>
-or C<uuid>).
+C<label>, C<format>, C<text_case>, C<unit>, C<behavior>, C<computed>,
+C<storage>, and for arrays C<items> (C<string>, C<integer>, C<decimal>,
+C<boolean>, C<date> or C<uuid>).
+
+C<storage> is available only on C<utc_datetime> columns that are not
+computed, and its only value is C<naive_utc>: the column is a time-zone-less
+timestamp holding UTC wall time (a PostgreSQL C<timestamp without time zone>,
+a DuckDB C<TIMESTAMP>, or a Rails C<datetime> column). Without it a
+C<utc_datetime> column is taken to be zone-aware (PostgreSQL C<timestamptz>,
+DuckDB C<TIMESTAMPTZ>). The hint changes SQL only where a value is used as an
+instant: under L<Selecto::Query/use_timezone> on PostgreSQL and DuckDB the
+field becomes C<((column AT TIME ZONE 'UTC') AT TIME ZONE $zone)> instead of
+C<(column AT TIME ZONE $zone)>, and the instant formats of
+L<Selecto::Expression/datetime_format> (C<iso8601>, C<rfc3339_millis>,
+C<epoch_seconds>, C<epoch_milliseconds>, C<timezone_offset>) read
+C<(column AT TIME ZONE 'UTC')> with or without a query timezone. Calendar
+formats, buckets, date shortcuts and filters follow the localized field. A
+plain read without a query timezone returns the stored value unchanged. SQLite,
+MySQL, MariaDB and Microsoft SQL Server accept the hint and compile as before.
+Any other C<storage> value, or C<storage> on another type, is
+C<invalid_domain>.
 
 =item C<associations>
 
