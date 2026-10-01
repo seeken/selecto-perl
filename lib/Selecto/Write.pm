@@ -471,8 +471,8 @@ can resolve to a row outside the predicate.
 
 A predicate that reads an association field has no portable write form:
 every write on the domain fails with C<query_rule_unsupported_field>
-("association fields are not portable write guards"), with C<relation>,
-C<fields> and C<associations> in the details.
+("association fields are not portable write guards"), with C<relation> and
+the sorted association C<fields> paths in the details.
 
 =back
 

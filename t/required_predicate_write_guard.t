@@ -6,6 +6,7 @@ use DBI ();
 use JSON::PP ();
 use Scalar::Util qw(blessed refaddr);
 use Selecto;
+use Selecto::API ();
 use Selecto::API::EngineHandler ();
 
 # Every required predicate guards engine writes. A predicate over root fields
@@ -49,7 +50,8 @@ sub task_contract {
 sub project_contract {
     my (%o) = @_;
     return {
-        schema_version => 1, name => 'Projects',
+        schema_version => 1, name => 'Projects', domain_version => '1',
+        domain_fingerprint => 'sha256:required-predicate-write-guard',
         source => {
             source_table => $PROJECTS, primary_key => 'id',
             fields => [qw(id site_id team_id region title state)],
@@ -271,7 +273,7 @@ sub run_suite {
             my $error = error_of($code);
             is($error && $error->code, 'query_rule_unsupported_field', "$name is refused");
             is($error && $error->message, 'association fields are not portable write guards', "$name: shared message");
-            is_deeply($error && $error->details, {relation => $PROJECTS, fields => ['team.region'], associations => ['team'],
+            is_deeply($error && $error->details, {relation => $PROJECTS, fields => ['team.region'],
                 ($error && exists $error->details->{graph_node} ? (graph_node => $error->details->{graph_node}) : ())},
                 "$name: details name the field path and relation");
         };
@@ -329,6 +331,17 @@ sub run_suite {
             'upsert is refused even with writes.scope.tenant');
         is(code_of(sub { engine_for($dbh, undef, tenant => 1, tenant_value => 10)->preview_write($upsert) }), 'ok',
             'a tenant-scoped domain without a required predicate still upserts');
+
+        # The predicate joins after writes.scope.tenant, so a host predicate
+        # wider than the tenant narrows to it instead of reading as a
+        # caller-named foreign tenant.
+        my $wide = engine_for($dbh, $E->in('site_id', [10, 20]), tenant => 1, tenant_value => 10);
+        is($wide->execute_write(update_id(2))->affected_rows, 1, 'an IN-list predicate covering the tenant applies');
+        is(code_of(sub { $wide->execute_write(update_id(4)) }), 'cardinality_mismatch',
+            'and narrows to the trusted tenant');
+        is(title_of($dbh, 4), 'e2', "the other tenant's row is untouched");
+        is($wide->execute_write(insert_row(id => 23, region => 'east', title => 'wide'))->affected_rows, 1,
+            'an insert assigned the trusted tenant satisfies the IN-list predicate');
     };
 
     subtest 'actions preview and execute the guarded statement' => sub {
@@ -367,6 +380,42 @@ sub run_suite {
         ok(!defined($command->scope_predicate), 'the handler leaves the predicate to the engine');
         is(scalar(() = $engine->preview_write($command)->{sql} =~ /"region"/g), 1,
             'the governed API command carries the predicate exactly once');
+
+        # Capture what the adapter receives from an API write.
+        my $adapter_class = ref($engine->adapter);
+        my $original = $adapter_class->can('execute_write');
+        my @received;
+        {
+            no strict 'refs';
+            no warnings 'redefine';
+            local *{"${adapter_class}::execute_write"} = sub { push @received, $_[1]; goto &$original };
+            $handler->write($engine, $update->(3));
+        }
+        is(scalar @received, 1, 'the adapter received one command');
+        my $required = $engine->domain->required_predicate;
+        is(refaddr($received[0]->scope_predicate), refaddr($required),
+            'its scope is the required predicate, applied once by the engine');
+
+        my $api = Selecto::API->new(domain => $engine->domain, base_path => '/api/v1/projects');
+        my $write_handler = sub {
+            my ($engine) = @_;
+            return sub {
+                my ($body) = @_;
+                my $data = eval { $handler->write($engine, $body) };
+                return ['ok', $data] unless $@;
+                my $e = $@;
+                die $e unless blessed($e) && $e->isa('Selecto::Error');
+                return ['error', {code => $e->code, message => $e->message, details => $e->details}];
+            };
+        };
+        my $association = engine_for($dbh, $E->eq('team.region', 'west'));
+        my $response = $api->request({method => 'POST', path => '/api/v1/projects/write', body => $update->(1)},
+            {write => $write_handler->($association)});
+        is($response->{status}, 422, 'an association-predicate API write is a 422');
+        my $payload = JSON::PP->new->decode($response->{body});
+        is($payload->{error}{code}, 'query_rule_unsupported_field', 'with its error code');
+        is_deeply($payload->{error}{details}, {relation => $PROJECTS, fields => ['team.region']},
+            'and its details');
         is(code_of(sub { $handler->write($engine, $update->(2)) }), 'cardinality_mismatch',
             'an API update outside the predicate matches nothing');
         is(title_of($dbh, 2), 'e1', 'the outside row is untouched');
