@@ -80,6 +80,7 @@ t/api_write_parity_live.t
 t/array_json.t
 t/canned_page.integration.t
 t/canned_page_case_insensitive.t
+t/canned_page_redaction.t
 t/co_domain.t
 t/computed_coalesce.t
 t/data_rules.t
