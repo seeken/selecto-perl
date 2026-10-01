@@ -54,15 +54,17 @@ sub _trusted_scope {
     return defined($tenant) ? {tenant => $tenant} : {};
 }
 
-# strict (default): a domain must declare writes.operations, and writes.fields
-# for anything but deletes, before this engine writes it. permissive keeps the
-# earlier behavior, where absent sections allow the write; it must be chosen
-# explicitly.
+# strict is the only write policy: a domain must declare writes.operations,
+# and writes.fields for anything but deletes, before this engine writes it.
+# The argument remains so callers may name strict explicitly; every other
+# value, including the removed permissive policy, fails closed.
 sub _write_policy {
     my ($policy) = @_;
     $policy //= 'strict';
-    Selecto::Error->throw('invalid_write_policy', 'write_policy must be strict or permissive')
-        unless !ref($policy) && ($policy eq 'strict' || $policy eq 'permissive');
+    Selecto::Error->throw(
+        'invalid_write_policy',
+        'write_policy must be strict; the permissive write policy was removed',
+    ) unless !ref($policy) && $policy eq 'strict';
     return $policy;
 }
 
@@ -980,21 +982,19 @@ sub _validate_command_against_contract {
     }
     my $writes = _checked_writes($context{writes});
     my $fields_spec = ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : undef;
-    if ($self->{write_policy} eq 'strict') {
-        # A strict engine writes only what a domain explicitly grants. A graph
-        # edge grants its operations through the relationship's allowed_ops.
-        Selecto::Error->throw(
-            'write_policy_missing',
-            "the $label write contract declares no writes.operations",
-            {relation => $context{label} // $command->relation, operation => $operation},
-        ) unless ref($writes->{operations}) eq 'HASH'
-            || (ref($context{allowed_ops}) eq 'ARRAY' && @{$context{allowed_ops}});
-        Selecto::Error->throw(
-            'write_policy_missing',
-            "the $label write contract declares no writes.fields",
-            {relation => $context{label} // $command->relation, operation => $operation},
-        ) unless defined($fields_spec) || $operation eq 'delete';
-    }
+    # An engine writes only what a domain explicitly grants. A graph edge
+    # grants its operations through the relationship's allowed_ops.
+    Selecto::Error->throw(
+        'write_policy_missing',
+        "the $label write contract declares no writes.operations",
+        {relation => $context{label} // $command->relation, operation => $operation},
+    ) unless ref($writes->{operations}) eq 'HASH'
+        || (ref($context{allowed_ops}) eq 'ARRAY' && @{$context{allowed_ops}});
+    Selecto::Error->throw(
+        'write_policy_missing',
+        "the $label write contract declares no writes.fields",
+        {relation => $context{label} // $command->relation, operation => $operation},
+    ) unless defined($fields_spec) || $operation eq 'delete';
     if (ref($writes->{operations}) eq 'HASH') {
         my $op_spec = $writes->{operations}{$operation};
         Selecto::Error->throw(
@@ -1195,12 +1195,12 @@ sub _validate_graph_node {
         }
     }
     # Without a nested domain no predicate, returning, or conflict field of
-    # the child can be checked, so a strict engine refuses the edge.
+    # the child can be checked, so the engine refuses the edge.
     Selecto::Error->throw(
         'write_policy_missing',
-        'nested writes under a strict write policy must declare their relationship domain',
+        'nested writes must declare their relationship domain',
         {relation => $command->relation, graph_node => $node->{id}},
-    ) if $self->{write_policy} eq 'strict' && !$edge->{fields_known};
+    ) unless $edge->{fields_known};
     my $scope = $edge->{tenant_scope};
     if (!$scope && $root_scope) {
         # A tenant-scoped graph cannot reach a node whose tenant it cannot see.
@@ -1389,7 +1389,7 @@ from a client.
       domain       => $domain,          # required, a Selecto::Domain
       adapter      => $adapter,         # required, a Selecto::Adapter
       scope        => {tenant => 42},   # optional trusted scope
-      write_policy => 'strict',         # or 'permissive'
+      write_policy => 'strict',         # optional; strict is the only policy
       domain_ref   => $ref,             # optional Selecto::Domain::Ref
   );
 
@@ -1397,11 +1397,14 @@ C<scope> accepts only a C<tenant> key. When the domain has a C<tenant_field>,
 reads are restricted to that tenant, inserts receive it, and updates and
 deletes are confined to it (see L</TENANT SCOPE>).
 
-C<write_policy> is C<strict> by default: a domain must declare
+C<write_policy> is always C<strict>: a domain must declare
 C<writes.operations> (with the operation enabled) and, for everything except
 deletes, C<writes.fields> before anything is written; otherwise writes fail
-with C<write_policy_missing>. C<permissive> lets domains without a C<writes>
-section be written and exists for legacy tooling.
+with C<write_policy_missing>. A graph edge must declare its relationship
+domain and grants its operations through C<allowed_ops>. The argument may be
+omitted or given as C<strict>; any other value, including the removed
+C<permissive> policy, throws C<invalid_write_policy>. There is no mode that
+writes a domain without a declared write policy.
 
 Throws C<invalid_domain>, C<invalid_adapter>, C<invalid_tenant_scope> or
 C<invalid_write_policy>.

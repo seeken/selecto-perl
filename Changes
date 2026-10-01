@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - Security: the permissive write policy is removed. Strict is the only
+      behaviour: an engine refuses (write_policy_missing) a write to a
+      domain without writes.operations, or without writes.fields for
+      anything but a delete, and a graph edge without its relationship
+      domain. Selecto::Engine->new and from_registry still accept
+      write_policy => 'strict', but any other value, including
+      'permissive', throws invalid_write_policy. Previously
+      write_policy => 'permissive' let a domain without a writes section be
+      written. Code that relied on it must declare a writes contract.
     - Selecto::Query->retarget($path, strategy => 'in' | 'exists') moves a
       query's row grain from the domain root to the relation at an
       association path. Earlier filters become the context: the result is

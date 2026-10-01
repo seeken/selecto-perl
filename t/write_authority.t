@@ -331,11 +331,20 @@ is(code_of(sub { $site10->execute_action($other, resolver => sub { 'disabled' })
     is($strict->write_policy, 'strict', 'engines are strict by default');
     is(code_of(sub { $strict->preview_write(update(assignments => {title => 'x'})) }), 'write_policy_missing',
         'a domain without a write policy is denied');
-    my $permissive = Selecto::Engine->new(domain => $legacy, adapter => $adapter, write_policy => 'permissive');
-    is(code_of(sub { $permissive->preview_write(update(assignments => {title => 'x'})) }), 'ok',
-        'permissive must be chosen explicitly');
-    is(code_of(sub { Selecto::Engine->new(domain => $legacy, adapter => $adapter, write_policy => 'lax') }),
-        'invalid_write_policy', 'only strict and permissive exist');
+    my $explicit = Selecto::Engine->new(domain => $legacy, adapter => $adapter, write_policy => 'strict');
+    is($explicit->write_policy, 'strict', 'strict may still be named explicitly');
+    is(code_of(sub { $explicit->preview_write(update(assignments => {title => 'x'})) }), 'write_policy_missing',
+        'naming strict changes nothing');
+    is(code_of(sub { Selecto::Engine->new(domain => $legacy, adapter => $adapter, write_policy => 'permissive') }),
+        'invalid_write_policy', 'there is no permissive write policy');
+    is(code_of(sub { Selecto::Engine->from_registry(
+        domain => 'legacy', adapter => $adapter, write_policy => 'permissive',
+        registry => Selecto::Domain::Registry->new->register(legacy => work_order_contract()),
+    ) }), 'invalid_write_policy', 'registry-built engines refuse permissive too');
+    for my $policy ('lax', '', ['strict'], {strict => 1}) {
+        is(code_of(sub { Selecto::Engine->new(domain => $legacy, adapter => $adapter, write_policy => $policy) }),
+            'invalid_write_policy', 'strict is the only write policy');
+    }
 
     my $no_fields = work_order_contract();
     delete $no_fields->{writes}{fields};

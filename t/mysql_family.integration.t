@@ -4,6 +4,8 @@ use warnings;
 use utf8;
 use Test::More;
 use DBI ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 
 eval { require Selecto::Certification; 1 }
@@ -12,7 +14,7 @@ eval { require Selecto::Certification; 1 }
 plan skip_all => 'DBD::MariaDB is not installed' unless eval { require DBD::MariaDB; 1 };
 
 sub product_domain {
-    return Selecto::Domain->new(
+    return TestSelecto::writable_domain(
         name => 'Products',
         table => 'selecto_perl_mysql_products',
         fields => { id => 'integer', name => 'string', amount => 'decimal' },
@@ -41,8 +43,7 @@ for my $specification (
         $dbh->do(q{INSERT INTO selecto_perl_mysql_products VALUES (1, 'Renée 東京', 10.50)});
 
         my $adapter = Selecto->adapter($backend => (dbh => $dbh));
-        my $engine = Selecto::Engine->new(domain => product_domain(), adapter => $adapter,
-            write_policy => 'permissive');    # legacy domain without a write policy
+        my $engine = Selecto::Engine->new(domain => product_domain(), adapter => $adapter);
         my $result = $engine->all($engine->query->select('id', 'name', 'amount')->order_by('id'));
         is_deeply(
             $result,

@@ -5,6 +5,8 @@ use feature 'signatures';
 no warnings 'experimental::signatures';
 use Test::More;
 use DBI ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 
 plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
@@ -15,12 +17,12 @@ my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', undef, undef, {
 $dbh->do('CREATE TABLE selecto_perl_test_items (id integer primary key, name text not null, amount decimal(12,2))');
 $dbh->do(q{INSERT INTO selecto_perl_test_items VALUES (1, 'Renée 東京', 10.50)});
 
-my $domain = Selecto::Domain->new(
+my $domain = TestSelecto::writable_domain(
     name => 'Items', table => 'selecto_perl_test_items',
     fields => { id => 'integer', name => 'string', amount => 'decimal' },
 );
 my $adapter = Selecto->adapter(sqlite => (dbh => $dbh));
-my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter, write_policy => 'permissive');
+my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
 my $result = $engine->all($engine->query->select('id', 'name', 'amount')->order_by('id'));
 is_deeply(
     $result,

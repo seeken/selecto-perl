@@ -4,6 +4,8 @@ use warnings;
 use utf8;
 use Test::More;
 use DBI ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 use Selecto::Domain ();
 use Selecto::Engine ();
@@ -32,7 +34,7 @@ $dbh->do("DROP TABLE IF EXISTS [$table]");
 $dbh->do("CREATE TABLE [$table] (id int primary key, external_id nvarchar(80) not null unique, name nvarchar(120) not null, active bit not null, amount decimal(30,2) not null)");
 $dbh->do("INSERT INTO [$table] VALUES (1, N'baseline', N'Renée 東京', 1, 10.50), (2, N'exact', N'precision', 0, 1234567890123456789012345678.90)");
 
-my $domain = Selecto::Domain->new(
+my $domain = TestSelecto::writable_domain(
     name => 'Products',
     table => $table,
     fields => {
@@ -41,8 +43,7 @@ my $domain = Selecto::Domain->new(
     },
 );
 my $adapter = Selecto->adapter(mssql => (dbh => $dbh));
-my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter,
-    write_policy => 'permissive');    # legacy domain without a write policy
+my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
 
 my $result = $engine->all(
     $engine->query->select('id', 'name', 'active', 'amount')

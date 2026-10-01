@@ -3,6 +3,7 @@ package TestSelecto;
 use 5.034;
 use strict;
 use warnings;
+use JSON::PP ();
 use Selecto;
 
 sub people_domain {
@@ -11,6 +12,44 @@ sub people_domain {
         table => 'people',
         fields => { id => 'integer', name => 'string', active => 'boolean', score => 'decimal' },
     );
+}
+
+# A canonical domain over root fields only whose writes contract enables
+# insert, update, upsert and delete and grants every field as insertable and
+# updatable. Adapter, dialect and transaction tests write through it, because
+# engines refuse to write a domain without a declared write policy.
+#
+#   my $domain = TestSelecto::writable_domain(
+#       name => 'Items', table => 'items', fields => {id => 'integer', name => 'string'},
+#       tenant_field => 'tenant_id',           # optional
+#       required_predicate => $expression,     # optional
+#   );
+sub writable_domain {
+    my (%args) = @_;
+    my $fields = $args{fields};
+    my @names = sort keys %$fields;
+    my $true = JSON::PP::true;
+    my $domain = Selecto::Domain->parse({
+        schema_version => 1,
+        name => $args{name},
+        source => {
+            source_table => $args{table},
+            primary_key => $args{primary_key} // 'id',
+            fields => \@names,
+            columns => {map { ($_ => {type => $fields->{$_}}) } @names},
+            associations => {},
+            (defined($args{tenant_field}) ? (tenant_field => $args{tenant_field}) : ()),
+        },
+        schemas => {},
+        joins => {},
+        writes => {
+            operations => {map { ($_ => {enabled => $true}) } qw(insert update upsert delete)},
+            fields => {map { ($_ => {insertable => $true, updatable => $true}) } @names},
+        },
+    }, strict => 1);
+    return defined($args{required_predicate})
+        ? $domain->with_required_predicate($args{required_predicate})
+        : $domain;
 }
 
 sub orders_domain {

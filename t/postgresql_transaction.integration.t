@@ -3,6 +3,8 @@ use strict;
 use warnings;
 use Test::More;
 use DBI ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 
 # Selecto writes on a PostgreSQL handle the host lends while its own
@@ -26,13 +28,13 @@ my $dbh = $connect->();
 my $observer = $connect->();
 $dbh->do('SET client_min_messages TO warning');
 
-my $domain = Selecto::Domain->new(
+my $domain = TestSelecto::writable_domain(
     name => 'Items', table => $table, fields => { id => 'integer', name => 'string' },
 );
 my $engine_for = sub {
     my ($handle, %options) = @_;
     return Selecto::Engine->new(
-        domain => $domain, write_policy => 'permissive',
+        domain => $domain,
         adapter => Selecto->adapter(postgresql => (dbh => $handle, %options)),
     );
 };

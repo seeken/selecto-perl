@@ -2469,7 +2469,7 @@ There are three ways to build one:
 The portable, cross-language format. It carries the full contract: related
 C<schemas>, C<joins>, C<writes>, C<actions>, C<capabilities>, C<imports>,
 C<query_library> and the other sections below. Only canonical domains can be
-written through a strict engine or hosted by L<Selecto::API>.
+written through an engine or hosted by L<Selecto::API>.
 
 =item Simple form (L</parse> with C<source.table>)
 
@@ -2479,8 +2479,8 @@ A compact JSON form equivalent to the constructor form.
 
 =item Constructor form (L</new>)
 
-A Perl-only shortcut for read-only use. It has no contract, so a strict
-engine refuses its writes with C<write_policy_missing>.
+A Perl-only shortcut for read-only use. It has no contract, so an engine
+refuses its writes with C<write_policy_missing>.
 
 =back
 

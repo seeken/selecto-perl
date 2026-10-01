@@ -334,9 +334,11 @@ code.
 
 =item *
 
-Keep the default strict write policy. C<< write_policy => 'permissive' >>
-and the adapters' C<execute_*_unsafe> methods are for trusted tooling and
-tests.
+Declare a C<writes> contract for every domain you write: engines refuse
+writes to a domain without C<writes.operations>, or without C<writes.fields>
+for anything but a delete, with C<write_policy_missing>, and there is no
+permissive mode. The adapters' C<execute_*_unsafe> methods skip governance
+and are for trusted tooling and adapter tests only.
 
 =item *
 

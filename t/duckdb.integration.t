@@ -3,6 +3,8 @@ use strict;
 use warnings;
 use Test::More;
 use DBI ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 use Selecto::API::EngineHandler ();
 use Selecto::DateFormat ();
@@ -37,8 +39,11 @@ my $domain = Selecto::Domain->new(
         },
     },
 );
-my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter,
-    write_policy => 'permissive');    # legacy domain without a write policy
+my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+# Writes go through a root-only domain that declares its write policy.
+my $writer = Selecto::Engine->new(adapter => $adapter, domain => TestSelecto::writable_domain(
+    name => 'DuckDBItems', table => 'selecto_perl_duckdb_items', fields => $domain->fields,
+));
 my $query = $engine->query->select(qw(id name active total))
     ->where(Selecto::Expression->eq(name => q{baseline' OR 1=1 --}));
 
@@ -203,7 +208,7 @@ my $upsert = Selecto::Write::Command->new(
         upsert_update_fields => [qw(name active total occurred_on occurred_at)],
     },
 );
-is($engine->execute_write($upsert)->affected_rows, 1, 'DuckDB reports native upsert rows');
+is($writer->execute_write($upsert)->affected_rows, 1, 'DuckDB reports native upsert rows');
 
 my $insert = Selecto::Write::Command->new(
     operation => 'insert', relation => 'selecto_perl_duckdb_items',
@@ -217,7 +222,7 @@ my $missing = Selecto::Write::Command->new(
     assignments => { name => 'never' },
     predicate => Selecto::Expression->eq(id => 999),
 );
-eval { $engine->execute_batch(Selecto::Write::Batch->new($insert, $missing)); 1 };
+eval { $writer->execute_batch(Selecto::Write::Batch->new($insert, $missing)); 1 };
 is($@->code, 'cardinality_mismatch', 'DuckDB reports portable batch cardinality errors');
 is($dbh->selectrow_array('SELECT count(*) FROM selecto_perl_duckdb_items'), 1, 'DuckDB rolls back the batch atomically');
 

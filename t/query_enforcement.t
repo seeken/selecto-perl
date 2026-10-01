@@ -4,6 +4,8 @@ use warnings;
 
 use Test::More;
 use DBI ();
+use lib 't/lib';
+use TestSelecto;
 use Selecto;
 
 plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
@@ -21,14 +23,13 @@ my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', undef, undef, {
 $dbh->do(q{CREATE TABLE items (id integer primary key, tenant_id integer not null, status text, total decimal not null)});
 $dbh->do(q{INSERT INTO items VALUES (1, 7, 'active', 10.5)});
 
-my $domain = Selecto::Domain->new(
+my $domain = TestSelecto::writable_domain(
     name => 'Items', table => 'items',
     fields => { id => 'integer', tenant_id => 'integer', status => 'string', total => 'decimal' },
     required_predicate => Selecto::Expression->eq('tenant_id', 7),
 );
 my $engine = Selecto::Engine->new(
     domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => $dbh)),
-    write_policy => 'permissive',    # legacy domain with no declared write policy
 );
 my $query = $engine->query->select('id')->where(Selecto::Expression->all(
     Selecto::Expression->eq('id', 1), Selecto::Expression->eq('status', 'active'),
@@ -71,13 +72,11 @@ my $evidence = Selecto::QueryEnforcement->capture(
 unlike($evidence->source_metadata->{predicate_fingerprint}, qr/active/, 'metadata contains only a digest');
 is(Selecto::QueryEnforcement::shape($evidence->predicate), 'and(eq,eq)', 'shape is deterministic');
 
-my $tenant_domain = Selecto::Domain->new(
+my $tenant_domain = TestSelecto::writable_domain(
     name => 'Scoped Items', table => 'items', fields => $domain->fields,
     tenant_field => 'tenant_id',
 );
-my $tenant_engine = Selecto::Engine->new(
-    domain => $tenant_domain, adapter => $engine->adapter, write_policy => 'permissive',
-);
+my $tenant_engine = Selecto::Engine->new(domain => $tenant_domain, adapter => $engine->adapter);
 my $tenant_query = $tenant_engine->query->where(Selecto::Expression->eq('tenant_id', 7));
 for my $scope (
     undef,
