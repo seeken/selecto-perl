@@ -55,7 +55,10 @@ them in C<execute_query> and C<stream_query>.
       sql => $sql, params => \@params, columns => \@columns, adapter_name => 'mydb',
   );
 
-For adapter authors.
+For adapter authors. A statement built this way carries no authority:
+C<execute_query> and C<stream_query> run it only if it is exactly one
+statement starting with C<SELECT> or C<WITH>, and always under a guard that discards any change it makes (see
+L<Selecto::SQL/"The query path">). Writes go through L<Selecto::Engine>.
 
 =head2 sql, params, columns, adapter_name
 

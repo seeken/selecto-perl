@@ -146,7 +146,10 @@ domain; queries never name a table.
 
 =item C<execute_query($statement)>
 
-Returns C<< {columns => [...], rows => [[...], ...]} >>.
+Returns C<< {columns => [...], rows => [[...], ...]} >>. It must never let
+the statement change data: the bundled SQL adapters refuse
+(C<invalid_query>) anything but one C<SELECT> or C<WITH> statement and run every query in a transaction or savepoint
+they always roll back (see L<Selecto::SQL/"The query path">).
 
 =item C<preview_write($command)>
 

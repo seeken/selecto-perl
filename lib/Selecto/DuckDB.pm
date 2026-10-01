@@ -84,7 +84,7 @@ sub _query_transport_sql {
     return 'SELECT ' . join(', ', map {
         $self->_transport_value_sql($source . '.' . $aliases[$_]) .
             ' AS ' . $self->quote_identifier($columns[$_])
-    } 0 .. $#columns) . ' FROM (' . $statement->sql . ') AS ' . $source .
+    } 0 .. $#columns) . ' FROM (' . ($statement->sql =~ s/;?\s*\z//r) . ') AS ' . $source .
         ' (' . join(', ', @aliases) . ')';
 }
 
@@ -465,6 +465,33 @@ sub _savepoint_transaction {
     );
 }
 
+
+# A query's own transaction is declared read-only. DuckDB has no savepoints,
+# so a query cannot be isolated inside a transaction the host holds open,
+# whether begun through DBI or with a raw BEGIN; it is refused instead.
+sub _begin_query_transaction {
+    my ($self) = @_;
+    my $began = eval { $self->_transaction_statement('BEGIN TRANSACTION READ ONLY'); 1 };
+    _query_transaction_unsupported() unless $began;
+    return;
+}
+
+sub _end_query_transaction { return $_[0]->_transaction_statement('ROLLBACK'); }
+
+sub _begin_query_savepoint { _query_transaction_unsupported(); }
+
+sub _query_transaction_unsupported {
+    Selecto::Error->throw(
+        'query_transaction_unsupported',
+        'DuckDB has no savepoints, so a query cannot run inside an open transaction',
+    );
+}
+
+sub _read_only_violation {
+    my ($self) = @_;
+    my $message = eval { $self->dbh->errstr } // '';
+    return $message =~ /transaction is launched in read-only mode/ ? 1 : 0;
+}
 1;
 
 __END__

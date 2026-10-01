@@ -1,6 +1,31 @@
 Revision history for Selecto
 
 Unreleased
+    - Security: the query path cannot write. execute_query and
+      stream_query (and so Engine all, stream and projection_sum) refuse
+      with invalid_query, before touching the database, anything but
+      exactly one statement starting with SELECT or WITH: a ";" anywhere
+      but one trailing, a NUL, MySQL /*! */ comments, and on SQL Server
+      COMMIT, ROLLBACK, EXEC, EXECUTE, OPENQUERY, OPENROWSET and
+      OPENDATASOURCE outside literals and comments. Every accepted query
+      then runs under a guard that always rolls back: on an idle handle a
+      transaction of its own, read-only on PostgreSQL, MySQL, MariaDB and
+      DuckDB and under PRAGMA query_only on SQLite; inside the host's
+      transaction a savepoint (read-only on PostgreSQL, query_only on
+      SQLite). A write the database refuses there is also invalid_query.
+      Previously a write preview's SQL, a raw INSERT, a data-modifying CTE
+      or "SELECT 1; COMMIT; DELETE ..." (DBD::Pg runs a parameterless
+      string as several statements) handed to the query path changed data
+      without governance. Behaviour hosts may notice: DuckDB queries
+      inside an open transaction fail with query_transaction_unsupported;
+      a failed query inside a host transaction no longer aborts it; a
+      Selecto write on a handle with an open stream that holds its guard
+      (SQLite, DuckDB, SQL Server, MySQL with mariadb_use_result) fails
+      with invalid_adapter; a hand-built statement starting with VALUES,
+      TABLE or "(" is refused; each query costs two or three extra round
+      trips on PostgreSQL. A for_share statement compiled by the adapter
+      still runs directly in the host's transaction so its locks last
+      until the host commits.
     - Security: the permissive write policy is removed. Strict is the only
       behaviour: an engine refuses (write_policy_missing) a write to a
       domain without writes.operations, or without writes.fields for

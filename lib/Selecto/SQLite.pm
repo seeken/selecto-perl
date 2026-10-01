@@ -96,6 +96,47 @@ sub _savepoint_command {
     return $self->SUPER::_savepoint_command($action, $name);
 }
 
+
+# A query's own transaction is deferred: DBD::SQLite otherwise begins with
+# BEGIN IMMEDIATE, which takes the write lock and is refused under
+# query_only. Reading the host's query_only setting makes DBD::SQLite begin
+# it now, while the override is in effect.
+sub _begin_query_transaction {
+    my ($self, $guard) = @_;
+    my $dbh = $self->dbh;
+    local $dbh->{sqlite_use_immediate_transaction} = 0;
+    $self->_begin_transaction;
+    $guard->{query_only} = _query_only($dbh);
+    return;
+}
+
+# PRAGMA query_only makes the connection refuse every write, DDL included,
+# for the query; the host's own setting is restored afterwards.
+sub _begin_query_session {
+    my ($self, $guard) = @_;
+    my $previous = $guard->{query_only} // _query_only($self->dbh);
+    $self->_query_control('PRAGMA query_only = ON') unless $previous;
+    return { previous => $previous };
+}
+
+sub _query_only {
+    my ($dbh) = @_;
+    my ($value) = $dbh->selectrow_array('PRAGMA query_only');
+    return $value ? 1 : 0;
+}
+
+sub _end_query_session {
+    my ($self, $session) = @_;
+    $self->_query_control('PRAGMA query_only = OFF') unless $session->{previous};
+    return;
+}
+
+# SQLITE_READONLY
+sub _read_only_violation {
+    my ($self) = @_;
+    my $code = eval { $self->dbh->err } // 0;
+    return "$code" eq '8' ? 1 : 0;
+}
 1;
 
 __END__

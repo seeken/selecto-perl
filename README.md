@@ -421,6 +421,18 @@ not start. Adapters take `transaction_mode`:
 `transaction_handler` (managed mode) hands transaction control to your own
 code, which must run the given code reference once, atomically.
 
+Queries never write. `execute_query`, `stream_query` and the engine reads
+built on them accept exactly one statement starting with `SELECT` or `WITH`
+(no `;` but one trailing; anything else fails with `invalid_query`) and run
+it in a transaction of their own that is always rolled back, read-only where
+the database can declare it, or inside
+your open transaction in a savepoint that is always rolled back. DuckDB has
+no savepoints, so a query inside an open DuckDB transaction fails with
+`query_transaction_unsupported`. A `for_share` query compiled by the adapter
+runs directly in your transaction so its locks last until you commit. Close a
+stream before writing to its handle; see `perldoc Selecto::SQL`, "The query
+path".
+
 ```perl
 $dbh->begin_work;
 $engine->execute_write($command);   # SAVEPOINT ... RELEASE, no commit
@@ -461,7 +473,10 @@ my $external = Selecto->adapter(postgresql => (
   to a domain without `writes.operations`, or without `writes.fields` for
   anything but a delete, with `write_policy_missing`; there is no permissive
   mode. The adapters' `execute_*_unsafe` methods skip governance and exist for
-  trusted tooling and adapter tests only.
+  trusted tooling and adapter tests only. The query path is not a way around
+  this: a write preview's SQL or any other data-modifying statement handed to
+  `execute_query` or `stream_query` fails with `invalid_query` and persists
+  nothing.
 - Keep credentials in the DBI handle. Selecto's errors and JSON output do not
   include connection details, and yours should not either.
 

@@ -4,6 +4,7 @@ use Mojo::Base 'Selecto::Adapter';
 use JSON::PP ();
 use Digest::SHA qw(sha1_hex);
 use Scalar::Util qw(blessed refaddr);
+use Hash::Util::FieldHash ();
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
@@ -25,6 +26,11 @@ our %WRITE_CAPABILITIES = map { $_ => 1 } qw(
 has transaction_mode => 'managed';
 has 'transaction_handler';
 
+# Statements compiled with a row lock, by object, with the SQL they were
+# compiled to. Only these run without the read-only guard, so a statement
+# built by a caller, or a compiled one altered afterwards, never does.
+Hash::Util::FieldHash::fieldhash(my %ROW_LOCK_STATEMENTS);
+
 sub feature_inventory { return [@FEATURE_INVENTORY]; }
 sub write_capabilities { return { %WRITE_CAPABILITIES }; }
 
@@ -44,7 +50,11 @@ sub compile {
     my $operations = $query->set_operations;
     Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')
         if @$operations && defined($query->row_lock);
-    return $self->_compile_single($domain, $query) unless @$operations;
+    unless (@$operations) {
+        my $statement = $self->_compile_single($domain, $query);
+        $ROW_LOCK_STATEMENTS{$statement} = $statement->sql if defined $query->row_lock;
+        return $statement;
+    }
     Selecto::Error->throw('unsupported_feature', 'adapter does not support set operations')
         unless $self->supports('set_operations');
 
@@ -762,9 +772,18 @@ sub _single_rollup_grouping_position {
     return undef;
 }
 
+# The query path runs only reads. Each execution is checked to be one read
+# statement and then runs under a guard that discards anything it changed:
+# in AutoCommit a transaction of its own, read-only where the dialect can
+# declare it, that is always rolled back; inside the host's transaction a
+# savepoint that is always rolled back. Write previews, raw data-modifying
+# statements and data-modifying CTEs therefore never persist through it;
+# writes go through execute_write with the engine's authorization.
 sub execute_query {
     my ($self, $statement) = @_;
-    my ($sth, @rows);
+    $self->_assert_read_statement($statement);
+    my $guard = $self->_begin_query_guard($statement);
+    my ($sth, @rows, $error);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
         $self->_execute_statement($sth, $statement->params);
@@ -774,7 +793,10 @@ sub execute_query {
         }
         1;
     };
-    die $self->normalize_error($@) unless $ok;
+    # Normalize before the guard ends: rolling back clears the handle's error.
+    $error = $self->_query_error($@) unless $ok;
+    eval { $sth->finish if $sth && $sth->{Active}; 1 } unless $ok;
+    $self->_end_query_guard($guard, $error);
     return { columns => $statement->columns, rows => \@rows };
 }
 
@@ -787,6 +809,8 @@ sub stream_query {
     my $fetch_size = $options{fetch_size} // 500;
     Selecto::Error->throw('invalid_stream', 'fetch_size must be a positive integer')
         unless defined($fetch_size) && !ref($fetch_size) && "$fetch_size" =~ /\A[1-9]\d*\z/;
+    $self->_assert_read_statement($statement);
+    my $guard = $self->_begin_query_guard($statement);
     my ($sth, @types);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
@@ -795,14 +819,274 @@ sub stream_query {
         @types = $self->_column_types($sth);
         1;
     };
-    die $self->normalize_error($@) unless $ok;
+    if (!$ok) {
+        my $error = $self->_query_error($@);
+        eval { $sth->finish if $sth && $sth->{Active}; 1 };
+        $self->_end_query_guard($guard, $error);
+    }
+    # A driver that already holds the whole result needs the guard no longer;
+    # otherwise the stream keeps it until it closes.
+    my $on_close;
+    if ($self->_stream_result_buffered($sth)) {
+        $self->_end_query_guard($guard);
+    } else {
+        $on_close = sub { $self->_end_query_guard($guard); };
+    }
     return Selecto::Stream->new(
         sth => $sth,
         columns => $statement->columns,
         types => \@types,
         decode => sub { return $self->_decode(@_); },
         normalize_error => sub { return $self->normalize_error($_[0]); },
+        ($on_close ? (on_close => $on_close) : ()),
     );
+}
+
+sub _trusted_row_lock {
+    my ($self, $statement) = @_;
+    my $sql = $ROW_LOCK_STATEMENTS{$statement};
+    return defined($sql) && $sql eq $statement->sql ? 1 : 0;
+}
+
+# The query path accepts exactly one statement that starts with SELECT or
+# WITH, and refuses anything else with invalid_query before touching the
+# database (compiled queries always pass):
+#
+# - A ";" anywhere but one trailing is refused, checked on the raw text so no
+#   literal or comment can hide one: DBD::Pg runs a parameterless string as
+#   several statements, so "SELECT 1; COMMIT; DELETE ..." would end the
+#   query's transaction and then write.
+# - The first word after whitespace and comments must be SELECT or WITH, so
+#   transaction control, SET, PRAGMA and DDL (which MySQL and MariaDB commit
+#   implicitly, even in a read-only transaction) never reach the database.
+# - NUL characters, and MySQL and MariaDB executable comments (/*! */), are
+#   refused.
+# - SQL Server runs batches without separators, so COMMIT, ROLLBACK, EXEC,
+#   EXECUTE, OPENQUERY, OPENROWSET and OPENDATASOURCE are refused outside
+#   string literals, quoted identifiers and comments.
+#
+# Whatever a SELECT or WITH statement could still write, such as a
+# data-modifying CTE, the query guard refuses or rolls back.
+sub _assert_read_statement {
+    my ($self, $statement) = @_;
+    Selecto::Error->throw('invalid_query', 'the query path requires a Selecto statement')
+        unless blessed($statement) && $statement->isa('Selecto::Statement');
+    my $reason = _query_statement_refusal($self->name, $statement->sql);
+    Selecto::Error->throw(
+        'invalid_query',
+        "query execution accepts a single SELECT or WITH statement: $reason",
+    ) if defined $reason;
+    return;
+}
+
+my %TRANSACT_SQL_ESCAPES = map { $_ => 1 }
+    qw(COMMIT ROLLBACK EXEC EXECUTE OPENQUERY OPENROWSET OPENDATASOURCE);
+
+sub _query_statement_refusal {
+    my ($dialect, $text) = @_;
+    $text = defined($text) ? "$text" : '';
+    return 'statement text contains a NUL character' if index($text, "\0") >= 0;
+    (my $body = $text) =~ s/\s+\z//;
+    $body =~ s/;\z//;
+    return 'statement separators are not allowed' if index($body, ';') >= 0;
+    my $mysql_family = $dialect eq 'mysql' || $dialect eq 'mariadb';
+    return 'executable comments are not allowed'
+        if $mysql_family && $body =~ m{/\*m?!}i;
+    my $keyword = _leading_keyword($body, $mysql_family);
+    return 'the statement must start with SELECT or WITH'
+        unless $keyword eq 'SELECT' || $keyword eq 'WITH';
+    if ($dialect eq 'mssql') {
+        my $word = _transact_sql_escape($body);
+        return "$word is not allowed" if defined $word;
+    }
+    return undef;
+}
+
+# The upper-cased first word after whitespace and comments. A block comment
+# ends at the first "*/" even where the database nests comments, so a nested
+# comment can only expose more text, never hide some.
+sub _leading_keyword {
+    my ($text, $mysql_family) = @_;
+    pos($text) = 0;
+    while (1) {
+        if ($text =~ /\G\s+/gc) { next; }
+        if ($mysql_family ? $text =~ /\G--(?=[\x00-\x20]|\z)[^\r\n]*/gc : $text =~ /\G--[^\r\n]*/gc) { next; }
+        if ($mysql_family && $text =~ /\G#[^\r\n]*/gc) { next; }
+        if ($text =~ m{\G/\*}gc) {
+            return '' unless $text =~ m{\G.*?\*/}gcs;
+            next;
+        }
+        return $text =~ /\G([A-Za-z0-9_]*)/gc ? uc($1) : '';
+    }
+}
+
+# The first word outside literals, quoted identifiers and comments that could
+# end the query transaction or run code outside it in a SQL Server batch.
+# T-SQL strings escape only by doubling quotes, so the scan matches the
+# server's tokens; comments end as early as possible, so any disagreement
+# exposes more text to the check.
+sub _transact_sql_escape {
+    my ($text) = @_;
+    pos($text) = 0;
+    while (pos($text) < length($text)) {
+        if ($text =~ /\G(['"\[])/gc) {
+            my $closing = $1 eq '[' ? ']' : $1;
+            my $quoted = quotemeta $closing;
+            return 'an unterminated literal'
+                unless $text =~ /\G(?>(?:[^$quoted]+|$quoted$quoted)*)$quoted/gc;
+        } elsif ($text =~ /\G--[^\r\n]*/gc) {
+        } elsif ($text =~ m{\G/\*}gc) {
+            return 'an unterminated comment' unless $text =~ m{\G.*?\*/}gcs;
+        } elsif ($text =~ /\G([A-Za-z_][A-Za-z0-9_]*)/gc) {
+            return uc($1) if $TRANSACT_SQL_ESCAPES{uc $1};
+        } else {
+            $text =~ /\G[0-9]+|\G./gcs;
+        }
+    }
+    return undef;
+}
+
+# Opens the guard one query runs under; see execute_query.
+sub _begin_query_guard {
+    my ($self, $statement) = @_;
+    my $dbh = $self->{dbh};
+    # Inside a guard already open on this handle (a query while a stream is
+    # open), whose transaction discards everything, the query just runs.
+    return { mode => 'nested' } if $dbh->{private_selecto_query_guard};
+    my $open = $self->_transaction_open;
+    my $guard = { mode => $open ? 'savepoint' : 'own', read_only => 1 };
+    if ($self->_trusted_row_lock($statement)) {
+        # A governed row-lock read keeps its locks for the host's transaction;
+        # read-only transactions refuse row locks.
+        return { mode => 'host' } if $open;
+        $guard->{read_only} = 0;
+    }
+    my $ok = eval {
+        if ($open) {
+            $self->_begin_query_savepoint($guard);
+        } else {
+            $self->_begin_query_transaction($guard);
+        }
+        $guard->{began} = 1;
+        $guard->{session} = $self->_begin_query_session($guard) if $guard->{read_only};
+        1;
+    };
+    if (!$ok) {
+        my $error = $@;
+        eval { $self->_rollback_query_guard($guard) } if $guard->{began};
+        die $self->_transaction_control_error($error);
+    }
+    $dbh->{private_selecto_query_guard} = 1;
+    return $guard;
+}
+
+# Ends a guard: discards everything the query did, restores the handle and
+# rethrows the query's own error, if any, in preference to a guard failure.
+sub _end_query_guard {
+    my ($self, $guard, $error) = @_;
+    return if $guard->{ended}++;
+    if ($guard->{mode} eq 'nested' || $guard->{mode} eq 'host') {
+        die $error if $error;
+        return;
+    }
+    delete $self->{dbh}{private_selecto_query_guard};
+    my $ok = eval {
+        my $session_ok = eval { $self->_end_query_session($guard->{session}) if $guard->{session}; 1 };
+        my $session_error = $@;
+        $self->_rollback_query_guard($guard);
+        die $session_error unless $session_ok;
+        1;
+    };
+    die $error if $error;
+    die $self->_transaction_control_error($@) unless $ok;
+    return;
+}
+
+sub _rollback_query_guard {
+    my ($self, $guard) = @_;
+    if ($guard->{mode} eq 'savepoint') {
+        $self->_end_query_savepoint($guard);
+    } else {
+        $self->_end_query_transaction($guard);
+    }
+    return;
+}
+
+# Dialect hook: opens the query's own transaction. The default begins one
+# through DBI and runs _read_only_transaction_sql in it.
+sub _begin_query_transaction {
+    my ($self, $guard) = @_;
+    $self->_begin_transaction;
+    if ($guard->{read_only}) {
+        $self->_query_control($_) for $self->_read_only_transaction_sql;
+    }
+    return;
+}
+
+# Dialect hook: rolls the query's own transaction back.
+sub _end_query_transaction {
+    my ($self, $guard) = @_;
+    my $dbh = $self->{dbh};
+    return if eval { $dbh->{AutoCommit} };
+    $dbh->rollback or die _dbi_error($dbh, 'database transaction could not roll back');
+    return;
+}
+
+# Dialect hook: opens a savepoint inside the host's transaction, read-only
+# where _read_only_savepoint_sql can declare it.
+sub _begin_query_savepoint {
+    my ($self, $guard) = @_;
+    $guard->{savepoint} = 'selecto_query';
+    $self->_savepoint_command(create => $guard->{savepoint});
+    $guard->{savepoint_open} = 1;
+    if ($guard->{read_only}) {
+        $self->_query_control($_) for $self->_read_only_savepoint_sql;
+    }
+    return;
+}
+
+sub _end_query_savepoint {
+    my ($self, $guard) = @_;
+    return unless $guard->{savepoint_open};
+    $self->_savepoint_command(rollback => $guard->{savepoint});
+    $self->_savepoint_command(release => $guard->{savepoint});
+    return;
+}
+
+# Dialect hooks: statements that make the query's own transaction (or its
+# savepoint) refuse writes, such as PostgreSQL's SET TRANSACTION READ ONLY.
+# Without them the rollback alone discards a write.
+sub _read_only_transaction_sql { return (); }
+sub _read_only_savepoint_sql { return (); }
+
+# Dialect hooks: connection-level read-only mode for the query (SQLite's
+# PRAGMA query_only), returning what _end_query_session needs to restore it.
+sub _begin_query_session { return undef; }
+sub _end_query_session { return; }
+
+# Dialect hook: whether the executed statement handle already holds the
+# whole result, so a stream can end its guard before the rows are read.
+sub _stream_result_buffered { return 0; }
+
+# Dialect hook: whether the failed statement was refused for writing in a
+# read-only transaction or connection.
+sub _read_only_violation { return 0; }
+
+sub _query_control {
+    my ($self, $sql) = @_;
+    defined($self->{dbh}->do($sql))
+        or die _dbi_error($self->{dbh}, 'database read-only guard failed');
+    return;
+}
+
+sub _query_error {
+    my ($self, $error) = @_;
+    return $error if blessed($error) && $error->isa('Selecto::Error');
+    return Selecto::Error->new(
+        code => 'invalid_query',
+        message => 'the query path cannot write; writes require the governed write path',
+    ) if $self->_read_only_violation($error);
+    return $self->normalize_error($error);
 }
 
 sub _query_transport_sql { return $_[1]->sql; }
@@ -2278,6 +2562,11 @@ sub _guarded_cardinality {
 
 sub _transaction {
     my ($self, $operation) = @_;
+    # A stream's guard discards everything on its handle when it closes.
+    Selecto::Error->throw(
+        'invalid_adapter',
+        'a query stream is open on this database handle; close it before writing',
+    ) if $self->{dbh}{private_selecto_query_guard};
     my $mode = $self->transaction_mode;
     Selecto::Error->throw('invalid_adapter', 'transaction_mode must be managed or external')
         unless defined($mode) && ($mode eq 'managed' || $mode eq 'external');
@@ -2607,6 +2896,61 @@ default. C<feature_inventory> and C<write_capabilities> describe the SQL
 family; subclasses narrow them through C<supports> and
 C<write_capabilities>.
 
+=head2 The query path
+
+C<execute_query> and C<stream_query> run reads only; no statement passed to
+them can change data. Each statement must be exactly one statement whose
+first word, after whitespace and comments, is C<SELECT> or C<WITH>. A C<;>
+anywhere but one trailing (even inside a literal or comment), a NUL
+character, MySQL and MariaDB executable comments (C</*! */>), and on SQL
+Server the words C<COMMIT>, C<ROLLBACK>, C<EXEC>, C<EXECUTE>, C<OPENQUERY>,
+C<OPENROWSET> and C<OPENDATASOURCE> outside literals, quoted identifiers and
+comments are refused too. A write preview's SQL, C<INSERT>, C<COMMIT>, DDL or
+several statements therefore fail with C<invalid_query> before they reach
+the database. Statements the adapter compiles always pass.
+
+The statement then runs under a guard that discards whatever it changed:
+
+=over 4
+
+=item * On an idle handle the query runs in a transaction of its own that is
+always rolled back: C<BEGIN READ ONLY> on PostgreSQL, C<START TRANSACTION
+READ ONLY> on MySQL and MariaDB, C<BEGIN TRANSACTION READ ONLY> on DuckDB, and
+a deferred transaction under C<PRAGMA query_only> on SQLite (the host's
+C<query_only> setting is restored afterwards). SQL Server has no read-only
+mode and relies on the rollback. A data-modifying CTE, C<SELECT INTO> or a
+writing function is therefore refused; a refusal the database reports
+becomes C<invalid_query>.
+
+=item * Inside a transaction the host holds open (detected as for writes,
+above) the query runs in a savepoint that is always rolled back, so it
+never commits or ends the host's transaction and a failed query no longer
+aborts it. PostgreSQL also makes the savepoint read-only, which rolling it
+back undoes, and SQLite applies C<query_only>. The query still sees the
+host's uncommitted writes. DuckDB has no savepoints, so a query inside an
+open transaction, including one begun with raw C<BEGIN>, fails with
+C<query_transaction_unsupported> before it runs.
+
+=item * A statement this adapter compiled from a query with
+L<Selecto::Query/for_share>, unaltered since, runs directly in the host's
+transaction so that its row locks last until the host commits; outside one
+it runs in a transaction that is rolled back but not read-only.
+
+=back
+
+A stream keeps its guard until it closes, except where the driver has
+already read the whole result when the statement executes (DBD::Pg, and
+DBD::MariaDB unless C<mariadb_use_result> is on); then the guard ends at
+once. While a stream keeps its guard, queries on the same handle run inside
+it, and a Selecto write on the handle fails with C<invalid_adapter>; do not
+write to the handle any other way until the stream is closed, because its
+rollback would discard that write too.
+
+Each guard costs round trips: on PostgreSQL C<pg_ping> (on an
+C<AutoCommit> handle), C<BEGIN READ ONLY> and C<ROLLBACK>, or two inside the
+host's transaction. Writes go through L<Selecto::Engine>, which authorizes
+them for C<execute_write>.
+
 =head2 execute_write_unsafe, execute_batch_unsafe, execute_graph_unsafe
 
 Execute without an engine authorization, skipping all domain governance.
@@ -2626,7 +2970,12 @@ customized through methods whose names begin with an underscore (for example
 C<_decode>, C<_column_types>, C<_compile_upsert_clause>,
 C<_compile_pagination>). Transaction control uses C<_begin_transaction>,
 C<_commit_transaction>, C<_rollback_transaction>, C<_savepoint_sql>,
-C<_server_transaction_open> and C<_savepoint_transaction>. Those hooks are
+C<_server_transaction_open> and C<_savepoint_transaction>; the query guard
+uses C<_begin_query_transaction>, C<_end_query_transaction>,
+C<_begin_query_savepoint>, C<_end_query_savepoint>,
+C<_read_only_transaction_sql>, C<_read_only_savepoint_sql>,
+C<_begin_query_session>, C<_end_query_session>, C<_stream_result_buffered>
+and C<_read_only_violation>. Those hooks are
 not yet a stable interface; study the bundled adapters and expect changes
 between releases.
 
