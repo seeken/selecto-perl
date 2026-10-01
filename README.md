@@ -388,12 +388,38 @@ distribution, which builds on this core.
 
 ### Adapters
 
-Pick an adapter by name and pass it a DBI handle you configured. Adapters own
-transactions by default; if your application already has a unit-of-work
-transaction open, construct the adapter with `transaction_mode => 'external'`
-and an `AutoCommit => 0` handle, and commit or roll back yourself. To support
+Pick an adapter by name and pass it a DBI handle you configured. To support
 another database, subclass `Selecto::SQL` (or `Selecto::Adapter` for non-SQL
 stores) and register it under a lowercase name; see `perldoc Selecto::Adapter`.
+
+#### Transactions
+
+Every write, batch and graph is atomic, and Selecto never commits work it did
+not start. Adapters take `transaction_mode`:
+
+- `managed` (default): on an idle handle the write runs in its own
+  `begin_work` ... `commit`. On a handle that is already inside a transaction
+  (`AutoCommit` off after `begin_work`, an `AutoCommit => 0` handle, or a raw
+  `BEGIN` that PostgreSQL, MySQL/MariaDB or SQL Server reports) it runs in a
+  `SAVEPOINT` instead (`SAVE TRANSACTION` on SQL Server): it commits or rolls
+  back with your transaction, and a failed write rolls back only its
+  savepoint, so your transaction stays usable, on PostgreSQL too. DuckDB has
+  no savepoints and refuses a managed write inside an open transaction.
+- `external`: you own the unit of work. The handle must have `AutoCommit`
+  off; the adapter never begins, commits, rolls back or creates savepoints.
+  Roll back yourself on every exception.
+
+`transaction_handler` (managed mode) hands transaction control to your own
+code, which must run the given code reference once, atomically.
+
+```perl
+$dbh->begin_work;
+$engine->execute_write($command);   # SAVEPOINT ... RELEASE, no commit
+$dbh->rollback;                     # the write is undone with the rest
+
+my $external = Selecto->adapter(postgresql => (
+    dbh => $dbh, transaction_mode => 'external'));
+```
 
 ### Security checklist
 

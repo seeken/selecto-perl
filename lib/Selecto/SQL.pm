@@ -22,6 +22,7 @@ our %WRITE_CAPABILITIES = map { $_ => 1 } qw(
 );
 
 has transaction_mode => 'managed';
+has 'transaction_handler';
 
 sub feature_inventory { return [@FEATURE_INVENTORY]; }
 sub write_capabilities { return { %WRITE_CAPABILITIES }; }
@@ -2144,6 +2145,13 @@ sub _transaction {
     my $mode = $self->transaction_mode;
     Selecto::Error->throw('invalid_adapter', 'transaction_mode must be managed or external')
         unless defined($mode) && ($mode eq 'managed' || $mode eq 'external');
+    my $handler = $self->transaction_handler;
+    if (defined $handler) {
+        Selecto::Error->throw('invalid_adapter', 'transaction_handler must be a code reference')
+            unless ref($handler) eq 'CODE';
+        Selecto::Error->throw('invalid_adapter', 'transaction_handler requires managed transaction mode')
+            if $mode eq 'external';
+    }
     if ($mode eq 'external') {
         my $auto_commit = eval { $self->{dbh}{AutoCommit} };
         Selecto::Error->throw(
@@ -2152,26 +2160,133 @@ sub _transaction {
         ) unless defined($auto_commit) && !$auto_commit;
         return $operation->();
     }
-    my $value;
-    my $ok = eval {
-        my $auto_commit = eval { $self->{dbh}{AutoCommit} };
-        if (!defined($auto_commit) || $auto_commit) {
-            my $begun = $self->{dbh}->begin_work;
-            die _dbi_error($self->{dbh}, 'database transaction could not begin')
-                unless $begun;
-        }
-        $value = $operation->();
-        my $committed = $self->{dbh}->commit;
-        die _dbi_error($self->{dbh}, 'database transaction could not commit')
-            unless $committed;
-        1;
-    };
+    return $self->_handler_transaction($handler, $operation) if defined $handler;
+    return $self->_savepoint_transaction($operation) if $self->_transaction_open;
+    return $self->_own_transaction($operation);
+}
+
+# Managed mode on an idle handle: the write's own transaction.
+sub _own_transaction {
+    my ($self, $operation) = @_;
+    # A transaction that never began is not rolled back: the handle may be
+    # inside work this adapter cannot see.
+    eval { $self->_begin_transaction; 1 }
+        or die $self->_transaction_control_error($@);
+    my ($value, $error);
+    my $ok = eval { $value = $operation->(); 1 };
+    if ($ok) {
+        $ok = eval { $self->_commit_transaction; 1 };
+        $error = $self->_transaction_control_error($@) unless $ok;
+    } else {
+        $error = $@;
+    }
     if (!$ok) {
-        my $error = $@;
-        eval { $self->{dbh}->rollback };
+        eval { $self->_rollback_transaction };
         die $error;
     }
     return $value;
+}
+
+# Managed mode inside the host's open transaction: the write commits or
+# rolls back with the host, and a failure undoes only its savepoint.
+sub _savepoint_transaction {
+    my ($self, $operation) = @_;
+    my $depth = ($self->{_selecto_savepoint_depth} // 0) + 1;
+    local $self->{_selecto_savepoint_depth} = $depth;
+    my $name = "selecto_write_$depth";
+    eval { $self->_savepoint_command(create => $name); 1 }
+        or die $self->_transaction_control_error($@);
+    my ($value, $error);
+    my $ok = eval { $value = $operation->(); 1 };
+    if ($ok) {
+        $ok = eval { $self->_savepoint_command(release => $name); 1 };
+        $error = $self->_transaction_control_error($@) unless $ok;
+    } else {
+        $error = $@;
+    }
+    if (!$ok) {
+        eval {
+            $self->_savepoint_command(rollback => $name);
+            $self->_savepoint_command(release => $name);
+        };
+        die $error;
+    }
+    return $value;
+}
+
+# The host's transaction API runs the write; it must call the work once.
+sub _handler_transaction {
+    my ($self, $handler, $operation) = @_;
+    my ($ran, $value) = (0);
+    $handler->(sub {
+        $ran = 1;
+        $value = $operation->();
+        return $value;
+    });
+    Selecto::Error->throw('invalid_adapter', 'transaction handler did not run the write')
+        unless $ran;
+    return $value;
+}
+
+# Whether the handle is inside a transaction the host opened: AutoCommit is
+# off (after begin_work, or on an AutoCommit => 0 handle), or the dialect
+# can see one on the server.
+sub _transaction_open {
+    my ($self) = @_;
+    my $auto_commit = eval { $self->{dbh}{AutoCommit} };
+    return 1 if defined($auto_commit) && !$auto_commit;
+    return $self->_server_transaction_open ? 1 : 0;
+}
+
+# Dialect hook: true when the server reports an open transaction although
+# AutoCommit is on (a raw BEGIN). Undef (unknown) keeps begin/commit.
+sub _server_transaction_open { return undef; }
+
+sub _begin_transaction {
+    my ($self) = @_;
+    $self->{dbh}->begin_work
+        or die _dbi_error($self->{dbh}, 'database transaction could not begin');
+    return;
+}
+
+sub _commit_transaction {
+    my ($self) = @_;
+    $self->{dbh}->commit
+        or die _dbi_error($self->{dbh}, 'database transaction could not commit');
+    return;
+}
+
+sub _rollback_transaction {
+    my ($self) = @_;
+    $self->{dbh}->rollback;
+    return;
+}
+
+# Dialect hook: the statement that creates (create), releases (release;
+# undef when the dialect has none) or rolls back to (rollback) a savepoint.
+sub _savepoint_sql {
+    my ($self, $action, $name) = @_;
+    return {
+        create => "SAVEPOINT $name",
+        release => "RELEASE SAVEPOINT $name",
+        rollback => "ROLLBACK TO SAVEPOINT $name",
+    }->{$action};
+}
+
+sub _savepoint_command {
+    my ($self, $action, $name) = @_;
+    my $sql = $self->_savepoint_sql($action, $name);
+    return unless defined $sql;
+    defined($self->{dbh}->do($sql))
+        or die _dbi_error($self->{dbh}, "database savepoint $action failed");
+    return;
+}
+
+# Begin, commit and savepoint failures become Selecto errors.
+sub _transaction_control_error {
+    my ($self, $error) = @_;
+    return $error if blessed($error) && $error->isa('Selecto::Error');
+    return $self->normalize_error($error);
 }
 
 sub _dbi_error {
@@ -2243,6 +2358,7 @@ Selecto::SQL - shared implementation for SQL database adapters
   my $adapter = Selecto->adapter(postgresql => (
       dbh              => $dbh,         # a connected DBI handle you own
       transaction_mode => 'managed',    # or 'external'
+      # transaction_handler => sub { my ($work) = @_; ... },   # optional
   ));
 
   # Subclassing for a new database:
@@ -2273,18 +2389,78 @@ The DBI handle. Selecto never connects, reconnects or disconnects it.
 
 =head2 transaction_mode
 
-C<managed> (default): each write, batch and graph runs in its own
-transaction. If the handle has C<AutoCommit> enabled the adapter begins a
-transaction; either way it commits on success and rolls back on failure.
-Note that with C<AutoCommit> disabled, C<managed> mode commits whatever the
-handle's current transaction contains.
+Every write, batch and graph is atomic, and Selecto never commits or rolls
+back work it did not start. C<transaction_mode> chooses how:
+
+C<managed> (default). On an idle handle (C<AutoCommit> on) the write runs in
+its own transaction: C<begin_work>, then C<commit>, or C<rollback> on
+failure. On a handle that is already inside a transaction (C<AutoCommit>
+off after C<begin_work>, an C<< AutoCommit => 0 >> handle, or a transaction
+the server reports although C<AutoCommit> is on) the write runs inside a
+savepoint instead: C<SAVEPOINT selecto_write_1> ... C<RELEASE SAVEPOINT>,
+and C<ROLLBACK TO SAVEPOINT> then C<RELEASE> on failure. The write then
+commits or rolls back with the host's transaction, a failed write undoes
+only itself, and on PostgreSQL the host's transaction stays usable. The
+host still commits; a managed write never commits an C<< AutoCommit => 0 >>
+handle.
+
+  $dbh->begin_work;
+  $engine->execute_write($command);   # SAVEPOINT ... RELEASE, no commit
+  $dbh->rollback;                     # the write is undone with the rest
+
+Per adapter:
+
+=over 4
+
+=item * PostgreSQL, SQLite, MySQL and MariaDB use C<SAVEPOINT>. PostgreSQL
+also detects a raw C<BEGIN> through C<pg_ping> and MySQL/MariaDB through
+C<@@in_transaction>; DBD::SQLite turns C<AutoCommit> off itself.
+
+=item * SQL Server uses C<SAVE TRANSACTION> and C<ROLLBACK TRANSACTION>
+(it has no release) and detects a transaction with C<@@TRANCOUNT>. On an
+C<< AutoCommit => 0 >> handle with nothing pending yet, the write's own
+statements open the transaction, which is left for the host to commit and
+rolled back on failure.
+
+=item * DuckDB has no savepoints, so a managed write on a handle with
+C<AutoCommit> off fails with C<invalid_adapter> before running anything;
+use C<external> mode there. A transaction opened with raw C<BEGIN> makes the
+adapter's own C<BEGIN> fail, and nothing is rolled back.
+
+=back
+
+A transaction that fails to begin is never rolled back. Begin, commit and
+savepoint failures are reported as L<Selecto::Error>s (normally
+C<query_error>); the write's own failure is reported unchanged. If a
+savepoint cannot be rolled back (for example after a dropped connection)
+the original error is still raised and the host must roll back.
 
 C<external>: for hosts that already own a unit-of-work transaction. The
 handle must have C<AutoCommit> disabled (otherwise C<invalid_adapter>) and
-the adapter never begins, commits or rolls back. The host must commit on
-success and roll back on every exception. Use this mode with
-L<Selecto::Query/for_share> to keep an eligibility read valid until the
+the adapter never begins, commits, rolls back or creates savepoints. The
+host must commit on success and roll back on every exception, including a
+failed write. Use this mode, or C<managed> inside the host's transaction,
+with L<Selecto::Query/for_share> to keep an eligibility read valid until the
 write commits.
+
+An unknown mode fails with C<invalid_adapter> when a write runs.
+
+=head2 transaction_handler
+
+  my $adapter = Selecto->adapter(postgresql => (
+      dbh => $dbh,
+      transaction_handler => sub {
+          my ($work) = @_;
+          return $schema->txn_do($work);   # for example DBIx::Class
+      },
+  ));
+
+C<managed> mode only. A code reference that replaces the adapter's own
+transaction control: it is called with a code reference that runs the
+write, must call it exactly once inside a transaction it controls, and
+should return its value and let its exceptions propagate. A handler that
+never calls the work fails with C<invalid_adapter>, as do a handler that is
+not a code reference and a handler combined with C<external> mode.
 
 =head1 METHODS
 
@@ -2312,8 +2488,11 @@ that differ in quoting override C<quote_identifier>.
 Result decoding, upsert syntax, pagination and dialect-only expressions are
 customized through methods whose names begin with an underscore (for example
 C<_decode>, C<_column_types>, C<_compile_upsert_clause>,
-C<_compile_pagination>). Those hooks are not yet a stable interface; study
-the bundled adapters and expect changes between releases.
+C<_compile_pagination>). Transaction control uses C<_begin_transaction>,
+C<_commit_transaction>, C<_rollback_transaction>, C<_savepoint_sql>,
+C<_server_transaction_open> and C<_savepoint_transaction>. Those hooks are
+not yet a stable interface; study the bundled adapters and expect changes
+between releases.
 
 Register the class with L<Selecto::Adapter::Registry> under a lowercase
 name.

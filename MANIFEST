@@ -114,6 +114,7 @@ t/mysql_family.t
 t/naive_utc_storage.t
 t/postgresql.integration.t
 t/postgresql.t
+t/postgresql_transaction.integration.t
 t/query.t
 t/query_enforcement.t
 t/query_enforcement_scalar.t
@@ -123,6 +124,7 @@ t/sqlite.integration.t
 t/stream.t
 t/temporal_format_bindings.t
 t/text_filters.t
+t/transaction_mode.t
 t/value_expression.t
 t/values_types.t
 t/write.t

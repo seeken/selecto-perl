@@ -232,6 +232,54 @@ sub _related_collection_text_sql {
     return "CAST($sql AS NVARCHAR(MAX))";
 }
 
+
+sub _server_transaction_open {
+    my ($self) = @_;
+    my $count = $self->_transaction_count;
+    return defined($count) ? ($count > 0 ? 1 : 0) : undef;
+}
+
+sub _transaction_count {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    my ($count) = eval {
+        local $dbh->{PrintError} = 0;
+        $dbh->selectrow_array('SELECT @@TRANCOUNT');
+    };
+    return defined($count) && "$count" =~ /\A\d+\z/ ? 0 + $count : undef;
+}
+
+# SQL Server savepoints: SAVE TRANSACTION and ROLLBACK TRANSACTION name.
+# They have no release; they end with the outer transaction.
+sub _savepoint_sql {
+    my ($self, $action, $name) = @_;
+    return {
+        create => "SAVE TRANSACTION $name",
+        rollback => "ROLLBACK TRANSACTION $name",
+    }->{$action};
+}
+
+sub _savepoint_transaction {
+    my ($self, $operation) = @_;
+    my $count = $self->_transaction_count;
+    return $self->SUPER::_savepoint_transaction($operation)
+        unless defined($count) && $count == 0;
+    # AutoCommit => 0 is SQL Server's implicit-transaction mode: until a
+    # statement runs @@TRANCOUNT is 0, SAVE TRANSACTION is refused and BEGIN
+    # TRANSACTION would open two levels. Nothing of the host's is pending,
+    # so the write's statements open the transaction and are left for the
+    # host to commit; on failure they are rolled back, which undoes only
+    # the write.
+    my $value;
+    my $ok = eval { $value = $operation->(); 1 };
+    if (!$ok) {
+        my $error = $@;
+        eval { $self->_rollback_transaction };
+        die $error;
+    }
+    return $value;
+}
+
 1;
 
 __END__
@@ -280,6 +328,12 @@ explicitly.
 Transactions, CTEs, window functions, set operations and streaming are
 supported. Recursive CTEs, rollups, lateral joins, JSON features, row locks,
 C<RETURNING> and write graphs are not.
+
+=item *
+
+Inside a transaction the host holds open, a managed write uses
+C<SAVE TRANSACTION> and C<ROLLBACK TRANSACTION> instead of committing; see
+L<Selecto::SQL/transaction_mode>.
 
 =back
 

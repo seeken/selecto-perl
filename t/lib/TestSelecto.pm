@@ -52,6 +52,7 @@ sub prepare {
 sub begin_work { push @{$_[0]->{events}}, 'BEGIN'; $_[0]{AutoCommit} = 0; return 1; }
 sub commit     { push @{$_[0]->{events}}, 'COMMIT'; return 1; }
 sub rollback   { push @{$_[0]->{events}}, 'ROLLBACK'; return 1; }
+sub do         { push @{$_[0]->{events}}, $_[1]; return '0E0'; }
 sub errstr     { return $_[0]->{errstr}; }
 sub prepared   { return [@{$_[0]->{prepared}}]; }
 sub events     { return [@{$_[0]->{events}}]; }

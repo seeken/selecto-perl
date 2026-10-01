@@ -448,11 +448,14 @@ three-valued logic is preserved and domain drift fails closed.
 
 =head1 TRANSACTIONS
 
-Adapters open and commit their own transactions by default. A host that
-already owns a transaction constructs the adapter with
-C<< transaction_mode => 'external' >> and an C<< AutoCommit => 0 >> DBI
-handle; the adapter then never begins, commits or rolls back, and the host
-must commit on success and roll back on every exception. See L<Selecto::SQL>.
+Adapters open and commit their own transactions on an idle handle. Inside a
+transaction the host already holds open, a managed write runs in a
+savepoint: it commits or rolls back with the host's transaction and a
+failure undoes only the write. A host can instead construct the adapter
+with C<< transaction_mode => 'external' >> and an C<< AutoCommit => 0 >> DBI
+handle; the adapter then never begins, commits, rolls back or creates
+savepoints, and the host must commit on success and roll back on every
+exception. See L<Selecto::SQL/transaction_mode>.
 
 =head1 SEE ALSO
 
