@@ -17,6 +17,7 @@ sub new {
     my %allowed = map { $_ => 1 } qw(
         selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
         set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
+        retarget
     );
     my @unknown = sort grep { !$allowed{$_} } keys %args;
     Selecto::Error->throw(
@@ -78,6 +79,7 @@ sub new {
         if defined($timezone) && (
             ref($timezone) || !DateTime::TimeZone->is_valid_name("$timezone")
         );
+    my $retarget = defined($args{retarget}) ? _retarget_spec($args{retarget}) : undef;
     Selecto::Error->throw('invalid_query', 'CTEs must be an array') unless ref($ctes) eq 'ARRAY';
     Selecto::Error->throw('invalid_query', 'lateral joins must be an array')
         unless ref($lateral_joins) eq 'ARRAY';
@@ -107,6 +109,7 @@ sub new {
         members => [map { "$_" } @$members],
         timezone => defined($timezone) ? "$timezone" : undef,
         row_lock => $row_lock,
+        retarget => $retarget,
         applied_query_library => dclone($args{applied_query_library} // {
             segments => [], projections => [], projection => undef,
             ordering => undef, views => [],
@@ -183,6 +186,64 @@ sub replace_orders {
         $query = $query->order_by($order->[0], $order->[1]);
     }
     return $query;
+}
+
+# Moves the row grain to the relation at an association path from the domain
+# root. The current predicate becomes the retarget context: the query returns
+# target rows reachable from a root row that satisfies it. Root-shaped state
+# (selections, grouping, ordering, pagination) is cleared for the new grain;
+# what follows the retarget resolves against the target relation.
+sub retarget {
+    my ($self, $path, %options) = @_;
+    $self->_ensure_pre_set_mutation('retarget');
+    my @unknown = sort grep { $_ ne 'strategy' } keys %options;
+    Selecto::Error->throw(
+        'invalid_query', 'retarget contains unsupported options', {keys => \@unknown},
+    ) if @unknown;
+    Selecto::Error->throw('invalid_query', 'a query can be retargeted only once')
+        if defined $self->{retarget};
+    Selecto::Error->throw('invalid_query', 'retarget cannot be applied to a row-locked query')
+        if defined $self->{row_lock};
+    Selecto::Error->throw(
+        'invalid_query',
+        'retarget must precede CTEs, lateral joins, rowsets, and query members',
+    ) if @{$self->{ctes}} || @{$self->{lateral_joins}} || @{$self->{json_rowsets}}
+        || @{$self->{array_rowsets}} || @{$self->{members}};
+    return $self->_copy(
+        retarget => {
+            path => $path,
+            strategy => $options{strategy} // 'in',
+            context => $self->{predicate},
+        },
+        predicate => undef,
+        selections => [],
+        groups => [],
+        grouping_mode => 'plain',
+        orders => [],
+        limit_value => undef,
+        offset_value => undef,
+    );
+}
+
+sub _retarget_spec {
+    my ($spec) = @_;
+    Selecto::Error->throw('invalid_query', 'retarget must be an object')
+        unless ref($spec) eq 'HASH';
+    my @unknown = sort grep { !/\A(?:path|strategy|context)\z/ } keys %$spec;
+    Selecto::Error->throw(
+        'invalid_query', 'retarget contains unsupported keys', {keys => \@unknown},
+    ) if @unknown;
+    my $path = $spec->{path};
+    Selecto::Error->throw('invalid_query', 'retarget path must be an association path')
+        unless defined($path) && !ref($path)
+            && "$path" =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+    my $strategy = $spec->{strategy} // 'in';
+    Selecto::Error->throw('invalid_query', 'retarget strategy must be in or exists')
+        unless !ref($strategy) && ($strategy eq 'in' || $strategy eq 'exists');
+    my $context = $spec->{context};
+    Selecto::Error->throw('invalid_query', 'retarget context must be an expression')
+        if defined($context) && !(blessed($context) && $context->isa('Selecto::Expression'));
+    return {path => "$path", strategy => "$strategy", context => $context};
 }
 
 sub union     { my ($self, $query, %opts) = @_; return $self->_set_operation('union', $query, %opts); }
@@ -515,6 +576,7 @@ sub _copy {
         members => $self->{members},
         timezone => $self->{timezone},
         row_lock => $self->{row_lock},
+        retarget => $self->{retarget},
         applied_query_library => $self->{applied_query_library},
         %changes,
     );
@@ -537,6 +599,10 @@ sub json_rowsets { return [map { _clone_json_rowset_spec($_) } @{$_[0]->{json_ro
 sub array_rowsets { return [map { {%$_} } @{$_[0]->{array_rowsets}}]; }
 sub members { return [@{$_[0]->{members}}]; }
 sub applied_query_library { return dclone($_[0]->{applied_query_library}); }
+sub retarget_spec {
+    my ($self) = @_;
+    return defined($self->{retarget}) ? {%{$self->{retarget}}} : undef;
+}
 
 sub _clone_cte_spec {
     my ($spec) = @_;

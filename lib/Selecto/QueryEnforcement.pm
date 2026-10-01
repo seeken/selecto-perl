@@ -25,6 +25,10 @@ sub new {
 
 sub capture {
     my ($class, $domain, $query) = @_;
+    # A retargeted query's predicate describes the target relation, not the
+    # root rows a write would change.
+    Selecto::Error->throw('invalid_query', 'query enforcement cannot use a retargeted query')
+        if defined $query->retarget_spec;
     my $predicate = combine($domain->required_predicate, $query->predicate);
     Selecto::Error->throw('query_enforcement_requires_filter', 'query enforcement requires an effective predicate')
         unless $predicate;
