@@ -334,6 +334,12 @@ sub _compile_dialect_expression {
     return $self->SUPER::_compile_dialect_expression($domain, $expression, $params);
 }
 
+# A naive timestamp holding UTC becomes timestamptz.
+sub _compile_naive_utc_instant_sql {
+    my ($self, $sql) = @_;
+    return '(' . $sql . q{ AT TIME ZONE 'UTC')};
+}
+
 sub _compile_timezone_sql {
     my ($self, $sql, $type, $timezone, $params) = @_;
     # Raw epoch fields are numbers; explicit epoch_datetime expressions have

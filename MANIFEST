@@ -111,6 +111,7 @@ t/mssql_decimal_scale.t
 t/mutation_expression.t
 t/mysql_family.integration.t
 t/mysql_family.t
+t/naive_utc_storage.t
 t/postgresql.integration.t
 t/postgresql.t
 t/query.t

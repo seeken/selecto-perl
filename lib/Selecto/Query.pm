@@ -689,6 +689,16 @@ Interprets date/time selections, filters and formats in an IANA time zone.
 On PostgreSQL and DuckDB, raw C<epoch_datetime> fields are converted to an
 instant before the zone is applied.
 
+A C<utc_datetime> field is taken to be a zone-aware column (PostgreSQL
+C<timestamptz>, DuckDB C<TIMESTAMPTZ>) and becomes
+C<(column AT TIME ZONE $zone)>. A zone-less column holding UTC, such as a
+Rails C<datetime>, must declare C<< storage => 'naive_utc' >> (see
+L<Selecto::Domain/CANONICAL FORMAT>); it then becomes
+C<((column AT TIME ZONE 'UTC') AT TIME ZONE $zone)>, so selections, filters,
+calendar formats, buckets and date shortcuts see the same local time as for a
+zone-aware column. Without the hint, C<AT TIME ZONE> would read the UTC wall
+time as local time in C<$zone> and shift every value the wrong way.
+
 =head2 for_share
 
   my $eligible = $engine->query->where(...)->for_share;

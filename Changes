@@ -5,3 +5,10 @@ Revision history for Selecto
       governed actions, and database adapters for PostgreSQL, MySQL,
       MariaDB, SQL Server, SQLite, and DuckDB.
     - Licensed under the Artistic License 2.0.
+    - utc_datetime columns accept "storage": "naive_utc" for zone-less
+      timestamps that hold UTC (Rails datetime columns). On PostgreSQL and
+      DuckDB such a column is read as (column AT TIME ZONE 'UTC') wherever
+      it is used as an instant: under use_timezone and in the iso8601,
+      rfc3339_millis, epoch and timezone_offset formats. Other adapters
+      accept the hint and compile as before. Domain::field_storage reports
+      it.

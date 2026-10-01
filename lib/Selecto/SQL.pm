@@ -916,7 +916,8 @@ sub _group_expression_key {
     # another zone. Those are different expressions, as are correlated roots.
     return _value_key([
         "$domain", $self->_root_alias, $self->{_timezone},
-        $self->{_suppress_field_timezone} ? 1 : 0, $expression,
+        $self->{_suppress_field_timezone} ? 1 : 0,
+        $self->{_instant_fields} ? 1 : 0, $expression,
     ]);
 }
 
@@ -1587,9 +1588,16 @@ sub _field_sql {
         );
         $sql = "COALESCE($sql, $key_sql)";
     }
-    return $sql unless defined($self->{_timezone})
+    my $localize = defined($self->{_timezone})
         && ($resolved->{type} eq 'utc_datetime' || $resolved->{type} eq 'epoch_datetime')
         && !$self->{_suppress_field_timezone};
+    # A naive column holding UTC becomes a true instant wherever the value is
+    # used as one: before a zone conversion, and in instant formats.
+    $sql = $self->_compile_naive_utc_instant_sql($sql)
+        if $resolved->{type} eq 'utc_datetime'
+        && ($localize || $self->{_suppress_field_timezone} || $self->{_instant_fields})
+        && ($domain->field_storage($path) // '') eq 'naive_utc';
+    return $sql unless $localize;
     return $self->_compile_timezone_sql(
         $sql, $resolved->{type}, $self->{_timezone}, $params,
     );
@@ -1710,6 +1718,8 @@ sub _compile_value_expression {
         } @arguments) . ')';
     }
     if ($operator eq 'cast') {
+        # Casting to an instant reads naive-UTC columns as instants.
+        local $self->{_instant_fields} = $self->{_instant_fields} || $arguments[1] eq q{utc_datetime};
         return 'CAST(' . $self->_compile_value_expression($domain, $arguments[0], $params)
             . ' AS ' . $self->_value_type_sql($arguments[1]) . ')';
     }
@@ -2173,6 +2183,14 @@ sub _dbi_error {
 sub _compile_dialect_expression {
     my ($self, $domain, $expression, $params) = @_;
     Selecto::Error->throw('invalid_query', 'expression is not supported by this SQL dialect');
+}
+
+# A utc_datetime column declared storage naive_utc holds UTC wall time without
+# a zone. Dialects with zone-aware timestamps turn it into an instant here;
+# the others store every timestamp naive and leave it unchanged.
+sub _compile_naive_utc_instant_sql {
+    my ($self, $sql) = @_;
+    return $sql;
 }
 
 sub _compile_timezone_sql {
