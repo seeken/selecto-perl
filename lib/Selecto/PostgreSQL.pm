@@ -575,6 +575,17 @@ sub _decode {
     return $value;
 }
 
+
+# A raw BEGIN leaves AutoCommit on, but the server still reports the
+# transaction: pg_ping answers 3 (idle in a transaction) or 4 (in a failed
+# one). Asked only when AutoCommit is on.
+sub _server_transaction_open {
+    my ($self) = @_;
+    my $status = eval { $self->{dbh}->pg_ping };
+    return undef unless defined($status) && $status > 0;
+    return $status >= 3 ? 1 : 0;
+}
+
 1;
 
 __END__

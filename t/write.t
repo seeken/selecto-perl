@@ -26,8 +26,9 @@ my $existing_transaction_adapter = Selecto::PostgreSQL->new(
     dbh => $existing_transaction_dbh,
 );
 $existing_transaction_adapter->execute_write_unsafe($command);
-is_deeply $existing_transaction_dbh->events, ['COMMIT'],
-    'managed writes reuse an already-open DBI transaction without begin_work noise';
+is_deeply $existing_transaction_dbh->events,
+    ['SAVEPOINT selecto_write_1', 'RELEASE SAVEPOINT selecto_write_1'],
+    'managed writes inside an open DBI transaction use a savepoint and never commit the host transaction';
 
 my $failed_write_dbh = TestSelecto::DBH->new({
     execute_error => 'invalid input syntax for type date',

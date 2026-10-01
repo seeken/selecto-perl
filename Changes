@@ -12,3 +12,18 @@ Revision history for Selecto
       rfc3339_millis, epoch and timezone_offset formats. Other adapters
       accept the hint and compile as before. Domain::field_storage reports
       it.
+    - Managed writes no longer commit or roll back a transaction the host
+      opened. When the DBI handle is inside a transaction (AutoCommit off
+      after begin_work, an AutoCommit => 0 handle, or a raw BEGIN the
+      server reports on PostgreSQL, MySQL/MariaDB or SQL Server) a write,
+      batch or graph runs in a savepoint (SAVEPOINT selecto_write_N /
+      RELEASE, ROLLBACK TO SAVEPOINT on failure; SAVE TRANSACTION on SQL
+      Server): it commits or rolls back with the host, a failed write
+      undoes only itself, and a PostgreSQL transaction stays usable. The
+      host now commits an AutoCommit => 0 handle itself. DuckDB has no
+      savepoints and refuses such a write with invalid_adapter. A
+      transaction that failed to begin is no longer rolled back, begin,
+      commit and savepoint failures are Selecto errors, and DuckDB now
+      honours transaction_mode => 'external'.
+    - SQL adapters accept transaction_handler, a code reference that runs
+      each managed write in the host's own transaction API.

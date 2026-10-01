@@ -81,6 +81,21 @@ sub _compile_related_collection_sql {
     );
 }
 
+
+# DBD::SQLite begins an AutoCommit => 0 handle's transaction lazily, before
+# the next statement, but not before a SAVEPOINT. SQLite would then treat the
+# savepoint as a transaction of its own and RELEASE would commit it, past the
+# host's rollback. A plain statement first opens the host's transaction; it
+# changes nothing when the transaction is already open.
+sub _savepoint_command {
+    my ($self, $action, $name) = @_;
+    if ($action eq 'create') {
+        defined($self->dbh->do('SELECT 1'))
+            or die Selecto::SQL::_dbi_error($self->dbh, 'database transaction could not begin');
+    }
+    return $self->SUPER::_savepoint_command($action, $name);
+}
+
 1;
 
 __END__

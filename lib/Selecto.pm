@@ -166,8 +166,8 @@ loaded lazily by L</adapter>.
 Builds the adapter registered under C<$name> in the default
 L<Selecto::Adapter::Registry>, passing C<%args> to its constructor. Every SQL
 adapter takes C<dbh> (a connected DBI handle you own) and
-C<transaction_mode> (C<managed>, the default, or C<external>); see
-L<Selecto::SQL>. Throws C<unknown_adapter> for an unregistered name and
+C<transaction_mode> (C<managed>, the default, or C<external>) and an optional
+C<transaction_handler>; see L<Selecto::SQL>. Throws C<unknown_adapter> for an unregistered name and
 C<invalid_adapter> when the module cannot be loaded or no handle is given.
 
 =head2 available_adapters

@@ -86,6 +86,20 @@ sub _related_collection_text_sql {
     return "CAST($sql AS CHAR)";
 }
 
+
+# MySQL 5.7+ and MariaDB report a transaction opened by a raw START
+# TRANSACTION in @@in_transaction; without it the answer is unknown. Asked
+# only when AutoCommit is on.
+sub _server_transaction_open {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    my ($value) = eval {
+        local $dbh->{PrintError} = 0;
+        $dbh->selectrow_array('SELECT @@in_transaction');
+    };
+    return defined($value) && "$value" =~ /\A[01]\z/ ? 0 + $value : undef;
+}
+
 1;
 
 __END__

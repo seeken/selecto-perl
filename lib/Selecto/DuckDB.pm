@@ -441,21 +441,28 @@ sub _related_collection_text_sql {
     return "CAST($sql AS VARCHAR)";
 }
 
-sub _transaction {
-    my ($self, $operation) = @_;
-    my $value;
-    my $ok = eval {
-        $self->dbh->do('BEGIN');
-        $value = $operation->();
-        $self->dbh->do('COMMIT');
-        1;
-    };
-    if (!$ok) {
-        my $error = $@;
-        eval { $self->dbh->do('ROLLBACK') };
-        die $error;
-    }
-    return $value;
+# DuckDB's own BEGIN, COMMIT and ROLLBACK statements control a managed
+# write. A BEGIN that fails (the host opened a transaction with raw SQL) is
+# not rolled back.
+sub _begin_transaction    { return $_[0]->_transaction_statement('BEGIN'); }
+sub _commit_transaction   { return $_[0]->_transaction_statement('COMMIT'); }
+sub _rollback_transaction { return $_[0]->_transaction_statement('ROLLBACK'); }
+
+sub _transaction_statement {
+    my ($self, $sql) = @_;
+    defined($self->dbh->do($sql))
+        or die Selecto::SQL::_dbi_error($self->dbh, "database $sql failed");
+    return;
+}
+
+# DuckDB has no savepoints, so a managed write cannot run inside a
+# transaction the host holds open without committing or discarding the
+# host's work. It is refused instead.
+sub _savepoint_transaction {
+    Selecto::Error->throw(
+        'invalid_adapter',
+        'DuckDB has no savepoints; inside an open transaction use transaction_mode external',
+    );
 }
 
 1;
@@ -482,6 +489,11 @@ operations, C<ROLLUP>, streaming, computed value expressions and
 C<json_text>, and writes with C<RETURNING> and write graphs. Lateral joins,
 JSON and array rowsets, array predicates, full-text search and row locks fail
 closed.
+
+DuckDB has no savepoints. A managed write on a handle with C<AutoCommit> off
+fails with C<invalid_adapter> instead of committing or discarding the host's
+work; use C<< transaction_mode => 'external' >> there (see
+L<Selecto::SQL/transaction_mode>).
 
 DBD::DuckDB 0.16 decodes some timestamps and decimals inexactly and infers
 numeric-looking strings as floating point. The adapter works around this
