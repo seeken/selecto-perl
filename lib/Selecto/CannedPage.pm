@@ -376,7 +376,14 @@ sub run {
     _fail('page engine uses a different domain')
         unless blessed($engine) && $engine->can('domain') && $engine->can('all')
             && $engine->domain->fingerprint eq $self->domain->fingerprint;
-    $engine->assert_tenant_boundary(access => 'read', host_predicate => $scope) if $engine->isa('Selecto::Engine');
+    # Every engine answers for the tenant boundary, not only Selecto::Engine:
+    # an engine that cannot assert it may not read a tenant_field domain.
+    if ($engine->can('assert_tenant_boundary')) {
+        $engine->assert_tenant_boundary(access => 'read', host_predicate => $scope);
+    } elsif (defined(my $field = $self->domain->tenant_field)) {
+        Selecto::Error->throw('missing_tenant_scope', 'trusted tenant scope is required',
+            {tenant_field => "$field"});
+    }
     my $plan = $self->plan($input, $scope);
     my $query_started = time;
     my $rows = $engine->all($plan->{query});
@@ -483,52 +490,16 @@ sub _refuse_withheld_fields {
         }
     };
     $check->('dataset', 'entity_key', $key);
-    $check->('dataset', 'query', _field_references($base->predicate));
+    $check->('dataset', 'query', Selecto::Expression->field_references($base->predicate));
     for my $view (@$views) {
         my $query = $view->{query};
-        $check->('view', $view->{id}, map { _field_references($_) }
+        $check->('view', $view->{id}, map { Selecto::Expression->field_references($_) }
             @{$query->selections}, @{$query->groups}, map { $_->[0] } @{$query->orders});
     }
     for my $control (@$controls) {
         $check->('control', $control->{id}, $control->{field},
             (defined($control->{label_field}) ? $control->{label_field} : ()));
     }
-}
-
-# Every field path an expression reads, in argument order: field operands,
-# value-expression dependencies and related-collection children (whose
-# named fields, filters and orderings are relative to the association;
-# expression fields carry full paths).
-sub _field_references {
-    my ($value) = @_;
-    if (blessed($value) && $value->isa('Selecto::Expression')) {
-        my ($kind, $arguments) = ($value->kind, $value->arguments);
-        return ($arguments->[0]) if $kind eq 'field';
-        return () if $kind eq 'literal';
-        if ($kind eq 'value') {
-            require Selecto::ValueExpression;
-            return Selecto::ValueExpression->dependencies($arguments->[0]);
-        }
-        if ($kind eq 'related_collection') {
-            my ($association, $fields, $options) = @$arguments;
-            $options = {} unless ref($options) eq 'HASH';
-            return (
-                (map {
-                    !ref($_) ? "$association.$_"
-                        # A nested collection's association is relative to this one.
-                        : $_->{expression}->kind eq 'related_collection'
-                            ? (map { "$association.$_" } _field_references($_->{expression}))
-                        : _field_references($_->{expression})
-                } @{ref($fields) eq 'ARRAY' ? $fields : []}),
-                (map { "$association.$_->[0]" }
-                    @{$options->{filters} // []}, @{$options->{order_by} // []}),
-            );
-        }
-        return map { _field_references($_) } @$arguments;
-    }
-    return map { _field_references($_) } @$value if ref($value) eq 'ARRAY';
-    return map { _field_references($value->{$_}) } sort keys %$value if ref($value) eq 'HASH';
-    return ();
 }
 
 sub _query { blessed($_[0]) && $_[0]->isa('Selecto::Query') }
@@ -698,7 +669,9 @@ C<rows>, C<columns>, C<total> (distinct matching entities), C<has_more>,
 C<facets>, the normalized C<state>, the C<view> and C<elapsed_ms>. The engine
 must use the page's domain. C<$scope_predicate> is an optional
 L<Selecto::Expression> added to every query; on a tenant-field domain the
-page requires a tenant boundary (C<missing_tenant_scope>).
+page requires a tenant boundary (C<missing_tenant_scope>), which an engine
+other than L<Selecto::Engine> must assert through its own
+C<assert_tenant_boundary>.
 
 State keys: C<view>, C<filters> (by control id), C<page> (1 to 100000),
 C<limit> (1 to 100, default 25), C<facet_search> (prefix search for

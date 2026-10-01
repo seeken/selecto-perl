@@ -85,6 +85,13 @@ sub _compile_expression {
     return $self->SUPER::_compile_expression($domain, $expression, $params, $selections);
 }
 
+# SQL Server also reads [ as the start of a character class.
+sub _escape_like {
+    my ($self, $text) = @_;
+    $text =~ s/([!%_\[])/!$1/g;
+    return $text;
+}
+
 sub _decimal_field {
     my ($self, $domain, $expression) = @_;
     return 0 unless blessed($expression) && $expression->isa('Selecto::Expression')
@@ -161,11 +168,16 @@ sub _compile_write {
         'target.' . $field . ' = source.' . $field
     } @$updates;
 
+    # Each branch carries the foreign-key guard (TW-05), bound once per branch.
+    my $matched_guard = $self->_compile_foreign_key_guards($command, \@params);
+    my $insert_guard = $self->_compile_foreign_key_guards($command, \@params);
     my $sql = 'MERGE INTO ' . $self->quote_identifier($relation) . ' WITH (HOLDLOCK) AS target ' .
         'USING (VALUES (' . join(', ', @values) . ')) AS source (' . join(', ', @quoted) . ') ' .
         'ON ' . join(' AND ', @matches) . ' ' .
-        'WHEN MATCHED THEN UPDATE SET ' . join(', ', @sets) . ' ' .
-        'WHEN NOT MATCHED THEN INSERT (' . join(', ', @quoted) . ') VALUES (' . join(', ', @source) . ');';
+        'WHEN MATCHED' . (defined($matched_guard) ? " AND $matched_guard" : '') .
+        ' THEN UPDATE SET ' . join(', ', @sets) . ' ' .
+        'WHEN NOT MATCHED' . (defined($insert_guard) ? " AND $insert_guard" : '') .
+        ' THEN INSERT (' . join(', ', @quoted) . ') VALUES (' . join(', ', @source) . ');';
     # Keep the shared returning validation on the specialized MERGE path.
     # SQL Server does not yet implement the portable returning contract; never
     # execute a mutation while silently dropping requested result fields.

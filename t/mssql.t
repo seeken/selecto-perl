@@ -62,6 +62,17 @@ for my $returning ([], ['id']) {
     }
 }
 
+# S17/INJ-06: SQL Server reads [ in a LIKE pattern as a character class, so
+# it is escaped with the other wildcards; other dialects keep it literal.
+for my $kind (qw(starts_with starts_with_ci text_contains text_contains_ci ends_with ends_with_ci)) {
+    my $like = $engine->compile($engine->query->select('id')->where(Selecto::Expression->$kind('name', '[a-z]%_!')));
+    like($like->sql, qr/ LIKE (?:LOWER\()?\?\)? ESCAPE '!'\z/, "SQL Server $kind declares the escape character");
+    like($like->params->[0], qr/\A%?!\[a-z\]!%!_!!%?\z/, "SQL Server $kind binds [ as a literal");
+}
+my $sqlite = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => TestSelecto::DBH->new)));
+is($sqlite->compile($sqlite->query->select('id')->where(Selecto::Expression->starts_with('name', '[a]')))->params->[0],
+    '[a]%', 'dialects without bracket classes leave [ unescaped');
+
 is($adapter->_decode('1234567890123456789012345678.90', DBI::SQL_NUMERIC()), '1234567890123456789012345678.9', 'SQL Server preserves an exact high-precision decimal string');
 is($adapter->_decode('2024-02-01 09:15:00.0000000', DBI::SQL_TYPE_TIMESTAMP()), '2024-02-01T09:15:00', 'SQL Server normalizes datetime2 values');
 

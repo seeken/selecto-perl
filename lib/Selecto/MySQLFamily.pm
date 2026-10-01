@@ -32,6 +32,30 @@ sub supports {
     return "$feature" eq 'transactions' || "$feature" eq 'stream' ? 1 : 0;
 }
 
+# ON DUPLICATE KEY UPDATE fires on every unique key, not the declared
+# conflict target, so a scoped upsert could update another tenant's row
+# through its primary key. Refuse it, as the Go MySQL adapter does.
+sub _compile_write {
+    my ($self, $command) = @_;
+    Selecto::Error->throw(
+        'unsupported_scope_predicate',
+        'MySQL-family adapters cannot apply write scope predicates to upserts',
+    ) if $command->operation eq 'upsert' && defined $command->scope_predicate;
+    return $self->SUPER::_compile_write($command);
+}
+
+# A WHERE needs FROM DUAL, and a parent read through a derived table may be
+# the updated table itself (MySQL error 1093); LIMIT keeps it materialized.
+sub _guarded_insert_source {
+    my ($self, $values, $guard) = @_;
+    return 'SELECT ' . join(', ', @$values) . " FROM DUAL WHERE $guard";
+}
+
+sub _foreign_key_exists_sql {
+    my ($self, $select) = @_;
+    return 'EXISTS (SELECT 1 FROM (' . $select . ' LIMIT 1) AS ' . $self->quote_identifier('selecto_fk_check') . ')';
+}
+
 sub _compile_upsert_clause {
     my ($self, $conflict, $updates) = @_;
     Selecto::Identifier::checked($_) for @$conflict;
