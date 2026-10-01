@@ -69,6 +69,7 @@ t/action.t
 t/action_forms.t
 t/adapter.t
 t/advanced_query.t
+t/adversarial_hardening.t
 t/analytics_pipeline.t
 t/analytics_unit_registry.t
 t/api.t
@@ -93,6 +94,7 @@ t/duckdb.integration.t
 t/duckdb_result_transport.t
 t/epoch_timezone.t
 t/field_policy.t
+t/foreign_key_tenant_guard.t
 t/files.t
 t/fixtures/data_rules/baseline.cases.json
 t/fixtures/data_rules/baseline.contract.json

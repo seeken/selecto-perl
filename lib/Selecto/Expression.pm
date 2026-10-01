@@ -344,8 +344,13 @@ sub any {
 
 sub not { my ($class, $expression) = @_; return $class->new('not', $expression); }
 
+# Nesting beyond 64 levels is refused, as in the Go core: compile time grows
+# with depth, and no authored filter needs more.
 sub from_filter_ast {
-    my ($class, $filter) = @_;
+    my ($class, $filter, $depth) = @_;
+    $depth //= 0;
+    Selecto::Error->throw('invalid_query', 'filter expression is nested too deeply')
+        if $depth > 64;
     Selecto::Error->throw('invalid_query', 'filter expression must be a non-empty array')
         unless ref($filter) eq 'ARRAY' && @$filter;
     my ($operator, @arguments) = @$filter;
@@ -358,13 +363,13 @@ sub from_filter_ast {
             ? $arguments[0] : \@arguments;
         Selecto::Error->throw('invalid_query', "$operator filter requires expressions")
             unless @$items;
-        my @expressions = map { $class->from_filter_ast($_) } @$items;
+        my @expressions = map { $class->from_filter_ast($_, $depth + 1) } @$items;
         return $operator eq 'and' ? $class->all(\@expressions) : $class->any(\@expressions);
     }
     if ($operator eq 'not') {
         Selecto::Error->throw('invalid_query', 'not filter requires one expression')
             unless @arguments == 1;
-        return $class->not($class->from_filter_ast($arguments[0]));
+        return $class->not($class->from_filter_ast($arguments[0], $depth + 1));
     }
 
     my ($field, $value, $end) = @arguments;
@@ -419,6 +424,43 @@ sub from_filter_ast {
         $right = $class->literal($value);
     }
     return $class->can($operator)->($class, $field, $right);
+}
+
+# Every field path an expression reads, in argument order: field operands,
+# value-expression dependencies and related-collection children (whose
+# named fields, filters and orderings are relative to the association;
+# expression fields carry full paths). Arrays and hashes of expressions are
+# walked in order.
+sub field_references {
+    my ($class, $value) = @_;
+    if (blessed($value) && $value->isa('Selecto::Expression')) {
+        my ($kind, $arguments) = ($value->kind, $value->arguments);
+        return ($arguments->[0]) if $kind eq 'field';
+        return () if $kind eq 'literal';
+        if ($kind eq 'value') {
+            require Selecto::ValueExpression;
+            return Selecto::ValueExpression->dependencies($arguments->[0]);
+        }
+        if ($kind eq 'related_collection') {
+            my ($association, $fields, $options) = @$arguments;
+            $options = {} unless ref($options) eq 'HASH';
+            return (
+                (map {
+                    !ref($_) ? "$association.$_"
+                        # A nested collection's association is relative to this one.
+                        : $_->{expression}->kind eq 'related_collection'
+                            ? (map { "$association.$_" } $class->field_references($_->{expression}))
+                        : $class->field_references($_->{expression})
+                } @{ref($fields) eq 'ARRAY' ? $fields : []}),
+                (map { "$association.$_->[0]" }
+                    @{$options->{filters} // []}, @{$options->{order_by} // []}),
+            );
+        }
+        return map { $class->field_references($_) } @$arguments;
+    }
+    return map { $class->field_references($_) } @$value if ref($value) eq 'ARRAY';
+    return map { $class->field_references($value->{$_}) } sort keys %$value if ref($value) eq 'HASH';
+    return ();
 }
 
 sub _filter_field {
@@ -590,7 +632,18 @@ segments, computed predicate columns and API clients:
   ['json_contains', FIELD, {DOCUMENT}]
 
 A comparison VALUE may be C<['field', PATH]> to compare two fields. Field
-names must be dotted identifiers; anything else throws C<invalid_query>.
+names must be dotted identifiers; anything else throws C<invalid_query>, as
+does nesting C<and>, C<or> and C<not> more than 64 levels deep.
+
+=head2 field_references
+
+  my @paths = Selecto::Expression->field_references($expression_or_list);
+
+Every field path an expression reads, in argument order: field operands,
+the dependencies of computed values and the children, filters and orderings
+of related collections (prefixed with their association). Literals add
+nothing. Public surfaces use it to refuse expressions that read a field the
+domain withholds (L<Selecto::Domain/field_is_public>).
 
 =head1 AGGREGATES
 

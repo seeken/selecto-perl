@@ -2,7 +2,8 @@ package Selecto::SQL;
 
 use Mojo::Base 'Selecto::Adapter';
 use JSON::PP ();
-use Scalar::Util qw(blessed);
+use Digest::SHA qw(sha1_hex);
+use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
@@ -240,6 +241,7 @@ sub _compile_single {
     my $groups = $query->groups;
     local $self->{_group_expression_sql} = {};
     local $self->{_group_expression_params} = \@params;
+    local $self->{_group_expression_digests} = {};
     if ($self->_reuses_parameter_identity) {
         # Compile governed group expressions before their consumers. This also
         # handles GROUPING before its dimension, unselected sort keys, and a
@@ -963,8 +965,34 @@ sub _group_expression_key {
     return _value_key([
         "$domain", $self->_root_alias, $self->{_timezone},
         $self->{_suppress_field_timezone} ? 1 : 0,
-        $self->{_instant_fields} ? 1 : 0, $expression,
+        $self->{_instant_fields} ? 1 : 0,
+        _expression_digest($expression, $self->{_group_expression_digests} // {}),
     ]);
+}
+
+# A structural digest of an expression. Each node's digest covers its kind
+# and its children's digests, memoized by node for one compile, so keying
+# every node of a tree costs time linear in its size; _value_key over each
+# subtree grew with size times depth. The memo holds each node it keys, so a
+# temporary expression freed during the compile cannot hand its address,
+# and so its digest, to another.
+sub _expression_digest {
+    my ($expression, $memo) = @_;
+    my $entry = $memo->{refaddr $expression} //= [$expression, sha1_hex(
+        $expression->kind . ':' . _digest_value($expression->arguments, $memo),
+    )];
+    return $entry->[1];
+}
+
+sub _digest_value {
+    my ($value, $memo) = @_;
+    return 'e:' . _expression_digest($value, $memo)
+        if blessed($value) && $value->isa('Selecto::Expression');
+    return 'a:[' . join(',', map { _digest_value($_, $memo) } @$value) . ']'
+        if ref($value) eq 'ARRAY';
+    return 'h:{' . join(',', map { _value_key($_) . '=' . _digest_value($value->{$_}, $memo) } sort keys %$value) . '}'
+        if ref($value) eq 'HASH';
+    return _value_key($value);
 }
 
 sub _value_key {
@@ -993,11 +1021,19 @@ sub _selection_name {
     return $expression->kind;
 }
 
+# Escapes LIKE wildcards with '!', the ESCAPE character every dialect declares.
+sub _escape_like {
+    my ($self, $text) = @_;
+    $text =~ s/([!%_])/!$1/g;
+    return $text;
+}
+
 sub _compile_expression {
     my ($self, $domain, $expression, $params, $compiled_selections) = @_;
     Selecto::Error->throw('invalid_query', 'expected an expression')
         unless blessed($expression) && $expression->isa('Selecto::Expression');
-    if (defined($self->{_group_expression_params}) && $self->{_group_expression_params} == $params) {
+    if (defined($self->{_group_expression_params}) && $self->{_group_expression_params} == $params
+        && %{$self->{_group_expression_sql}}) {
         my $key = $self->_group_expression_key($domain, $expression);
         return $self->{_group_expression_sql}{$key} if exists $self->{_group_expression_sql}{$key};
     }
@@ -1038,7 +1074,7 @@ sub _compile_expression {
         my $text = $literal->arguments->[0];
         Selecto::Error->throw('invalid_query', "$kind requires a literal string value")
             if !defined($text) || ref($text);
-        $text =~ s/([!%_])/!$1/g;
+        $text = $self->_escape_like($text);
         my $field_sql = $self->_compile_expression($domain, $arguments->[0], $params);
         push @$params, $kind =~ /\Atext_contains/ ? "%$text%"
             : $kind =~ /\Aends_with/ ? "%$text" : "$text%";
@@ -1966,9 +2002,15 @@ sub _compile_write {
         my @values = map {
             $self->_compile_assignment_value($assignments->{$_}, \@params, $operation, 1)
         } @fields;
+        # A guarded row is inserted through a SELECT that yields it only when
+        # every referenced parent belongs to the trusted tenant (TW-05).
+        my $guard = $self->_compile_foreign_key_guards($command, \@params);
+        Selecto::Error->throw('invalid_write', 'a guarded insert cannot assign DEFAULT')
+            if defined($guard) && grep { $_ eq 'DEFAULT' } @values;
         my $sql = 'INSERT INTO ' . $self->quote_identifier($relation) .
             ' (' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @fields) . ')' .
-            ' VALUES (' . join(', ', @values) . ')';
+            (defined($guard) ? ' ' . $self->_guarded_insert_source(\@values, $guard)
+                : ' VALUES (' . join(', ', @values) . ')');
         if ($operation eq 'upsert') {
             my $metadata = $command->metadata;
             my $conflict = $metadata->{conflict_target};
@@ -1997,6 +2039,8 @@ sub _compile_write {
             ),
             \@params,
         );
+        my $guard = $self->_compile_foreign_key_guards($command, \@params);
+        $predicate .= " AND $guard" if defined $guard;
         return $self->_append_returning('UPDATE ' . $self->quote_identifier($relation) . ' SET ' . join(', ', @set) . " WHERE $predicate", \@params, $command);
     }
     if ($operation eq 'delete') {
@@ -2012,6 +2056,40 @@ sub _compile_write {
         return $self->_append_returning('DELETE FROM ' . $self->quote_identifier($relation) . " WHERE $predicate", \@params, $command);
     }
     Selecto::Error->throw('invalid_write', "unsupported operation $operation");
+}
+
+# TW-05: one EXISTS per foreign-key guard, ANDed; undef without guards. The
+# parent's columns are qualified by an alias so a column missing from it
+# fails instead of resolving to the written row, and the referenced value and
+# trusted tenants are bound.
+sub _compile_foreign_key_guards {
+    my ($self, $command, $params) = @_;
+    my @guards = @{$command->foreign_key_guards};
+    return undef unless @guards;
+    my $alias = $self->quote_identifier('selecto_fk_parent');
+    return join ' AND ', map {
+        my $guard = $_;
+        Selecto::Error->throw('invalid_write', 'foreign-key guard must name its parent and tenants')
+            unless ref($guard) eq 'HASH' && defined($guard->{value}) && !ref($guard->{value})
+                && ref($guard->{tenants}) eq 'ARRAY' && @{$guard->{tenants}}
+                && !grep { !defined($_) || ref($_) } @{$guard->{tenants}};
+        push @$params, $guard->{value};
+        my $value = $self->placeholder(scalar @$params);
+        my @tenants = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$guard->{tenants}};
+        $self->_foreign_key_exists_sql(
+            'SELECT 1 FROM ' . $self->quote_identifier(Selecto::Identifier::checked($guard->{relation})) . " AS $alias"
+            . " WHERE $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{target_field})) . " = $value"
+            . " AND $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{tenant_field}))
+            . (@tenants == 1 ? " = $tenants[0]" : ' IN (' . join(', ', @tenants) . ')'),
+        );
+    } @guards;
+}
+
+sub _foreign_key_exists_sql { return "EXISTS ($_[1])"; }
+
+sub _guarded_insert_source {
+    my ($self, $values, $guard) = @_;
+    return 'SELECT ' . join(', ', @$values) . " WHERE $guard";
 }
 
 sub _insert_candidate {
@@ -2162,6 +2240,8 @@ sub _execute_compiled_write_in_transaction {
             my @row = $sth->fetchrow_array;
             die _dbi_error($sth, 'database returning fetch failed')
                 if !@row && eval { $sth->err };
+            # A guarded write that yields no row was refused by its guard.
+            _guarded_cardinality($command, 0) if !@row && @{$command->foreign_key_guards};
             Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
             @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row);
             # RETURNING emits one row per affected row. Some DBI drivers report
@@ -2182,7 +2262,18 @@ sub _execute_compiled_write_in_transaction {
             actual => $affected,
         });
     }
+    # Without an expected count, a guarded write that changed nothing is still
+    # refused rather than reported as an empty success.
+    _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
     return Selecto::Write::Result->new(operation => $command->operation, affected_rows => $affected, values => \%values);
+}
+
+sub _guarded_cardinality {
+    my ($command, $affected) = @_;
+    Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows', {
+        expected => $command->expected_count // 'at least 1',
+        actual => $affected,
+    });
 }
 
 sub _transaction {

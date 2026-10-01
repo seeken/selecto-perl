@@ -48,7 +48,7 @@ sub consume {
     my $record = blessed($grant) && $grant->isa(__PACKAGE__) ? $GRANTS{refaddr $grant} : undef;
     Selecto::Error->throw('action_grant_invalid', 'action grant is unknown, used, or expired')
         unless $record && !$record->{used}
-            && (!defined($record->{expires_at}) || Time::HiRes::time() < $record->{expires_at});
+            && defined($record->{expires_at}) && Time::HiRes::time() < $record->{expires_at};
     for my $key (qw(phase plan domain tenant actor)) {
         my ($have, $want) = ($record->{$key}, $expected{$key});
         next if !defined($have) && !defined($want);
@@ -90,10 +90,11 @@ L<Selecto::Engine/grant_action> and are bound to the phase, a digest of the
 plan's content, the domain fingerprint, the engine's trusted tenant and the
 context's actor.
 
-A grant works once and only before it expires. Using it with a different
-binding fails with C<action_grant_mismatch> and revokes it; a used, revoked,
-expired or forged grant fails with C<action_grant_invalid>. A denied
-capability issues no grant.
+A grant works once and only before it expires: five minutes after it is
+issued unless C<expires_in> sets another lifetime of at most 3600 seconds.
+Using it with a different binding fails with C<action_grant_mismatch> and
+revokes it; a used, revoked, expired or forged grant fails with
+C<action_grant_invalid>. A denied capability issues no grant.
 
 Grants are opaque in-process objects: the record of what was issued lives in
 the Perl process that issued it, so a grant cannot be serialized, stored or

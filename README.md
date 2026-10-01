@@ -440,6 +440,14 @@ my $external = Selecto->adapter(postgresql => (
   one that reads an association field refuses all writes
   (`query_rule_unsupported_field`), and any required predicate refuses
   upserts.
+- A tenant-scoped write may only reference a parent row of its own tenant.
+  Foreign keys declared under `writes.constraints.foreign_keys` and the owner
+  keys of to-one associations are checked inside the write statement; a
+  reference to a relation whose tenancy the domain does not record fails
+  closed (`foreign_key_tenant_scope_undeclared`) until you declare
+  `references.tenant_field` (`false` for a shared lookup table), the target
+  schema's `tenant_field`, or association scope keys. See
+  `perldoc Selecto::Engine`, "References to other tenants' rows".
 - The public surfaces (`Selecto::API::EngineHandler`, `Selecto::CannedPage`,
   `Selecto::CoDomain`) fail closed with `missing_tenant_scope` when a domain
   declares a tenant field but the engine carries no tenant boundary.

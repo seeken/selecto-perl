@@ -288,6 +288,10 @@ sub query ($self, $engine, $body) {
         my %seen;
         @segments = grep { !$seen{$_}++ } @segments;
         $query = $engine->apply_segments($query, \@segments, $parameters);
+        # Segments are not permission to filter on an internal field either:
+        # with a parameter, a caller could probe its value. They are the only
+        # predicate so far (the required predicate is added when compiling).
+        _public_field_definition($domain, $_) for Selecto::Expression->field_references($query->predicate);
     } elsif (keys %$parameters) {
         Selecto::Error->throw(
             'invalid_api_query',
@@ -307,9 +311,11 @@ sub query ($self, $engine, $body) {
     }
 
     if (defined $named_ordering) {
-        $query = $engine->apply_ordering(
-            $query, _required_string($named_ordering, 'ordering'),
-        );
+        my $ordering = _required_string($named_ordering, 'ordering');
+        # Sorting by an internal field would reveal its order.
+        _public_field_definition($domain, $_->[0])
+            for @{Selecto::QueryLibrary->ordering_entries($domain, $ordering)};
+        $query = $engine->apply_ordering($query, $ordering);
     } elsif (exists $body->{order_by}) {
         my $orders = $body->{order_by};
         Selecto::Error->throw('invalid_api_query', 'order_by must be an array')
@@ -691,6 +697,20 @@ sub _filters ($self, $domain, $filters) {
                 $filter, $operator, $definition,
                 Selecto::Expression->field($conditional->{absent_field}),
             );
+            # A choice filter may read internal fields, but only through the
+            # choices the domain declares: any other value, or a null test,
+            # would probe their values.
+            if (grep { !$domain->field_is_public($conditional->{$_}) }
+                qw(when_field present_field absent_field)) {
+                my %declared = map { ("$_->{value}" => 1) } @{$choice->{choices} // []};
+                my @values = $operator =~ /\A(?:in|not_in)\z/
+                    ? @{$filter->{value}} : ($filter->{value});
+                Selecto::Error->throw(
+                    'field_not_public', 'Filter value is not a declared choice',
+                    {field => "$field"},
+                ) if $operator =~ /\A(?:is_null|not_null)\z/
+                    || grep { !defined($_) || ref($_) || !$declared{"$_"} } @values;
+            }
             my $when = Selecto::Expression->field($conditional->{when_field});
             push @expressions, Selecto::Expression->any([
                 Selecto::Expression->all([
@@ -1046,8 +1066,13 @@ operator and query-library name against that engine's domain.
 
 Only public fields are accepted. Columns marked C<internal> and fields
 listed in C<redact_fields> cannot be selected, filtered, ordered, assigned
-or returned (C<field_not_public>), at any association depth. Trusted host
-code can still use them directly through the engine.
+or returned (C<field_not_public>), at any association depth. Query-library
+names are no exception: a requested segment (or a view's segment) that reads
+such a field, or an ordering that sorts by one, fails the same way. A
+C<components.filter_choices> conditional filter whose fields are not all
+public accepts only its declared choice values and no null test. Trusted
+host code, the domain's required predicate and C<required_order_by> can
+still use withheld fields directly through the engine.
 
 Both entry points fail with C<missing_tenant_scope> when the domain has a
 tenant field but the engine has no tenant boundary; see

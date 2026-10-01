@@ -21,6 +21,52 @@ Unreleased
       ("view list references redacted field secret_token") and details
       carry {field, view | control | dataset}. Previously such a page ran
       and showed the field.
+    - Security: Selecto::CannedPage->run asserts the tenant boundary for
+      every engine, not only a Selecto::Engine. An engine without
+      assert_tenant_boundary is refused (missing_tenant_scope) on a
+      tenant_field domain; previously a delegating engine skipped the check
+      and read every tenant.
+    - Security: action grants expire 300 seconds after grant_action unless
+      expires_in says otherwise, and expires_in may not exceed 3600
+      (invalid_action_grant). Previously a grant without expires_in never
+      expired.
+    - Security: the API query handler refuses (field_not_public) a
+      requested or view segment that reads an internal or redacted field and
+      a named ordering that sorts by one. A components.filter_choices
+      conditional filter whose fields are not all public accepts only its
+      declared choice values and no null test.
+    - Security: an update may not set the tenant field to a tenant the
+      domain's required tenant predicate excludes, or to a computed value
+      (tenant_mismatch); previously it could move a row to another tenant
+      when the field was updatable.
+    - Security: MySQL and MariaDB refuse tenant-scoped upserts
+      (unsupported_scope_predicate): ON DUPLICATE KEY UPDATE fires on any
+      unique key, so a primary-key collision could update another tenant's
+      row.
+    - SQL Server escapes [ in starts_with, text_contains and ends_with
+      patterns, so it no longer opens a character class.
+    - Expression->from_filter_ast refuses filters nested more than 64 levels
+      deep (invalid_query).
+    - Read compiles are linear in the size of an expression: grouped
+      expressions are matched through memoized structural digests, and not
+      looked up at all when a query has none. A 7,500-deep predicate took
+      about 110 seconds to compile and now takes under 0.1.
+    - Selecto::Expression->field_references (formerly private to
+      CannedPage) lists every field path an expression reads.
+    - Security (TW-05): a write with trusted tenants (the engine tenant or
+      a required tenant predicate) may only reference a parent row of one of
+      those tenants. References are writes.constraints.foreign_keys
+      (references.tenant_field names the parent's tenant column, or false for
+      a shared relation) and the owner keys of direct to-one associations.
+      Each assigned reference becomes an EXISTS guard in the write statement
+      (insert and upsert through SELECT ... WHERE, update in its WHERE, both
+      MERGE branches on SQL Server); a refused write fails with
+      cardinality_mismatch even without expected_count, the same as a
+      missing parent. A reference whose tenancy the domain does not record
+      fails closed on a tenant-scoped write (invalid_domain,
+      foreign_key_tenant_scope_undeclared). Write::Command carries the
+      guards (foreign_key_guards); the engine sets them on every governed
+      command.
 
 0.2.0  2026-09-30
     - First CPAN release: governed domains, queries, portable writes,

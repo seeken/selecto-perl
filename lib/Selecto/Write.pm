@@ -36,6 +36,7 @@ sub new {
         query_enforcement => $args{query_enforcement},
         expected_count => exists($args{expected_count}) ? $args{expected_count} : 1,
         metadata => { map { ("$_", _clone($metadata->{$_})) } keys %$metadata },
+        foreign_key_guards => _clone($args{foreign_key_guards} // []),
     }, $class;
 }
 
@@ -47,6 +48,9 @@ sub scope_predicate { return $_[0]->{scope_predicate}; }
 sub query_enforcement { return $_[0]->{query_enforcement}; }
 sub expected_count { return $_[0]->{expected_count}; }
 sub metadata       { return { map { ($_ => _clone($_[0]->{metadata}{$_})) } keys %{$_[0]->{metadata}} }; }
+# Existence guards for referenced parent rows. Selecto::Engine sets them while
+# governing a write (TW-05); adapters compile them into the statement.
+sub foreign_key_guards { return _clone($_[0]->{foreign_key_guards}); }
 
 sub with_query_enforcement {
     my ($self, $evidence) = @_;
@@ -59,6 +63,7 @@ sub with_query_enforcement {
         query_enforcement => $evidence,
         expected_count => $self->expected_count,
         metadata => $self->metadata,
+        foreign_key_guards => $self->foreign_key_guards,
     );
 }
 
@@ -73,6 +78,7 @@ sub with_assignments {
         query_enforcement => $self->query_enforcement,
         expected_count => $self->expected_count,
         metadata => $self->metadata,
+        foreign_key_guards => $self->foreign_key_guards,
     );
 }
 
@@ -87,6 +93,7 @@ sub with_scope_predicate {
         query_enforcement => $self->query_enforcement,
         expected_count => $self->expected_count,
         metadata => $self->metadata,
+        foreign_key_guards => $self->foreign_key_guards,
     );
 }
 
@@ -103,6 +110,24 @@ sub with_metadata {
         query_enforcement => $self->query_enforcement,
         expected_count => $self->expected_count,
         metadata => $metadata,
+        foreign_key_guards => $self->foreign_key_guards,
+    );
+}
+
+sub with_foreign_key_guards {
+    my ($self, $guards) = @_;
+    Selecto::Error->throw('invalid_write', 'foreign_key_guards must be an array')
+        unless ref($guards) eq 'ARRAY';
+    return ref($self)->new(
+        operation => $self->operation,
+        relation => $self->relation,
+        assignments => $self->assignments,
+        predicate => $self->predicate,
+        scope_predicate => $self->scope_predicate,
+        query_enforcement => $self->query_enforcement,
+        expected_count => $self->expected_count,
+        metadata => $self->metadata,
+        foreign_key_guards => $guards,
     );
 }
 
@@ -369,10 +394,13 @@ C<write_operation_not_enabled>.
 =head2 Accessors and copies
 
 C<operation>, C<relation>, C<assignments>, C<predicate>,
-C<scope_predicate>, C<query_enforcement>, C<expected_count>, C<metadata>.
-C<with_assignments>, C<with_metadata>, C<with_scope_predicate> and
-C<with_query_enforcement> return modified copies. Commands are never changed
-in place.
+C<scope_predicate>, C<query_enforcement>, C<expected_count>, C<metadata>,
+C<foreign_key_guards>. C<with_assignments>, C<with_metadata>,
+C<with_scope_predicate>, C<with_query_enforcement> and
+C<with_foreign_key_guards> return modified copies. Commands are never changed
+in place. The engine sets C<foreign_key_guards> on every command it governs
+(see L<Selecto::Engine/"References to other tenants' rows">), replacing any
+the caller supplied.
 
 =head1 Selecto::Write::Batch
 

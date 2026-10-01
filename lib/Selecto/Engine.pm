@@ -238,9 +238,10 @@ sub execute_graph {
         tenant_scope  => $self->{domain}->write_tenant_scope,
     });
     my $root_scope = $self->{domain}->write_tenant_scope;
+    my $tenants = $self->_trusted_write_tenants($self->{domain}->required_predicate);
     for my $node (@nodes[1 .. $#nodes]) {
         ($contexts{$node->{id}}, $node->{command}) =
-            $self->_validate_graph_node($node, \%contexts, $root_scope);
+            $self->_validate_graph_node($node, \%contexts, $root_scope, $tenants);
     }
     return $self->_execute_governed(execute_graph => Selecto::Write::Graph->new(nodes => \@nodes));
 }
@@ -306,7 +307,11 @@ sub governed_write {
                 && _has_conjunct($command->query_enforcement->predicate, $required));
     }
     $self->_validate_write_command($command, trusted_field => $scope ? $scope->{field} : undef);
-    return $command;
+    $self->_check_required_tenant_assignment($command, $required, %details);
+    # Set on every governed command, replacing any a caller supplied.
+    return $command->with_foreign_key_guards(_foreign_key_guards(
+        _domain_references($self->{domain}), $command, $self->_trusted_write_tenants($required), %details,
+    ));
 }
 
 # Every required predicate guards engine writes, beyond the shared protocol's
@@ -334,6 +339,246 @@ sub required_write_guard {
         { relation => $relation, %details },
     ) if ($operation // '') eq 'upsert';
     return $required;
+}
+
+# The required predicate limits the rows an update matches, not the values it
+# writes. When it carries the tenant boundary, an update may set the tenant
+# field only to a literal tenant the boundary admits, so it cannot move a row
+# to another tenant. Inserts are checked as candidates against the predicate.
+sub _check_required_tenant_assignment {
+    my ($self, $command, $required, %details) = @_;
+    my $field = $self->{domain}->tenant_field;
+    return unless defined($required) && defined($field) && $command->operation eq 'update'
+        && exists($command->assignments->{$field}) && _has_tenant_conjunct($required, $field);
+    my $value = $command->assignments->{$field};
+    $value = $value->kind eq 'literal' ? $value->arguments->[0] : undef
+        if blessed($value) && $value->isa('Selecto::Write::Expression');
+    Selecto::Error->throw(
+        'tenant_mismatch', 'tenant value must match the trusted tenant scope',
+        {relation => $command->relation, field => "$field", %details},
+    ) if !defined($value) || ref($value) || _excludes_tenant($required, $field, $value);
+}
+
+# TW-05: the trusted tenants a write is confined to: the engine tenant, or
+# the tenant values of the domain's required tenant predicate. Undef when the
+# write has no tenant boundary.
+sub _trusted_write_tenants {
+    my ($self, $required) = @_;
+    return [$self->{scope}{tenant}] if defined $self->{scope}{tenant};
+    my $field = $self->{domain}->tenant_field;
+    return undef unless defined($field) && defined($required);
+    my $values;
+    for my $conjunct ($required->kind eq 'and' ? @{$required->arguments->[0] // []} : ($required)) {
+        next unless blessed($conjunct) && $conjunct->isa('Selecto::Expression')
+            && ($conjunct->kind eq 'eq' || $conjunct->kind eq 'in') && _is_tenant_comparison($conjunct, $field);
+        my $argument = $conjunct->arguments->[1];
+        my @allowed = $conjunct->kind eq 'eq' ? ($argument->arguments->[0]) : @$argument;
+        my %allowed = map { ("$_" => 1) } @allowed;
+        $values = $values ? [grep { $allowed{"$_"} } @$values] : [@allowed];
+    }
+    return $values && @$values ? $values : undef;
+}
+
+# The references a relation declares, for the foreign-key tenant guard:
+# writes.constraints.foreign_keys and its direct to-one associations, with
+# what the domain records about each referenced relation's tenancy.
+sub _domain_references {
+    my ($domain) = @_;
+    my $contract = $domain->contract // {};
+    my $schemas = ref($contract->{schemas}) eq 'HASH' ? $contract->{schemas} : {};
+    my $associations = $domain->associations;
+    my $scope = $domain->write_tenant_scope;
+    return {
+        table => $domain->table,
+        primary_key => $domain->primary_key,
+        tenant_field => $scope ? $scope->{field} : $domain->tenant_field,
+        tenant_data => $scope || defined($domain->tenant_field) ? 1 : 0,
+        foreign_keys => _declared_foreign_keys($contract->{writes}),
+        schemas => _schema_tenancy($schemas),
+        associations => [map {
+            my $association = $associations->{$_};
+            my $target = defined($association->queryable) ? $schemas->{$association->queryable} : undef;
+            {
+                name => $_,
+                owner_key => $association->owner_key,
+                related_key => $association->related_key,
+                cardinality => $association->cardinality,
+                table => $association->table,
+                static => defined($association->values) || (ref($target) eq 'HASH' && defined($target->{values})) ? 1 : 0,
+                through => defined($association->through) ? 1 : 0,
+                target_scope_key => $association->target_scope_key,
+                target_tenant_field => ref($target) eq 'HASH' ? $target->{tenant_field} : undef,
+            }
+        } sort keys %$associations],
+    };
+}
+
+# The same description from a raw contract, for a graph child's nested domain.
+sub _contract_references {
+    my ($contract, $table) = @_;
+    $contract = {} unless ref($contract) eq 'HASH';
+    my $source = ref($contract->{source}) eq 'HASH' ? $contract->{source} : {};
+    my $schemas = ref($contract->{schemas}) eq 'HASH' ? $contract->{schemas} : {};
+    my $scope = Selecto::Write::Scope->parse_tenant($contract->{writes}, tenant_field => $source->{tenant_field});
+    my $associations = ref($source->{associations}) eq 'HASH' ? $source->{associations} : {};
+    return {
+        table => $source->{source_table} // $table,
+        primary_key => $source->{primary_key} // 'id',
+        tenant_field => $scope ? $scope->{field} : $source->{tenant_field},
+        tenant_data => $scope || defined($source->{tenant_field}) ? 1 : 0,
+        foreign_keys => _declared_foreign_keys($contract->{writes}),
+        schemas => _schema_tenancy($schemas),
+        associations => [map {
+            my $spec = $associations->{$_};
+            my $target = ref($spec) eq 'HASH' && defined($spec->{queryable}) ? $schemas->{$spec->{queryable}} : undef;
+            ref($spec) eq 'HASH' ? {
+                name => $_,
+                owner_key => $spec->{owner_key},
+                related_key => $spec->{related_key},
+                cardinality => lc($spec->{cardinality} // 'one'),
+                table => ref($target) eq 'HASH' ? $target->{source_table} : $spec->{table},
+                static => ref($target) eq 'HASH' && defined($target->{values}) ? 1 : 0,
+                through => defined($spec->{through}) ? 1 : 0,
+                target_scope_key => $spec->{target_scope_key},
+                target_tenant_field => ref($target) eq 'HASH' ? $target->{tenant_field} : undef,
+            } : ()
+        } sort keys %$associations],
+    };
+}
+
+sub _declared_foreign_keys {
+    my ($writes) = @_;
+    my $constraints = ref($writes) eq 'HASH' ? $writes->{constraints} : undef;
+    return {} unless ref($constraints) eq 'HASH' && defined($constraints->{foreign_keys});
+    Selecto::Error->throw('invalid_domain', 'writes.constraints.foreign_keys must be an object')
+        unless ref($constraints->{foreign_keys}) eq 'HASH';
+    return $constraints->{foreign_keys};
+}
+
+sub _schema_tenancy {
+    my ($schemas) = @_;
+    return [map {
+        my $schema = $schemas->{$_};
+        ref($schema) eq 'HASH' ? {
+            table => $schema->{source_table} // $_,
+            tenant_field => $schema->{tenant_field},
+            static => defined($schema->{values}) ? 1 : 0,
+        } : ()
+    } sort keys %$schemas];
+}
+
+# TW-05: on a write with trusted tenants, every assigned reference to tenant
+# data gets a guard: the adapter writes only when the referenced row exists
+# in one of those tenants, inside the same statement, so another tenant's
+# parent and a missing one are refused alike. References are declared by
+# writes.constraints.foreign_keys (its references.tenant_field names the
+# referenced tenant column, or false for a relation every tenant shares) or
+# by the owner key of a direct to-one association. A tenant-scoped write that
+# assigns a reference whose tenancy the domain does not record fails closed,
+# as in the Elixir core (foreign_key_tenant_scope_undeclared).
+sub _foreign_key_guards {
+    my ($references, $command, $tenants, %details) = @_;
+    return [] if $command->operation eq 'delete';
+    my $assignments = $command->assignments;
+    my $tenant_scoped = $tenants && $references->{tenant_data};
+    my $relation = $command->relation;
+    my (@candidates, %declared);
+    my $foreign_keys = $references->{foreign_keys};
+    for my $field (sort keys %$foreign_keys) {
+        $declared{$field} = 1;
+        next unless exists $assignments->{$field};
+        my $spec = $foreign_keys->{$field};
+        my $target = ref($spec) eq 'HASH' ? $spec->{references} : undef;
+        Selecto::Error->throw('invalid_domain', 'foreign key references must name a relation and field',
+            {code => 'invalid_foreign_key', field => $field, relation => $relation, %details},
+        ) unless ref($target) eq 'HASH'
+            && grep({ defined($target->{$_}) && !ref($target->{$_}) && "$target->{$_}" =~ /\A[A-Za-z_][A-Za-z0-9_.]*\z/ }
+                qw(relation field)) == 2;
+        push @candidates, {
+            field => $field, relation => "$target->{relation}", target_field => "$target->{field}", declared => 1,
+            tenancy => _declared_tenancy($references, $target),
+        };
+    }
+    for my $association (@{$references->{associations}}) {
+        my $field = $association->{owner_key};
+        next if !defined($field) || $declared{$field} || !exists($assignments->{$field});
+        # Only a reference from this row to another: not the row's own key, a
+        # to-many or bridged association, or a static value list.
+        next if $field eq ($references->{primary_key} // '') || $association->{cardinality} ne 'one'
+            || $association->{through} || $association->{static} || !defined($association->{table});
+        my $tenancy = defined($association->{target_scope_key}) ? ['tenant', $association->{target_scope_key}]
+            : defined($association->{target_tenant_field}) ? ['tenant', $association->{target_tenant_field}]
+            : $association->{table} eq $references->{table} && defined($references->{tenant_field})
+                ? ['tenant', $references->{tenant_field}]
+            : ['undeclared'];
+        push @candidates, {
+            field => $field, relation => $association->{table}, target_field => $association->{related_key},
+            tenancy => $tenancy,
+        };
+    }
+    my (%seen, @guards);
+    for my $candidate (@candidates) {
+        my ($kind, $tenant_field) = @{$candidate->{tenancy}};
+        my $value = $assignments->{$candidate->{field}};
+        $value = $value->kind eq 'literal' ? $value->arguments->[0] : $value
+            if blessed($value) && $value->isa('Selecto::Write::Expression');
+        next unless defined $value;    # a null reference names no parent
+        my %where = (field => $candidate->{field}, relation => $relation, %details);
+        Selecto::Error->throw('invalid_domain', 'foreign-key tenant scope is invalid',
+            {%where, code => $tenant_field, referenced => $candidate->{relation}},
+        ) if $kind eq 'error';
+        next if $kind eq 'shared';
+        if ($kind eq 'undeclared') {
+            Selecto::Error->throw('invalid_domain',
+                'a reference on a tenant-scoped write must declare the referenced relation\'s tenant field',
+                {%where, code => 'foreign_key_tenant_scope_undeclared', referenced => $candidate->{relation},
+                    required => ['references', 'tenant_field']},
+            ) if $tenant_scoped;
+            next;
+        }
+        unless ($tenants) {
+            Selecto::Error->throw('missing_tenant_scope',
+                'a foreign key to a tenant-scoped relation requires a trusted tenant',
+                {%where, referenced => $candidate->{relation}, tenant_field => $tenant_field},
+            ) if $candidate->{declared};
+            next;
+        }
+        Selecto::Error->throw('invalid_write', 'a reference on a tenant-scoped write must be a literal value',
+            \%where,
+        ) if ref($value);
+        my $key = join "\0", @{$candidate}{qw(field relation target_field)}, $tenant_field;
+        next if $seen{$key}++;
+        push @guards, {
+            field => $candidate->{field}, relation => $candidate->{relation},
+            target_field => $candidate->{target_field}, tenant_field => $tenant_field,
+            value => $value, tenants => [@$tenants],
+        };
+    }
+    return \@guards;
+}
+
+# references.tenant_field when declared (a field, or false/null for a shared
+# relation); otherwise the tenant field the domain records for the
+# referenced relation: the root for a self-reference, or its schemas.
+sub _declared_tenancy {
+    my ($references, $target) = @_;
+    my $relation = "$target->{relation}";
+    my @candidates = (
+        ($relation eq $references->{table} ? ({table => $relation, tenant_field => $references->{tenant_field}}) : ()),
+        grep { $_->{table} eq $relation } @{$references->{schemas}},
+    );
+    if (exists $target->{tenant_field}) {
+        my $field = $target->{tenant_field};
+        return ['shared'] if !defined($field) || (JSON::PP::is_bool($field) && !$field);
+        return ['error', 'invalid_foreign_key_tenant_field']
+            if ref($field) || "$field" !~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+        return ['tenant', "$field"];
+    }
+    my %fields = map { ("$_->{tenant_field}" => 1) } grep { defined $_->{tenant_field} } @candidates;
+    my @fields = sort keys %fields;
+    return ['undeclared'] unless @fields;
+    return ['error', 'ambiguous_foreign_key_tenant_field'] if @fields > 1;
+    return ['tenant', $fields[0]];
 }
 
 # Dotted (association) field paths an expression reads anywhere in its tree,
@@ -499,13 +744,16 @@ sub grant_action {
     my $decision = Selecto::Action::Capability->authorize(
         $plan, $phase, resolver => $options{resolver}, context => $options{context} // {},
     );
-    my $expires_in = $options{expires_in};
-    Selecto::Error->throw('invalid_action_grant', 'expires_in must be a positive number of seconds')
-        if defined($expires_in) && !($expires_in =~ /\A\d+(?:\.\d+)?\z/ && $expires_in > 0);
+    # Every grant expires. A grant bridges a confirmation step, so it defaults
+    # to the five minutes (and at most the hour) the Elixir planned operation
+    # allows a confirmation.
+    my $expires_in = $options{expires_in} // 300;
+    Selecto::Error->throw('invalid_action_grant', 'expires_in must be a positive number of seconds up to 3600')
+        unless $expires_in =~ /\A\d+(?:\.\d+)?\z/ && $expires_in > 0 && $expires_in <= 3600;
     return Selecto::Action::Grant->_issue(
         $self->_grant_binding($plan, $phase, $options{context}),
         decision => $decision,
-        (defined($expires_in) ? (expires_at => Time::HiRes::time() + $expires_in) : ()),
+        expires_at => Time::HiRes::time() + $expires_in,
     );
 }
 
@@ -912,7 +1160,7 @@ sub _mutation_reference_fields {
 # writable relationship declared on the exact parent node it references, and
 # the binding must name that relationship's parent_key and child_key.
 sub _validate_graph_node {
-    my ($self, $node, $contexts, $root_scope) = @_;
+    my ($self, $node, $contexts, $root_scope, $tenants) = @_;
     my $command = $node->{command};
     Selecto::Error->throw('invalid_write_graph', 'graph node requires a write command')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
@@ -979,6 +1227,12 @@ sub _validate_graph_node {
         label       => $command->relation,
         trusted_field => $scope ? $scope->{field} : undef,
     );
+    # A bound field takes its value from the parent this graph wrote, so only
+    # the child's own assignments are guarded.
+    $command = $command->with_foreign_key_guards(_foreign_key_guards(
+        _contract_references($edge->{contract}, $edge->{table}), $command, $tenants,
+        graph_node => $node->{id},
+    ));
     return ({
         table         => $edge->{table},
         primary_key   => $edge->{primary_key},
@@ -1066,6 +1320,7 @@ sub _relationship_context {
     return {
         ($edge_id ? (edge_id => $edge_id) : ()),
         ($table ? (table => $table) : ()),
+        contract      => $nested,
         ($fields_known ? (
             fields => { map { ("$_" => 1) } map { "$_" } @{$nested->{source}{fields}} },
             primary_key => defined($nested->{source}{primary_key}) ? "$nested->{source}{primary_key}" : 'id',
@@ -1348,7 +1603,8 @@ host executor (C<unsupported_action_collection_patch>).
 
 Authorizes now and returns a single-use L<Selecto::Action::Grant> bound to
 the phase, the plan's content, the domain fingerprint, the engine's tenant
-and C<< $context->{actor} >>. A mismatched use fails with
+and C<< $context->{actor} >>. It expires after C<expires_in> seconds (default
+300, at most 3600). A mismatched use fails with
 C<action_grant_mismatch> and revokes the grant; a used, expired, revoked or
 forged grant fails with C<action_grant_invalid>.
 
@@ -1414,6 +1670,44 @@ C<writes.scope.tenant>.
 Reads of a domain with a C<tenant_field> are always restricted to the
 engine's tenant. Domains that rely on a required predicate as their tenant
 boundary are described under L<Selecto::Domain/with_required_predicate>.
+
+=head2 References to other tenants' rows
+
+A write with trusted tenants (the engine tenant, or the tenant values of a
+required tenant predicate, where an C<in> list allows each of its tenants)
+may only point a reference at a parent row of one of those tenants. A
+reference is a field declared under C<writes.constraints.foreign_keys>:
+
+  writes => {constraints => {foreign_keys => {
+      customer_id => {source => 'input',
+          references => {relation => 'customers', field => 'id', tenant_field => 'site_id'}},
+      country_id  => {source => 'input',
+          references => {relation => 'countries', field => 'id', tenant_field => JSON::PP::false}},
+  }}}
+
+or the owner key of a direct to-one association (not the row's primary key,
+a C<through> or values-backed association). The referenced tenant column is
+C<references.tenant_field> (C<false> or C<undef>: a relation every tenant
+shares, left unguarded), else the association's C<target_scope_key>, else
+the C<tenant_field> of the domain relation backed by the referenced table
+(the root's for a self-reference). Every assigned, non-null reference to
+tenant data is compiled into the write statement as
+C<EXISTS (SELECT 1 FROM parent AS selecto_fk_parent WHERE ... = ? AND tenant = ?)>:
+inserts and upserts insert through a C<SELECT ... WHERE> (C<FROM DUAL> on
+MySQL and MariaDB), updates add it to their C<WHERE>, and SQL Server's
+C<MERGE> adds it to both branches. A refused write affects no row and fails
+with C<cardinality_mismatch>, even without an C<expected_count>, exactly
+like one naming a parent that does not exist. A batch or graph child may
+reference a row written earlier in the same transaction; a graph child's
+bound parent key is not a caller assignment and is not guarded.
+
+On a write to tenant data, a reference whose tenancy the domain does not
+record fails closed with C<invalid_domain> (details C<code>
+C<foreign_key_tenant_scope_undeclared>); declare
+C<references.tenant_field>, a C<tenant_field> on the target schema, or
+association scope keys. A declared foreign key to tenant data without
+trusted tenants fails with C<missing_tenant_scope>, and a computed reference
+value cannot be guarded (C<invalid_write>).
 
 =head1 REQUIRED PREDICATES
 
