@@ -438,6 +438,48 @@ tenant is then added to every update and delete predicate and assigned on
 every insert, and commands naming another tenant fail. The full rules are in
 L<Selecto::Engine/TENANT SCOPE>.
 
+=head1 REQUIRED PREDICATES
+
+A domain's required predicate (L<Selecto::Domain/with_required_predicate>)
+guards every governed write: commands, batch members, the root node of a
+graph (children are already confined to their parent row), actions at
+preview and execute, and L<Selecto::API::EngineHandler> writes. The engine
+adds it to the command's C<scope_predicate> once (a command already carrying
+it, or one whose query enforcement does, is not guarded twice) after
+C<writes.scope.tenant>, so both boundaries hold.
+
+=over 4
+
+=item *
+
+Updates and deletes match only rows inside the predicate, so a row outside
+it is never changed and C<expected_count> counts only rows inside it.
+
+=item *
+
+Inserted rows must satisfy the predicate before the transaction opens
+(C<query_rule_violation>; C<query_rule_not_evaluable> when an inserted value
+it reads is missing).
+
+=item *
+
+Upserts are refused with C<query_enforcement_unsupported_operation> ("upsert
+is not supported on a domain with a required predicate"), because a conflict
+can resolve to a row outside the predicate.
+
+=item *
+
+A predicate that reads an association field has no portable write form:
+every write on the domain fails with C<query_rule_unsupported_field>
+("association fields are not portable write guards"), with C<relation>,
+C<fields> and C<associations> in the details.
+
+=back
+
+This deliberately goes beyond the shared protocol's earlier rule that
+required predicates are read scopes. A domain without a required predicate
+is unaffected.
+
 =head1 QUERY-GUARDED WRITES
 
 L<Selecto::Engine/enforce_query> attaches the predicate of the query that

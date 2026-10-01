@@ -345,15 +345,18 @@ SKIP: {
             metadata => {conflict_target => ['id'], upsert_update_fields => ['title']})) }),
             'query_enforcement_unsupported_operation', 'upsert is refused under a required predicate');
 
-        # Without a tenant_field the required predicate is a read scope only;
-        # writes stay governed by the write contract, as the shared protocol
-        # specifies.
+        # Without a tenant_field the required predicate still guards writes:
+        # every required predicate is a write guard, deliberately beyond the
+        # shared protocol's earlier read-scope-only rule.
         my $plain_contract = work_order_domain()->as_contract;
         delete $plain_contract->{source}{tenant_field};
-        my $read_scoped = Selecto::Domain->parse($plain_contract)
+        my $guarded = Selecto::Domain->parse($plain_contract)
             ->with_required_predicate(Selecto::Expression->eq('site_id', 10));
-        my $plain = Selecto::Engine->new(domain => $read_scoped, adapter => Selecto->adapter(sqlite => (dbh => $dbh)));
-        is(code_of(sub { $plain->execute_write($update->(2)) }), 'ok', 'a read scope without tenant_field does not govern writes');
+        my $plain = Selecto::Engine->new(domain => $guarded, adapter => Selecto->adapter(sqlite => (dbh => $dbh)));
+        is(code_of(sub { $plain->execute_write($update->(2)) }), 'cardinality_mismatch',
+            'a required predicate without tenant_field also guards writes');
+        is($dbh->selectrow_array('SELECT title FROM work_orders WHERE id = 2'), 'theirs', 'other site row is still intact');
+        is(code_of(sub { $plain->execute_write($update->(3)) }), 'ok', 'a row inside it is still writable');
     };
 
     subtest 'API writes accept an engine-held tenant scope' => sub {

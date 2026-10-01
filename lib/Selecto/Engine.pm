@@ -277,7 +277,8 @@ sub write_command {
 
 # The single path from a caller's command to the command an adapter receives:
 # normalize assignments, apply the domain's tenant scope with the engine's
-# trusted tenant, then validate against the domain contract.
+# trusted tenant and the domain's required predicate, then validate against
+# the domain contract.
 sub governed_write {
     my ($self, $command, %details) = @_;
     Selecto::Error->throw('invalid_write', 'write command required')
@@ -288,34 +289,106 @@ sub governed_write {
         { relation => $command->relation, expected => $self->{domain}->table },
     ) unless $command->relation eq $self->{domain}->table;
     $command = $self->_normalize_write_command($command);
-    # A domain that names a tenant_field without declaring writes.scope.tenant
-    # relies on its request-scoped required predicate as the tenant boundary
-    # (the legacy pattern EngineHandler also enforces). Engine writes honor
-    # that boundary too: updates and deletes match only rows inside it and
-    # inserts must satisfy it. Upsert conflicts can resolve to rows outside
-    # it, so upsert is refused. Other required predicates are read scopes and
-    # leave writes to the write contract, as the shared protocol specifies.
-    my $required = defined($self->{domain}->tenant_field) && !defined($self->{domain}->write_tenant_scope)
-        ? $self->{domain}->required_predicate : undef;
-    if (defined $required) {
-        Selecto::Error->throw(
-            'query_enforcement_unsupported_operation',
-            'upsert is not supported on a domain with a required predicate',
-            { relation => $command->relation, %details },
-        ) if $command->operation eq 'upsert';
-        my $existing = $command->scope_predicate;
-        $command = $command->with_scope_predicate(
-            !defined($existing) ? $required
-                : refaddr($existing) == refaddr($required) ? $existing
-                : Selecto::Expression->all($existing, $required)
-        );
-    }
+    my $required = $self->required_write_guard($command->operation, %details);
     my $scope = $self->{domain}->write_tenant_scope;
     $command = Selecto::Write::Scope->apply(
         $command, $scope, $self->{scope}{tenant}, label => $command->relation, details => \%details,
     );
+    # The required predicate is host-authored, so it joins the scope after
+    # writes.scope.tenant has checked the caller's own tenant references;
+    # both boundaries then hold in the same statement.
+    if (defined $required) {
+        my $existing = $command->scope_predicate;
+        $command = $command->with_scope_predicate(
+            Selecto::QueryEnforcement::combine($existing, $required)
+        ) unless _has_conjunct($existing, $required)
+            || (defined($command->query_enforcement)
+                && _has_conjunct($command->query_enforcement->predicate, $required));
+    }
     $self->_validate_write_command($command, trusted_field => $scope ? $scope->{field} : undef);
     return $command;
+}
+
+# Every required predicate guards engine writes, beyond the shared protocol's
+# earlier rule that required predicates are read scopes. Returns the domain's
+# required predicate (undef when it has none) after refusing what it cannot
+# guard: a predicate that reaches into an association has no portable write
+# form, so every write on the domain fails closed; and an upsert conflict can
+# resolve to a row outside the predicate, so upsert is refused. Updates and
+# deletes then match only rows inside the predicate, and the adapter checks
+# insert candidates against it before the transaction opens.
+sub required_write_guard {
+    my ($self, $operation, %details) = @_;
+    my $required = $self->{domain}->required_predicate;
+    return undef unless defined $required;
+    my $relation = $self->{domain}->table;
+    my @paths = _association_paths($required);
+    if (@paths) {
+        my %associations;
+        for my $path (@paths) {
+            (my $association = $path) =~ s/\.[^.]*\z//;
+            $associations{$association} = 1;
+        }
+        Selecto::Error->throw(
+            'query_rule_unsupported_field',
+            'association fields are not portable write guards',
+            {
+                relation => $relation,
+                fields => \@paths,
+                associations => [sort keys %associations],
+                %details,
+            },
+        );
+    }
+    Selecto::Error->throw(
+        'query_enforcement_unsupported_operation',
+        'upsert is not supported on a domain with a required predicate',
+        { relation => $relation, %details },
+    ) if ($operation // '') eq 'upsert';
+    return $required;
+}
+
+# Dotted field paths (and related-collection associations) an expression
+# reads, sorted and unique.
+sub _association_paths {
+    my %paths;
+    my @pending = grep { defined } @_;
+    while (@pending) {
+        my $node = shift @pending;
+        if (ref($node) eq 'ARRAY') {
+            push @pending, @$node;
+            next;
+        }
+        next unless blessed($node) && $node->isa('Selecto::Expression');
+        my $kind = $node->kind;
+        my $arguments = $node->arguments;
+        if ($kind eq 'field') {
+            $paths{"$arguments->[0]"} = 1 if "$arguments->[0]" =~ /\./;
+            next;
+        }
+        if ($kind =~ /\Arelated_/ && defined($arguments->[0]) && !ref($arguments->[0])) {
+            my $association = "$arguments->[0]";
+            my $fields = ref($arguments->[1]) eq 'ARRAY' ? $arguments->[1] : [];
+            my @named = grep { defined($_) && !ref($_) } @$fields;
+            my @related = @named ? (map { "$association.$_" } @named) : ("$association.*");
+            $paths{$_} = 1 for @related;
+        }
+        push @pending, @$arguments;
+    }
+    return sort keys %paths;
+}
+
+# True when $target is $expression itself or a conjunct of its top-level AND
+# tree, compared by identity.
+sub _has_conjunct {
+    my ($expression, $target) = @_;
+    return 0 unless blessed($expression) && $expression->isa('Selecto::Expression');
+    return 1 if refaddr($expression) == refaddr($target);
+    return 0 unless $expression->kind eq 'and';
+    for my $conjunct (@{$expression->arguments->[0] // []}) {
+        return 1 if _has_conjunct($conjunct, $target);
+    }
+    return 0;
 }
 
 # ---------------------------------------------------------------------------
@@ -1063,8 +1136,9 @@ Selecto::Engine - run governed queries, writes and actions for one domain
 An engine binds one L<Selecto::Domain> to one L<Selecto::Adapter> and is the
 object applications use. It compiles queries against the domain, applies
 the domain's required predicate and the engine's trusted tenant to every
-read, and validates every write against the domain's C<writes> contract
-before handing it to the adapter with a single-use
+read, guards every write with the same required predicate (see
+L</REQUIRED PREDICATES>), and validates every write against the domain's
+C<writes> contract before handing it to the adapter with a single-use
 L<Selecto::Write::Authorization>.
 
 Engines are cheap. Build one per request with the tenant taken from your
@@ -1215,8 +1289,19 @@ declares. See L<Selecto::Write/WRITE GRAPHS>.
 
 The single path from a caller's command to what the adapter receives:
 normalizes assignments, applies tenant scope and the required-predicate
-boundary, then validates against the contract. Returns the governed command.
-Used by the methods above; call it directly only to inspect the result.
+guard (L</REQUIRED PREDICATES>), then validates against the contract.
+Returns the governed command. Used by the methods above; call it directly
+only to inspect the result.
+
+=head2 required_write_guard
+
+  my $predicate = $engine->required_write_guard($operation);
+
+Returns the domain's required predicate, or C<undef> when it has none, after
+refusing what it cannot guard: C<query_rule_unsupported_field> when the
+predicate reads an association field (for every operation), and
+C<query_enforcement_unsupported_operation> for C<upsert>. L</governed_write>
+calls it for every write; public surfaces call it for early feedback.
 
 =head2 enforce_query
 
@@ -1349,6 +1434,44 @@ Reads of a domain with a C<tenant_field> are always restricted to the
 engine's tenant. Domains that rely on a required predicate as their tenant
 boundary are described under L<Selecto::Domain/with_required_predicate>.
 
+=head1 REQUIRED PREDICATES
+
+Every required predicate (L<Selecto::Domain/with_required_predicate>) guards
+writes as well as reads, whether or not the domain has a C<tenant_field>.
+This deliberately goes beyond the shared protocol's earlier rule that
+required predicates are read scopes. It applies to L</execute_write>,
+L</preview_write>, L</write_command>, every member of L</execute_batch>, the
+root node of L</execute_graph> (children are confined to their parent row),
+L</"preview_action, execute_action"> (the preview shows the guarded
+statement), and L<Selecto::API::EngineHandler> writes:
+
+=over 4
+
+=item *
+
+a predicate over root fields is ANDed into update and delete scope, so they
+match only rows inside it and C<expected_count> counts only those rows;
+inserted rows must satisfy it (C<query_rule_violation>, or
+C<query_rule_not_evaluable> when a value it reads is not assigned);
+
+=item *
+
+upserts are refused with C<query_enforcement_unsupported_operation>;
+
+=item *
+
+a predicate that reads any association field refuses every write with
+C<query_rule_unsupported_field> (details: C<relation>, C<fields>,
+C<associations>); reads are unaffected;
+
+=item *
+
+C<writes.scope.tenant> still applies, and both conditions must hold. The
+predicate is added once: a command that already carries it as a conjunct of
+its scope or query enforcement is not guarded twice.
+
+=back
+
 =head1 ERRORS
 
 All failures are L<Selecto::Error> exceptions. Codes you are likely to
@@ -1357,6 +1480,8 @@ C<query_error> (database failure, message withheld), C<write_policy_missing>,
 C<write_operation_not_enabled>, C<write_field_not_writable>,
 C<write_relation_mismatch>, C<missing_required_write_fields>,
 C<cardinality_mismatch>, C<tenant_mismatch>, C<missing_tenant_scope>,
+C<query_rule_violation>, C<query_rule_unsupported_field>,
+C<query_enforcement_unsupported_operation>,
 C<action_capability_denied>, C<missing_capability_resolver>.
 
 =head1 SEE ALSO

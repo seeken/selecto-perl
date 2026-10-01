@@ -165,19 +165,20 @@ sub write_command ($self, $engine, $body) {
         );
     }
 
-    my $scope = $domain->required_predicate;
-    # An upsert's conflict branch updates whichever row the key hits, which
-    # can lie outside a required predicate, so it is refused under one.
+    # The engine guards every write with the domain's required predicate
+    # (Selecto::Engine::required_write_guard): it refuses upserts and domains
+    # whose predicate reaches into an association, and ANDs the predicate
+    # into the command when it is governed. Checking here only reports those
+    # refusals before the tenant boundary; the command stays unguarded so the
+    # predicate is applied exactly once, by the engine.
     # Tenant upserts go through an engine tenant and writes.scope.tenant.
-    Selecto::Error->throw('query_enforcement_unsupported_operation', 'query-scoped API upsert is not supported')
-        if $operation eq 'upsert' && defined($scope);
+    $engine->required_write_guard($operation);
     $engine->assert_tenant_boundary(access => 'write');
     my $command = Selecto::Write::Command->new(
         operation => $operation,
         relation => $domain->table,
         assignments => \%normalized_assignments,
         predicate => $predicate,
-        scope_predicate => $scope,
         expected_count => $expected_count,
         metadata => \%metadata,
     );
@@ -1163,7 +1164,9 @@ upserts (C<missing_required_write_fields>); deletes take none.
 
 Required for updates and deletes, rejected otherwise. Root fields only, with
 C<eq>, C<ne>, C<gt>, C<gte>, C<lt>, C<lte>, C<in>, C<is_null> and
-C<not_null>. The engine's required predicate is always added.
+C<not_null>. The engine's required predicate is always added, by the engine
+when the command is governed (see L<Selecto::Engine/REQUIRED PREDICATES>);
+the returned command does not carry it, so it is never applied twice.
 
 =item C<expected_count>
 
@@ -1175,6 +1178,10 @@ Root field lists. Upserts require the last two and are refused on domains
 with a required predicate (C<query_enforcement_unsupported_operation>).
 
 =back
+
+On a domain whose required predicate reads an association field every write
+is refused with C<query_rule_unsupported_field>, and inserts must satisfy a
+root-field required predicate (C<query_rule_violation>).
 
 A rolled-back write reports C<cardinality_mismatch> with the expected count
 only.
