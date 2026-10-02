@@ -1,6 +1,22 @@
 Revision history for Selecto
 
 Unreleased
+    - Security: apply trusted finite budgets to query-library expansion, CSV
+      inspection, action targets, and nested public API results. Oversized
+      nested collections are refused before returning partial data.
+    - Security: remove hidden field values and matched-row error counts;
+      enforce public co-domain lookup fields and authority-specific file hold
+      release with audit-before-mutation behavior.
+    - Security: preserve selected action upsert identity, require declared
+      conflict targets on all governed paths, and refuse MySQL/MariaDB upserts
+      whose requested identity cannot be guaranteed. Separate authored
+      system-now instructions from caller literals.
+    - Security: preserve SELECT/JOIN positional parameter order, require
+      concrete public non-bulk write targets, and bound broad PostgreSQL/SQLite
+      writes before DML. Other adapters refuse unsupported broad writes.
+    - Add scoped database execution budgets and verified bounded PostgreSQL
+      cursor / SQLite streaming for consumers. See docs/security-boundaries.md
+      for migration requirements, defaults and evidence limits.
     - A joins entry that is not an object is refused with invalid_domain
       ("join <name> must be an object") instead of being silently ignored,
       as the Ruby, .NET and Python cores already do.

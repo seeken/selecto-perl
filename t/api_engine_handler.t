@@ -355,7 +355,7 @@ is_deeply $result->{rows}, [[
     7, [['ABC', '2026-09-11']],
 ]], 'array row format is applied to the root and its related collection';
 is_deeply $result->{subtables}, {
-    lines => {columns => ['lines.sku', 'line_day']},
+    lines => {columns => ['lines.sku', 'line_day'], limit => 100, complete => JSON::PP::true},
 }, 'array-form subtables publish their ordered child columns';
 like $adapter->{last_statement}->sql,
     qr/JSON_BUILD_OBJECT\('lines\.sku', "c_lines"\."sku", 'line_day', TO_CHAR\(TO_TIMESTAMP\("c_lines"\."occurred_at"\), 'YYYY-MM-DD'\)\)/,
@@ -582,6 +582,12 @@ my $api = Selecto::API->new(domain => $domain, base_path => '/api/v1/records');
 is $handler->describe_openapi($api), $api,
     'OpenAPI decoration returns the same API object';
 my $schema = $api->openapi_document->{components}{schemas}{SelectoQuery};
+is_deeply $api->openapi_document->{components}{schemas}{SelectoSubtableMetadata}{required},
+    [qw(columns limit complete)], 'OpenAPI response advertises bounded complete subtable metadata';
+ok $api->openapi_document->{components}{schemas}{SelectoSubtableMetadata}{properties}{complete}{const},
+    'OpenAPI completeness is true for successful responses';
+is_deeply $api->openapi_document->{paths}{'/api/v1/records/query'}{post}{responses}{200}{content}{'application/json'}{schema},
+    {'$ref' => '#/components/schemas/SelectoQueryResponse'}, 'OpenAPI query response uses the metadata schema';
 for my $op (qw(starts_with starts_with_ci text_contains text_contains_ci ends_with ends_with_ci)) {
     ok grep({ $_ eq $op } @{$api->openapi_document->{components}{schemas}{SelectoFilter}{properties}{op}{enum}}),
         "OpenAPI advertises $op query filters";

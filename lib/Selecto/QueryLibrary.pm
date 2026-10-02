@@ -8,6 +8,7 @@ use Scalar::Util qw(blessed looks_like_number);
 use Storable qw(dclone);
 use Selecto::Error ();
 use Selecto::Expression ();
+use Selecto::Limits ();
 
 my @REGISTRIES = qw(segments projections orderings views);
 
@@ -98,7 +99,7 @@ sub parameter_specs {
 }
 
 sub normalize_parameters_for_selection {
-    my ($class, $domain, $selection, $params) = @_;
+    my ($class, $domain, $selection, $params, $limits) = @_;
     $selection //= {};
     $params //= {};
     Selecto::Error->throw('invalid_query_library', 'query-library selection must be an object')
@@ -110,7 +111,7 @@ sub normalize_parameters_for_selection {
         view => $selection->{view},
         segments => $selection->{segments} // [],
     );
-    return _normalize_parameters($specs, $params);
+    return _normalize_parameters($specs, $params, $limits);
 }
 
 sub projection_fields {
@@ -135,12 +136,15 @@ sub ordering_entries {
 }
 
 sub apply_segment {
-    my ($class, $domain, $query, $segment_id, $params) = @_;
-    return $class->apply_segments($domain, $query, [$segment_id], $params // {});
+    my ($class, $domain, $query, $segment_id, $params, $limits) = @_;
+    return $class->apply_segments($domain, $query, [$segment_id], $params // {}, $limits);
 }
 
 sub apply_segments {
-    my ($class, $domain, $query, $segment_ids, $params) = @_;
+    my ($class, $domain, $query, $segment_ids, $params, $limits) = @_;
+    $limits //= Selecto::Limits->new;
+    Selecto::Error->throw('invalid_limits', 'query library limits must be a Selecto::Limits')
+        unless blessed($limits) && $limits->isa('Selecto::Limits');
     _query($query);
     $params //= {};
     _array($segment_ids, 'query-library segments');
@@ -159,8 +163,8 @@ sub apply_segments {
             {group => $group->{id}, segments => [map { $_->{segment} } @chosen]},
         ) if @chosen > 1;
     }
-    my $values = _normalize_parameters($resolved->{parameters}, $params);
-    my @predicates = map { _filter_expression($_, $values) } @{$resolved->{filters}};
+    my $values = _normalize_parameters($resolved->{parameters}, $params, $limits);
+    my @predicates = map { _filter_expression($_, $values, $limits) } @{$resolved->{filters}};
     my $predicate = @predicates == 1 ? $predicates[0]
         : @predicates ? Selecto::Expression->all(\@predicates) : undef;
     if ($predicate) {
@@ -218,10 +222,10 @@ sub apply_ordering {
 }
 
 sub apply_view {
-    my ($class, $domain, $query, $view_id, $params) = @_;
+    my ($class, $domain, $query, $view_id, $params, $limits) = @_;
     my $view = $class->definition($domain, 'views', $view_id);
     my @segments = @{$view->{segments} // []};
-    $query = $class->apply_segments($domain, $query, \@segments, $params // {});
+    $query = $class->apply_segments($domain, $query, \@segments, $params // {}, $limits);
     $query = $class->apply_projection($domain, $query, $view->{projection})
         if defined($view->{projection}) && "$view->{projection}" ne '';
     $query = $class->apply_ordering($domain, $query, $view->{ordering})
@@ -356,7 +360,10 @@ sub _collect_segment_parameters {
 }
 
 sub _normalize_parameters {
-    my ($specs, $params) = @_;
+    my ($specs, $params, $limits) = @_;
+    $limits //= Selecto::Limits->new;
+    Selecto::Error->throw('invalid_limits', 'query library limits must be a Selecto::Limits')
+        unless blessed($limits) && $limits->isa('Selecto::Limits');
     my %known = map { $_ => 1 } keys %$specs;
     my @unknown = sort grep { !$known{$_} } keys %$params;
     Selecto::Error->throw('invalid_query_library', 'unknown segment parameters', {names => \@unknown})
@@ -368,6 +375,12 @@ sub _normalize_parameters {
             unless ref($spec) eq 'HASH';
         my $present = exists($params->{$id});
         my $value = $present ? $params->{$id} : $spec->{default};
+        if (ref($value) eq 'ARRAY') {
+            _bounded_members($value, $limits);
+        } elsif (!ref($value)) {
+            $limits->check_bytes('max_parameter_bytes', $value,
+                'invalid_query_library', 'segment parameter');
+        }
         if (!defined($value) && ($spec->{required} // !exists($spec->{default}))) {
             Selecto::Error->throw('invalid_query_library', "missing required segment parameter $id");
         }
@@ -420,32 +433,44 @@ sub _cast_parameter {
 }
 
 sub _filter_expression {
-    my ($filter, $values) = @_;
+    my ($filter, $values, $limits) = @_;
     Selecto::Error->throw('invalid_query_library', 'segment filters must be arrays')
         unless ref($filter) eq 'ARRAY' && @$filter;
     my ($operator, @args) = @$filter;
     $operator = lc("$operator");
     if ($operator eq 'and' || $operator eq 'or') {
         my $items = @args == 1 && ref($args[0]) eq 'ARRAY' ? $args[0] : \@args;
-        my @expressions = map { _filter_expression($_, $values) } @$items;
+        my @expressions = map { _filter_expression($_, $values, $limits) } @$items;
         return $operator eq 'and'
             ? Selecto::Expression->all(\@expressions)
             : Selecto::Expression->any(\@expressions);
     }
-    return Selecto::Expression->not(_filter_expression($args[0], $values)) if $operator eq 'not';
+    return Selecto::Expression->not(_filter_expression($args[0], $values, $limits)) if $operator eq 'not';
     my ($field, $raw_value, $raw_end) = @args;
     my $value = _substitute($raw_value, $values);
     return Selecto::Expression->is_null($field) if $operator eq 'is_null';
     return Selecto::Expression->not_null($field) if $operator eq 'not_null';
-    return Selecto::Expression->in($field, $value) if $operator eq 'in';
+    if ($operator eq 'in') {
+        _bounded_members($value, $limits);
+        return Selecto::Expression->in($field, $value);
+    }
     if ($operator eq 'csv_in') {
         Selecto::Error->throw('invalid_query_library', 'csv_in requires a scalar value')
             if ref($value);
-        my @values = grep { length } map {
-            my $item = "$_";
+        $limits->check_bytes('max_parameter_bytes', $value,
+            'invalid_query_library', 'csv_in input');
+        my @values;
+        # Input bytes are bounded before tokenization, and list growth stops at
+        # the first excess member instead of materializing a full split.
+        my $text = defined($value) ? "$value" : '';
+        while ($text =~ /([^,]*)(?:,|\z)/g) {
+            my $item = $1;
             $item =~ s/\A\s+|\s+\z//g;
-            $item;
-        } split /,/, defined($value) ? "$value" : '';
+            next unless length $item;
+            $limits->check_bytes('max_value_bytes', $item, 'invalid_query_library', 'csv_in item');
+            $limits->check_count('max_filter_values', @values + 1, 'invalid_query_library', 'csv_in values');
+            push @values, $item;
+        }
         Selecto::Error->throw('invalid_query_library', 'csv_in requires at least one value')
             unless @values;
         return Selecto::Expression->in($field, \@values);
@@ -457,6 +482,19 @@ sub _filter_expression {
     Selecto::Error->throw('invalid_query_library', "unsupported segment filter operator $operator")
         unless $operator =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/;
     return Selecto::Expression->can($operator)->('Selecto::Expression', $field, $value);
+}
+
+sub _bounded_members {
+    my ($values, $limits) = @_;
+    Selecto::Error->throw('invalid_query_library', 'in requires a non-empty scalar list')
+        unless ref($values) eq 'ARRAY' && @$values;
+    $limits->check_count('max_filter_values', scalar(@$values), 'invalid_query_library', 'in values');
+    my $total = 0;
+    for my $value (@$values) {
+        $total += $limits->check_bytes('max_value_bytes', JSON::PP::is_bool($value) ? ($value ? 1 : 0) : $value,
+            'invalid_query_library', 'in item');
+        $limits->check_count('max_parameter_bytes', $total, 'invalid_query_library', 'in bytes');
+    }
 }
 
 sub _substitute {

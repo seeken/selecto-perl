@@ -7,8 +7,8 @@ use Selecto::Action::Capability ();
 use Selecto::Action::Planner ();
 
 sub plan {
-    my ($class, $domain, $intent) = @_;
-    return Selecto::Action::Planner->plan($domain, $intent);
+    my ($class, $domain, $intent, %options) = @_;
+    return Selecto::Action::Planner->plan($domain, $intent, %options);
 }
 
 # Resolve conditional input specifications without requiring a write executor
@@ -106,6 +106,13 @@ Common errors: C<invalid_action_intent> (unknown action),
 C<action_scope_mismatch> (wrong target shape), C<unknown_action_input>,
 C<missing_action_input>, C<action_operation_not_enabled>,
 C<unsupported_action_executor>.
+
+Bulk plans always have a finite target ceiling: 1,000 raw ID occurrences by
+default, reduced by C<selection.max_rows> when smaller. Standalone planning
+accepts C<< limits => Selecto::Limits->new(max_action_targets => 100) >> as
+trusted host configuration. IDs are counted before normalization or copying;
+duplicates are rejected after normalization. Request data must not supply
+limit overrides. Larger jobs should use bounded batches.
 
 =head2 authorize
 

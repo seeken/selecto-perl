@@ -9,9 +9,12 @@ use Storable qw(dclone);
 use Selecto::Action::Plan ();
 use Selecto::Domain ();
 use Selecto::Error ();
+use Selecto::Limits ();
+use Selecto::Write::ConflictTarget ();
+use Selecto::Write::Expression ();
 
 sub plan {
-    my ($class, $input, $intent) = @_;
+    my ($class, $input, $intent, %options) = @_;
     my $contract = _contract($input);
     _object($intent, 'action intent');
     my $action_id = _id($intent->{action});
@@ -22,6 +25,8 @@ sub plan {
     my $action = $actions->{$action_id};
     Selecto::Error->throw('invalid_action_intent', 'action is not exposed by this domain contract', { action => $action_id })
         unless ref($action) eq 'HASH';
+    my $limits = _limits($options{limits});
+    _check_target_limit($action, $intent->{target}, $limits);
 
     my ($inputs, $variant, $execution) = _select_variant($action, $intent->{inputs});
     my ($execution_case, $selected_execution) = _select_execution_case($execution, $inputs);
@@ -40,6 +45,21 @@ sub plan {
 
     my $changes = _resolve_template($execution->{set} // {}, $inputs);
     _object($changes, 'action changes');
+    my %system_values;
+    for my $field (keys %$changes) {
+        my $value = $changes->{$field};
+        my $type = $contract->{source}{columns}{$field}{type} // '';
+        if (blessed($value) && $value->isa('Selecto::Write::Expression')
+            && $value->kind eq 'current_timestamp') {
+            Selecto::Error->throw('invalid_action_changes', 'system-now requires a temporal field', {field => $field})
+                unless $type =~ /\A(?:utc_datetime|naive_datetime|datetime|timestamp|date)\z/;
+            $system_values{$field} = 'now';
+            $changes->{$field} = ['system', 'now'];
+        } elsif (ref($value) && !JSON::PP::is_bool($value)) {
+            Selecto::Error->throw('invalid_action_changes', 'structured input requires a JSON field', {field => $field})
+                unless $type =~ /\A(?:json|jsonb|map)\z/;
+        }
+    }
     _validate_changes($writes, $changes, $operation);
     my $collection_patches = _collection_patches($execution, $inputs);
 
@@ -47,7 +67,7 @@ sub plan {
     _declared_preconditions($contract, $action, $operation) if $operation eq 'insert' || $operation eq 'upsert';
     my ($scope, $filters, $expected, $target) = $operation eq 'insert' || $operation eq 'upsert'
         ? _create_target($action, $intent->{target})
-        : _target($contract, $action, $operation_spec, $intent->{target});
+        : _target($contract, $action, $operation_spec, $intent->{target}, $limits);
     my ($transition, $preconditions) = _transition($writes, $action, $changes);
     $preconditions = [@{_declared_preconditions($contract, $action, $operation)}, @$preconditions];
     push @$filters, map {
@@ -57,6 +77,15 @@ sub plan {
 
     my $capability = defined($action->{capability}) ? "$action->{capability}" : undef;
     _validate_capability($contract, $capability, $action_id, $operation);
+
+    my $conflict_target;
+    if ($operation eq 'upsert') {
+        my $declared = $operation_spec->{conflict_targets};
+        my $target = $execution->{conflict_target};
+        $target //= $declared->[0] if ref($declared) eq 'ARRAY' && @$declared == 1;
+        $conflict_target = Selecto::Write::ConflictTarget->validate(
+            $writes, $target, $contract->{source}{columns});
+    }
 
     return Selecto::Action::Plan->new(
         action               => $action_id,
@@ -70,11 +99,88 @@ sub plan {
         expected_cardinality => $expected,
         transition           => $transition,
         preconditions        => $preconditions,
-        inputs               => $inputs,
+        inputs               => _display_values($inputs),
         variant              => $variant,
         execution_case       => $execution_case,
         collection_patches   => $collection_patches,
+        conflict_target      => $conflict_target,
+        system_values        => \%system_values,
     );
+}
+
+sub _limits {
+    my ($limits) = @_;
+    $limits //= Selecto::Limits->new;
+    Selecto::Error->throw('invalid_limits', 'action limits must be a Selecto::Limits object')
+        unless blessed($limits) && $limits->isa('Selecto::Limits');
+    return $limits;
+}
+
+sub _maximum_targets {
+    my ($action, $limits) = @_;
+    my $maximum = $limits->get('max_action_targets');
+    my $selection = ref($action->{selection}) eq 'HASH' ? $action->{selection} : {};
+    if (exists($selection->{max_rows})) {
+        my $declared = $selection->{max_rows};
+        Selecto::Error->throw('invalid_action_contract', 'selection.max_rows must be a positive bounded integer')
+            unless defined($declared) && !ref($declared) && "$declared" =~ /\A[1-9][0-9]{0,8}\z/;
+        $maximum = $declared if $declared < $maximum;
+    }
+    return $maximum;
+}
+
+sub _check_target_limit {
+    my ($action, $target, $limits) = @_;
+    my $maximum = _maximum_targets($action, $limits);
+    # Count occurrences before normalizing, copying, hashing or deduplicating.
+    if (ref($target) eq 'HASH' && ref($target->{ids}) eq 'ARRAY') {
+        Selecto::Error->throw('action_cardinality_mismatch',
+            "action permits at most $maximum target rows",
+            {maximum => 0 + $maximum, actual => scalar(@{$target->{ids}})},
+        ) if @{$target->{ids}} > $maximum;
+        for my $id (@{$target->{ids}}) {
+            Selecto::Error->throw('invalid_action_target', 'target IDs must be nonempty scalars')
+                unless defined($id) && !ref($id) && length("$id");
+            $limits->check_bytes('max_value_bytes', $id, 'invalid_action_target', 'target ID');
+        }
+    }
+    return $maximum;
+}
+
+# Plans are mutable host objects. Recheck their raw target and count before
+# authorization serializes them or invokes a host callback.
+sub validate_plan_limits {
+    my ($class, $input, $plan, %options) = @_;
+    Selecto::Error->throw('invalid_action_plan', 'action plan is required')
+        unless blessed($plan) && $plan->isa('Selecto::Action::Plan');
+    my $contract = _contract($input);
+    my $action = $contract->{actions}{$plan->action};
+    Selecto::Error->throw('invalid_action_plan', 'action plan belongs to a different domain')
+        unless ref($action) eq 'HASH';
+    my $limits = _limits($options{limits});
+    my $target = $plan->target;
+    Selecto::Error->throw('invalid_action_plan', 'plan bulk target must contain only an ids list')
+        if ref($target) eq 'HASH' && (keys(%$target) != 1 || ref($target->{ids}) ne 'ARRAY');
+    my $maximum = _check_target_limit($action, $target, $limits);
+    $limits->check_bytes('max_value_bytes', $target, 'invalid_action_target', 'target ID')
+        if defined($target) && !ref($target);
+    my ($kind, $count) = ref($plan->expected_cardinality) eq 'ARRAY'
+        ? @{$plan->expected_cardinality} : ();
+    Selecto::Error->throw('invalid_action_plan', 'action cardinality must be a positive exact count')
+        unless defined($kind) && $kind eq 'exactly' && defined($count) && !ref($count)
+            && "$count" =~ /\A[1-9][0-9]*\z/;
+    Selecto::Error->throw('action_cardinality_mismatch', 'action exceeds its target limit',
+        {maximum => 0 + $maximum}) if $count > $maximum;
+    my $filters = $plan->filters // [];
+    Selecto::Error->throw('invalid_action_plan', 'action filters must be an array') unless ref($filters) eq 'ARRAY';
+    $limits->check_count('max_expression_nodes', scalar(@$filters), 'action_cardinality_mismatch', 'action filters');
+    for my $filter (@$filters) {
+        next unless ref($filter) eq 'ARRAY' && @$filter == 3 && ($filter->[1] // '') eq 'in'
+            && ref($filter->[2]) eq 'ARRAY';
+        Selecto::Error->throw('action_cardinality_mismatch', 'action filter exceeds its target limit',
+            {maximum => 0 + $maximum}) if @{$filter->[2]} > $maximum;
+    }
+    return $plan;
 }
 
 sub _declared_preconditions {
@@ -265,7 +371,33 @@ sub _normalize_input_value {
             if @$value < $minimum;
         return dclone($value);
     }
-    return dclone($value) if ref($value);
+    if ($type eq 'json' || $type eq 'jsonb' || $type eq 'map') {
+        # The submitted subtree is literal data. Never recurse through it as
+        # a template, even if one of its arrays resembles an instruction.
+        Selecto::Error->throw('invalid_action_input', 'JSON action input must contain only JSON values', {input => $id})
+            unless _json_value($value);
+        return _clone($value);
+    }
+    Selecto::Error->throw('invalid_action_input', 'scalar action input must be a scalar', {input => $id})
+        if ref($value);
+    return $value;
+}
+
+sub _json_value {
+    my ($value) = @_;
+    return 1 unless ref($value);
+    return 1 if JSON::PP::is_bool($value);
+    return !grep { !_json_value($_) } @$value if ref($value) eq 'ARRAY';
+    return !grep { !_json_value($_) } values %$value if ref($value) eq 'HASH';
+    return 0;
+}
+
+sub _display_values {
+    my ($value) = @_;
+    return ['system', 'now'] if blessed($value) && $value->isa('Selecto::Write::Expression')
+        && $value->kind eq 'current_timestamp';
+    return [map { _display_values($_) } @$value] if ref($value) eq 'ARRAY';
+    return {map { $_ => _display_values($value->{$_}) } keys %$value} if ref($value) eq 'HASH';
     return $value;
 }
 
@@ -299,6 +431,10 @@ sub _resolve_template {
                 unless exists $inputs->{$id};
             return _clone($inputs->{$id});
         }
+        # Only walking an authored template/default may construct this
+        # internal instruction. Returned input subtrees are never walked.
+        return Selecto::Write::Expression->current_timestamp
+            if @$value == 2 && _id($value->[0]) eq 'system' && _id($value->[1]) eq 'now';
         return [map { _resolve_template($_, $inputs) } @$value];
     }
     if (ref($value) eq 'HASH') {
@@ -363,7 +499,7 @@ sub _create_target {
 }
 
 sub _target {
-    my ($contract, $action, $operation_spec, $target) = @_;
+    my ($contract, $action, $operation_spec, $target, $limits) = @_;
     my $primary_key = "$contract->{source}{primary_key}";
     $primary_key = 'id' if $primary_key eq '';
     my $declared_scope = _id($action->{scope}) || (_id($action->{type}) eq 'bulk_action' ? 'bulk' : 'row');
@@ -372,17 +508,17 @@ sub _target {
         my $ids = $target->{ids};
         Selecto::Error->throw('invalid_action_target', 'bulk target ids must be a non-empty list')
             unless ref($ids) eq 'ARRAY' && @$ids;
-        my %seen;
-        Selecto::Error->throw('invalid_action_target', 'bulk target ids must not contain duplicates')
-            if grep { $seen{"$_"}++ } @$ids;
+        my $maximum = _check_target_limit($action, $target, $limits);
         Selecto::Error->throw('action_scope_mismatch', 'row action cannot target a bulk selection')
             unless $declared_scope eq 'bulk' || $action->{bulk}{enabled};
         Selecto::Error->throw('bulk_action_operation_not_enabled', 'bulk action requires a bulk-enabled write operation')
             unless $operation_spec->{bulk};
         my @normalized = map { _target_value($_) } @$ids;
+        my %seen;
+        Selecto::Error->throw('invalid_action_target', 'bulk target ids must not contain duplicates')
+            if grep { $seen{"$_"}++ } @normalized;
         my $selection = ref($action->{selection}) eq 'HASH' ? $action->{selection} : {};
         my $minimum = $selection->{min_rows} // 1;
-        my $maximum = $selection->{max_rows};
         Selecto::Error->throw(
             'action_cardinality_mismatch',
             $minimum == 1 ? 'action requires at least one target row'

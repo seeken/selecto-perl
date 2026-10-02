@@ -57,6 +57,7 @@ lib/Selecto/Stream.pm
 lib/Selecto/ValueExpression.pm
 lib/Selecto/Write.pm
 lib/Selecto/Write/Authorization.pm
+lib/Selecto/Write/ConflictTarget.pm
 lib/Selecto/Write/Expression.pm
 lib/Selecto/Write/Scope.pm
 LICENSE
@@ -141,3 +142,15 @@ t/write_graph.t
 t/write_graph_child_scope.t
 xt/changes.t
 xt/pod.t
+lib/Selecto/Limits.pm
+t/security_boundaries.t
+t/security_action_integrity.t
+lib/Selecto/QueryBudget.pm
+t/query_budget.t
+t/bounded_write.t
+t/security_sql_boundaries.t
+docs/security-boundaries.md
+script/importer-memory-check
+t/security_boundaries_live.t
+lib/Selecto/PostgreSQL/Stream.pm
+t/bounded_stream.t

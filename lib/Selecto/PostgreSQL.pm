@@ -13,6 +13,25 @@ sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
 sub _reuses_parameter_identity { return 1; }
 
+sub bounded_stream_supported {
+    my ($self) = @_;
+    return eval { $self->dbh->isa('DBI::db') && $self->dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0;
+}
+
+sub stream_query {
+    my ($self, $statement, %options) = @_;
+    return $self->SUPER::stream_query($statement, %options) unless $options{bounded};
+    Selecto::Error->throw('unsupported_feature', 'bounded streaming requires a real PostgreSQL DBI handle')
+        unless $self->supports('stream') && $self->bounded_stream_supported;
+    Selecto::Error->throw('invalid_stream', 'stream_query requires a Selecto statement')
+        unless blessed($statement) && $statement->isa('Selecto::Statement');
+    my $size = $options{fetch_size} // 1;
+    Selecto::Error->throw('invalid_stream', 'stream fetch size must be a positive integer')
+        unless !ref($size) && "$size" =~ /\A[1-9]\d*\z/;
+    require Selecto::PostgreSQL::Stream;
+    return Selecto::PostgreSQL::Stream->new(adapter => $self, statement => $statement);
+}
+
 sub placeholder {
     my ($self, $index) = @_;
     Selecto::Error->throw('invalid_query', 'placeholder index must be positive')
@@ -624,6 +643,10 @@ C<ROLLUP>, lateral joins, JSON rowsets, array rowsets and array predicates,
 JSON containment, full-text search, computed value expressions, C<FOR SHARE>
 row locks, streaming and projection sums. Writes support C<RETURNING> and
 write graphs.
+
+For bounded result buffering, pass C<< bounded => 1 >> to C<stream>. A real
+DBD::Pg handle then uses a server cursor, not a C<RowCacheSize> hint. See
+L<Selecto::PostgreSQL::Stream> for transaction ownership and cleanup rules.
 
 =head1 ATTRIBUTES
 

@@ -187,7 +187,7 @@ my $contract_engine_full = Selecto::Engine->new(domain => Selecto::Domain->parse
         operations => {
             insert => { enabled => JSON::PP::true },
             update => { enabled => JSON::PP::true },
-            upsert => { enabled => JSON::PP::true },
+            upsert => { enabled => JSON::PP::true, conflict_targets => [['id']] },
         },
         fields     => {
             id     => { insertable => JSON::PP::true },

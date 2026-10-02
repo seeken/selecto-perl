@@ -20,6 +20,8 @@ use Selecto::Write::Authorization ();
 use Selecto::Action::Capability ();
 use Selecto::Action::Grant ();
 use Selecto::Action::Planner ();
+use Selecto::Limits ();
+use Selecto::Write::ConflictTarget ();
 
 sub new {
     my ($class, %args) = @_;
@@ -31,12 +33,16 @@ sub new {
         if defined($args{domain_ref})
             && !(blessed($args{domain_ref}) && $args{domain_ref}->isa('Selecto::Domain::Ref'));
     $args{adapter}->assert_contract;
+    my $limits = $args{limits} // Selecto::Limits->new;
+    Selecto::Error->throw('invalid_limits', 'engine limits must be a Selecto::Limits object')
+        unless blessed($limits) && $limits->isa('Selecto::Limits');
     return bless {
         domain => $args{domain},
         adapter => $args{adapter},
         domain_ref => $args{domain_ref},
         scope => _trusted_scope($args{scope}),
         write_policy => _write_policy($args{write_policy}),
+        limits => $limits,
     }, $class;
 }
 
@@ -69,6 +75,7 @@ sub _write_policy {
 }
 
 sub write_policy { return $_[0]->{write_policy}; }
+sub limits { return $_[0]->{limits}; }
 
 sub scope { return {%{$_[0]->{scope}}}; }
 
@@ -106,6 +113,7 @@ sub from_registry {
         adapter => $args{adapter},
         (defined($args{scope}) ? (scope => $args{scope}) : ()),
         (defined($args{write_policy}) ? (write_policy => $args{write_policy}) : ()),
+        (defined($args{limits}) ? (limits => $args{limits}) : ()),
     );
 }
 
@@ -310,6 +318,11 @@ sub governed_write {
     }
     $self->_validate_write_command($command, trusted_field => $scope ? $scope->{field} : undef);
     $self->_check_required_tenant_assignment($command, $required, %details);
+    # Adapter bounded-write preflight must use the governing domain identity,
+    # never a key supplied by the caller's command metadata.
+    $command = $command->with_metadata({%{$command->metadata},
+        __selecto_primary_key => $self->{domain}->primary_key,
+        __selecto_write_limit => $self->{limits}->get('max_action_targets')});
     # Set on every governed command, replacing any a caller supplied.
     return $command->with_foreign_key_guards(_foreign_key_guards(
         _domain_references($self->{domain}), $command, $self->_trusted_write_tenants($required), %details,
@@ -628,7 +641,7 @@ sub _has_conjunct {
 
 sub plan_action {
     my ($self, $intent) = @_;
-    return Selecto::Action::Planner->plan($self->{domain}, $intent);
+    return Selecto::Action::Planner->plan($self->{domain}, $intent, limits => $self->{limits});
 }
 
 my %ACTION_COMPARATOR = (eq => 'eq', neq => 'ne', gt => 'gt', gte => 'gte', lt => 'lt', lte => 'lte');
@@ -638,6 +651,7 @@ my %ACTION_COMPARATOR = (eq => 'eq', neq => 'ne', gt => 'gt', gte => 'gte', lt =
 # preconditions; the planned cardinality becomes the expected row count.
 sub action_command {
     my ($self, $plan, %options) = @_;
+    Selecto::Action::Planner->validate_plan_limits($self->{domain}, $plan, limits => $self->{limits});
     Selecto::Error->throw('invalid_action_plan', 'action plan is required')
         unless blessed($plan) && $plan->isa('Selecto::Action::Plan');
     Selecto::Error->throw('invalid_action_plan', 'action plan belongs to a different domain')
@@ -664,7 +678,7 @@ sub action_command {
         return Selecto::Write::Command->new(
             operation => $operation,
             relation => $self->{domain}->table,
-            assignments => _action_assignments($plan->changes),
+            assignments => _action_assignments($plan, $self->{domain}),
             expected_count => 1,
             metadata => {
                 ($operation eq 'upsert' ? $self->_action_upsert_metadata($plan) : ()),
@@ -677,7 +691,7 @@ sub action_command {
     return Selecto::Write::Command->new(
         operation => $operation,
         relation => $self->{domain}->table,
-        assignments => $operation eq 'delete' ? {} : _action_assignments($plan->changes),
+        assignments => $operation eq 'delete' ? {} : _action_assignments($plan, $self->{domain}),
         predicate => @filters == 1 ? $filters[0] : Selecto::Expression->all(@filters),
         expected_count => 0 + $count,
         metadata => {$options{returning} ? (returning => [@{$options{returning}}]) : ()},
@@ -691,18 +705,8 @@ sub action_command {
 sub _action_upsert_metadata {
     my ($self, $plan) = @_;
     my $writes = _checked_writes($self->{domain}->writes);
-    my $upsert = ref($writes->{operations}) eq 'HASH' ? $writes->{operations}{upsert} : undef;
-    my $declared = ref($upsert) eq 'HASH' && ref($upsert->{conflict_targets}) eq 'ARRAY'
-        ? $upsert->{conflict_targets} : [];
-    my $action = $self->{domain}->actions->{$plan->action} // {};
-    my $execution = ref($action->{execution}) eq 'HASH' ? $action->{execution} : {};
-    my $target = $execution->{conflict_target} // (@$declared == 1 ? $declared->[0] : undef);
-    Selecto::Error->throw(
-        'conflict_target_not_declared',
-        'upsert actions resolve conflicts on a target declared by writes.operations.upsert.conflict_targets',
-        {action => $plan->action},
-    ) unless ref($target) eq 'ARRAY' && @$target
-        && grep { ref($_) eq 'ARRAY' && join("\0", @$_) eq join("\0", @$target) } @$declared;
+    my $target = Selecto::Write::ConflictTarget->validate(
+        $writes, $plan->conflict_target, $self->{domain}->fields);
     my %key = map { ("$_" => 1) } @$target;
     my $fields = ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : {};
     my @updates = sort grep {
@@ -742,6 +746,7 @@ sub execute_action {
 # engine's domain and trusted tenant, and the actor in the context.
 sub grant_action {
     my ($self, $plan, %options) = @_;
+    Selecto::Action::Planner->validate_plan_limits($self->{domain}, $plan, limits => $self->{limits});
     my $phase = $options{phase} // 'execute';
     my $decision = Selecto::Action::Capability->authorize(
         $plan, $phase, resolver => $options{resolver}, context => $options{context} // {},
@@ -776,6 +781,7 @@ sub _grant_binding {
 # resolver directly, which is the same as issuing and consuming a grant.
 sub _authorize_action {
     my ($self, $plan, $phase, %options) = @_;
+    Selecto::Action::Planner->validate_plan_limits($self->{domain}, $plan, limits => $self->{limits});
     Selecto::Error->throw('invalid_action_plan', 'action plan is required')
         unless blessed($plan) && $plan->isa('Selecto::Action::Plan');
     return Selecto::Action::Grant->consume(
@@ -803,17 +809,32 @@ sub _action_filter {
     return Selecto::Expression->$method($field, $value);
 }
 
-# ['system', 'now'] is the one portable system value an action may assign.
+# Only the planner's separate authored-instruction map grants executable
+# meaning. A literal JSON array with the same display value stays literal.
 sub _action_assignments {
-    my ($changes) = @_;
+    my ($plan, $domain) = @_;
+    my $changes = $plan->changes;
+    my $system = $plan->system_values // {};
+    Selecto::Error->throw('invalid_action_changes', 'system values must be an object')
+        unless ref($system) eq 'HASH';
     my %assignments;
     for my $field (keys %{$changes // {}}) {
         my $value = $changes->{$field};
-        if (ref($value) eq 'ARRAY') {
+        my $type = $domain->fields->{$field} // '';
+        if (exists($system->{$field})) {
             Selecto::Error->throw('invalid_action_changes', 'action change value is not portable',
                 {field => $field})
-                unless @$value == 2 && ($value->[0] // '') eq 'system' && ($value->[1] // '') eq 'now';
+                unless defined($system->{$field}) && !ref($system->{$field}) && $system->{$field} eq 'now'
+                    && ref($value) eq 'ARRAY' && @$value == 2
+                    && ($value->[0] // '') eq 'system' && ($value->[1] // '') eq 'now'
+                    && $type =~ /\A(?:utc_datetime|naive_datetime|datetime|timestamp|date)\z/;
             $value = Selecto::Write::Expression->current_timestamp;
+        } elsif (ref($value) && !JSON::PP::is_bool($value)) {
+            Selecto::Error->throw('invalid_action_changes', 'structured input requires a JSON field', {field => $field})
+                unless $type =~ /\A(?:json|jsonb|map)\z/;
+            my $encoded = eval {JSON::PP->new->canonical->encode($value)};
+            Selecto::Error->throw('invalid_action_changes', 'action JSON value is not portable', {field => $field}) if $@;
+            $value = $encoded;
         }
         $assignments{$field} = $value;
     }
@@ -833,11 +854,11 @@ sub _normalize_write_command {
 sub query_library { my ($self) = @_; return Selecto::QueryLibrary->library($self->domain); }
 sub apply_segment {
     my ($self, $query, $id, $params) = @_;
-    return Selecto::QueryLibrary->apply_segment($self->domain, $query, $id, $params // {});
+    return Selecto::QueryLibrary->apply_segment($self->domain, $query, $id, $params // {}, $self->{limits});
 }
 sub apply_segments {
     my ($self, $query, $ids, $params) = @_;
-    return Selecto::QueryLibrary->apply_segments($self->domain, $query, $ids, $params // {});
+    return Selecto::QueryLibrary->apply_segments($self->domain, $query, $ids, $params // {}, $self->{limits});
 }
 sub apply_projection {
     my ($self, $query, $ids) = @_;
@@ -849,7 +870,7 @@ sub apply_ordering {
 }
 sub apply_view {
     my ($self, $query, $id, $params) = @_;
-    return Selecto::QueryLibrary->apply_view($self->domain, $query, $id, $params // {});
+    return Selecto::QueryLibrary->apply_view($self->domain, $query, $id, $params // {}, $self->{limits});
 }
 
 sub enforce_query {
@@ -1052,7 +1073,11 @@ sub _validate_command_against_contract {
     _validate_values_foreign_keys(
         $command->assignments, $context{values_foreign_keys}, $label,
     ) if $operation ne 'delete';
-    return $self unless $domain_fields;
+    if (!$domain_fields) {
+        Selecto::Write::ConflictTarget->validate($writes, $command->metadata->{conflict_target}, undef)
+            if $operation eq 'upsert';
+        return $self;
+    }
     # Metadata is validated for every operation, deletes included.
     my $metadata = $command->metadata;
     for my $key (qw(conflict_target returning)) {
@@ -1068,6 +1093,8 @@ sub _validate_command_against_contract {
         }
     }
     if ($operation eq 'upsert') {
+        Selecto::Write::ConflictTarget->validate(
+            $writes, $metadata->{conflict_target}, $domain_fields);
         my $updates = $metadata->{upsert_update_fields};
         Selecto::Error->throw('invalid_write', 'upsert requires declared update fields')
             unless ref($updates) eq 'ARRAY' && @$updates;
@@ -1233,6 +1260,9 @@ sub _validate_graph_node {
         _contract_references($edge->{contract}, $edge->{table}), $command, $tenants,
         graph_node => $node->{id},
     ));
+    $command = $command->with_metadata({%{$command->metadata},
+        __selecto_primary_key => $edge->{primary_key},
+        __selecto_write_limit => $self->{limits}->get('max_action_targets')});
     return ({
         table         => $edge->{table},
         primary_key   => $edge->{primary_key},
@@ -1504,6 +1534,14 @@ execution validates again.
 Validates the command and returns C<< {sql => $sql, params => \@params} >>
 without executing anything.
 
+Every governed upsert requires a nonempty, duplicate-free C<conflict_target>
+that exactly matches one ordered entry in
+C<writes.operations.upsert.conflict_targets>. Omitting the allowlist refuses
+upserts. The check is shared by direct writes, actions, batches and nested
+graph domains. MySQL and MariaDB refuse target-specific upserts with
+C<unsupported_upsert_conflict_target> because their native syntax cannot
+guarantee this identity when another unique key collides.
+
 =head2 execute_write
 
 Validates and executes a command in a transaction, returning a
@@ -1584,8 +1622,12 @@ actions or C<< {ids => [...]} >> for bulk actions.
 Both authorize the plan through the capability resolver (or a C<grant>, see
 below), then build the write command from the plan: the plan's filters
 (target, transition source state, declared preconditions) become the
-predicate, its changes become assignments (C<['system', 'now']> becomes the
-current timestamp) and its cardinality becomes C<expected_count>. The command
+predicate, its changes become assignments and its cardinality becomes
+C<expected_count>. Only a timestamp authored in the selected template or
+default, recorded in the plan's separate C<system_values> provenance, becomes
+the current timestamp. Scalar caller inputs reject references; structured
+JSON values remain bound literals even when they contain C<['system','now']>.
+The command
 then passes through the same governance and tenant scope as any other write.
 Pass C<< returning => [...] >> to request values back.
 
@@ -1596,6 +1638,14 @@ with C<action_capability_denied>. Insert and upsert actions create one row;
 upserts resolve conflicts on a target declared under
 C<writes.operations.upsert.conflict_targets>. Collection patches require a
 host executor (C<unsupported_action_collection_patch>).
+
+The engine accepts a trusted C<Selecto::Limits> object in its constructor's
+C<limits> option and exposes it through C<limits>. Action planning, grant
+issuance, preview and execution recheck its finite C<max_action_targets>
+ceiling before invoking capability resolvers. The default is 1,000; an action's
+C<selection.max_rows> can reduce it. The selected conflict target and system
+instruction provenance are included in the grant digest, so changing either
+invalidates an issued grant.
 
 =head2 grant_action
 

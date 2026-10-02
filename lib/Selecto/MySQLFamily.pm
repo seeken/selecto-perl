@@ -32,15 +32,20 @@ sub supports {
     return "$feature" eq 'transactions' || "$feature" eq 'stream' ? 1 : 0;
 }
 
+sub write_capabilities {
+    my ($self) = @_;
+    return {%{$self->SUPER::write_capabilities}, upsert => 0};
+}
+
 # ON DUPLICATE KEY UPDATE fires on every unique key, not the declared
-# conflict target, so a scoped upsert could update another tenant's row
-# through its primary key. Refuse it, as the Go MySQL adapter does.
+# conflict target. Refuse every upsert: an unscoped table may have another
+# unique index too, and a domain allowlist is not a physical index inventory.
 sub _compile_write {
     my ($self, $command) = @_;
     Selecto::Error->throw(
-        'unsupported_scope_predicate',
-        'MySQL-family adapters cannot apply write scope predicates to upserts',
-    ) if $command->operation eq 'upsert' && defined $command->scope_predicate;
+        'unsupported_upsert_conflict_target',
+        'MySQL-family adapters cannot guarantee the declared upsert conflict target',
+    ) if $command->operation eq 'upsert';
     return $self->SUPER::_compile_write($command);
 }
 
@@ -57,12 +62,8 @@ sub _foreign_key_exists_sql {
 }
 
 sub _compile_upsert_clause {
-    my ($self, $conflict, $updates) = @_;
-    Selecto::Identifier::checked($_) for @$conflict;
-    return ' ON DUPLICATE KEY UPDATE ' . join(', ', map {
-        my $field = Selecto::Identifier::checked($_);
-        $self->quote_identifier($field) . ' = VALUES(' . $self->quote_identifier($field) . ')'
-    } @$updates);
+    Selecto::Error->throw('unsupported_upsert_conflict_target',
+        'MySQL-family adapters cannot guarantee the declared upsert conflict target');
 }
 
 sub _logical_affected_rows {
@@ -135,8 +136,11 @@ Selecto::MySQLFamily - shared DBD::MariaDB mechanics for the MySQL and MariaDB a
 =head1 DESCRIPTION
 
 Common base class of L<Selecto::MySQL> and L<Selecto::MariaDB>: placeholders,
-backtick quoting, C<ON DUPLICATE KEY UPDATE> upserts and value decoding. The
-two public adapters stay separate classes with separate identities.
+backtick quoting and value decoding. The two public adapters stay separate
+classes with separate identities. Their C<upsert> write capability is false:
+C<ON DUPLICATE KEY UPDATE> can match any unique index and cannot guarantee the
+declared conflict target. All upsert previews and executions therefore fail
+with C<unsupported_upsert_conflict_target> before database preparation.
 
 This module is an internal part of the L<Selecto> distribution. Its interface
 may change without notice; applications should use the public entry points

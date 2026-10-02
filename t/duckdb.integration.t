@@ -54,23 +54,12 @@ ok($adapter->supports('transactions'), 'DuckDB declares transaction support');
 ok($adapter->supports('rollup'), 'DuckDB declares native rollup support');
 
 my $api_handler = Selecto::API::EngineHandler->new(default_limit => 100);
-my $subtable = $api_handler->query($engine, {
-    select => [
-        'id', [
-            'lines.sku',
-            {field => 'lines.occurred_at', alias => 'line_day', format => 'day'},
-        ],
-    ],
-});
-is_deeply($subtable->{columns}, [qw(id lines)],
-    'DuckDB API builds an explicitly requested to-many subtable');
-is_deeply($subtable->{rows}, [[1, [
-    ['A-10', '2026-09-11'],
-    ['B-20', '2026-09-11'],
-]]], 'DuckDB API applies array row format to nested aliases and formats');
-is_deeply($subtable->{subtables}, {
-    lines => {columns => ['lines.sku', 'line_day']},
-}, 'DuckDB API publishes ordered columns for array-form subtables');
+my $subtable_error = eval {
+    $api_handler->query($engine, {select => ['id', ['lines.sku']]});
+    undef;
+} // $@;
+is($subtable_error->code, 'unsupported_feature',
+    'DuckDB API refuses nested collections until bounded per-parent semantics are supported');
 
 my $flattened = $api_handler->query($engine, {
     select => ['id', 'lines.sku'],

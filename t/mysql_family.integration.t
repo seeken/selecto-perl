@@ -18,6 +18,7 @@ sub product_domain {
         name => 'Products',
         table => 'selecto_perl_mysql_products',
         fields => { id => 'integer', name => 'string', amount => 'decimal' },
+        conflict_targets => [['id'], ['name']],
     );
 }
 
@@ -57,8 +58,13 @@ for my $specification (
             assignments => { id => 9, name => 'Renée 東京', amount => 20.25 },
             metadata => { conflict_target => ['name'], upsert_update_fields => ['amount'] },
         );
-        is($engine->execute_write($upsert)->affected_rows, 1, "$backend normalizes native upsert rows");
-        is($engine->execute_write($upsert)->affected_rows, 1, "$backend normalizes no-op upsert rows");
+        for my $target (['name'], ['id']) {
+            my $command = $upsert->with_metadata({conflict_target => $target, upsert_update_fields => ['amount']});
+            eval { $engine->execute_write($command) };
+            is($@->code, 'unsupported_upsert_conflict_target', "$backend refuses target-specific upsert");
+            is($dbh->selectrow_array('SELECT amount FROM selecto_perl_mysql_products WHERE id = 1'),
+                '10.50', "$backend never changes the row selected by another unique key");
+        }
 
         my $first = Selecto::Write::Command->new(
             operation => 'insert', relation => 'selecto_perl_mysql_products',

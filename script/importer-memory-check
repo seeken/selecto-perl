@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+use 5.034;
+use strict;
+use warnings;
+use Selecto::Domain;
+use Selecto::Importer;
+
+# Run under an external peak-memory recorder, e.g. /usr/bin/time -l on macOS.
+# Both the default byte cap and cell cap are saturated; no database is used.
+my $domain=Selecto::Domain->parse({
+    schema_version=>1,name=>'Synthetic importer memory check',
+    source=>{source_table=>'fixture',primary_key=>'id',fields=>[qw(id value)],
+        columns=>{id=>{type=>'integer'},value=>{type=>'string'}},associations=>{}},
+    schemas=>{},joins=>{},
+    writes=>{operations=>{update=>{enabled=>1}},fields=>{value=>{updatable=>1}}},
+    imports=>{contract_version=>1,enabled=>1,field_policy=>'declared_only',
+        fields=>{value=>{sources=>['column']}},
+        key_sets=>[{id=>'value',fields=>['value'],cardinality=>'zero_or_one',
+            allowed_on_match=>['update'],allowed_on_missing=>['error'],
+            default_on_match=>'update',default_on_missing=>'error'}]},
+});
+my $row=join(',',('x'x15)x20)."\n";
+my $input=$row x 50_000;
+substr($input,length($row),15,'x'x(15+777_216));
+die 'unexpected fixture size' unless length($input)==16_777_216;
+my $result=Selecto::Importer->new(domain=>$domain)->inspect_csv($input);
+die 'unexpected row count' unless $result->{row_count}==49_999 && @{$result->{columns}}==20;
+print "accepted_input_bytes=16777216 total_cells_including_header=1000000 rows=49999\n";

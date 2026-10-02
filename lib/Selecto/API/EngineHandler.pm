@@ -15,6 +15,7 @@ use Selecto::DateFormat ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
 use Selecto::QueryLibrary ();
+use Selecto::Limits ();
 use Selecto::Write ();
 
 has max_fields        => 100;
@@ -27,9 +28,12 @@ has max_limit         => 1000;
 has max_offset        => 100_000;
 has default_limit     => 100;
 has max_write_count   => 1000;
+has limits => sub { Selecto::Limits->new };
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
+    Selecto::Error->throw('invalid_api_handler', 'limits must be a Selecto::Limits')
+        unless blessed($self->limits) && $self->limits->isa('Selecto::Limits');
     for my $name (qw(
         max_fields max_filters max_filter_values max_orders max_segments
         max_limit max_offset default_limit max_write_count
@@ -46,6 +50,13 @@ sub new ($class, @args) {
     Selecto::Error->throw(
         'invalid_api_handler', 'max_write_count must be positive',
     ) if $self->max_write_count < 1;
+    $self->max_filter_values($self->limits->get('max_filter_values'))
+        if $self->max_filter_values > $self->limits->get('max_filter_values');
+    $self->max_fields($self->limits->get('max_fields'))
+        if $self->max_fields > $self->limits->get('max_fields');
+    $self->limits($self->limits->tightened(
+        max_filter_values => $self->max_filter_values, max_fields => $self->max_fields,
+    ));
     return $self;
 }
 
@@ -58,6 +69,7 @@ sub write_command ($self, $engine, $body) {
     Selecto::Error->throw(
         'invalid_api_host', 'API write handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
+    $self = $self->_for_engine($engine);
     _write_object($body, 'write body');
     _write_reject_unknown($body, [qw(
         operation assignments filters expected_count returning
@@ -117,6 +129,16 @@ sub write_command ($self, $engine, $body) {
         Selecto::Error->throw(
             'invalid_api_write', "$operation requires at least one explicit filter",
         ) unless @filters;
+        unless ($operation_spec->{bulk}) {
+            my $key = $domain->primary_key;
+            my $targeted = defined($key) && grep {
+                ref($_) eq 'HASH' && ($_->{field} // '') eq $key
+                    && lc($_->{op} // '') eq 'eq'
+                    && defined($_->{value}) && !ref($_->{value})
+            } @{$body->{filters} // []};
+            Selecto::Error->throw('invalid_api_write',
+                'non-bulk writes require a concrete primary-key equality target') unless $targeted;
+        }
     } elsif (@filters) {
         Selecto::Error->throw(
             'invalid_api_write', "$operation does not accept filters",
@@ -182,6 +204,9 @@ sub write_command ($self, $engine, $body) {
         expected_count => $expected_count,
         metadata => \%metadata,
     );
+    # Validate public construction through the same contract as direct/action
+    # writes. Return the original so tenant guards are attached exactly once.
+    $engine->governed_write($command);
     return $command;
 }
 
@@ -189,6 +214,7 @@ sub query ($self, $engine, $body) {
     Selecto::Error->throw(
         'invalid_api_host', 'API query handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
+    $self = $self->_for_engine($engine);
     $engine->assert_tenant_boundary(access => 'read');
     _object($body, 'query body');
     _reject_unknown($body, [qw(
@@ -225,7 +251,7 @@ sub query ($self, $engine, $body) {
 
     if ($has_select) {
         # Validate caller intent before composing host-mandated output fields.
-        _api_selections($domain, $body->{select}, $self->max_fields);
+        _api_selections($domain, $body->{select}, $self->max_fields, $self->limits, $engine->adapter->name);
         my @required = @{($domain->contract // {})->{required_selected} // []};
         my %required = map { $_ => 1 } @required;
         my $field_identity = sub {
@@ -244,7 +270,7 @@ sub query ($self, $engine, $body) {
             (grep { my $field = $field_identity->($_); !defined($field) || !$required{$field} } @{$body->{select}}),
         );
         my $selection_plan = _api_selections(
-            $domain, \@selections, $self->max_fields,
+            $domain, \@selections, $self->max_fields, $self->limits, $engine->adapter->name,
         );
         $query = $query->select($selection_plan->{expressions});
         @subtables = @{$selection_plan->{subtables}};
@@ -280,14 +306,14 @@ sub query ($self, $engine, $body) {
     if (!$has_select) {
         # Named library definitions are not permission to expose internal fields.
         my @fields = map { $_->arguments->[0] } @{$query->selections};
-        my $selection_plan = _api_selections($domain, \@fields, $self->max_fields);
+        my $selection_plan = _api_selections($domain, \@fields, $self->max_fields, $self->limits, $engine->adapter->name);
         $query = $query->replace_selections($selection_plan->{expressions});
     }
 
     if (@segments) {
         my %seen;
         @segments = grep { !$seen{$_}++ } @segments;
-        $query = $engine->apply_segments($query, \@segments, $parameters);
+        $query = Selecto::QueryLibrary->apply_segments($domain, $query, \@segments, $parameters, $self->limits);
         # Segments are not permission to filter on an internal field either:
         # with a parameter, a caller could probe its value. They are the only
         # predicate so far (the required predicate is added when compiling).
@@ -343,6 +369,10 @@ sub query ($self, $engine, $body) {
     my $offset = exists($body->{offset})
         ? _bounded_integer($body->{offset}, 'offset', 0, $self->max_offset)
         : 0;
+    my $children_per_root = 0;
+    $children_per_root += $_->{limit} for @subtables;
+    $self->limits->check_count('max_total_collection_rows', $limit * $children_per_root,
+        'invalid_api_query', 'requested related collection rows');
     $query = $query->limit($limit)->offset($offset);
     if (defined $timezone) {
         my $ok = eval { $query = $query->use_timezone($timezone); 1 };
@@ -365,11 +395,11 @@ sub query ($self, $engine, $body) {
     ) unless ref($result) eq 'HASH'
         && ref($result->{columns}) eq 'ARRAY'
         && ref($result->{rows}) eq 'ARRAY';
-    _shape_result_rows($result, \@subtables, $row_format);
+    _shape_result_rows($result, \@subtables, $row_format, $self->limits);
     my %subtable_metadata = map {
-        $_->{column} => {columns => [@{$_->{columns}}]}
+        $_->{column} => {columns => [@{$_->{columns}}], limit => $_->{limit}, complete => JSON::PP::true}
     } @subtables;
-    return {
+    my $response = {
         columns => $result->{columns},
         rows => $result->{rows},
         returned => scalar(@{$result->{rows}}),
@@ -379,6 +409,22 @@ sub query ($self, $engine, $body) {
         offset => $offset,
         query_library => $query->applied_query_library,
     };
+    # Raw-cell checks precede child decoding; this exact JSON-envelope check
+    # also counts escaping, keys and metadata in the eventual public response.
+    $self->limits->check_bytes('max_response_bytes',
+        JSON::PP->new->utf8->encode({data => $response, ok => JSON::PP::true}),
+        'api_result_limit_exceeded', 'encoded result bytes');
+    return $response;
+}
+
+sub _for_engine ($self, $engine) {
+    my $limits = $self->limits->intersect($engine->limits);
+    # Request-local copy: an engine's tighter trusted policy cannot be widened
+    # by a handler, and serving it must not mutate a shared handler instance.
+    return bless {%$self, limits => $limits,
+        max_filter_values => $limits->get('max_filter_values'),
+        max_fields => $limits->get('max_fields'),
+    }, ref($self);
 }
 
 sub describe_openapi ($self, $api) {
@@ -392,6 +438,35 @@ sub describe_openapi ($self, $api) {
         Selecto::API::ResultFormatter->openapi_parameters;
     $openapi->{paths}{$query_path}{post}{responses}{200}{content} =
         Selecto::API::ResultFormatter->openapi_content;
+    $openapi->{paths}{$query_path}{post}{responses}{200}{content}{'application/json'} = {
+        schema => {'$ref' => '#/components/schemas/SelectoQueryResponse'},
+    };
+    $openapi->{components}{schemas}{SelectoSubtableMetadata} = {
+        type => 'object', additionalProperties => JSON::PP::false,
+        required => [qw(columns limit complete)],
+        properties => {
+            columns => {type => 'array', items => {type => 'string'}},
+            limit => {type => 'integer', minimum => 0},
+            complete => {type => 'boolean', const => JSON::PP::true},
+        },
+        description => 'Complete bounded collection in stable primary-key order; oversized collections refuse the query.',
+    };
+    $openapi->{components}{schemas}{SelectoQueryResponse} = {
+        type => 'object', required => [qw(ok data)],
+        properties => {
+            ok => {type => 'boolean', const => JSON::PP::true},
+            data => {
+                type => 'object', required => [qw(columns rows subtables)],
+                properties => {
+                    columns => {type => 'array', items => {type => 'string'}},
+                    rows => {type => 'array', items => {oneOf => [{type => 'array'}, {type => 'object'}]}},
+                    subtables => {type => 'object', additionalProperties => {
+                        '$ref' => '#/components/schemas/SelectoSubtableMetadata',
+                    }},
+                },
+            },
+        },
+    };
     $openapi->{paths}{$query_path}{post}{requestBody} = {
         required => JSON::PP::true,
         content => {
@@ -472,7 +547,8 @@ sub describe_openapi ($self, $api) {
     };
     $openapi->{components}{schemas}{SelectoSubtableSelection} = {
         type => 'array', minItems => 1, maxItems => $self->max_fields,
-        description => 'Fields from one direct to-many association returned as a nested collection.',
+        description => 'PostgreSQL only. Stable primary-key order; each collection must fit the configured per-parent limit or the request is refused. Successful subtable metadata includes limit and complete=true.',
+        'x-selecto-max-rows-per-parent' => $self->limits->get('max_collection_rows'),
         items => {
             oneOf => [
                 {type => 'string'},
@@ -576,6 +652,11 @@ sub _write_filters ($self, $domain, $filters) {
             ) unless ref($values) eq 'ARRAY' && @$values;
             Selecto::Error->throw('invalid_api_write', 'Too many in filter values')
                 if @$values > $self->max_filter_values;
+            my $total = 0;
+            for my $value (@$values) {
+                $total += $self->limits->check_bytes('max_value_bytes', _write_value($value, 'in filter item'), 'invalid_api_write', 'in filter item');
+                $self->limits->check_count('max_parameter_bytes', $total, 'invalid_api_write', 'in filter bytes');
+            }
             push @expressions, Selecto::Expression->in(
                 $operand,
                 [map { _write_value($_, 'in filter value') } @$values],
@@ -655,9 +736,13 @@ sub _write_string_array ($value, $label, $maximum, $required = 0) {
         if $required && !@$value;
     Selecto::Error->throw('invalid_api_write', "Too many $label entries")
         if @$value > $maximum;
+    my @fields = map { _write_required_string($_, "$label entry") } @$value;
+    # Conflict targets have an exact ordered identity. Preserve duplicates so
+    # the common governed-write validator refuses them instead of silently
+    # turning the request into a different, declared target.
+    return @fields if $label eq 'conflict_target';
     my %seen;
-    return grep { !$seen{$_}++ }
-        map { _write_required_string($_, "$label entry") } @$value;
+    return grep { !$seen{$_}++ } @fields;
 }
 
 sub _write_bounded_integer ($value, $label, $minimum, $maximum) {
@@ -753,6 +838,11 @@ sub _query_filter_expression ($self, $filter, $operator, $definition, $operand) 
             unless ref($values) eq 'ARRAY' && @$values;
         Selecto::Error->throw('invalid_api_query', 'Too many in filter values')
             if @$values > $self->max_filter_values;
+        my $total = 0;
+        for my $value (@$values) {
+            $total += $self->limits->check_bytes('max_value_bytes', _literal_value($value, 'in filter item'), 'invalid_api_query', 'in filter item');
+            $self->limits->check_count('max_parameter_bytes', $total, 'invalid_api_query', 'in filter bytes');
+        }
         my @values = map { _literal_value($_, 'in filter value') } @$values;
         my $expression = Selecto::Expression->in($operand, \@values);
         return $operator eq 'not_in' ? Selecto::Expression->not($expression) : $expression;
@@ -821,7 +911,7 @@ sub _required_string ($value, $label) {
     return "$value";
 }
 
-sub _api_selections ($domain, $value, $maximum) {
+sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
     Selecto::Error->throw('invalid_api_query', 'select must be an array')
         unless ref($value) eq 'ARRAY';
     Selecto::Error->throw('invalid_api_query', 'select must not be empty')
@@ -842,6 +932,8 @@ sub _api_selections ($domain, $value, $maximum) {
         }
         Selecto::Error->throw('invalid_api_query', 'subtable selection must not be empty')
             unless @$entry;
+        Selecto::Error->throw('unsupported_feature', 'bounded API collections require PostgreSQL')
+            unless $adapter_name eq 'postgresql';
         my (@fields, %nested_names, $association);
         for my $nested_entry (@$entry) {
             Selecto::Error->throw(
@@ -883,12 +975,19 @@ sub _api_selections ($domain, $value, $maximum) {
             'a subtable association collides with another result column',
             {column => $association},
         ) if $column_names{$association}++;
+        my $related = $domain->resolve_association($association)->{association};
+        my $primary_key = $related->target_primary_key;
+        Selecto::Error->throw('invalid_api_query', 'bounded collection requires a public target primary key')
+            unless defined($primary_key) && $domain->field_is_public("$association.$primary_key");
+        my $child_limit = $limits->get('max_collection_rows');
         push @subtables, {
+            limit => $child_limit,
             column => $association,
             columns => [map { $_->{key} } @fields],
         };
         push @expressions, Selecto::Expression->related_collection(
-            $association, \@fields,
+            $association, \@fields, limit => $child_limit + 1,
+            order_by => [[$primary_key, 'asc']],
         )->as($association);
     }
     Selecto::Error->throw('invalid_api_query', 'Too many select entries')
@@ -942,7 +1041,15 @@ sub _api_selection_entry ($domain, $entry, $label) {
     };
 }
 
-sub _shape_result_rows ($result, $subtables, $row_format) {
+sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
+    my ($total_bytes, $total_children) = (0, 0);
+    for my $row (@{$result->{rows}}) {
+        for my $value (@$row) {
+            $total_bytes += $limits->check_bytes('max_response_bytes', ref($value) ? JSON::PP->new->utf8->encode($value) : $value,
+                'api_result_limit_exceeded', 'result cell');
+            $limits->check_count('max_response_bytes', $total_bytes, 'api_result_limit_exceeded', 'result bytes');
+        }
+    }
     my %subtable = map { $_->{column} => $_ } @$subtables;
     for my $index (0 .. $#{$result->{columns}}) {
         my $specification = $subtable{$result->{columns}[$index]};
@@ -961,6 +1068,12 @@ sub _shape_result_rows ($result, $subtables, $row_format) {
                 {column => $result->{columns}[$index]},
             ) unless $ok && ref($decoded) eq 'ARRAY'
                 && !grep { ref($_) ne 'HASH' } @$decoded;
+            Selecto::Error->throw('related_collection_limit_exceeded',
+                'related collection exceeds its per-parent limit; use a separately paged child query',
+                {maximum => $specification->{limit}}) if @$decoded > $specification->{limit};
+            $total_children += @$decoded;
+            $limits->check_count('max_total_collection_rows', $total_children,
+                'api_result_limit_exceeded', 'related collection rows');
             $decoded = _collection_json_value($decoded);
             $row->[$index] = $row_format eq 'objects' ? $decoded : [map {
                 my $record = $_;
@@ -1155,7 +1268,8 @@ alike.
 =back
 
 The result has C<columns>, C<rows>, C<returned>, C<limit>, C<offset>,
-C<row_format>, C<subtables> (per association, its C<columns>) and
+C<row_format>, C<subtables> (per association, its C<columns>, C<limit> and
+C<complete: true>) and
 C<query_library> (the applied definitions).
 
 =head2 write
