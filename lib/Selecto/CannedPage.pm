@@ -193,6 +193,40 @@ sub new {
     return $page;
 }
 
+sub experiences {
+    my ($class, $domain) = @_;
+    _fail('experience discovery requires a domain')
+        unless blessed($domain) && $domain->isa('Selecto::Domain');
+    my $registry = $domain->experiences;
+    my @entries;
+    for my $id (sort keys %$registry) {
+        my $entry = $registry->{$id};
+        next unless ref($entry) eq 'HASH' && ($entry->{kind} // '') eq 'canned_page';
+        _fail('invalid canned-page experience') unless _id($id)
+            && join(',', sort keys %$entry) eq 'definition,kind,version'
+            && defined($entry->{version}) && !ref($entry->{version}) && "$entry->{version}" eq '1'
+            && _id($entry->{definition});
+        push @entries, {id => $id, definition => $entry->{definition}, version => 1};
+    }
+    return \@entries;
+}
+
+sub from_experience {
+    my ($class, $engine, $id, $factories) = @_;
+    _fail('experience resolution requires an engine and factory map')
+        unless blessed($engine) && $engine->isa('Selecto::Engine') && ref($factories) eq 'HASH';
+    _fail('invalid experience id') unless _id($id);
+    my ($entry) = grep { $_->{id} eq $id } @{$class->experiences($engine->domain)};
+    _fail('unknown canned-page experience') unless $entry;
+    my $factory = $factories->{$entry->{definition}};
+    _fail('unbound canned-page definition') unless ref($factory) eq 'CODE';
+    my $page = $factory->($engine);
+    _fail('factory must return a page with the registered id and domain')
+        unless blessed($page) && $page->isa('Selecto::CannedPage') && $page->id eq $id
+            && $page->domain->fingerprint eq $engine->domain->fingerprint;
+    return $page;
+}
+
 sub id { $_[0]->{id} }
 sub domain { $_[0]->{domain} }
 sub version { $_[0]->{version} }

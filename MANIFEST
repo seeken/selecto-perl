@@ -61,6 +61,7 @@ lib/Selecto/Write/Expression.pm
 lib/Selecto/Write/Scope.pm
 script/with-local-deps
 t/00-load.t
+t/canned_page_experiences.t
 t/canned_page.integration.t
 t/canned_page_case_insensitive.t
 t/computed_coalesce.t
