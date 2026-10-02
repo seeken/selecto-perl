@@ -195,6 +195,7 @@ sub live_cases {
             is_deeply [map { $_->[1] } @{$result->{rows}}], [map { $_->[2] } @{$result->{rows}}],
                 "$format->{id} in $zone matches";
         }
+        if ($name eq 'postgresql') {
         for my $bucket (
             {kind => 'year_increment', increment => 1},
             {kind => 'date_relative_ranges', ranges => [{minimum => 0, maximum => 400, label => 'recent'}]},
@@ -211,6 +212,16 @@ sub live_cases {
             Selecto::Expression->count_bucket(q{aware}, 0, undef, q{elapsed_days})->as('a'))
             ->use_timezone($zone))->{rows};
         is $counts->[0][0], $counts->[0][1], "elapsed-day counts in $zone match";
+        } else {
+            for my $expression (
+                Selecto::Expression->bucket('naive', {kind => 'year_increment', increment => 1}),
+                Selecto::Expression->count_bucket('naive', 0, undef, 'elapsed_days'),
+            ) {
+                my $ok = eval { $engine->compile($engine->query->select($expression)->use_timezone($zone)); 1 };
+                ok !$ok && blessed($@) && $@->code eq 'invalid_query',
+                    "$name refuses unsupported bucket expressions under $zone";
+            }
+        }
         for my $filter (
             [between => '2024-03-10T01:00:00', '2024-03-10T04:00:00'],
             [between => '2024-11-03T01:00:00', '2024-11-03T02:00:00'],

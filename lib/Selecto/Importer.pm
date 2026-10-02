@@ -13,8 +13,14 @@ use Text::CSV ();
 use Selecto::DateShortcut ();
 use Selecto::Domain ();
 use Selecto::Error ();
+use Selecto::Limits ();
+use bytes ();
 
 has 'domain';
+has limits => sub { Selecto::Limits->new };
+has max_file_bytes => sub { $_[0]->limits->get('max_file_bytes') };
+has max_total_decoded_bytes => sub { $_[0]->limits->get('max_total_decoded_bytes') };
+has max_total_cells => sub { $_[0]->limits->get('max_total_cells') };
 has max_columns => 200;
 has max_rows => 50_000;
 has max_sample_rows => 25;
@@ -22,9 +28,11 @@ has max_cell_bytes => 1_048_576;
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
+    Selecto::Error->throw('invalid_importer', 'limits must be a Selecto::Limits')
+        unless blessed($self->limits) && $self->limits->isa('Selecto::Limits');
     Selecto::Error->throw('invalid_importer', 'importer requires a Selecto domain')
         unless blessed($self->domain) && $self->domain->isa('Selecto::Domain');
-    for my $name (qw(max_columns max_rows max_sample_rows max_cell_bytes)) {
+    for my $name (qw(max_columns max_rows max_sample_rows max_cell_bytes max_file_bytes max_total_decoded_bytes max_total_cells)) {
         my $value = $self->$name;
         Selecto::Error->throw('invalid_importer', "$name must be a positive integer")
             unless defined($value) && !ref($value) && "$value" =~ /\A[1-9][0-9]*\z/;
@@ -53,6 +61,8 @@ sub domain_fingerprint ($self) {
 sub inspect_csv ($self, $content, %options) {
     Selecto::Error->throw('invalid_import_file', 'CSV content must be a scalar')
         if !defined($content) || ref($content);
+    Selecto::Error->throw('import_file_limit_exceeded', 'Import file exceeds its byte limit', {maximum_bytes => $self->max_file_bytes})
+        if bytes::length($content) > $self->max_file_bytes;
     my $bytes = eval { utf8::is_utf8($content) ? encode('UTF-8', "$content", FB_CROAK) : "$content" };
     Selecto::Error->throw('invalid_import_file', 'CSV content must be UTF-8')
         if $@ || !eval { decode('UTF-8', "$bytes", FB_CROAK); 1 };
@@ -72,28 +82,48 @@ sub inspect_csv ($self, $content, %options) {
     open my $fh, '<:encoding(UTF-8)', \$bytes
         or Selecto::Error->throw('invalid_import_file', 'CSV content cannot be read');
 
-    my @records;
-    my $record_number = 0;
+    my (@columns, @rows);
+    my ($record_number, $total_bytes, $total_cells) = (0, 0, 0);
     while (my $row = $csv->getline($fh)) {
         $record_number++;
         Selecto::Error->throw('import_column_limit_exceeded', 'Import file has too many columns', {
             maximum => $self->max_columns,
             columns => scalar(@$row),
         }) if @$row > $self->max_columns;
+        $total_cells += @$row;
+        Selecto::Error->throw('import_total_cell_limit_exceeded', 'Import file has too many cells', {maximum => $self->max_total_cells})
+            if $total_cells > $self->max_total_cells;
         for my $index (0 .. $#$row) {
             next unless defined $row->[$index];
-            my $cell_bytes = eval { encode('UTF-8', $row->[$index], FB_CROAK | LEAVE_SRC) };
-            Selecto::Error->throw('invalid_import_file', 'CSV content must be UTF-8') if $@;
+            my $cell_bytes = bytes::length($row->[$index]);
+            $total_bytes += $cell_bytes;
+            Selecto::Error->throw('import_decoded_limit_exceeded', 'Import decoded cells exceed their byte limit', {maximum_bytes => $self->max_total_decoded_bytes})
+                if $total_bytes > $self->max_total_decoded_bytes;
             Selecto::Error->throw('import_cell_limit_exceeded', 'Import file contains a cell that is too large', {
                 maximum_bytes => $self->max_cell_bytes,
                 row => $record_number,
                 column => $index + 1,
-            }) if length($cell_bytes) > $self->max_cell_bytes;
+            }) if $cell_bytes > $self->max_cell_bytes;
         }
-        push @records, {values => [@$row], physical_line => $csv->record_number};
+        if ($record_number == 1) {
+            my @headers = $header ? map { defined($_) ? "$_" : '' } @$row
+                : map { 'Column ' . ($_ + 1) } 0 .. $#$row;
+            my %occurrences;
+            @columns = map {
+                my $label = $headers[$_] // '';
+                $occurrences{lc $label}++;
+                {id => 'c' . ($_ + 1), ordinal => $_ + 1, header => $label,
+                 occurrence => $occurrences{lc $label},
+                 label => length($label) ? $label . ($occurrences{lc $label} > 1 ? ' #' . $occurrences{lc $label} : '') : 'Column ' . ($_ + 1)};
+            } 0 .. $#headers;
+            next if $header;
+        }
         Selecto::Error->throw('import_row_limit_exceeded', 'Import file has too many rows', {
             maximum => $self->max_rows,
-        }) if @records > $self->max_rows + ($header ? 1 : 0);
+        }) if @rows >= $self->max_rows;
+        my %values = map { $_->{id} => $row->[$_->{ordinal} - 1] } @columns;
+        push @rows, {row_number => scalar(@rows) + 1,
+            physical_line => $csv->record_number, values => \%values};
     }
     my ($code, $message, $position, $record, $field) = $csv->error_diag;
     if (defined($code) && $code != 0 && $code != 2012) {
@@ -103,35 +133,8 @@ sub inspect_csv ($self, $content, %options) {
             defined($field) ? (field => $field) : (),
         });
     }
-    Selecto::Error->throw('import_file_empty', 'Import file has no rows') unless @records;
+    Selecto::Error->throw('import_file_empty', 'Import file has no rows') unless $record_number;
 
-    my $header_record = $header ? shift @records : undef;
-    my @headers = $header
-        ? map { defined($_) ? "$_" : '' } @{$header_record->{values}}
-        : map { 'Column ' . ($_ + 1) } 0 .. $#{$records[0]{values}};
-    my %occurrences;
-    my @columns = map {
-        my $label = $headers[$_] // '';
-        $occurrences{lc $label}++;
-        {
-            id => 'c' . ($_ + 1), ordinal => $_ + 1, header => $label,
-            occurrence => $occurrences{lc $label},
-            label => length($label) ? $label . ($occurrences{lc $label} > 1 ? ' #' . $occurrences{lc $label} : '') : 'Column ' . ($_ + 1),
-        }
-    } 0 .. $#headers;
-    my @rows;
-    for my $index (0 .. $#records) {
-        my $record = $records[$index];
-        my %values;
-        for my $column (@columns) {
-            $values{$column->{id}} = $record->{values}[ $column->{ordinal} - 1 ];
-        }
-        push @rows, {
-            row_number => $index + 1,
-            physical_line => $record->{physical_line},
-            values => \%values,
-        };
-    }
     return {
         format => 'csv', delimiter => $delimiter, header => $header ? JSON::PP::true : JSON::PP::false,
         sha256 => 'sha256:' . sha256_hex($bytes), columns => \@columns,

@@ -6,7 +6,7 @@ use Storable qw(dclone);
 
 has [qw(
     action type operation scope capability target filters changes expected_cardinality
-    transition preconditions inputs variant execution_case collection_patches
+    transition preconditions inputs variant execution_case collection_patches conflict_target system_values
 )];
 
 sub to_hash ($self) {
@@ -26,6 +26,8 @@ sub to_hash ($self) {
         variant              => $self->variant,
         execution_case       => $self->execution_case,
         collection_patches   => $self->collection_patches,
+        conflict_target      => $self->conflict_target,
+        system_values        => $self->system_values,
     });
 }
 
@@ -76,6 +78,20 @@ and declared preconditions.
 =item C<changes>
 
 The assignments the action makes, after input substitution.
+
+=item C<conflict_target>
+
+The exact ordered conflict target resolved from the selected upsert execution,
+including any variant or case. Execution checks it against the domain allowlist.
+
+=item C<system_values>
+
+Planner-produced provenance for authored system assignments (currently a map
+from temporal field names to C<now>). C<changes> keeps the display value
+C<['system','now']>; only this separate map gives it instruction semantics.
+Request input never supplies this map. Both fields are included in C<to_hash>
+and therefore the action grant digest. Treat serialized plans as host-owned
+values; accept request intents through the planner, never as arbitrary plans.
 
 =item C<expected_cardinality>
 

@@ -208,7 +208,8 @@ for my $backend (@backends) {
         my $bulk = code_of(sub { $engine->execute_write(Selecto::Write::Command->new(
             operation => 'update', relation => $tables{orders}, assignments => {customer_id => 2},
             predicate => $E->eq('code', 'A'), expected_count => undef)) });
-        is($bulk, 'cardinality_mismatch', 'a guarded bulk update without expected_count still fails when guarded out');
+        is($bulk, $name eq 'duckdb' ? 'write_capability_missing' : 'cardinality_mismatch',
+            'a broad guarded update is refused before mutation or by the foreign-key guard');
         is_deeply($rows->(), $baseline, 'the bulk update changed nothing');
 
         my $batch = sub {

@@ -43,7 +43,9 @@ sub writable_domain {
         schemas => {},
         joins => {},
         writes => {
-            operations => {map { ($_ => {enabled => $true}) } qw(insert update upsert delete)},
+            operations => {map { ($_ => {enabled => $true,
+                ($_ eq 'upsert' ? (conflict_targets => $args{conflict_targets} // [[$args{primary_key} // 'id']]) : ())}) }
+                qw(insert update upsert delete)},
             fields => {map { ($_ => {insertable => $true, updatable => $true}) } @names},
         },
     }, strict => 1);

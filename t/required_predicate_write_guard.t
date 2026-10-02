@@ -75,7 +75,7 @@ sub project_contract {
                 insert => {enabled => 1},
                 update => {enabled => 1, bulk => 1},
                 delete => {enabled => 1, bulk => 1},
-                upsert => {enabled => 1, conflict_targets => [['id']]},
+                upsert => {enabled => 1, conflict_targets => [['id'], [qw(id site_id)]]},
             },
             fields => {
                 id => {insertable => 1},
@@ -114,7 +114,7 @@ sub project_contract {
             },
             sync => {
                 type => 'create', label => 'Sync project',
-                execution => {kind => 'updato', operation => 'upsert',
+                execution => {kind => 'updato', operation => 'upsert', conflict_target => ['id'],
                     set => {id => 1, site_id => 10, region => 'west', title => 'synced', state => 'open'}},
             },
         },

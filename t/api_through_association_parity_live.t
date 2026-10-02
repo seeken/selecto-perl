@@ -41,7 +41,7 @@ is_deeply $handler->query($engine, {select => ['id','tags.label'], order_by => [
     'filtered targets do not add null rows alongside permitted targets';
 is_deeply $result->{rows}, [[1,[[10,'allowed',2],['9007199254740993','large',2]]],[2,[]],[3,[]]],
     'through collection retains bridge and target policies, exact IDs, target columns and parent cardinality';
-is_deeply $result->{subtables}, {tags => {columns => [qw(tags.id tags.label tags.active)]}},
+is_deeply $result->{subtables}, {tags => {columns => [qw(tags.id tags.label tags.active)], limit => 100, complete => JSON::PP::true}},
     'subtable metadata uses selected output names';
 like(JSON::PP->new->encode($result->{rows}), qr/"9007199254740993"/,
     'unsafe child integer has a JSON string type, not only string-equal value');

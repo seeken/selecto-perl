@@ -146,7 +146,8 @@ sub resolve ($self, %args) {
             required => $required,
             nullable => $entry->{nullable} ? 1 : 0,
             writable => $contract_writable,
-            value => exists($snapshot->{$field}) ? $snapshot->{$field} : undef,
+            ($state ne 'hidden'
+                ? (value => exists($snapshot->{$field}) ? $snapshot->{$field} : undef) : ()),
             (defined($entry->{action}) ? (action => _identifier(
                 $entry->{action}, "field policy action for $field",
             )) : ()),

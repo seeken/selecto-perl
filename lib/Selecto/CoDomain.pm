@@ -55,9 +55,13 @@ sub lookup {
             if defined $definition->{ordering};
     }
 
+    _public_field($target_domain, $_)
+        for Selecto::Expression->field_references($query->predicate);
     my %selection_index;
     my $selection_index = 0;
     for my $selection (@{$query->selections}) {
+        _public_field($target_domain, $_)
+            for Selecto::Expression->field_references($selection);
         if ($selection->kind eq 'field') {
             my $field = $selection->arguments->[0];
             $selection_index{$field} //= $selection_index;
@@ -70,7 +74,7 @@ sub lookup {
         @{$result->{description_fields} // []},
     );
     for my $field (@result_fields) {
-        $target_domain->resolve($field);
+        _public_field($target_domain, $field);
         Selecto::Error->throw(
             'invalid_co_domain', 'co-domain result field is absent from its projection',
             {co_domain => _id($args{co_domain}), field => $field},
@@ -78,7 +82,12 @@ sub lookup {
     }
 
     my $search = $definition->{search};
-    $target_domain->resolve($_) for @{$search->{fields}};
+    _public_field($target_domain, $_) for @{$search->{fields}};
+    for my $order (@{$query->orders}) {
+        my $field = $order->[0];
+        _public_field($target_domain, $_) for blessed($field)
+            ? Selecto::Expression->field_references($field) : ($field);
+    }
     Selecto::Error->throw(
         'unsupported_feature', 'co-domain lookup requires adapter text search support',
         {co_domain => _id($args{co_domain}), adapter => $engine->adapter->name},
@@ -140,6 +149,13 @@ sub _prefix_query {
     my ($value) = @_;
     my @tokens = map { lc $_ } "$value" =~ /([[:alnum:]_]+)/g;
     return join(' & ', map { $_ . ':*' } @tokens);
+}
+
+sub _public_field {
+    my ($domain, $field) = @_;
+    Selecto::Error->throw('invalid_co_domain', 'co-domain lookup uses a non-public field')
+        unless $domain->field_is_public($field);
+    return $domain->resolve($field);
 }
 
 sub _domain {

@@ -37,6 +37,7 @@ $dbh->do("INSERT INTO [$table] VALUES (1, N'baseline', N'Renée 東京', 1, 10.5
 my $domain = TestSelecto::writable_domain(
     name => 'Products',
     table => $table,
+    conflict_targets => [['external_id']],
     fields => {
         id => 'integer', external_id => 'string', name => 'string',
         active => 'boolean', amount => 'decimal',

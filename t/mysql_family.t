@@ -32,10 +32,10 @@ for my $adapter ($mysql, $mariadb) {
             upsert_update_fields => ['name'],
         },
     );
-    my $preview = $adapter->preview_write($command);
-    like($preview->{sql}, qr/ON DUPLICATE KEY UPDATE `name` = VALUES\(`name`\)/, $adapter->name . ' uses native upsert syntax');
-    is_deeply($preview->{params}, ['one', 'updated'], $adapter->name . ' keeps upsert values bound');
-    is($adapter->_logical_affected_rows('upsert', 2), 1, $adapter->name . ' normalizes changed upsert rows');
+    eval { $adapter->preview_write($command) };
+    is($@->code, 'unsupported_upsert_conflict_target', $adapter->name . ' refuses an unenforceable conflict identity');
+    ok(!$adapter->write_capabilities->{upsert}, $adapter->name . ' does not advertise upsert support');
+    is_deeply($dbh->prepared, [], $adapter->name . ' refuses before database preparation');
 }
 
 done_testing;

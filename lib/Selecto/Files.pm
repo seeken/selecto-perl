@@ -13,6 +13,8 @@ our $MAX_SAFE_INTEGER = 9_007_199_254_740_991;
 
 sub new {
     my ($class, %args) = @_;
+    _error('invalid_request') if exists($args{authorize}) && ref($args{authorize}) ne 'CODE';
+    _error('invalid_request') if exists($args{audit}) && ref($args{audit}) ne 'CODE';
     _text($args{secret});
     my $descriptor = $args{descriptor};
     _error('invalid_request') unless ref($descriptor) eq 'HASH';
@@ -37,6 +39,7 @@ sub new {
         },
         storage => $args{storage} // Selecto::Files::MemoryStorage->new,
         authorize => $args{authorize} // sub { 1 },
+        audit => $args{audit} // sub { 1 },
         attachments => {}, collections => {}, operations => {}, versions => {}, holds => {},
         sequence => 0,
     }, $class;
@@ -489,20 +492,56 @@ sub detach {
 
 sub place_hold {
     my ($self, $version_id, %args) = @_;
-    $self->_allow('hold', undef);
+    $version_id = Selecto::Files::_text($version_id);
+    my $authority = Selecto::Files::_text($args{authority});
     my $version = $self->{service}{versions}{$version_id};
     Selecto::Files::_error('not_found') unless $self->_owned($version);
-    $self->{service}{holds}{$version_id}{Selecto::Files::_text($args{authority})} = 1;
+    my $existing = $self->{service}{holds}{$version_id}{$authority};
+    $self->_hold_decision('place_hold', $version_id, $authority, $version, $existing);
+    $self->_audit_hold('place_hold', $version_id, $authority);
+    $self->{service}{holds}{$version_id}{$authority} //= {actor => $self->{actor}};
     return;
 }
 
 sub release_hold {
     my ($self, $version_id, %args) = @_;
-    $self->_allow('hold', undef);
-    my $version = $self->{service}{versions}{Selecto::Files::_text($version_id)};
+    $version_id = Selecto::Files::_text($version_id);
+    my $authority = Selecto::Files::_text($args{authority});
+    my $version = $self->{service}{versions}{$version_id};
     Selecto::Files::_error('not_found') unless $self->_owned($version);
-    delete $self->{service}{holds}{$version_id}{Selecto::Files::_text($args{authority})};
+    my $existing = $self->{service}{holds}{$version_id}{$authority};
+    $self->_hold_decision('release_hold', $version_id, $authority, $version, $existing);
+    return unless $existing;
+    # A failed audit cannot remove a hold or make the version purgeable.
+    $self->_audit_hold('release_hold', $version_id, $authority);
+    delete $self->{service}{holds}{$version_id}{$authority};
     return;
+}
+
+sub _hold_decision {
+    my ($self, $operation, $version_id, $authority, $version, $existing) = @_;
+    my $decision = $self->{service}{authorize}->($operation, $self->{actor},
+        $self->{owner}, $version->{role},
+        {operation => $operation, version_id => $version_id, authority => $authority});
+    my $allowed = ref($decision) eq 'HASH' ? $decision->{allowed}
+        : (!ref($decision) || JSON::PP::is_bool($decision)) && $decision;
+    Selecto::Files::_error('not_found') unless $allowed;
+    # Older boolean hold records have no proven owner and require explicit
+    # administrative authorization. A generic true grant is never hold-admin.
+    if ($existing && !(ref($existing) eq 'HASH'
+        && defined($existing->{actor}) && $existing->{actor} eq $self->{actor})) {
+        Selecto::Files::_error('not_found') unless ref($decision) eq 'HASH'
+            && ($decision->{hold_admin} || $decision->{release_authority});
+    }
+}
+
+sub _audit_hold {
+    my ($self, $operation, $version_id, $authority) = @_;
+    my $event = {operation => $operation, version_id => $version_id,
+        authority => $authority, actor => $self->{actor}};
+    my $ok = eval { $self->{service}{audit}->({%$event}) };
+    Selecto::Files::_error('audit_failed') unless $ok && !$@;
+    $self->{service}{versions}{$version_id}{last_hold_event} = $event;
 }
 
 sub purge {
@@ -612,8 +651,9 @@ Attachment metadata is kept in the C<Selecto::Files> object's memory.
 Persistent metadata, Mojolicious routes, cloud storage adapters and workers
 are not part of this release.
 
-If C<authorize> is omitted every action is allowed; production hosts should
-always supply one.
+If C<authorize> is omitted ordinary actions are allowed, but another actor's
+hold cannot be replaced or released. Production hosts should supply both
+authorization and a durable audit callback.
 
 =head1 METHODS
 
@@ -622,7 +662,9 @@ always supply one.
 Arguments: C<secret>, C<descriptor> (C<id>, C<domain_fingerprint> and
 C<roles>, each with positive C<max_files>, C<max_bytes> and a non-empty
 C<media_types> list), C<storage> (default L</Selecto::Files::MemoryStorage>)
-and C<authorize>.
+and C<authorize>. Optional C<audit> receives a hold event hash and must return
+true; a false return or exception refuses the hold change with C<audit_failed>.
+The default records only the version's last event in memory, not a durable log.
 
 =head2 bind
 
@@ -653,6 +695,18 @@ and optional SHA-256, and never closes the handle.
 =item C<detach($attachment_id, expected_revision => $n)>
 
 =item C<place_hold($version_id, authority => $name)>, C<release_hold($version_id, authority => $name)>
+
+Authorization receives the distinct action C<place_hold> or C<release_hold>,
+actor, owner, role, and a fifth hash containing C<operation>, C<version_id> and
+C<authority>. Migrate callbacks that previously recognized only C<hold>.
+A true scalar permits operations on the actor's own authority record only.
+Releasing another actor's hold requires an explicit callback decision
+C<{allowed =E<gt> 1, hold_admin =E<gt> 1}> or
+C<{allowed =E<gt> 1, release_authority =E<gt> 1}>. The latter is for a trusted
+host's delegation decision for the supplied authority, never request data.
+Legacy records without an owner also require this explicit authorization.
+Auditing completes before a hold is removed, so audit failure preserves the
+purge block.
 
 =item C<purge($version_id)>
 

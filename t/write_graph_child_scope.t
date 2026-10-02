@@ -37,7 +37,9 @@ sub step_domain {
         },
         schemas => {}, joins => {},
         writes => {
-            operations => {map { ($_ => {enabled => 1}) } qw(insert update upsert delete)},
+            operations => {map { ($_ => {enabled => 1,
+                ($_ eq 'upsert' ? (conflict_targets => [[qw(work_order_id position)]]) : ())}) }
+                qw(insert update upsert delete)},
             fields => {
                 work_order_id => {insertable => 1},
                 position      => {insertable => 1, updatable => 1},
@@ -162,7 +164,7 @@ subtest 'upsert child conflict target must include the parent key' => sub {
         assignments => {position => 1, instruction => 'x'},
         metadata => {conflict_target => ['position'], upsert_update_fields => ['instruction']},
     );
-    is(code_of(sub { $engine->execute_graph(graph_with_child($outside)) }), 'invalid_write_graph',
+    is(code_of(sub { $engine->execute_graph(graph_with_child($outside)) }), 'conflict_target_not_declared',
         'conflict target without the parent key is refused');
 
     ($dbh, $engine) = engine();
@@ -174,6 +176,12 @@ subtest 'upsert child conflict target must include the parent key' => sub {
     is(code_of(sub { $engine->execute_graph(graph_with_child($inside)) }), 'ok',
         'conflict target including the parent key is accepted');
     like($dbh->prepared->[1]->sql, qr/ON CONFLICT \("work_order_id", "position"\)/, 'conflict is parent-scoped');
+    ($dbh, $engine) = engine();
+    my $undeclared = $inside->with_metadata({conflict_target => [qw(work_order_id instruction)],
+        upsert_update_fields => ['instruction']});
+    is(code_of(sub {$engine->execute_graph(graph_with_child($undeclared))}), 'conflict_target_not_declared',
+        'including parent key does not bypass child-domain target allowlist');
+    is_deeply($dbh->prepared, [], 'invalid child identity refuses before any graph mutation');
 };
 
 subtest 'insert child still receives the parent key by assignment' => sub {

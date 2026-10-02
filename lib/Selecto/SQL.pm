@@ -24,6 +24,18 @@ our %WRITE_CAPABILITIES = map { $_ => 1 } qw(
 
 has transaction_mode => 'managed';
 has 'transaction_handler';
+has 'query_budget_progress_handler';
+
+sub query_budget_supported {
+    require Selecto::QueryBudget;
+    return Selecto::QueryBudget->supported($_[0]);
+}
+
+sub begin_query_budget {
+    my ($self, %options) = @_;
+    require Selecto::QueryBudget;
+    return Selecto::QueryBudget->begin($self, %options);
+}
 
 sub feature_inventory { return [@FEATURE_INVENTORY]; }
 sub write_capabilities { return { %WRITE_CAPABILITIES }; }
@@ -135,6 +147,48 @@ sub _compile_single {
     $with_sql = $self->_append_values_ctes(
         $with_sql, \@params, $domain, $sources, @association_paths,
     );
+    my @columns = map { $self->_selection_name($_) } @$selections;
+    my %column_counts;
+    $column_counts{$_}++ for @columns;
+    my @duplicate_columns = sort grep { $column_counts{$_} > 1 } keys %column_counts;
+    Selecto::Error->throw(
+        'invalid_query',
+        'query selections produce duplicate result column names; provide explicit aliases',
+        {columns => \@duplicate_columns},
+    ) if @duplicate_columns;
+
+    my $groups = $query->groups;
+    local $self->{_group_expression_sql} = {};
+    local $self->{_group_expression_params} = \@params;
+    local $self->{_group_expression_digests} = {};
+    if ($self->_reuses_parameter_identity) {
+        # Compile governed group expressions before their consumers. This also
+        # handles GROUPING before its dimension, unselected sort keys, and a
+        # selected expression that contains a grouped expression.
+        for my $group (@$groups) {
+            my $group_sql = $self->_compile_expression($domain, $group, \@params);
+            $self->{_group_expression_sql}{$self->_group_expression_key($domain, $group)} = $group_sql;
+        }
+    }
+    my %compiled_selections;
+    my %selection_positions;
+    my $selection_position = 0;
+    my @selection_sql = map {
+        $selection_position++;
+        my $expression_sql = $self->_compile_expression(
+            $domain, $_, \@params, \%compiled_selections,
+        );
+        $compiled_selections{_expression_key($_)} //= $expression_sql;
+        $selection_positions{_expression_key($_)} //= $selection_position;
+        my $needs_result_alias = defined($_->alias_name)
+            || ($_->kind eq 'field' && $_->arguments->[0] =~ /\./)
+            || ($_->kind eq 'field'
+                && ref($domain->field_metadata($_->arguments->[0])->{computed}) eq 'HASH');
+        $needs_result_alias
+            ? $expression_sql . ' AS ' . $self->quote_identifier($columns[$selection_position - 1])
+            : $expression_sql
+    } @$selections;
+    # SELECT placeholders precede JOIN placeholders, including nested joins.
     for my $path (@association_paths) {
         my $resolved = $domain->resolve_association($path);
         my $association = $resolved->{association};
@@ -156,11 +210,13 @@ sub _compile_single {
                         $through->{target_key_cast},
                     ),
             );
-            push @bridge_on, $self->_constant_join_predicates(
-                $bridge_alias, $through->{where}, \@params
-            );
+            # The target ON occurs inside the nested join, before the bridge ON.
+            # Accumulate anonymous parameters in that emitted SQL order.
             push @target_on, $self->_constant_join_predicates(
                 $target_alias, $association->where, \@params
+            );
+            push @bridge_on, $self->_constant_join_predicates(
+                $bridge_alias, $through->{where}, \@params
             );
             if (defined $through->{source_scope_key}) {
                 push @bridge_on,
@@ -228,47 +284,6 @@ sub _compile_single {
             }
         }
     }
-    my @columns = map { $self->_selection_name($_) } @$selections;
-    my %column_counts;
-    $column_counts{$_}++ for @columns;
-    my @duplicate_columns = sort grep { $column_counts{$_} > 1 } keys %column_counts;
-    Selecto::Error->throw(
-        'invalid_query',
-        'query selections produce duplicate result column names; provide explicit aliases',
-        {columns => \@duplicate_columns},
-    ) if @duplicate_columns;
-
-    my $groups = $query->groups;
-    local $self->{_group_expression_sql} = {};
-    local $self->{_group_expression_params} = \@params;
-    local $self->{_group_expression_digests} = {};
-    if ($self->_reuses_parameter_identity) {
-        # Compile governed group expressions before their consumers. This also
-        # handles GROUPING before its dimension, unselected sort keys, and a
-        # selected expression that contains a grouped expression.
-        for my $group (@$groups) {
-            my $group_sql = $self->_compile_expression($domain, $group, \@params);
-            $self->{_group_expression_sql}{$self->_group_expression_key($domain, $group)} = $group_sql;
-        }
-    }
-    my %compiled_selections;
-    my %selection_positions;
-    my $selection_position = 0;
-    my @selection_sql = map {
-        $selection_position++;
-        my $expression_sql = $self->_compile_expression(
-            $domain, $_, \@params, \%compiled_selections,
-        );
-        $compiled_selections{_expression_key($_)} //= $expression_sql;
-        $selection_positions{_expression_key($_)} //= $selection_position;
-        my $needs_result_alias = defined($_->alias_name)
-            || ($_->kind eq 'field' && $_->arguments->[0] =~ /\./)
-            || ($_->kind eq 'field'
-                && ref($domain->field_metadata($_->arguments->[0])->{computed}) eq 'HASH');
-        $needs_result_alias
-            ? $expression_sql . ' AS ' . $self->quote_identifier($columns[$selection_position - 1])
-            : $expression_sql
-    } @$selections;
     push @joins, @{$self->_compile_cte_joins($domain, $query)};
     push @joins, @{$self->_compile_lateral_joins($domain, $query, \@params)};
     push @joins, @{$self->_compile_json_rowsets($domain, $query, \@params)};
@@ -778,12 +793,21 @@ sub execute_query {
     return { columns => $statement->columns, rows => \@rows };
 }
 
+sub bounded_stream_supported {
+    my ($self) = @_;
+    # SQLite steps its VM while fetching; other drivers must provide an
+    # adapter-owned implementation rather than relying on RowCacheSize.
+    return $self->name eq 'sqlite' && eval { $self->dbh->isa('DBI::db') } ? 1 : 0;
+}
+
 sub stream_query {
     my ($self, $statement, %options) = @_;
     Selecto::Error->throw('unsupported_feature', 'adapter does not support streaming')
         unless $self->supports('stream');
     Selecto::Error->throw('invalid_stream', 'stream_query requires a Selecto statement')
         unless blessed($statement) && $statement->isa('Selecto::Statement');
+    Selecto::Error->throw('unsupported_feature', 'adapter cannot bound driver result buffering')
+        if $options{bounded} && !$self->bounded_stream_supported;
     my $fetch_size = $options{fetch_size} // 500;
     Selecto::Error->throw('invalid_stream', 'fetch_size must be a positive integer')
         unless defined($fetch_size) && !ref($fetch_size) && "$fetch_size" =~ /\A[1-9]\d*\z/;
@@ -2230,6 +2254,9 @@ sub _write_literal {
 
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
+    my $bounded = $self->_bounded_write_command($command);
+    $compiled = $self->_compile_write($bounded) if $bounded != $command;
+    $command = $bounded;
     my ($sth, $affected, %values);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($compiled->{sql});
@@ -2259,7 +2286,6 @@ sub _execute_compiled_write_in_transaction {
     if (defined($command->expected_count) && $affected != $command->expected_count) {
         Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows', {
             expected => $command->expected_count,
-            actual => $affected,
         });
     }
     # Without an expected count, a guarded write that changed nothing is still
@@ -2268,11 +2294,114 @@ sub _execute_compiled_write_in_transaction {
     return Selecto::Write::Result->new(operation => $command->operation, affected_rows => $affected, values => \%values);
 }
 
+sub _bounded_write_command {
+    my ($self, $command) = @_;
+    return $command unless $command->operation eq 'update' || $command->operation eq 'delete';
+    my $metadata = $command->metadata;
+    # Only the engine supplies this key before sealing the exact command in its
+    # authorization. Explicit *_unsafe calls remain a trusted adapter escape.
+    return $command unless exists $metadata->{__selecto_primary_key};
+    my $key = Selecto::Identifier::checked($metadata->{__selecto_primary_key});
+    my $maximum = $metadata->{__selecto_write_limit} // 1000;
+    my $expected = $command->expected_count;
+    Selecto::Error->throw('invalid_write', 'write cardinality requires a finite nonnegative integer')
+        if defined($expected) && (ref($expected) || "$expected" !~ /\A\d{1,9}\z/);
+    Selecto::Error->throw('invalid_write', 'write row ceiling must be a positive integer')
+        if ref($maximum) || "$maximum" !~ /\A[1-9]\d{0,8}\z/;
+    Selecto::Error->throw('invalid_write', 'write cardinality exceeds the trusted row ceiling')
+        if defined($expected) && $expected > $maximum;
+    my $limit = defined($expected) ? 0 + $expected : 0 + $maximum;
+    my $predicate = Selecto::QueryEnforcement::combine(
+        $command->predicate, $command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
+    );
+    my $identity_bound = _write_identity_bound($predicate, $key);
+    # A predicate selecting at most N distinct primary keys already bounds
+    # mutation work without a second query or a check/use interval.
+    return $command if defined($identity_bound) && $identity_bound <= $limit;
+    my $name = $self->name;
+    Selecto::Error->throw('write_capability_missing', 'adapter cannot safely bound a broad write')
+        unless $name =~ /\A(?:postgresql|sqlite)\z/;
+    my @params;
+    my $where = $self->_compile_write_predicate($predicate, \@params);
+    my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
+    my $column = $self->quote_identifier($key);
+    my $probe_limit = $limit + 1;
+    my $sql = "SELECT $column FROM $table WHERE $where ORDER BY $column LIMIT $probe_limit";
+    $sql .= ' FOR UPDATE' if $name eq 'postgresql';
+    # Recover a timed-out PostgreSQL statement before restoring session
+    # settings. The outer write transaction still owns all selected row locks.
+    my $savepoint = $name eq 'postgresql' ? 'selecto_bounded_probe' : undef;
+    if ($savepoint) {
+        eval { $self->_savepoint_command(create => $savepoint); 1 }
+            or die $self->_transaction_control_error($@);
+    }
+    my ($budget, $sth, @keys, $error);
+    my $ok = eval {
+        $budget = $self->begin_query_budget(timeout_ms => 5000);
+        $sth = $self->dbh->prepare($sql);
+        die _dbi_error($self->dbh, 'bounded write preparation failed') unless $sth;
+        defined($self->_execute_statement($sth, \@params))
+            or die _dbi_error($sth, 'bounded write selection failed');
+        while (my @row = $sth->fetchrow_array) {
+            $budget->check;
+            push @keys, $row[0];
+            last if @keys > $limit;
+        }
+        die _dbi_error($sth, 'bounded write fetch failed') if eval { $sth->err };
+        1;
+    };
+    $error = $self->normalize_error($@) unless $ok;
+    eval { $sth->finish } if $sth;
+    my $restored = eval {
+        $self->_savepoint_command(rollback => $savepoint) if !$ok && $savepoint;
+        $budget->close if $budget;
+        $self->_savepoint_command(release => $savepoint) if $savepoint;
+        1;
+    };
+    if (!$restored) {
+        eval { $budget->close } if $budget;
+        $self->dbh->{private_selecto_query_budget_poisoned} = 1;
+        Selecto::Error->throw('query_budget_restore_failed', 'bounded write could not restore its execution scope');
+    }
+    die $error unless $ok;
+    Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
+        {defined($expected) ? (expected => $expected) : ()})
+        if @keys > $limit || (defined($expected) && @keys != $expected);
+    # Keep every original scope and precondition, then constrain DML to the
+    # exact locked keys. New matching rows can never join this mutation.
+    my $keys = @keys ? Selecto::Expression->in($key, \@keys)
+        : Selecto::Expression->and(Selecto::Expression->is_null($key), Selecto::Expression->not_null($key));
+    return $command->with_scope_predicate(
+        Selecto::QueryEnforcement::combine($command->scope_predicate, $keys));
+}
+
+sub _write_identity_bound {
+    my ($expression, $key) = @_;
+    return undef unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $kind = $expression->kind;
+    my $args = $expression->arguments;
+    if (($kind eq 'eq' || $kind eq 'in') && blessed($args->[0])
+        && $args->[0]->kind eq 'field' && $args->[0]->arguments->[0] eq $key) {
+        if ($kind eq 'eq') {
+            return 1 if blessed($args->[1]) && $args->[1]->kind eq 'literal'
+                && defined($args->[1]->arguments->[0]) && !ref($args->[1]->arguments->[0]);
+        } elsif (ref($args->[1]) eq 'ARRAY' && !grep { !defined($_) || ref($_) } @{$args->[1]}) {
+            my %ids = map { ("$_" => 1) } @{$args->[1]};
+            return scalar keys %ids;
+        }
+    }
+    if ($kind eq 'and') {
+        my @bounds = grep { defined } map { _write_identity_bound($_, $key) } @{$args->[0]};
+        return (sort { $a <=> $b } @bounds)[0] if @bounds;
+    }
+    return undef;
+}
+
 sub _guarded_cardinality {
     my ($command, $affected) = @_;
     Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows', {
         expected => $command->expected_count // 'at least 1',
-        actual => $affected,
     });
 }
 

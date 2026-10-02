@@ -320,7 +320,7 @@ subtest 'TW-04/BD-07 (S9 analog): scoped upserts stay inside the tenant' => sub 
         my $scoped = Selecto::Engine->new(domain => order_domain(),
             adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)), scope => {tenant => 10});
         is(code_of(sub { $handler->write($scoped, {operation => 'upsert', assignments => {id => 2, code => 'Z', title => 'x'},
-            conflict_target => [qw(site_id code)], upsert_update_fields => ['title']}) }), 'unsupported_scope_predicate',
+            conflict_target => [qw(site_id code)], upsert_update_fields => ['title']}) }), 'unsupported_upsert_conflict_target',
             "$name refuses a tenant-scoped upsert");
     }
 };
