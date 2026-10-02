@@ -1,6 +1,9 @@
 Revision history for Selecto
 
 Unreleased
+    - A joins entry that is not an object is refused with invalid_domain
+      ("join <name> must be an object") instead of being silently ignored,
+      as the Ruby, .NET and Python cores already do.
     - Security: the permissive write policy is removed. Strict is the only
       behaviour: an engine refuses (write_policy_missing) a write to a
       domain without writes.operations, or without writes.fields for

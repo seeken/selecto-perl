@@ -444,6 +444,19 @@ is $person_dimension->dimension_key, 'person_id',
 is $person_dimension->display_name, 'Person',
     'a star dimension retains its presentation name';
 
+for my $malformed ('star_dimension', undef, ['star_dimension']) {
+    my $bad_join_contract = dclone($star_contract);
+    $bad_join_contract->{joins}{person} = $malformed;
+    for my $strict (1, 0) {
+        eval { Selecto::Domain->parse(dclone($bad_join_contract), strict => $strict) };
+        my $bad_join = $@;
+        is(eval { $bad_join->code }, 'invalid_domain',
+            'a joins entry that is not an object fails closed (strict ' . $strict . ')');
+        is(eval { $bad_join->message }, 'join person must be an object',
+            'the refusal names the join');
+    }
+}
+
 my $fallback_star_contract = dclone($star_contract);
 $fallback_star_contract->{joins}{person}{display_fallback} = 'dimension_key';
 $fallback_star_contract->{schemas}{people}{columns}{name}{type} = 'integer';

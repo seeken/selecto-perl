@@ -523,17 +523,18 @@ sub _canonical_associations {
 
 sub _canonical_join {
     my ($joins, $path, $name) = @_;
-    return $joins->{$path} if ref($joins->{$path}) eq 'HASH';
-    return $joins->{$name} if $path eq $name && ref($joins->{$name}) eq 'HASH';
+    # A declared entry is returned as-is, so a join that is not an object fails
+    # closed at the caller instead of being silently ignored.
+    return $joins->{$path} if exists $joins->{$path};
+    return $joins->{$name} if $path eq $name && exists $joins->{$name};
 
     my $current = $joins;
     my @segments = split /\./, $path;
     for my $index (0 .. $#segments) {
         my $segment = $segments[$index];
-        return {} unless ref($current) eq 'HASH'
-            && ref($current->{$segment}) eq 'HASH';
+        return {} unless ref($current) eq 'HASH' && exists $current->{$segment};
         my $join = $current->{$segment};
-        return $join if $index == $#segments;
+        return $join if $index == $#segments || ref($join) ne 'HASH';
         $current = $join->{joins};
     }
     return {};
