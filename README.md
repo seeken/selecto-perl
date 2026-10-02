@@ -622,6 +622,44 @@ bounded selected-value lookup
 when that facet has selections. Separate statements may observe different data
 under concurrent writes unless the host gives them a suitable transaction.
 
+### Register canned-page experiences
+
+Domains may advertise pages through `experiences`:
+
+```perl
+experiences => {
+    products => {kind => 'canned_page', version => 1, definition => 'catalog_products'},
+}
+```
+
+Build the domain with this metadata before constructing the engine. Discover
+registrations without invoking callbacks, then resolve through host factories:
+
+```perl
+my $entries = Selecto::CannedPage->experiences($engine->domain);
+my $page = Selecto::CannedPage->from_experience($engine, 'products', {
+    catalog_products => sub {
+        my ($configured) = @_;
+        return Selecto::CannedPage->new(
+            id => 'products', domain => $configured->domain,
+            dataset => {query => $configured->query, entity_key => ['id']},
+            views => [{id => 'detail', kind => 'detail',
+                query => $configured->query->select('id', 'name')}],
+            controls => [],
+        );
+    },
+});
+```
+
+Pass the resolved page to the existing Components `pages` integration. Resolution
+executes no query and mounts no route. Every execution still requires current
+authorization. Entries have exactly `kind`, `version`, and `definition`; page
+ids and definition references match `[a-z][a-z0-9_]*`. Unknown experience kinds
+are ignored; malformed canned-page registrations, unsupported versions, unbound
+references, and mismatched factory results are rejected. Factories must return
+a page with the registered id and matching domain fingerprint. No dynamic module
+loading or callbacks embedded in domain metadata are supported.
+
 ## Query libraries
 
 Domains may own reusable query intent under `query_library`. A view composes
