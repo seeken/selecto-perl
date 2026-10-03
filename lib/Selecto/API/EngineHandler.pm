@@ -8,6 +8,8 @@ use Mojo::Base -base, -signatures;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Selecto::API::ResultFormatter ();
+use Selecto::API::ResponsePolicy ();
+use Selecto::OperationBudget ();
 use Selecto::Engine ();
 use Selecto::Error ();
 use Selecto::DateShortcut ();
@@ -62,7 +64,9 @@ sub new ($class, @args) {
 
 sub write ($self, $engine, $body) {
     my $command = $self->write_command($engine, $body);
-    return $engine->execute_write($command)->to_hash;
+    $engine = $self->_engine_with_limits($engine);
+    return Selecto::API::ResponsePolicy->bind_limits(
+        $engine->execute_write($command)->to_hash, $self->limits->intersect($engine->limits));
 }
 
 sub write_command ($self, $engine, $body) {
@@ -70,7 +74,9 @@ sub write_command ($self, $engine, $body) {
         'invalid_api_host', 'API write handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
     $self = $self->_for_engine($engine);
+    $engine = $self->_engine_with_limits($engine);
     _write_object($body, 'write body');
+    $self->_admit_body($body, 'invalid_api_write');
     _write_reject_unknown($body, [qw(
         operation assignments filters expected_count returning
         conflict_target upsert_update_fields
@@ -215,8 +221,10 @@ sub query ($self, $engine, $body) {
         'invalid_api_host', 'API query handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
     $self = $self->_for_engine($engine);
+    $engine = $self->_engine_with_limits($engine);
     $engine->assert_tenant_boundary(access => 'read');
     _object($body, 'query body');
+    $self->_admit_body($body, 'invalid_api_query');
     _reject_unknown($body, [qw(
         select projection view segments parameters filters ordering order_by limit offset timezone row_format
     )], 'query body');
@@ -411,10 +419,33 @@ sub query ($self, $engine, $body) {
     };
     # Raw-cell checks precede child decoding; this exact JSON-envelope check
     # also counts escaping, keys and metadata in the eventual public response.
-    $self->limits->check_bytes('max_response_bytes',
-        JSON::PP->new->utf8->encode({data => $response, ok => JSON::PP::true}),
-        'api_result_limit_exceeded', 'encoded result bytes');
-    return $response;
+    Selecto::API::ResponsePolicy->check_json({data => $response, ok => JSON::PP::true}, $self->limits);
+    return Selecto::API::ResponsePolicy->bind_limits($response, $self->limits);
+}
+
+# One input budget includes all scalar filters, both range endpoints, membership
+# lists, segment parameters and assignments before normalization or callbacks.
+# The compiler separately counts actual emitted occurrences after composition.
+sub _admit_body ($self, $body, $code) {
+    my $budget = Selecto::OperationBudget->new(limits => $self->limits, code => $code);
+    $budget->check_tree($body, label => 'API request');
+    my @values;
+    push @values, values %{$body->{assignments}} if ref($body->{assignments}) eq 'HASH';
+    push @values, values %{$body->{parameters}} if ref($body->{parameters}) eq 'HASH';
+    if (ref($body->{filters}) eq 'ARRAY') {
+        for my $filter (@{$body->{filters}}) {
+            next unless ref($filter) eq 'HASH';
+            push @values, $filter->{$_} for grep { exists $filter->{$_} } qw(value end);
+        }
+    }
+    # Parameter maps may group segment parameters. Tree admission has already
+    # checked depth, breadth and cycles, so iterating their leaves is bounded.
+    while (@values) {
+        my $value = pop @values;
+        if (ref($value) eq 'ARRAY') { push @values, @$value }
+        elsif (ref($value) eq 'HASH') { push @values, values %$value }
+        else { $budget->consume_value($value, label => 'API parameter') }
+    }
 }
 
 sub _for_engine ($self, $engine) {
@@ -425,6 +456,13 @@ sub _for_engine ($self, $engine) {
         max_filter_values => $limits->get('max_filter_values'),
         max_fields => $limits->get('max_fields'),
     }, ref($self);
+}
+
+# The generated statement must obey the handler's ceiling as well as the
+# original engine's. Copy request-local state; never mutate a shared engine's
+# policy while a callback or adapter can re-enter it.
+sub _engine_with_limits ($self, $engine) {
+    return bless {%$engine, limits => $self->limits->intersect($engine->limits)}, ref($engine);
 }
 
 sub describe_openapi ($self, $api) {
@@ -1042,11 +1080,14 @@ sub _api_selection_entry ($domain, $entry, $label) {
 }
 
 sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
+    Selecto::OperationBudget->new(limits => $limits, code => 'api_result_limit_exceeded')->check_tree(
+        $result, label => 'adapter result', bytes_limit => 'max_response_bytes');
     my ($total_bytes, $total_children) = (0, 0);
     for my $row (@{$result->{rows}}) {
         for my $value (@$row) {
-            $total_bytes += $limits->check_bytes('max_response_bytes', ref($value) ? JSON::PP->new->utf8->encode($value) : $value,
-                'api_result_limit_exceeded', 'result cell');
+            $total_bytes += ref($value)
+                ? Selecto::API::ResponsePolicy->check_json($value, $limits)
+                : $limits->check_bytes('max_response_bytes', $value, 'api_result_limit_exceeded', 'result cell');
             $limits->check_count('max_response_bytes', $total_bytes, 'api_result_limit_exceeded', 'result bytes');
         }
     }
@@ -1061,7 +1102,7 @@ sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
             my $decoded = $row->[$index];
             my $ok = ref($decoded) eq 'ARRAY';
             $ok = defined($decoded) && !ref($decoded)
-                && eval { $decoded = JSON::PP->new->decode($decoded); 1 }
+                && eval { $decoded = JSON::PP->new->max_depth($limits->get('max_response_depth'))->decode($decoded); 1 }
                 unless $ok;
             Selecto::Error->throw(
                 'invalid_api_host', 'Selecto adapter returned an invalid related collection',
@@ -1074,6 +1115,8 @@ sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
             $total_children += @$decoded;
             $limits->check_count('max_total_collection_rows', $total_children,
                 'api_result_limit_exceeded', 'related collection rows');
+            Selecto::OperationBudget->new(limits => $limits, code => 'api_result_limit_exceeded')->check_tree(
+                $decoded, label => 'decoded collection', bytes_limit => 'max_response_bytes');
             $decoded = _collection_json_value($decoded);
             $row->[$index] = $row_format eq 'objects' ? $decoded : [map {
                 my $record = $_;

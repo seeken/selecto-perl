@@ -352,23 +352,24 @@ subtest 'TW-02 (S2 analog): an update cannot move a row to another tenant' => su
         'no row reached a tenant outside its boundary');
 };
 
-subtest 'PE #11/DOS-03: filter ASTs are capped at 64 levels of nesting' => sub {
+subtest 'PE #11/DOS-03: filter and normalized expression depth are bounded' => sub {
     my $engine = Selecto::Engine->new(domain => order_domain(unscoped => 1),
         adapter => Selecto->adapter(sqlite => (dbh => order_dbh())));
     my $nested = sub { my ($depth) = @_; my $ast = ['eq', 'id', 1]; $ast = ['not', $ast] for 1 .. $depth; $ast };
     is(code_of(sub { $engine->write_command(operation => 'update', assignments => {title => 'x'},
-        filter => $nested->(64)) }), 'ok', 'a filter nested 64 levels deep compiles');
+        filter => $nested->(12)) }), 'ok', 'an ordinary nested filter compiles within all structural budgets');
     is(code_of(sub { $engine->write_command(operation => 'update', assignments => {title => 'x'},
-        filter => $nested->(65)) }), 'invalid_query', 'one level deeper is refused');
+        filter => $nested->(65)) }), 'invalid_query', 'a filter beyond the outer nesting ceiling is refused');
     is(code_of(sub { Selecto::Expression->from_filter_ast(['and', [['or', [$nested->(64)]]]]) }), 'invalid_query',
         'and/or levels count toward the cap');
     is(code_of(sub { Selecto::Expression->from_filter_ast($nested->(20_000)) }), 'invalid_query',
         'a very deep filter fails fast');
 };
 
-subtest 'PE #11/DOS-03: read compile time grows with expression size, not depth' => sub {
+subtest 'PE #11/DOS-03: programmatic expressions are bounded before compilation' => sub {
     require Time::HiRes;
-    # Expressions built in code are not capped like filter ASTs.
+    # Programmatic constructors now share finite structural admission. Keep the
+    # compiler regression on admitted shapes, and assert huge shapes refuse.
     local $SIG{__WARN__} = sub { warn @_ unless $_[0] =~ /Deep recursion/ };
     my $engine = Selecto::Engine->new(domain => order_domain(unscoped => 1),
         adapter => Selecto->adapter(postgresql => (dbh => TestSelecto::DBH->new)));
@@ -382,19 +383,23 @@ subtest 'PE #11/DOS-03: read compile time grows with expression size, not depth'
         $engine->compile($query);
         return Time::HiRes::time() - $started;
     };
-    my $flat = $E->all([map { $E->eq('id', $_) } 1 .. 5_000]);
-    my $deep = $chain->(7_500, 1);
-    my $capped = $E->all([map { $chain->(60, $_) } 1 .. 250]);
+    is(code_of(sub { $E->all([map { $E->eq('id', $_) } 1 .. 5_000]) }),
+        'invalid_query', 'a 5,000-term programmatic AND refuses before compile');
+    is(code_of(sub { $chain->(7_500, 1) }),
+        'invalid_query', 'a 7,500-deep chain refuses during construction');
+    my $flat = $E->all([map { $E->eq('id', $_) } 1 .. 100]);
+    my $deep = $chain->(12, 1);
+    my $capped = $E->all([map { $chain->(10, $_) } 1 .. 20]);
     for my $grouped (0, 1) {
         my $mode = $grouped ? 'grouped' : 'ungrouped';
         my $flat_seconds = $seconds->($flat, $grouped);
         my $deep_seconds = $seconds->($deep, $grouped);
-        ok($flat_seconds < 1.5, sprintf('a 5,000-term AND compiles %s in %.3fs', $mode, $flat_seconds));
-        ok($deep_seconds < 1.5, sprintf('a 7,500-deep chain compiles %s in %.3fs', $mode, $deep_seconds));
+        ok($flat_seconds < 1.5, sprintf('a 100-term AND compiles %s in %.3fs', $mode, $flat_seconds));
+        ok($deep_seconds < 1.5, sprintf('a 12-deep chain compiles %s in %.3fs', $mode, $deep_seconds));
         ok($deep_seconds < 4 * $flat_seconds + 0.25,
             "depth costs no more per node than breadth ($mode)");
         my $capped_seconds = $seconds->($capped, $grouped);
-        ok($capped_seconds < 1.5, sprintf('250 terms 60 deep compile %s in %.3fs', $mode, $capped_seconds));
+        ok($capped_seconds < 1.5, sprintf('20 terms 10 deep compile %s in %.3fs', $mode, $capped_seconds));
     }
     my $sql = $engine->compile($engine->query->select('title', $E->count_field('id')->as('n'))->group_by('title')
         ->where($E->all([$chain->(3, 1), $E->eq('title', 'x')])))->sql;

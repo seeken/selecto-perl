@@ -2,9 +2,39 @@ package Selecto::SQLite;
 
 use Mojo::Base 'Selecto::SQL';
 use Selecto::Error ();
+use Selecto::Statement ();
 
 sub name    { return 'sqlite'; }
 sub dialect { return __PACKAGE__; }
+
+# The guard suppresses an oversized value on the server before DBI receives
+# it, and adds a sentinel that the bounded consumer must reject. No truncation
+# is presented as a successful value. Placeholders and their order are unchanged.
+sub bounded_result_statement {
+    my ($self, $statement, %args) = @_;
+    my ($cap, $rows) = @args{qw(max_cell_bytes max_rows)};
+    Selecto::Error->throw('invalid_query', 'invalid bounded result limits')
+        if grep { !defined($_) || ref($_) || "$_" !~ /\A[1-9][0-9]{0,9}\z/ } ($cap, $rows);
+    my (@values, @overflow, %seen);
+    for my $name (@{$statement->columns}) {
+        Selecto::Error->throw('unsupported_feature', 'bounded results require unique named columns')
+            unless defined($name) && !ref($name) && length($name) && !$seen{$name}++;
+        my $column = 'selecto_bounded.' . $self->quote_identifier($name);
+        my $large = "length(CAST($column AS BLOB)) > " . int($cap);
+        push @values, "CASE WHEN $large THEN NULL ELSE $column END AS " . $self->quote_identifier($name);
+        push @overflow, "($large)";
+    }
+    Selecto::Error->throw('invalid_query', 'bounded results need columns') unless @values;
+    push @values, 'CASE WHEN ' . join(' OR ', @overflow) . ' THEN 1 ELSE 0 END AS selecto_transfer_overflow';
+    # Fence the computed projection: volatile expressions must be evaluated
+    # once, so the size predicate and emitted cell inspect the same value.
+    # Cap materialization at the finite transfer row allowance.
+    return Selecto::Statement->new(sql => 'WITH selecto_bounded AS MATERIALIZED (SELECT * FROM ('
+        . $statement->sql . ') AS selecto_source LIMIT ' . int($rows) . ') SELECT '
+        . join(', ', @values) . ' FROM selecto_bounded LIMIT ' . int($rows),
+        params => $statement->params, columns => [@{$statement->columns}, 'selecto_transfer_overflow'],
+        adapter_name => $self->name);
+}
 
 sub placeholder {
     my ($self, $index) = @_;
@@ -20,6 +50,52 @@ sub normalize_type {
         decimal => 'decimal',
         datetime => 'naive_datetime',
     }->{lc "$name"} // 'unknown';
+}
+
+sub insert_admission_storage {
+    my ($self, $command, $types) = @_;
+    my $dbh = $self->dbh;
+    my $fail = sub { Selecto::Error->throw('query_rule_not_evaluable',
+        'SQLite cannot establish the guarded insert storage contract'); };
+    $fail->() unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'SQLite' }
+        && $dbh->can('sqlite_table_column_metadata');
+    my $table = Selecto::Identifier::checked($command->relation);
+    # The main-schema profile refuses shadowing/attached-only names. Reading
+    # sqlite_schema in the transaction also prevents a concurrent schema change.
+    my ($shadow) = $dbh->selectrow_array('SELECT 1 FROM temp.sqlite_master WHERE name = ?', undef, $table);
+    $fail->() if $shadow;
+    my ($kind, $ddl) = $dbh->selectrow_array('SELECT type, sql FROM main.sqlite_master WHERE name = ?', undef, $table);
+    $fail->() unless defined($kind) && $kind eq 'table' && defined($ddl) && $ddl =~ /\ACREATE\s+TABLE\b/i;
+    for my $schema (qw(main temp)) {
+        my ($trigger) = $dbh->selectrow_array("SELECT 1 FROM $schema.sqlite_master WHERE type = 'trigger' AND tbl_name = ? LIMIT 1", undef, $table);
+        $fail->() if $trigger;
+    }
+    my $rows = $dbh->selectall_arrayref('PRAGMA main.table_xinfo(' . $self->quote_identifier($table) . ')', {Slice => {}});
+    my %columns = map { $_->{name} => $_ } @$rows;
+    my %storage;
+    for my $field (keys %$types) {
+        $fail->() unless exists($columns{$field}) && !$columns{$field}{hidden};
+        my $metadata = $dbh->sqlite_table_column_metadata('main', $table, $field);
+        $fail->() unless ref($metadata) eq 'HASH';
+        my $declared = uc($metadata->{data_type} // '');
+        my $collation = uc($metadata->{collation_name} // '');
+        my $type = $types->{$field};
+        my $cast;
+        if ($type eq 'integer' || $type eq 'boolean') {
+            $fail->() unless $declared =~ /INT/ || ($type eq 'boolean' && $declared eq 'BOOLEAN');
+            $cast = 'INTEGER';
+        } elsif ($type eq 'decimal') {
+            $fail->() unless $declared =~ /\A(?:NUMERIC|DECIMAL)(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?\z/;
+            $cast = 'NUMERIC';
+        } else {
+            $fail->() unless $declared !~ /INT/ && $declared =~ /CHAR|CLOB|TEXT/;
+            $fail->() unless $collation =~ /\A(?:BINARY|NOCASE|RTRIM)\z/;
+            $cast = 'TEXT';
+        }
+        $storage{$field} = {cast => $cast,
+            $type eq 'string' ? (collation => $self->quote_identifier($collation)) : ()};
+    }
+    return \%storage;
 }
 
 sub supports {

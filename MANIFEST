@@ -154,3 +154,13 @@ script/importer-memory-check
 t/security_boundaries_live.t
 lib/Selecto/PostgreSQL/Stream.pm
 t/bounded_stream.t
+docs/typed-insert-admission.md
+lib/Selecto/API/ResponsePolicy.pm
+lib/Selecto/BoundedQuery.pm
+lib/Selecto/InsertAdmission.pm
+lib/Selecto/OperationBudget.pm
+lib/Selecto/Pattern.pm
+t/api_security_round2.t
+t/bounded_result.t
+t/security_insert_admission.t
+t/security_operation_budgets.t

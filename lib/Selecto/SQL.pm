@@ -7,6 +7,8 @@ use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
+use Selecto::InsertAdmission ();
+use Selecto::OperationBudget ();
 use Selecto::QueryEnforcement ();
 use Selecto::Statement ();
 use Selecto::Stream ();
@@ -53,6 +55,16 @@ sub quote_identifier {
 
 sub compile {
     my ($self, $domain, $query) = @_;
+    my $statement = $self->_compile_query($domain, $query);
+    Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')
+        ->consume_parameters($statement->params, label => 'statement parameter');
+    return $statement;
+}
+
+sub _compile_query {
+    my ($self, $domain, $query) = @_;
+    Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')->check_tree(
+        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)]);
     my $operations = $query->set_operations;
     Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')
         if @$operations && defined($query->row_lock);
@@ -1133,16 +1145,20 @@ sub _compile_expression {
         Selecto::Error->throw('invalid_query', 'json_contains requires a JSON field')
             unless blessed($operand) && $operand->kind eq 'field'
                 && ($domain->resolve($operand->arguments->[0])->{type} // '') =~ /\Ajsonb?\z/i;
+        my $operand_sql = $self->_compile_expression($domain, $operand, $params);
         push @$params, JSON::PP->new->canonical(1)->encode($arguments->[1]);
         return $self->_compile_json_contains(
-            $self->_compile_expression($domain, $operand, $params), $self->placeholder(scalar @$params),
+            $operand_sql, $self->placeholder(scalar @$params),
         );
     }
     if ($kind eq 'in') {
         my $values = $arguments->[1];
         Selecto::Error->throw('invalid_query', 'IN requires at least one value') unless ref($values) eq 'ARRAY' && @$values;
+        # Anonymous markers bind by SQL occurrence, including parameters from
+        # computed/association-existence operands on the left of IN.
+        my $operand = $self->_compile_expression($domain, $arguments->[0], $params);
         my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
-        return $self->_compile_expression($domain, $arguments->[0], $params) . ' IN (' . join(', ', @markers) . ')';
+        return $operand . ' IN (' . join(', ', @markers) . ')';
     }
     if ($kind eq 'and' || $kind eq 'or') {
         my $expressions = $arguments->[0];
@@ -1165,8 +1181,8 @@ sub _compile_expression {
         } @$fields) . ')';
     }
     if ($kind eq 'dimension_display') {
-        my $display_sql = $self->_compile_expression($domain, $arguments->[0], $params);
         my $key_sql = $self->_compile_expression($domain, $arguments->[1], $params);
+        my $display_sql = $self->_compile_expression($domain, $arguments->[0], $params);
         return "CASE WHEN GROUPING($key_sql) = 1 THEN NULL ELSE MIN($display_sql) END";
     }
     return $self->_compile_related_collection($domain, $expression, $params)
@@ -2012,15 +2028,23 @@ sub _compile_write {
             defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
         );
         if ($insert_predicate) {
-            my $truth = Selecto::QueryEnforcement::evaluate(
+            if (exists $command->metadata->{__selecto_insert_types}) {
+                Selecto::InsertAdmission->prepare($insert_predicate, $assignments,
+                    $command->metadata->{__selecto_insert_types});
+            } else {
+                # Explicit *_unsafe adapter tooling retains the standalone
+                # untyped evaluator. Engine-authorized writes always carry
+                # domain types and use the storage check before DML instead.
+                my $truth = Selecto::QueryEnforcement::evaluate(
                 $insert_predicate,
                 $self->_insert_candidate($assignments),
-            );
-            Selecto::Error->throw(
+                );
+                Selecto::Error->throw(
                 'query_rule_violation',
                 'insert candidate does not satisfy the enforced query',
                 { truth_value => $truth },
-            ) unless $truth eq 'true';
+                ) unless $truth eq 'true';
+            }
         }
         my @params;
         my @values = map {
@@ -2187,6 +2211,8 @@ sub _compile_mutation_default {
 
 sub _append_returning {
     my ($self, $sql, $params, $command) = @_;
+    Selecto::OperationBudget->new(limits => $command->metadata->{__selecto_limits}, code => 'invalid_write')
+        ->consume_parameters($params, label => 'write parameter');
     my $returning = $command->metadata->{returning} // [];
     Selecto::Error->throw('invalid_write', 'returning must be an array of declared identifiers')
         unless ref($returning) eq 'ARRAY' && !grep { ref($_) || !defined($_) || !Selecto::Identifier::checked($_) } @$returning;
@@ -2252,8 +2278,96 @@ sub _write_literal {
     return $expression->arguments->[0];
 }
 
+sub insert_admission_storage {
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'adapter cannot establish typed insert storage semantics');
+}
+
+sub _check_typed_insert_admission {
+    my ($self, $command) = @_;
+    return unless $command->operation eq 'insert' || $command->operation eq 'upsert';
+    my $types = $command->metadata->{__selecto_insert_types};
+    return unless defined $types; # Explicit, trusted *_unsafe adapter tooling.
+    my $predicate = Selecto::QueryEnforcement::combine(
+        $command->predicate, $command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
+    );
+    return unless $predicate;
+    my $candidate = Selecto::InsertAdmission->prepare($predicate, $command->assignments, $types);
+    Selecto::Error->throw('query_rule_not_evaluable', 'adapter cannot establish typed insert storage semantics')
+        unless $self->name =~ /\A(?:sqlite|postgresql)\z/ && $self->query_budget_supported;
+    my $savepoint = $self->name eq 'postgresql' ? 'selecto_insert_admission' : undef;
+    $self->_savepoint_command(create => $savepoint) if $savepoint;
+    my ($budget, $error);
+    my $ok = eval {
+        $budget = $self->begin_query_budget(timeout_ms => 5000);
+        $self->_typed_insert_admission_probe($command, $predicate, $candidate, $budget);
+        1;
+    };
+    $error = $self->normalize_error($@) unless $ok;
+    my $restored = eval {
+        $self->_savepoint_command(rollback => $savepoint) if !$ok && $savepoint;
+        $budget->close if $budget;
+        $self->_savepoint_command(release => $savepoint) if $savepoint;
+        1;
+    };
+    die $self->normalize_error($@) unless $restored;
+    die $error unless $ok;
+}
+
+sub _typed_insert_admission_probe {
+    my ($self, $command, $predicate, $candidate, $budget) = @_;
+    # This runs inside the write transaction. Concrete adapters verify actual
+    # column storage, hold schema stable, and refuse transforming triggers.
+    my $storage = $self->insert_admission_storage($command, $candidate->{types});
+    $budget->check;
+    my @params;
+    my $where = $self->_compile_write_predicate($predicate, \@params);
+    my @fields = sort keys %{$candidate->{values}};
+    my @columns;
+    for my $field (@fields) {
+        my $spec = $storage->{$field};
+        Selecto::Error->throw('query_rule_not_evaluable', 'insert storage metadata is unavailable')
+            unless ref($spec) eq 'HASH' && defined($spec->{cast});
+        push @params, $candidate->{values}{$field};
+        my $value = 'CAST(' . $self->placeholder(scalar @params) . ' AS ' . $spec->{cast} . ')';
+        $value .= ' COLLATE ' . $spec->{collation} if defined $spec->{collation};
+        push @columns, $value . ' AS ' . $self->quote_identifier($field);
+    }
+    # Return an integer truth marker, independent of driver boolean settings
+    # such as DBD::Pg's pg_bool_tf (where the string "f" is truthy in Perl).
+    my $sql = 'SELECT CASE WHEN (' . $where . ') THEN 1 ELSE 0 END, ' . join(', ', map { $self->quote_identifier($_) } @fields)
+        . ' FROM (SELECT ' . join(', ', @columns) . ') AS ' . $self->quote_identifier('__selecto_candidate');
+    Selecto::OperationBudget->new(limits => $command->metadata->{__selecto_limits}, code => 'invalid_write')
+        ->consume_parameters(\@params, label => 'insert policy parameter');
+    my ($sth, @row);
+    my $ok = eval {
+        $sth = $self->dbh->prepare($sql);
+        die _dbi_error($self->dbh, 'insert admission preparation failed') unless $sth;
+        defined($self->_execute_statement($sth, \@params))
+            or die _dbi_error($sth, 'insert admission failed');
+        @row = $sth->fetchrow_array;
+        die _dbi_error($sth, 'insert admission fetch failed') unless @row;
+        # Overflow to a non-finite database number is outside this profile.
+        for my $index (0 .. $#fields) {
+            # A verified BOOLEAN cast cannot overflow; its driver rendering
+            # may be 0/1 or t/f and need not match canonical caller scalars.
+            next if $candidate->{types}{$fields[$index]} eq 'boolean';
+            Selecto::InsertAdmission::_value($candidate->{types}{$fields[$index]}, $row[$index + 1], $fields[$index]);
+        }
+        1;
+    };
+    my $error = $@;
+    eval { $sth->finish } if $sth;
+    die $self->normalize_error($error) unless $ok;
+    $budget->check;
+    Selecto::Error->throw('query_rule_violation', 'insert candidate does not satisfy the enforced query',
+        {truth_value => 'false_or_unknown'}) unless defined($row[0]) && "$row[0]" eq '1';
+}
+
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
+    $self->_check_typed_insert_admission($command);
     my $bounded = $self->_bounded_write_command($command);
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;

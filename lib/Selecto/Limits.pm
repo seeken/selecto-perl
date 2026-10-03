@@ -19,6 +19,12 @@ my %DEFAULTS = (
     max_bucket_bytes => 16_384, max_numeric_digits => 15,
     max_generated_selections => 256, max_generated_parameters => 1_000,
     max_expression_nodes => 10_000,
+    max_expression_depth => 64, max_expression_arity => 1_000,
+    max_json_path_segments => 64,
+    max_rule_numeric_digits => 1_024, max_rule_work => 1_000_000,
+    max_regex_states => 4_096, max_import_preview_bytes => 16_777_216,
+    max_result_cell_bytes => 65_536, max_response_temp_bytes => 33_554_432,
+    max_response_nodes => 100_000, max_response_depth => 32,
 );
 
 sub new {
@@ -94,6 +100,14 @@ request data. Defaults limit membership to 100 values, values to 4 KiB,
 parameters to 64 KiB, action targets to 1,000, child collections to 100 rows per
 parent and 10,000 total rows, and responses to 16 MiB. Import inspection accepts
 at most 16 MiB of UTF-8 input, 32 MiB of decoded cell bytes and one million cells.
+Operation admission defaults to 10,000 node occurrences and 64 structural
+levels; Boolean/variadic arity is 1,000 and JSON paths have at most 64 segments.
+Response admission has separate ceilings of 100,000 nodes and 32 levels, with
+64 KiB per result cell and 32 MiB of encoder temporary bytes. Import previews
+have a 16 MiB encoded ceiling intersected with the response limit. Exact rule
+numbers allow 1,024 integer/fraction digits, independently of the 15-digit
+bucket policy. Patterns compile to at most 4,096 NFA states; an evaluation
+shares a 1,000,000-work-unit rule ceiling.
 Overrides are positive integers at most 999,999,999; applications should tighten
 them to their worker and database budgets. Byte checks count UTF-8 bytes, not
 characters. A transport must additionally bound incoming bodies before buffering.

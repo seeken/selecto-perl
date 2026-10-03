@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - 0.2.2 security remediation: bound complete filter/value-expression trees,
+      scalar and whole-operation parameter bytes, exact rule numeric work,
+      non-backtracking ASCII patterns, and importer preview amplification.
+    - Refuse unverifiable typed governed inserts before DML; use verified
+      SQLite/PostgreSQL storage types, rounding and collations. Fix computed
+      IN operand binding order. See docs/typed-insert-admission.md.
+    - Bound ordinary UI/canned result consumption and final API JSON/CSV/TSV/
+      XLSX bytes. SQL diagnostics and full-domain publication now default off;
+      trusted debug/publication configuration is required to enable them.
     - Security: apply trusted finite budgets to query-library expansion, CSV
       inspection, action targets, and nested public API results. Oversized
       nested collections are refused before returning partial data.
