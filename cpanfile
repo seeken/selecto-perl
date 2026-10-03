@@ -1,4 +1,6 @@
 requires 'perl', '5.034';
+requires 'File::Find';
+requires 'Hash::Util::FieldHash';
 requires 'DBI', '1.652';
 requires 'DateTime';
 requires 'DateTime::TimeZone';

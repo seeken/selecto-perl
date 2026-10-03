@@ -14,6 +14,7 @@ use Selecto::DateShortcut ();
 use Selecto::Domain ();
 use Selecto::Error ();
 use Selecto::Limits ();
+use Selecto::OperationBudget ();
 use bytes ();
 
 has 'domain';
@@ -146,6 +147,8 @@ sub inspect_csv ($self, $content, %options) {
 
 sub normalize_configuration ($self, $configuration, %options) {
     _object($configuration, 'import configuration');
+    my $budget = Selecto::OperationBudget->new(limits => $self->limits, code => 'import_configuration_limit_exceeded');
+    $budget->check_tree($configuration, label => 'import configuration');
     _reject_unknown($configuration, [qw(
         config_version domain_fingerprint upload_id profile parser rows mappings actions match idempotency errors parameters
     )], 'import configuration');
@@ -192,6 +195,7 @@ sub normalize_configuration ($self, $configuration, %options) {
         } elsif ($kind eq 'static') {
             Selecto::Error->throw('invalid_import_configuration', "Static source for $target requires value")
                 unless exists $mapping->{source}{value};
+            _charge_value($budget, $mapping->{source}{value});
             $source{value} = _clone($mapping->{source}{value});
         } elsif ($kind eq 'parameter') {
             $source{name} = _string($mapping->{source}{name}, "import mapping $target parameter name");
@@ -260,6 +264,7 @@ sub normalize_configuration ($self, $configuration, %options) {
             } elsif ($kind eq 'static') {
                 Selecto::Error->throw('invalid_import_configuration', "Static source for action $action_id input $name requires value")
                     unless exists $mapping->{source}{value};
+                _charge_value($budget, $mapping->{source}{value});
                 $source{value} = _clone($mapping->{source}{value});
             } elsif ($kind eq 'parameter') {
                 $source{name} = _string($mapping->{source}{name}, "import action $action_id input $name parameter name");
@@ -310,6 +315,8 @@ sub normalize_configuration ($self, $configuration, %options) {
     my $end = exists($rows->{end}) ? _positive_integer($rows->{end}, 'import rows end') : undef;
     Selecto::Error->throw('invalid_import_configuration', 'import row end must not precede start')
         if defined($end) && $end < $start;
+    _object($configuration->{parameters}, 'import parameters') if exists $configuration->{parameters};
+    _charge_value($budget, $_) for values %{$configuration->{parameters} // {}};
     return {
         config_version => 1,
         domain_fingerprint => $fingerprint,
@@ -326,12 +333,47 @@ sub normalize_configuration ($self, $configuration, %options) {
 
 sub preview_rows ($self, $inspection, $configuration, %options) {
     _object($inspection, 'import inspection');
+    Selecto::Error->throw('invalid_import_configuration', 'inspection rows must be an array')
+        unless ref($inspection->{rows} // []) eq 'ARRAY';
+    Selecto::Error->throw('import_row_limit_exceeded', 'Import preview has too many source rows')
+        if @{$inspection->{rows} // []} > $self->max_rows;
+    Selecto::OperationBudget->new(limits => $self->limits, code => 'import_preview_limit_exceeded')->check_tree(
+        $inspection, label => 'import inspection', bytes_limit => 'max_total_decoded_bytes', nodes_limit => 'max_total_cells');
     my $normalized = $self->normalize_configuration($configuration, columns => $inspection->{columns} // []);
     my $resolver = $options{key_resolver};
     Selecto::Error->throw('invalid_import_host', 'preview requires a key_resolver callback')
         unless ref($resolver) eq 'CODE';
     my $trusted = $options{trusted_values} // {};
     _object($trusted, 'trusted values');
+    Selecto::OperationBudget->new(limits => $self->limits, code => 'import_preview_limit_exceeded')->check_tree($trusted, label => 'trusted import values');
+    my $limits = $self->limits->tightened(max_import_preview_bytes => $self->limits->get('max_response_bytes'));
+    my $output_budget = Selecto::OperationBudget->new(limits => $limits, code => 'import_preview_limit_exceeded');
+    $output_budget->check_tree($normalized, label => 'preview configuration', bytes_limit => 'max_import_preview_bytes');
+    my $encoded_bytes = bytes::length(JSON::PP->new->canonical->utf8->encode($normalized));
+    $limits->check_count('max_import_preview_bytes', $encoded_bytes, 'import_preview_limit_exceeded', 'preview bytes');
+    my $selected = 0;
+    for my $row (@{$inspection->{rows} // []}) {
+        _object($row, 'inspection row');
+        next if $row->{row_number} < $normalized->{rows}{start};
+        next if defined($normalized->{rows}{end}) && $row->{row_number} > $normalized->{rows}{end};
+        $selected++;
+    }
+    # Static/parameter/trusted sources are predictable amplification. Reserve
+    # their bytes for all selected rows before any clone or resolver callback.
+    my @mappings = (@{$normalized->{mappings}}, map { values %{$_->{inputs}} } @{$normalized->{actions}});
+    my $constant_bytes = 0;
+    for my $mapping (@mappings) {
+        next if $mapping->{source}{kind} eq 'column';
+        my ($present, $value) = _resolve_value($mapping, {}, $normalized->{parameters}, $trusted);
+        next unless $present;
+        my $value_budget = Selecto::OperationBudget->new(limits => $self->limits, code => 'import_preview_limit_exceeded');
+        _charge_value($value_budget, $value);
+        my $transformed = _apply_transforms($value, $mapping->{transforms});
+        _charge_value(Selecto::OperationBudget->new(limits => $self->limits, code => 'import_preview_limit_exceeded'), $transformed);
+        $constant_bytes += bytes::length(JSON::PP->new->allow_nonref->utf8->encode($transformed));
+    }
+    $limits->check_count('max_import_preview_bytes', $encoded_bytes + $constant_bytes * $selected,
+        'import_preview_limit_exceeded', 'static preview expansion');
     my $contract = $self->_contract;
     my ($key_set) = grep { $_->{id} eq $normalized->{match}{key_set} } @{$contract->{key_sets}};
     my @rows;
@@ -339,12 +381,21 @@ sub preview_rows ($self, $inspection, $configuration, %options) {
         next if $row->{row_number} < $normalized->{rows}{start};
         last if defined($normalized->{rows}{end}) && $row->{row_number} > $normalized->{rows}{end};
         my $preview = $self->_preview_row($row, $normalized, $key_set, $trusted, $resolver);
+        $output_budget->check_tree($preview, label => 'preview rows', bytes_limit => 'max_import_preview_bytes');
+        $encoded_bytes += bytes::length(JSON::PP->new->canonical->utf8->encode($preview));
+        $limits->check_count('max_import_preview_bytes', $encoded_bytes, 'import_preview_limit_exceeded', 'preview bytes');
         push @rows, $preview;
     }
-    return {configuration => $normalized, rows => \@rows, returned => scalar(@rows)};
+    my $result = {configuration => $normalized, rows => \@rows, returned => scalar(@rows)};
+    $limits->check_bytes('max_import_preview_bytes', JSON::PP->new->canonical->utf8->encode($result),
+        'import_preview_limit_exceeded', 'encoded preview bytes');
+    return $result;
 }
 
 sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
+    my $input_budget = Selecto::OperationBudget->new(limits => $self->limits, code => 'import_preview_limit_exceeded');
+    my $value_budget = Selecto::OperationBudget->new(limits => $self->limits, code => 'import_preview_limit_exceeded');
+    $input_budget->check_tree($row->{values}, label => 'import row', scalar_limit => 'max_value_bytes');
     my %assignments;
     my %assignment_write_on;
     my %match_values;
@@ -355,6 +406,7 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
         my $values = $field->{match_only} ? \%match_values : \%assignments;
         my ($present, $value) = _resolve_value($mapping, $row->{values}, $configuration->{parameters}, $trusted);
         if ($present) {
+            _charge_value($input_budget, $value);
             my $ok = eval { $value = _apply_transforms($value, $mapping->{transforms}); 1 };
             if (!$ok) {
                 my $error = $@;
@@ -364,6 +416,7 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
             $value = $self->domain->normalize_field_value(
                 $mapping->{target}, $value,
             );
+            _charge_value($value_budget, $value);
         }
         if (!$present || _blank($value)) {
             my $policy = $mapping->{blank_policy};
@@ -393,6 +446,7 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
             my $input_spec = $self->_contract->{actions}{$configured->{action}}{inputs}{$name};
             my ($present, $value) = _resolve_value($mapping, $row->{values}, $configuration->{parameters}, $trusted);
             if ($present) {
+                _charge_value($input_budget, $value);
                 my $ok = eval { $value = _apply_transforms($value, $mapping->{transforms}); 1 };
                 if (!$ok) {
                     my $error = _error_hash($@, undef);
@@ -401,6 +455,7 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
                     push @errors, $error;
                     next;
                 }
+                _charge_value($value_budget, $value);
             }
             if (!$present || _blank($value)) {
                 my $policy = $mapping->{blank_policy};
@@ -437,6 +492,10 @@ sub _preview_row ($self, $row, $configuration, $key_set, $trusted, $resolver) {
         if (!$ok) { push @errors, _error_hash($@, undef); }
         elsif (ref($match_result) ne 'HASH' || ref($match_result->{matches}) ne 'ARRAY') {
             push @errors, {code => 'invalid_import_host', message => 'key resolver returned an invalid result'};
+        }
+        else {
+            Selecto::OperationBudget->new(limits => $self->limits, code => 'import_preview_limit_exceeded')->check_tree(
+                $match_result, label => 'import resolver result', scalar_limit => 'max_value_bytes');
         }
     }
     my $decision = 'error';
@@ -709,10 +768,21 @@ sub _contract ($self) {
 sub _resolve_value ($mapping, $values, $parameters, $trusted) {
     my $source = $mapping->{source};
     return (1, $values->{$source->{column_id}}) if $source->{kind} eq 'column';
-    return (1, _clone($source->{value})) if $source->{kind} eq 'static';
+    # Perl scalar assignment is copy-on-write. Only structured values need a
+    # bounded deep copy to keep host normalizers from mutating configuration.
+    return (1, ref($source->{value}) ? _clone($source->{value}) : $source->{value}) if $source->{kind} eq 'static';
     return (exists($parameters->{$source->{name}}), $parameters->{$source->{name}}) if $source->{kind} eq 'parameter';
     return (exists($trusted->{$source->{name}}), $trusted->{$source->{name}}) if $source->{kind} eq 'trusted';
     return (0, undef);
+}
+
+sub _charge_value ($budget, $value) {
+    if (ref($value) && !JSON::PP::is_bool($value)) {
+        $budget->check_tree($value, label => 'import value');
+        $budget->consume_value(JSON::PP->new->allow_nonref->utf8->encode($value), label => 'import value');
+    } else {
+        $budget->consume_value($value, label => 'import value');
+    }
 }
 
 sub _apply_transforms ($value, $transforms) {

@@ -389,8 +389,28 @@ print "$response->{status} $response->{headers}{'content-type'}\n";
 print $response->{body}, "\n";   # UTF-8 encoded canonical JSON bytes
 ```
 
-The same routes serve `GET .../domain` and `GET .../openapi.json`, and query
-responses can be negotiated as CSV, TSV or XLSX. For a ready-made
+`GET .../domain` defaults to 403: the complete contract can contain internal
+expressions and policy metadata. A trusted host can set `publish_domain => 1`
+for an intentionally public contract, or supply a callback that returns exactly
+`1` for an authorized request. Authorized responses retain the complete canonical
+contract bytes; there is no silently redacted replacement contract.
+
+SQL and parameter diagnostics are omitted from ordinary API responses. Supplied
+handler errors use a generic public message and structured validation details.
+To deliberately expose diagnostics, set `debug_sql => 1` in trusted host
+configuration, or provide an authorization callback returning exactly `1`.
+Both settings default off; body fields and query parameters cannot enable them.
+Callbacks must check server-owned authentication context. Business row fields
+named `sql` remain ordinary application data. Custom handlers must keep diagnostic
+content in diagnostic metadata, never mix it into business rows or field values.
+
+`GET .../openapi.json` remains available, and query
+responses can be negotiated as CSV, TSV or XLSX. Every format enforces the final
+encoded response byte limit, including XLSX package overhead; XLSX also reserves
+a finite temporary-file budget before generation. Set `limits => $limits` on the
+API host and handler. The built-in handler carries any tighter engine limits into
+the final encoding step; custom handlers use the API host policy.
+For a ready-made
 Mojolicious user interface (an explorer, saved views, action dialogs), see the
 separate [Selecto::Components](https://github.com/seeken/selecto-perl-components)
 distribution, which builds on this core.

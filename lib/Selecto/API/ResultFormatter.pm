@@ -5,10 +5,13 @@ use utf8;
 
 use Encode qw(encode);
 use File::Temp qw(tempfile);
+use File::Find ();
 use JSON::PP ();
 use Mojo::Base -base, -signatures;
 use Scalar::Util qw(blessed looks_like_number);
 use Selecto::Error ();
+use Selecto::Limits ();
+use Selecto::OperationBudget ();
 use Text::CSV ();
 
 my %FORMAT = (
@@ -151,15 +154,18 @@ sub specification ($class, $format) {
     return {%{$FORMAT{$format}}};
 }
 
-sub encode_result ($class, $format, $result) {
+sub encode_result ($class, $format, $result, %options) {
+    my $limits = $options{limits} // Selecto::Limits->new;
+    Selecto::OperationBudget->new(limits => $limits, code => 'api_result_limit_exceeded')
+        ->check_tree($result, label => 'tabular result', bytes_limit => 'max_response_bytes');
     $format = $class->normalize($format);
     Selecto::Error->throw(
         'invalid_response_format', 'unknown API response format',
     ) unless defined($format) && length($format) && $format ne 'json';
     my ($columns, $rows) = _tabular_result($result);
-    return _delimited($columns, $rows, $format eq 'csv' ? ',' : "\t")
+    return _delimited($columns, $rows, $format eq 'csv' ? ',' : "\t", $limits)
         if $format eq 'csv' || $format eq 'tsv';
-    return _xlsx($columns, $rows);
+    return _xlsx($columns, $rows, $limits);
 }
 
 sub _tabular_result ($result) {
@@ -194,31 +200,56 @@ sub _tabular_result ($result) {
     return (\@columns, \@rows);
 }
 
-sub _delimited ($columns, $rows, $separator) {
+sub _delimited ($columns, $rows, $separator, $limits) {
     my $csv = Text::CSV->new({
         binary => 1,
         sep_char => $separator,
     }) or Selecto::Error->throw(
         'response_encoding_failed', 'could not initialize the delimited response writer',
     );
-    my @lines;
+    my $output = '';
+    my $append = sub {
+        my $line = encode('UTF-8', $csv->string . "\r\n");
+        $limits->check_count('max_response_bytes', length($output) + length($line),
+            'api_result_limit_exceeded', 'encoded response bytes');
+        $output .= $line;
+    };
     $csv->combine(map { _spreadsheet_safe($_) } @$columns)
         or Selecto::Error->throw('response_encoding_failed', 'could not encode delimited headings');
-    push @lines, $csv->string;
+    $append->();
     for my $row (@$rows) {
         $csv->combine(map { _spreadsheet_safe(_flat_value($_)) } @$row)
             or Selecto::Error->throw('response_encoding_failed', 'could not encode a delimited row');
-        push @lines, $csv->string;
+        $append->();
     }
-    return encode('UTF-8', join("\r\n", @lines) . "\r\n");
+    return $output;
 }
 
-sub _xlsx ($columns, $rows) {
+sub _xlsx ($columns, $rows, $limits) {
     require Excel::Writer::XLSX;
-    my ($handle) = tempfile(SUFFIX => '.xlsx', UNLINK => 1);
+    # Reserve conservatively for XML escaping, worksheet/package copies and
+    # ZIP overhead before creating any spool files. The tree was admitted
+    # before flattening nested cells. Actual spool and output bytes are checked
+    # again before the finished workbook is read into memory.
+    my $reserved = 262_144;
+    my $reserve = sub {
+        my ($value) = @_;
+        $reserved += 4 * (1024 + 6 * length(encode('UTF-8', _flat_value($value))));
+        $limits->check_count('max_response_temp_bytes', $reserved,
+            'api_result_limit_exceeded', 'XLSX temporary bytes');
+    };
+    $limits->check_count('max_response_temp_bytes', $reserved,
+        'api_result_limit_exceeded', 'XLSX temporary bytes');
+    $reserve->($_) for @$columns;
+    for my $row (@$rows) { $reserve->($_) for @$row }
+    my $directory = File::Temp->newdir('selecto-api-xlsx-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    # A File::Temp object unlinks at scope exit. tempfile(UNLINK => 1) only
+    # schedules end-of-process cleanup, leaking failed responses in workers.
+    my $handle = File::Temp->new(DIR => "$directory", SUFFIX => '.xlsx', UNLINK => 1);
     binmode $handle;
     my $workbook = Excel::Writer::XLSX->new($handle)
         or Selecto::Error->throw('response_encoding_failed', 'could not create the XLSX response');
+    $workbook->set_tempdir("$directory");
     my $worksheet = $workbook->add_worksheet('Query Results');
     my $header = $workbook->add_format(
         bold => 1, bg_color => '#DCE6F1', bottom => 1,
@@ -260,6 +291,15 @@ sub _xlsx ($columns, $rows) {
     }
     $workbook->close
         or Selecto::Error->throw('response_encoding_failed', 'could not finish the XLSX response');
+    my $output_bytes = -s $handle;
+    my $temporary_bytes = 0;
+    File::Find::find({no_chdir => 1, wanted => sub {
+        $temporary_bytes += -s $_ if -f $_;
+    }}, "$directory");
+    $limits->check_count('max_response_temp_bytes', $temporary_bytes,
+        'api_result_limit_exceeded', 'XLSX temporary bytes');
+    $limits->check_count('max_response_bytes', $output_bytes,
+        'api_result_limit_exceeded', 'encoded response bytes');
     seek $handle, 0, 0
         or Selecto::Error->throw('response_encoding_failed', 'could not rewind the XLSX response');
     local $/;

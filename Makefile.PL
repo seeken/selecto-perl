@@ -18,6 +18,8 @@ WriteMakefile(
         'Encode'      => 0,
         'Excel::Writer::XLSX' => '1.10',
         'File::Temp'  => 0,
+        'File::Find'  => 0,
+        'Hash::Util::FieldHash' => 0,
         'JSON::PP'    => '4.06',
         'Math::BigInt' => 0,
         'Mojolicious' => '9.49',

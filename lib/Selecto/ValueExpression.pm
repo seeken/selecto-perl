@@ -7,6 +7,7 @@ use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Error ();
+use Selecto::OperationBudget ();
 
 # A closed, typed AST for governed computed values.
 #
@@ -57,10 +58,14 @@ sub _category_of_cast {
 
 # Structural validation that needs no domain. Returns a normalized deep copy.
 our $_ALLOW_PREVIOUS = 0;
+our $_BUDGET;
 
 sub parse {
     my ($class, $ast, %options) = @_;
     local $_ALLOW_PREVIOUS = $options{allow_previous} ? 1 : 0;
+    local $_BUDGET = $options{budget} // Selecto::OperationBudget->new(
+        (defined($options{limits}) ? (limits => $options{limits}) : ()), code => 'invalid_value_expression');
+    $_BUDGET->check_tree($ast, label => 'value expression');
     return _parse($ast, 'value expression');
 }
 
@@ -96,6 +101,7 @@ sub _parse {
         _fail("$label literal value must be a scalar") if ref($value);
         _fail("$label literal value must not be null; use a nullable field or case")
             unless defined $value;
+        $_BUDGET->consume_value($value, label => 'value expression literal');
         if (defined $type) {
             _fail("$label literal type must be one of " . join(', ', sort keys %CAST_TYPE))
                 unless !ref($type) && $CAST_TYPE{$type};
@@ -110,6 +116,7 @@ sub _parse {
     }
     if ($operator eq 'coalesce' || $operator eq 'concat') {
         _fail("$label $operator requires at least two values") unless @arguments >= 2;
+        $_BUDGET->limits->check_count('max_expression_arity', scalar(@arguments), 'invalid_value_expression', 'value expression arity');
         return [$operator, map { _parse($_, "$label $operator argument") } @arguments];
     }
     if ($ARITHMETIC{$operator}) {
@@ -132,14 +139,17 @@ sub _parse {
         _fail("$label json_text requires a field path and a non-empty segment list")
             unless @arguments == 2 && defined($field) && !ref($field) && "$field" =~ $PATH
                 && ref($segments) eq 'ARRAY' && @$segments;
+        $_BUDGET->limits->check_count('max_json_path_segments', scalar(@$segments), 'invalid_value_expression', 'JSON path segments');
         for my $segment (@$segments) {
             _fail("$label json_text segments must be letters, digits, or underscores")
                 unless defined($segment) && !ref($segment) && "$segment" =~ $SEGMENT;
+            $_BUDGET->consume_value($segment, label => 'JSON path segment');
         }
         return ['json_text', "$field", [map { "$_" } @$segments]];
     }
     if ($operator eq 'case') {
         _fail("$label case requires at least one condition") unless @arguments;
+        $_BUDGET->limits->check_count('max_expression_arity', scalar(@arguments), 'invalid_value_expression', 'case branches');
         my @branches;
         my $else;
         for my $index (0 .. $#arguments) {
@@ -153,7 +163,9 @@ sub _parse {
             }
             _fail("$label case branches must be [condition, value]") unless @$branch == 2;
             require Selecto::Expression;
-            my $ok = eval { Selecto::Expression->from_filter_ast($branch->[0]); 1 };
+            # The containing value tree was already admitted. Share literal
+            # accounting with conditions rather than resetting it per branch.
+            my $ok = eval { Selecto::Expression->_from_filter_ast($branch->[0], 0, $_BUDGET); 1 };
             _fail("$label case condition is not a valid filter") unless $ok;
             push @branches, [dclone($branch->[0]), _parse($branch->[1], "$label case value")];
         }

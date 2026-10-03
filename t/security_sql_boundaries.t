@@ -74,4 +74,33 @@ subtest 'originating cardinality errors never serialize match counts' => sub {
         is_deeply $dbh->events, ['BEGIN', 'ROLLBACK'], 'refusal rolls back';
     }
 };
+subtest 'parameterized IN operands retain SQL occurrence order' => sub {
+    for my $name (qw(sqlite mysql mariadb mssql postgresql duckdb)) {
+        my $engine = Selecto::Engine->new(domain => TestSelecto::people_domain(),
+            adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)));
+        my $statement = $engine->compile($engine->query->select('id')->where(
+            Selecto::Expression->not(Selecto::Expression->in(Selecto::Expression->literal('operand'), ['list_a', 'list_b']))));
+        is_deeply $statement->params, ['operand', 'list_a', 'list_b'], "$name scalar IN bindings follow emitted order";
+    }
+};
+
+subtest 'live SQLite computed IN and NOT IN preserve row eligibility' => sub {
+    plan skip_all => 'DBD::SQLite unavailable' unless eval { require DBI; require DBD::SQLite; 1 };
+    my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', '', '',
+        {RaiseError => 1, PrintError => 0, sqlite_see_if_its_a_number => 1});
+    $dbh->do('CREATE TABLE scoped_records(id INTEGER PRIMARY KEY, tenant_id INTEGER)');
+    $dbh->do('INSERT INTO scoped_records VALUES (1,7),(2,2),(3,3)');
+    my $domain = Selecto::Domain->parse({name => 'Synthetic computed scope', source => {
+        source_table => 'scoped_records', primary_key => 'id', fields => [qw(id tenant_id eligible)],
+        columns => {id => {type => 'integer'}, tenant_id => {type => 'integer'},
+            eligible => {type => 'boolean', computed => {kind => 'predicate', expression => ['eq', 'tenant_id', 7]}}},
+        associations => {}}, schemas => {}, joins => {}});
+    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => $dbh)));
+    my $predicate = Selecto::Expression->in('eligible', [2, 1]);
+    is_deeply $engine->all($engine->query->select('id')->where($predicate)->order_by('id'))->{rows}, [[1]],
+        'intended tenant row matches computed IN';
+    is_deeply $engine->all($engine->query->select('id')->where(Selecto::Expression->not($predicate))->order_by('id'))->{rows}, [[2],[3]],
+        'NOT IN preserves its computed operand too';
+};
+
 done_testing;

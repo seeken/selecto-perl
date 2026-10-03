@@ -21,6 +21,7 @@ use Selecto::Action::Capability ();
 use Selecto::Action::Grant ();
 use Selecto::Action::Planner ();
 use Selecto::Limits ();
+use Selecto::OperationBudget ();
 use Selecto::Write::ConflictTarget ();
 
 sub new {
@@ -121,7 +122,16 @@ sub domain  { return $_[0]->{domain}; }
 sub adapter { return $_[0]->{adapter}; }
 sub domain_ref { return $_[0]->{domain_ref}; }
 sub query   { return Selecto::Query->new; }
-sub compile { my ($self, $query) = @_; return $self->{adapter}->compile($self->read_domain, $query); }
+sub compile {
+    my ($self, $query) = @_;
+    Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(
+        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)]);
+    local $self->{adapter}{_selecto_compile_limits} = $self->{limits};
+    my $statement = $self->{adapter}->compile($self->read_domain, $query);
+    Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')
+        ->consume_parameters($statement->params, label => 'statement parameter');
+    return $statement;
+}
 sub all     { my ($self, $query) = @_; return $self->{adapter}->execute_query($self->compile($query)); }
 
 # The domain reads compile against. An engine holding a trusted tenant scopes
@@ -294,6 +304,10 @@ sub governed_write {
     my ($self, $command, %details) = @_;
     Selecto::Error->throw('invalid_write', 'write command required')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
+    Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_write')->check_tree(
+        {assignments => $command->{assignments}, predicate => $command->{predicate},
+            scope_predicate => $command->{scope_predicate}, query_enforcement => $command->{query_enforcement}},
+        label => 'write', allowed_classes => [qw(Selecto::Expression Selecto::Write::Expression Selecto::QueryEnforcement)]);
     Selecto::Error->throw(
         'write_relation_mismatch',
         'write relation must be the domain table',
@@ -322,6 +336,8 @@ sub governed_write {
     # never a key supplied by the caller's command metadata.
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $self->{domain}->primary_key,
+        __selecto_insert_types => $self->{domain}->fields,
+        __selecto_limits => $self->{limits},
         __selecto_write_limit => $self->{limits}->get('max_action_targets')});
     # Set on every governed command, replacing any a caller supplied.
     return $command->with_foreign_key_guards(_foreign_key_guards(
@@ -1191,6 +1207,10 @@ sub _validate_graph_node {
     my $command = $node->{command};
     Selecto::Error->throw('invalid_write_graph', 'graph node requires a write command')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
+    Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_write')->check_tree(
+        {assignments => $command->{assignments}, predicate => $command->{predicate},
+            scope_predicate => $command->{scope_predicate}, query_enforcement => $command->{query_enforcement}},
+        label => 'write', allowed_classes => [qw(Selecto::Expression Selecto::Write::Expression Selecto::QueryEnforcement)]);
     my $bindings = $node->{bindings} // [];
     Selecto::Error->throw('invalid_write_graph', 'graph child must bind to its declared parent')
         unless @$bindings;
@@ -1262,6 +1282,8 @@ sub _validate_graph_node {
     ));
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $edge->{primary_key},
+        __selecto_insert_types => $edge->{field_types},
+        __selecto_limits => $self->{limits},
         __selecto_write_limit => $self->{limits}->get('max_action_targets')});
     return ({
         table         => $edge->{table},
@@ -1353,6 +1375,9 @@ sub _relationship_context {
         contract      => $nested,
         ($fields_known ? (
             fields => { map { ("$_" => 1) } map { "$_" } @{$nested->{source}{fields}} },
+            field_types => { map { ($_ => $nested->{source}{columns}{$_}{type}) }
+                grep { ref($nested->{source}{columns}{$_}) eq 'HASH' }
+                @{$nested->{source}{fields}} },
             primary_key => defined($nested->{source}{primary_key}) ? "$nested->{source}{primary_key}" : 'id',
         ) : ()),
         fields_known  => $fields_known,
@@ -1588,8 +1613,10 @@ calls it for every write; public surfaces call it for early feedback.
   $engine->execute_write($guarded);
 
 Attaches the predicate of a read query to a write so the database applies
-it again in the same statement. For inserts the candidate row is checked
-against the captured predicate before the transaction opens. Upserts and
+it again in the same statement. For inserts canonical typed values are checked
+before dispatch, then the candidate is compared using verified actual column
+storage inside the write transaction, before its INSERT. Preview compilation
+does not establish that live storage check. Upserts and
 predicates that reach into associations are rejected, and on a tenant-field
 domain the command must be tenant-scoped (C<missing_tenant_scope>).
 
@@ -1797,6 +1824,19 @@ association C<fields> paths); reads are unaffected;
 C<writes.scope.tenant> still applies, and both conditions must hold. The
 predicate is added once: a command that already carries it as a conjunct of
 its scope or query enforcement is not guarded twice.
+
+=item *
+
+Guarded insert admission currently verifies ordinary PostgreSQL and SQLite
+tables with integer, decimal, string/text or boolean policy fields. Each
+guarded field requires an explicit canonical value (or literal assignment).
+The database applies actual precision/scale and collation to the prospective
+row. Only TRUE admits it; FALSE or UNKNOWN produces C<query_rule_violation>.
+Malformed numeric values, unverified adapters or storage, generated policy
+columns, defaults, user triggers/rules and unsupported table forms fail closed.
+Pure L<Selecto::QueryEnforcement> scalar comparison remains a separate contract.
+This check applies through common single, batch, graph and action execution;
+earlier commands in a transaction may already have run when a later one fails.
 
 =back
 

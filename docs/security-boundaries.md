@@ -8,15 +8,68 @@
 | Query-library parameter bytes / membership item bytes | 65,536 / 4,096 |
 | Action target occurrences | 1,000 |
 | Related rows per parent / total requested child rows | 100 / 10,000 |
-| Encoded JSON API response, including success envelope | 16 MiB |
+| Final encoded API response in every format, including JSON envelope | 16 MiB |
+| XLSX temporary-byte reservation | 32 MiB |
+| Result cell bytes / result nodes / result depth | 65,536 / 100,000 / 32 |
 | CSV input UTF-8 bytes / total decoded cell bytes | 16 MiB / 32 MiB |
 | Total CSV cells, including headers | 1,000,000 |
 | State bytes / bucket input bytes / bucket ranges / numeric digits | 131,072 / 16,384 / 100 / 15 |
 | Generated selections / parameters / expression nodes | 256 / 1,000 / 10,000 |
+| Expression depth / arity / JSON path segments | 64 / 1,000 / 64 |
+| Exact numeric rule digits / rule work / regex states | 1,024 / 1,000,000 / 4,096 |
+| Import preview bytes | 16 MiB |
+| Input structural depth / Boolean or variadic arity / JSON path segments | 64 / 1,000 / 64 |
+| Response nodes / response depth / result cell bytes | 100,000 / 32 / 65,536 |
+| Import preview encoded bytes / encoder temporary bytes | 16 MiB / 32 MiB |
+| Exact data-rule digits / compiled regex states / rule work units | 1,024 / 4,096 / 1,000,000 |
 
 Constructor overrides are positive integers no larger than 999,999,999; callers should size them for actual workers. API `max_fields` and `max_filter_values` can further tighten the shared limits. UTF-8 byte checks happen before parameter copying/CSV splitting; list occurrence checks precede normalization. Regular query-library IN lists are subject to the same count and byte budgets as `csv_in` and direct API membership filters.
 
-A transport still needs a receiving-layer body limit before buffering. Hosts should retain database statement/lock timeouts and sensible indexes. The bounded write preflight and Components export paths install temporary database execution budgets; general query execution still uses the host configuration. A response byte check protects returned data, not allocations the database or driver already performed.
+A transport still needs a receiving-layer body limit before buffering. Hosts should retain database statement/lock timeouts and sensible indexes. The bounded write preflight and Components result/export paths install temporary database execution budgets; general engine query execution still uses the host configuration. A response byte check alone does not bound allocations already performed by a custom handler or driver.
+
+## API privacy and final encoding
+
+`Selecto::API->new(debug_sql => 0, publish_domain => 0)` is the default.
+Normal successes remove diagnostic SQL/parameter/statement metadata; ordinary
+handler errors expose a generic message and safe structured validation details.
+Business rows and returning values retain their field names and data, so custom
+handlers must keep host diagnostics out of application rows. Explicit trusted
+`debug_sql => 1` permits diagnostics; an authorization callback returning exactly
+`1` can restrict that decision per request. Request body/query flags cannot
+activate it, and callback exceptions deny access. Debug output is not suitable
+for a public ordinary remote-query response.
+
+The full `GET .../domain` contract now requires `publish_domain => 1` or a trusted
+authorization callback. Denial returns 403; authorized responses preserve the
+complete canonical contract bytes/fingerprint. Internal expressions and policy
+metadata are not turned into a misleading partially redacted contract.
+
+Use the same trusted `limits` object on the API host and handler. The built-in
+handler also propagates tighter engine limits into the final encoder. Custom
+handlers use the API host's ceiling. All successful formats check actual encoded
+bytes; CSV/TSV charge rows incrementally, while XLSX reserves conservative XML/
+package temporary bytes before creating files and checks the final archive size
+before reading it into memory. Small constant error envelopes may exceed a tiny
+successful-response ceiling. This does not bound work performed by an arbitrary
+custom handler before it returns its result.
+
+`t/api_security_round2.t` covers default SQL privacy, explicit debug permission,
+callback failure, complete-domain permission, exact encoded byte boundaries,
+XLSX overhead, tighter engine policy and aggregate scalar request admission.
+
+## Operation admission and rules
+
+`Selecto::OperationBudget` keeps mutable counters separate from the immutable trusted policy. `check_tree` iteratively admits bytes, node occurrences, depth and reference types before cloning or recursive parsing. Reused references count at every occurrence; cycles refuse. Input-tree bytes and bound-parameter bytes are independent counters. Scalar values share one parameter accumulator across an operation, and generated statements are checked again with a fresh accumulator for actual emitted parameter occurrences. A tighter engine/handler policy wins. The defaults also apply to direct portable filters, value-expression ASTs and programmatic expression construction.
+
+Depth counts the actual admitted representation, including array/object wrappers, rather than only SQL operators. A raw AST fitting its parsing depth may still exceed the normalized expression/Query representation at compilation. Oversized programmatic shapes that previously relied on arbitrary depth or breadth now refuse. Ordinary admitted expressions retain their SQL meaning; tune only trusted host policy to measured worker capacity.
+
+DataRules accepts a trusted `limits` option at parse time and optionally intersects it with evaluation-time limits. Admission precedes subject cloning, numeric conversion and pattern matching. All integer and fractional digits count against `max_rule_numeric_digits`, including fractional leading zeros; sign and decimal separator do not. This is separate from the existing 15-digit bucket range policy, preserving bounded exact-decimal precision. Failed admission returns `evaluation_limit` without copying rejected input into normalized output.
+
+The `ascii_v1` grammar is evaluated by a Thompson NFA rather than a native backtracking regex. Grouping, alternation and quantifiers retain regular-language full/search semantics, ASCII escapes use ASCII classes, and dot excludes newline. Patterns remain limited to 256 ASCII bytes and subjects to 4,096 UTF-8 bytes. Compiled state count and shared per-evaluation work are finite; huge counted repetitions fail contract admission, and exhausting matching work returns `evaluation_limit`. Trusted authors choose patterns; callers may control subjects. A new grammar blacklist is not substituted for the portable profile.
+
+Importer configuration, static values, action inputs and parameters are admitted before copying. Preview reserves predictable constant-value expansion over the selected row range before resolver callbacks, bounds transformed/resolver values, then checks cumulative rows and exact encoded preview bytes. Its preview ceiling is the smaller of `max_import_preview_bytes` and `max_response_bytes`. A failing preview returns no partial accumulated rows. CSV file/decoded-cell limits remain independent; an acceptable CSV is not necessarily an acceptable full preview.
+
+`t/security_operation_budgets.t` covers exact thresholds, mixed filter/CASE accounting, cycles, before-clone/conversion checks, regex grammar parity on small inputs, bounded adversarial matching, UTF-8 limits and importer expansion before callbacks. `t/adversarial_hardening.t` verifies the newly bounded programmatic expression behavior as well as compilation of ordinary shapes.
 
 ## Bounded driver streaming
 

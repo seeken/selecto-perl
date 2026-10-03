@@ -5,9 +5,29 @@ use strict;
 use warnings;
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
+use Selecto::OperationBudget ();
+our $_CONSTRUCTION_LIMITS;
 
 sub new {
     my ($class, $kind, @arguments) = @_;
+    my $budget = Selecto::OperationBudget->new(
+        (defined($_CONSTRUCTION_LIMITS) ? (limits => $_CONSTRUCTION_LIMITS) : ()), code => 'invalid_query');
+    $budget->check_tree(\@arguments, label => 'expression arguments', allowed_classes => ['Selecto::Expression']);
+    if ($kind eq 'literal') {
+        # Preserve the semantic validators' existing handling of bounded JSON
+        # containers (for example an invalid tenant-scope operand). Resource
+        # admission must not replace that later type/authority decision.
+        my $value = $arguments[0];
+        if (ref($value) && !JSON::PP::is_bool($value)) {
+            $value = JSON::PP->new->canonical->utf8->encode($value);
+        }
+        $budget->consume_value($value, label => 'expression literal');
+    } elsif ($kind =~ /\A(?:in|array_contains|array_contained|array_overlap)\z/ && ref($arguments[1]) eq 'ARRAY') {
+        $budget->limits->check_count('max_filter_values', scalar(@{$arguments[1]}), 'invalid_query', 'expression members');
+        $budget->consume_value($_, label => 'expression member') for @{$arguments[1]};
+    } elsif (($kind eq 'and' || $kind eq 'or') && ref($arguments[0]) eq 'ARRAY') {
+        $budget->limits->check_count('max_expression_arity', scalar(@{$arguments[0]}), 'invalid_query', 'expression fan-out');
+    }
     return bless { kind => "$kind", arguments => [map { _clone($_) } @arguments], alias_name => undef }, $class;
 }
 
@@ -242,6 +262,7 @@ sub epoch_datetime {
 sub value {
     my ($class, $ast, %options) = @_;
     require Selecto::ValueExpression;
+    local $_CONSTRUCTION_LIMITS = $options{limits} // (defined($options{budget}) ? $options{budget}->limits : $_CONSTRUCTION_LIMITS);
     return $class->new('value', Selecto::ValueExpression->parse($ast, %options));
 }
 sub is_null { my ($class, $field) = @_; return $class->new('is_null', $class->_operand($field)); }
@@ -347,10 +368,18 @@ sub not { my ($class, $expression) = @_; return $class->new('not', $expression);
 # Nesting beyond 64 levels is refused, as in the Go core: compile time grows
 # with depth, and no authored filter needs more.
 sub from_filter_ast {
-    my ($class, $filter, $depth) = @_;
+    my ($class, $filter, $depth, $budget) = @_;
+    $budget //= Selecto::OperationBudget->new(code => 'invalid_query');
+    local $_CONSTRUCTION_LIMITS = $budget->limits;
+    $budget->check_tree($filter, label => 'filter expression');
+    return $class->_from_filter_ast($filter, $depth // 0, $budget);
+}
+
+sub _from_filter_ast {
+    my ($class, $filter, $depth, $budget) = @_;
     $depth //= 0;
     Selecto::Error->throw('invalid_query', 'filter expression is nested too deeply')
-        if $depth > 64;
+        if $depth > $budget->limits->get('max_expression_depth');
     Selecto::Error->throw('invalid_query', 'filter expression must be a non-empty array')
         unless ref($filter) eq 'ARRAY' && @$filter;
     my ($operator, @arguments) = @$filter;
@@ -363,24 +392,31 @@ sub from_filter_ast {
             ? $arguments[0] : \@arguments;
         Selecto::Error->throw('invalid_query', "$operator filter requires expressions")
             unless @$items;
-        my @expressions = map { $class->from_filter_ast($_, $depth + 1) } @$items;
+        $budget->limits->check_count('max_expression_arity', scalar(@$items), 'invalid_query', 'filter fan-out');
+        my @expressions = map { $class->_from_filter_ast($_, $depth + 1, $budget) } @$items;
         return $operator eq 'and' ? $class->all(\@expressions) : $class->any(\@expressions);
     }
     if ($operator eq 'not') {
         Selecto::Error->throw('invalid_query', 'not filter requires one expression')
             unless @arguments == 1;
-        return $class->not($class->from_filter_ast($arguments[0], $depth + 1));
+        return $class->not($class->_from_filter_ast($arguments[0], $depth + 1, $budget));
     }
 
     my ($field, $value, $end) = @arguments;
     if ($operator =~ /\A(?:array_contains|array_contained|array_overlap)\z/) {
         Selecto::Error->throw('invalid_query', "$operator filter requires a field and a value list")
             unless @arguments == 2 && ref($value) eq 'ARRAY';
+        $budget->limits->check_count('max_filter_values', scalar(@$value), 'invalid_query', 'array members');
+        $budget->consume_value($_, label => 'array member') for @$value;
         return $class->can($operator)->($class, _filter_field($field), $value);
     }
     if ($operator eq 'json_contains') {
         Selecto::Error->throw('invalid_query', 'json_contains filter requires a field and a document')
             unless @arguments == 2;
+        # The whole document was admitted before cloning; charge its exact JSON
+        # parameter now, after a bounded traversal made encoding safe.
+        require JSON::PP;
+        $budget->consume_value(JSON::PP->new->canonical->utf8->encode($value), label => 'JSON containment value');
         return $class->json_contains(_filter_field($field), $value);
     }
     Selecto::Error->throw('invalid_query', 'filter field must be a governed field name')
@@ -395,11 +431,14 @@ sub from_filter_ast {
         Selecto::Error->throw('invalid_query', 'in filter requires a non-empty literal list')
             unless @arguments == 2 && ref($value) eq 'ARRAY' && @$value
                 && !grep { ref($_) } @$value;
+        $budget->limits->check_count('max_filter_values', scalar(@$value), 'invalid_query', 'in members');
+        $budget->consume_value($_, label => 'in member') for @$value;
         return $class->in($field, $value);
     }
     if ($operator eq 'between') {
         Selecto::Error->throw('invalid_query', 'between filter requires two literal bounds')
             unless @arguments == 3 && !ref($value) && !ref($end);
+        $budget->consume_value($_, label => 'between bound') for ($value, $end);
         return $class->between($field, $value, $end);
     }
     Selecto::Error->throw('invalid_query', "unsupported filter operator $operator")
@@ -409,6 +448,7 @@ sub from_filter_ast {
     if ($operator =~ /\A(?:starts_with|text_contains|ends_with)(?:_ci)?\z/) {
         Selecto::Error->throw('invalid_query', "$operator requires a string value")
             if !defined($value) || ref($value);
+        $budget->consume_value($value, label => 'text filter value');
         return $class->$operator($field, $value);
     }
     my $right;
@@ -421,6 +461,7 @@ sub from_filter_ast {
     } else {
         Selecto::Error->throw('invalid_query', "$operator filter value must be a literal or field reference")
             if ref($value);
+        $budget->consume_value($value, label => 'filter value');
         $right = $class->literal($value);
     }
     return $class->can($operator)->($class, $field, $right);
@@ -501,6 +542,8 @@ sub _known_options {
 
 sub as {
     my ($self, $name) = @_;
+    Selecto::OperationBudget->new(code => 'invalid_query')->check_tree(
+        $self, label => 'expression alias', allowed_classes => ['Selecto::Expression']);
     my $copy = bless {
         kind       => $self->{kind},
         arguments  => [map { _clone($_) } @{$self->{arguments}}],

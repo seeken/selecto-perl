@@ -414,8 +414,8 @@ sub run_suite {
         is($response->{status}, 422, 'an association-predicate API write is a 422');
         my $payload = JSON::PP->new->decode($response->{body});
         is($payload->{error}{code}, 'query_rule_unsupported_field', 'with its error code');
-        is_deeply($payload->{error}{details}, {relation => $PROJECTS, fields => ['team.region']},
-            'and its details');
+        is_deeply($payload->{error}{details}, {fields => ['team.region']},
+            'public field details remain without physical relation metadata');
         is(code_of(sub { $handler->write($engine, $update->(2)) }), 'cardinality_mismatch',
             'an API update outside the predicate matches nothing');
         is(title_of($dbh, 2), 'e1', 'the outside row is untouched');

@@ -126,9 +126,9 @@ if (my $url = $ENV{SELECTO_PERL_TEST_POSTGRES_URL}) {
         return $dbh;
     }, 1] if eval { require DBD::Pg; 1 };
 }
-push @backends, ['duckdb', sub {
-    DBI->connect('dbi:DuckDB:dbname=:memory:', undef, undef, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
-}, 0] if eval { require DBD::DuckDB; 1 };
+# The positive tenant-insert path requires verified typed storage admission.
+# DuckDB intentionally fails closed; security_insert_admission.t exercises
+# that refusal before DML. Keep these relational positive tests on Pg/SQLite.
 
 for my $backend (@backends) {
     my ($name, $connect, $foreign_keys) = @$backend;

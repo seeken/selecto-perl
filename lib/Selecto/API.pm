@@ -6,6 +6,8 @@ use Mojo::Base -base, -signatures;
 use JSON::PP ();
 use Scalar::Util qw(blessed looks_like_number);
 use Selecto::API::ResultFormatter ();
+use Selecto::API::ResponsePolicy ();
+use Selecto::Limits ();
 use Selecto::Domain ();
 use Selecto::Error ();
 
@@ -15,9 +17,19 @@ our $JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
 our $OPENAPI_CONTENT_TYPE = 'application/vnd.oai.openapi+json;version=3.1';
 
 has [qw(domain base_path manifest openapi)];
+has limits => sub { Selecto::Limits->new };
+has debug_sql => 0;
+has publish_domain => 0;
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
+    Selecto::Error->throw('invalid_api_host', 'API limits must be a Selecto::Limits')
+        unless blessed($self->limits) && $self->limits->isa('Selecto::Limits');
+    for my $name (qw(debug_sql publish_domain)) {
+        my $option = $self->$name;
+        Selecto::Error->throw('invalid_api_host', "$name must be a trusted boolean or callback")
+            unless ref($option) eq 'CODE' || (!ref($option) && defined($option) && "$option" =~ /\A[01]\z/);
+    }
     my $domain = $self->domain;
     Selecto::Error->throw(
         'canonical_api_requires_domain_contract',
@@ -51,7 +63,14 @@ sub request ($self, $request, $handlers = {}) {
     my $path = $request->{path};
     my $body = $request->{body};
     my $route = $self->_route($method, $path);
-    return _response(200, $self->domain, $JSON_CONTENT_TYPE) if $route eq 'domain';
+    if ($route eq 'domain') {
+        return _error_response(403, 'domain_publication_denied',
+            'Full domain publication is not enabled for this request')
+            unless $self->_permits('publish_domain', $request);
+        return _error_response(422, 'api_result_limit_exceeded', 'The response exceeds its resource limit')
+            unless eval { Selecto::API::ResponsePolicy->check_json($self->domain, $self->limits); 1 };
+        return $self->_bounded_response(_response(200, $self->domain, $JSON_CONTENT_TYPE), $self->limits);
+    }
     return _response(200, $self->openapi, $OPENAPI_CONTENT_TYPE) if $route eq 'openapi';
     return $self->_dispatch($route->[0], $route->[1], $body, $request, $handlers)
         if ref($route) eq 'ARRAY';
@@ -61,6 +80,13 @@ sub request ($self, $request, $handlers = {}) {
         'Canonical API route not found',
         { method => $method, path => $path },
     );
+}
+
+sub _permits ($self, $name, $request) {
+    my $option = $self->$name;
+    return $option ? 1 : 0 unless ref($option) eq 'CODE';
+    my $granted = eval { $option->($request) };
+    return !$@ && defined($granted) && !ref($granted) && "$granted" eq '1' ? 1 : 0;
 }
 
 sub _route ($self, $method, $path) {
@@ -157,9 +183,18 @@ sub _dispatch ($self, $operation, $params, $body, $request, $handlers) {
         && ($result->[0] eq 'ok' || $result->[0] eq 'error');
 
     if ($result->[0] eq 'ok') {
-        return _query_success($self, $result->[1], $format, $download_filename)
+        my $limits = Selecto::API::ResponsePolicy->limits_for($result->[1], $self->limits);
+        my $data;
+        my $safe = eval {
+            $data = Selecto::API::ResponsePolicy->public_data(
+                $result->[1], $self->_permits('debug_sql', $request), $limits);
+            1;
+        };
+        return _error_response(422, 'api_result_limit_exceeded',
+            'The response exceeds its resource limit') unless $safe;
+        return _query_success($self, $data, $format, $download_filename, $limits)
             if $operation eq 'query';
-        return _success($result->[1]);
+        return $self->_bounded_success($data, $limits);
     }
     my $error = $result->[1];
     return _error_response(
@@ -168,25 +203,59 @@ sub _dispatch ($self, $operation, $params, $body, $request, $handlers) {
         'Canonical API handler returned an invalid result',
     ) unless ref($error) eq 'HASH';
 
+    my $debug = $self->_permits('debug_sql', $request);
+    my $details = eval { Selecto::API::ResponsePolicy->error_details(
+        $error->{details}, $debug, $self->limits) } // {};
+    my $code = _error_string($error, 'code', 'operation_rejected');
+    $code = 'operation_rejected' unless $code =~ /\A[a-z][a-z0-9_]{0,127}\z/;
+    my $response = {
+        error => {
+            code => $code, details => $details,
+            message => $debug ? _error_string($error, 'message', 'Canonical API operation rejected')
+                : 'Canonical API operation rejected',
+        }, ok => JSON::PP::false,
+    };
+    return _error_response(422, 'api_result_limit_exceeded', 'The response exceeds its resource limit')
+        unless eval { Selecto::API::ResponsePolicy->check_json($response, $self->limits); 1 };
     return _error_response(
         _error_integer($error, 'status', 422),
-        _error_string($error, 'code', 'operation_rejected'),
-        _error_string($error, 'message', 'Canonical API operation rejected'),
-        ref($error->{details}) eq 'HASH' ? $error->{details} : {},
+        $code,
+        $debug ? _error_string($error, 'message', 'Canonical API operation rejected')
+            : 'Canonical API operation rejected',
+        $details,
     );
 }
 
-sub _query_success ($self, $data, $format, $download_filename = undef) {
+sub _bounded_success ($self, $data, $limits) {
+    return _error_response(422, 'api_result_limit_exceeded', 'The response exceeds its resource limit')
+        unless eval { Selecto::API::ResponsePolicy->check_json({data => $data, ok => JSON::PP::true}, $limits); 1 };
+    return $self->_bounded_response(_success($data), $limits);
+}
+
+sub _bounded_response ($self, $response, $limits) {
+    return _error_response(422, 'api_result_limit_exceeded',
+        'The response exceeds its resource limit')
+        if length($response->{body}) > $limits->get('max_response_bytes');
+    return $response;
+}
+
+sub _query_success ($self, $data, $format, $download_filename = undef, $limits = undef) {
+    $limits //= $self->limits;
     my $response;
     if ($format eq 'json') {
-        $response = _success($data);
+        $response = $self->_bounded_success($data, $limits);
     } else {
         my $body;
         my $ok = eval {
-            $body = Selecto::API::ResultFormatter->encode_result($format, $data);
+            $body = Selecto::API::ResultFormatter->encode_result($format, $data, limits => $limits);
             1;
         };
         unless ($ok) {
+            my $error = $@;
+            return _error_response(422, 'api_result_limit_exceeded',
+                'The response exceeds its resource limit')
+                if blessed($error) && $error->isa('Selecto::Error')
+                    && $error->code eq 'api_result_limit_exceeded';
             return _error_response(
                 500, 'response_encoding_failed',
                 'The query succeeded but its requested response could not be encoded',
@@ -207,7 +276,7 @@ sub _query_success ($self, $data, $format, $download_filename = undef) {
         };
     }
     $response->{headers}{vary} = 'Accept';
-    return $response;
+    return $self->_bounded_response($response, $limits);
 }
 
 sub _validate_download_filename ($filename, $format) {
@@ -564,6 +633,21 @@ route list).
 A function (not a method) that encodes a value as Selecto Canonical JSON v1
 bytes, throwing C<non_canonical_value> for floats and other values it cannot
 represent exactly.
+
+=head2 Host privacy and resource policy
+
+C<debug_sql> and C<publish_domain> default to C<0>. Each accepts a trusted
+C<0>/C<1> flag or a callback receiving the host request and returning exactly
+C<1> to authorize it. Request parameters do not modify either setting. Callback
+exceptions deny access. Default responses omit diagnostic SQL and parameter
+metadata and suppress arbitrary handler-error messages and causes. Business rows
+and returning values are application data and must not contain host diagnostics.
+
+C<GET .../domain> requires publication authorization and then returns the full
+canonical contract. C<limits> accepts a trusted L<Selecto::Limits>; all successful
+representations obey C<max_response_bytes>, and XLSX generation additionally
+reserves C<max_response_temp_bytes>. Small constant error envelopes may exceed
+an unusually tiny successful-response limit.
 
 =head1 SEE ALSO
 

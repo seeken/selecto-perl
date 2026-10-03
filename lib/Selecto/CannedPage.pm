@@ -7,6 +7,7 @@ use Scalar::Util qw(blessed);
 use Time::HiRes qw(time);
 use Selecto::Domain ();
 use Selecto::Error ();
+use Selecto::BoundedQuery ();
 use Selecto::Expression ();
 use Selecto::Query ();
 
@@ -372,7 +373,7 @@ sub plan {
 }
 
 sub run {
-    my ($self, $engine, $input, $scope) = @_;
+    my ($self, $engine, $input, $scope, $execution_options) = @_;
     _fail('page engine uses a different domain')
         unless blessed($engine) && $engine->can('domain') && $engine->can('all')
             && $engine->domain->fingerprint eq $self->domain->fingerprint;
@@ -386,15 +387,20 @@ sub run {
     }
     my $plan = $self->plan($input, $scope);
     my $query_started = time;
-    my $rows = $engine->all($plan->{query});
+    _fail('execution options must be an object') if defined($execution_options) && ref($execution_options) ne 'HASH';
+    my $run = sub {
+        return $execution_options ? Selecto::BoundedQuery->all($engine, $_[0], %$execution_options)
+            : $engine->all($_[0]);
+    };
+    my $rows = $run->($plan->{query});
     my $has_more = @{$rows->{rows}} > $plan->{state}{limit} ? 1 : 0;
     pop @{$rows->{rows}} if $has_more;
-    my $total_rows = $engine->all($plan->{total_query})->{rows};
+    my $total_rows = $run->($plan->{total_query})->{rows};
     my %facets;
     for my $control (@{$self->{controls}}) {
         next unless $control->{kind} eq 'facet';
         my $id = $control->{id};
-        my $raw = $engine->all($plan->{facet_queries}{$id});
+        my $raw = $run->($plan->{facet_queries}{$id});
         my $limit = $control->{values}{limit} // 30;
         my $has_label = defined($control->{label_field});
         my @options = map {{
@@ -413,7 +419,7 @@ sub run {
         }
         my %shown = map { (defined($_->{value}) ? $_->{value} : '') => 1 } @options;
         my $selected_rows = $plan->{selected_facet_queries}{$id}
-            ? $engine->all($plan->{selected_facet_queries}{$id})->{rows} : [];
+            ? $run->($plan->{selected_facet_queries}{$id})->{rows} : [];
         for my $selected (@{$plan->{state}{filters}{$id} // []}) {
             next if $shown{$selected};
             my ($match) = grep { defined($_->[0]) && "$_->[0]" eq "$selected" } @$selected_rows;
