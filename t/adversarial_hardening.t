@@ -225,7 +225,10 @@ subtest 'PE :123/FV-03: library orderings and segments cannot read internal fiel
     for my $name (sort keys %refused) {
         my %body = (select => ['id'], %{$refused{$name}});
         delete $body{select} unless defined $body{select};
-        is(code_of(sub { $handler->query($engine, \%body) }), 'field_not_public', "$name is refused");
+        # A conditional filter names a public choice field; only reading the
+        # internal fields behind it outside its declared choices is refused.
+        my $code = $name =~ /conditional filter|among declared/ ? 'field_not_public' : 'hidden_field';
+        is(code_of(sub { $handler->query($engine, \%body) }), $code, "$name is refused");
     }
     is_deeply($ids->({ordering => 'by_name'}), [1, 2, 3], 'a named ordering on public fields still applies');
     is_deeply($ids->({segments => ['named'], order_by => [{field => 'id'}]}), [1, 2, 3],
@@ -235,7 +238,7 @@ subtest 'PE :123/FV-03: library orderings and segments cannot read internal fiel
     is_deeply($ids->({filters => [{field => 'either_code', op => 'eq', value => '10'}]}), [1],
         'a declared choice still switches on an internal field');
     is(code_of(sub { $handler->query($engine, {select => ['id'], order_by => [{field => 'secret_code'}]}) }),
-        'field_not_public', 'a direct order_by on the internal field stays refused');
+        'hidden_field', 'a direct order_by on the internal field stays refused');
 };
 
 sub order_domain {

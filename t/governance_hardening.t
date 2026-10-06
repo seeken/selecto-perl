@@ -63,12 +63,12 @@ subtest 'internal columns stay private at every association depth' => sub {
         adapter => Capture::PG->new(dbh => bless({}, 'Offline::DBH')),
     );
     is(code_of(sub { $handler->query($engine, {select => ['id', 'orders.customer.ssn']}) }),
-        'field_not_public', 'API select refuses the deep internal column');
+        'hidden_field', 'API select refuses the deep internal column');
     is(code_of(sub { $handler->query($engine, {select => ['id'],
         filters => [{field => 'orders.customer.ssn', op => 'eq', value => 'x'}]}) }),
-        'field_not_public', 'API filter refuses the deep internal column');
+        'hidden_field', 'API filter refuses the deep internal column');
     is(code_of(sub { $handler->query($engine, {select => ['id'], order_by => [{field => 'orders.customer.ssn'}]}) }),
-        'field_not_public', 'API order_by refuses the deep internal column');
+        'hidden_field', 'API order_by refuses the deep internal column');
     is(code_of(sub { $handler->query($engine, {select => ['id', 'orders.customer.name']}) }),
         'ok', 'deep public columns remain queryable');
 };
@@ -91,9 +91,9 @@ subtest 'redact_fields withhold columns from untrusted surfaces' => sub {
     ok($domain->field_is_public('team.name'), 'unredacted schema column stays public');
     ok($domain->field_metadata('ssn')->{redacted}, 'metadata records the redaction');
     my $engine = Selecto::Engine->new(domain => $domain, adapter => Capture::PG->new(dbh => bless({}, 'Offline::DBH')));
-    is(code_of(sub { $handler->query($engine, {select => ['id', 'ssn']}) }), 'field_not_public', 'API select refuses redacted field');
+    is(code_of(sub { $handler->query($engine, {select => ['id', 'ssn']}) }), 'hidden_field', 'API select refuses redacted field');
     is(code_of(sub { $handler->query($engine, {select => ['id'], filters => [{field => 'team.budget', op => 'gt', value => 1}]}) }),
-        'field_not_public', 'API filter refuses redacted association field');
+        'hidden_field', 'API filter refuses redacted association field');
 };
 
 subtest 'related collection keys must be identifier paths' => sub {

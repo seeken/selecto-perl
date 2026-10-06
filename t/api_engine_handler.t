@@ -543,8 +543,9 @@ my $error = eval {
     $handler->query($engine, {select => ['tenant_id']});
     undef;
 } // $@;
-is $error->code, 'field_not_public',
+is $error->code, 'hidden_field',
     'internal domain dependencies cannot be selected through the handler';
+is_deeply $error->details, {field => 'tenant_id'}, 'the refusal names the hidden field';
 
 $error = eval {
     $handler->query($engine, {

@@ -75,6 +75,7 @@ t/analytics_pipeline.t
 t/analytics_unit_registry.t
 t/api.t
 t/api_engine_handler.t
+t/api_hidden_field.t
 t/api_query_library_parity_live.t
 t/api_result_formatter.t
 t/api_through_association_parity_live.t
