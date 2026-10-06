@@ -76,6 +76,32 @@ subtest 'PostgreSQL server cursor lifecycle' => sub {
         is(($dbh->selectrow_array('SELECT COUNT(*) FROM bounded_stream_host'))[0],0,'host work was never committed by stream');
     }
 
+    # fetch_size rows per FETCH: each round trip evaluates exactly one batch.
+    $dbh->begin_work;
+    $dbh->do('ALTER SEQUENCE bounded_stream_probe RESTART WITH 1');
+    $stream=$adapter->stream_query(statement(q{SELECT nextval('bounded_stream_probe') FROM generate_series(1,1000)}),bounded=>1,fetch_size=>3);
+    is_deeply($stream->next,[1],'first batch yields its first row');
+    is(($dbh->selectrow_array('SELECT last_value FROM bounded_stream_probe'))[0],3,'one FETCH evaluates fetch_size rows');
+    is_deeply([map {$stream->next} 1..2],[[2],[3]],'buffered rows come from the same batch');
+    is(($dbh->selectrow_array('SELECT last_value FROM bounded_stream_probe'))[0],3,'buffered rows need no further FETCH');
+    is_deeply($stream->next,[4],'next batch continues in order');
+    is(($dbh->selectrow_array('SELECT last_value FROM bounded_stream_probe'))[0],6,'second FETCH evaluates the next batch only');
+    $stream->close;
+    is($stream->next,undef,'close discards buffered rows');
+    is(($dbh->selectrow_array('SELECT last_value FROM bounded_stream_probe'))[0],6,'early close executes no remaining rows');
+    $dbh->rollback;
+
+    my $batched=statement(q{SELECT n::int, (n::numeric / 4)::numeric(10,4), n % 2 = 0, TIMESTAMP '2025-03-01 10:00:00' + n * INTERVAL '1 second' FROM generate_series(1,7) n},
+        [],['id','quarter','even','at']);
+    my $expected=$adapter->execute_query($batched)->{rows};
+    for my $size (1,3,7,50) {
+        $stream=$adapter->stream_query($batched,bounded=>1,fetch_size=>$size);
+        my @rows;
+        while (my $row=$stream->next) { push @rows,$row; }
+        is_deeply(\@rows,$expected,"fetch_size $size yields every row in order, decoded as execute_query does");
+        ok($stream->closed && $dbh->{AutoCommit},"fetch_size $size exhaustion restores idle handle");
+    }
+
     for my $host_transaction (0,1) {
         $dbh->begin_work if $host_transaction;
         $dbh->do('INSERT INTO bounded_stream_host VALUES (1)') if $host_transaction;

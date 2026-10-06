@@ -17,8 +17,9 @@ sub new {
     Selecto::Error->throw('stream_unavailable', 'database handle requires recovery after stream cleanup failed')
         if $dbh->{private_selecto_bounded_stream_poisoned};
     my $name = 'selecto_stream_' . $$ . '_' . ++$SERIAL;
+    my $fetch_size = int($args{fetch_size} // 1);
     my $self = bless {adapter => $adapter, dbh => $dbh, name => $name,
-        columns => $args{statement}->columns, closed => 0}, $class;
+        columns => $args{statement}->columns, closed => 0, buffer => []}, $class;
     $dbh->{private_selecto_bounded_stream} = $name;
     my $ok = eval {
         if ($adapter->_transaction_open) {
@@ -36,9 +37,10 @@ sub new {
             or die 'cursor declaration failed';
         $self->{declared} = 1;
         $declaration->finish;
-        # One FETCH result is all that libpq can buffer. RowCacheSize alone
-        # cannot bound DBD::Pg's eager result allocation.
-        $self->{sth} = $dbh->prepare("FETCH FORWARD 1 FROM $name")
+        # One FETCH result is all that libpq can buffer, so fetch_size rows
+        # (default 1) bound DBD::Pg's eager result allocation. RowCacheSize
+        # alone cannot.
+        $self->{sth} = $dbh->prepare("FETCH FORWARD $fetch_size FROM $name")
             or die 'cursor fetch could not be prepared';
         1;
     };
@@ -53,16 +55,15 @@ sub new {
 sub next {
     my ($self) = @_;
     return undef if $self->{closed};
-    my ($available, $decoded);
+    return shift @{$self->{buffer}} if @{$self->{buffer}};
+    my $rows;
     my $ok = eval {
         my $sth = $self->{sth};
         defined($sth->execute) or die 'cursor fetch failed';
-        my @types = $self->{adapter}->_column_types($sth);
-        my @row = $sth->fetchrow_array;
-        die 'cursor row fetch failed' if $sth->err;
-        $available = @row ? 1 : 0;
-        $decoded = [map { $self->{adapter}->_decode($row[$_], $types[$_]) } 0 .. $#row]
-            if $available;
+        $self->{types} //= [$self->{adapter}->_column_types($sth)];
+        $rows = $sth->fetchall_arrayref;
+        die 'cursor row fetch failed' if !$rows || $sth->err;
+        $self->{adapter}->_decode_rows($rows, $self->{types});
         $sth->finish;
         1;
     };
@@ -72,11 +73,12 @@ sub next {
         eval { $self->_close(1) };
         die $error;
     }
-    if (!$available) {
+    if (!@$rows) {
         $self->close;
         return undef;
     }
-    return $decoded;
+    $self->{buffer} = $rows;
+    return shift @{$self->{buffer}};
 }
 
 sub close { return $_[0]->_close(0); }
@@ -133,12 +135,14 @@ Selecto::PostgreSQL::Stream - bounded PostgreSQL server cursor
 
 =head1 DESCRIPTION
 
-C<< $engine->stream($query, bounded => 1) >> uses a PostgreSQL C<NO SCROLL>
-cursor and fetches exactly one row per call. This bounds the number of result
-rows buffered by DBD::Pg; an individual row and the server's query plan can
-still consume substantial memory. Row limits, byte budgets and database
-deadlines remain separate requirements. C<fetch_size> is accepted for API
-compatibility but does not increase the one-row fetch.
+C<< $engine->stream($query, bounded => 1, fetch_size => $n) >> uses a
+PostgreSQL C<NO SCROLL> cursor and fetches C<$n> rows per round trip (default
+1), handing them out one at a time. This bounds the number of result rows
+buffered by DBD::Pg to C<$n>; an individual row and the server's query plan
+can still consume substantial memory. Row limits, byte budgets and database
+deadlines remain separate requirements, and a caller's per-row checks see a
+batch only after it has been fetched. Each batch is decoded column by column
+(see C<_decode_rows> in L<Selecto::SQL>).
 
 The stream owns an idle handle's read-only transaction and rolls it back on
 close. Inside an existing transaction it owns a savepoint: normal close
