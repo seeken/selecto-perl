@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Faster query composition, compilation and write governance with the
+      same resource limits, thresholds and error codes: inlined operation
+      budget comparisons (the breach path is unchanged), one admission per
+      query under Engine->compile instead of two, a single deep copy in write
+      command derivation, no whole-contract copy to read one section, no
+      copies of field metadata or the applied query library for internal
+      reads, and a shared default limits policy.
     - Faster bounded results: Selecto::BoundedQuery (canned pages, component
       result pages) fetches min(max_rows + 1, 100) guarded rows per round
       trip instead of one, and QueryBudget->check(defer_rearm => 1) lets a

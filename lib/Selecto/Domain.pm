@@ -1060,6 +1060,18 @@ sub _portable_schema_name {
 
 sub field_metadata {
     my ($self, $path) = @_;
+    my $view = $self->_field_metadata_view($path);
+    # A deep copy the caller owns. Redaction flags are set on the copy.
+    my $metadata = dclone($view);
+    return $metadata;
+}
+
+# The same metadata field_metadata returns, without the caller-owned copy:
+# the declared column itself (or a shallow copy carrying the redaction flags,
+# or a fresh empty hash). For library code that only reads keys; it must
+# never be modified.
+sub _field_metadata_view {
+    my ($self, $path) = @_;
     my $contract = $self->{contract};
     return {} unless ref($contract) eq 'HASH';
     my @segments = split /\./, "$path", -1;
@@ -1089,11 +1101,11 @@ sub field_metadata {
             if defined($queryable) && ref($contract->{schemas}) eq 'HASH';
         push @redacted, _redacted($contract, join('.', @segments, $field));
     }
-    my $metadata = ref($column) eq 'HASH' ? dclone($column) : {};
+    my $metadata = ref($column) eq 'HASH' ? $column : {};
     # Redacted fields are withheld from every untrusted surface exactly like
     # internal columns: field_is_public is false, so API, component, and
     # template catalogs refuse to select, filter, or order on them.
-    @$metadata{qw(internal redacted)} = (1, 1) if grep { $_ } @redacted;
+    return {%$metadata, internal => 1, redacted => 1} if grep { $_ } @redacted;
     return $metadata;
 }
 
@@ -1131,7 +1143,7 @@ sub values_foreign_keys {
 sub normalize_field_value {
     my ($self, $path, $value) = @_;
     return $value unless defined($value) && !ref($value);
-    my $text_case = $self->field_metadata($path)->{text_case};
+    my $text_case = $self->_field_metadata_view($path)->{text_case};
     return uc("$value") if defined($text_case) && $text_case eq 'uppercase';
     return lc("$value") if defined($text_case) && $text_case eq 'lowercase';
     return $value;
@@ -1187,7 +1199,7 @@ sub field_behavior {
 
 sub field_is_public {
     my ($self, $path) = @_;
-    my $metadata = $self->field_metadata($path);
+    my $metadata = $self->_field_metadata_view($path);
     return $metadata->{internal} ? 0 : 1;
 }
 
@@ -2110,6 +2122,8 @@ sub primary_key  { return $_[0]->{primary_key}; }
 sub required_predicate { return $_[0]->{required_predicate}; }
 sub tenant_field { return $_[0]->{tenant_field}; }
 sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
+# The contract itself, for library code that only reads it; never modify it.
+sub _contract_view { return $_[0]->{contract}; }
 sub retarget_config {
     my ($self) = @_;
     my $contract = $self->{contract};
@@ -2121,12 +2135,14 @@ sub write_tenant_scope {
     my $scope = $_[0]->{write_tenant_scope};
     return $scope ? dclone($scope) : undef;
 }
-sub writes       { my $contract = $_[0]->contract // {}; return dclone($contract->{writes} // {}); }
-sub actions      { my $contract = $_[0]->contract // {}; return dclone($contract->{actions} // {}); }
-sub imports      { my $contract = $_[0]->contract // {}; return dclone($contract->{imports} // {}); }
+# Each section is deep-copied straight from the contract, rather than from a
+# deep copy of the whole contract; the caller receives the same fresh copy.
+sub writes       { my $contract = $_[0]->{contract} // {}; return dclone($contract->{writes} // {}); }
+sub actions      { my $contract = $_[0]->{contract} // {}; return dclone($contract->{actions} // {}); }
+sub imports      { my $contract = $_[0]->{contract} // {}; return dclone($contract->{imports} // {}); }
 sub editors      { return dclone($_[0]->{editors} // {}); }
 sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
-sub capabilities { my $contract = $_[0]->contract // {}; return dclone($contract->{capabilities} // {}); }
+sub capabilities { my $contract = $_[0]->{contract} // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }
 sub query_library { return dclone($_[0]->{query_library} // {}); }
 sub co_domains   { return dclone($_[0]->{co_domains} // {}); }

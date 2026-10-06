@@ -30,111 +30,82 @@ sub new {
     return bless {
         operation => $operation,
         relation => "$args{relation}",
-        assignments => { map { ("$_", _clone($assignments->{$_})) } keys %$assignments },
+        assignments => { map { ("$_", ref($assignments->{$_}) ? _clone($assignments->{$_}) : $assignments->{$_}) } keys %$assignments },
         predicate => $args{predicate},
         scope_predicate => $args{scope_predicate},
         query_enforcement => $args{query_enforcement},
         expected_count => exists($args{expected_count}) ? $args{expected_count} : 1,
-        metadata => { map { ("$_", _clone($metadata->{$_})) } keys %$metadata },
+        metadata => { map { ("$_", ref($metadata->{$_}) ? _clone($metadata->{$_}) : $metadata->{$_}) } keys %$metadata },
         foreign_key_guards => _clone($args{foreign_key_guards} // []),
     }, $class;
 }
 
 sub operation      { return $_[0]->{operation}; }
 sub relation       { return $_[0]->{relation}; }
-sub assignments    { return { map { ($_ => _clone($_[0]->{assignments}{$_})) } keys %{$_[0]->{assignments}} }; }
+sub assignments    { my $own = $_[0]->{assignments}; return { map { ($_ => ref($own->{$_}) ? _clone($own->{$_}) : $own->{$_}) } keys %$own }; }
 sub predicate      { return $_[0]->{predicate}; }
 sub scope_predicate { return $_[0]->{scope_predicate}; }
 sub query_enforcement { return $_[0]->{query_enforcement}; }
 sub expected_count { return $_[0]->{expected_count}; }
-sub metadata       { return { map { ($_ => _clone($_[0]->{metadata}{$_})) } keys %{$_[0]->{metadata}} }; }
+sub metadata       { my $own = $_[0]->{metadata}; return { map { ($_ => ref($own->{$_}) ? _clone($own->{$_}) : $own->{$_}) } keys %$own }; }
 # Existence guards for referenced parent rows. Selecto::Engine sets them while
 # governing a write (TW-05); adapters compile them into the statement.
 sub foreign_key_guards { return _clone($_[0]->{foreign_key_guards}); }
 
+# A copy with some fields replaced. new() deep-copies every field once, so the
+# copy owns its state exactly as before; reading this object's own fields
+# directly avoids first deep-copying them through the accessors as well.
+sub _with {
+    my ($self, %changes) = @_;
+    return ref($self)->new(
+        operation => $self->{operation},
+        relation => $self->{relation},
+        assignments => $self->{assignments},
+        predicate => $self->{predicate},
+        scope_predicate => $self->{scope_predicate},
+        query_enforcement => $self->{query_enforcement},
+        expected_count => $self->{expected_count},
+        metadata => $self->{metadata},
+        foreign_key_guards => $self->{foreign_key_guards},
+        %changes,
+    );
+}
+
 sub with_query_enforcement {
     my ($self, $evidence) = @_;
-    return ref($self)->new(
-        operation => $self->operation,
-        relation => $self->relation,
-        assignments => $self->assignments,
-        predicate => $self->predicate,
-        scope_predicate => $self->scope_predicate,
-        query_enforcement => $evidence,
-        expected_count => $self->expected_count,
-        metadata => $self->metadata,
-        foreign_key_guards => $self->foreign_key_guards,
-    );
+    return $self->_with(query_enforcement => $evidence);
 }
 
 sub with_assignments {
     my ($self, $assignments) = @_;
-    return ref($self)->new(
-        operation => $self->operation,
-        relation => $self->relation,
-        assignments => $assignments,
-        predicate => $self->predicate,
-        scope_predicate => $self->scope_predicate,
-        query_enforcement => $self->query_enforcement,
-        expected_count => $self->expected_count,
-        metadata => $self->metadata,
-        foreign_key_guards => $self->foreign_key_guards,
-    );
+    return $self->_with(assignments => $assignments);
 }
 
 sub with_scope_predicate {
     my ($self, $scope_predicate) = @_;
-    return ref($self)->new(
-        operation => $self->operation,
-        relation => $self->relation,
-        assignments => $self->assignments,
-        predicate => $self->predicate,
-        scope_predicate => $scope_predicate,
-        query_enforcement => $self->query_enforcement,
-        expected_count => $self->expected_count,
-        metadata => $self->metadata,
-        foreign_key_guards => $self->foreign_key_guards,
-    );
+    return $self->_with(scope_predicate => $scope_predicate);
 }
 
 sub with_metadata {
     my ($self, $metadata) = @_;
     Selecto::Error->throw('invalid_write', 'metadata must be an object')
         unless ref($metadata) eq 'HASH';
-    return ref($self)->new(
-        operation => $self->operation,
-        relation => $self->relation,
-        assignments => $self->assignments,
-        predicate => $self->predicate,
-        scope_predicate => $self->scope_predicate,
-        query_enforcement => $self->query_enforcement,
-        expected_count => $self->expected_count,
-        metadata => $metadata,
-        foreign_key_guards => $self->foreign_key_guards,
-    );
+    return $self->_with(metadata => $metadata);
 }
 
 sub with_foreign_key_guards {
     my ($self, $guards) = @_;
     Selecto::Error->throw('invalid_write', 'foreign_key_guards must be an array')
         unless ref($guards) eq 'ARRAY';
-    return ref($self)->new(
-        operation => $self->operation,
-        relation => $self->relation,
-        assignments => $self->assignments,
-        predicate => $self->predicate,
-        scope_predicate => $self->scope_predicate,
-        query_enforcement => $self->query_enforcement,
-        expected_count => $self->expected_count,
-        metadata => $self->metadata,
-        foreign_key_guards => $guards,
-    );
+    return $self->_with(foreign_key_guards => $guards);
 }
 
 sub _clone {
     my ($value) = @_;
-    return [map { _clone($_) } @$value] if ref($value) eq 'ARRAY';
-    return { map { ($_ => _clone($value->{$_})) } keys %$value } if ref($value) eq 'HASH';
+    # Scalars are copied inline; only references recurse. Same result as
+    # cloning every element, without a call per scalar.
+    return [map { ref($_) ? _clone($_) : $_ } @$value] if ref($value) eq 'ARRAY';
+    return { map { ($_ => ref($value->{$_}) ? _clone($value->{$_}) : $value->{$_}) } keys %$value } if ref($value) eq 'HASH';
     return $value;
 }
 

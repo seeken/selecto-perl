@@ -14,6 +14,15 @@ our $RECURSION_DEPTH_COLUMN = 'selecto_depth';
 
 sub new {
     my ($class, %args) = @_;
+    return $class->_build(\%args, 0);
+}
+
+# $share_library: the applied query library comes from an existing query's own
+# private copy (see _copy), which no code modifies in place, so the new query
+# may hold the same copy. Input from callers is always deep-copied.
+sub _build {
+    my ($class, $given, $share_library) = @_;
+    my %args = %$given;
     my %allowed = map { $_ => 1 } qw(
         selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
         set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
@@ -110,7 +119,7 @@ sub new {
         timezone => defined($timezone) ? "$timezone" : undef,
         row_lock => $row_lock,
         retarget => $retarget,
-        applied_query_library => dclone($args{applied_query_library} // {
+        applied_query_library => $share_library ? $args{applied_query_library} : dclone($args{applied_query_library} // {
             segments => [], projections => [], projection => undef,
             ordering => undef, views => [],
         }),
@@ -580,7 +589,11 @@ sub _copy {
         applied_query_library => $self->{applied_query_library},
         %changes,
     );
-    return ref($self)->new(%state);
+    my $class = ref($self);
+    # A subclass with its own constructor still receives every copy through it.
+    return $class->new(%state) unless $class->can('new') == \&new;
+    return $class->_build(\%state, !exists($changes{applied_query_library})
+        && defined($self->{applied_query_library}));
 }
 
 sub selections   { return [@{$_[0]->{selections}}]; }

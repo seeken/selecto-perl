@@ -28,7 +28,7 @@ sub new {
     } elsif (($kind eq 'and' || $kind eq 'or') && ref($arguments[0]) eq 'ARRAY') {
         $budget->limits->check_count('max_expression_arity', scalar(@{$arguments[0]}), 'invalid_query', 'expression fan-out');
     }
-    return bless { kind => "$kind", arguments => [map { _clone($_) } @arguments], alias_name => undef }, $class;
+    return bless { kind => "$kind", arguments => [map { ref($_) ? _clone($_) : $_ } @arguments], alias_name => undef }, $class;
 }
 
 sub field   { my ($class, $name) = @_; return $class->new('field', "$name"); }
@@ -560,13 +560,14 @@ sub as {
 }
 
 sub kind       { return $_[0]->{kind}; }
-sub arguments  { return [map { _clone($_) } @{$_[0]->{arguments}}]; }
+sub arguments  { return [map { ref($_) ? _clone($_) : $_ } @{$_[0]->{arguments}}]; }
 sub alias_name { return $_[0]->{alias_name}; }
 
 sub _clone {
     my ($value) = @_;
-    return [map { _clone($_) } @$value] if ref($value) eq 'ARRAY';
-    return { map { ($_ => _clone($value->{$_})) } keys %$value } if ref($value) eq 'HASH';
+    # Scalars are copied inline; only references recurse.
+    return [map { ref($_) ? _clone($_) : $_ } @$value] if ref($value) eq 'ARRAY';
+    return { map { ($_ => ref($value->{$_}) ? _clone($value->{$_}) : $value->{$_}) } keys %$value } if ref($value) eq 'HASH';
     return $value;
 }
 

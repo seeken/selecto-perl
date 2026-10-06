@@ -56,15 +56,27 @@ sub quote_identifier {
 sub compile {
     my ($self, $domain, $query) = @_;
     my $statement = $self->_compile_query($domain, $query);
+    # Selecto::Engine::compile admits these parameters itself, with the same
+    # limits, code and label, as soon as this returns.
     Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')
-        ->consume_parameters($statement->params, label => 'statement parameter');
+        ->consume_parameters($statement->params, label => 'statement parameter')
+        unless _engine_admitted($self, $query);
     return $statement;
+}
+
+# True for the exact query Selecto::Engine::compile admitted under the same
+# limits immediately before calling compile.
+sub _engine_admitted {
+    my ($self, $query) = @_;
+    my $admitted = $self->{_selecto_admitted_query};
+    return ref($admitted) && ref($query) && refaddr($admitted) == refaddr($query) ? 1 : 0;
 }
 
 sub _compile_query {
     my ($self, $domain, $query) = @_;
     Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')->check_tree(
-        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)]);
+        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)])
+        unless _engine_admitted($self, $query);
     my $operations = $query->set_operations;
     Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')
         if @$operations && defined($query->row_lock);
@@ -195,7 +207,7 @@ sub _compile_single {
         my $needs_result_alias = defined($_->alias_name)
             || ($_->kind eq 'field' && $_->arguments->[0] =~ /\./)
             || ($_->kind eq 'field'
-                && ref($domain->field_metadata($_->arguments->[0])->{computed}) eq 'HASH');
+                && ref($domain->_field_metadata_view($_->arguments->[0])->{computed}) eq 'HASH');
         $needs_result_alias
             ? $expression_sql . ' AS ' . $self->quote_identifier($columns[$selection_position - 1])
             : $expression_sql
@@ -255,7 +267,7 @@ sub _compile_single {
                     : $association->owner_key;
                 $owner_sql = _text_case_sql(
                     $owner_sql,
-                    $domain->field_metadata($owner_path)->{text_case},
+                    $domain->_field_metadata_view($owner_path)->{text_case},
                 );
             }
             my $lateral_lookup = ($association->join_strategy // '') eq 'lateral_lookup';
@@ -761,7 +773,7 @@ sub _array_element_type {
     my $resolved = $domain->resolve($path);
     Selecto::Error->throw('invalid_query', "$label must be an array field", {field => "$path"})
         unless lc($resolved->{type} // '') eq 'array';
-    my $items = $domain->field_metadata($path)->{items};
+    my $items = $domain->_field_metadata_view($path)->{items};
     Selecto::Error->throw('invalid_query', "$label must declare its element type (items)", {field => "$path"})
         unless defined($items) && !ref($items) && $ARRAY_ELEMENT_TYPE{$items};
     return "$items";
@@ -1717,7 +1729,7 @@ sub _field_sql {
             ? join('.', @association_path, $association->dimension_key)
             : $association->dimension_key;
         $key_sql = _text_case_sql(
-            $key_sql, $domain->field_metadata($key_path)->{text_case},
+            $key_sql, $domain->_field_metadata_view($key_path)->{text_case},
         );
         $sql = "COALESCE($sql, $key_sql)";
     }
@@ -1924,7 +1936,7 @@ sub _expression_associations {
         if (@segments == 1) {
             # A computed root field brings the joins its expression reads.
             $domain //= $self->{_association_domain};
-            my $computed = $domain ? $domain->field_metadata($segments[0])->{computed} : undef;
+            my $computed = $domain ? $domain->_field_metadata_view($segments[0])->{computed} : undef;
             return () unless ref($computed) eq 'HASH';
             if ($computed->{kind} eq 'coalesce_fields') {
                 return map {
