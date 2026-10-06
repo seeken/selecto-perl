@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - CSV and TSV exports follow the certified cross-runtime cell rules
+      (api_export_rules) instead of Text::CSV's defaults. Changed export
+      bytes: a cell is no longer quoted for a space alone ("two words",
+      " ", "trail "); a cell with any non-ASCII character is now always
+      quoted (before, only when its UTF-8 bytes included 0x7F-0xA0, so
+      "café"/"Renée" were bare while "東京" was quoted); control characters
+      (0x01-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F) no longer force quotes, and a
+      NUL is written as is instead of the escaped "0; a formula lead after
+      leading Unicode White_Space ("  =1+1", "\x{A0}=x", VT/FF then "=")
+      is now neutralized with a leading "'". Headers follow the same rules.
+      Unchanged: separators, quotes, tab/CR/LF, leading =,+,-,@ and
+      tab/CR/LF, nulls, booleans, numbers, nested JSON, CRLF row endings.
     - Faster large IN lists with the same SQL, parameters, limits and
       refusals: operation budgets admit a list of values in one pass (each
       value still checked in order, each maximum looked up once), recognise
