@@ -1,6 +1,8 @@
 Revision history for Selecto
 
 Unreleased
+    - Expression->from_filter_ast reads a decoded JSON boolean comparison value
+      or in member as the literal 1 or 0 instead of refusing it as a reference.
     - 0.2.2 security remediation: bound complete filter/value-expression trees,
       scalar and whole-operation parameter bytes, exact rule numeric work,
       non-backtracking ASCII patterns, and importer preview amplification.

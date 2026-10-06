@@ -430,10 +430,11 @@ sub _from_filter_ast {
     if ($operator eq 'in') {
         Selecto::Error->throw('invalid_query', 'in filter requires a non-empty literal list')
             unless @arguments == 2 && ref($value) eq 'ARRAY' && @$value
-                && !grep { ref($_) } @$value;
+                && !grep { ref($_) && !_is_json_boolean($_) } @$value;
         $budget->limits->check_count('max_filter_values', scalar(@$value), 'invalid_query', 'in members');
-        $budget->consume_value($_, label => 'in member') for @$value;
-        return $class->in($field, $value);
+        my @members = map { _filter_literal($_) } @$value;
+        $budget->consume_value($_, label => 'in member') for @members;
+        return $class->in($field, \@members);
     }
     if ($operator eq 'between') {
         Selecto::Error->throw('invalid_query', 'between filter requires two literal bounds')
@@ -460,12 +461,18 @@ sub _from_filter_ast {
         $right = $class->field($value->[1]);
     } else {
         Selecto::Error->throw('invalid_query', "$operator filter value must be a literal or field reference")
-            if ref($value);
+            if ref($value) && !_is_json_boolean($value);
+        $value = _filter_literal($value);
         $budget->consume_value($value, label => 'filter value');
         $right = $class->literal($value);
     }
     return $class->can($operator)->($class, $field, $right);
 }
+
+# A decoded JSON boolean in a filter AST is the literal 1 or 0, as domain
+# defaults and query-library parameters already read it.
+sub _is_json_boolean { return blessed($_[0]) && $_[0]->isa('JSON::PP::Boolean') ? 1 : 0; }
+sub _filter_literal { return _is_json_boolean($_[0]) ? ($_[0] ? 1 : 0) : $_[0]; }
 
 # Every field path an expression reads, in argument order: field operands,
 # value-expression dependencies and related-collection children (whose
@@ -674,7 +681,9 @@ segments, computed predicate columns and API clients:
   ['array_contains', FIELD, [VALUE, ...]]   # also array_contained, array_overlap
   ['json_contains', FIELD, {DOCUMENT}]
 
-A comparison VALUE may be C<['field', PATH]> to compare two fields. Field
+A comparison VALUE may be C<['field', PATH]> to compare two fields. A
+decoded JSON boolean (C<JSON::PP::true> or C<false>) is read as the literal
+C<1> or C<0>. Field
 names must be dotted identifiers; anything else throws C<invalid_query>, as
 does nesting C<and>, C<or> and C<not> more than 64 levels deep.
 
