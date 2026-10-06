@@ -407,7 +407,11 @@ content in diagnostic metadata, never mix it into business rows or field values.
 `GET .../openapi.json` remains available, and query
 responses can be negotiated as CSV, TSV or XLSX. Every format enforces the final
 encoded response byte limit, including XLSX package overhead; XLSX also reserves
-a finite temporary-file budget before generation. Set `limits => $limits` on the
+a finite temporary-file budget before generation. CSV and TSV cells follow the
+certified cross-runtime export rules: a cell is quoted only for the separator, a
+quote, tab, CR, LF or non-ASCII text (not for spaces), and a formula lead
+(`=`, `+`, `-`, `@`, also after leading whitespace, and on negative numbers) gets
+a leading `'`. Set `limits => $limits` on the
 API host and handler. The built-in handler carries any tighter engine limits into
 the final encoding step; custom handlers use the API host policy.
 For a ready-made

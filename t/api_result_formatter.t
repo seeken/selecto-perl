@@ -47,8 +47,64 @@ is $tsv,
 my $object_csv = decode('UTF-8', Selecto::API::ResultFormatter->encode_result('csv', {
     columns => [qw(id label)], rows => [{label => 'Object row', id => 9}],
 }));
-is $object_csv, "id,label\r\n9,\"Object row\"\r\n",
+is $object_csv, "id,label\r\n9,Object row\r\n",
     'object rows follow the declared column order';
+
+# The certified cross-runtime cell rules (api_export_rules; the reference
+# encoder is selecto_backend_certification's Perf.Export): a cell is quoted
+# for the separator, a quote, tab, CR, LF or any non-ASCII character, never
+# for a space alone; a formula lead after leading Unicode White_Space is
+# neutralized, the "'" going before the whitespace.
+{
+    my @cells = (
+        'two words', ' lead', 'trail ', ' ', '   ', '', undef,
+        'Renée', 'café', '東京', "nb\x{a0}sp", 'a,b', 'a;b|c', 'say "hi"',
+        "tab\there", "lf\nx", "cr\rx", 'back\\slash',
+        '=1+1', '+x', '-5', '@a', -5, '-12.50', "\t=1", "\r=1", "\n-1", "\t",
+        '  =1+1', " \t\@x", " =HYPERLINK(\"http://x\")", "\x{3000}+1", "\x{a0}=x",
+        "\x{2003}-1", "\x{0b}=x", "\x{85}=x", "\x{feff}=x", "\x{200b}=x",
+        '1=1', 'a-b', 'x@y.z', '|calc', '%0A', "'=already", '=A1,B1', '-', '+',
+        "\x01ctl\x1f", "\x7f", 0, 7, 0 + '9007199254740993', JSON::PP::true, JSON::PP::false,
+        {b => 'say "hi"', a => [1, '東京']}, [], {'=k' => '-v', x => undef},
+    );
+    my @expected_csv = (
+        'two words', ' lead', 'trail ', ' ', '   ', '', '',
+        '"Renée"', '"café"', '"東京"', qq{"nb\x{a0}sp"}, '"a,b"', 'a;b|c', '"say ""hi"""',
+        qq{"tab\there"}, qq{"lf\nx"}, qq{"cr\rx"}, 'back\\slash',
+        "'=1+1", "'+x", "'-5", "'\@a", "'-5", "'-12.50", qq{"'\t=1"}, qq{"'\r=1"}, qq{"'\n-1"}, qq{"'\t"},
+        "'  =1+1", qq{"' \t\@x"}, qq{"' =HYPERLINK(""http://x"")"}, qq{"'\x{3000}+1"}, qq{"'\x{a0}=x"},
+        qq{"'\x{2003}-1"}, "'\x{0b}=x", qq{"'\x{85}=x"}, qq{"\x{feff}=x"}, qq{"\x{200b}=x"},
+        '1=1', 'a-b', 'x@y.z', '|calc', '%0A', "'=already", qq{"'=A1,B1"}, "'-", "'+",
+        "\x01ctl\x1f", "\x7f", '0', '7', '9007199254740993', 'true', 'false',
+        '"{""a"":[1,""東京""],""b"":""say \\""hi\\""""}"', '[]', qq{"{""=k"":""-v"",""x"":null}"},
+    );
+    is scalar(@cells), scalar(@expected_csv), 'every rule sample has an expected cell';
+    my @columns = map { "c$_" } 0 .. $#cells;
+    my $body = decode('UTF-8', Selecto::API::ResultFormatter->encode_result('csv', {
+        columns => \@columns, rows => [\@cells],
+    }));
+    my (undef, $line) = split /\r\n/, $body, 2;
+    is $line, join(',', @expected_csv) . "\r\n", 'CSV cells follow the certified export rules';
+    for my $index (0 .. $#cells) {
+        my $cell = decode('UTF-8', Selecto::API::ResultFormatter->encode_result('csv', {
+            columns => ['c'], rows => [[$cells[$index]]],
+        }));
+        is $cell, "c\r\n$expected_csv[$index]\r\n", "CSV cell $index";
+    }
+
+    my $tsv = decode('UTF-8', Selecto::API::ResultFormatter->encode_result('tsv', {
+        columns => ['id', 'unit price', 'montant €', '-delta'],
+        rows => [[1, 'a,b', '=A1,B1', 'two words'], [2, "tab\there", '  -padded', 'Renée']],
+    }));
+    is $tsv, join('', "id\tunit price\t\"montant €\"\t'-delta\r\n",
+        "1\ta,b\t'=A1,B1\ttwo words\r\n",
+        "2\t\"tab\there\"\t'  -padded\t\"Renée\"\r\n"),
+        'TSV quotes for tabs and non-ASCII but not commas or spaces; headers follow the cell rules';
+
+    is decode('UTF-8', Selecto::API::ResultFormatter->encode_result('csv', {
+        columns => ['id', 'name'], rows => [],
+    })), "id,name\r\n", 'an empty result exports the header row alone';
+}
 
 my $xlsx = Selecto::API::ResultFormatter->encode_result('xlsx', $result);
 is substr($xlsx, 0, 2), 'PK', 'XLSX output is an Office Open XML zip archive';

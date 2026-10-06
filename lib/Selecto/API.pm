@@ -615,9 +615,13 @@ handler result produces a 500 C<non_canonical_value>.
 
 Query responses default to JSON. Pass the C<Accept> header as C<accept>, or
 an explicit C<?format=> value as C<response_format> (which wins), to get
-C<csv>, C<tsv> or C<xlsx>. CSV and TSV start with a header row, encode nested
-subtables as JSON cells and guard formula-leading values; XLSX writes text
-as strings, never formulas. Other routes answer only JSON (406
+C<csv>, C<tsv> or C<xlsx>. CSV and TSV start with a header row, end every
+row with CRLF and encode nested values as canonical JSON cells. A cell that
+starts with a tab, CR or LF, or with C<=>, C<+>, C<-> or C<@> after any
+leading whitespace, gets a leading C<'>; a cell is quoted when it contains
+the separator, a quote, a tab, CR, LF or any non-ASCII character (never for
+a space alone). These are the certified C<api_export_rules>. XLSX writes text as strings, never
+formulas. Other routes answer only JSON (406
 C<response_format_not_acceptable>). C<download_filename> must be a safe
 basename of at most 160 characters ending in the format's extension.
 

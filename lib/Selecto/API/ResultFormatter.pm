@@ -12,7 +12,18 @@ use Scalar::Util qw(blessed looks_like_number);
 use Selecto::Error ();
 use Selecto::Limits ();
 use Selecto::OperationBudget ();
-use Text::CSV ();
+
+# A delimited cell is quoted (after doubling its quotes) when it contains the
+# separator, a quote, a tab, CR, LF or any non-ASCII character. A space alone
+# never quotes a cell, and a comma does not quote a TSV cell.
+my $QUOTE_CSV = qr/[,"\t\r\n]|[^\x00-\x7f]/;
+my $QUOTE_TSV = qr/["\t\r\n]|[^\x00-\x7f]/;
+# A cell that starts with a tab, CR or LF, or whose text after any leading
+# Unicode White_Space starts with =, +, - or @, gets a leading "'" (before
+# the whitespace). Negative numbers and headers are neutralized too.
+# Canonical JSON text of a nested cell (sorted keys, characters unescaped).
+my $CELL_JSON = JSON::PP->new->canonical(1)->allow_nonref(1)->utf8(0);
+my $FORMULA_LEAD = qr/\A(?:[\t\r\n]|\p{White_Space}*[=+\-@])/;
 
 my %FORMAT = (
     json => {
@@ -200,28 +211,26 @@ sub _tabular_result ($result) {
     return (\@columns, \@rows);
 }
 
+# One CRLF-terminated line per row, the header row first. Each cell is the
+# canonical cell text (_flat_value), neutralized by $FORMULA_LEAD and quoted by
+# the separator's quote rule: the rules of the cross-runtime reference encoder
+# certified by api_export_rules.
 sub _delimited ($columns, $rows, $separator, $limits) {
-    my $csv = Text::CSV->new({
-        binary => 1,
-        sep_char => $separator,
-    }) or Selecto::Error->throw(
-        'response_encoding_failed', 'could not initialize the delimited response writer',
-    );
+    my $quote = $separator eq ',' ? $QUOTE_CSV : $QUOTE_TSV;
     my $output = '';
-    my $append = sub {
-        my $line = encode('UTF-8', $csv->string . "\r\n");
+    my $append = sub ($cells) {
+        # The per-cell hot path: plain scalars skip _flat_value.
+        # Every '"' quotes its cell, so quotes are doubled only in quoted cells.
+        my $line = encode('UTF-8', join($separator, map {
+            my $text = !defined($_) ? '' : ref($_) ? _flat_value($_) : "$_";
+            $text = "'$text" if $text =~ $FORMULA_LEAD;
+            $text =~ $quote ? '"' . ($text =~ s/"/""/gr) . '"' : $text;
+        } @$cells) . "\r\n");
         $limits->check_count('max_response_bytes', length($output) + length($line),
             'api_result_limit_exceeded', 'encoded response bytes');
         $output .= $line;
     };
-    $csv->combine(map { _spreadsheet_safe($_) } @$columns)
-        or Selecto::Error->throw('response_encoding_failed', 'could not encode delimited headings');
-    $append->();
-    for my $row (@$rows) {
-        $csv->combine(map { _spreadsheet_safe(_flat_value($_)) } @$row)
-            or Selecto::Error->throw('response_encoding_failed', 'could not encode a delimited row');
-        $append->();
-    }
+    $append->($_) for $columns, @$rows;
     return $output;
 }
 
@@ -312,16 +321,8 @@ sub _flat_value ($value) {
     return '' unless defined $value;
     return $value ? 'true' : 'false'
         if blessed($value) && JSON::PP::is_bool($value);
-    return JSON::PP->new->canonical(1)->allow_nonref(1)->utf8(0)->encode($value)
-        if ref($value);
+    return $CELL_JSON->encode($value) if ref($value);
     return "$value";
-}
-
-sub _spreadsheet_safe ($value) {
-    $value = '' unless defined $value;
-    $value = "$value";
-    return "'$value" if $value =~ /\A[=+\-@\t\r\n]/;
-    return $value;
 }
 
 sub _native_number ($value) {
