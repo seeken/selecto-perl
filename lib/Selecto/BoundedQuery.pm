@@ -98,9 +98,9 @@ sub execute {
     my $budget = $class->result_budget($limits);
     my $ok = eval {
         $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
-        $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => 1);
+        $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows));
         while (my $row = $stream->next) {
-            $deadline->check;
+            $deadline->check(defer_rearm => 1);
             Selecto::Error->throw('result_limit_exceeded', 'Result exceeds its transfer limit')
                 unless @$row == @columns + 1 && !pop(@$row);
             Selecto::Error->throw('result_limit_exceeded', 'Result row limit exceeded') if @rows >= $max_rows;
@@ -115,6 +115,12 @@ sub execute {
     die $error unless $ok && !$error;
     return {columns => \@columns, rows => \@rows};
 }
+
+# Rows per database round trip: the whole result when it fits (max_rows plus
+# the one row that detects excess), otherwise batches of FETCH_ROWS. Every cell
+# is already capped by the transfer guard, so a batch is bounded too.
+use constant FETCH_ROWS => 100;
+sub fetch_rows { my ($max_rows) = @_; return $max_rows + 1 < FETCH_ROWS ? $max_rows + 1 : FETCH_ROWS; }
 
 sub result_budget {
     my ($class, $limits) = @_;
@@ -203,6 +209,9 @@ Selecto::BoundedQuery - finite ordinary result execution for untrusted surfaces
 
 Intersects host limits with the engine limits, bounds PostgreSQL child
 collections before JSON aggregation, and consumes one guarded row at a time.
+It fetches C<min(max_rows + 1, 100)> guarded rows per database round trip,
+so an ordinary page is a single fetch; each row is admitted as it is handed
+out.
 The concrete materialization guards require PostgreSQL 12 or newer, or SQLite
 3.35 or newer. The adapter must implement C<bounded_result_statement>, bounded streaming and
 a database deadline. PostgreSQL and SQLite transfer guards suppress a cell

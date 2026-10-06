@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use Scalar::Util qw(blessed);
 use Selecto;
+use Selecto::Statement;
 
 subtest 'SQLite enforces execution time and restores host settings' => sub {
     plan skip_all => 'SQLite driver unavailable' unless eval { require DBI; require DBD::SQLite; 1 };
@@ -60,6 +61,38 @@ subtest 'PostgreSQL server timeout bounds blocking execution' => sub {
     $ok=eval{$dbh->do('SELECT pg_sleep(0.10)');1};
     ok !$ok,'second blocking operation cannot restart the original budget';
     $guard->close;
+
+    # Deferred re-arm: per-row checks between buffered rows send nothing; the
+    # stream refreshes the server timeout right before its next FETCH.
+    $dbh->do(q{SET statement_timeout=0});
+    my $timeout=sub {($dbh->selectrow_array(q{SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'}))[0]};
+    $guard=$adapter->begin_query_budget(timeout_ms=>5000);
+    my $armed=$timeout->();
+    my $stream=$adapter->stream_query(Selecto::Statement->new(sql=>'SELECT n FROM generate_series(1,6) n',params=>[],
+        columns=>['n'],adapter_name=>'postgresql'),bounded=>1,fetch_size=>3);
+    is_deeply $stream->next,[1],'first row of the first batch';
+    select undef,undef,undef,0.05;
+    ok $guard->check(defer_rearm=>1),'deferred check passes the wall deadline';
+    is $timeout->(),$armed,'deferred check leaves the server timeout untouched';
+    $stream->next for 1..2;
+    is $timeout->(),$armed,'buffered rows need no re-arm';
+    is_deeply $stream->next,[4],'next batch fetched';
+    cmp_ok $timeout->(),'<',$armed,'re-armed with the remaining budget right before the FETCH';
+    $stream->close;
+    $guard->close;
+
+    $guard=$adapter->begin_query_budget(timeout_ms=>60);
+    $stream=$adapter->stream_query(Selecto::Statement->new(sql=>'SELECT n FROM generate_series(1,4) n',params=>[],
+        columns=>['n'],adapter_name=>'postgresql'),bounded=>1,fetch_size=>2);
+    $stream->next;
+    $guard->check(defer_rearm=>1);
+    select undef,undef,undef,0.08;
+    $stream->next;
+    $ok=eval{$stream->next;1};
+    is $ok ? 'ok' : $@->code,'query_budget_exceeded','an expired deadline stops the next FETCH';
+    ok $stream->closed,'the stream closes when its deadline expires';
+    $guard->close;
+    is(($dbh->selectrow_array(q{SHOW statement_timeout}))[0], '0', 'host timeout restored after deferred re-arm');
     $dbh->disconnect;
 };
 done_testing;
