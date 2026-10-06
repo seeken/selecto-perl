@@ -136,7 +136,14 @@ sub compile {
         ->consume_parameters($statement->params, label => 'statement parameter');
     return $statement;
 }
-sub all     { my ($self, $query) = @_; return $self->{adapter}->execute_query($self->compile($query)); }
+sub all {
+    my ($self, $query, %options) = @_;
+    return $self->{adapter}->execute_query($self->compile($query)) unless $options{export_scalars};
+    # Export scalars are opt-in: only adapters that provide them may be asked.
+    Selecto::Error->throw('unsupported_feature', 'configured adapter does not provide export scalars')
+        unless $self->{adapter}->supports('export_scalars');
+    return $self->{adapter}->execute_query($self->compile($query), export_scalars => 1);
+}
 
 # The domain reads compile against. An engine holding a trusted tenant scopes
 # every read of a tenant_field domain to that tenant, as it already scopes
@@ -1498,6 +1505,17 @@ Returns a new empty L<Selecto::Query>.
 Compiles and executes the query and returns every row. Values are
 normalized by the adapter (integers as numbers, exact decimals without
 trailing zeros, timestamps in ISO form).
+
+With C<< export_scalars => 1 >> (C<< $engine->all($query, export_scalars => 1) >>)
+the rows hold canonical export scalars instead: exact decimals keep the
+column's scale as the database writes them (C<533.10>, C<7152.00>,
+C<0.0000>), booleans are L<JSON::PP> booleans, and JSON columns are decoded
+JSON values. Integers, text, dates (C<YYYY-MM-DD>) and timestamps
+(C<YYYY-MM-DDTHH:MM:SS>) are the same as without it. Exports
+(L<Selecto::API::ResultFormatter>) use these values. Only adapters that
+support C<export_scalars> accept it (the PostgreSQL adapter does); others
+throw C<unsupported_feature>. Without the option C<all> returns exactly what
+it always has.
 
 C<all> applies the domain's required predicate and the engine's tenant, but
 it does not require a tenant boundary: it is meant for trusted host code,

@@ -411,7 +411,10 @@ a finite temporary-file budget before generation. CSV and TSV cells follow the
 certified cross-runtime export rules: a cell is quoted only for the separator, a
 quote, tab, CR, LF or non-ASCII text (not for spaces), and a formula lead
 (`=`, `+`, `-`, `@`, also after leading whitespace, and on negative numbers) gets
-a leading `'`. Set `limits => $limits` on the
+a leading `'`. To export decimals at their column scale (`533.10`, not `533.1`),
+JSON booleans and decoded JSON columns, call
+`$handler->query($engine, $body, export_scalars => 1)` in the query handler that
+serves exports; normal query results are unchanged. Set `limits => $limits` on the
 API host and handler. The built-in handler carries any tighter engine limits into
 the final encoding step; custom handlers use the API host policy.
 For a ready-made

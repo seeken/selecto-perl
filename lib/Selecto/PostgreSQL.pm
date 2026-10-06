@@ -1,6 +1,8 @@
 package Selecto::PostgreSQL;
 
 use Mojo::Base 'Selecto::SQL';
+use JSON::PP ();
+use Mojo::JSON ();
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::Expression ();
@@ -187,7 +189,20 @@ sub supports {
         || "$feature" eq 'stream' || "$feature" eq 'projection_sum'
         || "$feature" eq 'row_locks' || "$feature" eq 'value_expressions'
         || "$feature" eq 'json_text' || "$feature" eq 'array_rowset'
-        || "$feature" eq 'array_predicates' || "$feature" eq 'json_contains' ? 1 : 0;
+        || "$feature" eq 'array_predicates' || "$feature" eq 'json_contains'
+        || "$feature" eq 'export_scalars' ? 1 : 0;
+}
+
+# export_scalars => 1 asks for canonical export scalars: NUMERIC keeps the
+# text PostgreSQL writes for it (plain notation at the column's scale), a
+# boolean is a JSON::PP boolean and json/jsonb is the decoded JSON value.
+# Every other value, and every result without the option, is decoded exactly
+# as before.
+sub execute_query {
+    my ($self, $statement, %options) = @_;
+    return $self->SUPER::execute_query($statement) unless $options{export_scalars};
+    local $self->{_selecto_export_scalars} = 1;
+    return $self->SUPER::execute_query($statement);
 }
 
 my %ARRAY_SQL_TYPE = (
@@ -664,6 +679,8 @@ sub _decode {
     my ($self, $value, $type) = @_;
     return undef unless defined $value;
     $type //= '';
+    return _export_scalar($value, $type)
+        if $self->{_selecto_export_scalars} && $type =~ /\A(?:numeric|bool|json|jsonb)\z/;
     return ($value eq 't' || "$value" eq '1') ? 1 : 0 if $type eq 'bool';
     return int($value) if $type =~ /\A(?:int2|int4|int8)\z/ && "$value" =~ /\A-?\d+\z/;
     if ($type =~ /\A(?:numeric|float4|float8)\z/) {
@@ -688,9 +705,14 @@ sub _decode_rows {
     my ($self, $rows, $types) = @_;
     return $self->SUPER::_decode_rows($rows, $types)
         unless $self->can('_decode') == \&_decode;
+    my $export = $self->{_selecto_export_scalars};
     for my $i (0 .. $#$types) {
         my $type = $types->[$i] // '';
-        if ($type eq 'bool') {
+        if ($export && $type =~ /\A(?:numeric|bool|json|jsonb)\z/) {
+            for my $row (@$rows) {
+                $row->[$i] = _export_scalar($row->[$i], $type) if defined $row->[$i];
+            }
+        } elsif ($type eq 'bool') {
             for my $row (@$rows) {
                 my $value = $row->[$i];
                 $row->[$i] = ($value eq 't' || "$value" eq '1') ? 1 : 0 if defined $value;
@@ -733,6 +755,17 @@ sub _decode_rows {
         }
     }
     return;
+}
+
+# One canonical export scalar for a NUMERIC, boolean or JSON cell. JSON text
+# is decoded with Mojo::JSON (JSON::PP::Boolean booleans, as JSON::PP gives),
+# which is several times faster than JSON::PP on wide exports.
+sub _export_scalar {
+    my ($value, $type) = @_;
+    return "$value" if $type eq 'numeric';
+    return ($value eq 't' || "$value" eq '1') ? JSON::PP::true : JSON::PP::false if $type eq 'bool';
+    return $value if ref $value;
+    return Mojo::JSON::from_json("$value");
 }
 
 # A raw BEGIN leaves AutoCommit on, but the server still reports the
@@ -788,6 +821,18 @@ For bounded result buffering, pass C<< bounded => 1 >> to C<stream>. A real
 DBD::Pg handle then uses a server cursor, not a C<RowCacheSize> hint, and
 buffers at most C<fetch_size> rows (default 1) per round trip. See
 L<Selecto::PostgreSQL::Stream> for transaction ownership and cleanup rules.
+
+=head1 EXPORT SCALARS
+
+C<< $engine->all($query, export_scalars => 1) >> returns canonical export
+scalars for API exports: a NUMERIC is the text PostgreSQL writes for it,
+which is plain notation at the column's scale (C<533.10>, C<7152.00>,
+C<-0.0001>, C<42> for C<NUMERIC(10,0)>); a boolean is C<JSON::PP::true> or
+C<JSON::PP::false>; C<json> and C<jsonb> are decoded JSON values. Integers,
+text, C<DATE> (C<YYYY-MM-DD>), C<TIMESTAMP> (C<YYYY-MM-DDTHH:MM:SS>) and
+floats are decoded as without the option. Without it, results are unchanged:
+decimals lose trailing zeros (C<533.1>), booleans are C<1> or C<0> and JSON
+columns are text.
 
 =head1 ATTRIBUTES
 

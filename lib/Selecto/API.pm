@@ -620,7 +620,9 @@ row with CRLF and encode nested values as canonical JSON cells. A cell that
 starts with a tab, CR or LF, or with C<=>, C<+>, C<-> or C<@> after any
 leading whitespace, gets a leading C<'>; a cell is quoted when it contains
 the separator, a quote, a tab, CR, LF or any non-ASCII character (never for
-a space alone). These are the certified C<api_export_rules>. XLSX writes text as strings, never
+a space alone). These are the certified C<api_export_rules>. For decimals at
+their column scale, have the query handler pass C<< export_scalars => 1 >> to
+L<Selecto::API::EngineHandler/query>. XLSX writes text as strings, never
 formulas. Other routes answer only JSON (406
 C<response_format_not_acceptable>). C<download_filename> must be a safe
 basename of at most 160 characters ending in the format's extension.
