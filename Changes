@@ -1,6 +1,22 @@
 Revision history for Selecto
 
 Unreleased
+    - Queries that name a hidden field are refused as hidden_field (403
+      through Selecto::API), as in the other runtimes. Changed responses,
+      all from EngineHandler->query: a select entry (plain, object or
+      subtable), projection, view, segment, view segment, named ordering,
+      view ordering, order_by or filter that reaches an internal or
+      redact_fields field used to fail with field_not_public and now fails
+      with hidden_field (details {field}; message "Field is not exposed.");
+      through Selecto::API a handler error without a status now answers
+      hidden_field with 403 instead of 422 (new Selecto::API::error_status).
+      Within select, an unknown field or another invalid entry is now
+      reported before a hidden one, and no type or association check runs
+      on a hidden field (a date format on a hidden text field is now
+      hidden_field, not invalid_api_query). Unchanged: unknown fields
+      (unknown_field), write assignments, write filters and returning
+      fields (field_not_public), conditional choice filters reading
+      internal fields (field_not_public), every other code and status.
     - CSV and TSV exports follow the certified cross-runtime cell rules
       (api_export_rules) instead of Text::CSV's defaults. Changed export
       bytes: a cell is no longer quoted for a space alone ("two words",

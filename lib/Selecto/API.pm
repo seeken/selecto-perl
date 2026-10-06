@@ -218,7 +218,7 @@ sub _dispatch ($self, $operation, $params, $body, $request, $handlers) {
     return _error_response(422, 'api_result_limit_exceeded', 'The response exceeds its resource limit')
         unless eval { Selecto::API::ResponsePolicy->check_json($response, $self->limits); 1 };
     return _error_response(
-        _error_integer($error, 'status', 422),
+        _error_integer($error, 'status', error_status($code)),
         $code,
         $debug ? _error_string($error, 'message', 'Canonical API operation rejected')
             : 'Canonical API operation rejected',
@@ -303,6 +303,12 @@ sub _download_filename ($name, $extension) {
     $name =~ s/\A-+|-+\z//g;
     $name = 'selecto' unless length $name;
     return "$name-query.$extension";
+}
+
+# The HTTP status for a handler error that names none: a query naming a hidden
+# (internal or redacted) field is forbidden, every other refusal is 422.
+sub error_status ($code) {
+    return defined($code) && !ref($code) && $code eq 'hidden_field' ? 403 : 422;
 }
 
 sub canonical_json ($value) {
@@ -590,9 +596,10 @@ Routes the request and returns C<< {status => ..., headers => {...}, body => $by
 The body is UTF-8 encoded bytes; C<content-length> is exact.
 
 A handler returns C<['ok', $data]> or C<['error', \%error]>, where
-C<%error> may contain C<status> (default 422), C<code>, C<message> and
-C<details>. If a handler dies, the response is a 500 C<handler_failed>
-without the exception text, so convert expected L<Selecto::Error>s into
+C<%error> may contain C<status> (default L</error_status> of the code: 403
+for C<hidden_field>, otherwise 422), C<code>, C<message> and C<details>.
+If a handler dies, the response is a 500 C<handler_failed> without the
+exception text, so convert expected L<Selecto::Error>s into
 C<['error', ...]> yourself:
 
   my $guard = sub {
@@ -601,7 +608,7 @@ C<['error', ...]> yourself:
       return ['ok', $data] unless $@;
       my $e = $@;
       die $e unless blessed($e) && $e->isa('Selecto::Error');
-      return ['error', {status => 422, code => $e->code,
+      return ['error', {status => Selecto::API::error_status($e->code), code => $e->code,
           message => $e->message, details => $e->details}];
   };
 
@@ -631,6 +638,15 @@ basename of at most 160 characters ending in the format's extension.
 
 The generated OpenAPI document and the API manifest (domain identity and
 route list).
+
+=head2 error_status
+
+  my $status = Selecto::API::error_status($code);
+
+A function (not a method) that returns the HTTP status for a refusal code:
+403 for C<hidden_field> (a query names a field the domain withholds), 422
+for every other code. L</request> uses it when a handler error has no
+C<status>.
 
 =head2 canonical_json
 

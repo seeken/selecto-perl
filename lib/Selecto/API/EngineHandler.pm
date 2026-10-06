@@ -325,7 +325,7 @@ sub query ($self, $engine, $body, %options) {
         # Segments are not permission to filter on an internal field either:
         # with a parameter, a caller could probe its value. They are the only
         # predicate so far (the required predicate is added when compiling).
-        _public_field_definition($domain, $_) for Selecto::Expression->field_references($query->predicate);
+        _visible_field_definition($domain, $_) for Selecto::Expression->field_references($query->predicate);
     } elsif (keys %$parameters) {
         Selecto::Error->throw(
             'invalid_api_query',
@@ -347,7 +347,7 @@ sub query ($self, $engine, $body, %options) {
     if (defined $named_ordering) {
         my $ordering = _required_string($named_ordering, 'ordering');
         # Sorting by an internal field would reveal its order.
-        _public_field_definition($domain, $_->[0])
+        _visible_field_definition($domain, $_->[0])
             for @{Selecto::QueryLibrary->ordering_entries($domain, $ordering)};
         $query = $engine->apply_ordering($query, $ordering);
     } elsif (exists $body->{order_by}) {
@@ -366,7 +366,7 @@ sub query ($self, $engine, $body, %options) {
             Selecto::Error->throw(
                 'invalid_api_query', 'order_by direction must be asc or desc',
             ) unless $direction eq 'asc' || $direction eq 'desc';
-            _public_field_definition($domain, $field);
+            _visible_field_definition($domain, $field);
             $query = $query->order_by($field, $direction);
         }
     }
@@ -845,7 +845,7 @@ sub _filters ($self, $domain, $filters) {
             ]);
             next;
         }
-        my $definition = _public_field_definition($domain, $field);
+        my $definition = _visible_field_definition($domain, $field);
         my $operand = $definition->{type} eq 'epoch_datetime'
             ? Selecto::Expression->epoch_datetime($field)
             : Selecto::Expression->field($field);
@@ -927,6 +927,19 @@ sub _public_field_definition ($domain, $field) {
     return $definition;
 }
 
+# A query that names, or reaches through the query library, an existing field
+# the domain withholds is refused as hidden_field (403 through Selecto::API,
+# as in the other runtimes). An unknown field still fails in resolve first.
+sub _visible_field_definition ($domain, $field) {
+    my $definition = $domain->resolve($field);
+    _throw_hidden_field($field) unless $domain->field_is_public($field);
+    return $definition;
+}
+
+sub _throw_hidden_field ($field) {
+    Selecto::Error->throw('hidden_field', 'Field is not exposed.', {field => "$field"});
+}
+
 sub _object ($value, $label) {
     Selecto::Error->throw('invalid_api_query', "$label must be an object")
         unless ref($value) eq 'HASH';
@@ -954,12 +967,13 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
         unless ref($value) eq 'ARRAY';
     Selecto::Error->throw('invalid_api_query', 'select must not be empty')
         unless @$value;
-    my (@expressions, @subtables, %column_names);
+    my (@expressions, @subtables, %column_names, @hidden);
     my $field_count = 0;
     for my $entry (@$value) {
         if (ref($entry) ne 'ARRAY') {
-            my $selection = _api_selection_entry($domain, $entry, 'select entry');
+            my $selection = _api_selection_entry($domain, $entry, 'select entry', \@hidden);
             $field_count++;
+            next unless $selection;
             Selecto::Error->throw(
                 'invalid_api_query',
                 'select entries produce duplicate result column names; provide distinct aliases',
@@ -978,9 +992,10 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
                 'invalid_api_query', 'subtable selections cannot contain another array',
             ) if ref($nested_entry) eq 'ARRAY';
             my $selection = _api_selection_entry(
-                $domain, $nested_entry, 'subtable select entry',
+                $domain, $nested_entry, 'subtable select entry', \@hidden,
             );
             $field_count++;
+            next unless $selection;
             my $definition = $selection->{definition};
             Selecto::Error->throw(
                 'invalid_api_query',
@@ -1008,6 +1023,7 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
                     ? (stringify => 1) : ()),
             };
         }
+        next unless defined $association; # every field in it is hidden
         Selecto::Error->throw(
             'invalid_api_query',
             'a subtable association collides with another result column',
@@ -1030,13 +1046,16 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
     }
     Selecto::Error->throw('invalid_api_query', 'Too many select entries')
         if $field_count > $maximum;
+    # As in the reference handler, every other selection error (an unknown
+    # field, an invalid entry) takes precedence over a hidden field.
+    _throw_hidden_field($hidden[0]) if @hidden;
     return {
         expressions => \@expressions,
         subtables => \@subtables,
     };
 }
 
-sub _api_selection_entry ($domain, $entry, $label) {
+sub _api_selection_entry ($domain, $entry, $label, $hidden) {
     my ($field, $alias, $format);
     if (ref($entry) eq 'HASH') {
         _reject_unknown($entry, [qw(field alias format)], $label);
@@ -1058,7 +1077,13 @@ sub _api_selection_entry ($domain, $entry, $label) {
     } else {
         $field = _required_string($entry, $label);
     }
-    my $definition = _public_field_definition($domain, $field);
+    my $definition = $domain->resolve($field);
+    # Nothing about a hidden field (its type, its association) is checked or
+    # reported; the caller refuses it once the other entries are validated.
+    unless ($domain->field_is_public($field)) {
+        push @$hidden, $field;
+        return undef;
+    }
     Selecto::Error->throw(
         'invalid_api_query', 'select format requires a date or time field',
         {field => $field, format => $format},
@@ -1221,12 +1246,18 @@ required scope and restriction, and the handler validates every field,
 operator and query-library name against that engine's domain.
 
 Only public fields are accepted. Columns marked C<internal> and fields
-listed in C<redact_fields> cannot be selected, filtered, ordered, assigned
-or returned (C<field_not_public>), at any association depth. Query-library
-names are no exception: a requested segment (or a view's segment) that reads
-such a field, or an ordering that sorts by one, fails the same way. A
+listed in C<redact_fields> cannot be selected, filtered or ordered by a
+query (C<hidden_field>, details C<field>), nor assigned or returned by a
+write (C<field_not_public>), at any association depth. Query-library names
+are no exception: a projection or view that selects such a field, a
+requested segment (or a view's segment) that reads one, or an ordering that
+sorts by one, fails the same way. A field that does not exist fails first
+(C<unknown_field>); within C<select>, every other selection error is
+reported before a hidden field. Through L<Selecto::API>, C<hidden_field>
+answers 403 (see L<Selecto::API/error_status>). A
 C<components.filter_choices> conditional filter whose fields are not all
-public accepts only its declared choice values and no null test. Trusted
+public accepts only its declared choice values and no null test
+(C<field_not_public>). Trusted
 host code, the domain's required predicate and C<required_order_by> can
 still use withheld fields directly through the engine.
 
@@ -1386,8 +1417,9 @@ object's OpenAPI document.
 
 =head1 ERRORS
 
-C<invalid_api_query>, C<invalid_api_write>, C<field_not_public>,
-C<missing_tenant_scope>, plus any engine or query-library error.
+C<invalid_api_query>, C<invalid_api_write>, C<hidden_field>,
+C<field_not_public>, C<missing_tenant_scope>, plus any engine or
+query-library error.
 
 =head1 SEE ALSO
 
