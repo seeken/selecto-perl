@@ -697,8 +697,19 @@ sub _decode_rows {
             }
         } elsif ($type eq 'int2' || $type eq 'int4' || $type eq 'int8') {
             for my $row (@$rows) {
-                my $value = $row->[$i];
-                $row->[$i] = int($value) if defined($value) && "$value" =~ /\A-?\d+\z/;
+                next unless defined(my $value = $row->[$i]);
+                if (ref $value) {
+                    $row->[$i] = int($value) if "$value" =~ /\A-?\d+\z/;
+                    next;
+                }
+                # $value is a private copy, so reading it as a string reads
+                # what "$value" would. A non-empty run of ASCII digits (what
+                # DBD::Pg's integers stringify to) matches /\A-?\d+\z/
+                # without starting the regex engine; anything else asks the
+                # regex itself.
+                $row->[$i] = int($value)
+                    if (($value =~ tr/0-9//) == length($value) && length($value))
+                    || $value =~ /\A-?\d+\z/;
             }
         } elsif ($type eq 'numeric' || $type eq 'float4' || $type eq 'float8') {
             for my $row (@$rows) {
@@ -713,7 +724,10 @@ sub _decode_rows {
                 next unless defined(my $value = $row->[$i]);
                 my $normalized = "$value";
                 $normalized =~ tr/ /T/;
-                $normalized =~ s/(?:\.0+)?(?:\+00(?::00)?|Z)\z//;
+                # The suffix pattern cannot match without a '+' or a 'Z', and
+                # its alternation defeats the regex optimizer, so a value
+                # holding neither (a timestamp without time zone) skips it.
+                $normalized =~ s/(?:\.0+)?(?:\+00(?::00)?|Z)\z// if $normalized =~ tr/+Z//;
                 $row->[$i] = $normalized;
             }
         }
