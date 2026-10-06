@@ -87,6 +87,7 @@ t/co_domain.t
 t/computed_coalesce.t
 t/data_rules.t
 t/date_shortcut.t
+t/decode_rows.t
 t/document_contract.t
 t/domain.t
 t/domain_overlay.t

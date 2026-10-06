@@ -128,6 +128,14 @@ sub fetchrow_array {
     return if $self->{index} >= @$rows;
     return @{$rows->[$self->{index}++]};
 }
+# Like DBI, every fetched row is a fresh array the caller may modify.
+sub fetchall_arrayref {
+    my ($self) = @_;
+    my $rows = $self->{spec}{rows} // [];
+    my @remaining = map { [@$_] } @{$rows}[$self->{index} .. $#$rows];
+    $self->{index} = @$rows;
+    return \@remaining;
+}
 sub rows   { return $_[0]->{spec}{affected} // scalar(@{$_[0]->{spec}{rows} // []}); }
 sub err    { return defined($_[0]->{errstr}) ? 1 : undef; }
 sub errstr { return $_[0]->{errstr}; }

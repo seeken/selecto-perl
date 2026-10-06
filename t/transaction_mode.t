@@ -187,6 +187,7 @@ package RecordingSTH {
     }
     sub rows { return $_[0]{rows}; }
     sub fetchrow_array { return; }
+    sub fetchall_arrayref { return []; }
     sub err { return undef; }
     sub errstr { return undef; }
 }

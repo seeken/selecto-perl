@@ -791,18 +791,29 @@ sub _single_rollup_grouping_position {
 
 sub execute_query {
     my ($self, $statement) = @_;
-    my ($sth, @rows);
+    my ($sth, $rows);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
         $self->_execute_statement($sth, $statement->params);
         my @types = $self->_column_types($sth);
-        while (my @row = $sth->fetchrow_array) {
-            push @rows, [map { $self->_decode($row[$_], $types[$_]) } 0 .. $#row];
-        }
+        $rows = $sth->fetchall_arrayref;
+        $self->_decode_rows($rows, \@types);
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    return { columns => $statement->columns, rows => \@rows };
+    return { columns => $statement->columns, rows => $rows };
+}
+
+# Decodes fetched rows in place, cell for cell as _decode would. An adapter
+# whose _decode is the identity skips the walk entirely; adapters may
+# override this with a column-wise version that gives the same results.
+sub _decode_rows {
+    my ($self, $rows, $types) = @_;
+    return if $self->can('_decode') == \&_decode;
+    for my $row (@$rows) {
+        $row->[$_] = $self->_decode($row->[$_], $types->[$_]) for 0 .. $#$row;
+    }
+    return;
 }
 
 sub bounded_stream_supported {

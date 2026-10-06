@@ -680,6 +680,45 @@ sub _decode {
     return $value;
 }
 
+# Column-wise _decode: the type branch is chosen once per column rather than
+# once per cell, and each cell gets exactly the transformation _decode gives
+# it. A subclass that redefines _decode keeps the per-cell path.
+sub _decode_rows {
+    my ($self, $rows, $types) = @_;
+    return $self->SUPER::_decode_rows($rows, $types)
+        unless $self->can('_decode') == \&_decode;
+    for my $i (0 .. $#$types) {
+        my $type = $types->[$i] // '';
+        if ($type eq 'bool') {
+            for my $row (@$rows) {
+                my $value = $row->[$i];
+                $row->[$i] = ($value eq 't' || "$value" eq '1') ? 1 : 0 if defined $value;
+            }
+        } elsif ($type eq 'int2' || $type eq 'int4' || $type eq 'int8') {
+            for my $row (@$rows) {
+                my $value = $row->[$i];
+                $row->[$i] = int($value) if defined($value) && "$value" =~ /\A-?\d+\z/;
+            }
+        } elsif ($type eq 'numeric' || $type eq 'float4' || $type eq 'float8') {
+            for my $row (@$rows) {
+                next unless defined(my $value = $row->[$i]);
+                my $normalized = "$value";
+                $normalized =~ s/(\.\d*?)0+\z/$1/;
+                $normalized =~ s/\.\z//;
+                $row->[$i] = $normalized eq '-0' ? '0' : $normalized;
+            }
+        } elsif ($type eq 'timestamp' || $type eq 'timestamptz') {
+            for my $row (@$rows) {
+                next unless defined(my $value = $row->[$i]);
+                my $normalized = "$value";
+                $normalized =~ tr/ /T/;
+                $normalized =~ s/(?:\.0+)?(?:\+00(?::00)?|Z)\z//;
+                $row->[$i] = $normalized;
+            }
+        }
+    }
+    return;
+}
 
 # A raw BEGIN leaves AutoCommit on, but the server still reports the
 # transaction: pg_ping answers 3 (idle in a transaction) or 4 (in a failed

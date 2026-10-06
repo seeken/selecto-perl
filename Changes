@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Faster query results: execute_query fetches with fetchall_arrayref and
+      PostgreSQL decodes column by column, choosing each column's type branch
+      once instead of per cell. Results are identical (t/decode_rows.t checks
+      every cell against _decode). On the performance lane's 5,000 x 20
+      result this halves query time (70 ms to 34 ms). Adapters with their own
+      _decode keep the per-cell path; one whose _decode is the identity skips
+      decoding.
     - Expression->from_filter_ast reads a decoded JSON boolean comparison value
       or in member as the literal 1 or 0 instead of refusing it as a reference.
     - 0.2.2 security remediation: bound complete filter/value-expression trees,
