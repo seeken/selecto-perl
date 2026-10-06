@@ -59,6 +59,8 @@ sub next {
     my $rows;
     my $ok = eval {
         my $sth = $self->{sth};
+        require Selecto::QueryBudget;
+        Selecto::QueryBudget->before_blocking($self->{dbh});
         defined($sth->execute) or die 'cursor fetch failed';
         $self->{types} //= [$self->{adapter}->_column_types($sth)];
         $rows = $sth->fetchall_arrayref;

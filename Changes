@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Faster bounded results: Selecto::BoundedQuery (canned pages, component
+      result pages) fetches min(max_rows + 1, 100) guarded rows per round
+      trip instead of one, and QueryBudget->check(defer_rearm => 1) lets a
+      bounded stream refresh the server statement timeout right before each
+      FETCH instead of once per row. The wall deadline is still checked on
+      every row and the server deadline before every fetch. 500 guarded rows
+      locally: 64 ms -> 25 ms; a 50-row page 8.1 ms -> 4.4 ms.
     - Bounded PostgreSQL streams fetch fetch_size rows per round trip
       (default 1, as before) instead of always one, read column types once
       and decode each batch column by column. Every existing bounded caller

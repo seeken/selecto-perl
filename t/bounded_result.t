@@ -108,6 +108,30 @@ subtest 'PostgreSQL per-parent bounded aggregation and transfer' => sub {
     $dbh->do('UPDATE bounded_children SET label=? WHERE id=1',undef,'x'x100);
     assert_rejected(sub{Selecto::BoundedQuery->all($engine,$query,limits=>Selecto::Limits->new(max_result_cell_bytes=>64))},'large nested JSON suppressed before driver consumption');
     is $dbh->selectrow_array('SELECT 1'),1,'PG transaction usable after child/transfer failures';
+
+    # Batched fetching: min(max_rows + 1, 100) rows per round trip, with the
+    # row cap and the transfer guard still enforced row by row.
+    $dbh->do('CREATE TEMP TABLE bounded_page(id integer primary key,label text,amount numeric(10,2))');
+    $dbh->do(q{INSERT INTO bounded_page SELECT n,'row'||n,n/4.0 FROM generate_series(1,250) n});
+    my $page_engine=Selecto::Engine->new(domain=>Selecto::Domain->new(name=>'Page',table=>'bounded_page',
+        fields=>{id=>'integer',label=>'string',amount=>'decimal'}),adapter=>Selecto->adapter(postgresql=>(dbh=>$dbh)));
+    my $page=$page_engine->query->select('id','label','amount')->order_by('id');
+    my @fetch_sizes;
+    {
+        no warnings 'redefine';
+        my $original=\&Selecto::PostgreSQL::stream_query;
+        local *Selecto::PostgreSQL::stream_query=sub { my($self,$statement,%options)=@_; push @fetch_sizes,$options{fetch_size}; return $original->(@_) };
+        is_deeply(Selecto::BoundedQuery->all($page_engine,$page,max_rows=>1000)->{rows},$page_engine->all($page)->{rows},
+            'batched bounded rows equal ordinary execution, in order, across fetches');
+        is_deeply(Selecto::BoundedQuery->all($page_engine,$page->limit(50),max_rows=>50)->{rows},$page_engine->all($page->limit(50))->{rows},
+            'a page smaller than a batch is one fetch');
+        assert_rejected(sub{Selecto::BoundedQuery->all($page_engine,$page,max_rows=>120)},'row cap still detected inside a batch');
+        $dbh->do('UPDATE bounded_page SET label=? WHERE id=150',undef,'x'x200);
+        assert_rejected(sub{Selecto::BoundedQuery->all($page_engine,$page,max_rows=>1000,limits=>Selecto::Limits->new(max_result_cell_bytes=>64))},
+            'transfer guard still rejects an oversized cell inside a batch');
+    }
+    is_deeply(\@fetch_sizes,[100,51,100,100],'fetch size is min(max_rows + 1, 100)');
+    is $dbh->selectrow_array('SELECT 1'),1,'PG handle usable after batched bounded reads';
     my $sqlite=engine('sqlite',child_domain(),DBI->connect('dbi:SQLite:dbname=:memory:','','',{RaiseError=>1,PrintError=>0}));
     my $error=assert_rejected(sub{Selecto::BoundedQuery->prepare($sqlite,$query)},'unsupported bounded nested SQLite refuses before database prepare');
     is $error->code,'unsupported_feature','unsupported capability remains explicit';
