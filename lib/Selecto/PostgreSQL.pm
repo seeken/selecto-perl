@@ -29,7 +29,8 @@ sub stream_query {
     Selecto::Error->throw('invalid_stream', 'stream fetch size must be a positive integer')
         unless !ref($size) && "$size" =~ /\A[1-9]\d*\z/;
     require Selecto::PostgreSQL::Stream;
-    return Selecto::PostgreSQL::Stream->new(adapter => $self, statement => $statement);
+    return Selecto::PostgreSQL::Stream->new(adapter => $self, statement => $statement,
+        fetch_size => $size);
 }
 
 # The guard suppresses an oversized value on the server before DBI receives
@@ -770,7 +771,8 @@ row locks, streaming and projection sums. Writes support C<RETURNING> and
 write graphs.
 
 For bounded result buffering, pass C<< bounded => 1 >> to C<stream>. A real
-DBD::Pg handle then uses a server cursor, not a C<RowCacheSize> hint. See
+DBD::Pg handle then uses a server cursor, not a C<RowCacheSize> hint, and
+buffers at most C<fetch_size> rows (default 1) per round trip. See
 L<Selecto::PostgreSQL::Stream> for transaction ownership and cleanup rules.
 
 =head1 ATTRIBUTES

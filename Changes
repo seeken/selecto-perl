@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 Unreleased
+    - Bounded PostgreSQL streams fetch fetch_size rows per round trip
+      (default 1, as before) instead of always one, read column types once
+      and decode each batch column by column. Every existing bounded caller
+      passes fetch_size => 1, so nothing changes until a caller asks for more;
+      docs/security-boundaries.md describes the new bound.
     - Faster query results: execute_query fetches with fetchall_arrayref and
       PostgreSQL decodes column by column, choosing each column's type branch
       once instead of per cell. Results are identical (t/decode_rows.t checks
