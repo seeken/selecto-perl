@@ -216,7 +216,7 @@ sub write_command ($self, $engine, $body) {
     return $command;
 }
 
-sub query ($self, $engine, $body) {
+sub query ($self, $engine, $body, %options) {
     Selecto::Error->throw(
         'invalid_api_host', 'API query handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
@@ -397,7 +397,7 @@ sub query ($self, $engine, $body) {
     # to obtain validated column metadata; never execute that statement.
     my $result = $limit == 0
         ? {columns => $engine->compile($query->limit(1))->columns, rows => []}
-        : $engine->all($query);
+        : $engine->all($query, $options{export_scalars} ? (export_scalars => 1) : ());
     Selecto::Error->throw(
         'invalid_api_host', 'Selecto adapter returned an invalid result',
     ) unless ref($result) eq 'HASH'
@@ -1257,6 +1257,12 @@ Throws C<invalid_api_handler> for invalid limits.
 =head2 query
 
   my $data = $handler->query($engine, \%body);
+  my $data = $handler->query($engine, \%body, export_scalars => 1);
+
+With C<< export_scalars => 1 >> the rows hold the engine's canonical export
+scalars (see L<Selecto::Engine/all>): use it when the result will be
+exported as CSV, TSV or XLSX so decimals keep their column scale. Without
+it the result is unchanged.
 
 Body keys:
 

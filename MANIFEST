@@ -96,6 +96,7 @@ t/domain_registry.t
 t/duckdb.integration.t
 t/duckdb_result_transport.t
 t/epoch_timezone.t
+t/export_scalars.integration.t
 t/field_policy.t
 t/foreign_key_tenant_guard.t
 t/files.t

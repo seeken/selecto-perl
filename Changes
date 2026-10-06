@@ -13,6 +13,13 @@ Unreleased
       is now neutralized with a leading "'". Headers follow the same rules.
       Unchanged: separators, quotes, tab/CR/LF, leading =,+,-,@ and
       tab/CR/LF, nulls, booleans, numbers, nested JSON, CRLF row endings.
+    - Opt-in export scalars: Engine->all($query, export_scalars => 1) and
+      EngineHandler->query($engine, $body, export_scalars => 1) return
+      NUMERIC as PostgreSQL's text at the column scale ("533.10",
+      "7152.00", "0.0000"), booleans as JSON booleans and json/jsonb as
+      decoded values, for exports. Only the PostgreSQL adapter supports it;
+      other adapters refuse it (unsupported_feature). Without the option,
+      results are unchanged.
     - Faster large IN lists with the same SQL, parameters, limits and
       refusals: operation budgets admit a list of values in one pass (each
       value still checked in order, each maximum looked up once), recognise

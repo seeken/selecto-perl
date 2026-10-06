@@ -2,6 +2,7 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
+use JSON::PP ();
 use Selecto::MSSQL ();
 use Selecto::PostgreSQL ();
 use Selecto::SQL ();
@@ -72,6 +73,45 @@ subtest 'missing or short type lists leave values untouched, as _decode does' =>
     is_deeply(\@rows, [['12.50', 't', '2025-03-01 10:00:00']], 'no types');
     $adapter->_decode_rows(\@rows, ['numeric']);
     is_deeply(\@rows, [['12.5', 't', '2025-03-01 10:00:00']], 'only typed columns decode');
+};
+
+subtest 'export scalars keep NUMERIC scale, give JSON booleans and decode JSON' => sub {
+    my $plain = bless {}, 'Selecto::PostgreSQL';
+    my $export = bless {_selecto_export_scalars => 1}, 'Selecto::PostgreSQL';
+    # Without the option nothing changes: decimals lose trailing zeros,
+    # booleans are 1/0 and JSON stays text (pinned values).
+    is_deeply([map { $plain->_decode($_, 'numeric') } '533.10', '7152.00', '0.0000', '-0.50', '42', '-0.000'],
+        ['533.1', '7152', '0', '-0.5', '42', '0'], 'normal results still normalize decimals');
+    is_deeply([map { $plain->_decode($_, 'bool') } 't', 'f'], [1, 0], 'normal booleans are 1 and 0');
+    is($plain->_decode('{"a": [1, 2]}', 'jsonb'), '{"a": [1, 2]}', 'normal JSON stays text');
+
+    is_deeply([map { $export->_decode($_, 'numeric') } '533.10', '7152.00', '0.0000', '-0.50', '42', '-0.0001', 'NaN'],
+        ['533.10', '7152.00', '0.0000', '-0.50', '42', '-0.0001', 'NaN'], 'export decimals keep the database text');
+    ok(JSON::PP::is_bool($export->_decode('t', 'bool')) && $export->_decode('t', 'bool'), 'true');
+    ok(JSON::PP::is_bool($export->_decode('f', 'bool')) && !$export->_decode('f', 'bool'), 'false');
+    is_deeply($export->_decode(qq({"b": "\x{6771}\x{4eac}", "a": [1, 2]}), 'jsonb'), {a => [1, 2], b => "\x{6771}\x{4eac}"}, 'jsonb decoded');
+    is_deeply($export->_decode('[true, null]', 'json'), [JSON::PP::true, undef], 'json decoded');
+    for my $type (grep { !/\A(?:numeric|bool|json|jsonb)\z/ } @types) {
+        for my $value (@{$samples{$type}}) {
+            is(flavour($export->_decode($value, $type)), flavour($plain->_decode($value, $type)),
+                "export leaves $type " . (defined $value ? "'$value'" : 'undef') . ' as before');
+        }
+    }
+
+    my @export_types = qw(numeric bool jsonb json int4 timestamp date float8 text);
+    my @raw = (
+        ['533.10', 't', '{"k": 1}', '[]', '7', '2025-05-31 00:00:00', '2025-05-31', '1.50', 'x'],
+        ['-0.0001', 'f', 'null', '{"a": {"b": null}}', undef, '2024-02-29 13:45:07', undef, undef, undef],
+        [undef, undef, undef, undef, '-4', undef, '1999-12-31', '-0', ''],
+    );
+    my @per_cell = map { my $row = $_; [map { $export->_decode($row->[$_], $export_types[$_]) } 0 .. $#export_types] } @raw;
+    my @decoded = map { [@$_] } @raw;
+    $export->_decode_rows(\@decoded, \@export_types);
+    is(JSON::PP->new->canonical->allow_nonref->encode(\@decoded),
+        JSON::PP->new->canonical->allow_nonref->encode(\@per_cell), 'column-wise export decode matches per-cell');
+    is(JSON::PP->new->canonical->encode($decoded[0]),
+        '[533.10,true,{"k":1},[],7,"2025-05-31T00:00:00","2025-05-31","1.5","x"]' =~ s/533\.10/"533.10"/r,
+        'export row values');
 };
 
 subtest 'empty results' => sub {
