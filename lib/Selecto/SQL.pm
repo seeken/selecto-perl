@@ -1962,7 +1962,8 @@ sub _expression_associations {
         if (blessed($argument) && $argument->isa('Selecto::Expression')) {
             push @names, $self->_expression_associations($argument, $domain);
         } elsif (ref($argument) eq 'ARRAY') {
-            push @names, map { $self->_expression_associations($_, $domain) } @$argument;
+            # A plain scalar (an IN member, say) names no association.
+            push @names, map { ref($_) ? $self->_expression_associations($_, $domain) : () } @$argument;
         } elsif (ref($argument) eq 'HASH') {
             push @names, map { $self->_expression_associations($argument->{$_}, $domain) }
                 sort keys %$argument;

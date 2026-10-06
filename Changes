@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Faster large IN lists with the same SQL, parameters, limits and
+      refusals: operation budgets admit a list of values in one pass (each
+      value still checked in order, each maximum looked up once), recognise
+      core booleans without a JSON::PP::is_bool call per scalar, and count
+      bytes without a bytes::length call; association discovery no longer
+      walks plain IN members. A 500-value IN filter now composes and
+      compiles in about 1.7 ms instead of 3.4 ms locally.
     - Faster query composition, compilation and write governance with the
       same resource limits, thresholds and error codes: inlined operation
       budget comparisons (the breach path is unchanged), one admission per

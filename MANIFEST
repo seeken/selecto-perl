@@ -109,6 +109,7 @@ t/fixtures/Selecto-Adapter-FutureDB/Makefile.PL
 t/governance_hardening.t
 t/grouped_expression_bindings.t
 t/importer.t
+t/in_list_golden.t
 t/lib/TestSelecto.pm
 t/manifest.t
 t/mssql.integration.t
