@@ -24,7 +24,7 @@ sub new {
         $budget->consume_value($value, label => 'expression literal');
     } elsif ($kind =~ /\A(?:in|array_contains|array_contained|array_overlap)\z/ && ref($arguments[1]) eq 'ARRAY') {
         $budget->limits->check_count('max_filter_values', scalar(@{$arguments[1]}), 'invalid_query', 'expression members');
-        $budget->consume_value($_, label => 'expression member') for @{$arguments[1]};
+        $budget->_consume_values($arguments[1], 'expression member');
     } elsif (($kind eq 'and' || $kind eq 'or') && ref($arguments[0]) eq 'ARRAY') {
         $budget->limits->check_count('max_expression_arity', scalar(@{$arguments[0]}), 'invalid_query', 'expression fan-out');
     }
@@ -407,7 +407,7 @@ sub _from_filter_ast {
         Selecto::Error->throw('invalid_query', "$operator filter requires a field and a value list")
             unless @arguments == 2 && ref($value) eq 'ARRAY';
         $budget->limits->check_count('max_filter_values', scalar(@$value), 'invalid_query', 'array members');
-        $budget->consume_value($_, label => 'array member') for @$value;
+        $budget->_consume_values($value, 'array member');
         return $class->can($operator)->($class, _filter_field($field), $value);
     }
     if ($operator eq 'json_contains') {
@@ -432,8 +432,9 @@ sub _from_filter_ast {
             unless @arguments == 2 && ref($value) eq 'ARRAY' && @$value
                 && !grep { ref($_) && !_is_json_boolean($_) } @$value;
         $budget->limits->check_count('max_filter_values', scalar(@$value), 'invalid_query', 'in members');
-        my @members = map { _filter_literal($_) } @$value;
-        $budget->consume_value($_, label => 'in member') for @members;
+        # _filter_literal, inline: only a reference can be a JSON boolean.
+        my @members = map { ref($_) && _is_json_boolean($_) ? ($_ ? 1 : 0) : $_ } @$value;
+        $budget->_consume_values(\@members, 'in member');
         return $class->in($field, \@members);
     }
     if ($operator eq 'between') {

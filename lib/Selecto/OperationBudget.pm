@@ -13,6 +13,12 @@ use Selecto::Limits ();
 # only read them; each budget still has its own counters.
 my $DEFAULT_LIMITS;
 
+# JSON::PP::is_bool for a value that is not a blessed reference: true only for
+# Perl core booleans, and only when this JSON::PP recognises them (CORE_BOOL,
+# JSON::PP 4.11+ on Perl 5.36+). Blessed references still call is_bool itself.
+use constant _CORE_BOOL => defined(&JSON::PP::CORE_BOOL) && JSON::PP::CORE_BOOL() ? 1 : 0;
+BEGIN { _CORE_BOOL and warnings->unimport('experimental::builtin') }
+
 sub new {
     my ($class, %args) = @_;
     my $limits = $args{limits} // ($DEFAULT_LIMITS //= Selecto::Limits->new);
@@ -39,17 +45,30 @@ sub consume_count {
 }
 sub consume_value {
     my ($self, $value, %options) = @_;
-    $value = $value ? 1 : 0 if JSON::PP::is_bool($value);
+    return $self->_consume_values([$value], $options{label} // 'parameter');
+}
+# consume_value for each value in turn, in order, with the same checks,
+# thresholds, errors and counters; each maximum is looked up once per call.
+# Returns the last admitted value (booleans as 1 or 0), as consume_value did.
+sub _consume_values {
+    my ($self, $values, $label) = @_;
     my $limits = $self->{limits};
-    my $label = $options{label} // 'parameter';
-    # check_bytes refuses references; keep its exact refusal on that path.
-    return $self->_consume_value_slow($value, $label) if ref($value);
-    my $bytes = defined($value) ? bytes::length($value) : 0;
-    $limits->check_count('max_value_bytes', $bytes, $self->{code}, $label)
-        if $bytes > $limits->get('max_value_bytes');
-    my $total = $self->{counts}{max_parameter_bytes} += $bytes;
-    $self->_check('max_parameter_bytes', $total, 'operation parameter bytes')
-        if $total > $limits->get('max_parameter_bytes');
+    my $counts = $self->{counts};
+    my ($value_max, $total_max, $value);
+    for my $item (@$values) {
+        $value = $item;
+        if (ref($value) ? blessed($value) && JSON::PP::is_bool($value) : _CORE_BOOL && builtin::is_bool($value)) {
+            $value = $value ? 1 : 0;
+        }
+        # check_bytes refuses references; keep its exact refusal on that path.
+        if (ref($value)) { $self->_consume_value_slow($value, $label); next }
+        my $bytes = defined($value) ? do { use bytes; length($value) } : 0;
+        $limits->check_count('max_value_bytes', $bytes, $self->{code}, $label)
+            if $bytes > ($value_max //= $limits->get('max_value_bytes'));
+        my $total = $counts->{max_parameter_bytes} += $bytes;
+        $self->_check('max_parameter_bytes', $total, 'operation parameter bytes')
+            if $total > ($total_max //= $limits->get('max_parameter_bytes'));
+    }
     return $value;
 }
 sub _consume_value_slow {
@@ -62,7 +81,7 @@ sub consume_parameters {
     my ($self, $values, %options) = @_;
     Selecto::Error->throw($self->{code}, 'parameters must be an array') unless ref($values) eq 'ARRAY';
     $self->consume_count('max_generated_parameters', scalar(@$values), label => 'generated parameters');
-    $self->consume_value($_, %options) for @$values;
+    $self->_consume_values($values, $options{label} // 'parameter');
     return $values;
 }
 
@@ -100,10 +119,10 @@ sub check_tree {
         $self->_check($depth_limit, $depth, "$label depth")
             if $depth > ($depth_max //= $limits->get($depth_limit));
         # JSON::PP::is_bool is false for every unblessed reference.
-        my $is_bool = ref($node) && !blessed($node) ? 0 : JSON::PP::is_bool($node);
+        my $is_bool = ref($node) ? blessed($node) && JSON::PP::is_bool($node) : _CORE_BOOL && builtin::is_bool($node);
         if (!ref($node) || $is_bool) {
             my $scalar = $is_bool ? ($node ? 1 : 0) : $node;
-            my $size = defined($scalar) ? bytes::length($scalar) : 0;
+            my $size = defined($scalar) ? do { use bytes; length($scalar) } : 0;
             if (defined $scalar_limit) {
                 $scalar_max //= $limits->get($scalar_limit);
                 $self->_check($scalar_limit, $size, "$label value bytes") if $size > $scalar_max;

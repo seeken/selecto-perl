@@ -176,7 +176,7 @@ subtest 'check_tree matches the reference at every threshold' => sub {
 };
 
 subtest 'parameter admission matches the reference at every threshold' => sub {
-    my @values = ('a', 'éé', 12345, undef, JSON::PP::true, JSON::PP::false, !!0, '', 'abcdef');
+    my @values = ('a', 'éé', 12345, undef, JSON::PP::true, JSON::PP::false, !!0, !!1, '', 'abcdef');
     for my $value_bytes (1 .. 7) {
         for my $parameter_bytes (1 .. 14) {
             my $limits = Selecto::Limits->new(max_value_bytes => $value_bytes, max_parameter_bytes => $parameter_bytes);
