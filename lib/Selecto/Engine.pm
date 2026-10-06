@@ -127,6 +127,10 @@ sub compile {
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)]);
     local $self->{adapter}{_selecto_compile_limits} = $self->{limits};
+    # This query was just admitted under these limits, and its parameters are
+    # admitted below under them too, so the SQL adapter skips repeating the
+    # identical checks for this exact query (nested queries are still checked).
+    local $self->{adapter}{_selecto_admitted_query} = $query;
     my $statement = $self->{adapter}->compile($self->read_domain, $query);
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')
         ->consume_parameters($statement->params, label => 'statement parameter');
@@ -415,7 +419,9 @@ sub _trusted_write_tenants {
 # what the domain records about each referenced relation's tenancy.
 sub _domain_references {
     my ($domain) = @_;
-    my $contract = $domain->contract // {};
+    # Read-only: the description below copies what it keeps, and its
+    # foreign_keys entry is only read by _foreign_key_guards.
+    my $contract = $domain->_contract_view // {};
     my $schemas = ref($contract->{schemas}) eq 'HASH' ? $contract->{schemas} : {};
     my $associations = $domain->associations;
     my $scope = $domain->write_tenant_scope;
@@ -978,7 +984,7 @@ sub _validate_write_command {
     for my $field (sort keys %{$command->assignments}) {
         Selecto::Error->throw(
             'write_field_not_writable', 'computed fields are read-only', {field => $field},
-        ) if ref($self->{domain}->field_metadata($field)->{computed}) eq 'HASH';
+        ) if ref($self->{domain}->_field_metadata_view($field)->{computed}) eq 'HASH';
     }
     return $self->_validate_command_against_contract(
         $command,
@@ -988,7 +994,7 @@ sub _validate_write_command {
         allowed_ops => undef,
         label       => $command->relation,
         trusted_field => $options{trusted_field},
-        computed    => sub { ref($self->{domain}->field_metadata($_[0])->{computed}) eq 'HASH' },
+        computed    => sub { ref($self->{domain}->_field_metadata_view($_[0])->{computed}) eq 'HASH' },
     );
 }
 

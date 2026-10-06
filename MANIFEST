@@ -166,3 +166,4 @@ t/bounded_result.t
 t/security_insert_admission.t
 t/security_operation_budgets.t
 t/filter_ast_json_booleans.t
+t/security_budget_equivalence.t

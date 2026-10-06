@@ -9,28 +9,52 @@ use Scalar::Util qw(blessed refaddr reftype);
 use Selecto::Error ();
 use Selecto::Limits ();
 
+# The default policy, built once. Limits objects are immutable and budgets
+# only read them; each budget still has its own counters.
+my $DEFAULT_LIMITS;
+
 sub new {
     my ($class, %args) = @_;
-    my $limits = $args{limits} // Selecto::Limits->new;
+    my $limits = $args{limits} // ($DEFAULT_LIMITS //= Selecto::Limits->new);
     Selecto::Error->throw('invalid_limits', 'operation budget requires Selecto::Limits')
         unless blessed($limits) && $limits->isa('Selecto::Limits');
     return bless {limits => $limits, code => $args{code} // 'resource_limit_exceeded', counts => {}}, $class;
 }
 sub limits { $_[0]->{limits} }
+
+# Every check compares against the same trusted maximum as before and, only on
+# a breach, calls the original throwing path, so thresholds, error codes,
+# messages and details are unchanged. The comparisons are inlined because
+# admission runs per node and per parameter on every operation.
 sub _check {
     my ($self, $limit, $count, $label) = @_;
-    return $self->limits->check_count($limit, $count, $self->{code}, $label);
+    return $self->{limits}->check_count($limit, $count, $self->{code}, $label);
 }
 sub consume_count {
     my ($self, $limit, $count, %options) = @_;
-    $self->{counts}{$limit} += $count;
-    return $self->_check($limit, $self->{counts}{$limit}, $options{label} // $limit);
+    my $total = $self->{counts}{$limit} += $count;
+    $self->_check($limit, $total, $options{label} // $limit)
+        if $total > $self->{limits}->get($limit);
+    return $total;
 }
 sub consume_value {
     my ($self, $value, %options) = @_;
-    my $label = $options{label} // 'parameter';
     $value = $value ? 1 : 0 if JSON::PP::is_bool($value);
-    my $bytes = $self->limits->check_bytes('max_value_bytes', $value, $self->{code}, $label);
+    my $limits = $self->{limits};
+    my $label = $options{label} // 'parameter';
+    # check_bytes refuses references; keep its exact refusal on that path.
+    return $self->_consume_value_slow($value, $label) if ref($value);
+    my $bytes = defined($value) ? bytes::length($value) : 0;
+    $limits->check_count('max_value_bytes', $bytes, $self->{code}, $label)
+        if $bytes > $limits->get('max_value_bytes');
+    my $total = $self->{counts}{max_parameter_bytes} += $bytes;
+    $self->_check('max_parameter_bytes', $total, 'operation parameter bytes')
+        if $total > $limits->get('max_parameter_bytes');
+    return $value;
+}
+sub _consume_value_slow {
+    my ($self, $value, $label) = @_;
+    my $bytes = $self->{limits}->check_bytes('max_value_bytes', $value, $self->{code}, $label);
     $self->consume_count('max_parameter_bytes', $bytes, label => 'operation parameter bytes');
     return $value;
 }
@@ -55,18 +79,35 @@ sub check_tree {
     my $depth_limit = $options{depth_limit} // ($response ? 'max_response_depth' : 'max_expression_depth');
     my $scalar_limit = $options{scalar_limit};
     my %allowed = map { $_ => 1 } @{$options{allowed_classes} // []};
+    # A flat stack of (node, depth, leave) triples, visited in the same order
+    # as before, without allocating a record per node.
     my (%active, @stack);
-    push @stack, [$value, 0, 0];
+    push @stack, $value, 0, 0;
     $self->consume_count($nodes_limit, 1, label => "$label nodes");
+    my $limits = $self->{limits};
+    my $counts = $self->{counts};
+    # The same maxima the per-node checks read, each looked up when its first
+    # check runs (as before) and then reused for the rest of the call.
+    my $nodes_max = $limits->get($nodes_limit);
+    my ($depth_max, $bytes_max, $scalar_max);
+    my $bytes_base = $counts->{"tree_bytes:$byte_limit"} // 0;
     my $bytes = 0;
     while (@stack) {
-        my ($node, $depth, $leave) = @{pop @stack};
+        my $leave = pop @stack;
+        my $depth = pop @stack;
+        my $node = pop @stack;
         if ($leave) { delete $active{$leave}; next }
-        $self->_check($depth_limit, $depth, "$label depth");
-        if (!ref($node) || JSON::PP::is_bool($node)) {
-            my $scalar = JSON::PP::is_bool($node) ? ($node ? 1 : 0) : $node;
+        $self->_check($depth_limit, $depth, "$label depth")
+            if $depth > ($depth_max //= $limits->get($depth_limit));
+        # JSON::PP::is_bool is false for every unblessed reference.
+        my $is_bool = ref($node) && !blessed($node) ? 0 : JSON::PP::is_bool($node);
+        if (!ref($node) || $is_bool) {
+            my $scalar = $is_bool ? ($node ? 1 : 0) : $node;
             my $size = defined($scalar) ? bytes::length($scalar) : 0;
-            $self->_check($scalar_limit, $size, "$label value bytes") if defined $scalar_limit;
+            if (defined $scalar_limit) {
+                $scalar_max //= $limits->get($scalar_limit);
+                $self->_check($scalar_limit, $size, "$label value bytes") if $size > $scalar_max;
+            }
             $bytes += $size;
         } else {
             my $type = reftype($node) // '';
@@ -75,23 +116,26 @@ sub check_tree {
             my $id = refaddr($node);
             Selecto::Error->throw($self->{code}, "$label contains a cycle") if $active{$id};
             $active{$id} = 1;
-            push @stack, [undef, 0, $id];
+            push @stack, undef, 0, $id;
             my $count = $type eq 'ARRAY' ? scalar(@$node) : scalar(keys %$node);
             # Refuse broad inputs before allocating a traversal stack of them.
-            $self->consume_count($nodes_limit, $count, label => "$label nodes");
+            my $nodes = $counts->{$nodes_limit} += $count;
+            $self->_check($nodes_limit, $nodes, "$label nodes") if $nodes > $nodes_max;
             if ($type eq 'ARRAY') {
-                push @stack, [$node->[$_], $depth + 1, 0] for reverse 0 .. $#$node;
+                push @stack, $node->[$_], $depth + 1, 0 for reverse 0 .. $#$node;
             } else {
                 for my $key (keys %$node) {
                     $bytes += bytes::length($key);
-                    $self->_check($byte_limit, ($self->{counts}{"tree_bytes:$byte_limit"} // 0) + $bytes, "$label bytes");
-                    push @stack, [$node->{$key}, $depth + 1, 0];
+                    $self->_check($byte_limit, $bytes_base + $bytes, "$label bytes")
+                        if $bytes_base + $bytes > ($bytes_max //= $limits->get($byte_limit));
+                    push @stack, $node->{$key}, $depth + 1, 0;
                 }
             }
         }
-        $self->_check($byte_limit, ($self->{counts}{"tree_bytes:$byte_limit"} // 0) + $bytes, "$label bytes");
+        $self->_check($byte_limit, $bytes_base + $bytes, "$label bytes")
+            if $bytes_base + $bytes > ($bytes_max //= $limits->get($byte_limit));
     }
-    $self->{counts}{"tree_bytes:$byte_limit"} += $bytes;
+    $counts->{"tree_bytes:$byte_limit"} += $bytes;
     return $bytes;
 }
 
