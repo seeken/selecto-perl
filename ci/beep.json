@@ -1,0 +1,87 @@
+{
+  "schema": "selecto.perl.beep.v1",
+  "repository": "seeken/selecto-perl",
+  "default_branch": "main",
+  "runtime": {
+    "perl": "5.40.2.1",
+    "actual_perl": "v5.40.2",
+    "python": "3.14.3",
+    "mise": "2026.10.3"
+  },
+  "sources": [
+    {
+      "repository": "seeken/selecto-perl-certification",
+      "commit": "c5fff27ff8d46d40f3577fc5d33e260cb436391b",
+      "access": "private"
+    }
+  ],
+  "modules": [
+    "DBI",
+    "Mojolicious",
+    "DateTime",
+    "DateTime::TimeZone",
+    "Excel::Writer::XLSX",
+    "Text::CSV",
+    "DBD::SQLite",
+    "DBD::Pg",
+    "Selecto",
+    "Selecto::Certification",
+    "URI::Escape"
+  ],
+  "module_sources": {
+    "Selecto": "lib",
+    "Selecto::Certification": "../selecto-perl-certification/lib"
+  },
+  "stages": {
+    "checkout": {},
+    "dependencies": {},
+    "required-prerequisites": {},
+    "unit": {
+      "minimum_tests": 3702,
+      "require_no_skips": true,
+      "allowed_skip_reasons": [
+        "DBD::DuckDB is not installed",
+        "both live drivers are required",
+        "both DBI drivers are required",
+        "DBD::ODBC is not installed",
+        "DBD::MariaDB is not installed"
+      ]
+    },
+    "distribution-configure": {},
+    "distribution-test": {
+      "minimum_tests": 3702,
+      "require_no_skips": true,
+      "allowed_skip_reasons": [
+        "DBD::DuckDB is not installed",
+        "both live drivers are required",
+        "both DBI drivers are required",
+        "DBD::ODBC is not installed",
+        "DBD::MariaDB is not installed"
+      ]
+    },
+    "diagnostics": {},
+    "postgres-start": {
+      "timeout_seconds": 180
+    },
+    "syntax": {},
+    "required-postgres-controls": {
+      "minimum_tests": 15,
+      "require_no_skips": true
+    },
+    "diagnostics-prerequisites": {}
+  },
+  "required_env": [
+    "SELECTO_PERL_TEST_POSTGRES_URL",
+    "SELECTO_TEST_PG_DSN",
+    "PGUSER",
+    "PGPASSWORD",
+    "SELECTO_PERL_SQLSTATE_TEST_DSN",
+    "SELECTO_API_TEST_DATABASE"
+  ],
+  "optional_targets": [
+    "DuckDB",
+    "MySQL",
+    "MariaDB",
+    "MSSQL"
+  ]
+}

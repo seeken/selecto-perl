@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_dir"
+# Relocatable SDKs place their binaries in a platform-specific subdirectory.
+sdk_perl=$(mise which perl --tool perl@5.40.2.1)
+sdk_bin=$(dirname -- "$sdk_perl")
+sdk_python=$(mise which python3 --tool python@3.14.3)
+python_bin=$(dirname -- "$sdk_python")
+export PATH="$sdk_bin:$python_bin:$PATH"
+: "${SELECTO_CI_CPAN_DIR:=${RUNNER_TEMP:?}/selecto-perl-cpan}"
+export SELECTO_CI_CPAN_DIR
+exec python3 -B ci/deps.py
