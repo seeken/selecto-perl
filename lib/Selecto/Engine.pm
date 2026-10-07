@@ -94,6 +94,18 @@ sub with_scope {
     return $copy;
 }
 
+# A copy of this engine whose domain omits the prerequisite columns of the
+# named actions; see Selecto::Domain::without_action_prerequisites.
+sub without_action_prerequisites {
+    my ($self, @action_ids) = @_;
+    my $domain = $self->{domain}->without_action_prerequisites(@action_ids);
+    return $self if $domain == $self->{domain};
+    my $copy = bless {%$self}, ref($self);
+    $copy->{domain} = $domain;
+    delete $copy->{_read_domain};
+    return $copy;
+}
+
 sub from_registry {
     my ($class, %args) = @_;
     my $subject = $args{domain};
@@ -1738,6 +1750,15 @@ of the trusted scope).
 
 Returns a copy bound to a trusted tenant. An engine that already has a
 different tenant throws C<tenant_mismatch>.
+
+=head2 without_action_prerequisites
+
+  my $for_user = $engine->without_action_prerequisites(@hidden_action_ids);
+
+Returns a copy whose domain omits the C<can_E<lt>actionE<gt>> prerequisite
+columns of the named actions (see
+L<Selecto::Domain/without_action_prerequisites>), or the engine itself when
+none of them has one.
 
 =head1 TENANT SCOPE
 

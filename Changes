@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Each domain action with preconditions or a transition gets a boolean
+      can_<action> column, true when the row meets them, with Yes/No filter
+      choices, so the API and Explorer can show and filter the rows an
+      action could run on. Actions opt out with prerequisite_column false.
+      Domain::without_action_prerequisites removes the columns of actions a
+      caller cannot see, and Selecto::Action->prerequisites returns the
+      guards without planning a target.
     - Selecto::API serves GET .../resources/{id} (getResource) when constructed
       with resources => 1; a resource's aggregate_version is its ETag, and
       resource_not_found maps to 404.
