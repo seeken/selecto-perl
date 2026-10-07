@@ -67,6 +67,7 @@ MANIFEST.SKIP
 README.md
 t/00-load.t
 t/action.t
+t/action_prerequisite_columns.t
 t/action_forms.t
 t/adapter.t
 t/advanced_query.t
