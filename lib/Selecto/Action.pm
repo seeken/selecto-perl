@@ -5,6 +5,7 @@ use strict;
 use warnings;
 use Selecto::Action::Capability ();
 use Selecto::Action::Planner ();
+use Selecto::Error ();
 
 sub plan {
     my ($class, $domain, $intent, %options) = @_;
@@ -17,6 +18,16 @@ sub plan {
 sub input_form {
     my ($class, $action, $inputs) = @_;
     return Selecto::Action::Planner->input_form($action, $inputs);
+}
+
+# The row-state guards of a declared action, without a target or inputs.
+sub prerequisites {
+    my ($class, $domain, $action_id) = @_;
+    my $contract = Selecto::Action::Planner::_contract($domain);
+    my $action = ref($contract->{actions}) eq 'HASH' ? $contract->{actions}{$action_id} : undef;
+    Selecto::Error->throw('invalid_action_intent', 'action is not exposed by this domain contract',
+        {action => $action_id}) unless ref($action) eq 'HASH';
+    return Selecto::Action::Planner->prerequisites($contract, $action);
 }
 
 sub authorize {
@@ -136,6 +147,19 @@ The data a resolver receives: C<phase>, C<capability>, C<action>,
 C<operation>, C<scope>, C<target>, C<filters>, C<transition> and
 C<preconditions>.
 
+=head2 prerequisites
+
+  my $guards = Selecto::Action->prerequisites($domain, 'archive');
+  # [{type => 'filter', field => 'priority', comparator => 'lte', value => 3, ...},
+  #  {type => 'field_equals', field => 'state', comparator => 'eq', value => 'done', ...}]
+
+The row state the action requires, without a target or inputs: its normalized
+C<preconditions>, then its transition source state. Domains build their
+C<can_E<lt>actionE<gt>> columns from these (see
+L<Selecto::Domain/Action prerequisite columns>). C<plan> still checks the
+operation and the full transition. Throws C<invalid_action_intent> for an
+unknown action and the precondition errors of C<plan> for malformed guards.
+
 =head2 input_form
 
   my $form = Selecto::Action->input_form($domain->actions->{check_in}, {
@@ -185,6 +209,13 @@ C<< {field => 'state', from => 'done', to => 'archived'} >>.
 
 Extra guards such as C<[['eligible', 1], ['<=', 'priority', 3]]>; update and
 delete only.
+
+=item C<prerequisite_column>
+
+Defaults to true: an action with preconditions or a transition gets a boolean
+C<can_E<lt>actionE<gt>> column and Yes/No filter that tell which rows meet
+them (see L<Selecto::Domain/Action prerequisite columns>). Set it false to
+leave the column out.
 
 =item C<selection>
 
