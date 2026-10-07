@@ -137,6 +137,8 @@ t/required_predicate_write_guard.t
 t/retarget.t
 t/sqlite.integration.t
 t/sqlstate.t
+t/statement_cache.t
+t/statement_cache.integration.t
 t/stream.t
 t/temporal_format_bindings.t
 t/text_filters.t
@@ -162,6 +164,7 @@ docs/security-boundaries.md
 script/importer-memory-check
 t/security_boundaries_live.t
 lib/Selecto/PostgreSQL/Stream.pm
+lib/Selecto/PostgreSQL/StatementCache.pm
 t/bounded_stream.t
 docs/typed-insert-admission.md
 lib/Selecto/API/ResponsePolicy.pm
