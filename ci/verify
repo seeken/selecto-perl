@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_dir"
+sdk_perl=$(mise which perl --tool perl@5.40.2.1)
+sdk_python=$(mise which python3 --tool python@3.14.3)
+export PATH="$(dirname -- "$sdk_perl"):$(dirname -- "$sdk_python"):$PATH"
+export PERL5LIB="${SELECTO_CI_CPAN_DIR:?}/lib/perl5${PERL5LIB:+:$PERL5LIB}"
+export HARNESS_VERBOSE=1 PYTHONDONTWRITEBYTECODE=1
+stage() { label=$1; shift; python3 -B ci/run.py "$label" -- "$@"; }
+stage checkout python3 -B ci/sources.py checkout
+stage dependencies ci/deps
+trap "ci/postgres-vm stop" EXIT HUP INT TERM
+stage postgres-start ci/postgres-vm start
+stage distribution-configure script/with-local-deps perl Makefile.PL
+stage required-prerequisites script/with-local-deps python3 -B ci/required.py
+stage diagnostics-prerequisites script/with-local-deps python3 -B ci/diagnostics.py
+stage syntax script/with-local-deps perl -Ilib -c bin/selecto-certify
+stage required-postgres-controls script/with-local-deps prove -lv t/postgresql.integration.t t/postgresql_transaction.integration.t t/security_insert_admission.t t/sqlstate.t t/api_through_association_parity_live.t t/api_write_parity_live.t t/api_query_library_parity_live.t t/security_boundaries_live.t t/bounded_result.t t/required_predicate_write_guard.t t/foreign_key_tenant_guard.t t/decode_rows_wide.t t/bounded_stream.t t/bounded_write.t t/query_budget.t
+stage unit script/with-local-deps prove -lrv t
+stage distribution-test script/with-local-deps make test TEST_VERBOSE=1
+stage diagnostics script/with-local-deps python3 -B ci/diagnostics.py
