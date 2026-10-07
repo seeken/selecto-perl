@@ -88,6 +88,7 @@ sub normalize_error ($self, $error) {
 # The handle's current SQLSTATE, or undef when it reports none or only a
 # generic one (00000 success, DBI's S1000 and HY000 general errors).
 sub driver_sqlstate ($self) {
+    return undef unless exists $self->{dbh};
     my $dbh = $self->{dbh};
     return undef unless blessed($dbh) && $dbh->can('state');
     my $state = eval { $dbh->state } // '';
