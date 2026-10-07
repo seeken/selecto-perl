@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Selecto::API serves GET .../resources/{id} (getResource) when constructed
+      with resources => 1; a resource's aggregate_version is its ETag, and
+      resource_not_found maps to 404.
+    - Selecto::API::EngineHandler reads one resource by primary key with
+      resource(), and publishes a virtual, read-only aggregate_version field
+      through an optional host versioner. Resources and queries return it only
+      when it is requested.
     - API subtables may be ordered by an internal child primary key. The key
       only orders the bounded collection and is never returned.
     - Trusted adapters may admit native flat array parameters under finite
