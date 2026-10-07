@@ -203,6 +203,53 @@ sub with_tenant_field {
     return $copy->_refresh_fingerprint;
 }
 
+# Action prerequisite columns (can_<action>) a host must not show this request,
+# because the action itself is hidden. The columns, their filter choices and
+# their fields are removed; the actions keep prerequisite_column false so a
+# re-parse of the contract does not bring them back.
+sub without_action_prerequisites {
+    my ($self, @action_ids) = @_;
+    my $derived = $self->action_prerequisite_fields;
+    my @hidden = grep { defined $derived->{$_} } @action_ids;
+    return $self unless @hidden;
+    my %remove = map { $derived->{$_} => 1 } @hidden;
+    my @remove = sort keys %remove;
+
+    my $copy = bless {%$self}, ref($self);
+    $copy->{fields} = {%{$self->{fields}}};
+    delete @{$copy->{fields}}{@remove};
+    my $contract = dclone($self->{contract});
+    delete @{$contract->{source}{columns}}{@remove};
+    $contract->{source}{fields} = [grep { !$remove{$_} } @{$contract->{source}{fields}}];
+    $contract->{actions}{$_}{prerequisite_column} = JSON::PP::false for @hidden;
+    if (ref($contract->{components}) eq 'HASH'
+        && ref($contract->{components}{filter_choices}) eq 'HASH') {
+        delete @{$contract->{components}{filter_choices}}{@remove};
+    }
+    $copy->{contract} = $contract;
+    if (ref($self->{components}{filter_choices}) eq 'HASH') {
+        $copy->{components} = dclone($self->{components});
+        delete @{$copy->{components}{filter_choices}}{@remove};
+    }
+    return $copy->_refresh_fingerprint;
+}
+
+# {action id => field} for the action prerequisite columns this domain has.
+sub action_prerequisite_fields {
+    my ($self) = @_;
+    my $contract = $self->{contract};
+    my $columns = ref($contract) eq 'HASH' && ref($contract->{source}) eq 'HASH'
+        ? $contract->{source}{columns} : undef;
+    return {} unless ref($columns) eq 'HASH';
+    return {
+        map { ($columns->{$_}{action_prerequisites} => $_) }
+        grep {
+            exists($self->{fields}{$_}) && ref($columns->{$_}) eq 'HASH'
+                && defined($columns->{$_}{action_prerequisites})
+        } sort keys %$columns
+    };
+}
+
 sub parse {
     my ($class, $document, %options) = @_;
     my $strict = exists($options{strict}) ? $options{strict} : 1;
@@ -251,6 +298,7 @@ sub _parse_canonical {
     Selecto::Error->throw(
         'invalid_domain', 'root source must use source_table rather than values',
     ) if exists $source->{values};
+    _derive_action_prerequisite_columns($raw);
     my $schemas = $raw->{schemas} // {};
     my $joins = $raw->{joins} // {};
     _object($schemas, 'schemas');
@@ -832,6 +880,91 @@ sub _validate_action_eligibility {
             {action => $action_id, field => $field},
         ) unless ref($column) eq 'HASH' && ($column->{type} // '') eq 'boolean';
     }
+}
+
+my %PREREQUISITE_COMPARATOR = (
+    eq => 'eq', neq => 'ne', gt => 'gt', gte => 'gte', lt => 'lt', lte => 'lte', in => 'in',
+);
+
+# Every action whose prerequisites (preconditions and transition source state)
+# are non-empty gets a boolean predicate column can_<action>, with Yes/No
+# filter choices, unless it sets prerequisite_column false. Columns from an
+# earlier parse carry action_prerequisites and are derived again here.
+# Malformed prerequisites get no column: plan() rejects the action itself. A
+# declared field already named can_<action> is left as it is.
+sub _derive_action_prerequisite_columns {
+    my ($raw) = @_;
+    my $source = $raw->{source};
+    my $columns = $source->{columns};
+    return unless ref($columns) eq 'HASH' && ref($source->{fields}) eq 'ARRAY';
+
+    my %stale = map { $_ => 1 } grep {
+        ref($columns->{$_}) eq 'HASH' && exists $columns->{$_}{action_prerequisites}
+    } keys %$columns;
+    delete @$columns{keys %stale};
+    $source->{fields} = [grep { !$stale{$_} } @{$source->{fields}}];
+
+    my $actions = $raw->{actions};
+    my %derived;
+    for my $action_id (sort keys %{ref($actions) eq 'HASH' ? $actions : {}}) {
+        my $action = $actions->{$action_id};
+        next unless ref($action) eq 'HASH' && _prerequisite_column_enabled($action, $action_id);
+        require Selecto::Action::Planner;
+        my $guards = eval { Selecto::Action::Planner->prerequisites($raw, $action) };
+        next unless ref($guards) eq 'ARRAY' && @$guards;
+        my $expression = _prerequisite_expression($guards) or next;
+        my $field = "can_$action_id";
+        next if exists($columns->{$field}) || grep { $_ eq $field } @{$source->{fields}};
+        my $label = (defined($action->{label}) && !ref($action->{label})
+            ? "$action->{label}" : $action_id) . ' prerequisites met';
+        $columns->{$field} = {
+            type => 'boolean',
+            (length($label) <= 80 ? (label => $label) : ()),
+            action_prerequisites => $action_id,
+            computed => {kind => 'predicate', expression => $expression},
+        };
+        push @{$source->{fields}}, $field;
+        $derived{$field} = 1;
+        $raw->{components}{filter_choices}{$field} //= {
+            (length($label) <= 80 ? (label => $label) : (label => $field)),
+            choices => [{value => 'true', label => 'Yes'}, {value => 'false', label => 'No'}],
+        };
+    }
+
+    my $choices = ref($raw->{components}) eq 'HASH' ? $raw->{components}{filter_choices} : undef;
+    delete @$choices{grep { !$derived{$_} } keys %stale} if ref($choices) eq 'HASH';
+}
+
+sub _prerequisite_column_enabled {
+    my ($action, $action_id) = @_;
+    return 1 unless exists $action->{prerequisite_column};
+    my $enabled = $action->{prerequisite_column};
+    Selecto::Error->throw(
+        'invalid_domain', "action $action_id prerequisite_column must be boolean",
+    ) unless JSON::PP::is_bool($enabled)
+        || (defined($enabled) && !ref($enabled) && "$enabled" =~ /\A(?:0|1)\z/);
+    return $enabled ? 1 : 0;
+}
+
+# True exactly when every guard holds. A NULL column would make a comparison
+# NULL rather than false, so each guarded field must also be non-null; a NULL
+# guard value never matches when the action runs, so the column is false.
+# Undef when a guard compares with something other than literals.
+sub _prerequisite_expression {
+    my ($guards) = @_;
+    my (@terms, %not_null);
+    for my $guard (@$guards) {
+        my ($field, $value) = @{$guard}{qw(field value)};
+        my $comparator = $PREREQUISITE_COMPARATOR{$guard->{comparator} // 'eq'};
+        return ['and', [['is_null', $field], ['not_null', $field]]] unless defined $value;
+        my $literal = $comparator eq 'in'
+            ? !grep { ref($_) && !JSON::PP::is_bool($_) } @$value
+            : !ref($value) || JSON::PP::is_bool($value);
+        return undef unless $literal;
+        push @terms, ['not_null', $field] unless $not_null{$field}++;
+        push @terms, [$comparator, $field, $value];
+    }
+    return ['and', \@terms];
 }
 
 sub _computed_predicate_fields {
@@ -2621,6 +2754,26 @@ Returns a copy that treats another root field as the tenant field. This is
 for role-dependent ownership where the trusted host picks the boundary per
 request. It never changes the shared domain.
 
+=head2 action_prerequisite_fields
+
+  my $fields = $domain->action_prerequisite_fields;   # {archive => 'can_archive'}
+
+The action prerequisite columns the domain has, by action id. See
+L</Action prerequisite columns>.
+
+=head2 without_action_prerequisites
+
+  my $for_user = $domain->without_action_prerequisites(@hidden_action_ids);
+
+Returns a copy without the prerequisite columns of the named actions: their
+fields, columns and filter choices are removed, so the API and component
+catalogs neither show nor accept them. Hosts call this per request for the
+actions the caller cannot see, because a prerequisite column should be
+visible only where its action is. The copy's contract sets
+C<prerequisite_column> false on those actions, so parsing it again keeps them
+hidden. Ids without a column are ignored; when none has one, the domain itself
+is returned. It never changes the shared domain.
+
 =head2 as_contract
 
   my $hash = $domain->as_contract;
@@ -2870,6 +3023,31 @@ A boolean that is true when the direct association has a matching row.
 =back
 
 Computed columns may build on each other; cycles are rejected.
+
+=head2 Action prerequisite columns
+
+Every action whose prerequisites are not empty gets a boolean predicate
+column C<can_E<lt>actionE<gt>>. The prerequisites are its C<preconditions>
+followed by its C<transition> source state (C<< field = from >>), as
+L<Selecto::Action/prerequisites> returns them. The column is true
+exactly when every guard holds: each guarded field must also be non-null, so
+the column is never NULL, and a guard comparing with NULL makes it always
+false, as that action never runs. It is labelled
+"E<lt>action labelE<gt> prerequisites met", is public (although guards may
+read internal fields), and is filtered with Yes/No
+C<components.filter_choices> unless the domain declares choices for it. The
+column carries C<< action_prerequisites => 'E<lt>action idE<gt>' >>, by which
+a later parse of the same contract recognises and derives it again.
+
+Set C<< prerequisite_column => false >> on an action to leave it out. An action
+gets no column when its prerequisites are malformed or compare with something
+other than literals (C<plan> rejects such an action), or when the domain
+already declares a field named C<can_E<lt>actionE<gt>>.
+
+The column describes row state only. It does not authorize the action, and
+C<plan> still enforces the guards when the action runs. Hosts hide the
+columns of actions a caller cannot see with
+L</without_action_prerequisites>.
 
 =head2 writes
 
