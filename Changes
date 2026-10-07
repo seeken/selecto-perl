@@ -1,6 +1,8 @@
 Revision history for Selecto
 
 Unreleased
+    - Query compilation admits Selecto::Query subclasses used by typed SQL
+      pattern builders while retaining depth, size, cycle and reference checks.
     - Native adapters without a DBI handle keep normalized query_error
       responses when their state is locked. SQLSTATE inspection now checks
       whether a handle exists before reading it.
