@@ -1,6 +1,8 @@
 Revision history for Selecto
 
 Unreleased
+    - API subtables may be ordered by an internal child primary key. The key
+      only orders the bounded collection and is never returned.
     - Trusted adapters may admit native flat array parameters under finite
       bind-slot, element and conservative wire-byte budgets. Other adapters
       retain scalar-only parameter admission.
