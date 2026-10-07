@@ -81,7 +81,37 @@ sub consume_parameters {
     my ($self, $values, %options) = @_;
     Selecto::Error->throw($self->{code}, 'parameters must be an array') unless ref($values) eq 'ARRAY';
     $self->consume_count('max_generated_parameters', scalar(@$values), label => 'generated parameters');
-    $self->_consume_values($values, $options{label} // 'parameter');
+    my $label = $options{label} // 'parameter';
+    if ($options{allow_flat_array_parameters}) {
+        for my $value (@$values) {
+            if (ref($value) eq 'ARRAY' && !blessed($value)) {
+                $self->_consume_flat_array($value, $label);
+            } else {
+                $self->_consume_values([$value], $label);
+            }
+        }
+    } else {
+        $self->_consume_values($values, $label);
+    }
+    return $values;
+}
+
+# PostgreSQL's native flat text-array bind, explicitly selected by an adapter.
+# Account for a conservative wire size without constructing or changing it:
+# braces, commas, quoted strings with doubled escaping, and unquoted NULL.
+sub _consume_flat_array {
+    my ($self, $values, $label) = @_;
+    my $count = scalar @$values;
+    $self->consume_count('max_expression_nodes', $count, label => 'array parameter elements');
+    my $bytes = 2 + ($count ? $count - 1 : 0);
+    my $maximum = $self->{limits}->get('max_value_bytes');
+    $self->_check('max_value_bytes', $bytes, $label) if $bytes > $maximum;
+    for my $value (@$values) {
+        Selecto::Error->throw($self->{code}, 'array parameter elements must be scalars') if ref($value);
+        $bytes += defined($value) ? 2 * bytes::length($value) + 2 : 4;
+        $self->_check('max_value_bytes', $bytes, $label) if $bytes > $maximum;
+    }
+    $self->consume_count('max_parameter_bytes', $bytes, label => 'operation parameter bytes');
     return $values;
 }
 
@@ -181,6 +211,12 @@ are rejected unless their exact classes occur in trusted C<allowed_classes>.
 Trusted C<allowed_base_classes> may explicitly permit subclasses, as query
 admission does for C<Selecto::Query>. This still traverses their full record
 and applies every node, byte, depth, cycle and nested-reference check.
+Parameter admission remains scalar-only by default. A trusted adapter may
+select C<allow_flat_array_parameters> for unblessed flat arrays of scalars.
+Each array consumes one bind slot, every element consumes a node, and its
+conservative PostgreSQL text-wire size consumes both the single-value and
+aggregate parameter-byte budgets. Referenced elements remain refused, and
+the original parameter representation is returned unchanged.
 C<max_response_bytes> and C<max_import_preview_bytes> select the separate
 response-node/depth defaults. C<nodes_limit> and C<depth_limit> can explicitly
 select another named trusted limit. Depth counts actual container/scalar

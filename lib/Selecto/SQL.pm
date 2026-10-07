@@ -58,8 +58,9 @@ sub compile {
     my $statement = $self->_compile_query($domain, $query);
     # Selecto::Engine::compile admits these parameters itself, with the same
     # limits, code and label, as soon as this returns.
-    Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')
-        ->consume_parameters($statement->params, label => 'statement parameter')
+    $self->admit_parameters(
+        Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query'),
+        $statement->params, label => 'statement parameter')
         unless _engine_admitted($self, $query);
     return $statement;
 }
