@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - Database failures keep the driver's SQLSTATE. A query_error from
+      normalize_error now carries details.sqlstate and details.category
+      (unique_violation, foreign_key_violation, not_null_violation,
+      check_violation, query_canceled, serialization_failure,
+      deadlock_detected, or database_error), as in the Elixir library, so a
+      host can tell a lock timeout (55P03), deadlock (40P01) or
+      serialization failure (40001) apart and retry. Before, the code was
+      dropped, and the write's rollback cleared it from the handle. Insert
+      admission and Selecto::Stream now normalize before finishing or
+      closing the statement, which also cleared it. New
+      Selecto::Adapter->driver_sqlstate. Unchanged: the code (query_error),
+      the message, details.cause, the specific constraint errors, and API
+      responses, whose details allow-list leaves sqlstate out outside debug.
     - A missing tenant scope is refused with 403 through Selecto::API, as
       in the other runtimes. Selecto::API::error_status now returns 403 for
       missing_tenant_scope (was 422), so Selecto::API->request answers a

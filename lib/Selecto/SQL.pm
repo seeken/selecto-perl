@@ -2381,9 +2381,10 @@ sub _typed_insert_admission_probe {
         }
         1;
     };
-    my $error = $@;
+    # Normalize first: finish clears the handle's SQLSTATE.
+    my $error = $ok ? undef : $self->normalize_error($@);
     eval { $sth->finish } if $sth;
-    die $self->normalize_error($error) unless $ok;
+    die $error unless $ok;
     $budget->check;
     Selecto::Error->throw('query_rule_violation', 'insert candidate does not satisfy the enforced query',
         {truth_value => 'false_or_unknown'}) unless defined($row[0]) && "$row[0]" eq '1';
