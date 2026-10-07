@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Trusted adapters may admit native flat array parameters under finite
+      bind-slot, element and conservative wire-byte budgets. Other adapters
+      retain scalar-only parameter admission.
+    - Query compilation admits Selecto::Query subclasses used by typed SQL
+      pattern builders while retaining depth, size, cycle and reference checks.
+    - Native adapters without a DBI handle keep normalized query_error
+      responses when their state is locked. SQLSTATE inspection now checks
+      whether a handle exists before reading it.
     - Database failures keep the driver's SQLSTATE. A query_error from
       normalize_error now carries details.sqlstate and details.category
       (unique_violation, foreign_key_violation, not_null_violation,

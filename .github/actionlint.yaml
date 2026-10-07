@@ -1,0 +1,2 @@
+self-hosted-runner:
+  labels: [beep, beep-vm, beep-perl, beep-postgres]

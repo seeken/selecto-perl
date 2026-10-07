@@ -53,6 +53,12 @@ sub normalize_execution_result ($self, $result) {
     };
 }
 
+# A trusted adapter may opt into a supported native parameter representation.
+# The default contract remains scalar-only, with all ordinary budget checks.
+sub admit_parameters ($self, $budget, $parameters, %options) {
+    return $budget->consume_parameters($parameters, %options);
+}
+
 # Driver SQLSTATEs with a stable category, as in the Elixir library's
 # Selecto.Error. Any other SQLSTATE is reported with category database_error.
 our %SQLSTATE_CATEGORIES = (
@@ -88,6 +94,7 @@ sub normalize_error ($self, $error) {
 # The handle's current SQLSTATE, or undef when it reports none or only a
 # generic one (00000 success, DBI's S1000 and HY000 general errors).
 sub driver_sqlstate ($self) {
+    return undef unless exists $self->{dbh};
     my $dbh = $self->{dbh};
     return undef unless blessed($dbh) && $dbh->can('state');
     my $state = eval { $dbh->state } // '';
@@ -152,6 +159,14 @@ The bundled adapters inherit L<Selecto::SQL>, which implements compilation,
 execution, streaming and transactions for SQL databases; a new SQL adapter
 usually only needs its identity, placeholder style, identifier quoting,
 capability list and value decoding.
+
+C<admit_parameters($budget, $parameters, %options)> is an optional trusted
+adapter hook, inherited by every adapter. Its default applies scalar-only
+parameter admission through the supplied operation budget. An adapter that
+supports native flat array binds may explicitly select
+C<allow_flat_array_parameters> on that budget; bind-slot, element and byte
+limits still apply. The hook preserves the original parameter representation.
+It adds no required method or contract-version change.
 
 Adapters are registered by a stable lowercase name in a
 L<Selecto::Adapter::Registry>. An independently distributed adapter can

@@ -125,15 +125,17 @@ sub query   { return Selecto::Query->new; }
 sub compile {
     my ($self, $query) = @_;
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(
-        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)]);
+        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
+        allowed_base_classes => ['Selecto::Query']);
     local $self->{adapter}{_selecto_compile_limits} = $self->{limits};
     # This query was just admitted under these limits, and its parameters are
     # admitted below under them too, so the SQL adapter skips repeating the
     # identical checks for this exact query (nested queries are still checked).
     local $self->{adapter}{_selecto_admitted_query} = $query;
     my $statement = $self->{adapter}->compile($self->read_domain, $query);
-    Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')
-        ->consume_parameters($statement->params, label => 'statement parameter');
+    $self->{adapter}->admit_parameters(
+        Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query'),
+        $statement->params, label => 'statement parameter');
     return $statement;
 }
 sub all {
