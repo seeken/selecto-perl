@@ -306,9 +306,12 @@ sub _download_filename ($name, $extension) {
 }
 
 # The HTTP status for a handler error that names none: a query naming a hidden
-# (internal or redacted) field is forbidden, every other refusal is 422.
+# (internal or redacted) field and a request without a trusted tenant scope
+# are forbidden, as in the other runtimes; every other refusal is 422.
+my %FORBIDDEN_CODES = map { $_ => 1 } qw(hidden_field missing_tenant_scope);
+
 sub error_status ($code) {
-    return defined($code) && !ref($code) && $code eq 'hidden_field' ? 403 : 422;
+    return defined($code) && !ref($code) && $FORBIDDEN_CODES{$code} ? 403 : 422;
 }
 
 sub canonical_json ($value) {
@@ -597,7 +600,8 @@ The body is UTF-8 encoded bytes; C<content-length> is exact.
 
 A handler returns C<['ok', $data]> or C<['error', \%error]>, where
 C<%error> may contain C<status> (default L</error_status> of the code: 403
-for C<hidden_field>, otherwise 422), C<code>, C<message> and C<details>.
+for C<hidden_field> and C<missing_tenant_scope>, otherwise 422), C<code>,
+C<message> and C<details>.
 If a handler dies, the response is a 500 C<handler_failed> without the
 exception text, so convert expected L<Selecto::Error>s into
 C<['error', ...]> yourself:
@@ -644,9 +648,10 @@ route list).
   my $status = Selecto::API::error_status($code);
 
 A function (not a method) that returns the HTTP status for a refusal code:
-403 for C<hidden_field> (a query names a field the domain withholds), 422
-for every other code. L</request> uses it when a handler error has no
-C<status>.
+403 for C<hidden_field> (a query names a field the domain withholds) and
+C<missing_tenant_scope> (the engine has no trusted tenant boundary for a
+C<tenant_field> domain), 422 for every other code. L</request> uses it when
+a handler error has no C<status>.
 
 =head2 canonical_json
 

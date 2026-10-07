@@ -1,6 +1,17 @@
 Revision history for Selecto
 
 Unreleased
+    - A missing tenant scope is refused with 403 through Selecto::API, as
+      in the other runtimes. Selecto::API::error_status now returns 403 for
+      missing_tenant_scope (was 422), so Selecto::API->request answers a
+      handler error with that code and no status with 403, as does the
+      documented host guard that passes status => error_status($code).
+      Changed responses: EngineHandler->query or ->write on a tenant_field
+      domain whose engine has no trusted tenant boundary (and any other
+      missing_tenant_scope a handler returns without a status) now answer
+      403 instead of 422. Unchanged: the code, the body (details {} and the
+      redacted message outside debug_sql), a status the handler sets, the
+      Selecto::Error thrown by the engine and handler, every other code.
     - Queries that name a hidden field are refused as hidden_field (403
       through Selecto::API), as in the other runtimes. Changed responses,
       all from EngineHandler->query: a select entry (plain, object or

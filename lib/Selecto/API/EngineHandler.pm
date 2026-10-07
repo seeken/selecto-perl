@@ -1263,7 +1263,8 @@ still use withheld fields directly through the engine.
 
 Both entry points fail with C<missing_tenant_scope> when the domain has a
 tenant field but the engine has no tenant boundary; see
-L<Selecto::Engine/assert_tenant_boundary>.
+L<Selecto::Engine/assert_tenant_boundary>. Through L<Selecto::API> it
+answers 403, as in the other runtimes.
 
 =head1 CONSTRUCTOR
 
@@ -1403,7 +1404,8 @@ is refused with C<query_rule_unsupported_field> (details C<relation> and
 C<fields>), and inserts must satisfy a root-field required predicate
 (C<query_rule_violation>). Like the other write refusals these are client
 errors: return them through L<Selecto::API> as C<['error', {...}]>, which
-responds 422 with the error code unless you set another status.
+responds 422 with the error code (403 for C<missing_tenant_scope>) unless
+you set another status.
 
 A rolled-back write reports C<cardinality_mismatch> with the expected count
 only.
