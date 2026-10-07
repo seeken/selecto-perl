@@ -1,6 +1,9 @@
 Revision history for Selecto
 
 Unreleased
+    - Trusted adapters may admit native flat array parameters under finite
+      bind-slot, element and conservative wire-byte budgets. Other adapters
+      retain scalar-only parameter admission.
     - Query compilation admits Selecto::Query subclasses used by typed SQL
       pattern builders while retaining depth, size, cycle and reference checks.
     - Native adapters without a DBI handle keep normalized query_error

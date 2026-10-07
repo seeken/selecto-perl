@@ -283,6 +283,75 @@ subtest 'typed query subclasses retain bounded admission' => sub {
         'exact class admission remains the default for other callers';
 };
 
+subtest 'native flat-array parameter admission is adapter-owned and bounded' => sub {
+    my $admit = sub {
+        my ($parameters, %limits) = @_;
+        return Selecto::OperationBudget->new(limits => Selecto::Limits->new(%limits), code => 'invalid_query')
+            ->consume_parameters($parameters, allow_flat_array_parameters => 1);
+    };
+    my $array = ['x', 'y'];
+    my $parameters = [$array];
+    is $admit->($parameters), $parameters, 'outer parameter identity retained';
+    is $parameters->[0], $array, 'native array identity retained';
+    is_deeply $parameters, [['x', 'y']], 'native representation unchanged';
+    for my $case (
+        [max_expression_nodes => 2, 1, [$array]],
+        [max_value_bytes => 11, 10, [$array]],
+        [max_parameter_bytes => 11, 10, [$array]],
+        [max_value_bytes => 2, 1, [[]]],
+        [max_value_bytes => 6, 5, [[undef]]],
+        [max_value_bytes => 10, 9, [["\x{2603}"]]],
+        [max_expression_nodes => 4, 3, [$array, $array]],
+        [max_parameter_bytes => 22, 21, [$array, $array]],
+        [max_generated_parameters => 2, 1, [$array, 'scalar']],
+        [max_parameter_bytes => 12, 11, [$array, 's']],
+    ) {
+        my ($name, $exact, $under, $params) = @$case;
+        is code_of(sub { $admit->($params, $name => $exact) }), 'ok', "$name exact bound accepted";
+        is code_of(sub { $admit->($params, $name => $under) }), 'invalid_query', "$name one over bound refused";
+    }
+    for my $referenced ([1], {}, sub {}, bless([], 'Budget::NativeArray'), bless({}, 'Budget::NativeValue')) {
+        is code_of(sub { $admit->([[$referenced]]) }), 'invalid_query', 'referenced array element refused';
+    }
+    is code_of(sub { $admit->([bless([], 'Budget::NativeArray')]) }), 'invalid_query', 'blessed array parameter refused';
+    my $cycle = []; push @$cycle, $cycle;
+    is code_of(sub { $admit->([$cycle]) }), 'invalid_query', 'cyclic array refused without recursion';
+    is code_of(sub { $adapter->admit_parameters(
+        Selecto::OperationBudget->new(code => 'invalid_query'), [$array]) }), 'invalid_query',
+        'default adapter still refuses native arrays';
+    {
+        package Budget::ArrayAdapter;
+        our @ISA = ('Selecto::PostgreSQL');
+        sub admit_parameters { my ($self, $budget, $params, %options) = @_;
+            $budget->consume_parameters($params, %options, allow_flat_array_parameters => 1) }
+        sub _compile_query { my ($self) = @_;
+            Selecto::Statement->new(sql => 'SELECT ?::text[]::text AS native_array',
+                params => $self->{native_parameters}, columns => ['native_array'], adapter_name => 'postgresql') }
+    }
+    my $native = Budget::ArrayAdapter->new(dbh => Budget::DBH->new, native_parameters => [$array]);
+    my $query = Selecto::Query->new->select('id');
+    my $engine = sub { Selecto::Engine->new(domain => $domain, adapter => $native,
+        limits => Selecto::Limits->new(@_)) };
+    is_deeply $engine->()->compile($query)->params, [$array], 'Engine uses the trusted adapter admission hook';
+    is code_of(sub { $engine->(max_parameter_bytes => 10)->compile($query) }), 'invalid_query',
+        'Engine preserves byte refusal through the hook';
+    is_deeply $native->compile($domain, $query)->params, [$array], 'direct SQL compile uses the hook';
+    {
+        local $native->{_selecto_compile_limits} = Selecto::Limits->new(max_parameter_bytes => 10);
+        is code_of(sub { $native->compile($domain, $query) }), 'invalid_query', 'direct SQL compile preserves byte refusal';
+    }
+    subtest 'live PostgreSQL native array bind' => sub {
+        plan skip_all => 'disposable PostgreSQL is not configured for native array bind'
+            unless $ENV{SELECTO_TEST_PG_DSN} && eval { require DBI; require DBD::Pg; 1 };
+        my $dbh = DBI->connect($ENV{SELECTO_TEST_PG_DSN}, $ENV{PGUSER}, $ENV{PGPASSWORD},
+            {RaiseError => 1, PrintError => 0});
+        my $live = Budget::ArrayAdapter->new(dbh => $dbh, native_parameters => [$array]);
+        my $result = $live->execute_query($live->compile($domain, $query));
+        is_deeply $result->{rows}, [['{x,y}']], 'unmodified array reaches the native driver';
+        $dbh->disconnect;
+    };
+};
+
 subtest 'governed writes refuse at the same limits' => sub {
     my $command = Selecto::Write::Command->new(operation => 'insert', relation => 'records',
         assignments => {id => 1, name => 'abc', tenant_id => 7});

@@ -133,8 +133,9 @@ sub compile {
     # identical checks for this exact query (nested queries are still checked).
     local $self->{adapter}{_selecto_admitted_query} = $query;
     my $statement = $self->{adapter}->compile($self->read_domain, $query);
-    Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')
-        ->consume_parameters($statement->params, label => 'statement parameter');
+    $self->{adapter}->admit_parameters(
+        Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query'),
+        $statement->params, label => 'statement parameter');
     return $statement;
 }
 sub all {
