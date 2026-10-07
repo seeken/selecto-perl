@@ -4,36 +4,62 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  MISE_PERL_VERSION: "5.40.2.1"
+  MISE_PYTHON_VERSION: "3.14.3"
+  SELECTO_ECOSYSTEM_USE_LOCAL: "1"
+  PGUSER: "postgres"
+  PGPASSWORD: "postgres"
+  SELECTO_PERL_TEST_POSTGRES_URL: "postgres://postgres@127.0.0.1:5432/postgres"
+  SELECTO_TEST_PG_DSN: "dbi:Pg:dbname=postgres;host=127.0.0.1;port=5432"
+  SELECTO_PERL_SQLSTATE_TEST_DSN: "dbi:Pg:dbname=postgres;host=/tmp"
+  SELECTO_API_TEST_DATABASE: "postgres"
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   verify:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: selecto_perl_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d selecto_perl_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+    name: Verify Perl library
+    runs-on: [self-hosted, beep-vm]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+        working-directory: selecto-perl
     steps:
-      - uses: actions/checkout@v6
-      - name: Install dependencies
+      - name: Checkout reviewed library
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: selecto-perl
+          persist-credentials: false
+      - name: Set up pinned toolchains
+        uses: jdx/mise-action@94c60b39bc2d90ab2f9bab27f38d3cc4812c1834 # v5.1.0
+        with:
+          version: "2026.10.3"
+          working_directory: selecto-perl
+          install_args: perl@5.40.2.1 python@3.14.3
+          cache: false
+          add_shims_to_path: false
+          env: false
+          export_path: false
+      - name: Install native build prerequisites in disposable guest
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cpanminus libpq-dev
-          sudo cpanm --installdeps .
-          sudo cpanm DBD::Pg
-      - name: Verify distribution
+          sudo apt-get install --yes libpq-dev libsqlite3-dev libssl-dev postgresql-client
+      - name: Verify immutable sources and complete distribution
         env:
-          SELECTO_PERL_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/selecto_perl_test
-        run: perl Makefile.PL && make test
+          SELECTO_CI_EVIDENCE_DIR: ${{ runner.temp }}/selecto-perl-ci-evidence
+          SELECTO_CI_CPAN_DIR: ${{ runner.temp }}/selecto-perl-cpan
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
+        run: mise exec perl@5.40.2.1 python@3.14.3 -- ci/verify
+      - name: Upload bounded CI evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: perl-library-selecto-perl-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/selecto-perl-ci-evidence/*.json
+          if-no-files-found: error

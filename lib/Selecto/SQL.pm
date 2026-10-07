@@ -58,8 +58,9 @@ sub compile {
     my $statement = $self->_compile_query($domain, $query);
     # Selecto::Engine::compile admits these parameters itself, with the same
     # limits, code and label, as soon as this returns.
-    Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')
-        ->consume_parameters($statement->params, label => 'statement parameter')
+    $self->admit_parameters(
+        Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query'),
+        $statement->params, label => 'statement parameter')
         unless _engine_admitted($self, $query);
     return $statement;
 }
@@ -75,7 +76,8 @@ sub _engine_admitted {
 sub _compile_query {
     my ($self, $domain, $query) = @_;
     Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')->check_tree(
-        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)])
+        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
+        allowed_base_classes => ['Selecto::Query'])
         unless _engine_admitted($self, $query);
     my $operations = $query->set_operations;
     Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')

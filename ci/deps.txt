@@ -1,0 +1,10 @@
+da853ff382ae8000e967767ad4ed90c5dc73004858f6dec48fc6f4340c306922 https://cpan.metacpan.org/authors/id/H/HM/HMBRAND/DBI-1.654.tgz
+ba237fe792c93e8c13879c58fead45de2d1185e53793b792db1a3c9e77dd7b55 https://cpan.metacpan.org/authors/id/D/DR/DROLSKY/DateTime-1.67.tar.gz
+c617009adefecbe14cf1c757bd6a964acb23943431fb3a047bdbd87c07c67174 https://cpan.metacpan.org/authors/id/D/DR/DROLSKY/DateTime-TimeZone-2.71.tar.gz
+e35891f4575ffd32168aa415abe595bb52e011cfb00c49fa6522da4e539a601c https://cpan.metacpan.org/authors/id/J/JM/JMCNAMARA/Excel-Writer-XLSX-1.10.tar.gz
+281933d4f9b821f669a3e93a466daaad5596443ea2cb167fa7c019752bce6d66 https://cpan.metacpan.org/authors/id/S/SR/SRI/Mojolicious-9.49.tar.gz
+4f80122e4ea0b05079cad493e386564030f18c8d7b1f9af561df86985a653fe3 https://cpan.metacpan.org/authors/id/I/IS/ISHIGAKI/Text-CSV-2.04.tar.gz
+0a33a7a935be63371071dbe600cfaefa67cd971b67580a917bbf6ebaf723c584 https://cpan.metacpan.org/authors/id/I/IS/ISHIGAKI/DBD-SQLite-1.76.tar.gz
+2c31163d8bdaaf8beaef9c97b8f260432d67a534bc7b69e7265c21cb841432b8 https://cpan.metacpan.org/authors/id/T/TU/TURNSTEP/DBD-Pg-3.16.0.tar.gz
+88efbe2e9a642dceaa186430fedfcf999aaf0e06f6cced28a714b8e56b514921 https://cpan.metacpan.org/authors/id/M/MI/MIYAGAWA/Module-CPANfile-1.1004.tar.gz
+5a8750ddd8ee743d7cc89bebdd542a9b78a34023164ebe19dea0c248e121c21e https://cpan.metacpan.org/authors/id/O/OA/OALDERS/URI-5.37.tar.gz

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Only the disposable beep-vm guest's Docker daemon is used.
+set -eu
+image=docker.io/library/postgres:17-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+name=selecto-perl-ci-postgres
+case ${1:-} in
+  start)
+    test "${SELECTO_CI_RUNNER_KIND:-}" = vm
+    # The API tests require a socket directly in this guest's /tmp.
+    docker run -d --name "$name" --publish 127.0.0.1:5432:5432 \
+      --mount type=bind,src=/tmp,dst=/var/run/postgresql \
+      --tmpfs /var/lib/postgresql:rw,size=1g \
+      --env POSTGRES_HOST_AUTH_METHOD=trust --env POSTGRES_USER=postgres \
+      --env POSTGRES_DB=postgres "$image" >/dev/null
+    ready=0
+    for attempt in $(seq 1 60); do
+      if docker exec "$name" pg_isready -U postgres -d postgres >/dev/null 2>&1; then ready=1; break; fi
+      sleep 1
+    done
+    test "$ready" = 1
+    test -S /tmp/.s.PGSQL.5432
+    version=$(docker exec "$name" psql -U postgres -d postgres -Atc 'show server_version_num')
+    case "$version" in 17[0-9][0-9][0-9][0-9]) ;; *) exit 1 ;; esac
+    mkdir -p "${SELECTO_CI_EVIDENCE_DIR:?}"
+    printf '{"postgres_server_version_num":%s,"image":"%s","socket_ready":true,"isolated_guest":true}\n' "$version" "$image" > "$SELECTO_CI_EVIDENCE_DIR/postgres.json"
+    ;;
+  stop)
+    test "${SELECTO_CI_RUNNER_KIND:-}" = vm
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    ;;
+  *) echo 'usage: postgres-vm start|stop' >&2; exit 2 ;;
+esac
