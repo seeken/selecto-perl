@@ -132,7 +132,8 @@ subtest 'unknown and hidden fields together' => sub {
 subtest 'Selecto::API answers hidden_field with 403' => sub {
     is(Selecto::API::error_status('hidden_field'), 403, 'hidden_field maps to 403');
     is(Selecto::API::error_status($_), 422, "$_ stays 422")
-        for qw(unknown_field field_not_public invalid_api_query missing_tenant_scope);
+        for qw(unknown_field field_not_public invalid_api_query);
+    is(Selecto::API::error_status('missing_tenant_scope'), 403, 'missing_tenant_scope maps to 403');
     is(Selecto::API::error_status(undef), 422, 'no code stays 422');
     my $api = Selecto::API->new(domain => $domain, base_path => '/api');
     my $run = sub {
