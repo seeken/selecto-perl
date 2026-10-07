@@ -1031,8 +1031,10 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
         ) if $column_names{$association}++;
         my $related = $domain->resolve_association($association)->{association};
         my $primary_key = $related->target_primary_key;
-        Selecto::Error->throw('invalid_api_query', 'bounded collection requires a public target primary key')
-            unless defined($primary_key) && $domain->field_is_public("$association.$primary_key");
+        # The key only orders the bounded collection and is never returned, so
+        # an internal key serves this internal use.
+        Selecto::Error->throw('invalid_api_query', 'bounded collection requires a target primary key')
+            unless defined($primary_key);
         my $child_limit = $limits->get('max_collection_rows');
         push @subtables, {
             limit => $child_limit,
