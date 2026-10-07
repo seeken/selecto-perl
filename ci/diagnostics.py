@@ -50,7 +50,7 @@ print JSON::PP->new->canonical->encode({perl=>"$^V", executable=>$^X, architectu
               'python': '.'.join(map(str, __import__('sys').version_info[:3]))}
     evidence = Path(os.environ['SELECTO_CI_EVIDENCE_DIR'])
     evidence.mkdir(parents=True, exist_ok=True)
-    (evidence / 'diagnostics.json').write_text(json.dumps(report, indent=2) + '\n')
+    (evidence / 'runtime-sources.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))
 
 if __name__ == '__main__':
