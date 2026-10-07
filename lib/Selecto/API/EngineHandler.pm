@@ -31,6 +31,11 @@ has max_offset        => 100_000;
 has default_limit     => 100;
 has max_write_count   => 1000;
 has limits => sub { Selecto::Limits->new };
+# Optional trusted host callback ($engine, \@primary_keys) returning
+# {primary_key => version}: publishes the virtual aggregate_version field.
+has 'versioner';
+
+my $MAX_RESOURCE_FIELDS = 50;
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
@@ -52,6 +57,8 @@ sub new ($class, @args) {
     Selecto::Error->throw(
         'invalid_api_handler', 'max_write_count must be positive',
     ) if $self->max_write_count < 1;
+    Selecto::Error->throw('invalid_api_handler', 'versioner must be a callback')
+        if defined($self->versioner) && ref($self->versioner) ne 'CODE';
     $self->max_filter_values($self->limits->get('max_filter_values'))
         if $self->max_filter_values > $self->limits->get('max_filter_values');
     $self->max_fields($self->limits->get('max_fields'))
@@ -216,7 +223,177 @@ sub write_command ($self, $engine, $body) {
     return $command;
 }
 
+# A copy of this handler that publishes aggregate versions through $versioner.
+sub with_versioner ($self, $versioner) {
+    Selecto::Error->throw('invalid_api_handler', 'versioner must be a callback')
+        unless ref($versioner) eq 'CODE';
+    return bless {%$self, versioner => $versioner}, ref($self);
+}
+
 sub query ($self, $engine, $body, %options) {
+    return $self->_query($engine, $body, %options)
+        unless $self->versioner && ref($body) eq 'HASH' && ref($body->{select}) eq 'ARRAY'
+            && grep { _is_version_selection($_) } @{$body->{select}};
+
+    # Each aggregate_version entry becomes a hidden primary-key column, which
+    # is replaced by the host's version for that row once the query has run.
+    Selecto::Error->throw(
+        'invalid_api_host', 'API query handler requires a Selecto engine',
+    ) unless blessed($engine) && $engine->isa('Selecto::Engine');
+    my $key = $engine->domain->primary_key;
+    Selecto::Error->throw('invalid_api_query', 'aggregate_version requires a public primary key')
+        unless defined($key) && $engine->domain->field_is_public($key);
+    my %reserved = map { ($_ => 1) } map { _selection_name($_) } @{$body->{select}};
+    my (@select, @versions);
+    my $sequence = 0;
+    for my $selection (@{$body->{select}}) {
+        unless (_is_version_selection($selection)) {
+            push @select, $selection;
+            next;
+        }
+        my $output = 'aggregate_version';
+        if (ref($selection) eq 'HASH') {
+            my @unknown = sort grep { $_ ne 'field' && $_ ne 'alias' } keys %$selection;
+            Selecto::Error->throw('invalid_api_query',
+                'aggregate_version selection accepts only field and alias', {fields => \@unknown})
+                if @unknown;
+            if (exists $selection->{alias}) {
+                Selecto::Error->throw('invalid_api_query', 'aggregate_version alias is invalid')
+                    unless defined($selection->{alias}) && !ref($selection->{alias})
+                        && "$selection->{alias}" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+                $output = "$selection->{alias}";
+            }
+        }
+        my $alias;
+        do { $alias = '__selecto_version_' . ++$sequence } while $reserved{$alias};
+        $reserved{$alias} = 1;
+        push @select, {field => $key, alias => $alias};
+        push @versions, {output => $output, alias => $alias};
+    }
+    my $result = $self->_query($engine, {%$body, select => \@select}, %options);
+    $self->_inject_versions($engine, $result, \@versions);
+    return $result;
+}
+
+# One resource by primary key: {id => ..., fields => [...] or 'a,b'}. Returns
+# the primary key and the requested public scalar or to-one fields, including
+# aggregate_version when a versioner is configured and it is requested.
+sub resource ($self, $engine, $params) {
+    Selecto::Error->throw(
+        'invalid_api_host', 'API resource handler requires a Selecto engine',
+    ) unless blessed($engine) && $engine->isa('Selecto::Engine');
+    _object($params, 'resource request');
+    my $domain = $engine->domain;
+    my $key = $domain->primary_key;
+    Selecto::Error->throw('invalid_api_query', 'resources require a public primary key')
+        unless defined($key) && $domain->field_is_public($key);
+    my $id = $params->{id};
+    my $key_type = $domain->resolve($key)->{type} // '';
+    Selecto::Error->throw('invalid_api_query', 'resource id is invalid')
+        unless defined($id) && !ref($id) && length("$id") && length("$id") <= 256
+            && ($key_type !~ /int|serial/i || "$id" =~ /\A-?[1-9]\d{0,17}\z/);
+    $id = 0 + $id if $key_type =~ /int|serial/i;
+
+    my $maximum = $MAX_RESOURCE_FIELDS < $self->max_fields - 2
+        ? $MAX_RESOURCE_FIELDS : $self->max_fields - 2;
+    my @fields;
+    for my $value (ref($params->{fields}) eq 'ARRAY' ? @{$params->{fields}} : ($params->{fields} // ())) {
+        Selecto::Error->throw('invalid_api_query', 'fields must be strings') if ref($value);
+        next if !defined($value) || "$value" eq '';
+        for my $field (split /,/, "$value", -1) {
+            $field =~ s/\A\s+|\s+\z//g;
+            Selecto::Error->throw('invalid_api_query', 'fields contains an empty field path')
+                unless length $field;
+            push @fields, $field;
+        }
+    }
+    my %seen = ($key => 1);
+    @fields = grep { !$seen{$_}++ } @fields;
+    Selecto::Error->throw('invalid_api_query', "fields may contain at most $maximum field paths")
+        if @fields > $maximum;
+    # The version is opt-in: computing it costs the versioner a lookup.
+    my $versioned = grep { $_ eq 'aggregate_version' } @fields;
+    @fields = grep { $_ ne 'aggregate_version' } @fields;
+    Selecto::Error->throw('invalid_api_query', 'aggregate_version is not published by this domain',
+        {field => 'aggregate_version'}) if $versioned && !$self->versioner;
+    my @select = ($key, ($versioned ? 'aggregate_version' : ()));
+    for my $field (@fields) {
+        Selecto::Error->throw('invalid_api_query', 'fields contains an invalid field path',
+            {field => $field})
+            unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+        # As in queries: an unknown field fails to resolve, a withheld one is hidden.
+        my $definition = _visible_field_definition($domain, $field);
+        Selecto::Error->throw('invalid_api_query',
+            'fields cannot include to-many relationships; use the query route', {field => $field})
+            if grep { $_->cardinality eq 'many' } @{$definition->{associations} // []};
+        push @select, ($definition->{type} // '') =~ /\A(?:datetime|naive_datetime|utc_datetime|epoch_datetime|timestamp|timestamptz)\z/
+            ? {field => $field, format => 'iso8601'} : $field;
+    }
+    my $result = $self->query($engine, {
+        select => \@select,
+        filters => [{field => $key, op => 'eq', value => $id}],
+        row_format => 'objects', limit => 2,
+    });
+    my $rows = $result->{rows} // [];
+    Selecto::Error->throw('invalid_api_host', 'resource primary key matched more than one row')
+        if @$rows > 1;
+    Selecto::Error->throw('resource_not_found', 'The requested resource is unavailable')
+        unless @$rows;
+    return {%{$rows->[0]}};
+}
+
+sub _inject_versions ($self, $engine, $result, $versions) {
+    my @names = map { ref($_) eq 'HASH' ? ($_->{id} // $_->{field} // '') : "$_" }
+        @{$result->{columns}};
+    my %index = map { ($names[$_] => $_) } 0 .. $#names;
+    my %output;
+    for my $version (@$versions) {
+        Selecto::Error->throw('invalid_api_host', 'query omitted aggregate-version keys')
+            unless exists $index{$version->{alias}};
+        $output{$index{$version->{alias}}} = $version;
+    }
+    my $first = $versions->[0]{alias};
+    my @keys = map {
+        ref($_) eq 'ARRAY' ? $_->[$index{$first}] : ref($_) eq 'HASH' ? $_->{$first} : undef
+    } @{$result->{rows}};
+    my $by_key = $self->versioner->($engine, [grep { defined } @keys]);
+    Selecto::Error->throw('invalid_api_host', 'versioner must return an object')
+        unless ref($by_key) eq 'HASH';
+    my $version_of = sub ($key) {
+        my $version = defined($key) ? $by_key->{$key} : undef;
+        return defined($version) && !ref($version) ? "$version" : undef;
+    };
+    # In place, so the result keeps its bound response limits.
+    $result->{columns} = [map { $output{$_} ? $output{$_}{output} : $result->{columns}[$_] } 0 .. $#names];
+    $result->{rows} = [map {
+        my $row = $_;
+        ref($row) eq 'ARRAY'
+            ? [map { $output{$_} ? $version_of->($row->[$_]) : $row->[$_] } 0 .. $#names]
+            : do {
+                my %shaped = %$row;
+                $shaped{$_->{output}} = $version_of->(delete $shaped{$_->{alias}}) for @$versions;
+                \%shaped;
+            };
+    } @{$result->{rows}}];
+    Selecto::API::ResponsePolicy->check_json({data => $result, ok => JSON::PP::true}, $self->limits);
+    return $result;
+}
+
+sub _is_version_selection ($selection) {
+    return !ref($selection) ? defined($selection) && "$selection" eq 'aggregate_version'
+        : ref($selection) eq 'HASH' && defined($selection->{field}) && !ref($selection->{field})
+            && "$selection->{field}" eq 'aggregate_version';
+}
+
+sub _selection_name ($selection) {
+    return "$selection" if !ref($selection) && defined($selection);
+    return () unless ref($selection) eq 'HASH';
+    return "$selection->{alias}" if defined($selection->{alias}) && !ref($selection->{alias});
+    return "$selection->{field}" if defined($selection->{field}) && !ref($selection->{field});
+    return ();
+}
+
+sub _query ($self, $engine, $body, %options) {
     Selecto::Error->throw(
         'invalid_api_host', 'API query handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
@@ -657,7 +834,25 @@ sub describe_openapi ($self, $api) {
             value => {},
         },
     };
+    $self->_describe_aggregate_version($api) if $self->versioner;
     return $api;
+}
+
+# The virtual aggregate_version column: selectable on queries and returned by
+# resource reads, never filterable, sortable or writable.
+sub _describe_aggregate_version ($self, $api) {
+    my $source = $api->domain->{source};
+    return unless ref($source) eq 'HASH' && ref($source->{columns}) eq 'HASH'
+        && !exists($source->{columns}{aggregate_version});
+    push @{$source->{fields}}, 'aggregate_version';
+    $source->{columns}{aggregate_version} = {
+        type => 'string', label => 'Aggregate Version',
+        read_only => JSON::PP::true,
+        filterable => JSON::PP::false,
+        sortable => JSON::PP::false,
+    };
+    my $hidden = ($api->domain->{components} //= {})->{filter_picker_hidden_paths} //= [];
+    push @$hidden, 'aggregate_version' unless grep { ($_ // '') eq 'aggregate_version' } @$hidden;
 }
 
 sub _write_filters ($self, $domain, $filters) {
@@ -1286,6 +1481,19 @@ All limits are optional non-negative integers:
 
 Throws C<invalid_api_handler> for invalid limits.
 
+C<versioner> is an optional trusted callback that publishes the virtual,
+read-only C<aggregate_version> field:
+
+  versioner => sub {
+      my ($engine, $primary_keys) = @_;
+      return {map { ($_ => version_of($_)) } @$primary_keys};
+  },
+
+It receives the primary keys of the rows a query returned and answers an
+opaque version string for each one it can see; the host decides what a
+version covers (a change timestamp, a content hash). Versions require a
+public primary key.
+
 =head1 METHODS
 
 =head2 query
@@ -1412,17 +1620,38 @@ you set another status.
 A rolled-back write reports C<cardinality_mismatch> with the expected count
 only.
 
+=head2 with_versioner
+
+  my $versioned = $handler->with_versioner(sub { ... });
+
+A copy of the handler with C<versioner> set; the original is unchanged.
+
+=head2 resource
+
+  my $data = $handler->resource($engine, {id => 7, fields => 'name,status'});
+
+One resource by primary key, for L<Selecto::API>'s C<getResource> route. It
+returns the primary key and up to 50 requested public scalar or to-one fields
+(timestamps in ISO 8601). C<aggregate_version> is returned only when
+requested, and only with a versioner configured (otherwise
+C<invalid_api_query>). A withheld field is C<hidden_field>, a to-many one C<invalid_api_query>
+and a missing row C<resource_not_found>.
+
+Queries may select C<aggregate_version> (optionally C<< {field =>
+'aggregate_version', alias => NAME} >>) when a versioner is configured.
+
 =head2 describe_openapi
 
   $handler->describe_openapi($api);
 
 Adds this handler's request schemas and limits to a L<Selecto::API>
-object's OpenAPI document.
+object's OpenAPI document. With a versioner it also lists the read-only
+C<aggregate_version> column in the published domain.
 
 =head1 ERRORS
 
 C<invalid_api_query>, C<invalid_api_write>, C<hidden_field>,
-C<field_not_public>, C<missing_tenant_scope>, plus any engine or
+C<field_not_public>, C<missing_tenant_scope>, C<resource_not_found>, plus any engine or
 query-library error.
 
 =head1 SEE ALSO

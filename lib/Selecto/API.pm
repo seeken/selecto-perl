@@ -20,6 +20,7 @@ has [qw(domain base_path manifest openapi)];
 has limits => sub { Selecto::Limits->new };
 has debug_sql => 0;
 has publish_domain => 0;
+has resources => 0;
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
@@ -30,6 +31,9 @@ sub new ($class, @args) {
         Selecto::Error->throw('invalid_api_host', "$name must be a trusted boolean or callback")
             unless ref($option) eq 'CODE' || (!ref($option) && defined($option) && "$option" =~ /\A[01]\z/);
     }
+    Selecto::Error->throw('invalid_api_host', 'resources must be a boolean')
+        unless !ref($self->resources) && defined($self->resources)
+            && "@{[$self->resources]}" =~ /\A[01]\z/;
     my $domain = $self->domain;
     Selecto::Error->throw(
         'canonical_api_requires_domain_contract',
@@ -46,8 +50,8 @@ sub new ($class, @args) {
     canonical_json($contract);
     $self->domain($contract);
     $self->base_path($base_path);
-    $self->manifest(_manifest($identity, $base_path));
-    $self->openapi(_openapi($identity, $base_path));
+    $self->manifest(_manifest($identity, $base_path, $self->resources));
+    $self->openapi(_openapi($identity, $base_path, $self->resources));
     return $self;
 }
 
@@ -63,6 +67,8 @@ sub request ($self, $request, $handlers = {}) {
     my $path = $request->{path};
     my $body = $request->{body};
     my $route = $self->_route($method, $path);
+    $route->[1]{fields} = $request->{fields}
+        if ref($route) eq 'ARRAY' && $route->[0] eq 'resource' && defined $request->{fields};
     if ($route eq 'domain') {
         return _error_response(403, 'domain_publication_denied',
             'Full domain publication is not enabled for this request')
@@ -99,6 +105,11 @@ sub _route ($self, $method, $path) {
         && $method eq 'POST' && $path eq "$base/query";
     return ['write', {}] if defined($method) && defined($path)
         && $method eq 'POST' && $path eq "$base/write";
+    if ($self->resources && defined($method) && defined($path) && $method eq 'GET'
+        && index($path, "$base/resources/") == 0) {
+        my $id = substr($path, length("$base/resources/"));
+        return ['resource', { id => $id }] if $id ne '' && index($id, '/') < 0;
+    }
     my $prefix = "$base/actions/";
     if (defined($method) && defined($path) && $method eq 'POST'
         && index($path, $prefix) == 0) {
@@ -194,7 +205,13 @@ sub _dispatch ($self, $operation, $params, $body, $request, $handlers) {
             'The response exceeds its resource limit') unless $safe;
         return _query_success($self, $data, $format, $download_filename, $limits)
             if $operation eq 'query';
-        return $self->_bounded_success($data, $limits);
+        my $response = $self->_bounded_success($data, $limits);
+        # A resource's aggregate version doubles as its entity tag.
+        $response->{headers}{etag} = qq{"$data->{aggregate_version}"}
+            if $operation eq 'resource' && $response->{status} == 200 && ref($data) eq 'HASH'
+                && defined($data->{aggregate_version}) && !ref($data->{aggregate_version})
+                && $data->{aggregate_version} =~ /\A[\x21\x23-\x7e]+\z/;
+        return $response;
     }
     my $error = $result->[1];
     return _error_response(
@@ -311,6 +328,7 @@ sub _download_filename ($name, $extension) {
 my %FORBIDDEN_CODES = map { $_ => 1 } qw(hidden_field missing_tenant_scope);
 
 sub error_status ($code) {
+    return 404 if defined($code) && !ref($code) && $code eq 'resource_not_found';
     return defined($code) && !ref($code) && $FORBIDDEN_CODES{$code} ? 403 : 422;
 }
 
@@ -437,7 +455,7 @@ sub _normalize_base_path ($path) {
     return $path;
 }
 
-sub _routes ($base_path) {
+sub _routes ($base_path, $resources = 0) {
     return [
         { method => 'GET', operation_id => 'getDomain', path => "$base_path/domain" },
         { method => 'GET', operation_id => 'getOpenApi', path => "$base_path/openapi.json" },
@@ -448,22 +466,25 @@ sub _routes ($base_path) {
             operation_id => 'executeAction',
             path => "$base_path/actions/{action}",
         },
+        ($resources
+            ? { method => 'GET', operation_id => 'getResource', path => "$base_path/resources/{id}" }
+            : ()),
     ];
 }
 
-sub _manifest ($identity, $base_path) {
+sub _manifest ($identity, $base_path, $resources = 0) {
     return {
         canonical_json => $CANONICAL_JSON,
         domain => $identity,
         format => 'selecto.canonical-domain-api',
         format_version => 1,
-        routes => _routes($base_path),
+        routes => _routes($base_path, $resources),
     };
 }
 
-sub _openapi ($identity, $base_path) {
+sub _openapi ($identity, $base_path, $resources = 0) {
     my %paths;
-    for my $route (@{_routes($base_path)}) {
+    for my $route (@{_routes($base_path, $resources)}) {
         my $operation = {
             operationId => $route->{operation_id},
             responses => {
@@ -477,6 +498,25 @@ sub _openapi ($identity, $base_path) {
                 required => JSON::PP::true,
                 schema => { type => 'string' },
             }];
+        }
+        if ($route->{operation_id} eq 'getResource') {
+            $operation->{summary} = 'Read one resource by primary key';
+            $operation->{parameters} = [
+                { in => 'path', name => 'id', required => JSON::PP::true, schema => { type => 'string' } },
+                {
+                    in => 'query', name => 'fields', required => JSON::PP::false,
+                    description => 'Comma-separated public scalar or to-one field paths. The primary '
+                        . 'key is always returned. Request aggregate_version, when the domain '
+                        . 'publishes it, for the resource version and its ETag. Timestamps are '
+                        . 'returned in ISO 8601 format.',
+                    style => 'form', explode => JSON::PP::false,
+                    schema => { type => 'array', items => { type => 'string' } },
+                },
+            ];
+            $operation->{responses}{200}{headers} = {
+                ETag => { description => 'The aggregate version, when requested', schema => { type => 'string' } },
+            };
+            $operation->{responses}{404} = { description => 'Resource unavailable' };
         }
         if ($route->{operation_id} eq 'queryDomain') {
             $operation->{parameters} = Selecto::API::ResultFormatter->openapi_parameters;
@@ -502,6 +542,7 @@ sub _openapi ($identity, $base_path) {
 sub _response_description ($operation_id) {
     return 'Canonical domain' if $operation_id eq 'getDomain';
     return 'OpenAPI document' if $operation_id eq 'getOpenApi';
+    return 'Resource' if $operation_id eq 'getResource';
     return 'Canonical response';
 }
 
@@ -574,6 +615,8 @@ Relative to C<base_path> (default C</api/v1/selecto>):
   POST /query           handlers->{query}
   POST /write           handlers->{write}
   POST /actions/NAME    handlers->{action}, with {action => NAME}
+  GET  /resources/ID    handlers->{resource}, with {id => ID, fields => ...}
+                        (only when constructed with resources => 1)
 
 Unknown routes return 404 C<route_not_found>; a route without a handler
 returns 501 C<operation_not_implemented>.
@@ -590,6 +633,13 @@ C<name>, C<schema_version>, C<domain_version> and C<domain_fingerprint>
 C<canonical_api_requires_domain_identity>). After construction C<domain>
 holds the contract hash, and C<manifest> and C<openapi> hold the generated
 documents.
+
+C<< resources => 1 >> adds the C<getResource> route, C<GET .../resources/{id}>.
+Pass the request's C<fields> query parameter (a comma-separated string or an
+array) as C<fields> in L</request>; the handler receives it with the C<id>.
+L<Selecto::API::EngineHandler/resource> implements the handler. When the
+resource's data has a scalar C<aggregate_version>, the response carries it,
+quoted, as its C<ETag>.
 
 =head2 request
 
@@ -650,7 +700,8 @@ route list).
 A function (not a method) that returns the HTTP status for a refusal code:
 403 for C<hidden_field> (a query names a field the domain withholds) and
 C<missing_tenant_scope> (the engine has no trusted tenant boundary for a
-C<tenant_field> domain), 422 for every other code. L</request> uses it when
+C<tenant_field> domain), 404 for C<resource_not_found>, 422 for every
+other code. L</request> uses it when
 a handler error has no C<status>.
 
 =head2 canonical_json
