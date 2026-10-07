@@ -98,6 +98,7 @@ sub check_tree {
     my $depth_limit = $options{depth_limit} // ($response ? 'max_response_depth' : 'max_expression_depth');
     my $scalar_limit = $options{scalar_limit};
     my %allowed = map { $_ => 1 } @{$options{allowed_classes} // []};
+    my @allowed_bases = @{$options{allowed_base_classes} // []};
     # A flat stack of (node, depth, leave) triples, visited in the same order
     # as before, without allocating a record per node.
     my (%active, @stack);
@@ -130,8 +131,11 @@ sub check_tree {
             $bytes += $size;
         } else {
             my $type = reftype($node) // '';
+            my $class = blessed($node);
+            my $class_allowed = !$class || $allowed{$class}
+                || grep { UNIVERSAL::isa($node, $_) } @allowed_bases;
             Selecto::Error->throw($self->{code}, "$label contains an unsupported reference")
-                if ($type ne 'ARRAY' && $type ne 'HASH') || (blessed($node) && !$allowed{blessed($node)});
+                if ($type ne 'ARRAY' && $type ne 'HASH') || !$class_allowed;
             my $id = refaddr($node);
             Selecto::Error->throw($self->{code}, "$label contains a cycle") if $active{$id};
             $active{$id} = 1;
@@ -174,6 +178,9 @@ caller copies input. It defaults to C<max_state_bytes>; C<bytes_limit> selects
 another trusted ceiling. Optional C<scalar_limit> checks every scalar leaf;
 omit it for grammars containing identifiers as well as values. Blessed records
 are rejected unless their exact classes occur in trusted C<allowed_classes>.
+Trusted C<allowed_base_classes> may explicitly permit subclasses, as query
+admission does for C<Selecto::Query>. This still traverses their full record
+and applies every node, byte, depth, cycle and nested-reference check.
 C<max_response_bytes> and C<max_import_preview_bytes> select the separate
 response-node/depth defaults. C<nodes_limit> and C<depth_limit> can explicitly
 select another named trusted limit. Depth counts actual container/scalar

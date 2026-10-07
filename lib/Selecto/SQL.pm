@@ -75,7 +75,8 @@ sub _engine_admitted {
 sub _compile_query {
     my ($self, $domain, $query) = @_;
     Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')->check_tree(
-        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)])
+        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
+        allowed_base_classes => ['Selecto::Query'])
         unless _engine_admitted($self, $query);
     my $operations = $query->set_operations;
     Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')

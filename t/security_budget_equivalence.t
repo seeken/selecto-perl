@@ -252,6 +252,37 @@ subtest 'compile still admits queries and parameters at the same limits' => sub 
     }
 };
 
+subtest 'typed query subclasses retain bounded admission' => sub {
+    { package Budget::DerivedQuery; our @ISA = ('Selecto::Query'); }
+    { package Budget::Impostor; sub isa { $_[1] eq 'Selecto::Query' } }
+    my $query = Budget::DerivedQuery->new->select('id')->where(Selecto::Expression->eq('id', 7));
+    my $engine = sub { Selecto::Engine->new(domain => $domain, adapter => $adapter,
+        limits => Selecto::Limits->new(@_)) };
+    is code_of(sub { $engine->()->compile($query) }), 'ok', 'engine accepts a typed query subclass';
+    is code_of(sub { $adapter->compile($domain, $query) }), 'ok', 'direct adapter accepts the same subclass';
+    my $budget = Selecto::OperationBudget->new;
+    $budget->check_tree($query, allowed_classes => ['Selecto::Expression'],
+        allowed_base_classes => ['Selecto::Query']);
+    my $nodes = $budget->{counts}{max_expression_nodes};
+    is code_of(sub { $engine->(max_expression_nodes => $nodes)->compile($query) }), 'ok',
+        'subclass accepts the exact node budget';
+    is code_of(sub { $engine->(max_expression_nodes => $nodes - 1)->compile($query) }), 'invalid_query',
+        'subclass still refuses one node over budget';
+    is code_of(sub { $engine->()->compile(bless({}, 'Budget::Impostor')) }), 'invalid_query',
+        'an overridden isa cannot impersonate the permitted base class';
+    for my $nested (sub { die 'must not run' }, bless({}, 'Budget::Impostor')) {
+        my $bad = Budget::DerivedQuery->new->select('id');
+        $bad->{extra} = $nested;
+        is code_of(sub { $engine->()->compile($bad) }), 'invalid_query', 'unsupported nested reference stays refused';
+    }
+    my $cyclic = Budget::DerivedQuery->new->select('id');
+    $cyclic->{cycle} = $cyclic;
+    is code_of(sub { $engine->()->compile($cyclic) }), 'invalid_query', 'subclass cycle stays refused';
+    is code_of(sub { Selecto::OperationBudget->new(code => 'invalid_query')->check_tree($query,
+        allowed_classes => ['Selecto::Query', 'Selecto::Expression']) }), 'invalid_query',
+        'exact class admission remains the default for other callers';
+};
+
 subtest 'governed writes refuse at the same limits' => sub {
     my $command = Selecto::Write::Command->new(operation => 'insert', relation => 'records',
         assignments => {id => 1, name => 'abc', tenant_id => 7});
