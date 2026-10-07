@@ -53,14 +53,47 @@ sub normalize_execution_result ($self, $result) {
     };
 }
 
+# Driver SQLSTATEs with a stable category, as in the Elixir library's
+# Selecto.Error. Any other SQLSTATE is reported with category database_error.
+our %SQLSTATE_CATEGORIES = (
+    '23505' => 'unique_violation',
+    '23503' => 'foreign_key_violation',
+    '23502' => 'not_null_violation',
+    '23514' => 'check_violation',
+    '57014' => 'query_canceled',
+    '40001' => 'serialization_failure',
+    '40P01' => 'deadlock_detected',
+);
+
+# A driver failure becomes query_error. The driver's SQLSTATE, when it has a
+# specific one, is kept in details.sqlstate with a category, so a host can
+# tell a lock timeout (55P03), deadlock (40P01) or serialization failure
+# (40001) apart and decide whether to retry. Callers must normalize before
+# anything else runs on the handle (rollback, finish), which clears it.
 sub normalize_error ($self, $error) {
     return $error if blessed($error) && $error->isa('Selecto::Error');
     my $cause = blessed($error) ? ref($error) : 'database_error';
+    my %details = (cause => $cause);
+    if (defined(my $sqlstate = $self->driver_sqlstate)) {
+        $details{sqlstate} = $sqlstate;
+        $details{category} = $SQLSTATE_CATEGORIES{$sqlstate} // 'database_error';
+    }
     return Selecto::Error->new(
         code => 'query_error',
         message => 'Execution failed',
-        details => { cause => $cause },
+        details => \%details,
     );
+}
+
+# The handle's current SQLSTATE, or undef when it reports none or only a
+# generic one (00000 success, DBI's S1000 and HY000 general errors).
+sub driver_sqlstate ($self) {
+    my $dbh = $self->{dbh};
+    return undef unless blessed($dbh) && $dbh->can('state');
+    my $state = eval { $dbh->state } // '';
+    return undef unless "$state" =~ /\A[0-9A-Z]{5}\z/;
+    return undef if "$state" eq '00000' || "$state" eq 'S1000' || "$state" eq 'HY000';
+    return "$state";
 }
 
 sub name ($self) { Selecto::Error->throw('invalid_adapter', 'adapter must implement name'); }
@@ -210,6 +243,21 @@ Converts any exception into a L<Selecto::Error>. The default wraps
 non-Selecto errors as C<query_error> with the message "Execution failed" and
 only the error class in its details, so driver messages (which may contain
 connection details) are not exposed.
+
+When the handle reports a specific SQLSTATE, the details also carry
+C<sqlstate> and a C<category>: C<unique_violation>, C<foreign_key_violation>,
+C<not_null_violation>, C<check_violation>, C<query_canceled>,
+C<serialization_failure>, C<deadlock_detected>, or C<database_error> for any
+other code. A host can retry on C<40001>, C<40P01> or a lock timeout
+(C<55P03>) without parsing messages:
+
+  my $ok = eval { $engine->execute_write($command); 1 };
+  my $state = !$ok && ref $@ ? $@->details->{sqlstate} // '' : '';
+  retry() if $state =~ /\A(?:40001|40P01|55P03)\z/;
+
+Adapters must normalize before running anything else on the handle (a
+rollback or C<finish> clears the SQLSTATE). C<driver_sqlstate> returns the
+handle's current one, ignoring C<00000> and the generic C<S1000> and C<HY000>.
 
 =head2 normalize_execution_result
 

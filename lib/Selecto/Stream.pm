@@ -37,9 +37,10 @@ sub next {
         1;
     };
     if (!$ok) {
-        my $error = $@;
+        # Normalize before close, which clears the handle's SQLSTATE.
+        my $error = $self->{normalize_error}->($@);
         $self->close;
-        die $self->{normalize_error}->($error);
+        die $error;
     }
     if (!$available) {
         $self->close;
