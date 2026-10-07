@@ -363,6 +363,25 @@ like $adapter->{last_statement}->sql,
 unlike $adapter->{last_statement}->sql, qr/JOIN "record_lines"/,
     'an explicit subtable does not multiply root rows';
 
+{
+    # An internal child key only orders the bounded collection, an internal use.
+    my $contract = $domain->contract;
+    delete $contract->{domain_fingerprint};
+    $contract->{schemas}{record_lines}{columns}{id}{internal} = 1;
+    my $internal_key_engine = Selecto::Engine->new(
+        domain => Selecto::Domain->parse($contract, strict => 1), adapter => $adapter,
+    );
+    my $internal_key_result = $handler->query($internal_key_engine, {
+        select => ['id', ['lines.sku']],
+    });
+    is_deeply $internal_key_result->{subtables}{lines}{columns}, ['lines.sku'],
+        'a subtable whose child key is internal still runs';
+    like $adapter->{last_statement}->sql, qr/ORDER BY "c_lines"\."id" ASC/,
+        'the internal child key orders the bounded collection';
+    unlike $adapter->{last_statement}->sql, qr/'lines\.id'/,
+        'the internal child key is not returned';
+}
+
 $result = $handler->query($engine, {
     select => ['id', 'lines.sku'],
 });
