@@ -109,6 +109,35 @@ sub rowid_alias {
     return $pk[0]{name};
 }
 
+# Replacement can delete another row or substitute a caller NULL default.
+# Tokenize stored DDL so quoted names/literals and comments are not policies.
+sub _has_replace_policy {
+    my ($ddl) = @_;
+    _fail() unless defined($ddl) && !ref($ddl) && length($ddl) <= 1_048_576;
+    my ($state, $tokens) = (0, 0);
+    pos($ddl) = 0;
+    while (pos($ddl) < length($ddl)) {
+        _fail() if ++$tokens > 65_536;
+        next if $ddl =~ /\G\s+/gc;
+        next if $ddl =~ /\G--[^\n]*(?:\n|\z)/gc;
+        next if $ddl =~ /\G\/\*.*?(?:\*\/|\z)/gcs;
+        if ($ddl =~ /\G(?:'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\])/gc) {
+            $state = 0;
+            next;
+        }
+        if ($ddl =~ /\G([A-Za-z_\x80-\x{10FFFF}][A-Za-z_0-9\$\x80-\x{10FFFF}]*)/gc) {
+            my $word = _upper($1);
+            return 1 if $state == 2 && $word eq 'REPLACE';
+            $state = $state == 1 && $word eq 'CONFLICT' ? 2 : $word eq 'ON' ? 1 : 0;
+            next;
+        }
+        _fail() if $ddl =~ /\G['"`\[]/gc;
+        $ddl =~ /\G./gcs or _fail();
+        $state = 0;
+    }
+    return 0;
+}
+
 sub plan_storage {
     my ($class, $adapter, $commands) = @_;
     my $pending = sub {
@@ -127,6 +156,10 @@ sub plan_storage {
         my $ok = eval {
             $physical = $class->table($adapter, $command->relation);
             _fail() if grep { $_->{hidden} } @{$physical->{columns}};
+            if ($command->operation =~ /\A(?:insert|update|upsert)\z/) {
+                my ($ddl) = $dbh->selectrow_array("SELECT sql FROM main.sqlite_schema WHERE type='table' AND name=? COLLATE NOCASE", undef, $physical->{name});
+                _fail() if _has_replace_policy($ddl);
+            }
             for my $catalog (qw(main temp)) {
                 my ($trigger) = $dbh->selectrow_array("SELECT 1 FROM $catalog.sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE LIMIT 1", undef, $physical->{name});
                 _fail() if $trigger;

@@ -81,6 +81,12 @@ normalizer-added key assignments and the actual upsert update fields. Automatic
 CASCADE, SET NULL and SET DEFAULT deletes remain pending, including an empty
 child relation. NO ACTION and RESTRICT retain native constraint behavior.
 Catalog scans have ceilings of 1,024 main tables and 4,096 FK components.
+INSERT, UPDATE and upsert targets also refuse schema-level `ON CONFLICT REPLACE`.
+That policy can implicitly delete another row or substitute a NULL default,
+effects which are not authorized by the ordinary command. Bounded stored-DDL
+tokenization distinguishes actual policies from quoted names, string values and
+comments. DELETE does not activate conflict replacement, and readonly graph
+anchors remain reads; their other physical authority checks still apply.
 
 A single exact INTEGER primary key in an ordinary rowid table is a generated
 identity only if SQLite has no primary-key index. An explicit NULL submitted for
