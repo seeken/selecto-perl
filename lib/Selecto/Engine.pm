@@ -281,6 +281,7 @@ sub execute_graph {
         writes        => $writes,
         relationships => $writes->{relationships},
         tenant_scope  => $self->{domain}->write_tenant_scope,
+        domain        => $self->{domain},
     });
     my $root_scope = $self->{domain}->write_tenant_scope;
     my $tenants = $self->_trusted_write_tenants($self->{domain}->required_predicate);
@@ -288,7 +289,78 @@ sub execute_graph {
         ($contexts{$node->{id}}, $node->{command}) =
             $self->_validate_graph_node($node, \%contexts, $root_scope, $tenants);
     }
-    return $self->_execute_governed(execute_graph => Selecto::Write::Graph->new(nodes => \@nodes));
+    my $sets = $self->_govern_owned_sets($graph->owned_sets, \@nodes, \%contexts);
+    my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets);
+    $prepared->{_governed_owned_sets} = $sets;
+    return $self->_execute_governed(execute_graph => $prepared);
+}
+
+sub _govern_owned_sets {
+    my ($self, $sets, $nodes, $contexts) = @_;
+    return [] unless @$sets;
+    Selecto::Error->throw('write_capability_missing', 'adapter does not support owned-set sync')
+        unless $self->{adapter}->write_capabilities->{owned_set_sync};
+    my %nodes = map { ($_->{id} => $_) } @$nodes;
+    my %position = map { ($nodes->[$_]{id} => $_) } 0 .. $#$nodes;
+    my %physical;
+    my @prepared;
+    for my $set (@$sets) {
+        my $parent = $contexts->{$set->{parent}};
+        my $edge = $parent->{relationships}{$set->{relationship}};
+        Selecto::Error->throw('write_relation_mismatch', 'owned sync requires a declared writable relationship')
+            unless ref($edge) eq 'HASH' && $edge->{writable} && ref($edge->{domain}) eq 'HASH';
+        Selecto::Error->throw('write_operation_not_enabled', 'relationship does not grant owned sync cleanup')
+            unless ($edge->{ownership} // '') =~ /\A(?:owned|composition)\z/
+                && ($edge->{strategy} // '') eq 'sync' && $edge->{delete_missing}
+                && ref($edge->{allowed_ops}) eq 'ARRAY'
+                && grep { $_ eq 'delete' } @{$edge->{allowed_ops}};
+        my $child = Selecto::Domain->parse($edge->{domain});
+        my $parent_key = $edge->{parent_key} // $parent->{primary_key};
+        my $child_key = $edge->{child_key} // $edge->{foreign_key};
+        my $identity = $edge->{identity_fields};
+        my %identity;
+        Selecto::Error->throw('invalid_domain', 'owned sync requires exact declared stored identity and binding keys')
+            unless defined($parent_key) && exists($parent->{fields}{$parent_key})
+                && ref($parent->{domain}->_field_metadata_view($parent_key)->{computed}) ne 'HASH'
+                && defined($child_key) && exists($child->fields->{$child_key})
+                && ref($child->_field_metadata_view($child_key)->{computed}) ne 'HASH'
+                && ref($identity) eq 'ARRAY' && @$identity
+                && !grep { !defined($_) || ref($_) || $identity{$_}++ || !exists($child->fields->{$_})
+                    || ref($child->_field_metadata_view($_)->{computed}) eq 'HASH' } @$identity;
+        Selecto::Error->throw('invalid_write_graph', 'owned set duplicates a physical relationship')
+            if $physical{join('/', $set->{parent}, $child->table, $parent_key, $child_key)}++;
+        Selecto::Error->throw('invalid_write_graph', 'owned sync parent must affect exactly one row')
+            unless defined($nodes{$set->{parent}}{command}->expected_count)
+                && $nodes{$set->{parent}}{command}->expected_count == 1
+                && $nodes{$set->{parent}}{command}->operation ne 'delete';
+        my %members = map { ($_ => 1) } @{$set->{nodes}};
+        for my $node (@$nodes) {
+            my @matches = grep { $_->{from} eq $set->{parent} && $_->{field} eq $child_key
+                && $_->{key} eq $parent_key } @{$node->{bindings}};
+            next unless $members{$node->{id}} || (@matches && $node->{command}->relation eq $child->table);
+            Selecto::Error->throw('invalid_write_graph', 'owned set must include every row on its exact relationship edge')
+                unless $members{$node->{id}} && @matches == 1 && @{$node->{bindings}} == 1
+                    && $node->{command}->relation eq $child->table
+                    && defined($node->{command}->expected_count) && $node->{command}->expected_count == 1;
+            my $metadata = $node->{command}->metadata;
+            $metadata->{returning} = [@{$metadata->{returning} // []}, @$identity];
+            my %seen;
+            $metadata->{returning} = [grep { !$seen{$_}++ } @{$metadata->{returning}}];
+            $node->{command} = $node->{command}->with_metadata($metadata);
+        }
+        my $root_metadata = $nodes{$set->{parent}}{command}->metadata;
+        $root_metadata->{returning} = [@{$root_metadata->{returning} // []}, $parent_key];
+        my %returned;
+        $root_metadata->{returning} = [grep { !$returned{$_}++ } @{$root_metadata->{returning}}];
+        $nodes{$set->{parent}}{command} = $nodes{$set->{parent}}{command}->with_metadata($root_metadata);
+        my $child_engine = ref($self)->new(domain => $child, adapter => $self->{adapter},
+            scope => $self->{scope}, limits => $self->{limits});
+        my $cleanup = $child_engine->governed_write(Selecto::Write::Command->new(
+            operation => 'delete', relation => $child->table, expected_count => undef));
+        push @prepared, {%$set, parent_key => $parent_key, child_key => $child_key,
+            identity_fields => [@$identity], cleanup => $cleanup};
+    }
+    return [sort { $position{$a->{parent}} <=> $position{$b->{parent}} } @prepared];
 }
 
 # A write command bound to this engine's domain, checked now for earlier
@@ -1276,6 +1348,10 @@ sub _validate_graph_node {
         {relation => $command->relation, graph_node => $node->{id}},
     ) unless $edge->{fields_known};
     my $scope = $edge->{tenant_scope};
+    my $nested_domain = Selecto::Domain->parse($edge->{contract});
+    my $nested_engine = ref($self)->new(domain => $nested_domain, adapter => $self->{adapter},
+        scope => $self->{scope}, limits => $self->{limits});
+    $command = $command->with_assignments($nested_domain->normalize_write_assignments($command->assignments));
     if (!$scope && $root_scope) {
         # A tenant-scoped graph cannot reach a node whose tenant it cannot see.
         Selecto::Error->throw(
@@ -1293,6 +1369,9 @@ sub _validate_graph_node {
         $command, $scope, $self->{scope}{tenant},
         label => $command->relation, details => {graph_node => $node->{id}},
     );
+    my $required = $nested_engine->required_write_guard($command->operation, graph_node => $node->{id});
+    $command = $command->with_scope_predicate(
+        Selecto::QueryEnforcement::combine($command->scope_predicate, $required)) if defined $required;
     my %nested_fields = %{$edge->{fields} // {}};
     $self->_validate_command_against_contract($command,
         ($edge->{fields_known} ? (fields => \%nested_fields) : (fields => undef)),
@@ -1320,6 +1399,7 @@ sub _validate_graph_node {
         writes        => $edge->{writes},
         relationships => $edge->{relationships},
         tenant_scope  => $scope,
+        domain        => $nested_domain,
     }, $command);
 }
 

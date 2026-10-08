@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - SQLite write graphs support explicitly declared owned-set reconciliation.
+      Cleanup uses actual RETURNING identities, whole composite keys and
+      independently derived parent, child tenant and required scopes. Empty
+      sets, exact generated identities, duplicate refusal and late rollback
+      are verified with native in-memory SQLite. Canonical required_filters
+      now guard both reads and writes, including nested domains.
     - SQLite supports typed values, JSON extraction and recursive typed JSON
       containment, JSON/array rowsets, array predicates, UTC calendar formats
       and buckets, FTS5 predicates/ranking, schema metadata and query plans.
