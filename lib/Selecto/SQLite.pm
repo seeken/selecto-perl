@@ -4,6 +4,45 @@ use Mojo::Base 'Selecto::SQL';
 use Selecto::Error ();
 use Selecto::Statement ();
 use Scalar::Util qw(blessed);
+use Selecto::SQLite::Ownership ();
+
+sub ownership_storage {
+    my ($self, @edge) = @_;
+    return Selecto::SQLite::Ownership->verify($self, @edge);
+}
+sub rule_candidate_storage {
+    my ($self, $command) = @_;
+    return Selecto::SQLite::Ownership->rules_storage($self, $command);
+}
+
+sub _admit_graph_storage {
+    my ($self, $graph) = @_;
+    my %nodes = map { ($_->{id} => $_) } @{$graph->nodes};
+    for my $node (@{$graph->nodes}) {
+        for my $binding (@{$node->{bindings}}) {
+            $self->_stable_graph_owner($nodes{$binding->{from}}{command}, $binding->{key});
+            $self->ownership_storage($nodes{$binding->{from}}{command}->relation, $binding->{key},
+                $node->{command}->relation, $binding->{field});
+        }
+    }
+    for my $set (@{$graph->{_governed_owned_sets} // []}) {
+        $self->_stable_graph_owner($nodes{$set->{parent}}{command}, $set->{parent_key});
+        $self->ownership_storage($nodes{$set->{parent}}{command}->relation, $set->{parent_key},
+            $set->{cleanup}->relation, $set->{child_key});
+    }
+}
+sub _stable_graph_owner {
+    my ($self, $command, $key) = @_;
+    return unless exists $command->assignments->{$key};
+    my $changes = $command->operation eq 'update';
+    if ($command->operation eq 'upsert') {
+        my $metadata = $command->metadata;
+        my $updates = $metadata->{upsert_update_fields};
+        $changes = ref($updates) eq 'ARRAY' ? scalar(grep {lc($_) eq lc($key)} @$updates)
+            : !(grep {lc($_) eq lc($key)} @{$metadata->{conflict_target} // []});
+    }
+    Selecto::Error->throw('ownership_storage_not_evaluable', 'SQLite graph ownership keys cannot be reassigned') if $changes;
+}
 
 sub name    { return 'sqlite'; }
 sub dialect { return __PACKAGE__; }
@@ -146,6 +185,8 @@ sub write_capabilities {
     my $capabilities = $self->SUPER::write_capabilities;
     if ($self->_returning_available) {
         $capabilities->{returning} = 1;
+    }
+    if ($self->_returning_available && $self->_sqlite_version_at_least(3, 37, 0)) {
         $capabilities->{write_graph} = 1;
         $capabilities->{owned_set_sync} = 1;
     }

@@ -45,6 +45,13 @@ subtest 'full SQLite version gates' => sub {
     my $old = Selecto->adapter(sqlite => dbh => Local::SQLiteVersion->new('3.34.9'));
     is(error_code(sub { $old->bounded_result_statement(statement('SELECT 1 AS id'), max_cell_bytes => 10, max_rows => 1) }),
         'unsupported_feature', 'materialization is refused before SQLite 3.35.0');
+    for my $version ('3.36.0', '3.37.0') {
+        my $adapter = Selecto->adapter(sqlite => dbh => Local::SQLiteVersion->new($version));
+        for my $capability (qw(write_graph owned_set_sync)) {
+            is($adapter->write_capabilities->{$capability} ? 1 : 0, $version eq '3.37.0' ? 1 : 0,
+                "$capability requires physical catalog proof for $version");
+        }
+    }
 };
 
 subtest 'read-only query and stream boundaries preserve caller state' => sub {

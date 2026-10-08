@@ -1,6 +1,7 @@
 Changes
 cpanfile
 docs/action-preconditions.md
+docs/data-rules-native.md
 docs/analytics-units.md
 docs/duckdb-result-transport.md
 lib/Selecto.pm
@@ -21,6 +22,7 @@ lib/Selecto/API/ResultFormatter.pm
 lib/Selecto/CannedPage.pm
 lib/Selecto/CoDomain.pm
 lib/Selecto/DataRules.pm
+lib/Selecto/RuleTest.pm
 lib/Selecto/DateFormat.pm
 lib/Selecto/DateShortcut.pm
 lib/Selecto/Document/Engine.pm
@@ -53,6 +55,7 @@ lib/Selecto/QueryMember.pm
 lib/Selecto/Retarget.pm
 lib/Selecto/SQL.pm
 lib/Selecto/SQLite.pm
+lib/Selecto/SQLite/Ownership.pm
 lib/Selecto/Statement.pm
 lib/Selecto/Stream.pm
 lib/Selecto/ValueExpression.pm
@@ -91,6 +94,10 @@ t/canned_page_redaction.t
 t/co_domain.t
 t/computed_coalesce.t
 t/data_rules.t
+t/portable_rules.t
+t/portable_rule_writes.integration.t
+t/sqlite_ownership.integration.t
+t/sqlite_rule_storage.integration.t
 t/date_shortcut.t
 t/decode_rows.t
 t/decode_rows_wide.t
@@ -166,6 +173,8 @@ t/bounded_write.t
 t/security_sql_boundaries.t
 docs/security-boundaries.md
 script/importer-memory-check
+script/rules-package-consumer
+script/verify-rules-package
 t/security_boundaries_live.t
 lib/Selecto/PostgreSQL/Stream.pm
 lib/Selecto/PostgreSQL/StatementCache.pm

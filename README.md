@@ -350,6 +350,11 @@ print $@->code, "\n";                                  # cardinality_mismatch
 `perldoc Selecto::Action` covers inputs, variants, bulk targets and
 single-use grants for confirm-then-execute flows.
 
+Domains can also declare all 27 portable DataRules operators and six text
+normalizers. Public writes and collection actions evaluate actual prospective
+stored candidates before dispatch. See [native rule admission](docs/data-rules-native.md)
+for input boundaries, resource limits and explicit SQLite refusals.
+
 ### Errors
 
 Every failure Selecto raises is a `Selecto::Error` exception with a stable

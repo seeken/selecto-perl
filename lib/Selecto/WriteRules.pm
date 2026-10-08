@@ -2,7 +2,7 @@ package Selecto::WriteRules;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed refaddr);
 use Storable qw(dclone);
 use JSON::PP ();
 use Math::BigInt ();
@@ -12,6 +12,7 @@ use Selecto::Error ();
 use Selecto::Query ();
 use Selecto::Expression ();
 use Selecto::QueryEnforcement ();
+our $HYDRATION;
 
 sub has_rules {
     my ($class, $domain, $operation) = @_;
@@ -31,6 +32,8 @@ sub _predicate {
 }
 sub rows {
     my ($class, $engine, $predicate, $maximum) = @_;
+    $maximum = 1000 - $HYDRATION->{loaded}
+        if $HYDRATION && $maximum > 1000 - $HYDRATION->{loaded};
     my $fields = _fields($engine->domain);
     my $query = Selecto::Query->new->select(@$fields)->limit($maximum + 1);
     $query = $query->where($predicate) if defined $predicate;
@@ -38,6 +41,7 @@ sub rows {
     _pending('candidate provider did not establish a complete bounded snapshot')
         if exists($result->{complete}) && !$result->{complete};
     _pending('stored candidate exceeds its row bound') if @{$result->{rows}} > $maximum;
+    $HYDRATION->{loaded} += @{$result->{rows}} if $HYDRATION;
     return [map { my $row = $_; _typed_subject($engine,
         +{map { ($fields->[$_] => $row->[$_]) } 0 .. $#$fields}) } @{$result->{rows}}];
 }
@@ -50,9 +54,16 @@ sub _check_storage {
             $fields{$_->[0]} = 1 for @{$rules->applicable_paths($stage, $command->operation)};
         }
     }
+    _pending('SQLite rule candidates require supported physical scalar types')
+        if grep { exists($engine->domain->fields->{$_})
+            && lc($engine->domain->fields->{$_}) !~ /\A(?:integer|decimal|string|boolean)\z/ } keys %fields;
     my %types = map { ($_ => lc($engine->domain->fields->{$_})) }
-        grep { exists($engine->domain->fields->{$_}) && lc($engine->domain->fields->{$_}) =~ /\A(?:integer|decimal|string|boolean)\z/ } keys %fields;
-    my $ok = eval { $engine->adapter->insert_admission_storage($command, \%types); 1 };
+        grep { exists($engine->domain->fields->{$_}) } keys %fields;
+    my $ok = eval {
+        $engine->adapter->rule_candidate_storage($command) if $engine->adapter->can('rule_candidate_storage');
+        $engine->adapter->insert_admission_storage($command, \%types);
+        1;
+    };
     _pending('SQLite cannot establish trigger-free ordinary storage for required rules') unless $ok;
 }
 sub candidate {
@@ -85,17 +96,105 @@ sub evaluate {
     my ($class, $rules, $stage, $operation, $subject, %options) = @_;
     my $paths = $rules->applicable_paths($stage, $operation, $options{action});
     return $subject unless @$paths;
-    _pending('external evidence is not an authoritative stored candidate') if $stage eq 'evidence';
-    _pending() if grep { !_at($subject, $_) } @$paths;
-    my $result = $rules->evaluate(stage => $stage, operation => $operation, subject => $subject,
+    my $consumed = $rules->consumed_paths($stage, $operation, $options{action});
+    my $unknown;
+    if ($stage eq 'input' || $stage eq 'action_input') {
+        $unknown = grep { _unknown_input($subject, $_) } @$consumed;
+        $subject = _clean_input($subject);
+    } else {
+        $unknown = grep { !_known_path($options{domain}, $subject, $_) } @$consumed;
+    }
+    my $method = $options{test_only} ? '_recheck' : 'evaluate';
+    my $result = $rules->$method(stage => $stage, operation => $operation, subject => $subject,
         ($stage eq 'transaction' ? (authoritative_stage => 'transaction') : ()),
         (defined($options{action}) ? (action => $options{action}) : ()));
+    Selecto::Error->throw('evaluation_limit', 'rule evaluation exceeds its finite resource budget')
+        if ($result->{code} // '') eq 'evaluation_limit';
+    _pending('consumed input or prospective candidate is unknown') if $unknown;
     if ($result->{state} ne 'passed') {
         _pending() if $result->{state} eq 'pending' || $result->{state} eq 'error';
         Selecto::Error->throw('data_rule_failed', 'required domain data rule failed',
             {rule_code => $result->{code}, path => $result->{path}});
     }
     return $result->{normalized};
+}
+sub literal_input {
+    my ($class, $command) = @_;
+    Selecto::Error->throw('invalid_write', 'rule input requires a write command')
+        unless blessed($command) && $command->isa('Selecto::Write::Command');
+    my $values = $command->assignments;
+    for my $field (keys %$values) {
+        my $value = $values->{$field};
+        $values->{$field} = $value->arguments->[0]
+            if blessed($value) && $value->isa('Selecto::Write::Expression') && $value->kind eq 'literal';
+    }
+    return $values;
+}
+sub _unknown_input {
+    my ($value, $path) = @_;
+    return blessed($value) && !JSON::PP::is_bool($value) unless @$path;
+    return 1 if blessed($value) && !JSON::PP::is_bool($value);
+    my ($head, @tail) = @$path;
+    if (ref($head) eq 'HASH') {
+        return _unknown_value($value) if $head->{complete};
+        return 0 unless ref($value) eq 'ARRAY';
+        return scalar(grep { _unknown_input($_, \@tail) } @$value);
+    }
+    return 0 unless ref($value) eq 'HASH' && exists $value->{$head};
+    return _unknown_input($value->{$head}, \@tail);
+}
+sub _unknown_value {
+    my ($value, $active, $depth) = @_;
+    $active //= {}; $depth //= 0;
+    return 1 if $depth > 64 || blessed($value) && !JSON::PP::is_bool($value);
+    return 0 unless ref($value) eq 'ARRAY' || ref($value) eq 'HASH';
+    my $id = refaddr($value);
+    return 1 if $active->{$id};
+    local $active->{$id} = 1;
+    return scalar(grep { _unknown_value($_, $active, $depth + 1) }
+        ref($value) eq 'ARRAY' ? @$value : values %$value);
+}
+sub _clean_input {
+    my $value = shift;
+    return undef if blessed($value) && !JSON::PP::is_bool($value);
+    return [map { _clean_input($_) } @$value] if ref($value) eq 'ARRAY';
+    return {map { ($_ => _clean_input($value->{$_})) }
+        grep { !blessed($value->{$_}) || JSON::PP::is_bool($value->{$_}) } keys %$value} if ref($value) eq 'HASH';
+    return $value;
+}
+sub _known_path {
+    my ($domain, $value, $path) = @_;
+    return !(blessed($value) && !JSON::PP::is_bool($value)) unless @$path;
+    my ($head, @tail) = @$path;
+    if (ref($head) eq 'HASH') {
+        if ($head->{each}) {
+            return 1 unless ref($value) eq 'ARRAY';
+            return !grep { !_known_path($domain, $_, \@tail) } @$value;
+        }
+        return _complete_rows($domain, $value);
+    }
+    return 0 unless ref($value) eq 'HASH' && exists $value->{$head};
+    my $edges = $domain ? $domain->writes->{relationships} // {} : {};
+    my $edge = ref($edges->{$head}) eq 'HASH' ? $edges->{$head} : {};
+    my $child = $edge->{domain};
+    $domain = ref($child) eq 'HASH' ? Selecto::Domain->parse($child) : undef;
+    return _known_path($domain, $value->{$head}, \@tail);
+}
+sub _complete_rows {
+    my ($domain, $value) = @_;
+    return 0 if blessed($value) && !JSON::PP::is_bool($value);
+    return 1 unless $domain && ref($value) eq 'ARRAY';
+    for my $row (@$value) {
+        next unless ref($row) eq 'HASH';
+        return 0 if grep { !exists($row->{$_}) || blessed($row->{$_}) && !JSON::PP::is_bool($row->{$_}) } keys %{$domain->fields};
+        for my $name (keys %{$domain->writes->{relationships} // {}}) {
+            my $edge = $domain->writes->{relationships}{$name};
+            next unless ($edge->{ownership} // '') =~ /\A(?:owned|composition)\z/;
+            return 0 unless exists($row->{$name}) && ref($edge->{domain}) eq 'HASH'
+                && _complete_rows(Selecto::Domain->parse($edge->{domain}), $row->{$name});
+        }
+    }
+    return 1;
 }
 sub _typed_subject {
     my ($engine, $subject) = @_;
@@ -125,7 +224,9 @@ sub _typed_subject {
             if ($engine->adapter->name eq 'sqlite') {
                 my ($stored) = $engine->adapter->dbh->selectrow_array('SELECT CAST(? AS NUMERIC)', undef, $value);
                 _pending('SQLite decimal candidate is non-finite') if !defined($stored) || "$stored" =~ /inf|nan/i;
-                $value = Math::BigFloat->new("$stored")->bstr;
+                # Retain the actual native scalar kind. Turning a projected
+                # numeric value back into text would make type.is coerce.
+                $value = $stored;
             }
         } elsif ($type eq 'boolean') {
             _pending('boolean candidate requires a canonical stored scalar')
@@ -137,35 +238,49 @@ sub _typed_subject {
     return \%values;
 }
 sub _normalize {
-    my ($class, $engine, $command, $values) = @_;
+    my ($class, $engine, $command, $values, $submitted) = @_;
     my $rules = $engine->domain->rules;
-    return ($command, $values) unless $rules;
     $values = _typed_subject($engine, $values);
+    return ($command, $values) unless $rules;
     my $before = dclone($values);
-    my $input = _typed_subject($engine, $command->assignments);
-    $input = $class->evaluate($rules, 'input', $command->operation, $input);
-    $values = {%$values, %$input};
-    $values = $class->evaluate($rules, $_, $command->operation, $values) for qw(candidate transaction evidence);
+    my $original_input = $submitted // $class->literal_input($command);
+    my $input = $class->evaluate($rules, 'input', $command->operation, $original_input);
+    # Unchanged raw inputs must never replace an already projected storage value.
+    for my $field (keys %$input) {
+        next if blessed($input->{$field}) && !JSON::PP::is_bool($input->{$field});
+        $values->{$field} = $input->{$field} if !exists($original_input->{$field})
+            || _changed($input->{$field}, $original_input->{$field});
+    }
+    $values = _typed_subject($engine, $values);
+    $values = $class->evaluate($rules, $_, $command->operation, $values, domain => $engine->domain) for qw(candidate transaction evidence);
+    $values = _typed_subject($engine, $values);
+    $values = $class->evaluate($rules, 'candidate', $command->operation, $values,
+        domain => $engine->domain, test_only => 1);
     my $assignments = $command->assignments;
     for my $field (keys %$values) {
         next unless exists($engine->domain->fields->{$field});
-        my $changed = !exists($before->{$field}) || JSON::PP->new->canonical->encode([$values->{$field}]) ne JSON::PP->new->canonical->encode([$before->{$field}]);
+        my $changed = !exists($before->{$field}) || _changed($values->{$field}, $before->{$field});
         $assignments->{$field} = $values->{$field} if exists($assignments->{$field}) || $changed;
     }
-    return ($command->with_assignments($assignments), $values);
+    my $normalized = $command->with_assignments($assignments);
+    _check_storage($engine, $normalized) unless $normalized->operation eq 'update' && !keys %$assignments;
+    return ($normalized, $values);
 }
+sub _changed { JSON::PP->new->canonical->encode([$_[0]]) ne JSON::PP->new->canonical->encode([$_[1]]) }
 sub govern {
-    my ($class, $engine, $command) = @_;
+    my ($class, $engine, $command, %options) = @_;
     return $command unless $class->has_rules($engine->domain, $command->operation);
+    local $HYDRATION = $HYDRATION // {loaded => 0};
     _check_storage($engine, $command);
     my $relationships = $engine->domain->writes->{relationships} // {};
     if (grep { my $stage = $_; grep { exists($relationships->{$_->[0]}) }
         @{$engine->domain->rules->applicable_paths($stage, $command->operation)} } qw(candidate transaction evidence)) {
         my ($graph, $contexts) = $engine->_prepared_graph(Selecto::Write::Graph->new(nodes => [{id => 'root', command => $command}]));
+        $contexts->{root}{rule_input} = $options{input} if defined $options{input};
         return $class->admit_graph($engine, $graph, $contexts)->nodes->[0]{command};
     }
     my $values = $class->candidate($engine, $command);
-    my ($normalized) = $class->_normalize($engine, $command, $values);
+    my ($normalized) = $class->_normalize($engine, $command, $values, $options{input});
     return $engine->governed_write($normalized);
 }
 sub _key {
@@ -181,6 +296,7 @@ sub _key {
 }
 sub admit_graph {
     my ($class, $root, $graph, $contexts) = @_;
+    local $HYDRATION = $HYDRATION // {loaded => 0};
     my @nodes = @{$graph->nodes};
     my %nodes = map { ($_->{id} => $_) } @nodes;
     my %engines = map { ($_ => ref($root)->new(domain => $contexts->{$_}{domain},
@@ -235,6 +351,10 @@ sub admit_graph {
                 scope => $root->scope, limits => $root->limits);
             my $parent_key = $edge->{parent_key} // $engine->domain->primary_key;
             my $child_key = $edge->{child_key} // $edge->{foreign_key};
+            _pending('stored collection ownership key cannot be reassigned')
+                if $command->operation ne 'insert' && exists($command->assignments->{$parent_key});
+            $root->adapter->ownership_storage($engine->domain->table, $parent_key,
+                $domain->table, $child_key) if $root->adapter->can('ownership_storage');
             my $owner_value = $candidate->{$parent_key};
             my $final = [];
             if ($command->operation ne 'insert') {
@@ -286,7 +406,12 @@ sub admit_graph {
             _pending('final candidate collection exceeds its bound') if @$final > 1000;
             $candidate->{$name} = $final;
         }
-        my ($normalized, $result) = $class->_normalize($engine, $command, $candidate);
+        my ($normalized, $result) = $class->_normalize($engine, $command, $candidate, $contexts->{$id}{rule_input});
+        for my $name (keys %names) {
+            my $key = $relationships->{$name}{parent_key} // $engine->domain->primary_key;
+            _pending('normalizers cannot change collection ownership keys')
+                if exists($candidate->{$key}) && exists($result->{$key}) && _changed($candidate->{$key}, $result->{$key});
+        }
         my $assignments = $normalized->assignments;
         for my $binding (@{$node->{bindings}}) {
             _pending('normalizers cannot change generated ownership bindings')

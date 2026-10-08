@@ -1,6 +1,16 @@
 Revision history for Selecto
 
 Unreleased
+    - Implement the complete 27-operator DataRules v1 AST and six text
+      normalizers with exact arithmetic, bounded ASCII patterns, shared
+      resource budgets and unconditional advisory/condition resource errors.
+    - Preserve submitted INPUT values separately from physical SQLite
+      candidates; consumed generated fields remain pending across logical
+      branches and conditions. Batch inserts preflight all rules before DML.
+    - Prove native graph/owned-set ownership with actual key affinities,
+      collations, complete single-key uniqueness and every present FK group.
+      Protected candidate storage refuses generated columns and automatic
+      foreign-key updates outside the admitted plan.
     - Govern native SQLite stored candidates and complete child collections inside
       their write transaction, applying required rules and normalizers before writes.
     - Execute owned one-root action collection patches with policy-scoped read
