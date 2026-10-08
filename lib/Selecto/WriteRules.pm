@@ -61,7 +61,7 @@ sub _check_storage {
         grep { exists($engine->domain->fields->{$_}) } keys %fields;
     my $ok = eval {
         $engine->adapter->rule_candidate_storage($command) if $engine->adapter->can('rule_candidate_storage');
-        $engine->adapter->insert_admission_storage($command, \%types);
+        $engine->adapter->insert_admission_storage($command, \%types, for_rules => 1);
         1;
     };
     _pending('SQLite cannot establish trigger-free ordinary storage for required rules') unless $ok;
@@ -252,8 +252,12 @@ sub _normalize {
             || _changed($input->{$field}, $original_input->{$field});
     }
     $values = _typed_subject($engine, $values);
+    $values = $engine->adapter->rule_project_subject($command, $values)
+        if $engine->adapter->can('rule_project_subject');
     $values = $class->evaluate($rules, $_, $command->operation, $values, domain => $engine->domain) for qw(candidate transaction evidence);
     $values = _typed_subject($engine, $values);
+    $values = $engine->adapter->rule_project_subject($command, $values)
+        if $engine->adapter->can('rule_project_subject');
     $values = $class->evaluate($rules, 'candidate', $command->operation, $values,
         domain => $engine->domain, test_only => 1);
     my $assignments = $command->assignments;

@@ -46,7 +46,20 @@ subtest 'SQLite preflight refuses before triggers' => sub {
     for my $op(qw(UPDATE DELETE)) {
         $dbh->do("CREATE TRIGGER observe_$op BEFORE $op ON bounded_items BEGIN SELECT observe_change(); END");
     }
-    exercise('sqlite',$dbh,sub{$count});
+    for my $op(qw(update delete)) {
+        for my $expected(1,2) {
+            my $engine=Selecto::Engine->new(domain=>TestSelecto::writable_domain(
+                name=>'Bounded items',table=>'bounded_items',fields=>{id=>'integer',name=>'string'}),
+                adapter=>Selecto->adapter(sqlite=>(dbh=>$dbh)));
+            eval {$engine->execute_write(command($expected,$op))};
+            is $@->code,'required_data_rule_pending','trigger target needs physical mutation authority';
+            is $count,0,'no row trigger runs before authority refusal';
+            is $dbh->selectrow_array('SELECT COUNT(*) FROM bounded_items'),2,'trigger target rows remain intact';
+        }
+    }
+    $dbh->do('DROP TRIGGER observe_UPDATE');$dbh->do('DROP TRIGGER observe_DELETE');
+    my $before=$dbh->selectrow_array('SELECT total_changes()');
+    exercise('sqlite',$dbh,sub{$dbh->selectrow_array('SELECT total_changes()')-$before});
 };
 
 subtest 'PostgreSQL preflight refuses before nontransactional trigger effects' => sub {

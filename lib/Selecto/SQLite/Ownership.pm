@@ -2,6 +2,7 @@ package Selecto::SQLite::Ownership;
 use 5.034;
 use strict;
 use warnings;
+use Selecto::QueryEnforcement ();
 use Selecto::Error ();
 use Selecto::Identifier ();
 
@@ -93,6 +94,72 @@ sub rules_storage {
             $target = $pk[$fk->{seq}]{name} if (!defined($target) || $target eq '') && exists $pk[$fk->{seq}];
             next unless defined($target) && $assigned{_lower($target)};
             _fail() unless ($fk->{on_update} // '') =~ /\A(?:NO ACTION|RESTRICT)\z/;
+        }
+    }
+    return 1;
+}
+
+sub rowid_alias {
+    my ($class, $adapter, $table) = @_;
+    return if $table->{wr};
+    my @pk = grep { $_->{pk} } @{$table->{columns}};
+    return unless @pk == 1 && _upper($pk[0]{type}) eq 'INTEGER';
+    my $indexes = $adapter->dbh->selectall_arrayref('PRAGMA main.index_list(' . $adapter->quote_identifier($table->{name}) . ')', {Slice => {}});
+    return if grep { ($_->{origin} // '') eq 'pk' } @$indexes;
+    return $pk[0]{name};
+}
+
+sub plan_storage {
+    my ($class, $adapter, $commands) = @_;
+    my $pending = sub {
+        my ($command) = @_;
+        my $guarded_insert = $command && $command->operation eq 'insert'
+            && Selecto::QueryEnforcement::combine($command->predicate, $command->scope_predicate,
+                $command->query_enforcement ? $command->query_enforcement->predicate : undef);
+        Selecto::Error->throw($guarded_insert ? 'query_rule_not_evaluable' : 'required_data_rule_pending',
+            'SQLite cannot prove all physical mutation effects belong to the governed plan');
+    };
+    my $dbh = $adapter->dbh;
+    $pending->() unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'SQLite' };
+    my %targets;
+    for my $command (@$commands) {
+        my $physical;
+        my $ok = eval {
+            $physical = $class->table($adapter, $command->relation);
+            _fail() if grep { $_->{hidden} } @{$physical->{columns}};
+            for my $catalog (qw(main temp)) {
+                my ($trigger) = $dbh->selectrow_array("SELECT 1 FROM $catalog.sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE LIMIT 1", undef, $physical->{name});
+                _fail() if $trigger;
+            }
+            1;
+        };
+        $pending->($command) unless $ok;
+        $targets{_lower($command->relation)} = $physical;
+    }
+    my @relevant = grep { $_->operation =~ /\A(?:update|upsert|delete)\z/ } @$commands;
+    return 1 unless @relevant;
+    my $tables = $dbh->selectall_arrayref("SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1025", {Slice => {}});
+    $pending->() if @$tables > 1024;
+    my $count = 0;
+    for my $table (@$tables) {
+        my $foreign = $dbh->selectall_arrayref('PRAGMA main.foreign_key_list(' . $adapter->quote_identifier($table->{name}) . ')', {Slice => {}});
+        $count += @$foreign; $pending->() if $count > 4096;
+        for my $fk (@$foreign) {
+            for my $command (@relevant) {
+                next unless _same($fk->{table}, $command->relation);
+                my $deletion = $command->operation eq 'delete';
+                my $action = _upper($fk->{$deletion ? 'on_delete' : 'on_update'});
+                next if $action eq 'NO ACTION' || $action eq 'RESTRICT';
+                $pending->() unless $action =~ /\A(?:CASCADE|SET NULL|SET DEFAULT)\z/;
+                $pending->() if $deletion;
+                my $fields = $command->operation eq 'upsert' ? $command->metadata->{upsert_update_fields} : [keys %{$command->assignments}];
+                $pending->() unless ref($fields) eq 'ARRAY';
+                my @pk = sort { $a->{pk} <=> $b->{pk} } grep { $_->{pk} } @{$targets{_lower($command->relation)}{columns}};
+                my $key = $fk->{to};
+                $key = $pk[$fk->{seq}]{name} if (!defined($key) || $key eq '') && exists($pk[$fk->{seq}]);
+                $pending->() unless defined($key) && length($key);
+                $pending->() if grep { _same($_, $key) } @$fields;
+            }
         }
     }
     return 1;

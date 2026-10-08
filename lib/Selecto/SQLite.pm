@@ -15,6 +15,32 @@ sub rule_candidate_storage {
     return Selecto::SQLite::Ownership->rules_storage($self, $command);
 }
 
+sub preview_write {
+    my ($self, $command) = @_;
+    # A compiler-only host has no native connection whose storage can be admitted.
+    return $self->SUPER::preview_write($command)
+        unless eval { $self->dbh->isa('DBI::db') && $self->dbh->{Driver}{Name} eq 'SQLite' };
+    return $self->_transaction(sub {
+        $self->_admit_plan_storage([$command]);
+        return $self->SUPER::preview_write($command);
+    });
+}
+
+sub _admit_plan_storage {
+    my ($self, $commands, $cleanup) = @_;
+    return Selecto::SQLite::Ownership->plan_storage($self, [@$commands, @{$cleanup // []}]);
+}
+
+sub rule_project_subject {
+    my ($self, $command, $values) = @_;
+    return $values unless $command->operation eq 'insert';
+    my $table = Selecto::SQLite::Ownership->table($self, $command->relation);
+    my $alias = Selecto::SQLite::Ownership->rowid_alias($self, $table);
+    my %projected = %$values;
+    delete $projected{$alias} if defined($alias) && exists($projected{$alias}) && !defined($projected{$alias});
+    return \%projected;
+}
+
 sub _admit_graph_storage {
     my ($self, $graph) = @_;
     my %nodes = map { ($_->{id} => $_) } @{$graph->nodes};
@@ -101,7 +127,7 @@ sub normalize_type {
 }
 
 sub insert_admission_storage {
-    my ($self, $command, $types) = @_;
+    my ($self, $command, $types, %opts) = @_;
     my $dbh = $self->dbh;
     my $fail = sub { Selecto::Error->throw('query_rule_not_evaluable',
         'SQLite cannot establish the guarded insert storage contract'); };
@@ -120,9 +146,14 @@ sub insert_admission_storage {
     }
     my $rows = $dbh->selectall_arrayref('PRAGMA main.table_xinfo(' . $self->quote_identifier($table) . ')', {Slice => {}});
     my %columns = map { $_->{name} => $_ } @$rows;
+    my $physical = Selecto::SQLite::Ownership->table($self, $table);
+    my $alias = Selecto::SQLite::Ownership->rowid_alias($self, $physical);
     my %storage;
     for my $field (keys %$types) {
         $fail->() unless exists($columns{$field}) && !$columns{$field}{hidden};
+        my $value = $command->assignments->{$field};
+        $value = $value->arguments->[0] if blessed($value) && $value->isa('Selecto::Write::Expression') && $value->kind eq 'literal';
+        $fail->() if !$opts{for_rules} && defined($alias) && $field eq $alias && exists($command->assignments->{$field}) && !defined($value);
         my $metadata = $dbh->sqlite_table_column_metadata('main', $table, $field);
         $fail->() unless ref($metadata) eq 'HASH';
         my $declared = uc($metadata->{data_type} // '');
