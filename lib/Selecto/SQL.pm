@@ -943,6 +943,7 @@ sub execute_graph_unsafe {
         unless $self->write_capabilities->{write_graph};
 
     my $work = sub {
+        $self->_admit_graph_storage($graph) if $self->can('_admit_graph_storage');
         my %results;
         for my $node (@{$graph->nodes}) {
             my $operation = $node->{command}->operation;

@@ -47,10 +47,8 @@ sub plan {
 
     my $rules = defined($contract->{rules}) ? Selecto::DataRules->parse($contract->{rules}) : undef;
     if ($rules) {
-        Selecto::Error->throw('required_data_rule_pending', 'action rule requires an unknown authored system value')
-            if grep { !Selecto::WriteRules::_at($inputs, $_) } @{$rules->applicable_paths('action_input', $operation, $action_id)};
         my $display = _display_values($inputs);
-        my $normalized = Selecto::WriteRules->evaluate($rules, 'action_input', $operation, $display, action => $action_id);
+        my $normalized = Selecto::WriteRules->evaluate($rules, 'action_input', $operation, $inputs, action => $action_id);
         $inputs->{$_} = $normalized->{$_} for grep { !_same_value($normalized->{$_}, $display->{$_}) } keys %$normalized;
     }
     my $changes = _resolve_template($execution->{set} // {}, $inputs);

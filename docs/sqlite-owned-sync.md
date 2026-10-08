@@ -41,13 +41,15 @@ Invalid fields or unsupported guards refuse domain construction. The existing
 `with_required_predicate` API remains available for trusted derived domains.
 
 `owned_set_sync` is advertised for native SQLite only when actual SQLite
-supports `RETURNING` (3.35 or newer). `result->metadata` reports the number of
+supports `RETURNING` and the physical ownership catalog (3.37 or newer).
+The adapter proves key affinity/collation, complete parent uniqueness, and
+every present foreign-key group before dispatch. `result->metadata` reports the number of
 sets and each actual cleanup affected count. Native tests use in-memory SQLite,
 including generated identities beyond 2^53, composite identities, policy
 boundaries, empty sets and rollback after a real DELETE trigger failure.
 
 Declared `rules` now govern native writes, batches, graphs, and action patches.
-Input rules see typed assigned values. Candidate rules see the actual stored
+Input rules see original submitted literals. Candidate rules see the actual stored
 row overlaid with the proposed changes; updates and deletes require exactly
 one governed row. Transaction rules run in that same transaction. Required
 values supplied by database expressions or external evidence remain pending

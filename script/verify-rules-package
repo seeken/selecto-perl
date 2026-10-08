@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+test -z "$(git status --porcelain --untracked-files=normal)" || {
+    echo 'package provenance requires a clean source HEAD' >&2
+    exit 1
+}
+printf 'source_head=%s\n' "$(git rev-parse HEAD)"
+printf 'source_status=clean\n'
+perl Makefile.PL
+make dist
+version=$(perl -Ilib -MSelecto -e 'print $Selecto::VERSION')
+archive="$repo/Selecto-$version.tar.gz"
+shasum -a 256 "$archive"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/selecto-perl-rules-package.XXXXXX")
+trap 'rm -rf "$stage"' EXIT HUP INT TERM
+tar -xzf "$archive" -C "$stage"
+source="$stage/Selecto-$version"
+cd "$source"
+perl Makefile.PL INSTALL_BASE="$stage/installed"
+make
+make pure_install
+PERL5LIB="$stage/installed/lib/perl5" prove -v t/portable_rules.t
+PERL5LIB="$stage/installed/lib/perl5" perl script/rules-package-consumer "$stage/installed"
+printf 'archive_consumer=passed sqlite_database=:memory:\n'

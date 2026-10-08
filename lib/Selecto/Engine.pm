@@ -249,18 +249,20 @@ sub stream {
 }
 sub preview_write {
     my ($self, $command) = @_;
+    my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
     return $self->{adapter}->preview_write($command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
-        return $self->{adapter}->preview_write(Selecto::WriteRules->govern($self, $command));
+        return $self->{adapter}->preview_write(Selecto::WriteRules->govern($self, $command, input => $input));
     });
 }
 sub execute_write {
     my ($self, $command) = @_;
+    my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
     return $self->_execute_governed(execute_write => $command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
-        return $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $command));
+        return $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $command, input => $input));
     });
 }
 
@@ -281,13 +283,17 @@ sub execute_batch {
     my ($self, $batch) = @_;
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
+    my @input = map { Selecto::WriteRules->literal_input($_) } @{$batch->commands};
     my @commands = map { $self->governed_write($_) } @{$batch->commands};
     return $self->_execute_governed(execute_batch => Selecto::Write::Batch->new(@commands))
         unless $self->{domain}->rules;
     return $self->_rules_transaction(sub {
-        my @results;
-        push @results, $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $_)) for @commands;
-        return \@results;
+        # Stored batch deltas may overlap or depend on earlier mutations. They
+        # need a prospective whole-plan provider; do not dispatch a prefix.
+        Selecto::Error->throw('required_data_rule_pending', 'protected stored batch deltas require a whole-plan candidate provider')
+            if grep { $_->operation ne 'insert' } @commands;
+        my @admitted = map { Selecto::WriteRules->govern($self, $commands[$_], input => $input[$_]) } 0 .. $#commands;
+        return $self->_execute_governed(execute_batch => Selecto::Write::Batch->new(@admitted));
     });
 }
 sub execute_graph {
@@ -305,6 +311,7 @@ sub _prepared_graph {
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
     my @nodes = @{$graph->nodes};
+    my %rule_inputs = map { ($_->{id} => Selecto::WriteRules->literal_input($_->{command})) } @nodes;
     $nodes[0]{command} = $self->governed_write($nodes[0]{command}, graph_node => $nodes[0]{id});
     my $writes = _checked_writes($self->{domain}->writes);
     my %contexts = ($nodes[0]{id} => {
@@ -316,12 +323,14 @@ sub _prepared_graph {
         relationships => $writes->{relationships},
         tenant_scope  => $self->{domain}->write_tenant_scope,
         domain        => $self->{domain},
+        rule_input    => $rule_inputs{$nodes[0]{id}},
     });
     my $root_scope = $self->{domain}->write_tenant_scope;
     my $tenants = $self->_trusted_write_tenants($self->{domain}->required_predicate);
     for my $node (@nodes[1 .. $#nodes]) {
         ($contexts{$node->{id}}, $node->{command}) =
             $self->_validate_graph_node($node, \%contexts, $root_scope, $tenants);
+        $contexts{$node->{id}}{rule_input} = $rule_inputs{$node->{id}};
     }
     my $sets = $self->_govern_owned_sets($graph->owned_sets, \@nodes, \%contexts);
     my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets);
