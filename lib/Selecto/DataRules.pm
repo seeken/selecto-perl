@@ -14,6 +14,19 @@ use Unicode::Normalize ();
 use bytes ();
 our $SCHEMA = 'selecto.data_rules.v1';
 
+# Only the native engine opens this scope. It is not a request option or
+# command metadata; nested previews, graph nodes and stages share the counter.
+my $PROOF_WORK;
+sub _with_proof_budget {
+    my ($class, $work) = @_;
+    return $work->() if $PROOF_WORK;
+    my $units = 0;
+    $PROOF_WORK = \$units;
+    my $scope = bless {restore => sub { $PROOF_WORK = undef }}, 'Selecto::DataRules::_BudgetScope';
+    return $work->();
+}
+
+
 sub parse {
     my ($class, $raw, %options) = @_;
     my $limits = $options{limits} // Selecto::Limits->new;
@@ -78,7 +91,8 @@ sub _evaluate_request {
             && ($stage ne 'action_input' || _id($request{action}));
     my $limits = defined($request{limits}) ? $self->{limits}->intersect($request{limits}) : $self->{limits};
     my $subject_value = _hash($request{subject}, 'invalid_data_rules_request', 'subject');
-    my $work = 0;
+    my $local_work = 0;
+    my $work = $PROOF_WORK // \$local_work;
     # Refuse oversized/cyclic values before cloning. Check every consumed value
     # before conditions so an advisory or false branch cannot conceal resources.
     my $admitted = eval {
@@ -87,7 +101,7 @@ sub _evaluate_request {
         for my $binding (values %{$self->{bindings}}) {
             next unless _applies($binding, \%request);
             my ($value, $present) = _at($subject_value, $binding->{subject}{path});
-            Selecto::RuleTest::check_value($value, $limits, \$work);
+            Selecto::RuleTest::check_value($value, $limits, $work);
             Selecto::RuleTest->preflight($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits);
             Selecto::RuleTest->preflight($binding->{prepared_condition}, $value, $present, $limits)
                 if $binding->{prepared_condition};
@@ -112,18 +126,18 @@ sub _evaluate_request {
         my ($failed, $code, $resource);
         my $ok = eval {
             if (!$test_only && (my $normalizer = $binding->{normalizer})) {
-                my ($next, $error) = _normalize($value, $present, $self->{normalizers}{$normalizer->{id}}, $limits, \$work);
+                my ($next, $error) = _normalize($value, $present, $self->{normalizers}{$normalizer->{id}}, $limits, $work);
                 if (defined $error) { $failed = 1; $code = $error }
                 else { _set($normalized, $path, $next) unless $unavailable; ($value, $present) = ($next, 1) }
             }
             unless ($failed) {
                 my $applies = 1;
                 if ($binding->{prepared_condition}) {
-                    ($applies) = Selecto::RuleTest->evaluate($binding->{prepared_condition}, $value, $present, $limits, \$work);
+                    ($applies) = Selecto::RuleTest->evaluate($binding->{prepared_condition}, $value, $present, $limits, $work);
                 }
                 if ($applies) {
                     my $passed;
-                    ($passed, $code) = Selecto::RuleTest->evaluate($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits, \$work);
+                    ($passed, $code) = Selecto::RuleTest->evaluate($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits, $work);
                     $failed = !$passed;
                 }
             }
@@ -204,6 +218,10 @@ sub _normalize {
     return ($current, undef);
 }
 sub _hash { my($v,$code,$label)=@_;_fail($code,"$label must be an object")unless ref$v eq'HASH';return$v } sub _keys {my($v,$a,$l)=@_;my%a=map{$_=>1}@$a;_fail('unknown_rule_option',"unknown member in $l")if grep{!$a{$_}}keys%$v} sub _id{defined($_[0])&&!ref($_[0])&&length($_[0])>0} sub _positive{_fail('invalid_rule_version','version must be a positive integer')unless defined($_[0])&&!ref($_[0])&&$_[0]=~/\A[1-9][0-9]*\z/;$_[0]} sub _nonneg{defined($_[0])&&!ref($_[0])&&$_[0]=~/\A(?:0|[1-9][0-9]*)\z/?$_[0]:undef} sub _ref{my$v=_hash($_[0],'invalid_data_rules_contract','reference');_keys($v,[qw(id version)],'reference');_fail('invalid_data_rules_contract','reference id is invalid')unless _id($v->{id});{id=>$v->{id},version=>_positive($v->{version})}} sub _path{my$v=$_[0];_fail('invalid_data_rules_contract','path is invalid')unless ref$v eq'ARRAY'&&@$v&&!grep{!defined($_)||ref($_)||$_ eq''}@$v;[@$v]} sub _at{my($r,$p)=@_;my$c=$r;for(@$p){return(undef,0)unless ref$c eq'HASH'&&exists$c->{$_};$c=$c->{$_}}($c,1)}sub _set{my($r,$p,$v)=@_;my$c=$r;for my$k(@$p[0..$#$p-1]){$c->{$k}={}unless ref$c->{$k}eq'HASH';$c=$c->{$k}}$c->{$p->[-1]}=$v}sub _decimal{my$v=$_[0];return undef unless defined$v&&!ref$v&&"$v"=~/\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/;Math::BigRat->new("$v")}sub _stable{JSON::PP->new->canonical(1)->encode($_[0])}sub _result{my($s,$n,$c,$p)=@_;{state=>$s,normalized=>dclone($n),(defined$c?(code=>$c):()),(defined$p?(path=>[@$p]):())}}sub _fail{Selecto::Error->throw(@_)}
+{
+    package Selecto::DataRules::_BudgetScope;
+    sub DESTROY { $_[0]{restore}->() }
+}
 1;
 
 __END__
