@@ -885,6 +885,8 @@ sub preview_write {
     return { sql => $statement->{sql}, params => [@{$statement->{params}}] };
 }
 
+sub _admit_plan_storage { return; }
+
 # Execution requires the engine's authorization for the exact object; see
 # Selecto::Write::Authorization. The *_unsafe variants skip domain governance
 # and exist for trusted internal tooling and adapter tests only.
@@ -930,6 +932,7 @@ sub execute_batch_unsafe {
     my @commands = @{$batch->commands};
     my @compiled = map { $self->_compile_write($_) } @commands;
     return $self->_transaction(sub {
+        $self->_admit_plan_storage(\@commands);
         my @results = map { $self->_execute_compiled_write_in_transaction($commands[$_], $compiled[$_]) } 0 .. $#commands;
         return \@results;
     });
@@ -943,6 +946,8 @@ sub execute_graph_unsafe {
         unless $self->write_capabilities->{write_graph};
 
     my $work = sub {
+        $self->_admit_plan_storage([map { $_->{command} } grep { !$_->{reference_only} } @{$graph->nodes}],
+            [map { $_->{cleanup} } @{$graph->{_governed_owned_sets} // []}]);
         $self->_admit_graph_storage($graph) if $self->can('_admit_graph_storage');
         my %results;
         for my $node (@{$graph->nodes}) {
@@ -2485,6 +2490,7 @@ sub _typed_insert_admission_probe {
 
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
+    $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
     my $bounded = $self->_bounded_write_command($command);
     $compiled = $self->_compile_write($bounded) if $bounded != $command;

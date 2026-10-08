@@ -56,6 +56,7 @@ lib/Selecto/Retarget.pm
 lib/Selecto/SQL.pm
 lib/Selecto/SQLite.pm
 lib/Selecto/SQLite/Ownership.pm
+t/sqlite_plan_authority.integration.t
 lib/Selecto/Statement.pm
 lib/Selecto/Stream.pm
 lib/Selecto/ValueExpression.pm

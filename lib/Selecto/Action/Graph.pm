@@ -88,6 +88,9 @@ sub preview {
     my ($prepared, $contexts) = $engine->_prepared_graph($graph);
     $prepared = Selecto::WriteRules->admit_graph($engine, $prepared, $contexts)
         if $prepared->{_requires_rules};
+    $engine->adapter->_admit_plan_storage([map { $_->{command} } grep { !$_->{reference_only} } @{$prepared->nodes}],
+        [map { $_->{cleanup} } @{$prepared->{_governed_owned_sets} // []}])
+        if $engine->adapter->can('_admit_plan_storage');
     my (@statements, @bindings, %owners);
     for my $node (@{$prepared->nodes}) {
         my $command = $node->{command};
