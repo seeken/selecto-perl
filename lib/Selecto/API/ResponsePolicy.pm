@@ -113,7 +113,7 @@ sub error_details {
     # Arbitrary driver causes/messages may embed whole SQL and bound values.
     # Retain only structured, public validation metadata in ordinary responses.
     my %allowed = map { $_ => 1 } qw(field fields missing_fields operation maximum expected
-        type format expected_extension row_limit limit offset);
+        type format expected_extension row_limit limit offset parameter);
     my $public = {map { $_ => $details->{$_} } grep { $allowed{$_} } keys %$details};
     return $class->public_data($public, 0, $limits);
 }
