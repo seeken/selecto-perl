@@ -139,6 +139,7 @@ t/required_predicate_write_guard.t
 t/retarget.t
 t/sqlite.integration.t
 t/sqlite_parity.integration.t
+t/sqlite_json_contains.integration.t
 t/sqlstate.t
 t/statement_cache.t
 t/statement_cache.integration.t

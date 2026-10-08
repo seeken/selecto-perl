@@ -1253,7 +1253,7 @@ sub _compile_expression {
             unless blessed($operand) && $operand->kind eq 'field'
                 && ($domain->resolve($operand->arguments->[0])->{type} // '') =~ /\Ajsonb?\z/i;
         my $operand_sql = $self->_compile_expression($domain, $operand, $params);
-        push @$params, JSON::PP->new->canonical(1)->encode($arguments->[1]);
+        push @$params, JSON::PP->new->canonical(1)->allow_nonref(1)->encode($arguments->[1]);
         return $self->_compile_json_contains(
             $operand_sql, $self->placeholder(scalar @$params),
         );
