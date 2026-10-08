@@ -261,6 +261,13 @@ sub datetime_format {
     return $class->new('datetime_format', $class->_operand($field), "$format",
         (defined($timezone) ? "$timezone" : ()));
 }
+sub date_shortcut {
+    my ($class, $field, $shortcut) = @_;
+    require Selecto::DateShortcut;
+    Selecto::Error->throw('invalid_query', 'date shortcut is not available')
+        unless Selecto::DateShortcut->valid($shortcut);
+    return $class->new('date_shortcut', $class->_operand($field), "$shortcut");
+}
 sub epoch_datetime {
     my ($class, $field) = @_;
     return $class->new('epoch_datetime', $class->_operand($field));
@@ -786,6 +793,16 @@ DuckDB implement these; other adapters fail closed. The instant formats
 C<timezone_offset>) read a C<utc_datetime> column declared
 C<< storage => 'naive_utc' >> as C<(column AT TIME ZONE 'UTC')>, with or
 without L<Selecto::Query/use_timezone>.
+
+=head2 date_shortcut
+
+  Selecto::Expression->date_shortcut('ordered_at', 'this_quarter')
+
+True when a date or time is within a L<Selecto::DateShortcut> period. On
+PostgreSQL and DuckDB the period is measured from the database's current
+date, so the session time zone (or the query's
+L<Selecto::Query/use_timezone>) decides when a day begins; other adapters
+bind the server's date. An epoch column compares as an instant.
 
 =head2 epoch_datetime
 

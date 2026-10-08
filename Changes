@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - Date shortcuts are measured from the database's current date: without
+      an explicit today, Selecto::DateShortcut->expression returns the new
+      date_shortcut expression, which PostgreSQL and DuckDB compile against
+      CURRENT_DATE (or today in the query's use_timezone), so the session
+      time zone decides when a day begins. Other adapters still bind the
+      server's date. An epoch column now compares as an instant. Shortcut
+      bounds are defined once, as terms(), for Perl and SQL alike.
+    - Bounded child collections accept a formatted child date
+      ({key, expression => datetime_format(...)}); other child expressions
+      are still refused.
+    - A canned text control with multiple => 1 takes up to 100 values
+      separated by whitespace, commas or semicolons (such as pasted VINs)
+      and matches a row that starts with any of them.
     - datetime_format takes a timezone option, which shows that one value in
       an IANA zone without localizing the query's filters, and two display
       formats: us_date (10/08/2026) and us_datetime (10/08/2026 2:30 PM),

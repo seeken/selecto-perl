@@ -383,6 +383,10 @@ sub _compile_naive_utc_instant_sql {
     return '(' . $sql . q{ AT TIME ZONE 'UTC')};
 }
 
+sub _current_date_shortcuts { return 1 }
+sub _months_interval_sql { return 'TO_MONTHS(' . int($_[1]) . ')' }
+sub _month_day_sql { return "STRFTIME($_[1], '%m-%d')" }
+
 sub _compile_timezone_sql {
     my ($self, $sql, $type, $timezone, $params) = @_;
     # Keep storage conversion separate from presentation-zone conversion.

@@ -40,6 +40,45 @@ my @CHOICES = (
     { group => 'Relative periods', id => 'next_30_days', label => 'Next 30 Days' },
 );
 
+# Each bound is [anchor, months, days]: the start of today's day, week
+# (Monday), month, quarter or year, moved by whole months and then days. Range
+# shortcuts include their start and exclude their end. Recurring shortcuts
+# compare the month and day of every year, from start through today.
+my %TERMS = (
+    today => [[today => 0, 0], [today => 0, 1]],
+    yesterday => [[today => 0, -1], [today => 0, 0]],
+    tomorrow => [[today => 0, 1], [today => 0, 2]],
+    this_week => [[week => 0, 0], [week => 0, 7]],
+    last_week => [[week => 0, -7], [week => 0, 0]],
+    next_week => [[week => 0, 7], [week => 0, 14]],
+    this_month => [[month => 0, 0], [month => 1, 0]],
+    last_month => [[month => -1, 0], [month => 0, 0]],
+    next_month => [[month => 1, 0], [month => 2, 0]],
+    mtd => [[month => 0, 0], [today => 0, 1]],
+    this_quarter => [[quarter => 0, 0], [quarter => 3, 0]],
+    last_quarter => [[quarter => -3, 0], [quarter => 0, 0]],
+    next_quarter => [[quarter => 3, 0], [quarter => 6, 0]],
+    qtd => [[quarter => 0, 0], [today => 0, 1]],
+    this_year => [[year => 0, 0], [year => 12, 0]],
+    last_year => [[year => -12, 0], [year => 0, 0]],
+    next_year => [[year => 12, 0], [year => 24, 0]],
+    ytd => [[year => 0, 0], [today => 0, 1]],
+    last_7_days => [[today => 0, -6], [today => 0, 1]],
+    last_14_days => [[today => 0, -13], [today => 0, 1]],
+    last_30_days => [[today => 0, -29], [today => 0, 1]],
+    last_90_days => [[today => 0, -89], [today => 0, 1]],
+    last_3_months => [[month => -3, 0], [today => 0, 1]],
+    this_and_last_month => [[month => -1, 0], [month => 1, 0]],
+    this_and_last_year => [[year => -12, 0], [year => 12, 0]],
+    next_7_days => [[today => 0, 1], [today => 0, 8]],
+    next_30_days => [[today => 0, 1], [today => 0, 31]],
+);
+my %RECURRING = (
+    mtd_all_years => [month => 0, 0],
+    qtd_all_years => [quarter => 0, 0],
+    ytd_all_years => [year => 0, 0],
+);
+
 my %KNOWN = map { $_->{id} => 1 } @CHOICES;
 
 sub choices { return [map { {%$_} } @CHOICES] }
@@ -59,6 +98,16 @@ sub valid_date {
     return strftime('%Y-%m-%d', gmtime($epoch)) eq "$date" ? 1 : 0;
 }
 
+# The symbolic bounds an adapter compiles against its own current date.
+sub terms {
+    my ($class, $shortcut) = @_;
+    die "date shortcut is not available\n" unless $class->valid($shortcut);
+    return {kind => 'recurring_month_day', start => [@{$RECURRING{$shortcut}}],
+        end => [today => 0, 0]} if $RECURRING{$shortcut};
+    return {kind => 'range', start => [@{$TERMS{$shortcut}[0]}],
+        end => [@{$TERMS{$shortcut}[1]}]};
+}
+
 sub bounds {
     my ($class, $shortcut, $today) = @_;
     my $plan = $class->plan($shortcut, $today);
@@ -69,68 +118,21 @@ sub bounds {
 
 sub plan {
     my ($class, $shortcut, $today) = @_;
-    die "date shortcut is not available\n" unless $class->valid($shortcut);
+    my $terms = $class->terms($shortcut);
     $today //= strftime('%Y-%m-%d', localtime);
     die "today must be an ISO date\n" unless $class->valid_date($today);
-
-    my ($year, $month) = "$today" =~ /\A(\d{4})-(\d{2})/;
-    my $tomorrow = _add_days($today, 1);
-    my $month_start = sprintf('%04d-%02d-01', $year, $month);
-    my $quarter_month = int(($month - 1) / 3) * 3 + 1;
-    my $quarter_start = sprintf('%04d-%02d-01', $year, $quarter_month);
-    my $year_start = sprintf('%04d-01-01', $year);
-    my $weekday = (gmtime(_epoch($today)))[6];
-    my $week_start = _add_days($today, -(($weekday + 6) % 7));
-
-    my $recurring_start =
-        $shortcut eq 'mtd_all_years' ? sprintf('%02d-01', $month)
-        : $shortcut eq 'qtd_all_years' ? sprintf('%02d-01', $quarter_month)
-        : $shortcut eq 'ytd_all_years' ? '01-01'
-        : undef;
-    return {
-        kind => 'recurring_month_day',
-        start => $recurring_start,
-        end => substr($today, 5),
-    } if defined $recurring_start;
-
-    my ($start, $end);
-    ($start, $end) = ($today, $tomorrow) if $shortcut eq 'today';
-    ($start, $end) = (_add_days($today, -1), $today) if $shortcut eq 'yesterday';
-    ($start, $end) = ($tomorrow, _add_days($today, 2)) if $shortcut eq 'tomorrow';
-    ($start, $end) = ($week_start, _add_days($week_start, 7)) if $shortcut eq 'this_week';
-    ($start, $end) = (_add_days($week_start, -7), $week_start) if $shortcut eq 'last_week';
-    ($start, $end) = (_add_days($week_start, 7), _add_days($week_start, 14)) if $shortcut eq 'next_week';
-    ($start, $end) = ($month_start, _add_months($month_start, 1)) if $shortcut eq 'this_month';
-    ($start, $end) = (_add_months($month_start, -1), $month_start) if $shortcut eq 'last_month';
-    ($start, $end) = (_add_months($month_start, 1), _add_months($month_start, 2)) if $shortcut eq 'next_month';
-    ($start, $end) = ($month_start, $tomorrow) if $shortcut eq 'mtd';
-    ($start, $end) = ($quarter_start, _add_months($quarter_start, 3)) if $shortcut eq 'this_quarter';
-    ($start, $end) = (_add_months($quarter_start, -3), $quarter_start) if $shortcut eq 'last_quarter';
-    ($start, $end) = (_add_months($quarter_start, 3), _add_months($quarter_start, 6)) if $shortcut eq 'next_quarter';
-    ($start, $end) = ($quarter_start, $tomorrow) if $shortcut eq 'qtd';
-    ($start, $end) = ($year_start, sprintf('%04d-01-01', $year + 1)) if $shortcut eq 'this_year';
-    ($start, $end) = (sprintf('%04d-01-01', $year - 1), $year_start) if $shortcut eq 'last_year';
-    ($start, $end) = (sprintf('%04d-01-01', $year + 1), sprintf('%04d-01-01', $year + 2)) if $shortcut eq 'next_year';
-    ($start, $end) = ($year_start, $tomorrow) if $shortcut eq 'ytd';
-    ($start, $end) = (_add_days($today, -6), $tomorrow) if $shortcut eq 'last_7_days';
-    ($start, $end) = (_add_days($today, -13), $tomorrow) if $shortcut eq 'last_14_days';
-    ($start, $end) = (_add_days($today, -29), $tomorrow) if $shortcut eq 'last_30_days';
-    ($start, $end) = (_add_days($today, -89), $tomorrow) if $shortcut eq 'last_90_days';
-    ($start, $end) = (_add_months($month_start, -3), $tomorrow)
-        if $shortcut eq 'last_3_months';
-    ($start, $end) = (_add_months($month_start, -1), _add_months($month_start, 1))
-        if $shortcut eq 'this_and_last_month';
-    ($start, $end) = (sprintf('%04d-01-01', $year - 1), sprintf('%04d-01-01', $year + 1))
-        if $shortcut eq 'this_and_last_year';
-    ($start, $end) = ($tomorrow, _add_days($today, 8)) if $shortcut eq 'next_7_days';
-    ($start, $end) = ($tomorrow, _add_days($today, 31)) if $shortcut eq 'next_30_days';
-    return {kind => 'range', start => $start, end => $end}
-        if defined($start) && defined($end);
-    die "date shortcut is not available\n";
+    my @bounds = map { _date($today, @$_) } $terms->{start}, $terms->{end};
+    @bounds = map { substr($_, 5) } @bounds if $terms->{kind} eq 'recurring_month_day';
+    return {kind => $terms->{kind}, start => $bounds[0], end => $bounds[1]};
 }
 
+# Without today, the database compares against its own current date, so the
+# session's time zone decides when a day begins. A given today (an ISO date)
+# is bound as literal dates instead.
 sub expression {
     my ($class, $operand, $shortcut, $today) = @_;
+    return Selecto::Expression->date_shortcut($operand, $shortcut)
+        unless defined $today;
     my $plan = $class->plan($shortcut, $today);
     if ($plan->{kind} eq 'range') {
         return Selecto::Expression->all([
@@ -143,6 +145,18 @@ sub expression {
         Selecto::Expression->gte($month_day, $plan->{start}),
         Selecto::Expression->lte($month_day, $plan->{end}),
     ]);
+}
+
+sub _date {
+    my ($today, $anchor, $months, $days) = @_;
+    my ($year, $month) = "$today" =~ /\A(\d{4})-(\d{2})/;
+    my $date = $anchor eq 'today' ? $today
+        : $anchor eq 'week' ? _add_days($today, -(((gmtime(_epoch($today)))[6] + 6) % 7))
+        : $anchor eq 'month' ? sprintf('%04d-%02d-01', $year, $month)
+        : $anchor eq 'quarter' ? sprintf('%04d-%02d-01', $year, int(($month - 1) / 3) * 3 + 1)
+        : sprintf('%04d-01-01', $year);
+    $date = _add_months($date, $months) if $months;
+    return $days ? _add_days($date, $days) : $date;
 }
 
 sub _epoch {
@@ -175,7 +189,9 @@ Selecto::DateShortcut - calendar shortcuts such as today or this quarter
 
 Validates relative date shortcuts (today, this month, this quarter and
 similar) and turns them into bounded date predicates for the canonical API
-and user interfaces.
+and user interfaces. Without an explicit today, PostgreSQL and DuckDB
+compare against the database's current date, so the session time zone (or
+the query's L<Selecto::Query/use_timezone>) decides when a day begins.
 
 This module is an internal part of the L<Selecto> distribution. Its interface
 may change without notice; applications should use the public entry points

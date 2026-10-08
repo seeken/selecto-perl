@@ -24,6 +24,7 @@ my $page = Selecto::CannedPage->new(
     controls => [
         {id => 'name', field => 'name', kind => 'text', ignore_case => 1},
         {id => 'city', field => 'city', kind => 'text'},
+        {id => 'names', field => 'name', kind => 'text', multiple => 1},
     ],
 );
 
@@ -42,6 +43,23 @@ like $sensitive->sql, qr/\bcity\b[^\n]* LIKE \$\d+ ESCAPE '!'/,
     'ordinary text controls retain case-sensitive prefix matching';
 unlike $sensitive->sql, qr/LOWER\([^)]*city[^)]*\)/,
     'ordinary controls do not lowercase the field';
+
+my $several = $engine->compile(
+    $page->plan({filters => {names => "ab1, cd2\nab1;ef%\n"}})->{query},
+);
+is scalar(() = $several->sql =~ /LIKE \$\d+ ESCAPE '!'/g), 3,
+    'a multiple text control matches each distinct value';
+like $several->sql, qr/ OR /, 'any value may match';
+ok grep({ defined($_) && $_ eq 'ef!%%' } @{$several->params}),
+    'each value is still a literal prefix';
+is_deeply $page->normalize_state({filters => {names => " \n"}})->{filters}{names}, " \n",
+    'blank input is kept as entered';
+unlike $engine->compile($page->plan({filters => {names => " \n"}})->{query})->sql, qr/LIKE/,
+    'blank input does not filter';
+ok !eval { $page->plan({filters => {names => join ' ', 1 .. 101}}); 1 },
+    'a multiple text control takes at most 100 values';
+ok !eval { $page->plan({filters => {city => 'x' x 300}}); 1 },
+    'a single text control keeps its short limit';
 
 my $invalid = eval {
     Selecto::CannedPage->new(

@@ -266,5 +266,27 @@ is_deeply($value_engine->all($value_engine->query
     ],
     'DuckDB executes coalesce, decimal division, and JSON text value expressions');
 
+# Date shortcuts are measured from DuckDB's own current date.
+require Selecto::DateShortcut;
+$dbh->do('CREATE TABLE selecto_perl_shortcut_probe AS SELECT i AS id, CAST(CURRENT_DATE + CAST(i AS INTEGER) AS DATE) AS day FROM range(-800, 800) t(i)');
+my ($duck_today) = $dbh->selectrow_array('SELECT CAST(CURRENT_DATE AS VARCHAR)');
+my $days = $dbh->selectall_arrayref('SELECT id, CAST(day AS VARCHAR) FROM selecto_perl_shortcut_probe');
+my $shortcut_engine = Selecto::Engine->new(adapter => $adapter, domain => Selecto::Domain->new(
+    name => 'ShortcutProbe', table => 'selecto_perl_shortcut_probe', fields => {id => 'integer', day => 'date'},
+));
+my @mismatched;
+for my $shortcut (map { $_->{id} } @{Selecto::DateShortcut->choices}) {
+    my $plan = Selecto::DateShortcut->plan($shortcut, $duck_today);
+    my @expected = sort { $a <=> $b } map { $_->[0] } grep {
+        my $value = $plan->{kind} eq 'range' ? $_->[1] : substr($_->[1], 5);
+        $plan->{kind} eq 'range' ? $value ge $plan->{start} && $value lt $plan->{end}
+            : $value ge $plan->{start} && $value le $plan->{end}
+    } @$days;
+    my @got = sort { $a <=> $b } map { $_->[0] } @{$shortcut_engine->all($shortcut_engine->query
+        ->select('id')->where(Selecto::DateShortcut->expression('day', $shortcut)))->{rows}};
+    push @mismatched, $shortcut unless "@got" eq "@expected";
+}
+is_deeply \@mismatched, [], 'DuckDB selects the same days for every shortcut from its current date';
+
 $dbh->disconnect;
 done_testing;

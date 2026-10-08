@@ -11,6 +11,8 @@ use Selecto::BoundedQuery ();
 use Selecto::Expression ();
 use Selecto::Query ();
 
+my $MAX_TEXT_VALUES = 100;
+
 # A canned page is deliberately HTTP-neutral. The host supplies an authorized
 # engine for every request; the page never accepts a client-selected adapter.
 sub new {
@@ -171,10 +173,12 @@ sub new {
             _fail('text control needs a string field and starts_with operator')
                 unless ($resolved->{type} // '') =~ /\A(?:string|text|varchar)\z/i
                     && ($control->{op} // 'starts_with') eq 'starts_with';
-            _fail('text control ignore_case must be a boolean')
-                if exists($control->{ignore_case})
-                    && (!defined($control->{ignore_case}) || ref($control->{ignore_case})
-                        || "$control->{ignore_case}" !~ /\A[01]\z/);
+            for my $flag (qw(ignore_case multiple)) {
+                _fail("text control $flag must be a boolean")
+                    if exists($control->{$flag})
+                        && (!defined($control->{$flag}) || ref($control->{$flag})
+                            || "$control->{$flag}" !~ /\A[01]\z/);
+            }
         } else {
             _fail('range control needs a numeric field')
                 unless ($resolved->{type} // '')
@@ -271,6 +275,12 @@ sub normalize_state {
                 _scalar($value->{$_}, 'range bound'), 'range bound')
                 for grep { exists($value->{$_}) && defined($value->{$_}) && "$value->{$_}" ne '' } qw(min max);
             $normalized{$id} = \%range;
+        } elsif ($control->{multiple}) {
+            _fail('text filter must be a scalar of at most 4096 characters')
+                if !defined($value) || ref($value) || length("$value") > 4096;
+            _fail('text filter has too many values')
+                if _text_values("$value") > $MAX_TEXT_VALUES;
+            $normalized{$id} = "$value";
         } else {
             $normalized{$id} = _scalar($value, 'text filter');
         }
@@ -469,10 +479,13 @@ sub _predicate {
         } elsif ($control->{kind} eq 'range') {
             push @expressions, Selecto::Expression->gte($field, $value->{min}) if exists $value->{min};
             push @expressions, Selecto::Expression->lte($field, $value->{max}) if exists $value->{max};
-        } elsif (length $value) {
-            push @expressions, $control->{ignore_case}
-                ? Selecto::Expression->starts_with_ci($field, $value)
-                : Selecto::Expression->starts_with($field, $value);
+        } else {
+            my @matches = map {
+                $control->{ignore_case}
+                    ? Selecto::Expression->starts_with_ci($field, $_)
+                    : Selecto::Expression->starts_with($field, $_)
+            } $control->{multiple} ? _text_values($value) : grep { length } $value;
+            push @expressions, @matches > 1 ? Selecto::Expression->any(\@matches) : @matches;
         }
     }
     return @expressions == 1 ? $expressions[0]
@@ -530,6 +543,13 @@ sub _child_field {
     return $field =~ /\A[a-z][a-z0-9_]*\z/ ? 1 : 0 unless ref($field);
     my $path = ref($field) eq 'HASH' ? _formatted_field($field->{expression}) : undef;
     return defined($path) && _id($field->{key}) && $path eq "$association.$field->{key}";
+}
+# A multiple text control takes values separated by whitespace, commas or
+# semicolons, such as a pasted column of VINs.
+sub _text_values {
+    my ($value) = @_;
+    my %seen;
+    return grep { length && !$seen{$_}++ } split /[\s,;]+/, $value;
 }
 sub _query { blessed($_[0]) && $_[0]->isa('Selecto::Query') }
 sub _id { defined($_[0]) && !ref($_[0]) && $_[0] =~ /\A[a-z][a-z0-9_]*\z/ }
@@ -655,6 +675,9 @@ and an optional C<label_field>. C<range> controls need a numeric field and
 accept C<min> and C<max>. C<text> controls need a string field and match a
 literal prefix (C<starts_with>), case-insensitively with
 C<< ignore_case => 1 >>; C<%> and C<_> in user input are never wildcards.
+With C<< multiple => 1 >> a text control takes up to 100 values separated by
+whitespace, commas or semicolons, and matches a row that starts with any of
+them.
 
 =item C<initial_state>
 

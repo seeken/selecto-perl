@@ -697,6 +697,10 @@ sub _compile_naive_utc_instant_sql {
     return '(' . $sql . q{ AT TIME ZONE 'UTC')};
 }
 
+sub _current_date_shortcuts { return 1 }
+sub _months_interval_sql { return 'MAKE_INTERVAL(months => ' . int($_[1]) . ')' }
+sub _month_day_sql { return "TO_CHAR($_[1], 'MM-DD')" }
+
 sub _compile_timezone_sql {
     my ($self, $sql, $type, $timezone, $params) = @_;
     # Raw epoch fields are numbers; explicit epoch_datetime expressions have

@@ -45,8 +45,8 @@ sub prepare {
             if (!defined($options->{aggregate})) {
                 Selecto::Error->throw('unsupported_feature', 'bounded child collections require PostgreSQL')
                     unless $adapter->name eq 'postgresql';
-                Selecto::Error->throw('unsupported_feature', 'bounded child collections require scalar child fields')
-                    if grep { ref($_) } @$fields;
+                Selecto::Error->throw('unsupported_feature', 'bounded child collections require scalar or formatted child fields')
+                    if grep { ref($_) && !_formatted_child($_) } @$fields;
                 my $association = $engine->domain->resolve_association($path)->{association};
                 my $key = $association->target_primary_key;
                 Selecto::Error->throw('unsupported_feature', 'bounded child collections require a primary key')
@@ -66,6 +66,17 @@ sub prepare {
     }
     my $bounded = $query->_copy(selections => \@select);
     return {statement => $engine->compile($bounded), query => $bounded, collections => \@collections, limits => $limits};
+}
+
+# A formatted child date is still one value per child row. Any other child
+# expression could conceal a nested collection outside the per-parent cap.
+sub _formatted_child {
+    my ($field) = @_;
+    my $expression = ref($field) eq 'HASH' ? $field->{expression} : undef;
+    return 0 unless blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind eq 'datetime_format';
+    my $operand = $expression->arguments->[0];
+    return blessed($operand) && $operand->kind eq 'field' ? 1 : 0;
 }
 
 sub all {
