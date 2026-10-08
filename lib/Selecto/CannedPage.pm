@@ -66,18 +66,22 @@ sub new {
                             && $selection->alias_name =~ /\A[a-z][a-z0-9_]*\z/
                             && $association_path =~ /\A[a-z][a-z0-9_]*\z/
                             && $domain->resolve_association($association_path)->{association}->cardinality eq 'many';
-                    _fail('detail collection selections need one or more scalar child fields')
+                    _fail('detail collection selections need one or more scalar or formatted child fields')
                         unless ref($fields) eq 'ARRAY' && @$fields
-                            && !grep { ref($_) || $_ !~ /\A[a-z][a-z0-9_]*\z/ } @$fields;
+                            && !grep { !_child_field($_, $association_path) } @$fields;
                     _fail('detail collection selections cannot use filters, limits, cursors, or aggregates')
                         if ref($options) eq 'HASH'
                             && grep { $_ ne 'order_by' } keys %$options;
-                    $domain->resolve("$association_path.$_") for @$fields;
+                    $domain->resolve(ref($_) ? _formatted_field($_->{expression})
+                        : "$association_path.$_") for @$fields;
                     next;
                 }
-                _fail('detail selections must be entity-grain fields or related collections')
-                    unless $selection->kind eq 'field';
-                my $resolved = $domain->resolve($selection->arguments->[0]);
+                my $path = $selection->kind eq 'field' ? $selection->arguments->[0]
+                    : _formatted_field($selection);
+                _fail('detail selections must be entity-grain fields, formatted dates or related collections')
+                    unless defined($path)
+                        && ($selection->kind eq 'field' || defined($selection->alias_name));
+                my $resolved = $domain->resolve($path);
                 _fail('detail selections cannot traverse a many association')
                     if grep { $_->cardinality eq 'many' } @{$resolved->{associations}};
             }
@@ -311,6 +315,9 @@ sub plan {
         groups => $view->{kind} eq 'detail'
             ? [Selecto::Expression->field($key),
                 grep { $_->kind eq 'field' } @{$template->selections},
+                # A formatted date is grouped by the field it formats.
+                (map { Selecto::Expression->field($_) }
+                    grep { defined } map { _formatted_field($_) } @{$template->selections}),
                 map { $_->[0] } @{$template->orders}]
             : $template->groups,
         orders => \@orders,
@@ -509,6 +516,20 @@ sub _refuse_withheld_fields {
     }
 }
 
+# The field a datetime_format of one field formats, or undef.
+sub _formatted_field {
+    my ($expression) = @_;
+    return undef unless blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind eq 'datetime_format';
+    my $operand = $expression->arguments->[0];
+    return blessed($operand) && $operand->kind eq 'field' ? $operand->arguments->[0] : undef;
+}
+sub _child_field {
+    my ($field, $association) = @_;
+    return $field =~ /\A[a-z][a-z0-9_]*\z/ ? 1 : 0 unless ref($field);
+    my $path = ref($field) eq 'HASH' ? _formatted_field($field->{expression}) : undef;
+    return defined($path) && _id($field->{key}) && $path eq "$association.$field->{key}";
+}
 sub _query { blessed($_[0]) && $_[0]->isa('Selecto::Query') }
 sub _id { defined($_[0]) && !ref($_[0]) && $_[0] =~ /\A[a-z][a-z0-9_]*\z/ }
 sub _scalar {
@@ -616,9 +637,11 @@ composite identities are not supported.
 
 =item C<views>
 
-C<detail> views select entity-grain fields (no to-many paths) or an aliased
-direct to-many L<Selecto::Expression/RELATED COLLECTIONS>, and may order by
-entity-grain fields. C<aggregate> views group by fields, project the group
+C<detail> views select entity-grain fields (no to-many paths), an aliased
+L<Selecto::Expression/datetime_format> of one, or an aliased direct to-many
+L<Selecto::Expression/RELATED COLLECTIONS> whose child fields are names or
+C<< {key => $name, expression => datetime_format("$association.$name", ...)} >>.
+They may order by entity-grain fields. C<aggregate> views group by fields, project the group
 fields first, and may only add C<count_distinct> of the entity key (ordinary
 sums could be multiplied by joins).
 

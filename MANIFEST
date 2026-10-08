@@ -92,6 +92,7 @@ t/co_domain.t
 t/computed_coalesce.t
 t/data_rules.t
 t/date_shortcut.t
+t/datetime_format_timezone.t
 t/decode_rows.t
 t/decode_rows_wide.t
 t/document_contract.t
