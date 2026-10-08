@@ -183,6 +183,31 @@ sub validate_plan_limits {
     return $plan;
 }
 
+# The row state an action requires, independent of target and inputs: its
+# declared preconditions, then its transition's source state. Domains derive
+# their action prerequisite columns from these; plan() still enforces them,
+# with its operation and transition checks, on every run.
+sub prerequisites {
+    my ($class, $contract, $action) = @_;
+    _object($contract, 'domain contract');
+    _object($action, 'domain action');
+    my $guards = _declared_preconditions($contract, $action);
+    my $transition = $action->{transition};
+    return $guards unless defined $transition;
+    _object($transition, 'action transition');
+    my ($field, $from) = map { defined($_) ? "$_" : '' } @{$transition}{qw(field from)};
+    Selecto::Error->throw('invalid_action_transition', 'transition must declare field, from, and to')
+        if $field eq '' || $from eq '';
+    my $columns = $contract->{source}{columns} // {};
+    Selecto::Error->throw('action_precondition_field_not_found', 'field must be a direct source column')
+        if $field =~ /\./ || ref($columns) ne 'HASH' || !exists($columns->{$field});
+    push @$guards, {type => 'field_equals', field => $field, comparator => 'eq',
+        value => $from, reason => 'transition_from'};
+    return $guards;
+}
+
+# Without an operation (prerequisites), the update/delete restriction is left
+# to plan().
 sub _declared_preconditions {
     my ($contract, $action, $operation) = @_;
     my $raw = $action->{preconditions};
@@ -190,7 +215,7 @@ sub _declared_preconditions {
     Selecto::Error->throw('invalid_action_preconditions', 'action preconditions must be a list')
         unless ref($raw) eq 'ARRAY';
     Selecto::Error->throw('action_preconditions_unsupported_operation', 'action preconditions require update or delete')
-        if @$raw && $operation ne 'update' && $operation ne 'delete';
+        if @$raw && defined($operation) && $operation ne 'update' && $operation ne 'delete';
     my %aliases = (eq => 'eq', '=' => 'eq', neq => 'neq', '!=' => 'neq', '<>' => 'neq',
         gt => 'gt', '>' => 'gt', gte => 'gte', '>=' => 'gte', lt => 'lt', '<' => 'lt',
         lte => 'lte', '<=' => 'lte', in => 'in');

@@ -16,6 +16,7 @@ lib/Selecto/Analytics/TransformRegistry.pm
 lib/Selecto/Analytics/UnitRegistry.pm
 lib/Selecto/API.pm
 lib/Selecto/API/EngineHandler.pm
+t/api_field_roles_adversarial.t
 lib/Selecto/API/ResultFormatter.pm
 lib/Selecto/CannedPage.pm
 lib/Selecto/CoDomain.pm
@@ -67,6 +68,7 @@ MANIFEST.SKIP
 README.md
 t/00-load.t
 t/action.t
+t/action_prerequisite_columns.t
 t/action_forms.t
 t/adapter.t
 t/advanced_query.t
@@ -94,6 +96,7 @@ t/decode_rows.t
 t/decode_rows_wide.t
 t/document_contract.t
 t/domain.t
+t/direct_join_tenant_inference.t
 t/domain_overlay.t
 t/domain_registry.t
 t/duckdb.integration.t
@@ -137,6 +140,8 @@ t/retarget.t
 t/sqlite.integration.t
 t/sqlite_parity.integration.t
 t/sqlstate.t
+t/statement_cache.t
+t/statement_cache.integration.t
 t/stream.t
 t/temporal_format_bindings.t
 t/text_filters.t
@@ -162,6 +167,7 @@ docs/security-boundaries.md
 script/importer-memory-check
 t/security_boundaries_live.t
 lib/Selecto/PostgreSQL/Stream.pm
+lib/Selecto/PostgreSQL/StatementCache.pm
 t/bounded_stream.t
 docs/typed-insert-admission.md
 lib/Selecto/API/ResponsePolicy.pm
