@@ -8,12 +8,20 @@ numbers or booleans. Explicit null is different from a missing semantic path.
 
 `Selecto::Engine` enforces these contracts for public writes, graphs, owned
 collections and actions. INPUT is the submitted command's literal assignments,
-before trusted tenant injection or physical conversion. ACTION_INPUT includes
+before trusted tenant injection or physical conversion. Scalar INPUT normalizers
+run before prospective native type projection; their actual assignments survive
+even when a generated identity remains unavailable to stored rules. ACTION_INPUT includes
 declared action defaults; an authored system expression is unknown until the
 host can establish its actual value. Graph INPUT applies to each node's own
 submitted assignments. The prospective child collection belongs to CANDIDATE.
 
-Stored updates load the complete governed source row. Collection rules load
+Stored updates load the complete governed source row. Scalar updates overlay
+explicit assignments and INPUT normalization before converting that row into the
+prospective candidate. Thus a canonical replacement can repair a stored REAL in
+an INTEGER field or TEXT in a BOOLEAN field without fabricating the original
+value. Unreplaced noncanonical values still refuse when native projection cannot
+establish their policy kind. Collection hydration retains its stricter original
+row projection; this scalar replacement slice does not claim collection repairs. Collection rules load
 actual child rows under the original ownership, tenant and required predicates,
 then apply submitted deltas and child normalizers before parent validation.
 Snapshots share a 1,000-row hydration ceiling; each read uses limit plus one.

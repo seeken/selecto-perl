@@ -199,3 +199,4 @@ lib/Selecto/Action/Graph.pm
 t/sqlite_rule_writes.integration.t
 t/fixtures/data_rules_write_inputs_v1.json
 t/sqlite_rule_budget.integration.t
+t/sqlite_native_projection.integration.t
