@@ -71,12 +71,12 @@ sub insert_admission_storage {
     my $table = Selecto::Identifier::checked($command->relation);
     # The main-schema profile refuses shadowing/attached-only names. Reading
     # sqlite_schema in the transaction also prevents a concurrent schema change.
-    my ($shadow) = $dbh->selectrow_array('SELECT 1 FROM temp.sqlite_master WHERE name = ?', undef, $table);
+    my ($shadow) = $dbh->selectrow_array('SELECT 1 FROM temp.sqlite_master WHERE name = ? COLLATE NOCASE', undef, $table);
     $fail->() if $shadow;
-    my ($kind, $ddl) = $dbh->selectrow_array('SELECT type, sql FROM main.sqlite_master WHERE name = ?', undef, $table);
+    my ($kind, $ddl) = $dbh->selectrow_array('SELECT type, sql FROM main.sqlite_master WHERE name = ? COLLATE NOCASE', undef, $table);
     $fail->() unless defined($kind) && $kind eq 'table' && defined($ddl) && $ddl =~ /\ACREATE\s+TABLE\b/i;
     for my $schema (qw(main temp)) {
-        my ($trigger) = $dbh->selectrow_array("SELECT 1 FROM $schema.sqlite_master WHERE type = 'trigger' AND tbl_name = ? LIMIT 1", undef, $table);
+        my ($trigger) = $dbh->selectrow_array("SELECT 1 FROM $schema.sqlite_master WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE LIMIT 1", undef, $table);
         $fail->() if $trigger;
     }
     my $rows = $dbh->selectall_arrayref('PRAGMA main.table_xinfo(' . $self->quote_identifier($table) . ')', {Slice => {}});

@@ -57,6 +57,8 @@ overflow, and a provider snapshot explicitly marked incomplete fail with
 Normalizers produce stored assignments, which are checked again against field
 grants and trusted tenants before any mutation.
 
+Catalog admission rejects case-insensitive TEMP table and view shadows,
+including uppercase objects that SQLite resolves ahead of a main table.
 Required SQLite rules on mutations also verify ordinary, unshadowed,
 trigger-free storage and compatible primitive column affinities inside the
 transaction. Virtual/generated storage and custom text collations refuse when

@@ -154,4 +154,18 @@ subtest 'normalizers cannot replace trusted tenant assignments and transaction-s
     $d=dclone($f->{flat_domain});$d->{rules}{bindings}{positive}{subject}{scope}='transaction';
     eval {engine($d,$a)->execute_write(Selecto::Write::Command->new(operation=>'insert',relation=>'line_items',assignments=>$f->{flat_invalid}))};is $@->code,'data_rule_failed','transaction-stage rule runs at protected boundary';is $a->{dispatches}//0,0,'transaction-stage invalid candidate does not dispatch';
 })};
+for my $shadow (
+    ['table','CREATE TEMP TABLE LINE_ITEMS(id INTEGER PRIMARY KEY,quantity REAL,reference TEXT)'],
+    ['view','CREATE TEMP VIEW LINE_ITEMS AS SELECT id,quantity*1.0 AS quantity,reference FROM main.line_items'],
+) {
+    for my $rules (0,1) {
+        subtest "uppercase TEMP $shadow->[0] shadow, rules=$rules" => sub {memory(sub {
+            my($db,$a)=@_;$db->do($shadow->[1]);my$d=dclone($f->{flat_domain});delete$d->{rules}unless$rules;
+            eval {engine($d,$a)->execute_write(Selecto::Write::Command->new(operation=>'insert',relation=>'line_items',assignments=>{quantity=>2,reference=>'AB12'},predicate=>Selecto::Expression->gt('quantity',0)))};
+            is $@->code,$rules?'required_data_rule_pending':'query_rule_not_evaluable','catalog guard refuses the actual shadow before dispatch';
+            is $db->selectrow_array('SELECT count(*) FROM main.line_items'),0,'main table unchanged';
+            is $db->selectrow_array('SELECT count(*) FROM temp.LINE_ITEMS'),0,'shadow unchanged';
+        })};
+    }
+}
 done_testing;
