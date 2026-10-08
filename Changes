@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 Unreleased
+    - Govern native SQLite stored candidates and complete child collections inside
+      their write transaction, applying required rules and normalizers before writes.
+    - Execute owned one-root action collection patches with policy-scoped read
+      anchors, exact returned client identities, plan revalidation, and atomic rollback.
     - SQLite write graphs support explicitly declared owned-set reconciliation.
       Cleanup uses actual RETURNING identities, whole composite keys and
       independently derived parent, child tenant and required scopes. Empty

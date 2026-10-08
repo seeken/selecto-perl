@@ -5,6 +5,7 @@ use strict;
 use warnings;
 use JSON::PP ();
 use Time::HiRes ();
+use Storable ();
 use Scalar::Util qw(blessed refaddr);
 use Selecto::Domain ();
 use Selecto::Domain::Ref ();
@@ -23,6 +24,8 @@ use Selecto::Action::Planner ();
 use Selecto::Limits ();
 use Selecto::OperationBudget ();
 use Selecto::Write::ConflictTarget ();
+use Selecto::WriteRules ();
+use Selecto::Action::Graph ();
 
 sub new {
     my ($class, %args) = @_;
@@ -246,11 +249,19 @@ sub stream {
 }
 sub preview_write {
     my ($self, $command) = @_;
-    return $self->{adapter}->preview_write($self->governed_write($command));
+    $command = $self->governed_write($command);
+    return $self->{adapter}->preview_write($command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
+    return $self->_rules_transaction(sub {
+        return $self->{adapter}->preview_write(Selecto::WriteRules->govern($self, $command));
+    });
 }
 sub execute_write {
     my ($self, $command) = @_;
-    return $self->_execute_governed(execute_write => $self->governed_write($command));
+    $command = $self->governed_write($command);
+    return $self->_execute_governed(execute_write => $command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
+    return $self->_rules_transaction(sub {
+        return $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $command));
+    });
 }
 
 # Hands a governed write object to the adapter with the engine's single-use
@@ -259,14 +270,37 @@ sub _execute_governed {
     my ($self, $method, $subject) = @_;
     return $self->{adapter}->$method($subject, Selecto::Write::Authorization->_issue($subject));
 }
+sub _rules_transaction {
+    my ($self, $work) = @_;
+    Selecto::Error->throw('required_data_rule_pending', 'adapter cannot protect stored candidates')
+        unless $self->{adapter}->can('execute_transaction');
+    my $request = bless {work => $work}, 'Selecto::Write::Transaction';
+    return $self->_execute_governed(execute_transaction => $request);
+}
 sub execute_batch {
     my ($self, $batch) = @_;
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
     my @commands = map { $self->governed_write($_) } @{$batch->commands};
-    return $self->_execute_governed(execute_batch => Selecto::Write::Batch->new(@commands));
+    return $self->_execute_governed(execute_batch => Selecto::Write::Batch->new(@commands))
+        unless $self->{domain}->rules;
+    return $self->_rules_transaction(sub {
+        my @results;
+        push @results, $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $_)) for @commands;
+        return \@results;
+    });
 }
 sub execute_graph {
+    my ($self, $graph) = @_;
+    my ($prepared, $contexts) = $self->_prepared_graph($graph);
+    my $work = sub {
+        $prepared = Selecto::WriteRules->admit_graph($self, $prepared, $contexts) if $prepared->{_requires_rules};
+        return $self->_execute_governed(execute_graph => $prepared);
+    };
+    return $self->_rules_transaction($work) if $prepared->{_requires_rules};
+    return $work->();
+}
+sub _prepared_graph {
     my ($self, $graph) = @_;
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
@@ -292,7 +326,15 @@ sub execute_graph {
     my $sets = $self->_govern_owned_sets($graph->owned_sets, \@nodes, \%contexts);
     my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets);
     $prepared->{_governed_owned_sets} = $sets;
-    return $self->_execute_governed(execute_graph => $prepared);
+    $prepared->{_reference_domains} = {map { ($_ => $contexts{$_}{domain}) } keys %contexts};
+    $prepared->{_requires_rules} = scalar(grep {
+        $contexts{$_->{id}}{domain} && Selecto::WriteRules->has_rules($contexts{$_->{id}}{domain}, $_->{command}->operation)
+    } @nodes);
+    for my $set (@{$graph->owned_sets}) {
+        my $edge = $contexts{$set->{parent}}{relationships}{$set->{relationship}};
+        $prepared->{_requires_rules} ||= Selecto::WriteRules->has_rules(Selecto::Domain->parse($edge->{domain}), 'delete');
+    }
+    return ($prepared, \%contexts);
 }
 
 sub _govern_owned_sets {
@@ -834,33 +876,71 @@ sub _action_upsert_metadata {
 
 sub preview_action {
     my ($self, $plan, %options) = @_;
+    $self->_validate_selected_action($plan) unless exists($options{grant});
     my $decision = $self->_authorize_action($plan, 'preview', %options);
-    my $command = $self->governed_write($self->action_command($plan, %options));
+    $self->_validate_selected_action($plan) if exists($options{grant});
+    if (ref($plan->collection_patches) eq 'HASH' && keys %{$plan->collection_patches}) {
+        my ($graph) = Selecto::Action::Graph->build($self, $plan, %options);
+        return {phase => 'preview', action => $plan->action, decision => $decision,
+            statement => $self->_rules_transaction(sub { Selecto::Action::Graph->preview($self, $graph) })};
+    }
+    my $command = $self->action_command($plan, %options);
     return {
         phase => 'preview',
         action => $plan->action,
         decision => $decision,
-        statement => $self->{adapter}->preview_write($command),
+        statement => $self->preview_write($command),
     };
 }
 
 sub execute_action {
     my ($self, $plan, %options) = @_;
+    $self->_validate_selected_action($plan) unless exists($options{grant});
     my $decision = $self->_authorize_action($plan, 'execute', %options);
-    my $command = $self->governed_write($self->action_command($plan, %options));
+    $self->_validate_selected_action($plan) if exists($options{grant});
+    if (ref($plan->collection_patches) eq 'HASH' && keys %{$plan->collection_patches}) {
+        my ($graph, $clients) = Selecto::Action::Graph->build($self, $plan, %options);
+        return {phase => 'execute', action => $plan->action, decision => $decision,
+            result => $self->_rules_transaction(sub { Selecto::Action::Graph->result($self->execute_graph($graph), $clients) })};
+    }
+    my $command = $self->action_command($plan, %options);
     return {
         phase => 'execute',
         action => $plan->action,
         decision => $decision,
-        result => $self->_execute_governed(execute_write => $command),
+        result => $self->execute_write($command),
     };
 }
 
 # Issues a single-use grant for one phase of $plan after the host's resolver
 # enables it. The grant is bound to the phase, the plan's content, this
 # engine's domain and trusted tenant, and the actor in the context.
+sub _validate_selected_action {
+    my ($self, $plan) = @_;
+    Selecto::Error->throw('invalid_action_plan', 'action plan required')
+        unless blessed($plan) && $plan->isa('Selecto::Action::Plan');
+    Selecto::Action::Planner->validate_plan_limits($self->{domain}, $plan, limits => $self->{limits});
+    my $inputs = Storable::dclone($plan->inputs // {});
+    my $action = $self->domain->actions->{$plan->action};
+    for my $declared ($action->{inputs} // {},
+        Selecto::Action::Planner->input_form($action, $inputs)->{inputs}) {
+        for my $name (keys %$inputs) {
+            my $value = $inputs->{$name};
+            my $default = ref($declared->{$name}) eq 'HASH' ? $declared->{$name}{default} : undef;
+            delete $inputs->{$name} if ref($value) eq 'ARRAY' && @$value == 2
+                && ($value->[0] // '') eq 'system' && ($value->[1] // '') eq 'now'
+                && ref($default) eq 'ARRAY' && @$default == 2
+                && ($default->[0] // '') eq 'system' && ($default->[1] // '') eq 'now';
+        }
+    }
+    my $selected = $self->plan_action({action => $plan->action, target => $plan->target, inputs => $inputs});
+    Selecto::Error->throw('action_plan_mismatch', 'plan differs from the selected declared action')
+        unless Selecto::Action::Grant->plan_digest($selected) eq Selecto::Action::Grant->plan_digest($plan);
+    return 1;
+}
 sub grant_action {
     my ($self, $plan, %options) = @_;
+    $self->_validate_selected_action($plan);
     Selecto::Action::Planner->validate_plan_limits($self->{domain}, $plan, limits => $self->{limits});
     my $phase = $options{phase} // 'execute';
     my $decision = Selecto::Action::Capability->authorize(

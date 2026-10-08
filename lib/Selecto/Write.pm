@@ -154,6 +154,13 @@ sub new {
             unless $id ne '' && !$seen{$id}++;
         Selecto::Error->throw('invalid_write_graph', "graph node $id must contain a write command")
             unless blessed($node_spec->{command}) && $node_spec->{command}->isa('Selecto::Write::Command');
+        my $reference = $node_spec->{reference_only} // 0;
+        Selecto::Error->throw('invalid_write_graph', 'reference_only must be an explicit boolean')
+            unless (!ref($reference) || JSON::PP::is_bool($reference)) && "$reference" =~ /\A[01]\z/;
+        Selecto::Error->throw('invalid_write_graph', 'read anchors require one empty update')
+            if $reference && ($node_spec->{command}->operation ne 'update'
+                || keys %{$node_spec->{command}->assignments}
+                || ($node_spec->{command}->expected_count // 0) != 1);
         my $bindings = $node_spec->{bindings} // [];
         Selecto::Error->throw('invalid_write_graph', "graph node $id bindings must be an array")
             unless ref($bindings) eq 'ARRAY';
@@ -193,6 +200,7 @@ sub new {
             id => $id,
             command => $node_spec->{command},
             bindings => \@normalized_bindings,
+            reference_only => $reference ? 1 : 0,
         };
     }
 
