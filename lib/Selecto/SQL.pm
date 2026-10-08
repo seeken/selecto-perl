@@ -906,6 +906,19 @@ sub execute_graph {
     return $self->execute_graph_unsafe($graph);
 }
 
+sub execute_transaction {
+    my ($self, $request, $authorization) = @_;
+    Selecto::Write::Authorization->require_for($request, $authorization);
+    Selecto::Error->throw('invalid_write', 'transaction work requires engine authority')
+        unless blessed($request) && $request->isa('Selecto::Write::Transaction') && ref($request->{work}) eq 'CODE';
+    if ($self->transaction_mode eq 'external') {
+        Selecto::Error->throw('invalid_adapter', 'protected rules require an open host transaction')
+            unless $self->_transaction_open;
+        return $self->_savepoint_transaction($request->{work});
+    }
+    return $self->_transaction($request->{work});
+}
+
 sub execute_write_unsafe {
     my ($self, $command) = @_;
     my $compiled = $self->_compile_write($command);
@@ -987,6 +1000,21 @@ sub execute_graph_unsafe {
             $command = $command->with_scope_predicate(
                 @scopes == 1 ? $scopes[0] : Selecto::Expression->all(@scopes)
             ) if @scopes;
+            if ($node->{reference_only}) {
+                my $domain = $graph->{_reference_domains}{$node->{id}};
+                Selecto::Error->throw('ungoverned_write', 'read anchor requires its governing domain') unless $domain;
+                my @fields = @{$command->metadata->{returning} // [$domain->primary_key]};
+                @fields = ($domain->primary_key) unless @fields;
+                my $predicate = Selecto::QueryEnforcement::combine($command->predicate,
+                    $command->scope_predicate, $command->query_enforcement ? $command->query_enforcement->predicate : undef);
+                my $query = Selecto::Query->new->select(@fields)->limit(2);
+                $query = $query->where($predicate) if defined $predicate;
+                my $rows = $self->execute_query($self->compile($domain, $query))->{rows};
+                Selecto::Error->throw('cardinality_mismatch', 'read anchor must resolve exactly one governed row') unless @$rows == 1;
+                $results{$node->{id}} = Selecto::Write::Result->new(operation => 'update', affected_rows => 0,
+                    values => {map { ($fields[$_] => $rows->[0][$_]) } 0 .. $#fields});
+                next;
+            }
             my $compiled = $self->_compile_write($command);
             my ($result, $ok);
             $ok = eval {

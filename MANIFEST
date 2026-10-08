@@ -183,3 +183,7 @@ t/filter_ast_json_booleans.t
 t/security_budget_equivalence.t
 docs/sqlite-owned-sync.md
 t/sqlite_owned_sync.integration.t
+lib/Selecto/WriteRules.pm
+lib/Selecto/Action/Graph.pm
+t/sqlite_rule_writes.integration.t
+t/fixtures/data_rules_write_inputs_v1.json

@@ -1,0 +1,519 @@
+{
+  "action_domain": {
+    "actions": {
+      "choose_products": {
+        "execution": {
+          "kind": "updato",
+          "operation": "update",
+          "set": {
+            "selected_products": [
+              "input",
+              "selected_products"
+            ]
+          }
+        },
+        "inputs": {
+          "selected_products": {
+            "required": true,
+            "type": "collection"
+          }
+        },
+        "type": "detail_action"
+      }
+    },
+    "name": "RuleActions",
+    "rules": {
+      "bindings": {
+        "three_products": {
+          "rule": {
+            "id": "exactly_three",
+            "version": 1
+          },
+          "subject": {
+            "action": "choose_products",
+            "path": [
+              "selected_products"
+            ],
+            "scope": "action_input"
+          }
+        }
+      },
+      "definitions": {
+        "exactly_three": {
+          "test": {
+            "exact": 3,
+            "op": "collection.count"
+          },
+          "version": 1
+        }
+      },
+      "normalizers": {},
+      "schema": "selecto.data_rules.v1"
+    },
+    "schema_version": 1,
+    "schemas": {},
+    "source": {
+      "associations": {},
+      "columns": {
+        "id": {
+          "type": "integer"
+        },
+        "selected_products": {
+          "type": "string"
+        }
+      },
+      "fields": [
+        "id",
+        "selected_products"
+      ],
+      "primary_key": "id",
+      "source_table": "orders"
+    },
+    "writes": {
+      "fields": {
+        "selected_products": {
+          "updatable": true
+        }
+      },
+      "operations": {
+        "update": {
+          "enabled": true,
+          "require_filter": true
+        }
+      }
+    }
+  },
+  "action_invalid": {
+    "selected_products": [
+      1,
+      2
+    ]
+  },
+  "action_valid": {
+    "selected_products": [
+      1,
+      2,
+      3
+    ]
+  },
+  "flat_domain": {
+    "name": "RuleWrites",
+    "rules": {
+      "bindings": {
+        "positive": {
+          "operations": [
+            "insert"
+          ],
+          "rule": {
+            "id": "positive",
+            "version": 1
+          },
+          "subject": {
+            "path": [
+              "quantity"
+            ],
+            "scope": "candidate"
+          }
+        },
+        "reference": {
+          "normalizer": {
+            "id": "reference",
+            "version": 1
+          },
+          "operations": [
+            "insert"
+          ],
+          "rule": {
+            "id": "reference",
+            "version": 1
+          },
+          "subject": {
+            "path": [
+              "reference"
+            ],
+            "scope": "candidate"
+          }
+        }
+      },
+      "definitions": {
+        "positive": {
+          "test": {
+            "bound": "0",
+            "op": "number.gt"
+          },
+          "version": 1
+        },
+        "reference": {
+          "test": {
+            "flags": [],
+            "match": "full",
+            "op": "text.pattern",
+            "pattern": "[A-Z0-9]{4,12}",
+            "profile": "ascii_v1"
+          },
+          "version": 1
+        }
+      },
+      "normalizers": {
+        "reference": {
+          "steps": [
+            {
+              "op": "text.trim",
+              "profile": "ascii_whitespace_v1"
+            },
+            {
+              "op": "text.uppercase",
+              "profile": "ascii_v1"
+            }
+          ],
+          "version": 1
+        }
+      },
+      "schema": "selecto.data_rules.v1"
+    },
+    "schema_version": 1,
+    "schemas": {},
+    "source": {
+      "associations": {},
+      "columns": {
+        "id": {
+          "type": "integer"
+        },
+        "quantity": {
+          "type": "integer"
+        },
+        "reference": {
+          "type": "string"
+        }
+      },
+      "fields": [
+        "id",
+        "quantity",
+        "reference"
+      ],
+      "primary_key": "id",
+      "source_table": "line_items"
+    },
+    "writes": {
+      "fields": {
+        "quantity": {
+          "insertable": true
+        },
+        "reference": {
+          "insertable": true
+        }
+      },
+      "operations": {
+        "insert": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "flat_invalid": {
+    "quantity": 0,
+    "reference": " ab12 "
+  },
+  "flat_valid": {
+    "quantity": 2,
+    "reference": " ab12 "
+  },
+  "nested_delta_invalid_count": {
+    "delete": [
+      {
+        "id": 13
+      }
+    ]
+  },
+  "nested_delta_invalid_unique": {
+    "create": [
+      {
+        "product_id": 5,
+        "quantity": 1
+      }
+    ],
+    "delete": [
+      {
+        "id": 13
+      }
+    ]
+  },
+  "nested_delta_valid": {
+    "update": [
+      {
+        "id": 11,
+        "quantity": 4
+      }
+    ]
+  },
+  "nested_domain": {
+    "name": "RuleWriteOrders",
+    "rules": {
+      "bindings": {
+        "exactly_three": {
+          "operations": [
+            "insert",
+            "update"
+          ],
+          "rule": {
+            "id": "exactly_three",
+            "version": 1
+          },
+          "subject": {
+            "path": [
+              "items"
+            ],
+            "scope": "candidate"
+          }
+        },
+        "unique_product": {
+          "operations": [
+            "insert",
+            "update"
+          ],
+          "rule": {
+            "id": "unique_product",
+            "version": 1
+          },
+          "subject": {
+            "path": [
+              "items"
+            ],
+            "scope": "candidate"
+          }
+        }
+      },
+      "definitions": {
+        "exactly_three": {
+          "test": {
+            "exact": 3,
+            "op": "collection.count"
+          },
+          "version": 1
+        },
+        "unique_product": {
+          "test": {
+            "op": "collection.unique_by",
+            "paths": [
+              [
+                "product_id"
+              ]
+            ]
+          },
+          "version": 1
+        }
+      },
+      "normalizers": {},
+      "schema": "selecto.data_rules.v1"
+    },
+    "schema_version": 1,
+    "schemas": {},
+    "source": {
+      "associations": {},
+      "columns": {
+        "id": {
+          "type": "integer"
+        },
+        "reference": {
+          "type": "string"
+        }
+      },
+      "fields": [
+        "id",
+        "reference"
+      ],
+      "primary_key": "id",
+      "source_table": "rule_write_orders"
+    },
+    "writes": {
+      "fields": {
+        "reference": {
+          "insertable": true,
+          "updatable": true
+        }
+      },
+      "operations": {
+        "insert": {
+          "enabled": true
+        },
+        "update": {
+          "enabled": true,
+          "require_filter": true
+        }
+      },
+      "relationships": {
+        "items": {
+          "allowed_ops": [
+            "insert",
+            "update",
+            "delete"
+          ],
+          "cardinality": "many",
+          "child_key": "order_id",
+          "domain": {
+            "name": "RuleWriteItems",
+            "rules": {
+              "bindings": {
+                "positive": {
+                  "operations": [
+                    "insert",
+                    "update"
+                  ],
+                  "rule": {
+                    "id": "positive",
+                    "version": 1
+                  },
+                  "subject": {
+                    "path": [
+                      "quantity"
+                    ],
+                    "scope": "candidate"
+                  }
+                }
+              },
+              "definitions": {
+                "positive": {
+                  "test": {
+                    "bound": "0",
+                    "op": "number.gt"
+                  },
+                  "version": 1
+                }
+              },
+              "normalizers": {},
+              "schema": "selecto.data_rules.v1"
+            },
+            "schema_version": 1,
+            "schemas": {},
+            "source": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "order_id": {
+                  "type": "integer"
+                },
+                "product_id": {
+                  "type": "integer"
+                },
+                "quantity": {
+                  "type": "integer"
+                }
+              },
+              "fields": [
+                "id",
+                "order_id",
+                "product_id",
+                "quantity"
+              ],
+              "primary_key": "id",
+              "source_table": "rule_write_items"
+            },
+            "writes": {
+              "fields": {
+                "product_id": {
+                  "insertable": true,
+                  "updatable": true
+                },
+                "quantity": {
+                  "insertable": true,
+                  "updatable": true
+                }
+              },
+              "operations": {
+                "delete": {
+                  "enabled": true,
+                  "require_filter": true
+                },
+                "insert": {
+                  "enabled": true
+                },
+                "update": {
+                  "enabled": true,
+                  "require_filter": true
+                }
+              }
+            }
+          },
+          "enabled": true,
+          "identity_fields": [
+            "id"
+          ],
+          "ownership": "owned",
+          "parent_key": "id",
+          "writable": true
+        }
+      }
+    }
+  },
+  "nested_invalid_child": [
+    {
+      "product_id": 5,
+      "quantity": 1
+    },
+    {
+      "product_id": 6,
+      "quantity": 0
+    },
+    {
+      "product_id": 7,
+      "quantity": 1
+    }
+  ],
+  "nested_invalid_count": [
+    {
+      "product_id": 5,
+      "quantity": 1
+    },
+    {
+      "product_id": 6,
+      "quantity": 1
+    }
+  ],
+  "nested_invalid_unique": [
+    {
+      "product_id": 5,
+      "quantity": 1
+    },
+    {
+      "product_id": 5,
+      "quantity": 2
+    },
+    {
+      "product_id": 7,
+      "quantity": 1
+    }
+  ],
+  "nested_prior": [
+    {
+      "id": 11,
+      "product_id": 5,
+      "quantity": 1
+    },
+    {
+      "id": 12,
+      "product_id": 6,
+      "quantity": 2
+    },
+    {
+      "id": 13,
+      "product_id": 7,
+      "quantity": 3
+    }
+  ],
+  "nested_valid": [
+    {
+      "product_id": 5,
+      "quantity": 1
+    },
+    {
+      "product_id": 6,
+      "quantity": 2
+    },
+    {
+      "product_id": 7,
+      "quantity": 3
+    }
+  ]
+}

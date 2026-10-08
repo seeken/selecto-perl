@@ -93,6 +93,15 @@ sub evaluate {
     return _result('passed', $normalized);
 }
 
+sub applicable_paths {
+    my ($self, $stage, $operation, $action) = @_;
+    return [map { [@{$_->{subject}{path}}] } grep {
+        $_->{subject}{scope} eq $stage
+            && (!@{$_->{operations}} || grep { $_ eq ($operation // '') } @{$_->{operations}})
+            && ($stage ne 'action_input' || ($_->{subject}{action} // '') eq ($action // ''))
+    } values %{$self->{bindings}}];
+}
+
 sub _test {
     my ($t, $limits) = @_;
     _hash($t, 'invalid_data_rules_contract', 'definition test');

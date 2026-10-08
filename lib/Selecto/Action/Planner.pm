@@ -12,6 +12,8 @@ use Selecto::Error ();
 use Selecto::Limits ();
 use Selecto::Write::ConflictTarget ();
 use Selecto::Write::Expression ();
+use Selecto::WriteRules ();
+use Selecto::DataRules ();
 
 sub plan {
     my ($class, $input, $intent, %options) = @_;
@@ -43,6 +45,14 @@ sub plan {
     Selecto::Error->throw('action_operation_not_enabled', 'action operation is not enabled by the write contract')
         unless ref($operation_spec) eq 'HASH' && $operation_spec->{enabled};
 
+    my $rules = defined($contract->{rules}) ? Selecto::DataRules->parse($contract->{rules}) : undef;
+    if ($rules) {
+        Selecto::Error->throw('required_data_rule_pending', 'action rule requires an unknown authored system value')
+            if grep { !Selecto::WriteRules::_at($inputs, $_) } @{$rules->applicable_paths('action_input', $operation, $action_id)};
+        my $display = _display_values($inputs);
+        my $normalized = Selecto::WriteRules->evaluate($rules, 'action_input', $operation, $display, action => $action_id);
+        $inputs->{$_} = $normalized->{$_} for grep { !_same_value($normalized->{$_}, $display->{$_}) } keys %$normalized;
+    }
     my $changes = _resolve_template($execution->{set} // {}, $inputs);
     _object($changes, 'action changes');
     my %system_values;
@@ -57,10 +67,10 @@ sub plan {
             $changes->{$field} = ['system', 'now'];
         } elsif (ref($value) && !JSON::PP::is_bool($value)) {
             Selecto::Error->throw('invalid_action_changes', 'structured input requires a JSON field', {field => $field})
-                unless $type =~ /\A(?:json|jsonb|map)\z/;
+                unless $type =~ /\A(?:json|jsonb|map)\z/ || $rules && grep { $_->[0] eq $field } @{$rules->applicable_paths('action_input', $operation, $action_id)};
         }
     }
-    _validate_changes($writes, $changes, $operation);
+    _validate_changes($writes, $changes, $operation, ref($execution->{collection_patches}) eq 'HASH' && keys %{$execution->{collection_patches}});
     my $collection_patches = _collection_patches($execution, $inputs);
 
     # Guards cannot apply to a create; report that before the target shape.
@@ -593,9 +603,9 @@ sub _transition {
 }
 
 sub _validate_changes {
-    my ($writes, $changes, $operation) = @_;
+    my ($writes, $changes, $operation, $collections) = @_;
     return if $operation eq 'delete';
-    Selecto::Error->throw('invalid_action_changes', 'action changes must not be empty') unless keys %$changes;
+    Selecto::Error->throw('invalid_action_changes', 'action changes must not be empty') unless keys %$changes || $operation eq 'update' && $collections;
     for my $field (keys %$changes) {
         my $field_spec = $writes->{fields}{$field};
         my $permission = $operation eq 'insert' || $operation eq 'upsert' ? 'insertable' : 'updatable';

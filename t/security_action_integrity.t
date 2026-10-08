@@ -140,7 +140,15 @@ subtest 'R14 caller references never become authored instructions' => sub {
     $default->system_values({});
     is(error_code(sub {$engine->preview_action($default, grant => $grant)}), 'action_grant_mismatch',
         'instruction provenance is covered by the grant digest');
-    my $nested = $engine->plan_action({action => 'json', target => 1,
+    my $variant_raw = contract();
+    $variant_raw->{actions}{mark}{inputs} = {choice => {type => 'string', default => 'yes'}};
+    $variant_raw->{actions}{mark}{variants} = [{id => 'timed', when => {choice => 'yes'},
+        inputs => {time => {type => 'utc_datetime', default => ['system', 'now']}}}];
+    my $variant_engine = engine($variant_raw);
+    my $variant_default = $variant_engine->plan_action({action => 'mark', target => 1});
+    like($variant_engine->preview_action($variant_default)->{statement}{sql}, qr/CURRENT_TIMESTAMP/,
+        'variant-authored temporal default survives intent revalidation');
+    my $nested = $engine->plan_action({action => 'json' , target => 1,
         inputs => {value => {nested => [['system', 'now']]}}});
     my $preview = $engine->preview_action($nested)->{statement};
     unlike($preview->{sql}, qr/CURRENT_TIMESTAMP/, 'nested caller arrays stay literal');
