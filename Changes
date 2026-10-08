@@ -9,6 +9,24 @@ Unreleased
     - Canned detail views may select an aliased datetime_format of an
       entity-grain field, and related collections may format a child date
       with {key, expression}. The formatted field joins the detail GROUP BY.
+    - Faster API query responses, byte for byte the same. EngineHandler->query
+      checks the adapter result (its traversal limits and every cell's
+      bytes) and the response's exact JSON bytes
+      (Selecto::API::ResponsePolicy->check_json) in one pass each, without a
+      method call per cell, and Selecto::API->request skips its second walk
+      of the result (public_data's traversal check) and canonical_json's
+      per-value validation when the value cannot fail them. Each limit
+      compares a running total that only grows, so the single pass decides
+      exactly what the previous checks decided; a result or response that
+      reaches a limit, or holds anything the single pass does not take
+      (blessed or unsupported references, cycles, and in check_json numbers
+      that are not integers), goes through the previous checks, which raise
+      the same error. Limits, defaults, statuses and response bytes are
+      unchanged. 100,000 rows of 10 columns (median of 5 interleaved runs,
+      RAM PostgreSQL): EngineHandler->query with a Mojo::JSON encode 4.81 s
+      to 1.44 s (arrays) and 6.87 s to 2.09 s (objects); Selecto::API->request
+      11.1 s to 2.9 s; peak RSS unchanged. A 50-row objects page: 4.5 to 1.9 ms
+      (handler), 9.0 to 3.1 ms (Selecto::API).
     - Breaking: Selecto::PostgreSQL returns the values DBD::Pg fetched,
       untouched, unless canonical values are asked for. Engine::all,
       Engine::stream (bounded too) and Engine::projection_sum take

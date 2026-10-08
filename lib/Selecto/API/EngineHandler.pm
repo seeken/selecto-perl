@@ -1348,17 +1348,8 @@ sub _api_selection_entry ($domain, $entry, $label, $hidden) {
 }
 
 sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
-    Selecto::OperationBudget->new(limits => $limits, code => 'api_result_limit_exceeded')->check_tree(
-        $result, label => 'adapter result', bytes_limit => 'max_response_bytes');
-    my ($total_bytes, $total_children) = (0, 0);
-    for my $row (@{$result->{rows}}) {
-        for my $value (@$row) {
-            $total_bytes += ref($value)
-                ? Selecto::API::ResponsePolicy->check_json($value, $limits)
-                : $limits->check_bytes('max_response_bytes', $value, 'api_result_limit_exceeded', 'result cell');
-            $limits->check_count('max_response_bytes', $total_bytes, 'api_result_limit_exceeded', 'result bytes');
-        }
-    }
+    _check_result_cells($result, $limits);
+    my $total_children = 0;
     my %subtable = map { $_->{column} => $_ } @$subtables;
     for my $index (0 .. $#{$result->{columns}}) {
         my $specification = $subtable{$result->{columns}[$index]};
@@ -1403,6 +1394,32 @@ sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
         @record{@columns} = @$row;
         \%record;
     } @{$result->{rows}}];
+}
+
+# The adapter result's traversal limits, then each cell's bytes and their
+# running total. A single pass (_tree_within with the rows) returns when every
+# limit holds: each compares a total that only grows, so its final value
+# decides it. Otherwise the checks run one by one and raise the same error as
+# before.
+sub _check_result_cells ($result, $limits) {
+    return if ref($result) eq 'HASH' && ref($result->{rows}) eq 'ARRAY'
+        && Selecto::API::ResponsePolicy::_tree_within($result, $limits, $result->{rows});
+    return _check_result_cells_exact($result, $limits);
+}
+
+sub _check_result_cells_exact ($result, $limits) {
+    Selecto::OperationBudget->new(limits => $limits, code => 'api_result_limit_exceeded')->check_tree(
+        $result, label => 'adapter result', bytes_limit => 'max_response_bytes');
+    my $total_bytes = 0;
+    for my $row (@{$result->{rows}}) {
+        for my $value (@$row) {
+            $total_bytes += ref($value)
+                ? Selecto::API::ResponsePolicy->check_json($value, $limits)
+                : $limits->check_bytes('max_response_bytes', $value, 'api_result_limit_exceeded', 'result cell');
+            $limits->check_count('max_response_bytes', $total_bytes, 'api_result_limit_exceeded', 'result bytes');
+        }
+    }
+    return;
 }
 
 sub _collection_json_value ($value) {

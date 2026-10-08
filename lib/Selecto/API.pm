@@ -335,7 +335,10 @@ sub error_status ($code) {
 }
 
 sub canonical_json ($value) {
-    _validate_canonical_value($value, '$');
+    # The check below refuses non-canonical values; a value it cannot refuse
+    # (_canonical_values_ok) is not walked twice.
+    _validate_canonical_value($value, '$')
+        unless Selecto::API::ResponsePolicy::_canonical_values_ok($value);
     return JSON::PP->new
         ->allow_nonref(1)
         ->ascii(0)
