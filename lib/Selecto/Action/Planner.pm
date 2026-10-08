@@ -14,8 +14,43 @@ use Selecto::Write::ConflictTarget ();
 use Selecto::Write::Expression ();
 use Selecto::WriteRules ();
 use Selecto::DataRules ();
+use Selecto::Action::Grant ();
+use Hash::Util::FieldHash qw(fieldhash);
+
+# Object identity owns accepted planning evidence. Serialized plans and caller
+# hash fields cannot assert that ACTION_INPUT has already been normalized.
+fieldhash my %ACCEPTED_PLANS;
 
 sub plan {
+    my ($class, $input, $intent, %options) = @_;
+    my ($plan, $work) = Selecto::DataRules->_measure_proof_work(sub {
+        return $class->_plan($input, $intent, %options);
+    }, limits => _limits($options{limits}));
+    $ACCEPTED_PLANS{$plan} = {
+        contract => JSON::PP->new->canonical->encode(_contract($input)),
+        digest => Selecto::Action::Grant->plan_digest($plan),
+        work => $work,
+    };
+    return $plan;
+}
+
+sub _accepted_plan {
+    my ($class, $domain, $plan) = @_;
+    my $record = $ACCEPTED_PLANS{$plan};
+    return 0 unless $record;
+    Selecto::Error->throw('action_plan_mismatch', 'plan differs from accepted planning evidence')
+        unless $record->{contract} eq JSON::PP->new->canonical->encode(_contract($domain))
+            && $record->{digest} eq Selecto::Action::Grant->plan_digest($plan);
+    return 1;
+}
+
+sub _accepted_proof_work {
+    my ($class, $plan) = @_;
+    my $record = blessed($plan) && $plan->isa('Selecto::Action::Plan') ? $ACCEPTED_PLANS{$plan} : undef;
+    return $record ? $record->{work} : undef;
+}
+
+sub _plan {
     my ($class, $input, $intent, %options) = @_;
     my $contract = _contract($input);
     _object($intent, 'action intent');

@@ -43,8 +43,26 @@ stages, false conditions, and all logical branches. The native engine owns one
 or graph, shared by INPUT, native candidate and transaction stages, test-only
 projection checks, child candidates and cleanup rules. Separate operations get
 fresh counters, including after a resource refusal. Callers cannot reset it with
-request options or command metadata. ACTION_INPUT planning remains a separate
-evaluation and is not claimed in this protected-write ceiling. Each text step
+request options or command metadata. An accepted action plan retains its measured
+ACTION_INPUT work privately; preview and execution carry that work into the
+same protected-write ceiling. Plan validation does not replay input normalizers.
+The public `action_command` bridge retains the same private receipt through
+`governed_write`, `preview_write`, `execute_write`, INSERT batches and graph
+nodes. Receipts bind authority-bearing command fields; changing an exact
+command refuses it. Command metadata cannot reset measured work. Ordinary
+copied commands are independently governed and do not inherit action receipts.
+Nested protected scopes import prior planning work once per accepted event;
+planning performed inside the current scope has already been charged. Receipt
+and scope identities follow object lifetime, without address-reuse acceptance.
+Trusted work ceilings may tighten the shared counter. Grant validation retains
+its public precedence before action resource admission.
+Private evidence is bound to the exact plan and domain contract, and follows
+object lifetime through weak keys. A serialized plan with ACTION_INPUT rules
+lacks that evidence and remains pending; rebuild it from an original intent.
+Changing the plan or contract refuses acceptance. Grants retain their phase,
+identity and single-use checks. This does not change ACTION_INPUT's declared
+default/coercion semantics or move scalar INPUT ahead of domain governance.
+Each text step
 charges its current UTF-8 size; NFC output is checked again for expansion. Text is bounded to 4,096 UTF-8 bytes,
 logical depth to 16, collection size to 1,000, and exact numbers to 1,024 digits.
 Trusted `Selecto::Limits` can tighten these bounds. The ASCII pattern evaluator
