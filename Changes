@@ -31,20 +31,32 @@ Unreleased
       adapters always return canonical values. A Selecto::PostgreSQL
       subclass that overrides execute_query is not sent the option unless
       its supports('canonical_values') is true.
-    - Canonical PostgreSQL values are formatted in SQL for large results.
-      After a statement's first canonical run on a handle (decoded in
-      Perl, which records the result column types), a run that follows one
-      returning at least 256 rows wraps each top-level numeric (PostgreSQL
-      13+, via trim_scale), timestamp and timestamptz selection in SQL
-      that turns the type's own output text into the canonical text,
-      guarded by pg_typeof so a changed type falls back to Perl. Floats,
-      integers and booleans stay in Perl (DBD::Pg returns them as Perl
-      numbers, whose canonical text SQL cannot reproduce). Only the
-      outermost select list changes; ORDER BY and GROUP BY still use the
-      underlying values. Values are identical to the Perl decode
-      (t/canonical_values.integration.t checks a wide corpus under several
-      DateStyle, TimeZone and extra_float_digits settings).
-      canonical_sql => 0 decodes in Perl.
+    - Breaking, with the entry above: canonical PostgreSQL dates and
+      timestamps are always the ISO form in the session time zone.
+      Canonical values of fields declared decimal (PostgreSQL 13+), date,
+      naive_datetime and utc_datetime are formatted by PostgreSQL in the
+      outermost select list, whatever the result size: trim_scale for
+      numeric, and TO_CHAR for dates and timestamps, in the session
+      TimeZone, with the offset from TO_CHAR's OF unless it is +00.
+      The declared type chooses the columns and the column's PostgreSQL type
+      (CASE on pg_typeof) the formatter, so a mis-declared temporal kind or a
+      date kept as text is unchanged. The values are the ones the Perl
+      decode gives under DateStyle ISO (BC, infinities, fractions and
+      historic offsets with seconds included), but they no longer follow a
+      non-ISO session DateStyle (SQL, Postgres, German): canonical output is
+      the ISO form in the session time zone. Columns PostgreSQL does not
+      format (integers, floats, booleans, aggregates and other expressions,
+      computed fields, ordered rollups, set operations) are decoded in Perl
+      as before. A float or integer column declared decimal comes out as its
+      PostgreSQL text ("1e+20", "Infinity"; "7" as a string). ORDER BY and
+      GROUP BY keep the underlying expressions. Streams, bounded streams and
+      BoundedQuery format the same columns (so a bounded result's cell-size
+      guard measures the canonical text). canonical_sql => 0 decodes in
+      Perl. PostgreSQL parses and plans the longer statement on every call
+      without the statement cache (roughly 30-50 microseconds per formatted
+      datetime column), and once per connection and SQL text with it.
+      Integer columns that DBD::Pg fetched as Perl numbers skip int() on
+      Perl 5.36 and newer.
     - getResource takes an optional date_format query parameter (iso8601,
       the default and the previous output; rfc3339_millis; epoch_seconds;
       epoch_milliseconds) that formats every temporal field in UTC,

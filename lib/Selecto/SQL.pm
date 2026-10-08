@@ -184,6 +184,7 @@ sub _compile_single {
     ) if @duplicate_columns;
 
     my $groups = $query->groups;
+    local $self->{_field_types} = {};
     local $self->{_group_expression_sql} = {};
     local $self->{_group_expression_params} = \@params;
     local $self->{_group_expression_digests} = {};
@@ -214,7 +215,7 @@ sub _compile_single {
         my $item = $needs_result_alias
             ? $expression_sql . ' AS ' . $self->quote_identifier($columns[$selection_position - 1])
             : $expression_sql;
-        push @projection, [length($expression_sql), length($item)];
+        push @projection, [length($expression_sql), length($item), $self->_canonical_kind($domain, $_)];
         $item
     } @$selections;
     # SELECT placeholders precede JOIN placeholders, including nested joins.
@@ -405,10 +406,14 @@ sub _compile_single {
     return $statement;
 }
 
-# Dialect hook: records where each top-level selection sits in a statement
-# compile just built (start offset; per selection, the expression length and
-# the item length including any ' AS alias'). The base adapter keeps nothing.
+# Dialect hooks for adapters that format result values in SQL.
+# _note_projection records where each top-level selection sits in a statement
+# compile just built (start offset; per selection, the expression length, the
+# item length including any ' AS alias', and its _canonical_kind).
+# _canonical_kind names the canonical formatting a selection's declared domain
+# type calls for, or undef. The base adapter keeps nothing.
 sub _note_projection { return; }
+sub _canonical_kind { return undef; }
 
 # A retargeted query compiles on a domain rooted at the target relation. Its
 # context is an ordinary query on the original domain, under the original
@@ -820,30 +825,22 @@ sub _single_rollup_grouping_position {
 
 sub execute_query {
     my ($self, $statement) = @_;
-    my $rows;
+    my ($sth, $rows);
     my $ok = eval {
-        ($rows, my $types) = $self->_fetch_query($self->_query_transport_sql($statement), $statement->params);
-        $self->_decode_rows($rows, $types);
+        if ($self->_statement_cache_enabled) {
+            $sth = $self->_cached_execute($self->_query_transport_sql($statement), $statement->params,
+                'database query failed');
+        } else {
+            $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
+            $self->_execute_statement($sth, $statement->params);
+        }
+        my @types = $self->_column_types($sth);
+        $rows = $sth->fetchall_arrayref;
+        $self->_decode_rows($rows, \@types);
         1;
     };
     die $self->normalize_error($@) unless $ok;
     return { columns => $statement->columns, rows => $rows };
-}
-
-# Runs one query SQL text and returns its undecoded rows and column types.
-# Errors propagate as raised; the caller normalizes them.
-sub _fetch_query {
-    my ($self, $sql, $params) = @_;
-    my $sth;
-    if ($self->_statement_cache_enabled) {
-        $sth = $self->_cached_execute($sql, $params, 'database query failed');
-    } else {
-        $sth = $self->{dbh}->prepare($sql);
-        $self->_execute_statement($sth, $params);
-    }
-    my @types = $self->_column_types($sth);
-    my $rows = $sth->fetchall_arrayref;
-    return ($rows, \@types);
 }
 
 # Decodes fetched rows in place, cell for cell as _decode would. An adapter
@@ -1773,6 +1770,10 @@ sub _field_sql {
             $key_sql, $domain->_field_metadata_view($key_path)->{text_case},
         );
         $sql = "COALESCE($sql, $key_sql)";
+    } elsif ($self->{_field_types}) {
+        # The declared type of a stored field this compile read, for
+        # _canonical_kind.
+        $self->{_field_types}{"$path"} = $resolved->{type};
     }
     my $localize = defined($self->{_timezone})
         && ($resolved->{type} eq 'utc_datetime' || $resolved->{type} eq 'epoch_datetime')
