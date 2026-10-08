@@ -16,6 +16,27 @@ Unreleased
       nongrouped selections or orderings before database execution.
     - Public API query pages publish has_more from one extra fetched row and
       return at most the requested limit. Zero-sized pages fetch no rows.
+    - Opt-in PostgreSQL statement cache. Selecto::PostgreSQL takes
+      statement_cache (default 0) and statement_cache_size (default 256).
+      When on, execute_query and executed writes reuse one statement handle
+      per SQL text and connection (kept with prepare_cached under a private
+      attribute, so it is freed with the handle), and DBD::Pg runs them as
+      named server-side statements. Least recently used handles beyond the
+      bound are deallocated, only right after a statement succeeded. A lost
+      statement (26000) or changed result type (0A000) is prepared again
+      once outside a transaction; inside one the original error and
+      SQLSTATE stand. New Selecto::PostgreSQL::StatementCache (forget,
+      count). Unchanged with it off (the default): every call prepares a new
+      handle as before. Streams, insert admission and bounded-write probes
+      always prepare afresh. Not for transaction-mode poolers before
+      PgBouncer 1.21.
+    - Each domain action with preconditions or a transition gets a boolean
+      can_<action> column, true when the row meets them, with Yes/No filter
+      choices, so the API and Explorer can show and filter the rows an
+      action could run on. Actions opt out with prerequisite_column false.
+      Domain::without_action_prerequisites removes the columns of actions a
+      caller cannot see, and Selecto::Action->prerequisites returns the
+      guards without planning a target.
     - Selecto::API serves GET .../resources/{id} (getResource) when constructed
       with resources => 1; a resource's aggregate_version is its ETag, and
       resource_not_found maps to 404.
