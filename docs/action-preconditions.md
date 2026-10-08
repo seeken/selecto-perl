@@ -26,3 +26,13 @@ expected affected-row cardinality. Preview does not reserve eligibility.
 D076-D077 in specification 2.7 / `domain_actions` 1.1 check public planner behavior,
 not arbitrary host callbacks or live mutation enforcement.
 
+## Prerequisite columns
+
+Each action with non-empty preconditions or a transition also gets a boolean
+`can_<action>` column on its domain: true exactly when every precondition and
+the transition source state hold, never NULL (guarded fields must be
+non-null), and filterable as Yes/No. `Selecto::Action->prerequisites($domain, $action_id)`
+returns the guards it is built from. Set `"prerequisite_column": false` on the
+action to leave it out. Hosts hide the columns of actions a caller cannot see
+with `$domain->without_action_prerequisites(@action_ids)`; the column reports
+row state and never grants the action.
