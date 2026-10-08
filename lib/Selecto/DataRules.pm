@@ -12,18 +12,64 @@ use Selecto::RuleTest ();
 use Selecto::Limits ();
 use Unicode::Normalize ();
 use bytes ();
+use Hash::Util::FieldHash qw(fieldhash);
+use Scalar::Util qw(refaddr);
 our $SCHEMA = 'selecto.data_rules.v1';
 
 # Only the native engine opens this scope. It is not a request option or
 # command metadata; nested previews, graph nodes and stages share the counter.
 my $PROOF_WORK;
+my ($PROOF_ID, $PROOF_ACCEPTED, $PROOF_LIMIT);
+fieldhash my %MEASURED_WORK;
 sub _with_proof_budget {
-    my ($class, $work) = @_;
-    return $work->() if $PROOF_WORK;
+    my ($class, $work, %options) = @_;
+    if ($PROOF_WORK) {
+        $PROOF_LIMIT = $options{limits}->get('max_rule_work')
+            if $options{limits} && $options{limits}->get('max_rule_work') < $PROOF_LIMIT;
+        $class->_charge_accepted_work($options{accepted_work});
+        return $work->();
+    }
     my $units = 0;
     $PROOF_WORK = \$units;
-    my $scope = bless {restore => sub { $PROOF_WORK = undef }}, 'Selecto::DataRules::_BudgetScope';
+    $PROOF_ID = bless \(my $identity = undef), 'Selecto::DataRules::_ProofIdentity';
+    fieldhash my %accepted;
+    $PROOF_ACCEPTED = \%accepted;
+    $PROOF_LIMIT = ($options{limits} // Selecto::Limits->new)->get('max_rule_work');
+    my $scope = bless {restore => sub {
+        ($PROOF_WORK, $PROOF_ID, $PROOF_ACCEPTED, $PROOF_LIMIT) = (undef, undef, undef, undef);
+    }}, 'Selecto::DataRules::_BudgetScope';
+    $class->_charge_accepted_work($options{accepted_work});
     return $work->();
+}
+
+sub _charge_accepted_work {
+    my ($class, $tickets) = @_;
+    $tickets = [] unless defined $tickets;
+    $tickets = [$tickets] unless ref($tickets) eq 'ARRAY';
+    for my $ticket (@$tickets) {
+        next unless defined $ticket;
+        my $record = ref($ticket) ? $MEASURED_WORK{$ticket} : undef;
+        Selecto::Error->throw('required_data_rule_pending', 'accepted planning work requires private evidence')
+            unless $record;
+        next if $PROOF_ACCEPTED->{$ticket};
+        # A plan created inside this proof has already spent its measured work.
+        $$PROOF_WORK += $record->{units} unless refaddr($record->{scope}) == refaddr($PROOF_ID);
+        $PROOF_ACCEPTED->{$ticket} = 1;
+    }
+    Selecto::Error->throw('evaluation_limit', 'accepted planning work exceeds the protected proof budget')
+        if $$PROOF_WORK > $PROOF_LIMIT;
+}
+
+sub _measure_proof_work {
+    my ($class, $work, %options) = @_;
+    return $class->_with_proof_budget(sub {
+        my $before = $$PROOF_WORK;
+        my $result = $work->();
+        my $ticket = bless \(my $identity = undef), 'Selecto::DataRules::_MeasuredWork';
+        $MEASURED_WORK{$ticket} = {units => $$PROOF_WORK - $before, scope => $PROOF_ID};
+        $PROOF_ACCEPTED->{$ticket} = 1;
+        return ($result, $ticket);
+    }, limits => $options{limits});
 }
 
 
@@ -90,6 +136,7 @@ sub _evaluate_request {
             && (!defined($request{operation}) || !ref($request{operation}) && $request{operation} =~ /\A(?:insert|update|delete|upsert)\z/)
             && ($stage ne 'action_input' || _id($request{action}));
     my $limits = defined($request{limits}) ? $self->{limits}->intersect($request{limits}) : $self->{limits};
+    $limits = $limits->tightened(max_rule_work => $PROOF_LIMIT) if $PROOF_WORK;
     my $subject_value = _hash($request{subject}, 'invalid_data_rules_request', 'subject');
     my $local_work = 0;
     my $work = $PROOF_WORK // \$local_work;
