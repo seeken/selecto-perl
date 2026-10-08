@@ -250,8 +250,16 @@ sub count_bucket {
     );
 }
 sub datetime_format {
-    my ($class, $field, $format) = @_;
-    return $class->new('datetime_format', $class->_operand($field), "$format");
+    my ($class, $field, $format, %options) = @_;
+    _known_options(\%options, [qw(timezone)], 'datetime format');
+    my $timezone = $options{timezone};
+    if (defined $timezone) {
+        require DateTime::TimeZone;
+        Selecto::Error->throw('invalid_query', 'timezone must be a valid IANA timezone name')
+            if ref($timezone) || !DateTime::TimeZone->is_valid_name("$timezone");
+    }
+    return $class->new('datetime_format', $class->_operand($field), "$format",
+        (defined($timezone) ? "$timezone" : ()));
 }
 sub epoch_datetime {
     my ($class, $field) = @_;
@@ -760,13 +768,19 @@ be C<< {key => 'name', expression => $expression} >>.
 =head2 datetime_format
 
   Selecto::Expression->datetime_format('ordered_at', 'month')
+  Selecto::Expression->datetime_format('ordered_at', 'us_datetime',
+      timezone => 'America/New_York')
 
 Formats a date or time with an allowlisted format name (C<iso8601>,
 C<rfc3339_millis>, C<epoch_seconds>, C<epoch_milliseconds>, C<day>,
-C<time>, C<day_hour>, C<week>, C<iso_week>, C<iso_week_date>, C<month>,
-C<quarter>, C<year>, C<month_of_year>, C<day_of_month>, C<day_of_week>,
-C<day_of_week_num>, C<day_of_year>, C<hour>, C<timezone_offset>). Use the
-same expression in C<select>, C<group_by> and C<order_by>. PostgreSQL and
+C<time>, C<day_hour>, C<day_minute>, C<week>, C<iso_week>, C<iso_week_date>,
+C<month>, C<quarter>, C<year>, C<month_of_year>, C<day_of_month>, C<day_of_week>,
+C<day_of_week_num>, C<day_of_year>, C<hour>, C<timezone_offset>, and the
+display formats C<us_date> (C<10/08/2026>) and C<us_datetime>
+(C<10/08/2026 2:30 PM>)). Use the same expression in C<select>, C<group_by>
+and C<order_by>. The C<timezone> option shows this value in an IANA time
+zone, as L<Selecto::Query/use_timezone> does for a whole query, without
+changing how filters compare the field. PostgreSQL and
 DuckDB implement these; other adapters fail closed. The instant formats
 (C<iso8601> of a C<utc_datetime>, C<rfc3339_millis>, the epochs and
 C<timezone_offset>) read a C<utc_datetime> column declared

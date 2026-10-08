@@ -298,12 +298,15 @@ sub _compile_dialect_expression {
     if ($kind eq 'datetime_format') {
         my %formats = (
             day => '%Y-%m-%d', time => '%H:%M:%S', day_hour => '%Y-%m-%d %H',
+            day_minute => '%Y-%m-%d %H:%M',
             week => '%G-W%V', iso_week => '%G-W%V',
             iso_week_date => '%G-W%V-%u', month => '%Y-%m', year => '%Y',
             month_of_year => '%m', month_day => '%m-%d', day_of_month => '%d',
             day_of_week => '%A', day_of_week_num => '%u', day_of_year => '%j', hour => '%H',
+            us_date => '%m/%d/%Y', us_datetime => '%m/%d/%Y %-I:%M %p',
         );
-        my ($field, $format) = @$arguments;
+        my ($field, $format, $timezone) = @$arguments;
+        local $self->{_timezone} = $timezone // $self->{_timezone};
         Selecto::Error->throw('invalid_query', 'datetime format field must be a governed temporal field')
             unless blessed($field) && $field->isa('Selecto::Expression')
                 && ($field->kind eq 'field' || $field->kind eq 'epoch_datetime');

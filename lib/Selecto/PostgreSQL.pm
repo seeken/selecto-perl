@@ -344,6 +344,7 @@ sub _compile_dialect_expression {
             day => 'YYYY-MM-DD',
             time => 'HH24:MI:SS',
             day_hour => 'YYYY-MM-DD HH24',
+            day_minute => 'YYYY-MM-DD HH24:MI',
             week => 'IYYY-"W"IW',
             iso_week => 'IYYY-"W"IW',
             iso_week_date => 'IYYY-"W"IW-ID',
@@ -357,8 +358,11 @@ sub _compile_dialect_expression {
             day_of_week_num => 'ID',
             day_of_year => 'DDD',
             hour => 'HH24',
+            us_date => 'MM/DD/YYYY',
+            us_datetime => 'MM/DD/YYYY FMHH12:MI AM',
         );
-        my ($field, $format) = @$arguments;
+        my ($field, $format, $timezone) = @$arguments;
+        local $self->{_timezone} = $timezone // $self->{_timezone};
         Selecto::Error->throw('invalid_query', 'datetime format field must be a governed temporal field')
             unless blessed($field) && $field->isa('Selecto::Expression')
                 && ($field->kind eq 'field' || $field->kind eq 'epoch_datetime');

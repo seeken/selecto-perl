@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - datetime_format takes a timezone option, which shows that one value in
+      an IANA zone without localizing the query's filters, and two display
+      formats: us_date (10/08/2026) and us_datetime (10/08/2026 2:30 PM),
+      on PostgreSQL and DuckDB. A day_minute format (2026-10-08 14:30)
+      sorts in date order, so it is also offered for grouping.
+    - Canned detail views may select an aliased datetime_format of an
+      entity-grain field, and related collections may format a child date
+      with {key, expression}. The formatted field joins the detail GROUP BY.
     - Canonical direct associations infer tenant equality from both declared
       relation tenant fields, including nested edges, correlated collections,
       computed EXISTS and PostgreSQL lateral lookups. Explicit complete pairs

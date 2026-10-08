@@ -80,9 +80,10 @@ is_deeply(
     [[
         '2026-09-11T12:30:45', '2026-09-11T12:30:45.123Z',
         1789129845, 1789129845123,
-        '2026-09-11', '12:30:45', '2026-09-11 12',
+        '2026-09-11', '12:30:45', '2026-09-11 12', '2026-09-11 12:30',
         '2026-W37', '2026-W37', '2026-W37-5', '2026-09', '2026-Q3',
         '2026', '09', '11', 'Friday', '5', '254', '12', '+00:00',
+        '09/11/2026', '09/11/2026 12:30 PM',
     ]],
     'DuckDB executes every governed date format used by API and Explorer clients',
 );
@@ -165,6 +166,14 @@ is_deeply(
     )->use_timezone('America/New_York'))->{rows},
     [['2026-09-11 08']],
     'DuckDB applies explicit IANA timezones to UTC datetime fields',
+);
+is_deeply(
+    $timezone_engine->all($timezone_engine->query->select(
+        Selecto::Expression->datetime_format('occurred_utc', 'us_datetime',
+            timezone => 'America/New_York')->as('occurred_local'),
+    )->where(Selecto::Expression->gte('occurred_utc', '2026-09-11T12:00:00Z')))->{rows},
+    [['09/11/2026 8:30 AM']],
+    'DuckDB shows one formatted value in a zone while filters compare instants',
 );
 is_deeply(
     $timezone_engine->all($timezone_engine->query->select(
