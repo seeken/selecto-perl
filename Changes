@@ -1,6 +1,17 @@
 Revision history for Selecto
 
 Unreleased
+    - SQLite supports typed values, JSON extraction and recursive typed JSON
+      containment, JSON/array rowsets, array predicates, UTC calendar formats
+      and buckets, FTS5 predicates/ranking, schema metadata and query plans.
+      Version gates compare full tuples; CTEs require 3.8.3, windows 3.28.0,
+      and bounded materialization/RETURNING 3.35.0. Offset-only paging uses
+      LIMIT -1. Governed query/stream execution rejects writes and preserves
+      caller-owned query_only and raw/DBI transactions; trusted tooling has
+      an explicit execute_query_unsafe escape.
+    - SQLite ordered/bounded related collections retain boolean/JSON types,
+      child/bridge policies and tenant guards. Limits/cursors and API subtables
+      execute with stable ordering and whole-response overflow refusal.
     - Selecto::API serves GET .../resources/{id} (getResource) when constructed
       with resources => 1; a resource's aggregate_version is its ETag, and
       resource_not_found maps to 404.

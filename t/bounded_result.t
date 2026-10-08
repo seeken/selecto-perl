@@ -133,8 +133,9 @@ subtest 'PostgreSQL per-parent bounded aggregation and transfer' => sub {
     is_deeply(\@fetch_sizes,[100,51,100,100],'fetch size is min(max_rows + 1, 100)');
     is $dbh->selectrow_array('SELECT 1'),1,'PG handle usable after batched bounded reads';
     my $sqlite=engine('sqlite',child_domain(),DBI->connect('dbi:SQLite:dbname=:memory:','','',{RaiseError=>1,PrintError=>0}));
-    my $error=assert_rejected(sub{Selecto::BoundedQuery->prepare($sqlite,$query)},'unsupported bounded nested SQLite refuses before database prepare');
-    is $error->code,'unsupported_feature','unsupported capability remains explicit';
+    my $sqlite_prepared=Selecto::BoundedQuery->prepare($sqlite,$query);
+    ok @{$sqlite_prepared->{collections}},'SQLite supports bounded nested collection planning';
+    like $sqlite_prepared->{statement}->sql,qr/LIMIT \d+/,'SQLite collection planning applies a finite child limit';
     $dbh->disconnect;
 };
 
