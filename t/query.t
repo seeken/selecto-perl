@@ -1145,8 +1145,8 @@ like(
         domain => $line_domain,
         adapter => Selecto::SQLite->new(dbh => TestSelecto::DBH->new),
     )->compile($collection_query)->sql,
-    qr/JSON_GROUP_ARRAY\(JSON_OBJECT\('sku', "c_lines"\."sku"\)\)/,
-    'SQLite related collections use JSON_GROUP_ARRAY',
+    qr/JSON_GROUP_ARRAY\(JSON\(__selecto_children\.record\)\).*JSON_OBJECT\('sku', "c_lines"\."sku"\)/,
+    'SQLite related collections aggregate JSON records through a stable ordered input',
 );
 my $sqlite_ordered = eval {
     Selecto::Engine->new(

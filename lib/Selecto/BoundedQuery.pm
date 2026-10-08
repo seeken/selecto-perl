@@ -43,8 +43,8 @@ sub prepare {
             my ($path, $fields, $options) = @{$expression->arguments};
             $options //= {};
             if (!defined($options->{aggregate})) {
-                Selecto::Error->throw('unsupported_feature', 'bounded child collections require PostgreSQL')
-                    unless $adapter->name eq 'postgresql';
+                Selecto::Error->throw('unsupported_feature', 'bounded child collections require a certified dialect')
+                    unless $adapter->name eq 'postgresql' || $adapter->supports('bounded_related_collections');
                 Selecto::Error->throw('unsupported_feature', 'bounded child collections require scalar child fields')
                     if grep { ref($_) } @$fields;
                 my $association = $engine->domain->resolve_association($path)->{association};

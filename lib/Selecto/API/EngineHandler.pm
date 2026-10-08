@@ -762,7 +762,7 @@ sub describe_openapi ($self, $api) {
     };
     $openapi->{components}{schemas}{SelectoSubtableSelection} = {
         type => 'array', minItems => 1, maxItems => $self->max_fields,
-        description => 'PostgreSQL only. Stable primary-key order; each collection must fit the configured per-parent limit or the request is refused. Successful subtable metadata includes limit and complete=true.',
+        description => 'Stable primary-key order; each collection must fit the configured per-parent limit or the request is refused. Successful subtable metadata includes limit and complete=true.',
         'x-selecto-max-rows-per-parent' => $self->limits->get('max_collection_rows'),
         items => {
             oneOf => [
@@ -1179,8 +1179,8 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
         }
         Selecto::Error->throw('invalid_api_query', 'subtable selection must not be empty')
             unless @$entry;
-        Selecto::Error->throw('unsupported_feature', 'bounded API collections require PostgreSQL')
-            unless $adapter_name eq 'postgresql';
+        Selecto::Error->throw('unsupported_feature', 'bounded API collections require a certified dialect')
+            unless $adapter_name eq 'postgresql' || $adapter_name eq 'sqlite';
         my (@fields, %nested_names, $association);
         for my $nested_entry (@$entry) {
             Selecto::Error->throw(

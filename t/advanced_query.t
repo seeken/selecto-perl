@@ -186,7 +186,7 @@ eval {
         Selecto::Expression->text_search(['person.name'], 'open'),
     ));
 };
-is($@->code, 'invalid_query', 'unsupported dialect full-text search fails closed');
+is($@->code, 'unsupported_feature', 'unavailable SQLite full-text search fails closed');
 
 my $orders_domain = Selecto::Domain->new(
     name => 'JSON orders', table => 'orders',

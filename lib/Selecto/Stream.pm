@@ -30,6 +30,7 @@ sub next {
     my (@row, $available, $decoded);
     my $ok = eval {
         @row = $self->{sth}->fetchrow_array;
+        die 'database stream fetch failed' if !@row && eval { $self->{sth}->err };
         $available = @row ? 1 : 0;
         $decoded = [map {
             $self->{decode}->($row[$_], $self->{types}[$_])

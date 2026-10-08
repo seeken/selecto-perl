@@ -859,8 +859,10 @@ A correlated lateral subquery (PostgreSQL).
       ->select('id', 'items.sku', 'items.quantity');
 
 Expands a JSON column into typed rows through a lateral
-C<JSONB_TO_RECORDSET> (PostgreSQL). Column types are allowlisted; the
-optional SQL/JSON C<path> is a bound parameter.
+C<JSONB_TO_RECORDSET> on PostgreSQL or C<JSON_EACH> on SQLite with JSON1.
+Column types are allowlisted; the optional path is a bound parameter.
+SQLite accepts direct array paths, optionally ending in C<[*]>, and preserves
+roots with empty/missing arrays for left joins.
 
 =head2 array_rowset
 

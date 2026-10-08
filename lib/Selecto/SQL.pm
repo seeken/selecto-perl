@@ -1414,6 +1414,7 @@ sub _compile_related_collection_at {
         if ($field->{expression}->kind eq 'related_collection') {
             push @collection_fields, {
                 key => "$field->{key}",
+                type => 'json',
                 sql => $self->_compile_related_collection_at(
                     $domain,
                     $field->{expression},
@@ -1438,6 +1439,7 @@ sub _compile_related_collection_at {
         push @collection_fields, {
             key => "$field->{key}",
             sql => $self->_compile_expression($domain, $field->{expression}, $params),
+            ($field->{expression}->kind eq 'field' ? (type => $resolved->{type}) : ()),
             (exists($field->{stringify}) ? (stringify => $field->{stringify}) : ()),
         };
     }
@@ -1526,7 +1528,7 @@ sub _compile_related_collection_at {
         unless ref($orders) eq 'ARRAY';
     Selecto::Error->throw(
         'unsupported_feature', 'ordered related collections require a certified dialect',
-    ) if @$orders && $self->name ne 'postgresql';
+    ) if @$orders && $self->name ne 'postgresql' && !$self->supports('ordered_related_collections');
     my @order_sql;
     for my $spec (@$orders) {
         my ($field, $direction) = ref($spec) eq 'ARRAY' ? @$spec : ();
@@ -1536,7 +1538,7 @@ sub _compile_related_collection_at {
             && exists($association_fields->{$field})
             && defined($direction) && !ref($direction)
             && "$direction" =~ /\A(?:asc|desc)\z/i;
-        push @order_sql, $self->_qualified($alias, $field) . ' ' . uc($direction);
+        push @order_sql, $self->_related_collection_order_term($alias, $field, $direction);
     }
     my $order = @order_sql ? join(', ', @order_sql)
         : defined($association->target_primary_key)
@@ -1549,15 +1551,15 @@ sub _compile_related_collection_at {
         Selecto::Error->throw('invalid_query', 'per-parent collection limit is invalid')
             unless !ref($limit) && "$limit" =~ /\A[1-9][0-9]*\z/ && @order_sql;
         Selecto::Error->throw(
-            'unsupported_feature', 'per-parent collection limits require PostgreSQL',
-        ) unless $self->name eq 'postgresql';
+            'unsupported_feature', 'per-parent collection limits require a certified dialect',
+        ) unless $self->name eq 'postgresql' || $self->supports('bounded_related_collections');
         my $primary_key = $association->target_primary_key;
         Selecto::Error->throw(
             'invalid_query', 'per-parent collection limit requires a target primary key',
         ) unless defined($primary_key) && exists($association_fields->{$primary_key});
         my @stable_orders = map { [$_->[0], lc($_->[1])] } @$orders;
         if (!grep { $_->[0] eq $primary_key } @$orders) {
-            push @order_sql, $self->_qualified($alias, $primary_key) . ' ASC';
+            push @order_sql, $self->_related_collection_order_term($alias, $primary_key, 'asc');
             push @stable_orders, [$primary_key, 'asc'];
             $order = join(', ', @order_sql);
         }
@@ -1585,6 +1587,11 @@ sub _compile_related_collection_at {
         where => $where,
         order => $order,
     });
+}
+
+sub _related_collection_order_term {
+    my ($self, $alias, $field, $direction) = @_;
+    return $self->_qualified($alias, $field) . ' ' . uc($direction);
 }
 
 sub _related_collection_cursor_predicate {
@@ -1643,6 +1650,7 @@ sub _related_collection_json_pairs {
         my $sql = $self->_related_collection_value_sql($_);
         $sql = "($sql)::text"
             if $exact_decimals_as_text
+                && !$_->{stringify}
                 && defined($_->{type})
                 && $_->{type} =~ /\A(?:decimal|numeric|number)\z/;
         "'$key', $sql"
