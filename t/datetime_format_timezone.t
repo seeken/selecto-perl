@@ -2,6 +2,7 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
+use Selecto::BoundedQuery ();
 use Selecto::CannedPage ();
 use Selecto::Domain ();
 use Selecto::DuckDB ();
@@ -85,6 +86,18 @@ ok grep({ $_->kind eq 'field' && $_->arguments->[0] eq 'delivered' }
         @{$ordered->plan({})->{query}->groups}),
     'an ordering field is still grouped beside a formatted date';
 ok !eval { page($local); 1 }, 'a formatted detail selection needs an alias';
+# Bounded preparation only compiles; stand in for a live connection's support.
+no warnings qw(redefine once);
+local *Selecto::PostgreSQL::bounded_stream_supported = sub { 1 };
+local *Selecto::PostgreSQL::query_budget_supported = sub { 1 };
+use warnings qw(redefine once);
+my $bounded_sql = Selecto::BoundedQuery->prepare($pg, $planned)->{statement}->sql;
+like $bounded_sql, qr/'inspected', TO_CHAR\(.+ LIMIT \d+/s,
+    'a bounded collection may format a child date and keeps its cap';
+ok !eval { Selecto::BoundedQuery->prepare($pg, $pg->query->select('id',
+    $E->related_collection('inspections', [{key => 'nested', expression =>
+        $E->related_collection('inspections', ['inspected'])}])->as('inspections'))); 1 },
+    'a bounded collection still refuses a nested collection as a child';
 ok !eval { page($E->related_collection('inspections', [
     {key => 'when', expression => $E->datetime_format('inspections.inspected', 'us_date')},
 ])->as('inspections')); 1 }, 'a nested formatted field keeps its own name';

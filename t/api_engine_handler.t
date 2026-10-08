@@ -492,29 +492,23 @@ my $timezone_error = eval {
 is $timezone_error->code, 'invalid_api_query',
     'unknown IANA timezone names fail during API validation';
 
-my ($shortcut_start, $shortcut_end) = Selecto::DateShortcut->bounds('this_week');
 $handler->query($engine, {
     select => ['id'],
     filters => [{field => 'occurred_at', op => 'date_shortcut', value => 'this_week'}],
 });
 like $adapter->{last_statement}->sql,
-    qr/TO_TIMESTAMP\("s0"\."occurred_at"\) >= \$2\) AND \(TO_TIMESTAMP\("s0"\."occurred_at"\) < \$3/,
-    'date shortcuts compile as a half-open temporal range';
-is_deeply $adapter->{last_statement}->params,
-    [41, $shortcut_start, $shortcut_end],
-    'date shortcut intent resolves to server-local bound parameters';
+    qr/TO_TIMESTAMP\("s0"\."occurred_at"\) >= CAST\(DATE_TRUNC\('week', CURRENT_DATE\) AS DATE\)\) AND \(TO_TIMESTAMP\("s0"\."occurred_at"\) < \(CAST\(DATE_TRUNC\('week', CURRENT_DATE\) AS DATE\) \+ 7\)/,
+    'date shortcuts compile as a half-open range from the database current date';
+is_deeply $adapter->{last_statement}->params, [41],
+    'so the session time zone, not the server, decides when a day begins';
 
-my $recurring_plan = Selecto::DateShortcut->plan('ytd_all_years');
 $handler->query($engine, {
     select => ['id'],
     filters => [{field => 'occurred_at', op => 'date_shortcut', value => 'ytd_all_years'}],
 });
 like $adapter->{last_statement}->sql,
-    qr/TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) >= \$2\).*TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) <= \$3/,
+    qr/TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) >= TO_CHAR\(CAST\(DATE_TRUNC\('year', CURRENT_DATE\) AS DATE\), 'MM-DD'\)\).*TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) <= TO_CHAR\(CURRENT_DATE, 'MM-DD'\)/,
     'all-years date shortcuts compare recurring calendar positions';
-is_deeply $adapter->{last_statement}->params,
-    [41, $recurring_plan->{start}, $recurring_plan->{end}],
-    'recurring date shortcut boundaries remain bound parameters';
 
 my $shortcut_error = eval {
     $handler->query($engine, {

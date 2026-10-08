@@ -1266,6 +1266,8 @@ sub _compile_expression {
         return "(100.0 * COUNT(CASE WHEN $numerator = TRUE THEN 1 END) / " .
             "NULLIF(COUNT($denominator), 0))";
     }
+    return $self->_compile_date_shortcut($domain, $expression, $params)
+        if $kind eq 'date_shortcut';
     return $self->_compile_dialect_expression($domain, $expression, $params)
         if $kind eq 'count_bucket' || $kind eq 'bucket' || $kind eq 'datetime_format'
             || $kind eq 'epoch_datetime' || $kind eq 'text_search' || $kind eq 'text_rank';
@@ -2748,6 +2750,57 @@ sub _dbi_error {
 sub _compile_dialect_expression {
     my ($self, $domain, $expression, $params) = @_;
     Selecto::Error->throw('invalid_query', 'expression is not supported by this SQL dialect');
+}
+
+# A dialect that can name its current date compares a shortcut's period with
+# it, so the session (or query) time zone decides when a day begins. Others
+# bind the bounds of the server's date.
+sub _current_date_shortcuts { return 0 }
+
+sub _compile_date_shortcut {
+    my ($self, $domain, $expression, $params) = @_;
+    my ($operand, $shortcut) = @{$expression->arguments};
+    require Selecto::DateShortcut;
+    unless ($self->_current_date_shortcuts) {
+        require POSIX;
+        return $self->_compile_expression($domain, Selecto::DateShortcut->expression(
+            $operand, $shortcut, POSIX::strftime('%Y-%m-%d', localtime)), $params);
+    }
+    if (blessed($operand) && $operand->kind eq 'field') {
+        my $type = $domain->resolve($operand->arguments->[0])->{type} // '';
+        Selecto::Error->throw('invalid_query', 'date shortcut requires a date or time field')
+            unless $type =~ /(?:date|time)/i;
+        $operand = Selecto::Expression->epoch_datetime($operand) if $type eq 'epoch_datetime';
+    }
+    my $terms = Selecto::DateShortcut->terms($shortcut);
+    if ($terms->{kind} eq 'recurring_month_day') {
+        my $value = $self->_compile_expression($domain,
+            Selecto::Expression->datetime_format($operand, 'month_day'), $params);
+        my ($start, $end) = map {
+            $self->_month_day_sql($self->_date_shortcut_bound_sql($_, $params))
+        } $terms->{start}, $terms->{end};
+        return "($value >= $start) AND ($value <= $end)";
+    }
+    my $value = $self->_compile_expression($domain, $operand, $params);
+    my ($start, $end) = map { $self->_date_shortcut_bound_sql($_, $params) }
+        $terms->{start}, $terms->{end};
+    return "($value >= $start) AND ($value < $end)";
+}
+
+# [anchor, months, days] from Selecto::DateShortcut, as a SQL date.
+sub _date_shortcut_bound_sql {
+    my ($self, $term, $params) = @_;
+    my ($anchor, $months, $days) = @$term;
+    Selecto::Error->throw('invalid_query', 'date shortcut bound is invalid')
+        unless $anchor =~ /\A(?:today|week|month|quarter|year)\z/
+            && "$months" =~ /\A-?\d+\z/ && "$days" =~ /\A-?\d+\z/;
+    my $today = defined($self->{_timezone})
+        ? 'CAST(' . $self->_compile_timezone_sql(
+            'CURRENT_TIMESTAMP', 'utc_datetime', $self->{_timezone}, $params) . ' AS DATE)'
+        : 'CURRENT_DATE';
+    my $sql = $anchor eq 'today' ? $today : "CAST(DATE_TRUNC('$anchor', $today) AS DATE)";
+    $sql = 'CAST(' . $sql . ' + ' . $self->_months_interval_sql($months) . ' AS DATE)' if $months;
+    return $days ? "($sql + $days)" : $sql;
 }
 
 # A utc_datetime column declared storage naive_utc holds UTC wall time without
