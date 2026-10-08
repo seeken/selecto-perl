@@ -4,7 +4,7 @@ use Mojo::Base 'Selecto::SQL';
 use Hash::Util::FieldHash ();
 use JSON::PP ();
 use Mojo::JSON ();
-use Scalar::Util qw(blessed refaddr);
+use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
@@ -12,10 +12,18 @@ use Selecto::PostgreSQL::StatementCache ();
 use Selecto::Statement ();
 
 has rollup_sort_fix => 'auto';
+# Perl 5.36 and newer tell a value made as a number from a string.
+use constant CREATED_AS_NUMBER => $] >= 5.036 ? 1 : 0;
+BEGIN {
+    no strict 'refs';
+    *_created_as_number = CREATED_AS_NUMBER ? \&{'builtin::created_as_number'} : sub { 0 };
+}
 # Result values are the driver's unless canonical values are asked for: see
 # RESULT VALUES below.
 has canonical_values => 0;
 has canonical_sql => 1;
+# Each compiled statement's outermost SELECT list: see Canonical values in SQL.
+Hash::Util::FieldHash::fieldhash(my %PROJECTION);
 # Opt-in, off by default: see STATEMENT CACHE below.
 has statement_cache => 0;
 has statement_cache_size => 256;
@@ -31,7 +39,11 @@ sub bounded_stream_supported {
 
 sub stream_query {
     my ($self, $statement, %options) = @_;
-    return $self->SUPER::stream_query($statement, %options) unless $options{bounded};
+    unless ($options{bounded}) {
+        $statement = $self->_canonical_statement($statement)
+            if blessed($statement) && !$options{export_scalars} && $self->_canonical_requested(%options);
+        return $self->SUPER::stream_query($statement, %options);
+    }
     Selecto::Error->throw('unsupported_feature', 'bounded streaming requires a real PostgreSQL DBI handle')
         unless $self->supports('stream') && $self->bounded_stream_supported;
     Selecto::Error->throw('invalid_stream', 'stream_query requires a Selecto statement')
@@ -39,9 +51,11 @@ sub stream_query {
     my $size = $options{fetch_size} // 1;
     Selecto::Error->throw('invalid_stream', 'stream fetch size must be a positive integer')
         unless !ref($size) && "$size" =~ /\A[1-9]\d*\z/;
+    my $canonical = $self->_canonical_requested(%options);
     require Selecto::PostgreSQL::Stream;
-    return Selecto::PostgreSQL::Stream->new(adapter => $self, statement => $statement,
-        fetch_size => $size, canonical_values => $self->_canonical_requested(%options));
+    return Selecto::PostgreSQL::Stream->new(adapter => $self,
+        statement => $canonical && !$options{export_scalars} ? $self->_canonical_statement($statement) : $statement,
+        fetch_size => $size, canonical_values => $canonical);
 }
 
 # A stream decodes canonical values in Perl, cell by cell, when they are asked
@@ -82,11 +96,18 @@ sub bounded_result_statement {
     # Fence the computed projection: volatile expressions must be evaluated
     # once, so the size predicate and emitted cell inspect the same value.
     # Cap materialization at the finite transfer row allowance.
-    return Selecto::Statement->new(sql => 'WITH selecto_bounded AS MATERIALIZED (SELECT * FROM ('
+    my $prefix = 'WITH selecto_bounded AS MATERIALIZED (SELECT * FROM (';
+    my $guarded = Selecto::Statement->new(sql => $prefix
         . $statement->sql . ') AS selecto_source LIMIT ' . int($rows) . ') SELECT '
         . join(', ', @values) . ' FROM selecto_bounded LIMIT ' . int($rows),
         params => $statement->params, columns => [@{$statement->columns}, 'selecto_transfer_overflow'],
         adapter_name => $self->name);
+    # Canonical values are formatted in the wrapped statement's SELECT list,
+    # so the size guard measures the canonical text.
+    my $plan = $PROJECTION{$statement};
+    $PROJECTION{$guarded} = {%$plan, sql => $guarded->sql, start => length($prefix) + $plan->{start},
+        formatted => undef} if $plan && $plan->{sql} eq $statement->sql;
+    return $guarded;
 }
 
 sub placeholder {
@@ -238,174 +259,177 @@ sub execute_query {
         local $self->{_selecto_raw_values} = 1;
         return $self->SUPER::execute_query($statement);
     }
-    my $plan = $self->_canonical_plan($statement)
-        or return $self->SUPER::execute_query($statement);
-    my $rows;
-    my $ok = eval {
-        $rows = $self->_fetch_canonical($statement, $plan);
-        1;
-    };
-    die $self->normalize_error($@) unless $ok;
-    return { columns => $statement->columns, rows => $rows };
+    return $self->SUPER::execute_query($self->_canonical_statement($statement));
 }
 
 # ---- Canonical values in SQL ------------------------------------------------
 #
-# Canonical formatting is a function of the column's PostgreSQL type, which
-# only the server knows for certain (an aggregate, a value expression or a
-# domain field declared with another type). So the adapter learns the result
-# types of each SQL text on its database handle: the first canonical execution
-# of a statement decodes in Perl and records the types; later executions wrap
-# each top-level NUMERIC, TIMESTAMP and TIMESTAMPTZ selection in an SQL
-# expression that yields the canonical text, and Perl leaves those (now
-# text) columns alone. Every other column is decoded in Perl as before.
-# Floats stay in Perl: DBD::Pg returns them as Perl numbers, so their
-# canonical text is Perl's own number formatting (0.3 for
-# 0.30000000000000004, Inf, 10000000000 for 1e+10), which SQL cannot
-# reproduce exactly. Integers and booleans already arrive as Perl numbers.
+# When canonical values are asked for, each top-level selection of a plain
+# stored field whose declared domain type is decimal, date, naive_datetime or
+# utc_datetime is formatted by PostgreSQL in the outermost SELECT list (the
+# declared type is the source the datetime_format compilers use too). The
+# formatted columns arrive as text, which the Perl decode leaves alone; every
+# other column (integers, floats, booleans, aggregates, computed fields and
+# other expressions) is decoded in Perl from its PostgreSQL result type, as
+# before. Within a formatted column the expression's own type picks the
+# formatter (see _canonical_format), so a timestamptz declared naive_datetime,
+# a utc_datetime localized by a query timezone or a date kept as text all
+# come out as the Perl decode gives them:
 #
-# Each formatter starts from the type's own output text (CAST AS TEXT is the
-# type's output function, the text DBD::Pg receives), so DateStyle, TimeZone,
-# extra_float_digits, BC years, infinities and NaN come out as the Perl decode
-# makes them:
-#   numeric      trim_scale of the text read back as NUMERIC (PostgreSQL 13+;
-#                Perl decode before 13)
-#   timestamp    spaces become T; its text never carries a zone suffix
-#   timestamptz  spaces become T, then the Perl suffix pattern
+#   numeric       CAST(trim_scale(x) AS TEXT), PostgreSQL 13+ (trim_scale);
+#                 before 13 decimal fields are decoded in Perl
+#   date          TO_CHAR(x, 'YYYY-MM-DD'), ' BC' for BC dates
+#   timestamp     TO_CHAR(x, 'YYYY-MM-DD"T"HH24:MI:SS.US') without trailing
+#                 fractional zeros or point; 'TBC' for BC
+#   timestamptz   the same in the session TimeZone, plus TO_CHAR(x, 'OF')
+#                 unless it is +00 (and an offset's seconds, which OF omits)
+#   other types   CAST(x AS TEXT)
 #
-# Only a statement whose previous execution returned at least
-# $CANONICAL_SQL_MIN_ROWS rows runs formatted: below that, parsing and planning
-# the longer SQL costs more than the Perl decoding it saves.
+# Infinities and NULL are the type's own text. The output is the ISO form
+# whatever the session DateStyle. No regular expressions, no type learning:
+# the SQL depends only on the compiled statement and the server version.
 #
-# The formatter only replaces the outermost SELECT list. ORDER BY and GROUP
-# BY are compiled expressions, never output names or positions (a rollup
-# ordered by position is not formatted), so they still sort and group the
-# underlying values; set operations and other wrapped statements carry no
-# projection and decode in Perl.
-#
-# A learned type is checked on every execution: each formatted column reads
-# CASE WHEN pg_typeof(<the expression>) is the learned type THEN <canonical
-# text> ELSE '!' END. The expression inside pg_typeof sits in CASE WHEN FALSE,
-# which the planner folds away, so it is not evaluated twice. A '!' in the
-# first row (no canonical text is '!'; a mismatch gives '!' in every row,
-# NULLs included) means the type changed; that column is then never formatted
-# for the SQL text, and the statement runs again unformatted and decodes in
-# Perl. Every formatter compiles whatever the column's type is now, so a
-# changed type is never a parse error. (A domain is checked as its base type:
-# CASE resolves domains to their base types.)
+# Only the outermost SELECT list changes: ORDER BY and GROUP BY are compiled
+# expressions, never output names or positions (a rollup ordered by position
+# records no projection), so they still sort and group the underlying values.
+# Set operations, projection sums and statements built outside compile carry
+# no projection and decode in Perl.
 
-Hash::Util::FieldHash::fieldhash(my %PROJECTION);
+my %CANONICAL_KIND = (decimal => 'numeric', date => 'date', naive_datetime => 'datetime',
+    utc_datetime => 'datetime');
 
-my %CANONICAL_TYPE_OID = (numeric => 1700, timestamp => 1114, timestamptz => 1184);
-my %CANONICAL_SQL = (
-    # Through TEXT, so the SQL still compiles if the column's type changed
-    # (the guard then answers '!'); numeric text input keeps the scale.
-    numeric => sub { "CAST(pg_catalog.trim_scale(CAST(CAST($_[0] AS TEXT) AS NUMERIC)) AS TEXT)" },
-    timestamp => sub { "pg_catalog.translate(CAST($_[0] AS TEXT), ' ', 'T')" },
-    timestamptz => sub {
-        "pg_catalog.regexp_replace(pg_catalog.translate(CAST($_[0] AS TEXT), ' ', 'T'), "
-            . q{'([.]0+)?([+]00(:00)?|Z)$', '')};
-    },
-);
-use constant CANONICAL_TYPE_ENTRIES => 1024;
-# Formatting in SQL makes the server parse and plan a longer statement (about
-# 80 microseconds without the statement cache) and saves about half a
-# microsecond per row of Perl decoding, so it pays off from a few hundred
-# rows. It is used when the SQL text's previous execution returned this many.
-our $CANONICAL_SQL_MIN_ROWS = 256;
-use constant CANONICAL_MISMATCH => '!';
+# The declared type of a selected stored field, as _field_sql read it while
+# compiling the selection (computed, query-source and star-dimension fallback
+# fields have none).
+sub _canonical_kind {
+    my ($self, $domain, $selection) = @_;
+    return undef unless $selection->kind eq 'field' && ref($self->{_field_types}) eq 'HASH';
+    my $type = $self->{_field_types}{$selection->arguments->[0]};
+    return defined($type) && !ref($type) ? $CANONICAL_KIND{$type} : undef;
+}
 
 sub _note_projection {
     my ($self, $statement, %projection) = @_;
-    $PROJECTION{$statement} = {sql => $statement->sql, %projection,
-        layout => join(',', $projection{start}, map { @$_ } @{$projection{items}})};
+    return unless grep { defined $_->[2] } @{$projection{items}};
+    # A formatted selection keeps its output name (a wrapping statement, such
+    # as the bounded-result guard, selects the columns by name).
+    $PROJECTION{$statement} = {sql => $statement->{sql}, start => $projection{start},
+        items => $projection{items}, columns => $statement->{columns}};
     return;
 }
 
-sub _canonical_plan {
+# The statement to run for canonical values: a copy whose outermost SELECT
+# list formats the canonical columns, or the statement itself.
+sub _canonical_statement {
     my ($self, $statement) = @_;
-    return undef unless $self->canonical_sql;
+    return $statement unless $self->canonical_sql;
+    my $plan = $PROJECTION{$statement};
+    return $statement unless $plan && $plan->{sql} eq $statement->sql;
+    my $version = $self->_canonical_server_version or return $statement;
+    my $numeric = $version >= 130000 ? 1 : 0;
+    my $sql = $plan->{formatted}[$numeric] //= $self->_canonical_sql($plan, $numeric) // '';
+    return $statement if $sql eq '';
+    return Selecto::Statement->new(sql => $sql, params => $statement->params,
+        columns => $statement->columns, adapter_name => $statement->adapter_name);
+}
+
+# The result columns _canonical_statement formats (for tests and diagnostics).
+sub _canonical_columns {
+    my ($self, $statement) = @_;
+    my $plan = $PROJECTION{$statement};
+    return () unless $self->canonical_sql && $plan && $plan->{sql} eq $statement->sql;
+    my $version = $self->_canonical_server_version or return ();
+    my $items = $plan->{items};
+    return grep { defined($items->[$_][2]) && ($items->[$_][2] ne 'numeric' || $version >= 130000) } 0 .. $#$items;
+}
+
+# The server version of a DBD::Pg handle (libpq reads it once, at connect), or
+# undef for any other handle.
+sub _canonical_server_version {
+    my ($self) = @_;
     my $dbh = $self->{dbh};
-    my $pg = $self->{_selecto_canonical_pg} //= [refaddr($dbh) // 0,
-        eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0];
-    $pg = $self->{_selecto_canonical_pg} = [refaddr($dbh) // 0,
-        eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0]
-        unless $pg->[0] == (refaddr($dbh) // 0);
-    return $pg->[1] ? $self->_projection($statement) : undef;
+    return eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' } ? $dbh->{pg_server_version} : undef;
 }
 
-# The projection compile recorded for this statement object, while the
-# statement still holds the SQL text it describes.
-sub _projection {
-    my ($self, $statement) = @_;
-    my $plan = $PROJECTION{$statement} or return undef;
-    return $plan->{sql} eq $statement->sql ? $plan : undef;
-}
-
-sub _fetch_canonical {
-    my ($self, $statement, $plan) = @_;
-    my $sql = $plan->{sql};
-    my $learned = $self->{dbh}{private_selecto_canonical_types} //= {};
-    my $entry = $learned->{$sql};
-    my ($rows, $types);
-    # The formatted text is built once per learned state and projection layout.
-    my $formatted = $entry && ($entry->{rows} // 0) >= $CANONICAL_SQL_MIN_ROWS
-        && ($entry->{formatted}{$plan->{layout}} //= $self->_canonical_sql_text($plan, $entry) // 0);
-    if ($formatted) {
-        ($rows, $types) = $self->_fetch_query($formatted->{sql}, $statement->params);
-        my @changed = @$rows
-            ? grep { defined($rows->[0][$_]) && $rows->[0][$_] eq CANONICAL_MISMATCH } @{$formatted->{columns}}
-            : ();
-        unless (@changed) {
-            $entry->{rows} = scalar @$rows;
-            $self->_decode_rows($rows, $types);
-            return $rows;
-        }
-        $entry->{blocked}{$_} = 1 for @changed;
-        $entry->{types} = undef;
-        delete $entry->{formatted};
-    }
-    ($rows, $types) = $self->_fetch_query($sql, $statement->params);
-    if (!$entry) {
-        %$learned = () if keys(%$learned) >= CANONICAL_TYPE_ENTRIES;
-        $entry = $learned->{$sql} = {types => [@$types], blocked => {}};
-    } elsif (!$entry->{types}) {
-        $entry->{types} = [@$types];
-    }
-    $entry->{rows} = scalar @$rows;
-    $self->_decode_rows($rows, $types);
-    return $rows;
-}
-
-sub _canonical_sql_text {
-    my ($self, $plan, $entry) = @_;
-    my ($items, $types, $blocked) = ($plan->{items}, $entry->{types}, $entry->{blocked});
-    return undef unless $types && @$types == @$items;
-    my $version = eval { $self->{dbh}{pg_server_version} } // 0;
-    my $sql = $plan->{sql};
-    my $position = $plan->{start};
+sub _canonical_sql {
+    my ($self, $plan, $numeric) = @_;
+    my ($sql, $position) = ($plan->{sql}, $plan->{start});
     my $text = substr($sql, 0, $position);
-    my @columns;
-    for my $index (0 .. $#$items) {
-        my ($expression_length, $item_length) = @{$items->[$index]};
+    my $formatted = 0;
+    for my $index (0 .. $#{$plan->{items}}) {
+        my ($expression_length, $item_length, $kind) = @{$plan->{items}[$index]};
         $text .= ', ' if $index;
-        my $type = $types->[$index] // '';
-        my $format = $CANONICAL_SQL{$type};
-        $format = undef if $blocked->{$index} || ($type eq 'numeric' && $version < 130000);
-        if ($format) {
-            my $expression = '(' . substr($sql, $position, $expression_length) . ')';
-            $text .= 'CASE WHEN CAST(pg_catalog.pg_typeof(CASE WHEN FALSE THEN ' . $expression
-                . ' END) AS OID) = ' . $CANONICAL_TYPE_OID{$type} . ' THEN ' . $format->($expression)
-                . q{ ELSE '} . CANONICAL_MISMATCH . q{' END}
-                . substr($sql, $position + $expression_length, $item_length - $expression_length);
-            push @columns, $index;
+        $kind = undef if defined($kind) && $kind eq 'numeric' && !$numeric;
+        if (defined $kind) {
+            $text .= _canonical_format($kind, '(' . substr($sql, $position, $expression_length) . ')')
+                . ($item_length == $expression_length ? ' AS ' . $self->quote_identifier($plan->{columns}[$index])
+                    : substr($sql, $position + $expression_length, $item_length - $expression_length));
+            $formatted++;
         } else {
             $text .= substr($sql, $position, $item_length);
         }
         $position += $item_length + 2;
     }
-    return undef unless @columns;
-    return {sql => $text . substr($sql, $position - 2), columns => \@columns};
+    return undef unless $formatted;
+    return $text . substr($sql, $position - 2);
+}
+
+# The canonical text of one value, given the SQL expression x. The declared
+# type says which formatters apply; the expression's PostgreSQL type picks
+# one: CASE on pg_typeof of a NULL of that type (CASE WHEN FALSE THEN x END
+# folds to one, and CASE resolves a domain to its base type), so x is not
+# evaluated for it. A column of any other type (a date kept in a VARCHAR, say,
+# or a date declared as a datetime) is its own text, which is what the Perl
+# decode leaves of it under DateStyle ISO. Untyped literals take the branch's
+# type; the timestamptz ones carry an explicit +00, so they do not depend on
+# the session TimeZone.
+sub _canonical_format {
+    my ($kind, $x) = @_;
+    my $type = "CAST(pg_catalog.pg_typeof(CASE WHEN FALSE THEN $x END) AS OID)";
+    my $text = "CAST($x AS TEXT)";
+    return "CASE WHEN $type = 1700 THEN CAST(pg_catalog.trim_scale(CAST($x AS NUMERIC)) AS TEXT) ELSE $text END"
+        if $kind eq 'numeric';
+    return "CASE WHEN $type = 1082 THEN " . _canonical_date("CAST($x AS DATE)") . " ELSE $text END"
+        if $kind eq 'date';
+    # A naive_datetime may be a timestamptz column, a utc_datetime a naive
+    # one (stored naive_utc, localized by a query timezone, or undeclared).
+    return "CASE $type WHEN 1114 THEN " . _canonical_timestamp("CAST($x AS TIMESTAMP)")
+        . " WHEN 1184 THEN " . _canonical_timestamptz("CAST($x AS TIMESTAMPTZ)") . " ELSE $text END";
+}
+
+# Each formatter names as few functions as it can: parsing and planning a
+# function call costs more than running it for a page of rows.
+sub _canonical_date {
+    my ($x) = @_;
+    return "CASE WHEN pg_catalog.isfinite($x) THEN pg_catalog.to_char(CAST($x AS TIMESTAMP), 'YYYY-MM-DD')"
+        . " || CASE WHEN $x < '0001-01-01' THEN ' BC' ELSE '' END ELSE CAST($x AS TEXT) END";
+}
+
+sub _canonical_local {
+    my ($x) = @_;
+    return q{pg_catalog.rtrim(pg_catalog.rtrim(pg_catalog.to_char(} . $x
+        . q{, 'YYYY-MM-DD"T"HH24:MI:SS.US'), '0'), '.')};
+}
+
+sub _canonical_timestamp {
+    my ($x) = @_;
+    return "CASE WHEN pg_catalog.isfinite($x) THEN " . _canonical_local($x)
+        . " || CASE WHEN $x < '0001-01-01' THEN 'TBC' ELSE '' END ELSE CAST($x AS TEXT) END";
+}
+
+# TO_CHAR's OF has no seconds. The last tz database offset with seconds
+# (Africa/Monrovia's -00:44:30) ended on 1972-01-07, so later values take OF
+# as it is, and earlier ones (and BC, where even +00 is kept before the TBC)
+# take the exact offset.
+sub _canonical_timestamptz {
+    my ($x) = @_;
+    my $seconds = "CAST(pg_catalog.date_part('timezone', $x) AS INTEGER) % 60";
+    my $exact = "pg_catalog.to_char($x, 'OF') || CASE WHEN $seconds = 0 THEN ''"
+        . " ELSE pg_catalog.to_char(pg_catalog.abs($seconds), '\":\"FM00') END"
+        . " || CASE WHEN $x < '0001-01-02 00:00:00+00' AND pg_catalog.to_char($x, 'BC') = 'BC' THEN 'TBC' ELSE '' END";
+    return "CASE WHEN pg_catalog.isfinite($x) THEN " . _canonical_local($x)
+        . " || COALESCE(NULLIF(CASE WHEN $x >= '1972-01-08 00:00:00+00' THEN pg_catalog.to_char($x, 'OF')"
+        . " ELSE $exact END, '+00'), '') ELSE CAST($x AS TEXT) END";
 }
 
 my %ARRAY_SQL_TYPE = (
@@ -914,6 +938,7 @@ sub _decode_rows {
     return $self->SUPER::_decode_rows($rows, $types)
         unless $self->can('_decode') == \&_decode;
     my $export = $self->{_selecto_export_scalars};
+    my $driver_numbers;
     for my $i (0 .. $#$types) {
         my $type = $types->[$i] // '';
         if ($export && $type =~ /\A(?:numeric|bool|json|jsonb)\z/) {
@@ -926,8 +951,16 @@ sub _decode_rows {
                 $row->[$i] = ($value eq 't' || "$value" eq '1') ? 1 : 0 if defined $value;
             }
         } elsif ($type eq 'int2' || $type eq 'int4' || $type eq 'int8') {
+            # DBD::Pg fetches integers as Perl integers (IVs), for which int()
+            # returns the same IV, so a value it made as a number is kept.
+            # It never makes one any other way, but other handles (and Perl
+            # before 5.36, without builtin::created_as_number) take the
+            # check below.
+            BEGIN { warnings->unimport('experimental::builtin') if CREATED_AS_NUMBER }
+            $driver_numbers //= CREATED_AS_NUMBER && defined($self->_canonical_server_version) ? 1 : 0;
             for my $row (@$rows) {
                 next unless defined(my $value = $row->[$i]);
+                next if $driver_numbers && _created_as_number($value);
                 if (ref $value) {
                     $row->[$i] = int($value) if "$value" =~ /\A-?\d+\z/;
                     next;
@@ -1086,38 +1119,64 @@ canonical value is their Perl string, with the same trimming (C<1.5>,
 C<10000000000> for C<1e+10>, C<0.3> for C<0.30000000000000004>, C<Inf>), so
 it encodes as a JSON string.
 
-=item * C<timestamp>, C<timestamptz>: the driver text with spaces as C<T>,
-and a zero UTC offset (C<+00>, C<+00:00> or C<Z>, with any all-zero
-fraction before it) removed (C<2024-01-01 10:00:00+00> is
-C<2024-01-01T10:00:00>; C<2024-06-01 12:34:56.789+05:30> is
-C<2024-06-01T12:34:56.789+05:30>). Other offsets, the session C<TimeZone>
-and C<DateStyle>, fractions and C<BC> are kept as the server writes them.
+=item * C<timestamp>, C<timestamptz>: the ISO form in the session
+C<TimeZone>, with C<T> between date and time, the fraction without trailing
+zeros, and the session's UTC offset unless it is zero (C<2024-01-01T10:00:00>,
+C<2024-06-01T12:34:56.789+05:30>, C<2024-01-01T04:00:00-06>; historic offsets
+keep their seconds, C<1849-12-31T18:09:24-05:50:36>). A BC value ends in
+C<TBC> (after its offset, zero included), and the infinities are
+C<infinity> and C<-infinity>.
 
-=item * Everything else (text, C<date>, C<json>/C<jsonb> text, UUIDs,
-arrays): the driver value.
+=item * C<date>: C<YYYY-MM-DD>, C<0044-03-15 BC>, C<infinity>.
+
+=item * Everything else (text, C<json>/C<jsonb> text, UUIDs, arrays): the
+driver value.
 
 =back
 
-With C<< canonical_sql => 1 >> (the default) PostgreSQL produces the
-numeric and timestamp forms itself for large results; Perl converts
-integers, booleans and floats (whose canonical form is Perl's own number
-formatting, which SQL cannot reproduce). The adapter learns each SQL text's
-result column types from its first canonical execution on a database handle
-(decoded in Perl), and later executions that follow one returning at least
-256 rows (smaller results decode faster in Perl than the longer SQL parses)
-wrap those top-level selections in SQL that turns the
-type's own output text into the canonical text: C<trim_scale> for
-C<numeric> (PostgreSQL 13 and newer; on 12 numeric stays in Perl), and
-C<translate> and the suffix pattern above for timestamps. Each
-formatted column checks with C<pg_typeof> that it still has the learned
-type; a changed type (or a domain type) is decoded in Perl from then on, and
-the execution that found it runs again unformatted. ORDER BY, GROUP BY,
-aggregates, window functions and pagination still work on the
-underlying values: only the outermost select list changes, and ordered
-rollups, set operations and statements built outside C<compile> are always
-decoded in Perl. The values are identical either way. At most 1024 SQL texts
-are remembered per handle. C<< canonical_sql => 0 >> decodes every
-canonical value in Perl.
+Canonical dates and timestamps of fields formatted in SQL (below) are always
+the ISO form, whatever the session C<DateStyle>; up to 0.2.2 they followed a
+non-ISO C<DateStyle> (C<SQL>, C<Postgres>, C<German>). Under the default
+C<ISO> they are the same.
+
+With C<< canonical_sql => 1 >> (the default) PostgreSQL formats them itself:
+each top-level selection of a stored field whose declared domain type is
+C<decimal>, C<date>, C<naive_datetime> or C<utc_datetime> is wrapped, in the
+outermost select list only, in SQL that gives the canonical text. The
+declared type chooses the columns and the formatters that may apply; the
+column's PostgreSQL type picks one (C<CASE> on C<pg_typeof> of a constant, so
+the value is not evaluated for it): C<CAST(trim_scale(x) AS TEXT)> for
+C<numeric> (PostgreSQL 13 and newer; on 12 decimal fields stay in Perl), and
+C<TO_CHAR> for C<date>, C<timestamp> and C<timestamptz> (with
+C<TO_CHAR(x, 'OF')> for the offset, and the offset's seconds, which C<OF>
+omits, for values before 1972). So a timestamptz declared C<naive_datetime>,
+a C<utc_datetime> localized by a query timezone or stored C<naive_utc> (or
+without the hint), and a C<date> column declared as a datetime come out as
+before. A column of any other type is its PostgreSQL text: exact for text
+columns (a date or decimal kept in a C<VARCHAR>); a C<timestamp> declared
+C<date> is its server text (C<2024-01-01 10:00:00>); a C<real> or
+C<double precision> column declared C<decimal> is the server's text
+(C<1e+20>, C<Infinity>) rather than its Perl string (C<1e+20>, C<Inf>), and an
+C<integer> column declared C<decimal> is a string (C<"7">) rather than a
+number. A date or datetime field must be a column PostgreSQL can cast to
+C<date>, C<timestamp> and C<timestamptz> (a date, timestamp or text type).
+
+The formatted statement is longer: PostgreSQL parses and plans each datetime
+column's formatter in roughly 30 to 50 microseconds, a date's or decimal's in
+about 10 to 20, every time the statement is prepared. That is paid on every
+call without the statement cache (see L</statement_cache>), and only once per
+connection and SQL text with it. Per row, C<TO_CHAR> costs PostgreSQL about
+0.2 (date) to 0.6 (timestamptz) microseconds.
+
+Perl decodes every other column from its PostgreSQL result type: integers,
+booleans and floats (whose canonical form is Perl's own number formatting,
+which SQL cannot reproduce), aggregates and other expressions, computed
+fields, and every column of an ordered rollup, a set operation or a statement
+built outside C<compile>. ORDER BY, GROUP BY, window functions and pagination
+use the underlying values, never output names or positions. Streams, bounded
+streams and L<Selecto::BoundedQuery> format the same columns.
+C<< canonical_sql => 0 >> decodes every canonical value in Perl, from the
+result types.
 
 =head2 Moving from 0.2.2
 
@@ -1169,8 +1228,9 @@ L</RESULT VALUES>.
 
 =head2 canonical_sql
 
-C<1> (the default): canonical values are formatted by PostgreSQL where the
-adapter can (see L</RESULT VALUES>). C<0>: they are all decoded in Perl.
+C<1> (the default): canonical decimal, date and timestamp fields are formatted
+by PostgreSQL (see L</RESULT VALUES>). C<0>: every canonical value is decoded
+in Perl from the result types.
 
 =head2 statement_cache
 
