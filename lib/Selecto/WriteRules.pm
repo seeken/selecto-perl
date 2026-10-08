@@ -46,7 +46,7 @@ sub _predicate {
         $command->query_enforcement ? $command->query_enforcement->predicate : undef);
 }
 sub rows {
-    my ($class, $engine, $predicate, $maximum) = @_;
+    my ($class, $engine, $predicate, $maximum, %options) = @_;
     $maximum = 1000 - $HYDRATION->{loaded}
         if $HYDRATION && $maximum > 1000 - $HYDRATION->{loaded};
     my $fields = _fields($engine->domain);
@@ -57,8 +57,8 @@ sub rows {
         if exists($result->{complete}) && !$result->{complete};
     _pending('stored candidate exceeds its row bound') if @{$result->{rows}} > $maximum;
     $HYDRATION->{loaded} += @{$result->{rows}} if $HYDRATION;
-    return [map { my $row = $_; _typed_subject($engine,
-        +{map { ($fields->[$_] => $row->[$_]) } 0 .. $#$fields}) } @{$result->{rows}}];
+    return [map { my $row = $_; my $values = +{map { ($fields->[$_] => $row->[$_]) } 0 .. $#$fields};
+        $options{raw} ? $values : _typed_subject($engine, $values) } @{$result->{rows}}];
 }
 sub _check_storage {
     my ($engine, $command, $bound_fields) = @_;
@@ -86,7 +86,7 @@ sub candidate {
     my $values = {};
     if ($command->operation eq 'update' || $command->operation eq 'delete') {
         _pending('protected scalar candidates require exactly one row') unless ($command->expected_count // 0) == 1;
-        my $rows = $class->rows($engine, _predicate($command), 1);
+        my $rows = $class->rows($engine, _predicate($command), 1, raw => 1);
         Selecto::Error->throw('cardinality_mismatch', 'candidate must resolve exactly one governed row') unless @$rows == 1;
         $values = $rows->[0];
     } elsif ($command->operation eq 'upsert') {
@@ -257,17 +257,22 @@ sub _typed_subject {
 sub _normalize {
     my ($class, $engine, $command, $values, $submitted) = @_;
     my $rules = $engine->domain->rules;
-    $values = _typed_subject($engine, $values);
-    return ($command, $values) unless $rules;
+    return ($command, _typed_subject($engine, $values)) unless $rules;
     my $before = dclone($values);
     my $original_input = $submitted // $class->literal_input($command);
     my $input = $class->evaluate($rules, 'input', $command->operation, $original_input);
+    # INPUT runs before native conversion. Materialize its actual mutations
+    # independently of candidate availability (a NULL rowid alias is unknown).
+    my $input_assignments = $command->assignments;
     # Unchanged raw inputs must never replace an already projected storage value.
     for my $field (keys %$input) {
         next if blessed($input->{$field}) && !JSON::PP::is_bool($input->{$field});
-        $values->{$field} = $input->{$field} if !exists($original_input->{$field})
-            || _changed($input->{$field}, $original_input->{$field});
+        if (!exists($original_input->{$field}) || _changed($input->{$field}, $original_input->{$field})) {
+            $values->{$field} = $input->{$field};
+            $input_assignments->{$field} = $input->{$field};
+        }
     }
+    $command = $command->with_assignments($input_assignments);
     $values = _typed_subject($engine, $values);
     $values = $engine->adapter->rule_project_subject($command, $values)
         if $engine->adapter->can('rule_project_subject');
