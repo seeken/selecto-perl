@@ -81,6 +81,7 @@ t/api_hidden_field.t
 t/api_missing_tenant_scope.t
 t/api_query_library_parity_live.t
 t/api_resources.t
+t/api_response_json_bytes.t
 t/api_result_formatter.t
 t/api_through_association_parity_live.t
 t/api_write_parity_live.t
