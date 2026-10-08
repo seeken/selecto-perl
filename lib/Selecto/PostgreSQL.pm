@@ -7,9 +7,13 @@ use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
+use Selecto::PostgreSQL::StatementCache ();
 use Selecto::Statement ();
 
 has rollup_sort_fix => 'auto';
+# Opt-in, off by default: see STATEMENT CACHE below.
+has statement_cache => 0;
+has statement_cache_size => 256;
 
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
@@ -768,6 +772,25 @@ sub _export_scalar {
     return Mojo::JSON::from_json("$value");
 }
 
+sub _statement_cache_enabled {
+    my ($self) = @_;
+    return 0 unless $self->statement_cache;
+    my $size = $self->statement_cache_size;
+    Selecto::Error->throw('invalid_adapter', 'statement_cache_size must be a positive integer')
+        unless defined($size) && !ref($size) && "$size" =~ /\A[1-9]\d{0,5}\z/;
+    return 1;
+}
+
+sub _cached_execute {
+    my ($self, $sql, $params, $failure) = @_;
+    return Selecto::PostgreSQL::StatementCache->execute($self->{dbh}, $sql, $params,
+        size => 0 + $self->statement_cache_size,
+        execute => sub { return $self->_execute_statement(@_); },
+        normalize => sub { return $self->normalize_error($_[0]); },
+        failure => $failure,
+    );
+}
+
 # A raw BEGIN leaves AutoCommit on, but the server still reports the
 # transaction: pg_ping answers 3 (idle in a transaction) or 4 (in a failed
 # one). Asked only when AutoCommit is on.
@@ -800,6 +823,8 @@ Selecto::PostgreSQL - PostgreSQL adapter
       dbh              => $dbh,
       transaction_mode => 'external',  # see Selecto::SQL
       rollup_sort_fix  => 'auto',      # 'auto' (default), 1 or 0
+      statement_cache  => 1,           # opt-in, default 0; see below
+      statement_cache_size => 256,     # handles kept per connection
   ));
 
 =head1 DESCRIPTION
@@ -844,6 +869,35 @@ C<NULLS FIRST> ordering for multi-level hierarchies. PostgreSQL 17 and older
 need that ordering and pagination wrapped around a C<rollupfix> subquery.
 With C<auto> the adapter reads C<server_version_num> once and disables the
 wrapper on PostgreSQL 18 and newer; C<1> or C<0> force it on or off.
+
+=head2 statement_cache
+
+Off (C<0>) by default, and then every query and write prepares a new DBI
+statement handle exactly as before: DBD::Pg sends it unnamed, so the server
+parses and plans each call.
+
+With C<< statement_cache => 1 >>, query execution (C<execute_query>, so
+C<all> and friends) and executed writes reuse one statement handle per
+distinct SQL text and database handle (L<Selecto::PostgreSQL::StatementCache>).
+DBD::Pg prepares a reused handle on the server as a named statement on its
+second execution, and later executions send only Bind/Execute. Streams,
+insert admission and bounded-write probes still prepare afresh. Results,
+types and errors are unchanged, including C<details.sqlstate>.
+
+The cache belongs to the database handle: it is kept in the handle's
+C<CachedKids> (under keys C<prepare_cached> never uses) and freed with it.
+It is keyed by the SQL text alone; parameter values are always bound. At
+most C<statement_cache_size> (default 256) handles are kept per connection,
+least recently used first out, and an evicted handle is deallocated. A
+statement the server lost (26000) or whose result type changed (0A000) is
+prepared again once outside a transaction; inside one the error stands, as
+it has aborted the transaction. After running C<DISCARD ALL> or
+C<DEALLOCATE ALL> yourself, call
+C<< Selecto::PostgreSQL::StatementCache->forget($dbh) >>.
+
+Leave it off behind a transaction-mode pooler: PgBouncer before 1.21 (or
+without C<max_prepared_statements>) cannot route named statements to the
+server connection that prepared them.
 
 =head1 ERRORS
 

@@ -33,6 +33,7 @@ sub contract {
                 id => 'integer', name => 'string', price => 'decimal', maker_id => 'integer',
                 secret_token => 'string', cost => 'integer',
                 shop_id => {type => 'integer', internal => 1},
+                private_label => {type => 'string', hidden => 1},
             }, redact_fields => ['cost'])},
             associations => {
                 notes => {queryable => 'note', owner_key => 'id', related_key => 'product_id', cardinality => 'many'},
@@ -41,6 +42,7 @@ sub contract {
         },
         schemas => {
             note => relation('notes', {id => 'integer', product_id => 'integer', body => 'string',
+                hidden_body => {type => 'string', hidden => 1},
                 private_body => 'string'}, redact_fields => ['private_body']),
             maker => relation('makers', {id => 'integer', name => 'string', code => 'string',
                 margin => 'decimal'}, redact_fields => ['margin']),
@@ -126,6 +128,11 @@ my @cases = (
         'view names references redacted field secret_token', {field => 'secret_token', view => 'names'}],
     ['internal column', [views => view('list', 'detail', $query->select('id', 'shop_id'))],
         'view list references internal field shop_id', {field => 'shop_id', view => 'list'}],
+    ['hidden root column', [views => view('list', 'detail', $query->select('id', 'private_label'))],
+        'view list references hidden field private_label', {field => 'private_label', view => 'list'}],
+    ['hidden collection child', [views => view('list', 'detail',
+        $query->select('id', $E->related_collection('notes', ['body', 'hidden_body'])->as('notes')))],
+        'view list references hidden field notes.hidden_body', {field => 'notes.hidden_body', view => 'list'}],
     ['dataset predicate', [dataset => {query => $query->where($E->not_null('secret_token')), entity_key => ['id']}],
         'dataset query references redacted field secret_token', {field => 'secret_token', dataset => 'query'}],
     ['dataset field comparison', [dataset => {query => $query->where(
