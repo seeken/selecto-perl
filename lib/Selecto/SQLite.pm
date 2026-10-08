@@ -147,6 +147,7 @@ sub write_capabilities {
     if ($self->_returning_available) {
         $capabilities->{returning} = 1;
         $capabilities->{write_graph} = 1;
+        $capabilities->{owned_set_sync} = 1;
     }
     return $capabilities;
 }

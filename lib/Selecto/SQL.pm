@@ -929,7 +929,7 @@ sub execute_graph_unsafe {
     Selecto::Error->throw('write_capability_missing', 'adapter does not support write graphs')
         unless $self->write_capabilities->{write_graph};
 
-    return $self->_transaction(sub {
+    my $work = sub {
         my %results;
         for my $node (@{$graph->nodes}) {
             my $operation = $node->{command}->operation;
@@ -998,9 +998,53 @@ sub execute_graph_unsafe {
             die _graph_node_error($self, $@, $node->{id}) unless $ok;
             $results{$node->{id}} = $result;
         }
+        my @cleanup;
+        if (@{$graph->owned_sets}) {
+            Selecto::Error->throw('invalid_write_graph', 'owned sets require engine-derived cleanup')
+                unless $self->write_capabilities->{owned_set_sync}
+                    && ref($graph->{_governed_owned_sets}) eq 'ARRAY'
+                    && @{$graph->{_governed_owned_sets}} == @{$graph->owned_sets};
+            my %nodes = map { ($_->{id} => $_) } @{$graph->nodes};
+            for my $set (reverse @{$graph->{_governed_owned_sets}}) {
+                my $parent = $results{$set->{parent}}->values->{$set->{parent_key}};
+                Selecto::Error->throw('generated_value_missing', 'owned sync parent did not return its exact key')
+                    unless defined($parent) && !ref($parent);
+                my (%seen, @kept);
+                for my $id (@{$set->{nodes}}) {
+                    next if $nodes{$id}{command}->operation eq 'delete';
+                    my $values = $results{$id}->values;
+                    Selecto::Error->throw('generated_value_missing', 'owned sync row identity is incomplete')
+                        if grep { !exists($values->{$_}) || !defined($values->{$_}) || ref($values->{$_}) }
+                            @{$set->{identity_fields}};
+                    my @identity = map {
+                        my $type = $nodes{$id}{command}->metadata->{__selecto_insert_types}{$_};
+                        Selecto::InsertAdmission::_value(lc($type // ''), $values->{$_}, $_)
+                    } @{$set->{identity_fields}};
+                    my $key = JSON::PP->new->canonical->encode([map { "$_" } @identity]);
+                    Selecto::Error->throw('invalid_write_graph', 'owned sync contains duplicate returned identities')
+                        if $seen{$key}++;
+                    push @kept, Selecto::Expression->all(map {
+                        Selecto::Expression->eq($set->{identity_fields}[$_], $identity[$_])
+                    } 0 .. $#identity);
+                }
+                my $predicate = Selecto::Expression->eq($set->{child_key}, $parent);
+                $predicate = Selecto::Expression->all($predicate,
+                    Selecto::Expression->not(Selecto::Expression->any(@kept))) if @kept;
+                my $command = $set->{cleanup}->_with(predicate => $predicate);
+                push @cleanup, $self->_execute_compiled_write_in_transaction($command, $self->_compile_write($command));
+            }
+        }
         my $root = $graph->nodes->[0]{id};
-        return Selecto::Write::Graph::Result->new(nodes => \%results, root => $results{$root});
-    });
+        return Selecto::Write::Graph::Result->new(nodes => \%results, root => $results{$root},
+            metadata => {owned_sync => scalar(@cleanup), cleanup_affected_rows =>
+                [map { $_->affected_rows } @cleanup]});
+    };
+    if (@{$graph->owned_sets} && $self->transaction_mode eq 'external') {
+        Selecto::Error->throw('invalid_adapter', 'owned sync requires an open host transaction')
+            unless $self->_transaction_open;
+        return $self->_savepoint_transaction($work);
+    }
+    return $self->_transaction($work);
 }
 
 sub _graph_node_error {
@@ -2432,6 +2476,9 @@ sub _execute_compiled_write_in_transaction {
                 if !@row && eval { $sth->err };
             # A guarded write that yields no row was refused by its guard.
             _guarded_cardinality($command, 0) if !@row && @{$command->foreign_key_guards};
+            Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
+                {expected => $command->expected_count})
+                if !@row && defined($command->expected_count) && $command->expected_count > 0;
             Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
             @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row);
             # RETURNING emits one row per affected row. Some DBI drivers report
@@ -2534,7 +2581,7 @@ sub _bounded_write_command {
     # Keep every original scope and precondition, then constrain DML to the
     # exact locked keys. New matching rows can never join this mutation.
     my $keys = @keys ? Selecto::Expression->in($key, \@keys)
-        : Selecto::Expression->and(Selecto::Expression->is_null($key), Selecto::Expression->not_null($key));
+        : Selecto::Expression->all(Selecto::Expression->is_null($key), Selecto::Expression->not_null($key));
     return $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $keys));
 }

@@ -181,3 +181,5 @@ t/security_insert_admission.t
 t/security_operation_budgets.t
 t/filter_ast_json_booleans.t
 t/security_budget_equivalence.t
+docs/sqlite-owned-sync.md
+t/sqlite_owned_sync.integration.t

@@ -14,6 +14,7 @@ use strict;
 use warnings;
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
+use JSON::PP ();
 
 my %OPERATIONS = map { $_ => 1 } qw(insert update upsert delete);
 
@@ -140,7 +141,7 @@ sub new {
     my ($class, %args) = @_;
     my $nodes = $args{nodes};
     Selecto::Error->throw('invalid_write_graph', 'graph nodes must be a non-empty array')
-        unless ref($nodes) eq 'ARRAY' && @$nodes;
+        unless ref($nodes) eq 'ARRAY' && @$nodes && @$nodes <= 1000;
 
     my (%seen, %required_returning, %required_returning_seen);
     my @normalized;
@@ -212,7 +213,38 @@ sub new {
         ];
         $node->{command} = $node->{command}->with_metadata($metadata);
     }
-    return bless { nodes => \@normalized }, $class;
+    my $sets = $args{owned_sets} // [];
+    Selecto::Error->throw('invalid_write_graph', 'owned_sets must be a bounded array')
+        unless ref($sets) eq 'ARRAY' && @$sets <= 1000;
+    my (%set_seen, @sets);
+    for my $set (@$sets) {
+        Selecto::Error->throw('invalid_write_graph', 'owned set must declare parent, relationship, nodes and delete_missing')
+            unless ref($set) eq 'HASH'
+                && !grep { !/\A(?:parent|relationship|nodes|delete_missing)\z/ } keys %$set;
+        my ($parent, $relationship) = @{$set}{qw(parent relationship)};
+        Selecto::Error->throw('invalid_write_graph', 'owned set parent and relationship must be declared names')
+            unless defined($parent) && !ref($parent) && $seen{$parent}
+                && defined($relationship) && !ref($relationship)
+                && $relationship =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/
+                && !$set_seen{"$parent/$relationship"}++;
+        Selecto::Error->throw('invalid_write_graph', 'owned set nodes must be distinct existing child ids')
+            unless ref($set->{nodes}) eq 'ARRAY' && @{$set->{nodes}} <= 1000;
+        my %members;
+        Selecto::Error->throw('invalid_write_graph', 'owned set nodes must be distinct existing child ids')
+            if grep { !defined($_) || ref($_) || !$seen{$_} || $_ eq $parent || $members{$_}++ }
+                @{$set->{nodes}};
+        Selecto::Error->throw('invalid_write_graph', 'owned set requires explicit delete_missing')
+            unless defined($set->{delete_missing}) && (!ref($set->{delete_missing})
+                || JSON::PP::is_bool($set->{delete_missing}))
+                && "$set->{delete_missing}" eq '1';
+        push @sets, {parent => "$parent", relationship => "$relationship",
+            nodes => [@{$set->{nodes}}], delete_missing => 1};
+    }
+    return bless { nodes => \@normalized, owned_sets => \@sets }, $class;
+}
+
+sub owned_sets {
+    return [map {{%$_, nodes => [@{$_->{nodes}}]}} @{$_[0]->{owned_sets} // []}];
 }
 
 sub nodes {
@@ -231,6 +263,7 @@ use warnings;
 sub new { my ($class, %args) = @_; return bless { %args }, $class; }
 sub nodes { return { %{$_[0]->{nodes} // {}} }; }
 sub root  { return $_[0]->{root}; }
+sub metadata { return {%{$_[0]->{metadata} // {}}}; }
 
 package Selecto::Write::Result;
 

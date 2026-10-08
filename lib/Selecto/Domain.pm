@@ -14,7 +14,7 @@ use Selecto::Write::Scope ();
 
 my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
-    default_selected required_selected required_order_by
+    default_selected required_selected required_order_by required_filters
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions imports editors extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
@@ -274,7 +274,7 @@ sub parse {
     _required_key($raw, 'name', 'domain');
     _required_key($raw->{source}, 'table', 'source');
     _required_key($raw->{source}, 'fields', 'source');
-    return $class->new(
+    my $domain = $class->new(
         name => $raw->{name},
         table => $raw->{source}{table},
         fields => $raw->{source}{fields},
@@ -288,6 +288,7 @@ sub parse {
         detail_actions => $raw->{detail_actions},
         rules => $raw->{rules},
     );
+    return _apply_required_filters($domain, $raw->{required_filters});
 }
 
 sub _parse_canonical {
@@ -331,6 +332,7 @@ sub _parse_canonical {
         experiences => $raw->{experiences},
         rules => $raw->{rules},
     );
+    _apply_required_filters($domain, $raw->{required_filters});
     $domain->{contract} = dclone($raw);
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
@@ -356,6 +358,41 @@ sub _parse_canonical {
         encode_utf8(JSON::PP->new->canonical(1)->encode($fingerprint_document))
     );
     return $domain;
+}
+
+sub _apply_required_filters {
+    my ($domain, $filters) = @_;
+    return $domain unless defined $filters;
+    Selecto::Error->throw('invalid_domain', 'required_filters must be a bounded array')
+        unless ref($filters) eq 'ARRAY' && @$filters <= 1000;
+    require Selecto::Expression;
+    require Selecto::QueryEnforcement;
+    my @predicates;
+    my $ok = eval {
+        for my $raw (@$filters) {
+            Selecto::Error->throw('invalid_domain', 'required filter must be an expression array')
+                unless ref($raw) eq 'ARRAY';
+            my $predicate;
+            if (@$raw == 2 && defined($raw->[0]) && !ref($raw->[0])
+                && exists($domain->fields->{$raw->[0]})) {
+                if (!defined($raw->[1])) {
+                    $predicate = Selecto::Expression->is_null($raw->[0]);
+                } elsif (ref($raw->[1]) eq 'ARRAY' && @{$raw->[1]} == 2) {
+                    $predicate = Selecto::Expression->from_filter_ast([$raw->[1][0], $raw->[0], $raw->[1][1]]);
+                } else {
+                    $predicate = Selecto::Expression->eq($raw->[0], $raw->[1]);
+                }
+            } else {
+                $predicate = Selecto::Expression->from_filter_ast($raw);
+            }
+            Selecto::QueryEnforcement::validate($domain, $predicate);
+            push @predicates, $predicate;
+        }
+        1;
+    };
+    Selecto::Error->throw('invalid_domain', 'required_filters contains an unsupported or invalid guard') unless $ok;
+    $domain->{required_predicate} = Selecto::QueryEnforcement::combine(@predicates);
+    return $domain->_refresh_fingerprint;
 }
 
 my %ARRAY_ITEMS = map { $_ => 1 } qw(string integer decimal boolean date uuid);
