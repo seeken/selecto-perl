@@ -30,12 +30,14 @@ reenter the original write grants, tenant and reference checks.
 
 Ordinary advisory validation failures allow an otherwise governed operation.
 Resource errors remain errors in advisory bindings, unavailable authoritative
-stages, false conditions, and all logical branches. All bindings in one evaluator
-call share a
-2,000,000-unit evaluation budget. Separate write stages currently obtain separate
-budgets; this does not establish a whole-write resource ceiling. Each text step
-charges its current UTF-8 size;
-NFC output is checked again for expansion. Text is bounded to 4,096 UTF-8 bytes,
+stages, false conditions, and all logical branches. The native engine owns one
+2,000,000-unit evaluation budget for each protected write, preview, INSERT batch
+or graph, shared by INPUT, native candidate and transaction stages, test-only
+projection checks, child candidates and cleanup rules. Separate operations get
+fresh counters, including after a resource refusal. Callers cannot reset it with
+request options or command metadata. ACTION_INPUT planning remains a separate
+evaluation and is not claimed in this protected-write ceiling. Each text step
+charges its current UTF-8 size; NFC output is checked again for expansion. Text is bounded to 4,096 UTF-8 bytes,
 logical depth to 16, collection size to 1,000, and exact numbers to 1,024 digits.
 Trusted `Selecto::Limits` can tighten these bounds. The ASCII pattern evaluator
 uses a finite Thompson NFA rather than native backtracking expressions.
@@ -45,8 +47,7 @@ write transaction. Native NUMERIC affinity is evaluated before rules; for
 example `1e-400` becomes zero and fails required positivity. Protected storage
 refuses temporary shadows, virtual/view/shadow tables, triggers, generated
 columns and unsupported scalar types. Every mutating ordinary write, preview,
-batch, graph and owned cleanup checks
-its physical targets before the first business statement. Readonly graph anchors
+batch, graph and owned cleanup checks its physical targets before the first business statement. Readonly graph anchors
 are excluded. This proof also applies when the domain has no data rules. It
 refuses main and temporary target triggers and hidden or generated columns.
 Automatic incoming foreign-key updates are refused for original and
@@ -67,7 +68,11 @@ An omitted FK target resolves only to a single primary key. Schemas without a
 physical FK still require exact comparator and uniqueness proof.
 Graph and owned-sync capability gates require SQLite 3.37 for this catalog.
 
-Protected insert batches preflight every member before any dispatch. Protected
+Protected insert batches preflight every member before any dispatch. Ordinary
+known stored-rule failures are retained while later available stages and graph
+or INSERT-batch candidates finish their resource checks. The first ordinary
+failure then refuses the plan if no later resource error occurs. Refused INPUT,
+unknown prospective values and unavailable storage still stop admission. Protected
 stored batch deltas and upserts require a prospective whole-plan or selected
 branch provider and remain pending here. External evidence requires its exact
 authoritative stage. Unknown defaults or generated fields consumed by a rule,

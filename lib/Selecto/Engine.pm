@@ -25,6 +25,7 @@ use Selecto::Limits ();
 use Selecto::OperationBudget ();
 use Selecto::Write::ConflictTarget ();
 use Selecto::WriteRules ();
+use Selecto::DataRules ();
 use Selecto::Action::Graph ();
 
 sub new {
@@ -276,7 +277,7 @@ sub _rules_transaction {
     my ($self, $work) = @_;
     Selecto::Error->throw('required_data_rule_pending', 'adapter cannot protect stored candidates')
         unless $self->{adapter}->can('execute_transaction');
-    my $request = bless {work => $work}, 'Selecto::Write::Transaction';
+    my $request = bless {work => sub { Selecto::DataRules->_with_proof_budget($work) }}, 'Selecto::Write::Transaction';
     return $self->_execute_governed(execute_transaction => $request);
 }
 sub execute_batch {
@@ -292,8 +293,11 @@ sub execute_batch {
         # need a prospective whole-plan provider; do not dispatch a prefix.
         Selecto::Error->throw('required_data_rule_pending', 'protected stored batch deltas require a whole-plan candidate provider')
             if grep { $_->operation ne 'insert' } @commands;
-        my @admitted = map { Selecto::WriteRules->govern($self, $commands[$_], input => $input[$_]) } 0 .. $#commands;
-        return $self->_execute_governed(execute_batch => Selecto::Write::Batch->new(@admitted));
+        my $admitted = Selecto::WriteRules->_with_stored_failure_deferral(sub {
+            my @admitted = map { Selecto::WriteRules->govern($self, $commands[$_], input => $input[$_]) } 0 .. $#commands;
+            return Selecto::Write::Batch->new(@admitted);
+        });
+        return $self->_execute_governed(execute_batch => $admitted);
     });
 }
 sub execute_graph {

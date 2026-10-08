@@ -13,6 +13,21 @@ use Selecto::Query ();
 use Selecto::Expression ();
 use Selecto::QueryEnforcement ();
 our $HYDRATION;
+my $STORED_FAILURES;
+
+sub _with_stored_failure_deferral {
+    my ($class, $work) = @_;
+    return $work->() if $STORED_FAILURES;
+    my $failures = [];
+    $STORED_FAILURES = $failures;
+    my $scope = bless {restore => sub { $STORED_FAILURES = undef }}, 'Selecto::WriteRules::_FailureScope';
+    my $want = wantarray;
+    my (@result, $result);
+    if ($want) { @result = $work->() } else { $result = $work->() }
+    die $failures->[0] if @$failures;
+    return $want ? @result : $result;
+}
+
 
 sub has_rules {
     my ($class, $domain, $operation) = @_;
@@ -113,8 +128,10 @@ sub evaluate {
     _pending('consumed input or prospective candidate is unknown') if $unknown;
     if ($result->{state} ne 'passed') {
         _pending() if $result->{state} eq 'pending' || $result->{state} eq 'error';
-        Selecto::Error->throw('data_rule_failed', 'required domain data rule failed',
-            {rule_code => $result->{code}, path => $result->{path}});
+        my $error = Selecto::Error->new(code => 'data_rule_failed', message => 'required domain data rule failed',
+            details => {rule_code => $result->{code}, path => $result->{path}});
+        if ($STORED_FAILURES && $stage ne 'input' && $stage ne 'action_input') { push @$STORED_FAILURES, $error }
+        else { die $error }
     }
     return $result->{normalized};
 }
@@ -272,6 +289,10 @@ sub _normalize {
 }
 sub _changed { JSON::PP->new->canonical->encode([$_[0]]) ne JSON::PP->new->canonical->encode([$_[1]]) }
 sub govern {
+    my ($class, @args) = @_;
+    return $class->_with_stored_failure_deferral(sub { $class->_govern(@args) });
+}
+sub _govern {
     my ($class, $engine, $command, %options) = @_;
     return $command unless $class->has_rules($engine->domain, $command->operation);
     local $HYDRATION = $HYDRATION // {loaded => 0};
@@ -299,6 +320,10 @@ sub _key {
     } @$fields]);
 }
 sub admit_graph {
+    my ($class, @args) = @_;
+    return $class->_with_stored_failure_deferral(sub { $class->_admit_graph(@args) });
+}
+sub _admit_graph {
     my ($class, $root, $graph, $contexts) = @_;
     local $HYDRATION = $HYDRATION // {loaded => 0};
     my @nodes = @{$graph->nodes};
@@ -430,5 +455,9 @@ sub admit_graph {
     # Re-run domain governance after every normalizer, including trusted tenant checks.
     my ($prepared) = $root->_prepared_graph(Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets));
     return $prepared;
+}
+{
+    package Selecto::WriteRules::_FailureScope;
+    sub DESTROY { $_[0]{restore}->() }
 }
 1;
