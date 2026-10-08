@@ -168,4 +168,25 @@ for my $shadow (
         })};
     }
 }
+subtest 'conditioned rules inspect native normalized candidates before target DML' => sub {memory(sub {
+    my($db,$a)=@_;my$d=dclone($f->{flat_domain});
+    $d->{rules}{bindings}{positive}{condition}={op=>'value.eq',value=>0};
+    my$e=engine($d,$a);
+    eval {$e->execute_write(Selecto::Write::Command->new(operation=>'insert',relation=>'line_items',assignments=>{quantity=>0,reference=>'AB12'}))};
+    is $@->code,'data_rule_failed','true native scalar condition keeps the required positivity rule';
+    is $a->{dispatches}//0,0,'true conditioned failure never dispatches business DML';
+    is $db->selectrow_array('SELECT count(*) FROM line_items'),0,'conditioned failure leaves the target empty';
+    $e->execute_write(Selecto::Write::Command->new(operation=>'insert',relation=>'line_items',assignments=>{quantity=>-1,reference=>'AB12'}));
+    is $db->selectrow_array('SELECT quantity FROM line_items'),-1,'false native condition skips its rule';
+})};
+
+subtest 'condition follows normalization at the governed native boundary' => sub {memory(sub {
+    my($db,$a)=@_;my$d=dclone($f->{flat_domain});
+    $d->{rules}{definitions}{reference}{test}{pattern}='OTHER';
+    $d->{rules}{bindings}{reference}{condition}={op=>'value.eq',value=>'AB12'};
+    eval {engine($d,$a)->execute_write(Selecto::Write::Command->new(operation=>'insert',relation=>'line_items',assignments=>{quantity=>2,reference=>'  ab12  '}))};
+    is $@->code,'data_rule_failed','normalized AB12 activates the rejecting reference rule';
+    is $a->{dispatches}//0,0,'raw-value condition cannot bypass target admission';
+    is $db->selectrow_array('SELECT count(*) FROM line_items'),0,'normalized conditioned failure leaves no row';
+})};
 done_testing;
