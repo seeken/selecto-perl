@@ -19,7 +19,8 @@ sub new {
     my $name = 'selecto_stream_' . $$ . '_' . ++$SERIAL;
     my $fetch_size = int($args{fetch_size} // 1);
     my $self = bless {adapter => $adapter, dbh => $dbh, name => $name,
-        columns => $args{statement}->columns, closed => 0, buffer => []}, $class;
+        columns => $args{statement}->columns, closed => 0, buffer => [],
+        canonical_values => $args{canonical_values} ? 1 : 0}, $class;
     $dbh->{private_selecto_bounded_stream} = $name;
     my $ok = eval {
         if ($adapter->_transaction_open) {
@@ -65,7 +66,7 @@ sub next {
         $self->{types} //= [$self->{adapter}->_column_types($sth)];
         $rows = $sth->fetchall_arrayref;
         die 'cursor row fetch failed' if !$rows || $sth->err;
-        $self->{adapter}->_decode_rows($rows, $self->{types});
+        $self->{adapter}->_decode_rows($rows, $self->{types}) if $self->{canonical_values};
         $sth->finish;
         1;
     };
@@ -143,8 +144,9 @@ PostgreSQL C<NO SCROLL> cursor and fetches C<$n> rows per round trip (default
 buffered by DBD::Pg to C<$n>; an individual row and the server's query plan
 can still consume substantial memory. Row limits, byte budgets and database
 deadlines remain separate requirements, and a caller's per-row checks see a
-batch only after it has been fetched. Each batch is decoded column by column
-(see C<_decode_rows> in L<Selecto::SQL>).
+batch only after it has been fetched. Rows hold the driver's values; with
+C<< canonical_values => 1 >> each batch is decoded to canonical values column
+by column (see L<Selecto::PostgreSQL/RESULT VALUES>).
 
 The stream owns an idle handle's read-only transaction and rolls it back on
 close. Inside an existing transaction it owns a savepoint: normal close

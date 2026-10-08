@@ -1,9 +1,10 @@
 package Selecto::PostgreSQL;
 
 use Mojo::Base 'Selecto::SQL';
+use Hash::Util::FieldHash ();
 use JSON::PP ();
 use Mojo::JSON ();
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
@@ -11,6 +12,10 @@ use Selecto::PostgreSQL::StatementCache ();
 use Selecto::Statement ();
 
 has rollup_sort_fix => 'auto';
+# Result values are the driver's unless canonical values are asked for: see
+# RESULT VALUES below.
+has canonical_values => 0;
+has canonical_sql => 1;
 # Opt-in, off by default: see STATEMENT CACHE below.
 has statement_cache => 0;
 has statement_cache_size => 256;
@@ -36,7 +41,23 @@ sub stream_query {
         unless !ref($size) && "$size" =~ /\A[1-9]\d*\z/;
     require Selecto::PostgreSQL::Stream;
     return Selecto::PostgreSQL::Stream->new(adapter => $self, statement => $statement,
-        fetch_size => $size);
+        fetch_size => $size, canonical_values => $self->_canonical_requested(%options));
+}
+
+# A stream decodes canonical values in Perl, cell by cell, when they are asked
+# for; otherwise its rows are the driver's values.
+sub _stream_decoder {
+    my ($self, %options) = @_;
+    return $self->_canonical_requested(%options)
+        ? sub { return $self->_decode(@_); }
+        : sub { return $_[0]; };
+}
+
+sub _canonical_requested {
+    my ($self, %options) = @_;
+    return 1 if $options{export_scalars};
+    return (exists($options{canonical_values}) ? $options{canonical_values} : $self->canonical_values)
+        ? 1 : 0;
 }
 
 # The guard suppresses an oversized value on the server before DBI receives
@@ -185,6 +206,10 @@ sub normalize_error {
 
 sub supports {
     my ($self, $feature) = @_;
+    # A subclass that replaces execute_query keeps its own signature: engines
+    # send it canonical_values only if it says so by overriding supports.
+    return $self->can('execute_query') == \&execute_query ? 1 : 0
+        if "$feature" eq 'canonical_values';
     return "$feature" eq 'transactions' || "$feature" eq 'returning'
         || "$feature" eq 'rollup' || "$feature" eq 'set_operations'
         || "$feature" eq 'window_functions' || "$feature" eq 'text_search'
@@ -197,16 +222,190 @@ sub supports {
         || "$feature" eq 'export_scalars' ? 1 : 0;
 }
 
-# export_scalars => 1 asks for canonical export scalars: NUMERIC keeps the
-# text PostgreSQL writes for it (plain notation at the column's scale), a
-# boolean is a JSON::PP boolean and json/jsonb is the decoded JSON value.
-# Every other value, and every result without the option, is decoded exactly
-# as before.
+# Without canonical_values (the default) rows hold exactly what DBD::Pg
+# returns. canonical_values => 1 asks for canonical values; see RESULT VALUES
+# in the POD. export_scalars => 1 asks for canonical export scalars: NUMERIC
+# keeps the text PostgreSQL writes for it (plain notation at the column's
+# scale), a boolean is a JSON::PP boolean and json/jsonb is the decoded JSON
+# value; every other value is canonical. Export scalars are decoded in Perl.
 sub execute_query {
     my ($self, $statement, %options) = @_;
-    return $self->SUPER::execute_query($statement) unless $options{export_scalars};
-    local $self->{_selecto_export_scalars} = 1;
-    return $self->SUPER::execute_query($statement);
+    if ($options{export_scalars}) {
+        local $self->{_selecto_export_scalars} = 1;
+        return $self->SUPER::execute_query($statement);
+    }
+    unless ($self->_canonical_requested(%options)) {
+        local $self->{_selecto_raw_values} = 1;
+        return $self->SUPER::execute_query($statement);
+    }
+    my $plan = $self->_canonical_plan($statement)
+        or return $self->SUPER::execute_query($statement);
+    my $rows;
+    my $ok = eval {
+        $rows = $self->_fetch_canonical($statement, $plan);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return { columns => $statement->columns, rows => $rows };
+}
+
+# ---- Canonical values in SQL ------------------------------------------------
+#
+# Canonical formatting is a function of the column's PostgreSQL type, which
+# only the server knows for certain (an aggregate, a value expression or a
+# domain field declared with another type). So the adapter learns the result
+# types of each SQL text on its database handle: the first canonical execution
+# of a statement decodes in Perl and records the types; later executions wrap
+# each top-level NUMERIC, TIMESTAMP and TIMESTAMPTZ selection in an SQL
+# expression that yields the canonical text, and Perl leaves those (now
+# text) columns alone. Every other column is decoded in Perl as before.
+# Floats stay in Perl: DBD::Pg returns them as Perl numbers, so their
+# canonical text is Perl's own number formatting (0.3 for
+# 0.30000000000000004, Inf, 10000000000 for 1e+10), which SQL cannot
+# reproduce exactly. Integers and booleans already arrive as Perl numbers.
+#
+# Each formatter starts from the type's own output text (CAST AS TEXT is the
+# type's output function, the text DBD::Pg receives), so DateStyle, TimeZone,
+# extra_float_digits, BC years, infinities and NaN come out as the Perl decode
+# makes them:
+#   numeric      trim_scale of the text read back as NUMERIC (PostgreSQL 13+;
+#                Perl decode before 13)
+#   timestamp    spaces become T; its text never carries a zone suffix
+#   timestamptz  spaces become T, then the Perl suffix pattern
+#
+# Only a statement whose previous execution returned at least
+# $CANONICAL_SQL_MIN_ROWS rows runs formatted: below that, parsing and planning
+# the longer SQL costs more than the Perl decoding it saves.
+#
+# The formatter only replaces the outermost SELECT list. ORDER BY and GROUP
+# BY are compiled expressions, never output names or positions (a rollup
+# ordered by position is not formatted), so they still sort and group the
+# underlying values; set operations and other wrapped statements carry no
+# projection and decode in Perl.
+#
+# A learned type is checked on every execution: each formatted column reads
+# CASE WHEN pg_typeof(<the expression>) is the learned type THEN <canonical
+# text> ELSE '!' END. The expression inside pg_typeof sits in CASE WHEN FALSE,
+# which the planner folds away, so it is not evaluated twice. A '!' in the
+# first row (no canonical text is '!'; a mismatch gives '!' in every row,
+# NULLs included) means the type changed; that column is then never formatted
+# for the SQL text, and the statement runs again unformatted and decodes in
+# Perl. Every formatter compiles whatever the column's type is now, so a
+# changed type is never a parse error. (A domain is checked as its base type:
+# CASE resolves domains to their base types.)
+
+Hash::Util::FieldHash::fieldhash(my %PROJECTION);
+
+my %CANONICAL_TYPE_OID = (numeric => 1700, timestamp => 1114, timestamptz => 1184);
+my %CANONICAL_SQL = (
+    # Through TEXT, so the SQL still compiles if the column's type changed
+    # (the guard then answers '!'); numeric text input keeps the scale.
+    numeric => sub { "CAST(pg_catalog.trim_scale(CAST(CAST($_[0] AS TEXT) AS NUMERIC)) AS TEXT)" },
+    timestamp => sub { "pg_catalog.translate(CAST($_[0] AS TEXT), ' ', 'T')" },
+    timestamptz => sub {
+        "pg_catalog.regexp_replace(pg_catalog.translate(CAST($_[0] AS TEXT), ' ', 'T'), "
+            . q{'([.]0+)?([+]00(:00)?|Z)$', '')};
+    },
+);
+use constant CANONICAL_TYPE_ENTRIES => 1024;
+# Formatting in SQL makes the server parse and plan a longer statement (about
+# 80 microseconds without the statement cache) and saves about half a
+# microsecond per row of Perl decoding, so it pays off from a few hundred
+# rows. It is used when the SQL text's previous execution returned this many.
+our $CANONICAL_SQL_MIN_ROWS = 256;
+use constant CANONICAL_MISMATCH => '!';
+
+sub _note_projection {
+    my ($self, $statement, %projection) = @_;
+    $PROJECTION{$statement} = {sql => $statement->sql, %projection,
+        layout => join(',', $projection{start}, map { @$_ } @{$projection{items}})};
+    return;
+}
+
+sub _canonical_plan {
+    my ($self, $statement) = @_;
+    return undef unless $self->canonical_sql;
+    my $dbh = $self->{dbh};
+    my $pg = $self->{_selecto_canonical_pg} //= [refaddr($dbh) // 0,
+        eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0];
+    $pg = $self->{_selecto_canonical_pg} = [refaddr($dbh) // 0,
+        eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0]
+        unless $pg->[0] == (refaddr($dbh) // 0);
+    return $pg->[1] ? $self->_projection($statement) : undef;
+}
+
+# The projection compile recorded for this statement object, while the
+# statement still holds the SQL text it describes.
+sub _projection {
+    my ($self, $statement) = @_;
+    my $plan = $PROJECTION{$statement} or return undef;
+    return $plan->{sql} eq $statement->sql ? $plan : undef;
+}
+
+sub _fetch_canonical {
+    my ($self, $statement, $plan) = @_;
+    my $sql = $plan->{sql};
+    my $learned = $self->{dbh}{private_selecto_canonical_types} //= {};
+    my $entry = $learned->{$sql};
+    my ($rows, $types);
+    # The formatted text is built once per learned state and projection layout.
+    my $formatted = $entry && ($entry->{rows} // 0) >= $CANONICAL_SQL_MIN_ROWS
+        && ($entry->{formatted}{$plan->{layout}} //= $self->_canonical_sql_text($plan, $entry) // 0);
+    if ($formatted) {
+        ($rows, $types) = $self->_fetch_query($formatted->{sql}, $statement->params);
+        my @changed = @$rows
+            ? grep { defined($rows->[0][$_]) && $rows->[0][$_] eq CANONICAL_MISMATCH } @{$formatted->{columns}}
+            : ();
+        unless (@changed) {
+            $entry->{rows} = scalar @$rows;
+            $self->_decode_rows($rows, $types);
+            return $rows;
+        }
+        $entry->{blocked}{$_} = 1 for @changed;
+        $entry->{types} = undef;
+        delete $entry->{formatted};
+    }
+    ($rows, $types) = $self->_fetch_query($sql, $statement->params);
+    if (!$entry) {
+        %$learned = () if keys(%$learned) >= CANONICAL_TYPE_ENTRIES;
+        $entry = $learned->{$sql} = {types => [@$types], blocked => {}};
+    } elsif (!$entry->{types}) {
+        $entry->{types} = [@$types];
+    }
+    $entry->{rows} = scalar @$rows;
+    $self->_decode_rows($rows, $types);
+    return $rows;
+}
+
+sub _canonical_sql_text {
+    my ($self, $plan, $entry) = @_;
+    my ($items, $types, $blocked) = ($plan->{items}, $entry->{types}, $entry->{blocked});
+    return undef unless $types && @$types == @$items;
+    my $version = eval { $self->{dbh}{pg_server_version} } // 0;
+    my $sql = $plan->{sql};
+    my $position = $plan->{start};
+    my $text = substr($sql, 0, $position);
+    my @columns;
+    for my $index (0 .. $#$items) {
+        my ($expression_length, $item_length) = @{$items->[$index]};
+        $text .= ', ' if $index;
+        my $type = $types->[$index] // '';
+        my $format = $CANONICAL_SQL{$type};
+        $format = undef if $blocked->{$index} || ($type eq 'numeric' && $version < 130000);
+        if ($format) {
+            my $expression = '(' . substr($sql, $position, $expression_length) . ')';
+            $text .= 'CASE WHEN CAST(pg_catalog.pg_typeof(CASE WHEN FALSE THEN ' . $expression
+                . ' END) AS OID) = ' . $CANONICAL_TYPE_OID{$type} . ' THEN ' . $format->($expression)
+                . q{ ELSE '} . CANONICAL_MISMATCH . q{' END}
+                . substr($sql, $position + $expression_length, $item_length - $expression_length);
+            push @columns, $index;
+        } else {
+            $text .= substr($sql, $position, $item_length);
+        }
+        $position += $item_length + 2;
+    }
+    return undef unless @columns;
+    return {sql => $text . substr($sql, $position - 2), columns => \@columns};
 }
 
 my %ARRAY_SQL_TYPE = (
@@ -711,6 +910,7 @@ sub _decode {
 # it. A subclass that redefines _decode keeps the per-cell path.
 sub _decode_rows {
     my ($self, $rows, $types) = @_;
+    return if $self->{_selecto_raw_values};
     return $self->SUPER::_decode_rows($rows, $types)
         unless $self->can('_decode') == \&_decode;
     my $export = $self->{_selecto_export_scalars};
@@ -829,7 +1029,12 @@ Selecto::PostgreSQL - PostgreSQL adapter
       rollup_sort_fix  => 'auto',      # 'auto' (default), 1 or 0
       statement_cache  => 1,           # opt-in, default 0; see below
       statement_cache_size => 256,     # handles kept per connection
+      canonical_values => 1,           # default 0: driver values; see RESULT VALUES
+      canonical_sql    => 1,           # default 1: format canonical values in SQL
   ));
+
+  # Or per call:
+  my $rows = $engine->all($query, canonical_values => 1)->{rows};
 
 =head1 DESCRIPTION
 
@@ -851,6 +1056,87 @@ DBD::Pg handle then uses a server cursor, not a C<RowCacheSize> hint, and
 buffers at most C<fetch_size> rows (default 1) per round trip. See
 L<Selecto::PostgreSQL::Stream> for transaction ownership and cleanup rules.
 
+=head1 RESULT VALUES
+
+By default (C<< canonical_values => 0 >>) C<execute_query>, and so
+C<< $engine->all >>, C<< $engine->stream >> and C<projection_sum>, return
+exactly the values DBD::Pg fetched: Selecto does not touch them.
+
+Ask for I<canonical values> per call with C<< canonical_values => 1 >>
+(C<< $engine->all($query, canonical_values => 1) >>, likewise C<stream> and
+C<projection_sum>), or for every call with the adapter attribute
+C<< canonical_values => 1 >>; a call's C<< canonical_values => 0 >> then asks
+for driver values again. Canonical values are what this adapter returned by
+default up to version 0.2.2 (the API, canned pages, co-domain lookups and
+certification ask for them):
+
+=over 4
+
+=item * C<smallint>, C<integer>, C<bigint>: Perl numbers (C<int()>), so they
+encode as JSON numbers. DBD::Pg 3 already returns them as numbers.
+
+=item * C<boolean>: C<1> or C<0>, as DBD::Pg returns them.
+
+=item * C<numeric>: the driver text without trailing fractional zeros or a
+trailing point, and C<-0> as C<0> (C<10.500> is C<10.5>, C<7152.00> is
+C<7152>; C<NaN> and the infinities are unchanged).
+
+=item * C<real>, C<double precision>: DBD::Pg returns Perl numbers; the
+canonical value is their Perl string, with the same trimming (C<1.5>,
+C<10000000000> for C<1e+10>, C<0.3> for C<0.30000000000000004>, C<Inf>), so
+it encodes as a JSON string.
+
+=item * C<timestamp>, C<timestamptz>: the driver text with spaces as C<T>,
+and a zero UTC offset (C<+00>, C<+00:00> or C<Z>, with any all-zero
+fraction before it) removed (C<2024-01-01 10:00:00+00> is
+C<2024-01-01T10:00:00>; C<2024-06-01 12:34:56.789+05:30> is
+C<2024-06-01T12:34:56.789+05:30>). Other offsets, the session C<TimeZone>
+and C<DateStyle>, fractions and C<BC> are kept as the server writes them.
+
+=item * Everything else (text, C<date>, C<json>/C<jsonb> text, UUIDs,
+arrays): the driver value.
+
+=back
+
+With C<< canonical_sql => 1 >> (the default) PostgreSQL produces the
+numeric and timestamp forms itself for large results; Perl converts
+integers, booleans and floats (whose canonical form is Perl's own number
+formatting, which SQL cannot reproduce). The adapter learns each SQL text's
+result column types from its first canonical execution on a database handle
+(decoded in Perl), and later executions that follow one returning at least
+256 rows (smaller results decode faster in Perl than the longer SQL parses)
+wrap those top-level selections in SQL that turns the
+type's own output text into the canonical text: C<trim_scale> for
+C<numeric> (PostgreSQL 13 and newer; on 12 numeric stays in Perl), and
+C<translate> and the suffix pattern above for timestamps. Each
+formatted column checks with C<pg_typeof> that it still has the learned
+type; a changed type (or a domain type) is decoded in Perl from then on, and
+the execution that found it runs again unformatted. ORDER BY, GROUP BY,
+aggregates, window functions and pagination still work on the
+underlying values: only the outermost select list changes, and ordered
+rollups, set operations and statements built outside C<compile> are always
+decoded in Perl. The values are identical either way. At most 1024 SQL texts
+are remembered per handle. C<< canonical_sql => 0 >> decodes every
+canonical value in Perl.
+
+=head2 Moving from 0.2.2
+
+With DBD::Pg 3, a host that does not ask for canonical values sees these
+differences: C<numeric> keeps its scale (C<10.500>, not C<10.5>);
+C<real> and C<double precision> are Perl numbers, which encode as JSON
+numbers, instead of strings; C<timestamp> and C<timestamptz> are the server
+text (C<2024-01-01 10:00:00+00>, or another offset under the session
+C<TimeZone>), not C<2024-01-01T10:00:00>. Integers, booleans, text, dates
+and JSON text are the same either way.
+
+Versions up to 0.2.2 returned canonical values by default. To keep that
+behaviour for a whole host, construct the adapter with
+C<< canonical_values => 1 >>; to keep it for particular reads, pass
+C<< canonical_values => 1 >> to C<all>, C<stream> or C<projection_sum>.
+Code that already uses C<export_scalars> is unaffected. A subclass that
+overrides C<execute_query> is not sent C<canonical_values> unless its
+C<supports('canonical_values')> says so.
+
 =head1 EXPORT SCALARS
 
 C<< $engine->all($query, export_scalars => 1) >> returns canonical export
@@ -859,9 +1145,10 @@ which is plain notation at the column's scale (C<533.10>, C<7152.00>,
 C<-0.0001>, C<42> for C<NUMERIC(10,0)>); a boolean is C<JSON::PP::true> or
 C<JSON::PP::false>; C<json> and C<jsonb> are decoded JSON values. Integers,
 text, C<DATE> (C<YYYY-MM-DD>), C<TIMESTAMP> (C<YYYY-MM-DDTHH:MM:SS>) and
-floats are decoded as without the option. Without it, results are unchanged:
-decimals lose trailing zeros (C<533.1>), booleans are C<1> or C<0> and JSON
-columns are text.
+floats are canonical values (see L</RESULT VALUES>), whatever the adapter's
+C<canonical_values>. Export scalars are decoded in Perl. Canonical values
+without the option differ: decimals lose trailing zeros (C<533.1>), booleans
+are C<1> or C<0> and JSON columns are text.
 
 =head1 ATTRIBUTES
 
@@ -873,6 +1160,17 @@ C<NULLS FIRST> ordering for multi-level hierarchies. PostgreSQL 17 and older
 need that ordering and pagination wrapped around a C<rollupfix> subquery.
 With C<auto> the adapter reads C<server_version_num> once and disables the
 wrapper on PostgreSQL 18 and newer; C<1> or C<0> force it on or off.
+
+=head2 canonical_values
+
+C<0> (the default): results hold the driver's values. C<1>: results hold
+canonical values unless a call passes C<< canonical_values => 0 >>. See
+L</RESULT VALUES>.
+
+=head2 canonical_sql
+
+C<1> (the default): canonical values are formatted by PostgreSQL where the
+adapter can (see L</RESULT VALUES>). C<0>: they are all decoded in Perl.
 
 =head2 statement_cache
 

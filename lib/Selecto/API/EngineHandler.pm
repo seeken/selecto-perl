@@ -586,7 +586,8 @@ sub _query ($self, $engine, $body, %options) {
     # to obtain validated column metadata; never execute that statement.
     my $result = $limit == 0
         ? {columns => $engine->compile($query->limit(1))->columns, rows => []}
-        : $engine->all($query->limit($limit + 1), $options{export_scalars} ? (export_scalars => 1) : ());
+        : $engine->all($query->limit($limit + 1),
+            $options{export_scalars} ? (export_scalars => 1) : (canonical_values => 1));
     Selecto::Error->throw(
         'invalid_api_host', 'Selecto adapter returned an invalid result',
     ) unless ref($result) eq 'HASH'

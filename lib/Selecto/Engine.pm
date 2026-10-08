@@ -152,7 +152,8 @@ sub compile {
 }
 sub all {
     my ($self, $query, %options) = @_;
-    return $self->{adapter}->execute_query($self->compile($query)) unless $options{export_scalars};
+    return $self->{adapter}->execute_query($self->compile($query), $self->_canonical_option(%options))
+        unless $options{export_scalars};
     # Export scalars are opt-in: only adapters that provide them may be asked.
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not provide export scalars')
         unless $self->{adapter}->supports('export_scalars');
@@ -225,12 +226,12 @@ sub _excludes_tenant {
     return !grep { "$_" eq "$tenant" } @allowed;
 }
 sub projection_sum {
-    my ($self, $query, $column) = @_;
+    my ($self, $query, $column, %options) = @_;
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not support projection sums')
         unless $self->{adapter}->supports('projection_sum')
             && $self->{adapter}->can('projection_sum_statement');
     my $statement = $self->{adapter}->projection_sum_statement($self->compile($query), $column);
-    my $result = $self->{adapter}->execute_query($statement);
+    my $result = $self->{adapter}->execute_query($statement, $self->_canonical_option(%options));
     my $rows = $result->{rows};
     Selecto::Error->throw('invalid_query', 'projection sum returned an invalid result')
         unless ref($rows) eq 'ARRAY' && @$rows == 1
@@ -242,7 +243,19 @@ sub stream {
     my ($self, $query, %options) = @_;
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not support streaming')
         unless $self->{adapter}->supports('stream') && $self->{adapter}->can('stream_query');
-    return $self->{adapter}->stream_query($self->compile($query), %options);
+    my %canonical = $self->_canonical_option(%options);
+    delete $options{canonical_values};
+    return $self->{adapter}->stream_query($self->compile($query), %options, %canonical);
+}
+
+# canonical_values reaches only adapters that choose between driver and
+# canonical values (supports('canonical_values')); the others always return
+# their canonical values and keep their execute_query signatures.
+sub _canonical_option {
+    my ($self, %options) = @_;
+    return () unless exists($options{canonical_values})
+        && $self->{adapter}->supports('canonical_values');
+    return (canonical_values => $options{canonical_values} ? 1 : 0);
 }
 sub preview_write {
     my ($self, $command) = @_;
@@ -1516,20 +1529,27 @@ Returns a new empty L<Selecto::Query>.
   my $result = $engine->all($query);
   # {columns => ['id', 'name'], rows => [[1, 'Anvil'], ...]}
 
-Compiles and executes the query and returns every row. Values are
-normalized by the adapter (integers as numbers, exact decimals without
-trailing zeros, timestamps in ISO form).
+  my $result = $engine->all($query, canonical_values => 1);
+
+Compiles and executes the query and returns every row. With the PostgreSQL
+adapter, values are the driver's own (DBD::Pg) unless canonical values are
+asked for, per call with C<< canonical_values => 1 >> or for the whole
+adapter with its C<canonical_values> attribute; canonical values are
+integers as numbers, booleans as C<1> or C<0>, exact decimals and floats
+without trailing zeros, and timestamps in ISO form (see
+L<Selecto::PostgreSQL/RESULT VALUES>). C<< canonical_values => 0 >> asks for
+the driver's values even when the adapter's default is canonical. The other
+adapters always normalize, as before, and ignore the option.
 
 With C<< export_scalars => 1 >> (C<< $engine->all($query, export_scalars => 1) >>)
 the rows hold canonical export scalars instead: exact decimals keep the
 column's scale as the database writes them (C<533.10>, C<7152.00>,
 C<0.0000>), booleans are L<JSON::PP> booleans, and JSON columns are decoded
 JSON values. Integers, text, dates (C<YYYY-MM-DD>) and timestamps
-(C<YYYY-MM-DDTHH:MM:SS>) are the same as without it. Exports
-(L<Selecto::API::ResultFormatter>) use these values. Only adapters that
-support C<export_scalars> accept it (the PostgreSQL adapter does); others
-throw C<unsupported_feature>. Without the option C<all> returns exactly what
-it always has.
+(C<YYYY-MM-DDTHH:MM:SS>) are canonical values, as with
+C<< canonical_values => 1 >>. Exports (L<Selecto::API::ResultFormatter>) use
+these values. Only adapters that support C<export_scalars> accept it (the
+PostgreSQL adapter does); others throw C<unsupported_feature>.
 
 C<all> applies the domain's required predicate and the engine's tenant, but
 it does not require a tenant boundary: it is meant for trusted host code,
@@ -1544,7 +1564,8 @@ L</assert_tenant_boundary> first.
 
 Returns a L<Selecto::Stream> that decodes one row at a time. Requires the
 adapter's C<stream> capability. Server-side cursor behavior is up to the
-DBI driver.
+DBI driver. Rows hold the same values as C<all>: pass
+C<< canonical_values => 1 >> for canonical values from PostgreSQL.
 
 =head2 compile
 
@@ -1553,9 +1574,11 @@ Returns the L<Selecto::Statement> the adapter would execute for a query.
 =head2 projection_sum
 
   my $total = $engine->projection_sum($query, 'total');
+  my $total = $engine->projection_sum($query, 'total', canonical_values => 1);
 
 Wraps the compiled query and returns the sum of one selected result column
-over the rows it returns (zero when there are none). Requires the adapter's
+over the rows it returns (zero when there are none), as the driver's value
+or, with C<< canonical_values => 1 >>, as a canonical value. Requires the adapter's
 C<projection_sum> capability (PostgreSQL); remove C<limit> and C<offset>
 first to sum the whole result.
 
