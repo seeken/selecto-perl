@@ -31,32 +31,36 @@ Unreleased
       adapters always return canonical values. A Selecto::PostgreSQL
       subclass that overrides execute_query is not sent the option unless
       its supports('canonical_values') is true.
-    - Breaking, with the entry above: canonical PostgreSQL dates and
-      timestamps are always the ISO form in the session time zone.
-      Canonical values of fields declared decimal (PostgreSQL 13+), date,
-      naive_datetime and utc_datetime are formatted by PostgreSQL in the
-      outermost select list, whatever the result size: trim_scale for
-      numeric, and TO_CHAR for dates and timestamps, in the session
-      TimeZone, with the offset from TO_CHAR's OF unless it is +00.
-      The declared type chooses the columns and the column's PostgreSQL type
+    - Canonical values are decoded in Perl by default, as before: a host
+      that asks for them gets exactly the values 0.2.2 returned, and dates
+      and timestamps follow the session DateStyle (a non-ISO DateStyle such
+      as SQL, Postgres or German shows through, as it always has). Integer
+      columns that DBD::Pg fetched as Perl numbers skip int() on Perl 5.36
+      and newer.
+    - Opt-in canonical_sql => 1 (default 0) has PostgreSQL format the
+      canonical values of fields declared decimal (PostgreSQL 13+), date,
+      naive_datetime and utc_datetime in the outermost select list: trim_scale
+      for numeric, and TO_CHAR for dates and timestamps, in the session
+      TimeZone, with the offset from TO_CHAR's OF unless it is +00. Its
+      dates and timestamps are always the ISO form in the session time zone,
+      whatever the DateStyle; under ISO they equal the Perl decode (BC,
+      infinities, fractions and historic offsets with seconds included). The
+      declared type chooses the columns and the column's PostgreSQL type
       (CASE on pg_typeof) the formatter, so a mis-declared temporal kind or a
-      date kept as text is unchanged. The values are the ones the Perl
-      decode gives under DateStyle ISO (BC, infinities, fractions and
-      historic offsets with seconds included), but they no longer follow a
-      non-ISO session DateStyle (SQL, Postgres, German): canonical output is
-      the ISO form in the session time zone. Columns PostgreSQL does not
-      format (integers, floats, booleans, aggregates and other expressions,
-      computed fields, ordered rollups, set operations) are decoded in Perl
-      as before. A float or integer column declared decimal comes out as its
+      date kept as text is unchanged. Columns PostgreSQL does not format
+      (integers, floats, booleans, aggregates and other expressions,
+      computed fields, ordered rollups, set operations) are decoded in Perl.
+      A float or integer column declared decimal comes out as its
       PostgreSQL text ("1e+20", "Infinity"; "7" as a string). ORDER BY and
       GROUP BY keep the underlying expressions. Streams, bounded streams and
       BoundedQuery format the same columns (so a bounded result's cell-size
-      guard measures the canonical text). canonical_sql => 0 decodes in
-      Perl. PostgreSQL parses and plans the longer statement on every call
-      without the statement cache (roughly 30-50 microseconds per formatted
-      datetime column), and once per connection and SQL text with it.
-      Integer columns that DBD::Pg fetched as Perl numbers skip int() on
-      Perl 5.36 and newer.
+      guard measures the canonical text). It is off by default because the
+      Perl decode measured faster at every result size (100,000 rows: 154 ms
+      in Perl, 213 ms in SQL), and PostgreSQL parses and plans the longer
+      statement on every call without the statement cache (roughly 30-50
+      microseconds per formatted datetime column; point reads were 100-150
+      microseconds slower). With canonical_sql off, compile records nothing
+      for it.
     - getResource takes an optional date_format query parameter (iso8601,
       the default and the previous output; rfc3339_millis; epoch_seconds;
       epoch_milliseconds) that formats every temporal field in UTC,

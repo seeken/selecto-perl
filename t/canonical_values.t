@@ -11,7 +11,8 @@ use Selecto::Expression ();
 use Selecto::PostgreSQL ();
 use Selecto::Statement ();
 
-# Offline checks of the SQL that formats canonical values: only the outermost
+# Offline checks of the SQL that formats canonical values (the opt-in
+# canonical_sql => 1; by default they are decoded in Perl): only the outermost
 # SELECT list changes, by the selections' declared domain types, and every
 # other byte of the statement is kept. The live identity of the values
 # themselves is t/canonical_values.integration.t.
@@ -26,7 +27,7 @@ use Selecto::Statement ();
 }
 
 my $dbh = TestSelecto::DBH->new;
-my $adapter = Local::CanonicalAdapter->new(dbh => $dbh);
+my $adapter = Local::CanonicalAdapter->new(dbh => $dbh, canonical_sql => 1);
 my $x = 'Selecto::Expression';
 
 my $domain = Selecto::Domain->parse({
@@ -153,13 +154,22 @@ subtest 'statements without a top-level projection decode in Perl' => sub {
     is($adapter->_canonical_statement($only_integers), $only_integers, 'nothing to format');
     $statement->{sql} .= ' ';
     is($adapter->_canonical_statement($statement), $statement, 'a statement whose SQL changed after compile');
-    my $plain = Selecto::PostgreSQL->new(dbh => $dbh);
+    my $plain = Selecto::PostgreSQL->new(dbh => $dbh, canonical_sql => 1);
     my $compiled = Selecto::Engine->new(domain => $domain, adapter => $plain)->compile(
         $engine->query->select('id', 'amount'));
     is($plain->_canonical_statement($compiled), $compiled, 'a handle that is not DBD::Pg');
     my $off = Local::CanonicalAdapter->new(dbh => $dbh, canonical_sql => 0);
     $compiled = Selecto::Engine->new(domain => $domain, adapter => $off)->compile($engine->query->select('id', 'amount'));
     is($off->_canonical_statement($compiled), $compiled, 'canonical_sql => 0');
+    my $default = Local::CanonicalAdapter->new(dbh => $dbh);
+    is($default->canonical_sql, 0, 'canonical_sql is off by default');
+    $compiled = Selecto::Engine->new(domain => $domain, adapter => $default)->compile(
+        $engine->query->select('id', 'amount', 'day', 'at', 'aware'));
+    is($default->_canonical_statement($compiled), $compiled, 'so canonical values are decoded in Perl');
+    is_deeply([$default->_canonical_columns($compiled)], [], 'and no column is formatted');
+    is($compiled->sql, $off->_canonical_statement(Selecto::Engine->new(domain => $domain, adapter => $off)
+        ->compile($engine->query->select('id', 'amount', 'day', 'at', 'aware')))->sql,
+        'the statement is the one compiled without canonical_sql');
 };
 
 subtest 'numeric needs PostgreSQL 13' => sub {
