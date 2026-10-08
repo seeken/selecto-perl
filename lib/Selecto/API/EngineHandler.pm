@@ -36,6 +36,11 @@ has limits => sub { Selecto::Limits->new };
 has 'versioner';
 
 my $MAX_RESOURCE_FIELDS = 50;
+# Instant formats a resource GET may ask for with date_format (default
+# iso8601). Each is a Selecto::DateFormat compiled through datetime_format.
+my @RESOURCE_DATE_FORMATS = qw(iso8601 rfc3339_millis epoch_seconds epoch_milliseconds);
+my %RESOURCE_DATE_FORMAT = map { ($_ => 1) } @RESOURCE_DATE_FORMATS;
+sub resource_date_formats ($class) { return [@RESOURCE_DATE_FORMATS]; }
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
@@ -275,9 +280,10 @@ sub query ($self, $engine, $body, %options) {
     return $result;
 }
 
-# One resource by primary key: {id => ..., fields => [...] or 'a,b'}. Returns
-# the primary key and the requested public scalar or to-one fields, including
-# aggregate_version when a versioner is configured and it is requested.
+# One resource by primary key: {id => ..., fields => [...] or 'a,b',
+# date_format => ...}. Returns the primary key and the requested public scalar
+# or to-one fields, including aggregate_version when a versioner is
+# configured and it is requested.
 sub resource ($self, $engine, $params) {
     Selecto::Error->throw(
         'invalid_api_host', 'API resource handler requires a Selecto engine',
@@ -293,6 +299,10 @@ sub resource ($self, $engine, $params) {
         unless defined($id) && !ref($id) && length("$id") && length("$id") <= 256
             && ($key_type !~ /int|serial/i || "$id" =~ /\A-?[1-9]\d{0,17}\z/);
     $id = 0 + $id if $key_type =~ /int|serial/i;
+    my $date_format = $params->{date_format} // 'iso8601';
+    Selecto::Error->throw('invalid_api_query', 'date_format is not available',
+        {parameter => 'date_format'})
+        unless !ref($date_format) && $RESOURCE_DATE_FORMAT{"$date_format"};
 
     my $maximum = $MAX_RESOURCE_FIELDS < $self->max_fields - 2
         ? $MAX_RESOURCE_FIELDS : $self->max_fields - 2;
@@ -326,8 +336,12 @@ sub resource ($self, $engine, $params) {
         Selecto::Error->throw('invalid_api_query',
             'fields cannot include to-many relationships; use the query route', {field => $field})
             if grep { $_->cardinality eq 'many' } @{$definition->{associations} // []};
-        push @select, ($definition->{type} // '') =~ /\A(?:datetime|naive_datetime|utc_datetime|epoch_datetime|timestamp|timestamptz)\z/
-            ? {field => $field, format => 'iso8601'} : $field;
+        # Timestamps always take date_format. A DATE keeps its calendar value
+        # under iso8601 (as before) and is midnight UTC under the others.
+        my $type = $definition->{type} // '';
+        push @select, $type =~ /\A(?:datetime|naive_datetime|utc_datetime|epoch_datetime|timestamp|timestamptz)\z/
+            || ($type eq 'date' && $date_format ne 'iso8601')
+            ? {field => $field, format => "$date_format"} : $field;
     }
     my $result = $self->query($engine, {
         select => \@select,
@@ -1679,11 +1693,44 @@ A copy of the handler with C<versioner> set; the original is unchanged.
   my $data = $handler->resource($engine, {id => 7, fields => 'name,status'});
 
 One resource by primary key, for L<Selecto::API>'s C<getResource> route. It
-returns the primary key and up to 50 requested public scalar or to-one fields
-(timestamps in ISO 8601). C<aggregate_version> is returned only when
+returns the primary key and up to 50 requested public scalar or to-one fields.
+C<aggregate_version> is returned only when
 requested, and only with a versioner configured (otherwise
 C<invalid_api_query>). A withheld field is C<hidden_field>, a to-many one C<invalid_api_query>
 and a missing row C<resource_not_found>.
+
+C<date_format> selects how every temporal field is returned:
+
+=over 4
+
+=item C<iso8601> (the default)
+
+C<utc_datetime> and C<epoch_datetime> fields are UTC instants,
+C<YYYY-MM-DDTHH:MM:SSZ>; C<naive_datetime> fields are their wall time,
+C<YYYY-MM-DDTHH:MM:SS>, without a zone; C<date> fields are C<YYYY-MM-DD>.
+Fractional seconds are dropped. This is the output from before the
+parameter existed.
+
+=item C<rfc3339_millis>
+
+C<YYYY-MM-DDTHH:MM:SS.sssZ> in UTC, milliseconds truncated.
+
+=item C<epoch_seconds>, C<epoch_milliseconds>
+
+Integers: whole seconds or milliseconds since 1970-01-01T00:00:00Z, rounded
+down (towards negative infinity).
+
+=back
+
+The resource route has no time zone parameter, so the instant formats are
+always UTC. A C<naive_datetime> is read as UTC wall time, and a C<date> as
+midnight UTC that day, for every format but C<iso8601>. A null field is null
+in every format. The format is compiled into the SQL (see
+L<Selecto::Expression/datetime_format>). Any other value, an empty one or a
+repeated one is C<invalid_api_query> with C<< {parameter => 'date_format'} >>.
+There is no C<raw> format: API responses carry canonical JSON, and a
+driver's own timestamp text differs between runtimes and session settings.
+C<< Selecto::API::EngineHandler->resource_date_formats >> lists the values.
 
 Queries may select C<aggregate_version> (optionally C<< {field =>
 'aggregate_version', alias => NAME} >>) when a versioner is configured.

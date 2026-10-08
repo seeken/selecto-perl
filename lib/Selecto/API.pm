@@ -67,8 +67,10 @@ sub request ($self, $request, $handlers = {}) {
     my $path = $request->{path};
     my $body = $request->{body};
     my $route = $self->_route($method, $path);
-    $route->[1]{fields} = $request->{fields}
-        if ref($route) eq 'ARRAY' && $route->[0] eq 'resource' && defined $request->{fields};
+    if (ref($route) eq 'ARRAY' && $route->[0] eq 'resource') {
+        $route->[1]{fields} = $request->{fields} if defined $request->{fields};
+        $route->[1]{date_format} = $request->{date_format} if defined $request->{date_format};
+    }
     if ($route eq 'domain') {
         return _error_response(403, 'domain_publication_denied',
             'Full domain publication is not enabled for this request')
@@ -507,10 +509,21 @@ sub _openapi ($identity, $base_path, $resources = 0) {
                     in => 'query', name => 'fields', required => JSON::PP::false,
                     description => 'Comma-separated public scalar or to-one field paths. The primary '
                         . 'key is always returned. Request aggregate_version, when the domain '
-                        . 'publishes it, for the resource version and its ETag. Timestamps are '
-                        . 'returned in ISO 8601 format.',
+                        . 'publishes it, for the resource version and its ETag. Temporal fields '
+                        . 'are returned in the date_format.',
                     style => 'form', explode => JSON::PP::false,
                     schema => { type => 'array', items => { type => 'string' } },
+                },
+                {
+                    in => 'query', name => 'date_format', required => JSON::PP::false,
+                    description => 'Format of every temporal field, in UTC. iso8601 (default): '
+                        . 'YYYY-MM-DDTHH:MM:SSZ for instants, YYYY-MM-DDTHH:MM:SS for naive '
+                        . 'datetimes, YYYY-MM-DD for dates. rfc3339_millis: '
+                        . 'YYYY-MM-DDTHH:MM:SS.sssZ. epoch_seconds, epoch_milliseconds: integers '
+                        . 'since 1970-01-01T00:00:00Z, rounded down. Except under iso8601, a naive '
+                        . 'datetime is read as UTC and a date as midnight UTC. Null stays null.',
+                    schema => { type => 'string', enum => [qw(iso8601 rfc3339_millis epoch_seconds epoch_milliseconds)],
+                        default => 'iso8601' },
                 },
             ];
             $operation->{responses}{200}{headers} = {
@@ -615,7 +628,8 @@ Relative to C<base_path> (default C</api/v1/selecto>):
   POST /query           handlers->{query}
   POST /write           handlers->{write}
   POST /actions/NAME    handlers->{action}, with {action => NAME}
-  GET  /resources/ID    handlers->{resource}, with {id => ID, fields => ...}
+  GET  /resources/ID    handlers->{resource}, with {id => ID, fields => ...,
+                        date_format => ...}
                         (only when constructed with resources => 1)
 
 Unknown routes return 404 C<route_not_found>; a route without a handler
@@ -636,7 +650,11 @@ documents.
 
 C<< resources => 1 >> adds the C<getResource> route, C<GET .../resources/{id}>.
 Pass the request's C<fields> query parameter (a comma-separated string or an
-array) as C<fields> in L</request>; the handler receives it with the C<id>.
+array) as C<fields>, and its C<date_format> query parameter as C<date_format>,
+in L</request>; the handler receives them with the C<id>. C<date_format>
+(C<iso8601>, the default, C<rfc3339_millis>, C<epoch_seconds> or
+C<epoch_milliseconds>) formats every temporal field in UTC; see
+L<Selecto::API::EngineHandler/resource>.
 L<Selecto::API::EngineHandler/resource> implements the handler. When the
 resource's data has a scalar C<aggregate_version>, the response carries it,
 quoted, as its C<ETag>.

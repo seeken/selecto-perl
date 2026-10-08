@@ -45,6 +45,16 @@ Unreleased
       (t/canonical_values.integration.t checks a wide corpus under several
       DateStyle, TimeZone and extra_float_digits settings).
       canonical_sql => 0 decodes in Perl.
+    - getResource takes an optional date_format query parameter (iso8601,
+      the default and the previous output; rfc3339_millis; epoch_seconds;
+      epoch_milliseconds) that formats every temporal field in UTC,
+      compiled into the SQL through datetime_format. Under the non-default
+      formats a date is midnight UTC and a naive datetime is UTC wall time;
+      epochs round down; null stays null. Any other value is
+      invalid_api_query with details {parameter => 'date_format'} (public
+      error details may now carry parameter). Documented in the OpenAPI
+      document (an enum), Selecto::API and Selecto::API::EngineHandler;
+      EngineHandler->resource_date_formats lists the values.
     - Canonical direct associations infer tenant equality from both declared
       relation tenant fields, including nested edges, correlated collections,
       computed EXISTS and PostgreSQL lateral lookups. Explicit complete pairs
