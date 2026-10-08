@@ -332,18 +332,23 @@ sub _json_available {
 # This adapter-owned scalar function provides those semantics on every JSON1
 # provider, without relying on textual JSON equality or lossy SQL coercion.
 sub _json_contains_value {
-    my ($source, $needle) = @_;
+    my ($source, $needle, $nested) = @_;
+    # PostgreSQL jsonb permits only a root array to contain a primitive RHS.
+    # Recursive object members and array elements still require matching shapes.
+    if (!$nested && ref($source) eq 'ARRAY' && ref($needle) ne 'ARRAY' && ref($needle) ne 'HASH') {
+        return scalar(grep { _json_contains_value($_, $needle, 1) } @$source) ? 1 : 0;
+    }
     if (ref($needle) eq 'HASH') {
         return 0 unless ref($source) eq 'HASH';
         for my $key (keys %$needle) {
-            return 0 unless exists($source->{$key}) && _json_contains_value($source->{$key}, $needle->{$key});
+            return 0 unless exists($source->{$key}) && _json_contains_value($source->{$key}, $needle->{$key}, 1);
         }
         return 1;
     }
     if (ref($needle) eq 'ARRAY') {
         return 0 unless ref($source) eq 'ARRAY';
         for my $element (@$needle) {
-            return 0 unless grep { _json_contains_value($_, $element) } @$source;
+            return 0 unless grep { _json_contains_value($_, $element, 1) } @$source;
         }
         return 1;
     }
@@ -832,7 +837,9 @@ JSON extraction, recursive type-aware containment, JSON record rowsets and
 JSON-backed typed array predicates/rowsets probe the connected JSON1 functions.
 Containment preserves explicit null versus missing keys, booleans versus
 numbers, nested object subsets and array-element subsets. Empty objects and
-arrays match containers of their own type. Array ordinality is one-based.
+arrays match containers of their own type. A root array may contain a primitive
+right-hand value; that exception does not flatten nested arrays or object members.
+Repeated object keys use their final value during containment. Array ordinality is one-based.
 JSON rowset paths accept direct object/array paths, optionally ending in C<[*]>;
 other SQL/JSON path constructs fail closed.
 
