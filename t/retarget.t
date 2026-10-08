@@ -111,8 +111,8 @@ subtest 'compiled shape' => sub {
     my $sql = $statement->sql;
     like($sql, qr/\ASELECT .* FROM "orders" AS "s0" LEFT JOIN "products" AS "j_product"/,
         'the target is the root and its own associations join from it');
-    like($sql, qr/"s0"\."id" IN \(SELECT "j_attendees__orders"\."id" AS "attendees\.orders\.id" FROM "events" AS "r0" LEFT JOIN "attendees" AS "j_attendees" ON "r0"\."id" = "j_attendees"\."event_id" INNER JOIN "orders" AS "j_attendees__orders"/,
-        'the context selects the target key through the declared path');
+    like($sql, qr/"s0"\."id" IN \(SELECT "j_attendees__orders"\."id" AS "attendees\.orders\.id" FROM "events" AS "r0" LEFT JOIN "attendees" AS "j_attendees" ON "r0"\."id" = "j_attendees"\."event_id" AND "r0"\."tenant_id" = "j_attendees"\."tenant_id" INNER JOIN "orders" AS "j_attendees__orders" ON "j_attendees"\."id" = "j_attendees__orders"\."attendee_id" AND "j_attendees"\."tenant_id" = "j_attendees__orders"\."tenant_id"/,
+        'the context selects the target key through both declared tenant-scoped edges');
     like($sql, qr/WHERE \("s0"\."total" > \$1\) AND \("s0"\."id" IN \(.* WHERE "r0"\."region" = \$2\)\)/,
         'target filters and the context are both applied');
     like($sql, qr/ORDER BY "s0"\."total" DESC LIMIT 2\z/, 'ordering and pagination are kept');
