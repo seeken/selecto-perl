@@ -457,6 +457,40 @@ my $external = Selecto->adapter(postgresql => (
     dbh => $dbh, transaction_mode => 'external'));
 ```
 
+#### PostgreSQL result values
+
+**Breaking since 0.2.2:** the PostgreSQL adapter returns the values DBD::Pg
+fetched, untouched, unless you ask for *canonical values*. Ask per call or
+for the whole adapter:
+
+```perl
+my $rows = $engine->all($query, canonical_values => 1)->{rows};   # one read
+my $stream = $engine->stream($query, canonical_values => 1);
+
+my $adapter = Selecto->adapter(postgresql => (
+    dbh => $dbh,
+    canonical_values => 1,   # every read, as before 0.2.2; a call may pass 0
+));
+```
+
+| PostgreSQL type | Driver value (default, DBD::Pg 3) | Canonical value |
+| --- | --- | --- |
+| `smallint`, `integer`, `bigint` | Perl number, `42` | the same |
+| `boolean` | `1` / `0` | the same |
+| `numeric` | string at the column scale, `"10.500"`, `"7152.00"` | string without trailing zeros, `"10.5"`, `"7152"` |
+| `real`, `double precision` | Perl number (a JSON number), `1.5`, `1e+10` | its Perl string (a JSON string), `"1.5"`, `"10000000000"`, `"Inf"` |
+| `timestamp` | `"2024-01-01 10:00:00"` | `"2024-01-01T10:00:00"` |
+| `timestamptz` | server text, `"2024-01-01 10:00:00+00"` | `"2024-01-01T10:00:00"` (a zero offset is removed; other offsets kept) |
+| text, `date`, `json`/`jsonb` (text), arrays, others | unchanged | unchanged |
+
+The API handler (`Selecto::API::EngineHandler`), canned pages, co-domain
+lookups and `export_scalars` ask for canonical values themselves, so their
+JSON is unchanged. On PostgreSQL 13 and newer, results of a few hundred rows
+or more get their canonical numeric and timestamp values from the SQL itself
+(identical values, less Perl work); set
+`canonical_sql => 0` to decode them in Perl. See `perldoc Selecto::PostgreSQL`
+(RESULT VALUES). The other adapters always return canonical values.
+
 #### PostgreSQL statement cache (opt-in)
 
 By default every query and write prepares a new statement handle, which

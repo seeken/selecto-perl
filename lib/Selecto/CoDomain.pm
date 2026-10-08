@@ -117,7 +117,7 @@ sub lookup {
     }
     $query = $query->limit($limit);
 
-    my $raw = $engine->all($query);
+    my $raw = $engine->all($query, canonical_values => 1);
     Selecto::Error->throw('invalid_co_domain_result', 'adapter returned an invalid lookup result')
         unless ref($raw) eq 'HASH' && ref($raw->{rows}) eq 'ARRAY';
     my @description_fields = @{$result->{description_fields} // []};

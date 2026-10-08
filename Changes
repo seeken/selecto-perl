@@ -9,6 +9,42 @@ Unreleased
     - Canned detail views may select an aliased datetime_format of an
       entity-grain field, and related collections may format a child date
       with {key, expression}. The formatted field joins the detail GROUP BY.
+    - Breaking: Selecto::PostgreSQL returns the values DBD::Pg fetched,
+      untouched, unless canonical values are asked for. Engine::all,
+      Engine::stream (bounded too) and Engine::projection_sum take
+      canonical_values => 1 per call, and the adapter takes
+      canonical_values => 1 (default 0) to make them the default again
+      (a call's canonical_values => 0 then asks for driver values). What a
+      host that does not ask sees, per PostgreSQL type (DBD::Pg 3): numeric
+      keeps its scale ("10.500", not "10.5"); real and
+      double precision are Perl numbers, so JSON numbers (1.5, 1e+20),
+      instead of their Perl strings ("1.5", "1e+20", "10000000000",
+      "Inf"); timestamp and timestamptz keep the server text
+      ("2024-01-01 10:00:00+00" or "2024-01-01 04:00:00-06" under the
+      session TimeZone, not "2024-01-01T10:00:00"); integers and booleans
+      (already numbers and 1/0), text, date, json text and the rest are
+      unchanged. To keep the old behaviour:
+          Selecto->adapter(postgresql => (dbh => $dbh, canonical_values => 1));
+      or $engine->all($query, canonical_values => 1). The API query and
+      resource handlers, canned pages, co-domain lookups and export_scalars
+      ask for canonical values, so their responses are unchanged. Other
+      adapters always return canonical values. A Selecto::PostgreSQL
+      subclass that overrides execute_query is not sent the option unless
+      its supports('canonical_values') is true.
+    - Canonical PostgreSQL values are formatted in SQL for large results.
+      After a statement's first canonical run on a handle (decoded in
+      Perl, which records the result column types), a run that follows one
+      returning at least 256 rows wraps each top-level numeric (PostgreSQL
+      13+, via trim_scale), timestamp and timestamptz selection in SQL
+      that turns the type's own output text into the canonical text,
+      guarded by pg_typeof so a changed type falls back to Perl. Floats,
+      integers and booleans stay in Perl (DBD::Pg returns them as Perl
+      numbers, whose canonical text SQL cannot reproduce). Only the
+      outermost select list changes; ORDER BY and GROUP BY still use the
+      underlying values. Values are identical to the Perl decode
+      (t/canonical_values.integration.t checks a wide corpus under several
+      DateStyle, TimeZone and extra_float_digits settings).
+      canonical_sql => 0 decodes in Perl.
     - Canonical direct associations infer tenant equality from both declared
       relation tenant fields, including nested edges, correlated collections,
       computed EXISTS and PostgreSQL lateral lookups. Explicit complete pairs

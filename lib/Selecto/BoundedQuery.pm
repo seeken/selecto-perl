@@ -98,7 +98,9 @@ sub execute {
     my $budget = $class->result_budget($limits);
     my $ok = eval {
         $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
-        $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows));
+        $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows),
+            exists($args{canonical_values}) && $adapter->supports('canonical_values')
+                ? (canonical_values => $args{canonical_values} ? 1 : 0) : ());
         while (my $row = $stream->next) {
             $deadline->check(defer_rearm => 1);
             Selecto::Error->throw('result_limit_exceeded', 'Result exceeds its transfer limit')
@@ -219,6 +221,10 @@ larger than the trusted byte ceiling before it reaches DBI, and mark the row
 for rejection. C<max_rows + 1> detects excess rows; excess children or bytes
 raise an error, never a successful truncated result. Advanced query-source
 shapes and nested collections on unsupported adapters fail closed.
+
+Rows hold the adapter's default result values; pass
+C<< canonical_values => 1 >> to C<all> or C<execute> for canonical values
+(see L<Selecto::PostgreSQL/RESULT VALUES>). L<Selecto::CannedPage> does.
 
 The result walker checks cumulative cells, child counts, UTF-8 bytes, nodes,
 depth and cycles. This bounds application transfer/materialization; it is not

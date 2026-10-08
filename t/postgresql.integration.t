@@ -380,7 +380,7 @@ my $typed_values_domain = Selecto::Domain->parse({
     joins => {kind_labels => {type => 'left', name => 'Kind labels'}},
 }, strict => 1);
 my $typed_values_engine = Selecto::Engine->new(
-    domain => $typed_values_domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+    domain => $typed_values_domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh, canonical_values => 1)),
 );
 $dbh->do(q{INSERT INTO selecto_perl_test_events VALUES (2, 1, 'note')});
 my $typed_values = $typed_values_engine->all($typed_values_engine->query->select(
@@ -438,7 +438,7 @@ my $value_domain = Selecto::Domain->parse({
     joins => {site => {type => 'left'}},
 });
 my $value_engine = Selecto::Engine->new(
-    domain => $value_domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+    domain => $value_domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh, canonical_values => 1)),
 );
 my $value_rows = $value_engine->all($value_engine->query
     ->select(qw(id effective_location attention_state rate_dollars manufacturer))->order_by('id'));

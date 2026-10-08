@@ -86,6 +86,8 @@ t/api_through_association_parity_live.t
 t/api_write_parity_live.t
 t/array_json.t
 t/canned_page.integration.t
+t/canonical_values.t
+t/canonical_values.integration.t
 t/canned_page_case_insensitive.t
 t/canned_page_redaction.t
 t/co_domain.t

@@ -192,9 +192,12 @@ An identifier for the SQL dialect, usually the class name.
 Returns a L<Selecto::Statement>. The root relation always comes from the
 domain; queries never name a table.
 
-=item C<execute_query($statement)>
+=item C<execute_query($statement, %options)>
 
-Returns C<< {columns => [...], rows => [[...], ...]} >>.
+Returns C<< {columns => [...], rows => [[...], ...]} >>. Engines pass
+C<< canonical_values => 1 >> when the caller asks for canonical values and
+C<< export_scalars => 1 >> for export scalars; an adapter that always
+returns canonical values may ignore the first.
 
 =item C<preview_write($command)>
 

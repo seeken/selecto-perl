@@ -396,8 +396,9 @@ sub run {
     my $query_started = time;
     _fail('execution options must be an object') if defined($execution_options) && ref($execution_options) ne 'HASH';
     my $run = sub {
-        return $execution_options ? Selecto::BoundedQuery->all($engine, $_[0], %$execution_options)
-            : $engine->all($_[0]);
+        return $execution_options
+            ? Selecto::BoundedQuery->all($engine, $_[0], %$execution_options, canonical_values => 1)
+            : $engine->all($_[0], canonical_values => 1);
     };
     my $rows = $run->($plan->{query});
     my $has_more = @{$rows->{rows}} > $plan->{state}{limit} ? 1 : 0;
