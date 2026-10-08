@@ -1,6 +1,21 @@
 Revision history for Selecto
 
 Unreleased
+    - Canonical direct associations infer tenant equality from both declared
+      relation tenant fields, including nested edges, correlated collections,
+      computed EXISTS and PostgreSQL lateral lookups. Explicit complete pairs
+      retain precedence; either partial pair is invalid_domain. Tenantless
+      targets, legacy explicit scope and through contracts retain their policy.
+    - Explicit hidden column metadata now withholds the field from every
+      public surface using Domain::field_is_public, matching internal and
+      redacted fields. API query roles and named routes refuse hidden_field
+      (403), while trusted Engine reads remain available.
+    - Public API queries enforce explicit filterable/sortable field roles on
+      direct intent and named query-library routes, with invalid_field (422).
+      Optional bounded group_by enforces public/groupable fields and refuses
+      nongrouped selections or orderings before database execution.
+    - Public API query pages publish has_more from one extra fetched row and
+      return at most the requested limit. Zero-sized pages fetch no rows.
     - Selecto::API serves GET .../resources/{id} (getResource) when constructed
       with resources => 1; a resource's aggregate_version is its ETag, and
       resource_not_found maps to 404.

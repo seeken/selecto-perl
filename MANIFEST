@@ -16,6 +16,7 @@ lib/Selecto/Analytics/TransformRegistry.pm
 lib/Selecto/Analytics/UnitRegistry.pm
 lib/Selecto/API.pm
 lib/Selecto/API/EngineHandler.pm
+t/api_field_roles_adversarial.t
 lib/Selecto/API/ResultFormatter.pm
 lib/Selecto/CannedPage.pm
 lib/Selecto/CoDomain.pm
@@ -94,6 +95,7 @@ t/decode_rows.t
 t/decode_rows_wide.t
 t/document_contract.t
 t/domain.t
+t/direct_join_tenant_inference.t
 t/domain_overlay.t
 t/domain_registry.t
 t/duckdb.integration.t
