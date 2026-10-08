@@ -21,7 +21,9 @@ BEGIN {
 # Result values are the driver's unless canonical values are asked for: see
 # RESULT VALUES below.
 has canonical_values => 0;
-has canonical_sql => 1;
+# Canonical values are decoded in Perl unless canonical_sql => 1 asks
+# PostgreSQL to format them: see Canonical values in SQL.
+has canonical_sql => 0;
 # Each compiled statement's outermost SELECT list: see Canonical values in SQL.
 Hash::Util::FieldHash::fieldhash(my %PROJECTION);
 # Opt-in, off by default: see STATEMENT CACHE below.
@@ -264,7 +266,8 @@ sub execute_query {
 
 # ---- Canonical values in SQL ------------------------------------------------
 #
-# When canonical values are asked for, each top-level selection of a plain
+# Opt-in (canonical_sql => 1; by default canonical values are decoded in
+# Perl). When canonical values are asked for, each top-level selection of a plain
 # stored field whose declared domain type is decimal, date, naive_datetime or
 # utc_datetime is formatted by PostgreSQL in the outermost SELECT list (the
 # declared type is the source the datetime_format compilers use too). The
@@ -303,7 +306,9 @@ my %CANONICAL_KIND = (decimal => 'numeric', date => 'date', naive_datetime => 'd
 # fields have none).
 sub _canonical_kind {
     my ($self, $domain, $selection) = @_;
-    return undef unless $selection->kind eq 'field' && ref($self->{_field_types}) eq 'HASH';
+    # Without canonical_sql nothing is formatted, so compile records nothing.
+    return undef unless $self->canonical_sql
+        && $selection->kind eq 'field' && ref($self->{_field_types}) eq 'HASH';
     my $type = $self->{_field_types}{$selection->arguments->[0]};
     return defined($type) && !ref($type) ? $CANONICAL_KIND{$type} : undef;
 }
@@ -1063,7 +1068,7 @@ Selecto::PostgreSQL - PostgreSQL adapter
       statement_cache  => 1,           # opt-in, default 0; see below
       statement_cache_size => 256,     # handles kept per connection
       canonical_values => 1,           # default 0: driver values; see RESULT VALUES
-      canonical_sql    => 1,           # default 1: format canonical values in SQL
+      canonical_sql    => 0,           # default 0: decode canonical values in Perl
   ));
 
   # Or per call:
@@ -1134,32 +1139,40 @@ driver value.
 
 =back
 
-Canonical dates and timestamps of fields formatted in SQL (below) are always
-the ISO form, whatever the session C<DateStyle>; up to 0.2.2 they followed a
-non-ISO C<DateStyle> (C<SQL>, C<Postgres>, C<German>). Under the default
-C<ISO> they are the same.
+By default (C<< canonical_sql => 0 >>) canonical values are decoded in Perl
+from the driver's values and result types, exactly as up to 0.2.2. Dates and
+timestamps are therefore the session C<DateStyle>'s text: under the default
+C<ISO> they are the forms above, and under a non-ISO C<DateStyle> (C<SQL>,
+C<Postgres>, C<German>) that style shows through, as it always has.
 
-With C<< canonical_sql => 1 >> (the default) PostgreSQL formats them itself:
-each top-level selection of a stored field whose declared domain type is
-C<decimal>, C<date>, C<naive_datetime> or C<utc_datetime> is wrapped, in the
-outermost select list only, in SQL that gives the canonical text. The
+=head2 Canonical values in SQL (opt-in)
+
+With C<< canonical_sql => 1 >> PostgreSQL formats some canonical values
+itself, and their dates and timestamps are always the ISO form, whatever the
+session C<DateStyle> (under C<ISO> the values are the same as the Perl
+decode's). It is off by default because the Perl decode measured faster at
+every result size (100,000 rows: about 154 ms in Perl against 213 ms in SQL),
+and the longer statement costs every small query its parse and plan time. With
+it on, each top-level selection of a stored field whose declared domain type
+is C<decimal>, C<date>, C<naive_datetime> or C<utc_datetime> is wrapped, in
+the outermost select list only, in SQL that gives the canonical text. The
 declared type chooses the columns and the formatters that may apply; the
 column's PostgreSQL type picks one (C<CASE> on C<pg_typeof> of a constant, so
 the value is not evaluated for it): C<CAST(trim_scale(x) AS TEXT)> for
 C<numeric> (PostgreSQL 13 and newer; on 12 decimal fields stay in Perl), and
-C<TO_CHAR> for C<date>, C<timestamp> and C<timestamptz> (with
-C<TO_CHAR(x, 'OF')> for the offset, and the offset's seconds, which C<OF>
-omits, for values before 1972). So a timestamptz declared C<naive_datetime>,
-a C<utc_datetime> localized by a query timezone or stored C<naive_utc> (or
-without the hint), and a C<date> column declared as a datetime come out as
-before. A column of any other type is its PostgreSQL text: exact for text
-columns (a date or decimal kept in a C<VARCHAR>); a C<timestamp> declared
-C<date> is its server text (C<2024-01-01 10:00:00>); a C<real> or
-C<double precision> column declared C<decimal> is the server's text
-(C<1e+20>, C<Infinity>) rather than its Perl string (C<1e+20>, C<Inf>), and an
-C<integer> column declared C<decimal> is a string (C<"7">) rather than a
-number. A date or datetime field must be a column PostgreSQL can cast to
-C<date>, C<timestamp> and C<timestamptz> (a date, timestamp or text type).
+C<TO_CHAR> for C<date>, C<timestamp> and C<timestamptz> (with C<TO_CHAR(x,
+'OF')> for the offset, and the offset's seconds, which C<OF> omits, for values
+before 1972). So a timestamptz declared C<naive_datetime>, a C<utc_datetime>
+localized by a query timezone or stored C<naive_utc> (or without the hint),
+and a C<date> column declared as a datetime come out as before. A column of
+any other type is its PostgreSQL text: exact for text columns (a date or
+decimal kept in a C<VARCHAR>); a C<timestamp> declared C<date> is its server
+text (C<2024-01-01 10:00:00>); a C<real> or C<double precision> column
+declared C<decimal> is the server's text (C<1e+20>, C<Infinity>) rather than
+its Perl string (C<1e+20>, C<Inf>), and an C<integer> column declared
+C<decimal> is a string (C<"7">) rather than a number. A date or datetime field
+must be a column PostgreSQL can cast to C<date>, C<timestamp> and
+C<timestamptz> (a date, timestamp or text type).
 
 The formatted statement is longer: PostgreSQL parses and plans each datetime
 column's formatter in roughly 30 to 50 microseconds, a date's or decimal's in
@@ -1168,15 +1181,16 @@ call without the statement cache (see L</statement_cache>), and only once per
 connection and SQL text with it. Per row, C<TO_CHAR> costs PostgreSQL about
 0.2 (date) to 0.6 (timestamptz) microseconds.
 
-Perl decodes every other column from its PostgreSQL result type: integers,
-booleans and floats (whose canonical form is Perl's own number formatting,
-which SQL cannot reproduce), aggregates and other expressions, computed
-fields, and every column of an ordered rollup, a set operation or a statement
-built outside C<compile>. ORDER BY, GROUP BY, window functions and pagination
-use the underlying values, never output names or positions. Streams, bounded
-streams and L<Selecto::BoundedQuery> format the same columns.
-C<< canonical_sql => 0 >> decodes every canonical value in Perl, from the
-result types.
+With C<< canonical_sql => 1 >>, Perl decodes every other column from its
+PostgreSQL result type: integers, booleans and floats (whose canonical form is
+Perl's own number formatting, which SQL cannot reproduce), aggregates and
+other expressions, computed fields, and every column of an ordered rollup, a
+set operation or a statement built outside C<compile>. ORDER BY, GROUP BY,
+window functions and pagination use the underlying values, never output names
+or positions. Streams, bounded streams and L<Selecto::BoundedQuery> format the
+same columns. With the default C<< canonical_sql => 0 >> every canonical value
+is decoded in Perl, from the result types, and compile records nothing for
+formatting.
 
 =head2 Moving from 0.2.2
 
@@ -1228,9 +1242,10 @@ L</RESULT VALUES>.
 
 =head2 canonical_sql
 
-C<1> (the default): canonical decimal, date and timestamp fields are formatted
-by PostgreSQL (see L</RESULT VALUES>). C<0>: every canonical value is decoded
-in Perl from the result types.
+C<0> (the default): every canonical value is decoded in Perl from the result
+types, and dates and timestamps follow the session C<DateStyle>. C<1>
+(opt-in): canonical decimal, date and timestamp fields are formatted by
+PostgreSQL, always in the ISO form (see L</Canonical values in SQL (opt-in)>).
 
 =head2 statement_cache
 

@@ -486,12 +486,16 @@ my $adapter = Selecto->adapter(postgresql => (
 
 The API handler (`Selecto::API::EngineHandler`), canned pages, co-domain
 lookups and `export_scalars` ask for canonical values themselves, so their
-JSON is unchanged under the default ISO `DateStyle`. PostgreSQL formats the
-canonical values of fields declared `decimal` (PostgreSQL 13 and newer),
-`date`, `naive_datetime` and `utc_datetime` in the outermost select list with
-`trim_scale` and `TO_CHAR` (chosen by the column's actual type), so they are
-always ISO, whatever the session `DateStyle`; the rest is decoded in Perl. Set `canonical_sql => 0` to decode
-everything in Perl. See `perldoc Selecto::PostgreSQL` (RESULT VALUES). The
+JSON is unchanged. Canonical values are decoded in Perl by default, exactly
+as before: dates and timestamps follow the session `DateStyle`, so a non-ISO
+`DateStyle` (`SQL`, `Postgres`, `German`) shows through as it always has.
+`canonical_sql => 1` (opt-in, default 0) has PostgreSQL format the canonical
+values of fields declared `decimal` (PostgreSQL 13 and newer), `date`,
+`naive_datetime` and `utc_datetime` in the outermost select list with
+`trim_scale` and `TO_CHAR` (chosen by the column's actual type); those are
+always ISO, whatever the session `DateStyle`, and the rest is decoded in
+Perl. The Perl decode measured faster at every result size, so the SQL path
+is off by default. See `perldoc Selecto::PostgreSQL` (RESULT VALUES). The
 other adapters always return canonical values.
 
 #### PostgreSQL statement cache (opt-in)

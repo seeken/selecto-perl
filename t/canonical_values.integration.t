@@ -11,6 +11,8 @@ use TestSelecto;
 use Selecto;
 use Selecto::PostgreSQL ();
 
+# Canonical values are decoded in Perl by default (canonical_sql => 0); the
+# opt-in canonical_sql => 1 formats some of them in SQL. Both paths run here.
 # Canonical values formatted in SQL must be exactly the values the Perl
 # decode makes from the driver's text: same definedness, same string, same
 # Perl number/string/UTF-8 flags and the same JSON, for a wide corpus of
@@ -114,9 +116,10 @@ sub engine_for {
     return Selecto::Engine->new(domain => $domain,
         adapter => Selecto->adapter(postgresql => (dbh => $handle, %attributes)));
 }
-my $sql_engine = engine_for($dbh, canonical_values => 1);
-my $perl_engine = engine_for($dbh, canonical_values => 1, canonical_sql => 0);
+my $sql_engine = engine_for($dbh, canonical_values => 1, canonical_sql => 1);
+my $perl_engine = engine_for($dbh, canonical_values => 1);   # the default: decoded in Perl
 my $raw_engine = engine_for($dbh);
+my $raw_sql_engine = engine_for($dbh, canonical_sql => 1);
 my $FORMATTED = qr/pg_catalog\.(?:to_char|trim_scale)\(/;
 
 my @columns = qw(id grp n n4 n0 f4 f8 ts tstz d b i8);
@@ -258,14 +261,27 @@ subtest 'streams' => sub {
     same_rows($collect->($raw_engine->stream($query)), $raw_engine->all($query)->{rows}, 'a stream holds driver values by default');
     same_rows($collect->($raw_engine->stream($query, bounded => 1, fetch_size => 7)),
         $raw_engine->all($query)->{rows}, 'a bounded stream holds driver values by default');
-    # Under a non-ISO DateStyle only SQL formatting gives ISO dates.
-    $dbh->do(q{SET DateStyle = 'German, DMY'});
     same_rows($collect->($raw_engine->stream($query, canonical_values => 1)), $expected,
-        'canonical_values => 1 streams canonical values, formatted in SQL');
+        'canonical_values => 1 streams canonical values, decoded in Perl by default');
+    unlike($dbh->{Statement}, $FORMATTED, 'from the unformatted statement');
     same_rows($collect->($raw_engine->stream($query, bounded => 1, fetch_size => 7, canonical_values => 1)),
         $expected, 'and so does a bounded stream');
     require Selecto::BoundedQuery;
-    my $bounded = Selecto::BoundedQuery->all($raw_engine, $query, max_rows => 1000, max_cell_bytes => 1000,
+    same_rows(Selecto::BoundedQuery->all($raw_engine, $query, max_rows => 1000, max_cell_bytes => 1000,
+        canonical_values => 1)->{rows}, $expected, 'and BoundedQuery');
+    # Under a non-ISO DateStyle the Perl decode shows the session style, as it
+    # always has; only SQL formatting gives ISO dates.
+    $dbh->do(q{SET DateStyle = 'German, DMY'});
+    my $german = $perl_engine->all($query)->{rows};
+    ok((grep { defined($_->[9]) && $_->[9] =~ /\A\d\d\.\d\d\.\d{4}/ } @$german),
+        'the default canonical dates follow a German DateStyle');
+    same_rows($collect->($raw_engine->stream($query, canonical_values => 1)), $german,
+        'a canonical stream decoded in Perl follows the session DateStyle');
+    same_rows($collect->($raw_sql_engine->stream($query, canonical_values => 1)), $expected,
+        'with canonical_sql => 1 canonical_values => 1 streams canonical values, formatted in SQL');
+    same_rows($collect->($raw_sql_engine->stream($query, bounded => 1, fetch_size => 7, canonical_values => 1)),
+        $expected, 'and so does a bounded stream');
+    my $bounded = Selecto::BoundedQuery->all($raw_sql_engine, $query, max_rows => 1000, max_cell_bytes => 1000,
         canonical_values => 1);
     same_rows($bounded->{rows}, $expected, 'and BoundedQuery');
     $dbh->do('RESET DateStyle');
@@ -273,10 +289,12 @@ subtest 'streams' => sub {
 
 subtest 'statement cache' => sub {
     my $cached = connect_db();
-    my $engine = engine_for($cached, canonical_values => 1, statement_cache => 1);
+    my $engine = engine_for($cached, canonical_values => 1, statement_cache => 1, canonical_sql => 1);
+    my $perl = engine_for($cached, canonical_values => 1, statement_cache => 1);
     for my $name (qw(all_columns grouped timezone)) {
         my $expected = $perl_engine->all($queries{$name})->{rows};
-        same_rows($engine->all($queries{$name})->{rows}, $expected, "$name, run $_") for 1 .. 3;
+        same_rows($engine->all($queries{$name})->{rows}, $expected, "$name, run $_ (SQL)") for 1 .. 3;
+        same_rows($perl->all($queries{$name})->{rows}, $expected, "$name, run $_ (Perl)") for 1 .. 3;
     }
     $cached->disconnect;
 };
@@ -300,7 +318,7 @@ subtest 'declared types' => sub {
     my $make = sub {
         my (%attributes) = @_;
         return Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $handle, canonical_values => 1,
-            %attributes)), domain => TestSelecto::writable_domain(name => 'Declared', table => $other,
+            canonical_sql => 1, %attributes)), domain => TestSelecto::writable_domain(name => 'Declared', table => $other,
             fields => {id => 'integer', money => 'decimal', naive => 'utc_datetime', naive_utc => 'utc_datetime',
                 aware => 'naive_datetime', day => 'utc_datetime', text_day => 'date', text_amount => 'decimal',
                 f8 => 'decimal', i4 => 'decimal'}));
@@ -330,10 +348,17 @@ subtest 'declared types' => sub {
     $handle->disconnect;
 };
 
-subtest 'formatting can be turned off and is version-gated' => sub {
+subtest 'formatting is opt-in and version-gated' => sub {
     my $query = $queries{numeric_order};
     $perl_engine->all($query);
-    unlike($dbh->{Statement}, $FORMATTED, 'canonical_sql => 0 decodes in Perl');
+    unlike($dbh->{Statement}, $FORMATTED, 'by default canonical values are decoded in Perl');
+    is($perl_engine->adapter->canonical_sql, 0, 'canonical_sql is 0 by default');
+    is_deeply([$perl_engine->adapter->_canonical_columns($perl_engine->compile($queries{all_columns}))], [],
+        'and nothing is formatted');
+    $raw_sql_engine->all($query, canonical_values => 1);
+    like($dbh->{Statement}, $FORMATTED, 'canonical_sql => 1 formats in SQL');
+    $raw_sql_engine->all($query);
+    unlike($dbh->{Statement}, $FORMATTED, 'only when canonical values are asked for');
     my $statement = $sql_engine->compile($queries{all_columns});
     is_deeply([$sql_engine->adapter->_canonical_columns($statement)], [2, 3, 4, 7, 8, 9],
         'numeric, timestamp, timestamptz and date columns are formatted');
