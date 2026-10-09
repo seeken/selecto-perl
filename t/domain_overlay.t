@@ -43,6 +43,7 @@ my $overlay_one = Selecto::Domain::DSL->define(sub {
         ->filter(status => {label => 'Order Status'})
         ->write_operation(update => {enabled => JSON::PP::true})
         ->write_field(status => {updatable => JSON::PP::true})
+        ->query_segment(open => {filters => [['eq','status','open']]})
         ->query_view(open_orders => {segments => ['open']})
         ->component(query_params => JSON::PP::true)
         ->capability(export => {description => 'Export visible orders'})
@@ -173,5 +174,8 @@ eval {
 } or $error = $@;
 isa_ok($error, 'Selecto::Error', 'invalid composed domain is typed');
 is($error->code, 'invalid_domain', 'composition validates the final domain fail closed');
+
+eval { Selecto::Domain->compose(base_contract(), {query_library => {views => {missing => {segments => ['undeclared']}}}}) } or $error = $@;
+is($error->code, 'invalid_query_library', 'composition refuses unresolved named query definitions');
 
 done_testing;

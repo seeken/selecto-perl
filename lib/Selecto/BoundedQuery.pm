@@ -18,6 +18,8 @@ sub prepare {
     my $limits = _limits($engine, $args{limits});
     my $adapter = $engine->adapter;
     _capabilities($adapter);
+    require Selecto::QueryPolicy;
+    $query = Selecto::QueryPolicy->apply($engine->read_domain, $query, $limits);
     Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query')->check_tree($query,
         allowed_classes => ['Selecto::Query', 'Selecto::Expression'], label => 'Bounded query');
     my %top = map { refaddr($_) => 1 } @{$query->selections};
