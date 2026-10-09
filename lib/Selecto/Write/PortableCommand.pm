@@ -4,9 +4,16 @@ use 5.034;
 use strict;
 use warnings;
 no overloading;
-use Scalar::Util qw(blessed reftype);
+use Scalar::Util qw(blessed reftype refaddr);
+use Hash::Util::FieldHash qw(fieldhash);
+use Digest::SHA ();
+use B ();
+use bytes ();
+use POSIX ();
+use Encode qw(encode_utf8);
 use JSON::PP ();
 use Selecto::Error ();
+use Selecto::Limits ();
 use Selecto::Domain::QueryContract ();
 use Selecto::Domain::WriteContract ();
 use Selecto::Expression ();
@@ -15,6 +22,180 @@ use Selecto::Write::Operation ();
 use Selecto::Write::Policy ();
 use Selecto::Write::ConflictTarget ();
 use Selecto::Write::QueryEnforcement ();
+
+# Only successful compiler calls issue these receipts. Neither serialized
+# metadata nor a reconstructed Command carries accepted INPUT evidence.
+fieldhash my %ACCEPTED_INPUT;
+fieldhash my %ACCEPTED_GRAPHS;
+fieldhash my %INPUT_PROOFS;
+my $RECEIPT_LIMITS = Selecto::Limits->new;
+my %RECEIPT_CLASSES = map { $_ => 1 } qw(Selecto::Write::Command
+    Selecto::Write::Graph Selecto::Expression Selecto::Write::Expression
+    Selecto::QueryEnforcement Selecto::Limits);
+sub _input_mismatch { _fail('compiled_input_mismatch', 'compiled INPUT evidence differs from its original subject or host',
+    defined($_[0]) ? {reason => $_[0]} : {}); }
+
+# Inspect native records directly, before accessors, cloning or encoding. This
+# bounded identity includes all fields and preserves scalar numeric/text kinds.
+sub _receipt_digest {
+    _input_mismatch() if grep { defined(tied($_[$_])) } 0..$#_;
+    my ($value) = @_;
+    my $hash = Digest::SHA->new(256);
+    my ($nodes, $bytes) = (0, 0);
+    my %active;
+    my $part = sub {
+        my ($tag, $text) = @_;
+        my $wire = utf8::is_utf8($text) ? encode_utf8($text) : $text;
+        _input_mismatch() if ($bytes += bytes::length($wire)) > $RECEIPT_LIMITS->get('max_response_bytes');
+        $hash->add($tag, pack('N', bytes::length($wire)), $wire);
+    };
+    my $walk;
+    $walk = sub {
+        my ($node, $depth) = @_;
+        _input_mismatch() if ++$nodes > $RECEIPT_LIMITS->get('max_response_nodes')
+            || $depth > $RECEIPT_LIMITS->get('max_expression_depth');
+        my $type = reftype($node);
+        unless (defined $type) {
+            return $part->('U', '') unless defined $node;
+            return $part->('B', $node ? '1' : '0') if JSON::PP::is_bool($node);
+            my $flags = B::svref_2object(\$node)->FLAGS;
+            # Public string identity survives numeric observations (fPOK),
+            # while a numeric scalar's private string cache (pPOK) does not
+            # turn it into authored text during ordinary cardinality checks.
+            my $kind = $flags & B::SVf_POK() ? 'S' : $flags & B::SVf_IOK() ? 'I' : 'N';
+            if ($kind eq 'N') {
+                _input_mismatch() unless POSIX::isfinite($node);
+                # Default NV stringification rounds distinct delivered values
+                # to the same text. F uses this Perl build's actual NV format.
+                return $part->('N', pack('F', $node));
+            }
+            return $part->($kind . (utf8::is_utf8($node) ? 'u' : 'b'), "$node");
+        }
+        my $class = blessed($node) // '';
+        if ($class eq 'JSON::PP::Boolean') {
+            _input_mismatch() unless $type eq 'SCALAR' && !defined(tied($$node));
+            _input_mismatch() if !defined($$node) || defined(reftype($$node)) || "$$node" !~ /\A[01]\z/;
+            return $part->('B', $$node ? '1' : '0');
+        }
+        _input_mismatch() if length($class) && !$RECEIPT_CLASSES{$class};
+        _input_mismatch() unless $type eq 'HASH' || $type eq 'ARRAY';
+        _input_mismatch() if $type eq 'HASH' ? defined(tied(%$node)) : defined(tied(@$node));
+        my $address = refaddr($node);
+        _input_mismatch() if $active{$address};
+        local $active{$address} = 1;
+        my $count = $type eq 'HASH' ? scalar(keys %$node) : scalar(@$node);
+        _input_mismatch() if $nodes + $count > $RECEIPT_LIMITS->get('max_response_nodes');
+        $part->('C', $class);$part->($type eq 'HASH' ? 'H' : 'A', "$count");
+        if ($type eq 'HASH') {
+            for my $key (sort keys %$node) {
+                _input_mismatch() if defined(tied($node->{$key}));
+                $part->(utf8::is_utf8($key) ? 'Ku' : 'Kb', $key);$walk->($node->{$key}, $depth + 1);
+            }
+        } else {
+            for my $index (0..$#$node) {
+                _input_mismatch() if defined(tied($node->[$index]));
+                $walk->($node->[$index], $depth + 1);
+            }
+        }
+        $part->('E', '');
+    };
+    $walk->($value, 0);
+    return $hash->hexdigest;
+}
+sub _submitted_identity {
+    my ($command, $record) = @_;
+    my $assignments=$command->assignments;
+    # Fresh host governance may replace a context-owned literal wrapper with
+    # its actual scalar. This identity is only for that submitted-value phase;
+    # the original receipt separately binds the complete command and wrappers.
+    for my $field (keys %$assignments) {
+        my $value=$assignments->{$field};
+        $assignments->{$field}=$value->arguments->[0]
+            if ref($value) eq 'Selecto::Write::Expression' && $value->kind eq 'literal';
+    }
+    # Scope independently replaces this declared, compiler-generated value
+    # with the host tenant. A prior harmless string observation can leave the
+    # generated scalar as text; preserve Scope's existing comparison only for
+    # this known tenant fill, after exact host context matching at reuse.
+    my $field=$record->{tenant_field};
+    if (defined($field) && $command->operation =~ /\A(?:insert|upsert)\z/
+            && exists($assignments->{$field}) && defined($record->{context}{tenant_id})) {
+        my $value=$assignments->{$field};
+        my $tenant=$record->{context}{tenant_id};
+        _input_mismatch('submitted_changed') unless defined($value) && !ref($value) && "$value" eq "$tenant";
+        $assignments->{$field}=$tenant;
+    }
+    return _receipt_digest({operation=>$command->operation,relation=>$command->relation,assignments=>$assignments});
+}
+my $issue_input = sub {
+    my ($command, $record) = @_;
+    my $token = bless \(my $identity = 0), 'Selecto::Write::PortableCommand::_InputProof';
+    $INPUT_PROOFS{$token} = {%$record, submitted => _submitted_identity($command, $record)};
+    $ACCEPTED_INPUT{$command} = {digest => _receipt_digest($command), proof => $token};
+};
+sub _accepted_input {
+    my ($class, $command) = @_;
+    my $record = ref($command) ? $ACCEPTED_INPUT{$command} : undef;
+    return undef unless $record;
+    _input_mismatch('command_changed') unless $record->{digest} eq _receipt_digest($command);
+    return $record->{proof};
+}
+sub _reuse_input {
+    my ($class, $token, $engine, $command) = @_;
+    my $record = ref($token) ? $INPUT_PROOFS{$token} : undef;
+    _input_mismatch('submitted_changed') unless $record;
+    require Selecto::Domain;
+    require Selecto::ConfiguredDomain;
+    my $expected = _copy($record->{domain});
+    $expected->{name} //= $expected->{source}{source_table} // $expected->{source}{table};
+    # This is actual native-domain parsing, at dispatch rather than pure
+    # compilation. Its full identity includes derived source/relationship and
+    # rule records, without relying on a caller-supplied fingerprint.
+    my $domain = Selecto::Domain->parse($expected);
+    _input_mismatch('domain_changed') unless Selecto::ConfiguredDomain->digest($domain, {})
+        eq Selecto::ConfiguredDomain->digest($engine->domain, {});
+    _input_mismatch('context_changed') unless _receipt_digest($record->{context}) eq _receipt_digest($engine->write_context);
+    _input_mismatch('submitted_changed') unless $record->{submitted} eq _submitted_identity($command, $record);
+    return Selecto::DataRules->_with_proof_budget(sub {
+        return Selecto::DataRules->_preflight_reused_input($record->{rules}, $command->operation,
+            $record->{original}, $record->{normalized}, $engine->limits);
+    }, accepted_work => $record->{work}, limits => $engine->limits);
+}
+
+# Nested lowering records original compiler-owned child identities, then seals
+# the final Graph after informational metadata and internal RETURNING copies.
+# A new Graph made by a caller does not inherit this receipt.
+sub _capture_graph_inputs {
+    my ($class, $graph, $sources) = @_;
+    _receipt_digest([$graph, $sources]);
+    _input_mismatch() unless ref($graph) eq 'Selecto::Write::Graph' && ref($sources) eq 'HASH';
+    my %proofs;
+    for my $node (@{$graph->{nodes}}) {
+        my $source = $sources->{$node->{id}};
+        next unless defined $source;
+        my $proof = $class->_accepted_input($source);
+        next unless defined $proof;
+        my @shapes;
+        for my $command ($source, $node->{command}) {
+            my %shape = %$command;
+            my %metadata = %{$shape{metadata}};
+            delete @metadata{qw(returning nested_graph)};
+            $shape{metadata} = \%metadata;
+            push @shapes, _receipt_digest(\%shape);
+        }
+        _input_mismatch() unless $shapes[0] eq $shapes[1];
+        $proofs{$node->{id}} = $proof;
+    }
+    $ACCEPTED_GRAPHS{$graph} = {digest => _receipt_digest($graph), proofs => \%proofs} if keys %proofs;
+    return $graph;
+}
+sub _accepted_graph_inputs {
+    my ($class, $graph) = @_;
+    my $record = ref($graph) ? $ACCEPTED_GRAPHS{$graph} : undef;
+    return {} unless $record;
+    _input_mismatch('graph_changed') unless $record->{digest} eq _receipt_digest($graph);
+    return {%{$record->{proofs}}};
+}
 
 sub _fail { Selecto::Error->throw($_[0], $_[1], {code => $_[0], %{$_[2] // {}}}); }
 sub _copy { Selecto::Domain::QueryContract->copy_declaration({value => $_[0]})->{value} }
@@ -284,11 +465,21 @@ sub _compile_flat {
     }
     _assignment_policy($contract, $values, $type, $tenant_field) unless $type eq 'delete';
     # INPUT transformations precede field text normalization and trusted fills.
+    my $accepted_input;
     if (keys %{$contract->{rules} // {}}) {
         require Selecto::DataRules;
         require Selecto::WriteRules;
         my $rules = Selecto::DataRules->parse($contract->{rules});
-        $values = Selecto::WriteRules->evaluate($rules, 'input', $type, $values);
+        if (@{$rules->applicable_paths('input', $type)}) {
+            my $original = _copy($values);
+            my ($normalized, $work) = Selecto::DataRules->_measure_proof_work(sub {
+                return Selecto::WriteRules->evaluate($rules, 'input', $type, $values);
+            });
+            $values = $normalized;
+            $accepted_input = {domain => _copy($state->{domain}), context => _copy($context), tenant_field => $tenant_field,
+                rules => _copy($contract->{rules}), original => $original,
+                normalized => _copy($normalized), work => $work};
+        }
     }
     for my $field (keys %$values) {
         my $case = $contract->{source}{columns}{$field}{text_case};
@@ -361,6 +552,7 @@ sub _compile_flat {
     $command = Selecto::Write::Policy->apply($command,
         {operations => $contract->{operations}, fields => $contract->{fields}}, $fields,
         trusted_field => $tenant_field);
+    $issue_input->($command, $accepted_input) if $accepted_input;
     return {command => $command, context => _copy($context)};
 }
 

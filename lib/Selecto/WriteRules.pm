@@ -36,6 +36,15 @@ sub has_rules {
     return 0 unless $rules;
     return scalar(grep { @{$rules->applicable_paths($_, $operation)} } qw(input candidate transaction evidence));
 }
+# INPUT consumes only submitted values. Stored-stage applicability is separate:
+# even an advisory or conditional stored binding retains its candidate and
+# resource checks, while an inactive operation does not demand stored rows.
+sub has_stored_rules {
+    my ($class, $domain, $operation) = @_;
+    my $rules = $domain->rules;
+    return 0 unless $rules;
+    return scalar(grep { @{$rules->applicable_paths($_, $operation)} } qw(candidate transaction evidence));
+}
 sub _pending { Selecto::Error->throw('required_data_rule_pending', $_[0] // 'required rule lacks a complete governed candidate') }
 sub _fields {
     my ($domain) = @_;
@@ -270,6 +279,11 @@ sub prepare_submitted {
         my $assignments=$command->assignments;
         my $rules=$engine->domain->rules;
         my $has_input=$rules && @{$rules->applicable_paths('input',$command->operation)};
+        my $accepted_input;
+        if (defined($options{accepted_input})) {
+            require Selecto::Write::PortableCommand;
+            $accepted_input=Selecto::Write::PortableCommand->_reuse_input($options{accepted_input},$engine,$command);
+        }
         my $has_validators=grep {
             ref($fields->{$_}) eq 'HASH' && exists($fields->{$_}{validators})
                 && !(ref($fields->{$_}{validators}) eq 'ARRAY' && !@{$fields->{$_}{validators}})
@@ -277,7 +291,7 @@ sub prepare_submitted {
         return $command unless $has_input || $has_validators;
         my $original=$options{input} // $class->literal_input($command);
         my $input=$original;
-        if ($has_input) {
+        if ($has_input && !$accepted_input) {
             $input=$class->evaluate($rules,'input',$command->operation,$original);
         }
         for my $field (keys %$assignments) {
@@ -344,6 +358,7 @@ sub _govern {
     my ($class, $engine, $command, %options) = @_;
     return $command unless $class->has_rules($engine->domain, $command->operation);
     $command=$class->prepare_submitted($engine,$command,input=>$options{input}) unless $options{input_prepared};
+    return $command unless $class->has_stored_rules($engine->domain, $command->operation);
     local $HYDRATION = $HYDRATION // {loaded => 0};
     _check_storage($engine, $command);
     my $relationships = $engine->domain->writes->{relationships} // {};

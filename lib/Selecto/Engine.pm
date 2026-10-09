@@ -32,6 +32,7 @@ use Selecto::Limits ();
 use Selecto::OperationBudget ();
 use Selecto::Write::ConflictTarget ();
 use Selecto::WriteRules ();
+use Selecto::Write::PortableCommand ();
 use Selecto::DataRules ();
 use Selecto::Action::Graph ();
 use Selecto::ConfiguredDomain ();
@@ -553,11 +554,12 @@ sub preview_write {
 }
 sub _preview_write {
     my ($self, $command) = @_;
+    my $accepted_input=Selecto::Write::PortableCommand->_accepted_input($command);
     my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
-    $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input);
+    $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input,accepted_input=>$accepted_input);
     $self->preflight_write($command);
-    return $self->{adapter}->preview_write($command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
+    return $self->{adapter}->preview_write($command) unless Selecto::WriteRules->has_stored_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
         return $self->{adapter}->preview_write(Selecto::WriteRules->govern($self, $command, input_prepared => 1));
     });
@@ -573,11 +575,12 @@ sub execute_write {
 }
 sub _execute_write {
     my ($self, $command) = @_;
+    my $accepted_input=Selecto::Write::PortableCommand->_accepted_input($command);
     my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
-    $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input);
+    $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input,accepted_input=>$accepted_input);
     $self->preflight_write($command);
-    return $self->_execute_governed(execute_write => $command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
+    return $self->_execute_governed(execute_write => $command) unless Selecto::WriteRules->has_stored_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
         return $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $command, input_prepared => 1));
     });
@@ -652,14 +655,15 @@ sub _execute_batch {
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
     my @input = map { Selecto::WriteRules->literal_input($_) } @{$batch->commands};
+    my @accepted_input = map { Selecto::Write::PortableCommand->_accepted_input($_) } @{$batch->commands};
     $engines//=[map{$self}@{$batch->commands}];
     my $original=$batch->commands;
     my @commands = map { $engines->[$_]->governed_write($original->[$_]) } 0..$#$original;
-    @commands = map { Selecto::WriteRules->prepare_submitted($engines->[$_],$commands[$_],input=>$input[$_]) } 0..$#commands;
+    @commands = map { Selecto::WriteRules->prepare_submitted($engines->[$_],$commands[$_],input=>$input[$_],accepted_input=>$accepted_input[$_]) } 0..$#commands;
     my $prepared = Selecto::Write::Batch->new(@commands);
     $self->preflight_write($prepared);
     return $self->_execute_governed(execute_batch => $prepared)
-        unless grep { $_->{domain}->rules } @$engines;
+        unless grep { Selecto::WriteRules->has_stored_rules($engines->[$_]->domain, $commands[$_]->operation) } 0..$#commands;
     return $self->_rules_transaction(sub {
         # Stored batch deltas may overlap or depend on earlier mutations. They
         # need a prospective whole-plan provider; do not dispatch a prefix.
@@ -703,6 +707,7 @@ sub _prepare_graph {
     my ($self, $graph,%options) = @_;
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
+    my $accepted_inputs=Selecto::Write::PortableCommand->_accepted_graph_inputs($graph);
     my @nodes = @{$graph->nodes};
     # The constructor materializes downstream keys for execution, but result
     # policy governs only the caller's public returning intent. Re-derive the
@@ -740,18 +745,18 @@ sub _prepare_graph {
     for my $node ($options{submitted_prepared} ? () : @nodes) {
         my $engine=ref($self)->new(domain=>$contexts{$node->{id}}{domain},adapter=>$self->{adapter},
             scope=>$self->{scope},write_context=>$self->{write_context},limits=>$self->{limits});
-        $node->{command}=Selecto::WriteRules->prepare_submitted($engine,$node->{command},input=>$rule_inputs{$node->{id}});
+        $node->{command}=Selecto::WriteRules->prepare_submitted($engine,$node->{command},input=>$rule_inputs{$node->{id}},accepted_input=>$accepted_inputs->{$node->{id}});
     }
     my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets,metadata=>$graph->metadata);
     my $sets = $self->_govern_owned_sets($graph->owned_sets, $prepared->{nodes}, \%contexts,$relationship_work);
     $prepared->{_governed_owned_sets} = $sets;
     $prepared->{_reference_domains} = {map { ($_ => $contexts{$_}{domain}) } keys %contexts};
     $prepared->{_requires_rules} = scalar(grep {
-        $contexts{$_->{id}}{domain} && Selecto::WriteRules->has_rules($contexts{$_->{id}}{domain}, $_->{command}->operation)
+        $contexts{$_->{id}}{domain} && Selecto::WriteRules->has_stored_rules($contexts{$_->{id}}{domain}, $_->{command}->operation)
     } @nodes);
     for my $set (@{$graph->owned_sets}) {
         my $edge = $contexts{$set->{parent}}{relationships}{$set->{relationship}};
-        $prepared->{_requires_rules} ||= Selecto::WriteRules->has_rules(_native_relationship_domain($edge->{domain}), 'delete');
+        $prepared->{_requires_rules} ||= Selecto::WriteRules->has_stored_rules(_native_relationship_domain($edge->{domain}), 'delete');
     }
     return ($prepared, \%contexts);
 }

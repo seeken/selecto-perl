@@ -15,6 +15,25 @@ declared action defaults; an authored system expression is unknown until the
 host can establish its actual value. Graph INPUT applies to each node's own
 submitted assignments. The prospective child collection belongs to CANDIDATE.
 
+Applicable INPUT rules do not require a stored candidate. Once submitted
+validation succeeds, ordinary writes, batches, graphs and both native SQLite
+upsert branches can proceed without a stored-rule provider. CANDIDATE,
+TRANSACTION and EVIDENCE bindings retain their stored-stage checks, including
+advisory bindings and bindings with false conditions. Operation filters apply
+to the actual command. Explicit child deletes validate their submitted INPUT;
+implicit owned-collection omission cleanup has no child INPUT submission.
+
+Portable compilation retains private evidence for INPUT evaluated before field
+normalization and trusted fills. The receiving native engine checks the exact
+compiled command or final graph, domain contract and trusted context before
+reusing that evidence. It still applies native governance, field validators,
+storage checks and stored-stage rules. Reconstructed commands and graphs have
+no compiler evidence; changing an original compiled object refuses it with
+`compiled_input_mismatch`. Each native request charges the measured INPUT work,
+once within a shared request, and checks the original and normalized subjects
+against its current resource ceilings without rerunning INPUT normalizers or
+tests. A tighter receiving host cannot borrow the compiler's larger limits.
+
 Stored updates load the complete governed source row. Scalar updates overlay
 explicit assignments and INPUT normalization before converting that row into the
 prospective candidate. Thus a canonical replacement can repair a stored REAL in
@@ -105,8 +124,9 @@ known stored-rule failures are retained while later available stages and graph
 or INSERT-batch candidates finish their resource checks. The first ordinary
 failure then refuses the plan if no later resource error occurs. Refused INPUT,
 unknown prospective values and unavailable storage still stop admission. Protected
-stored batch deltas and upserts require a prospective whole-plan or selected
-branch provider and remain pending here. External evidence requires its exact
+stored batch deltas and upserts with applicable stored-stage rules require a
+prospective whole-plan or selected branch provider and remain pending here.
+External evidence requires its exact
 authoritative stage. Unknown defaults or generated fields consumed by a rule,
 database-computed assignments and unmaterialized normalizer changes remain
 explicit refusals. Caller completeness flags do not supply authority.

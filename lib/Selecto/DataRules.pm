@@ -135,6 +135,37 @@ sub _recheck {
     my ($self, %request) = @_;
     return $self->_evaluate_request(\%request, 1);
 }
+# Resource admission is shared with native replay of compiler-owned INPUT
+# evidence. It inspects every applicable binding, including advisory and false
+# conditions, without running a normalizer, condition or rule test.
+sub _preflight_subject {
+    my ($self, $request, $subject, $limits, $work) = @_;
+    Selecto::OperationBudget->new(limits => $limits, code => 'evaluation_limit')
+        ->check_tree($subject, label => 'rule subject');
+    for my $binding (values %{$self->{bindings}}) {
+        next unless _applies($binding, $request);
+        my ($value, $present) = _at($subject, $binding->{subject}{path});
+        Selecto::RuleTest::check_value($value, $limits, $work);
+        Selecto::RuleTest->preflight($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits);
+        Selecto::RuleTest->preflight($binding->{prepared_condition}, $value, $present, $limits)
+            if $binding->{prepared_condition};
+    }
+    return 1;
+}
+sub _preflight_reused_input {
+    my ($class, $raw, $operation, $original, $normalized, $limits) = @_;
+    return $class->_with_proof_budget(sub {
+        my ($work, $effective) = $class->_rule_work_context($limits);
+        # Recompile under the receiving host's actual metadata, numeric and
+        # pattern ceilings; a compiler's default ceilings grant no exemption.
+        my $rules = $class->parse($raw, limits => $effective);
+        for my $subject ($original, $normalized) {
+            $rules->_preflight_subject({stage => 'input', operation => $operation},
+                _hash($subject, 'invalid_data_rules_request', 'subject'), $effective, $work);
+        }
+        return 1;
+    }, limits => $limits);
+}
 sub _evaluate_request {
     my ($self, $request, $test_only) = @_;
     my %request = %$request;
@@ -151,16 +182,7 @@ sub _evaluate_request {
     # Refuse oversized/cyclic values before cloning. Check every consumed value
     # before conditions so an advisory or false branch cannot conceal resources.
     my $admitted = eval {
-        Selecto::OperationBudget->new(limits => $limits, code => 'evaluation_limit')
-            ->check_tree($subject_value, label => 'rule subject');
-        for my $binding (values %{$self->{bindings}}) {
-            next unless _applies($binding, \%request);
-            my ($value, $present) = _at($subject_value, $binding->{subject}{path});
-            Selecto::RuleTest::check_value($value, $limits, $work);
-            Selecto::RuleTest->preflight($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits);
-            Selecto::RuleTest->preflight($binding->{prepared_condition}, $value, $present, $limits)
-                if $binding->{prepared_condition};
-        }
+        $self->_preflight_subject(\%request, $subject_value, $limits, $work);
         1;
     };
     unless ($admitted) {
