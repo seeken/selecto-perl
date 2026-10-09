@@ -242,3 +242,6 @@ t/domain_schema_query_boundary.t
 t/fixtures/schema_query_boundary.json
 t/fixtures/schema_query_boundary_expected.json
 t/field_policy_boundaries.t
+t/fixtures/source_relationships.json
+t/source_relationships.t
+lib/Selecto/Domain/SourceRelationships.pm
