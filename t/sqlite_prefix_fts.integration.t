@@ -41,6 +41,7 @@ is_deeply($main->all($q->where($search))->{rows}, [[1,'Oak']], 'explicit ASCII m
 my $fresh = Selecto->adapter(sqlite=>dbh=>$db);
 my $target = Selecto::Engine->new(domain=>Selecto::Domain->parse($raw),adapter=>$fresh)
     ->with_tenant({prefix=>'tenant_a'});
+my $target_q = $target->query->select('id','title')->order_by('id');
 my $legacy = Selecto::Engine->new(domain=>Selecto::Domain->new(name=>'Docs',table=>'docs',fields=>{title=>'fts5'}),adapter=>$fresh);
 my $legacy_target = $legacy->with_tenant({prefix=>'tenant_a'});
 is_deeply($legacy_target->all($legacy_target->query->select('title'))->{rows}, [['Elm tenant']],
@@ -61,12 +62,12 @@ sub refuses {
         is($events,0,"$label prepares no native SQL, including capability catalog reads");
     }
 }
-refuses('attached ordinary root cannot borrow main-index matches by rowid',sub{$target->all($q->where($search))});
+refuses('attached ordinary root cannot borrow main-index matches by rowid',sub{$target->all($target_q->where($search))});
 refuses('attached ordinary root cannot borrow main-index rank',sub{
     $target->all($target->query->select('id',Selecto::Expression->text_rank(['title'],'Oak')->as('rank')))
 });
 refuses('bounded preparation keeps the same main-only index authority',sub{
-    Selecto::BoundedQuery->prepare($target,$q->where($search))
+    Selecto::BoundedQuery->prepare($target,$target_q->where($search))
 },1);
 refuses('attached legacy root cannot borrow the main FTS catalog proof',sub{
     $legacy_target->all($legacy_target->query->select('title')->where(Selecto::Expression->text_search(['title'],'Oak')))

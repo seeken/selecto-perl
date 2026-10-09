@@ -79,7 +79,7 @@ is_deeply($compound->all(query($compound))->{rows}, [[10]], 'compound context sc
 is_deeply($compound->with_limits(Selecto::Limits->new(max_fields => 1))->all(query($compound))->{rows}, [[10]], 'approved limits transition keeps read authority');
 refusal('read context does not grant ordinary writes', 'unsupported_feature', sub { $compound->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'accounts', assignments => {name => 'forbidden', active => 1, tenant_id => 'tenant-a'})) });
 my $advanced = query($prefix)->_copy(ctes => [{name => 'x'}]);
-refusal('prefix advanced sources are explicitly unsupported', 'unsupported_feature', sub { $prefix->all($advanced) });
+refusal('malformed prefix source plans fail before SQL', 'invalid_query', sub { $prefix->all($advanced) });
 for my $edit (
     ['context', sub { $_[0]{tenant_context}{tenant_id} = 'tenant-b' }],
     ['required filter', sub { $_[0]{tenant_required_filters}[0][1] = 'tenant-b' }],

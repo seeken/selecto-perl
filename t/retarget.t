@@ -97,7 +97,7 @@ subtest 'query state' => sub {
         'the context cannot be switched off');
     is(code_of(sub { $pg->query->retarget('no such path!') }), 'invalid_query',
         'the path must be an association path');
-    is(code_of(sub { $pg->query->with_member('x')->retarget('attendees') }), 'invalid_query',
+    is(code_of(sub { Selecto::Query->new->with_member('x')->retarget('attendees') }), 'invalid_query',
         'root query sources must follow the retarget');
     is(code_of(sub { $pg->query->for_share->retarget('attendees') }), 'invalid_query',
         'a row-locked query cannot be retargeted');

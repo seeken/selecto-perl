@@ -9,6 +9,7 @@ use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Error ();
+use Selecto::ConfiguredDomain ();
 use Selecto::DataRules ();
 use Selecto::Write::Scope ();
 
@@ -29,6 +30,7 @@ my %ASSOCIATION = map { $_ => 1 } qw(
     join_strategy
 );
 my %JOIN = map { $_ => 1 } qw(
+    source fields on
     type name display_field dimension_key display_fallback joins
 );
 my %THROUGH = map { $_ => 1 } qw(
@@ -562,6 +564,32 @@ sub _canonical_associations {
         Selecto::Error->throw(
             'invalid_domain', "schema $queryable must declare exactly one of source_table or values",
         ) unless $has_table != $has_values;
+        # Canonical portable joins may repeat relation identity. Repetition
+        # cannot replace the source association or its declared target schema.
+        if (exists $join->{source}) {
+            Selecto::Error->throw('invalid_domain', "join $path source conflicts with its schema")
+                unless !ref($join->{source}) && defined($target->{source_table})
+                    && $join->{source} eq $target->{source_table};
+        }
+        if (exists $join->{fields}) {
+            _object($join->{fields}, "join $path fields");
+            my $expected = _canonical_fields($target);
+            my %given;
+            for my $field (keys %{$join->{fields}}) {
+                _object($join->{fields}{$field}, "join $path field $field");
+                $given{$field} = $join->{fields}{$field}{type};
+            }
+            Selecto::Error->throw('invalid_domain', "join $path fields conflict with its schema")
+                unless Selecto::ConfiguredDomain->digest(\%given, {}) eq Selecto::ConfiguredDomain->digest($expected, {});
+        }
+        if (exists $join->{on}) {
+            my $on = $join->{on};
+            Selecto::Error->throw('invalid_domain', "join $path conditions conflict with its association")
+                unless ref($on) eq 'ARRAY' && @$on == 1 && ref($on->[0]) eq 'HASH'
+                    && keys(%{$on->[0]}) == 2 && defined($on->[0]{left}) && !ref($on->[0]{left})
+                    && defined($on->[0]{right}) && !ref($on->[0]{right})
+                    && $on->[0]{left} eq $association->{owner_key} && $on->[0]{right} eq $association->{related_key};
+        }
         my $target_fields = _canonical_fields($target);
         my $values = $has_values
             ? _canonical_relation_values($target, "schema $queryable")
@@ -2446,6 +2474,16 @@ sub validate_choice_sources {
     require Selecto::Domain::ChoiceSources;
     return Selecto::Domain::ChoiceSources->validate($contract);
 }
+sub project_query_members {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::QueryMembers;
+    return Selecto::Domain::QueryMembers->project($contract);
+}
+sub validate_query_members {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::QueryMembers;
+    return Selecto::Domain::QueryMembers->validate($contract);
+}
 sub validate_query_library {
     my ($self, $limits) = @_;
     require Selecto::QueryLibrary;
@@ -2902,6 +2940,18 @@ C<capabilities>, C<source_relationships> and C<choice_sources> entries. See
 L<Selecto::Domain::Overlay>.
 
 =head1 METHODS
+
+=head2 project_query_members, validate_query_members
+
+  my $members = Selecto::Domain->project_query_members($complete_plain_contract);
+  my $report = Selecto::Domain->validate_query_members($complete_plain_contract);
+
+These bounded metadata APIs retain the whole declaration and inspect its five
+named-source families without executing portable callback markers. Projection
+returns sorted descriptors and an independent declaration copy; validation
+accumulates diagnostics. Native activation separately checks source columns,
+joins, configured query policy, tenant authority and adapter capabilities.
+See L<Selecto::Domain::QueryMembers> and L<Selecto::QueryMember>.
 
 =head2 resolve
 
