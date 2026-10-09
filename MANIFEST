@@ -203,3 +203,8 @@ t/sqlite_native_projection.integration.t
 t/sqlite_action_proof.integration.t
 t/sqlite_replace_authority.integration.t
 t/sqlite_rollup.t
+lib/Selecto/Domain/ContractVerification.pm
+lib/Selecto/Verification/ContractSafety.pm
+t/contract_compatibility.t
+t/fixtures/contract_compatibility.json
+docs/contract-compatibility.md

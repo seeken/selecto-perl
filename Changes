@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 Unreleased
+    - Publish stable provider contract snapshots and verify consumer fields,
+      filters, query members, versions, fingerprints, and required scopes.
+      Snapshot diffs distinguish additive surfaces from breaking removals,
+      result type changes, and added required scopes. A public exhaustive
+      32-state compatibility model checks two independent invariants.
     - Implement the complete 27-operator DataRules v1 AST and six text
       normalizers with exact arithmetic, bounded ASCII patterns, shared
       resource budgets and unconditional advisory/condition resource errors.
