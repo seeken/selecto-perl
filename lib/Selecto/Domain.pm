@@ -2406,6 +2406,16 @@ sub project_query_contract {
     require Selecto::Domain::QueryContract;
     return Selecto::Domain::QueryContract->project($contract);
 }
+sub validate_write_contract {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::WriteContract;
+    return Selecto::Domain::WriteContract->validate($contract);
+}
+sub compile_write_contract {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::WriteContract;
+    return Selecto::Domain::WriteContract->compile($contract);
+}
 sub validate_query_contract {
     my ($class, $contract) = @_;
     require Selecto::Domain::QueryContract;

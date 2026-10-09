@@ -396,6 +396,7 @@ sub write_capabilities {
     my $capabilities = $self->SUPER::write_capabilities;
     if ($self->_returning_available) {
         $capabilities->{returning} = 1;
+        $capabilities->{generated_keys} = 1;
     }
     if ($self->_returning_available && $self->_sqlite_version_at_least(3, 37, 0)) {
         $capabilities->{write_graph} = 1;

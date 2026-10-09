@@ -244,9 +244,15 @@ Returns C<< {supported => 0|1} >> for a feature.
 
 =head2 write_capabilities
 
-A hash of write features such as C<insert>, C<update>, C<upsert>,
+A hash with numeric C<protocol_version =E<gt> 1> and explicit Boolean write
+features such as C<insert>, C<update>, C<upsert>,
 C<delete>, C<transactions>, C<atomic_batch>, C<mutation_expressions>,
-C<returning> and C<write_graph>.
+C<returning>, C<generated_keys> and C<write_graph>. The default empty report
+indicates that the write protocol is unimplemented. Actual execution preflight
+refuses missing/incompatible protocols and missing requested semantics.
+An optional internal C<_validate_write_intent($write)> hook may return a more
+specific typed refusal for unsupported structured intent before report lookup.
+It must remain pure; it neither grants capabilities nor prepares or executes SQL.
 
 =head2 feature_inventory
 

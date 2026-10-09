@@ -166,8 +166,8 @@ sub new {
             unless ref($bindings) eq 'ARRAY';
         Selecto::Error->throw('invalid_write_graph', 'graph root must not contain bindings')
             if $index == 0 && @$bindings;
-        Selecto::Error->throw('invalid_write_graph', "graph child $id must bind to an earlier node")
-            if $index > 0 && !@$bindings;
+        # A graph may contain independent writes. Bindings, when present, still
+        # have to point to an earlier node and may never overwrite assignments.
         my $assignments = $node_spec->{command}->assignments;
         my %bound_fields;
         my @normalized_bindings = map {

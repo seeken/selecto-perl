@@ -299,7 +299,7 @@ sub _rollup_sort_fix_enabled {
 }
 
 sub write_capabilities {
-    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, write_graph => 1 };
+    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, generated_keys => 1, write_graph => 1 };
 }
 
 sub _renumber_placeholders {

@@ -199,6 +199,7 @@ package main;
     use Mojo::Base 'Selecto::SQLite';
     # This DBH double observes generic transaction control, without a SQLite catalog.
     sub _admit_plan_storage { return; }
+    sub write_capabilities { return Selecto::SQL::write_capabilities($_[0]); }
 }
 
 my $write = sub {
