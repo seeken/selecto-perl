@@ -2334,6 +2334,27 @@ sub contract_snapshot {
     require Selecto::Domain::ContractVerification;
     return Selecto::Domain::ContractVerification->snapshot($_[0]);
 }
+sub normalize_identity {
+    my ($invocant, @args) = @_;
+    require Selecto::Domain::Identity;
+    return Selecto::Domain::Identity->normalize(ref($invocant) ? $invocant : $args[0]);
+}
+sub validate_identity {
+    my ($invocant, @args) = @_;
+    require Selecto::Domain::Identity;
+    return Selecto::Domain::Identity->validate(ref($invocant) ? $invocant : $args[0]);
+}
+sub compose_identity {
+    my ($invocant, @args) = @_;
+    require Selecto::Domain::Identity;
+    my $base = ref($invocant) ? $invocant : shift @args;
+    return Selecto::Domain::Identity->compose($base, $args[0]);
+}
+sub query_identity {
+    my ($invocant, @args) = @_;
+    require Selecto::Domain::Identity;
+    return Selecto::Domain::Identity->query_identity(ref($invocant) ? $invocant : $args[0]);
+}
 sub verify_contract_compatibility {
     require Selecto::Domain::ContractVerification;
     return Selecto::Domain::ContractVerification->verify($_[0], $_[1]);
@@ -2731,6 +2752,12 @@ C<components>, C<query_library>, C<co_domains>, C<detail_actions> and C<rules>
 are also accepted and validated as in the canonical form.
 
 =head2 compose
+
+The separate C<normalize_identity>, C<validate_identity>, C<compose_identity>,
+and C<query_identity> methods delegate to L<Selecto::Domain::Identity>. They
+inspect metadata and return structured source-identity diagnostics without
+executing callbacks or authorizing query/write policy. Declared domain version
+and fingerprint labels remain separate from this runtime's C<fingerprint>.
 
   my ($domain, $diagnostics) = Selecto::Domain->compose($base, @overlays);
   my ($domain, $diagnostics) = $base_domain->compose(@overlays);

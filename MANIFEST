@@ -209,3 +209,6 @@ t/contract_compatibility.t
 t/fixtures/contract_compatibility.json
 docs/contract-compatibility.md
 t/sqlite_numeric_parameters.t
+lib/Selecto/Domain/Identity.pm
+t/domain_identity.t
+t/fixtures/domain_identity.json
