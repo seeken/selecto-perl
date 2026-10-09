@@ -7,9 +7,10 @@ use warnings;
 use Mojo::Base -base, -signatures;
 use JSON::PP ();
 use Scalar::Util qw(blessed);
-use Storable qw(dclone);
 use Selecto::Domain ();
+use Selecto::Domain::QueryContract ();
 use Selecto::Error ();
+use Selecto::OperationBudget ();
 
 has 'domain';
 has authorize => sub { return sub { return {status => 'enabled'} } };
@@ -26,6 +27,16 @@ sub new ($class, @args) {
 }
 
 sub resolve ($self, %args) {
+    # Admit the whole plain profile and snapshot before consulting any host
+    # capability callback. Context remains an opaque, trusted host value.
+    my $input = _copy_plain({operation => $args{operation} // 'update',
+        profile => $args{profile}, snapshot => $args{snapshot} // {},
+        include_hidden_values => exists($args{include_hidden_values}) ? $args{include_hidden_values} : 0});
+    @args{qw(operation profile snapshot)} = @{$input}{qw(operation profile snapshot)};
+    Selecto::Error->throw('invalid_field_policy',
+        'field policy include_hidden_values must be boolean')
+        unless _is_boolean($input->{include_hidden_values});
+    my $include_hidden_values = $input->{include_hidden_values} ? 1 : 0;
     my $operation = lc _scalar($args{operation} // 'update');
     Selecto::Error->throw(
         'invalid_field_policy', 'field policy operation is not supported',
@@ -50,6 +61,8 @@ sub resolve ($self, %args) {
         : ref($operation_spec) eq 'HASH' && $operation_spec->{enabled} ? 1 : 0;
 
     my (@resolved, %seen);
+    my $output_budget = Selecto::OperationBudget->new(code => 'invalid_field_policy');
+    my $callback_budget = Selecto::OperationBudget->new(code => 'invalid_field_policy');
     for my $index (0 .. $#$profile) {
         my $entry = $profile->[$index];
         $entry = {field => $entry} if defined($entry) && !ref($entry);
@@ -78,7 +91,7 @@ sub resolve ($self, %args) {
         ) unless $requested_mode =~ /\A(?:auto|hidden|read_only|editable|action)\z/;
 
         my $view = $self->_decision(
-            $entry->{view_capability}, 'view', $field, $operation, \%args,
+            $entry->{view_capability}, 'view', $field, $operation, \%args, $callback_budget,
         );
         my $state = !$public || $requested_mode eq 'hidden'
             || $view->{status} ne 'enabled' ? 'hidden' : undef;
@@ -98,7 +111,7 @@ sub resolve ($self, %args) {
         my $contract_writable = $operation_enabled && $root
             && $write_spec->{$permission} ? 1 : 0;
         my $edit = $self->_decision(
-            $entry->{edit_capability}, 'edit', $field, $operation, \%args,
+            $entry->{edit_capability}, 'edit', $field, $operation, \%args, $callback_budget,
         );
         my $eligible = !exists($entry->{eligible}) || $entry->{eligible} ? 1 : 0;
 
@@ -137,7 +150,7 @@ sub resolve ($self, %args) {
         $label = _scalar($metadata->{label}) unless length $label;
         $label = _humanize($field) unless length $label;
 
-        push @resolved, {
+        my $resolved = {
             field => $field,
             label => $label,
             type => $type,
@@ -146,7 +159,7 @@ sub resolve ($self, %args) {
             required => $required,
             nullable => $entry->{nullable} ? 1 : 0,
             writable => $contract_writable,
-            ($state ne 'hidden'
+            ($state ne 'hidden' || $include_hidden_values
                 ? (value => exists($snapshot->{$field}) ? $snapshot->{$field} : undef) : ()),
             (defined($entry->{action}) ? (action => _identifier(
                 $entry->{action}, "field policy action for $field",
@@ -156,7 +169,7 @@ sub resolve ($self, %args) {
             ) : ()),
             (defined($entry->{rows}) ? (rows => 0 + $entry->{rows}) : ()),
             (ref($entry->{options}) eq 'ARRAY' ? (
-                options => dclone($entry->{options}),
+                options => $entry->{options},
             ) : ()),
             (defined($entry->{view_capability}) ? (
                 view_capability => _scalar($entry->{view_capability}),
@@ -168,6 +181,10 @@ sub resolve ($self, %args) {
             (defined($reason_code) && length("$reason_code")
                 ? (reason_code => "$reason_code") : ()),
         };
+        # Charge emitted occurrences cumulatively before retaining another
+        # descriptor; long host decisions cannot amplify across a short profile.
+        $output_budget->check_tree($resolved, label => 'field policy result');
+        push @resolved, $resolved;
     }
     return \@resolved;
 }
@@ -182,23 +199,42 @@ sub accepted_fields ($self, %args) {
     } @{$self->resolve(%args)}];
 }
 
-sub _decision ($self, $capability, $phase, $field, $operation, $args) {
+sub _decision ($self, $capability, $phase, $field, $operation, $args, $budget) {
     return {status => 'enabled'} unless defined($capability)
         && length _scalar($capability);
+    $budget->check_tree({capability => $capability, phase => $phase,
+        field => $field, operation => $operation, snapshot => $args->{snapshot}},
+        label => 'field policy capability request');
     my $decision = $self->authorize->({
         capability => _scalar($capability),
         phase => $phase,
         field => $field,
         operation => $operation,
         context => $args->{context},
-        snapshot => $args->{snapshot},
+        snapshot => _copy_plain({snapshot => $args->{snapshot}})->{snapshot},
     });
+    $decision = _copy_plain({decision => $decision})->{decision};
+    $budget->check_tree($decision, label => 'field policy capability decision');
     Selecto::Error->throw(
         'invalid_field_policy', 'field policy authorization returned an invalid decision',
         {field => $field, capability => _scalar($capability)},
     ) unless ref($decision) eq 'HASH'
-        && _scalar($decision->{status}) =~ /\A(?:enabled|disabled|hidden)\z/;
+        && _scalar($decision->{status}) =~ /\A(?:enabled|disabled|hidden)\z/
+        && !grep { defined($decision->{$_}) && ref($decision->{$_}) } qw(reason reason_code);
     return $decision;
+}
+
+sub _copy_plain ($value) {
+    my $copy;
+    my $ok = eval { $copy = Selecto::Domain::QueryContract->copy_declaration($value); 1 };
+    unless ($ok) {
+        my $error = $@;
+        die $error unless ref($error) && UNIVERSAL::isa($error, 'Selecto::Error')
+            && $error->code eq 'invalid_query_contract';
+        Selecto::Error->throw('invalid_field_policy',
+            'field policy metadata must be plain and within its resource limits');
+    }
+    return $copy;
 }
 
 sub _reject_unknown ($entry, $index) {
@@ -211,6 +247,11 @@ sub _reject_unknown ($entry, $index) {
         'invalid_field_policy', 'field policy profile contains unsupported settings',
         {index => $index, settings => \@unknown},
     ) if @unknown;
+    for my $name (qw(field label control placeholder mode action view_capability edit_capability reason)) {
+        Selecto::Error->throw('invalid_field_policy',
+            "field policy $name must be a scalar", {index => $index})
+            if defined($entry->{$name}) && ref($entry->{$name});
+    }
     for my $name (qw(required nullable eligible)) {
         next unless exists $entry->{$name};
         Selecto::Error->throw(
@@ -222,7 +263,7 @@ sub _reject_unknown ($entry, $index) {
         Selecto::Error->throw(
             'invalid_field_policy', 'field policy rows must be from 2 to 20',
             {index => $index},
-        ) if ref($entry->{rows}) || "$entry->{rows}" !~ /\A\d+\z/
+        ) if !defined($entry->{rows}) || ref($entry->{rows}) || "$entry->{rows}" !~ /\A\d+\z/
             || $entry->{rows} < 2 || $entry->{rows} > 20;
     }
     Selecto::Error->throw(
@@ -330,6 +371,18 @@ C<control>, C<required>, C<nullable>, C<placeholder>, C<rows>, C<options>,
 C<mode> (C<auto>, C<hidden>, C<read_only>, C<editable> or C<action>),
 C<action>, C<view_capability>, C<edit_capability>, C<eligible> and
 C<reason>. Throws C<invalid_field_policy>.
+
+Profiles, snapshots, options and returned capability decisions must be plain
+bounded metadata. They are copied without invoking object or serialization
+hooks; the trusted C<context> value is passed through unchanged. Capability
+callbacks receive independent snapshot copies. Hidden descriptors omit their
+values by default. A trusted host can explicitly request complete descriptors
+with C<include_hidden_values =E<gt> 1>; this option is not a field-profile setting
+and must not come from an untrusted submission. L</visible> still removes hidden
+descriptors with either option. Complete host metadata must not be serialized
+as a public response. These helpers do not authorize write execution.
+Emitted metadata and cumulative capability request/decision copies
+each share the native finite node and byte budgets.
 
 =head2 visible
 
