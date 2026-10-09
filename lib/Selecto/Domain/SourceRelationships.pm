@@ -101,9 +101,9 @@ sub _joins {
         _work($state);
         my $join = $joins->{$id};
         my $association = $associations->{$id};
-        next unless ref($join) eq 'HASH' && ref($association) eq 'HASH'
-            && _string($association->{queryable}) && ref($schemas->{$association->{queryable}}) eq 'HASH';
-        my $target = $schemas->{$association->{queryable}};
+        next unless ref($join) eq 'HASH' && ref($association) eq 'HASH' && _string($association->{queryable});
+        my $target = $association->{queryable} eq 'source' ? $state->{source} : $schemas->{$association->{queryable}};
+        next unless ref($target) eq 'HASH';
         my $alias = _key($state, $prefix, $id);
         my $child_prefix = _key($state, $alias, '.');
         _relation($state, $target, $child_prefix);
@@ -222,6 +222,7 @@ sub _state {
     my $state = {contract => $contract, fields => {}, errors => [], work => 0,
         output => {nodes => 0, bytes => 0}};
     my $source = _object($state, $contract->{source} // {}, ['source']);
+    $state->{source} = $source;
     my $schemas = _object($state, $contract->{schemas} // {}, ['schemas']);
     _relation($state, $source, '');
     for my $id (sort keys %$schemas) { _relation($state, $schemas->{$id}, _key($state, $id, '.')); }
