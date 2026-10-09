@@ -154,6 +154,8 @@ sub _compile_single {
         require Selecto::QueryMember;
         $query = Selecto::QueryMember->expand($domain, $query);
     }
+    return $self->_compile_rollup($domain, $query, %options)
+        if $query->grouping_mode eq 'rollup' && $self->_emulates_rollup;
     local $self->{_root_alias} = $options{root_alias} // 's0';
     local $self->{_timezone} = $query->timezone;
     my $selections = $query->selections;
@@ -201,8 +203,8 @@ sub _compile_single {
     my $selection_position = 0;
     my @selection_sql = map {
         $selection_position++;
-        my $expression_sql = $self->_compile_expression(
-            $domain, $_, \@params, \%compiled_selections,
+        my $expression_sql = $self->_compile_selection_expression(
+            $domain, $_, \@params, \%compiled_selections, \%options,
         );
         $compiled_selections{_expression_key($_)} //= $expression_sql;
         $selection_positions{_expression_key($_)} //= $selection_position;
@@ -393,6 +395,15 @@ sub _compile_single {
         columns => \@columns,
         adapter_name => $self->name,
     );
+}
+
+sub _emulates_rollup { return 0; }
+
+# Dialects that emulate grouping sets may change projections without changing
+# the expressions used by WHERE, joins, or GROUP BY in an ordinary branch.
+sub _compile_selection_expression {
+    my ($self, $domain, $expression, $params, $compiled_selections) = @_;
+    return $self->_compile_expression($domain, $expression, $params, $compiled_selections);
 }
 
 # A retargeted query compiles on a domain rooted at the target relation. Its

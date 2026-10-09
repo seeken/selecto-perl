@@ -739,7 +739,8 @@ Sets plain grouping expressions.
 
 Groups with C<ROLLUP> to add subtotal and grand-total rows. Use
 L<Selecto::Expression/AGGREGATES> to tell detail rows from subtotal rows.
-Requires the C<rollup> capability (PostgreSQL, DuckDB). See
+Requires the C<rollup> capability (PostgreSQL, DuckDB, SQLite). SQLite uses
+bounded C<UNION ALL> branches with explicit grouping masks. See
 L<Selecto::PostgreSQL> for rollup ordering behavior.
 
 =head2 order_by
@@ -895,7 +896,7 @@ feature fails before any SQL is sent. At the time of writing:
   cte, recursive    yes         yes     3.8+      cte    no
   window functions  yes         yes     3.25+     yes    no
   set operations    yes         yes     yes       yes    no
-  rollup            yes         yes     no        no     no
+  rollup            yes         yes     yes       no     no
   lateral, json     yes         no      no        no     no
   array rowsets     yes         no      no        no     no
   for_share         yes         no      no        no     no
