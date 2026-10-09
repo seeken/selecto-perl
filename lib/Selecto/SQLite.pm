@@ -394,6 +394,7 @@ sub _value_type_sql {
 sub write_capabilities {
     my ($self) = @_;
     my $capabilities = $self->SUPER::write_capabilities;
+    $capabilities->{typed_insert_admission} = 1;
     if ($self->_returning_available) {
         $capabilities->{returning} = 1;
         $capabilities->{generated_keys} = 1;
