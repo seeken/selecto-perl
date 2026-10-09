@@ -109,9 +109,10 @@ sub rowid_alias {
     return $pk[0]{name};
 }
 
-# Replacement can delete another row or substitute a caller NULL default.
+# Replacement can delete another row or substitute a caller NULL default;
+# ROLLBACK can destroy the caller's transaction, including every savepoint.
 # Tokenize stored DDL so quoted names/literals and comments are not policies.
-sub _has_replace_policy {
+sub _has_unsafe_conflict_policy {
     my ($ddl) = @_;
     _fail() unless defined($ddl) && !ref($ddl) && length($ddl) <= 1_048_576;
     my ($state, $tokens) = (0, 0);
@@ -127,7 +128,7 @@ sub _has_replace_policy {
         }
         if ($ddl =~ /\G([A-Za-z_\x80-\x{10FFFF}][A-Za-z_0-9\$\x80-\x{10FFFF}]*)/gc) {
             my $word = _upper($1);
-            return 1 if $state == 2 && $word eq 'REPLACE';
+            return 1 if $state == 2 && ($word eq 'REPLACE' || $word eq 'ROLLBACK');
             $state = $state == 1 && $word eq 'CONFLICT' ? 2 : $word eq 'ON' ? 1 : 0;
             next;
         }
@@ -157,8 +158,11 @@ sub plan_storage {
             $physical = $class->table($adapter, $command->relation);
             _fail() if grep { $_->{hidden} } @{$physical->{columns}};
             if ($command->operation =~ /\A(?:insert|update|upsert)\z/) {
-                my ($ddl) = $dbh->selectrow_array("SELECT sql FROM main.sqlite_schema WHERE type='table' AND name=? COLLATE NOCASE", undef, $physical->{name});
-                _fail() if _has_replace_policy($ddl);
+                my ($stored_name, $ddl) = $dbh->selectrow_array("SELECT name,sql FROM main.sqlite_schema WHERE type='table' AND name=? COLLATE NOCASE", undef, $physical->{name});
+                # NOCASE can be supplied by the host. Independently bind this
+                # DDL to the exact canonical table returned by native PRAGMA.
+                _fail() unless defined($stored_name) && $stored_name eq $physical->{name};
+                _fail() if _has_unsafe_conflict_policy($ddl);
             }
             for my $catalog (qw(main temp)) {
                 my ($trigger) = $dbh->selectrow_array("SELECT 1 FROM $catalog.sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE LIMIT 1", undef, $physical->{name});
