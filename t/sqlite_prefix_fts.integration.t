@@ -36,8 +36,8 @@ is_deeply($prefixed->all($q)->{rows}, [[1,'Elm tenant'],[2,'Oak tenant']],
 my $main = $base->with_tenant({prefix=>'MAIN'});
 is_deeply($main->all($q->where($search))->{rows}, [[1,'Oak']], 'explicit ASCII main identity remains supported');
 
-# A fresh adapter has not cached its FTS capability. Refusal must precede even
-# that catalog lookup, rather than merely avoiding the final business SELECT.
+# A fresh adapter has not cached its FTS capability. Direct compilation must
+# refuse before that lookup. The bounded bridge first checks SQLite's version.
 my $fresh = Selecto->adapter(sqlite=>dbh=>$db);
 my $target = Selecto::Engine->new(domain=>Selecto::Domain->parse($raw),adapter=>$fresh)
     ->with_tenant({prefix=>'tenant_a'});
@@ -45,16 +45,21 @@ my $legacy = Selecto::Engine->new(domain=>Selecto::Domain->new(name=>'Docs',tabl
 my $legacy_target = $legacy->with_tenant({prefix=>'tenant_a'});
 is_deeply($legacy_target->all($legacy_target->query->select('title'))->{rows}, [['Elm tenant']],
     'ordinary prefixed reads also preserve the attached virtual relation');
-my $events = 0;
-$db->sqlite_set_authorizer(sub { ++$events; return 0 });
+my $events = 0;my @authorizations;
+$db->sqlite_set_authorizer(sub { ++$events;push @authorizations,[@_];return 0 });
 sub refuses {
-    my ($label,$run) = @_;
-    $events = 0;
+    my ($label,$run,$capability_check) = @_;
+    $events = 0;@authorizations=();
     my ($value,$error);my $ok=eval{$value=$run->();1};$error=$@;
     diag('unrefused native result: '.JSON::PP->new->canonical->allow_blessed->encode($value)) if $ok;
     is(!$ok && ref($error) && UNIVERSAL::isa($error,'Selecto::Error') ? $error->code : 'none',
         'unsupported_feature',$label);
-    is($events,0,"$label prepares no native SQL, including capability catalog reads");
+    if ($capability_check) {
+        ok($events && !(grep { $_->[0]==20 && defined($_->[1]) && $_->[1]=~/\A(?:items|docs|items_search)\z/ } @authorizations),
+            "$label permits bounded capability checks but no business-table reads");
+    } else {
+        is($events,0,"$label prepares no native SQL, including capability catalog reads");
+    }
 }
 refuses('attached ordinary root cannot borrow main-index matches by rowid',sub{$target->all($q->where($search))});
 refuses('attached ordinary root cannot borrow main-index rank',sub{
@@ -62,7 +67,7 @@ refuses('attached ordinary root cannot borrow main-index rank',sub{
 });
 refuses('bounded preparation keeps the same main-only index authority',sub{
     Selecto::BoundedQuery->prepare($target,$q->where($search))
-});
+},1);
 refuses('attached legacy root cannot borrow the main FTS catalog proof',sub{
     $legacy_target->all($legacy_target->query->select('title')->where(Selecto::Expression->text_search(['title'],'Oak')))
 });
