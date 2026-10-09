@@ -2382,6 +2382,11 @@ sub imports      { my $contract = $_[0]->{contract} // {}; return dclone($contra
 sub editors      { return dclone($_[0]->{editors} // {}); }
 sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->{contract} // {}; return dclone($contract->{capabilities} // {}); }
+sub validate_capability_policy {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::CapabilityPolicy;
+    return Selecto::Domain::CapabilityPolicy->validate($contract);
+}
 sub components   { return dclone($_[0]->{components} // {}); }
 sub query_library {
     require Selecto::ConfiguredDomain;

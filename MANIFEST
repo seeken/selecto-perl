@@ -223,6 +223,9 @@ t/sqlite_query_library.t
 t/sqlite_query_library_budget.t
 t/sqlite_configured_domain.t
 lib/Selecto/Domain/QueryContract.pm
+lib/Selecto/Domain/CapabilityPolicy.pm
+t/domain_capability_policy.t
+t/fixtures/capability_policy.json
 t/fixtures/query_policy.json
 t/domain_query_contract.t
 t/sqlite_query_policy.t
