@@ -1,0 +1,2992 @@
+{
+  "QL001": {
+    "domain": {
+      "joins": {
+        "items": {
+          "name": "Items",
+          "type": "left"
+        }
+      },
+      "name": "Certification Query Library",
+      "query_library": {
+        "orderings": {
+          "highest_priority": {
+            "order_by": [
+              [
+                "priority",
+                "desc"
+              ],
+              [
+                "id",
+                "asc"
+              ]
+            ]
+          }
+        },
+        "projections": {
+          "item_identity": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "id"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "item_name": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "name"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "project_identity": {
+            "associations": [],
+            "fields": [
+              "id",
+              "name"
+            ],
+            "projections": []
+          },
+          "project_status": {
+            "associations": [],
+            "fields": [
+              "status",
+              "priority"
+            ],
+            "projections": []
+          },
+          "project_summary": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "project_status"
+            ]
+          },
+          "project_with_items": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "item_identity",
+              "item_name"
+            ]
+          }
+        },
+        "segments": {
+          "active_or_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "or",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_priority_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "and",
+                "segments": [
+                  "active_projects",
+                  "priority_at_least"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "active"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "active_xor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "xor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "archived_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "archived"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "inactive_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "not",
+                "segments": [
+                  "active_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "neither_active_nor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "nor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "priority_at_least": {
+            "filters": [
+              [
+                "gte",
+                "priority",
+                [
+                  "param",
+                  "minimum"
+                ]
+              ]
+            ],
+            "parameters": {
+              "minimum": {
+                "required": true,
+                "type": "integer"
+              }
+            },
+            "segment_groups": [],
+            "segments": []
+          }
+        },
+        "views": {
+          "active_project_summaries": {
+            "ordering": "highest_priority",
+            "projection": "project_summary",
+            "segments": [
+              "active_priority_projects"
+            ]
+          }
+        }
+      },
+      "required_filters": [
+        [
+          "visible",
+          true
+        ]
+      ],
+      "required_order_by": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "required_selected": [
+        "id"
+      ],
+      "schema_version": 1,
+      "schemas": {
+        "items": {
+          "associations": {},
+          "columns": {
+            "id": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "integer"
+            }
+          },
+          "fields": [
+            "id",
+            "name",
+            "project_id"
+          ],
+          "primary_key": "id",
+          "redact_fields": [],
+          "source_table": "items"
+        }
+      },
+      "source": {
+        "associations": {
+          "items": {
+            "field": "items",
+            "owner_key": "id",
+            "queryable": "items",
+            "related_key": "project_id"
+          }
+        },
+        "columns": {
+          "id": {
+            "type": "integer"
+          },
+          "inserted_at": {
+            "type": "utc_datetime"
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "visible": {
+            "type": "boolean"
+          }
+        },
+        "fields": [
+          "id",
+          "name",
+          "status",
+          "priority",
+          "visible",
+          "inserted_at"
+        ],
+        "primary_key": "id",
+        "redact_fields": [],
+        "source_table": "projects"
+      }
+    },
+    "projection": "query_contract"
+  },
+  "QL002": {
+    "domain": {
+      "joins": {
+        "items": {
+          "name": "Items",
+          "type": "left"
+        }
+      },
+      "name": "Certification Query Library",
+      "query_library": {
+        "orderings": {
+          "highest_priority": {
+            "order_by": [
+              [
+                "priority",
+                "desc"
+              ],
+              [
+                "id",
+                "asc"
+              ]
+            ]
+          }
+        },
+        "projections": {
+          "item_identity": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "id"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "item_name": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "name"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "project_identity": {
+            "associations": [],
+            "fields": [
+              "id",
+              "name"
+            ],
+            "projections": []
+          },
+          "project_status": {
+            "associations": [],
+            "fields": [
+              "status",
+              "priority"
+            ],
+            "projections": []
+          },
+          "project_summary": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "project_status"
+            ]
+          },
+          "project_with_items": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "item_identity",
+              "item_name"
+            ]
+          }
+        },
+        "segments": {
+          "active_or_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "or",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_priority_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "and",
+                "segments": [
+                  "active_projects",
+                  "priority_at_least"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "active"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "active_xor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "xor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "archived_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "archived"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "inactive_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "not",
+                "segments": [
+                  "active_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "neither_active_nor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "nor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "priority_at_least": {
+            "filters": [
+              [
+                "gte",
+                "priority",
+                [
+                  "param",
+                  "minimum"
+                ]
+              ]
+            ],
+            "parameters": {
+              "minimum": {
+                "required": true,
+                "type": "integer"
+              }
+            },
+            "segment_groups": [],
+            "segments": []
+          }
+        },
+        "views": {
+          "active_project_summaries": {
+            "ordering": "highest_priority",
+            "projection": "project_summary",
+            "segments": [
+              "active_priority_projects"
+            ]
+          }
+        }
+      },
+      "required_filters": [
+        [
+          "visible",
+          true
+        ]
+      ],
+      "required_order_by": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "required_selected": [
+        "id"
+      ],
+      "schema_version": 1,
+      "schemas": {
+        "items": {
+          "associations": {},
+          "columns": {
+            "id": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "integer"
+            }
+          },
+          "fields": [
+            "id",
+            "name",
+            "project_id"
+          ],
+          "primary_key": "id",
+          "redact_fields": [],
+          "source_table": "items"
+        }
+      },
+      "source": {
+        "associations": {
+          "items": {
+            "field": "items",
+            "owner_key": "id",
+            "queryable": "items",
+            "related_key": "project_id"
+          }
+        },
+        "columns": {
+          "id": {
+            "type": "integer"
+          },
+          "inserted_at": {
+            "type": "utc_datetime"
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "visible": {
+            "type": "boolean"
+          }
+        },
+        "fields": [
+          "id",
+          "name",
+          "status",
+          "priority",
+          "visible",
+          "inserted_at"
+        ],
+        "primary_key": "id",
+        "redact_fields": [],
+        "source_table": "projects"
+      }
+    },
+    "segments": [
+      {
+        "id": "active_priority_projects",
+        "name": "and",
+        "parameters": {
+          "minimum": "2"
+        }
+      },
+      {
+        "id": "active_or_archived_projects",
+        "name": "or",
+        "parameters": {}
+      },
+      {
+        "id": "inactive_projects",
+        "name": "not",
+        "parameters": {}
+      },
+      {
+        "id": "neither_active_nor_archived_projects",
+        "name": "nor",
+        "parameters": {}
+      },
+      {
+        "id": "active_xor_archived_projects",
+        "name": "xor",
+        "parameters": {}
+      }
+    ]
+  },
+  "QL003": {
+    "domain": {
+      "joins": {
+        "items": {
+          "name": "Items",
+          "type": "left"
+        }
+      },
+      "name": "Certification Query Library",
+      "query_library": {
+        "orderings": {
+          "highest_priority": {
+            "order_by": [
+              [
+                "priority",
+                "desc"
+              ],
+              [
+                "id",
+                "asc"
+              ]
+            ]
+          }
+        },
+        "projections": {
+          "item_identity": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "id"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "item_name": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "name"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "project_identity": {
+            "associations": [],
+            "fields": [
+              "id",
+              "name"
+            ],
+            "projections": []
+          },
+          "project_status": {
+            "associations": [],
+            "fields": [
+              "status",
+              "priority"
+            ],
+            "projections": []
+          },
+          "project_summary": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "project_status"
+            ]
+          },
+          "project_with_items": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "item_identity",
+              "item_name"
+            ]
+          }
+        },
+        "segments": {
+          "active_or_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "or",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_priority_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "and",
+                "segments": [
+                  "active_projects",
+                  "priority_at_least"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "active"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "active_xor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "xor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "archived_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "archived"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "inactive_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "not",
+                "segments": [
+                  "active_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "neither_active_nor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "nor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "priority_at_least": {
+            "filters": [
+              [
+                "gte",
+                "priority",
+                [
+                  "param",
+                  "minimum"
+                ]
+              ]
+            ],
+            "parameters": {
+              "minimum": {
+                "required": true,
+                "type": "integer"
+              }
+            },
+            "segment_groups": [],
+            "segments": []
+          }
+        },
+        "views": {
+          "active_project_summaries": {
+            "ordering": "highest_priority",
+            "projection": "project_summary",
+            "segments": [
+              "active_priority_projects"
+            ]
+          }
+        }
+      },
+      "required_filters": [
+        [
+          "visible",
+          true
+        ]
+      ],
+      "required_order_by": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "required_selected": [
+        "id"
+      ],
+      "schema_version": 1,
+      "schemas": {
+        "items": {
+          "associations": {},
+          "columns": {
+            "id": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "integer"
+            }
+          },
+          "fields": [
+            "id",
+            "name",
+            "project_id"
+          ],
+          "primary_key": "id",
+          "redact_fields": [],
+          "source_table": "items"
+        }
+      },
+      "source": {
+        "associations": {
+          "items": {
+            "field": "items",
+            "owner_key": "id",
+            "queryable": "items",
+            "related_key": "project_id"
+          }
+        },
+        "columns": {
+          "id": {
+            "type": "integer"
+          },
+          "inserted_at": {
+            "type": "utc_datetime"
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "visible": {
+            "type": "boolean"
+          }
+        },
+        "fields": [
+          "id",
+          "name",
+          "status",
+          "priority",
+          "visible",
+          "inserted_at"
+        ],
+        "primary_key": "id",
+        "redact_fields": [],
+        "source_table": "projects"
+      }
+    },
+    "projection": "project_with_items"
+  },
+  "QL004": {
+    "domain": {
+      "joins": {
+        "items": {
+          "name": "Items",
+          "type": "left"
+        }
+      },
+      "name": "Certification Query Library",
+      "query_library": {
+        "orderings": {
+          "highest_priority": {
+            "order_by": [
+              [
+                "priority",
+                "desc"
+              ],
+              [
+                "id",
+                "asc"
+              ]
+            ]
+          }
+        },
+        "projections": {
+          "item_identity": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "id"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "item_name": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "name"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "project_identity": {
+            "associations": [],
+            "fields": [
+              "id",
+              "name"
+            ],
+            "projections": []
+          },
+          "project_status": {
+            "associations": [],
+            "fields": [
+              "status",
+              "priority"
+            ],
+            "projections": []
+          },
+          "project_summary": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "project_status"
+            ]
+          },
+          "project_with_items": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "item_identity",
+              "item_name"
+            ]
+          }
+        },
+        "segments": {
+          "active_or_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "or",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_priority_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "and",
+                "segments": [
+                  "active_projects",
+                  "priority_at_least"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "active"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "active_xor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "xor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "archived_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "archived"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "inactive_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "not",
+                "segments": [
+                  "active_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "neither_active_nor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "nor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "priority_at_least": {
+            "filters": [
+              [
+                "gte",
+                "priority",
+                [
+                  "param",
+                  "minimum"
+                ]
+              ]
+            ],
+            "parameters": {
+              "minimum": {
+                "required": true,
+                "type": "integer"
+              }
+            },
+            "segment_groups": [],
+            "segments": []
+          }
+        },
+        "views": {
+          "active_project_summaries": {
+            "ordering": "highest_priority",
+            "projection": "project_summary",
+            "segments": [
+              "active_priority_projects"
+            ]
+          }
+        }
+      },
+      "required_filters": [
+        [
+          "visible",
+          true
+        ]
+      ],
+      "required_order_by": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "required_selected": [
+        "id"
+      ],
+      "schema_version": 1,
+      "schemas": {
+        "items": {
+          "associations": {},
+          "columns": {
+            "id": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "integer"
+            }
+          },
+          "fields": [
+            "id",
+            "name",
+            "project_id"
+          ],
+          "primary_key": "id",
+          "redact_fields": [],
+          "source_table": "items"
+        }
+      },
+      "source": {
+        "associations": {
+          "items": {
+            "field": "items",
+            "owner_key": "id",
+            "queryable": "items",
+            "related_key": "project_id"
+          }
+        },
+        "columns": {
+          "id": {
+            "type": "integer"
+          },
+          "inserted_at": {
+            "type": "utc_datetime"
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "visible": {
+            "type": "boolean"
+          }
+        },
+        "fields": [
+          "id",
+          "name",
+          "status",
+          "priority",
+          "visible",
+          "inserted_at"
+        ],
+        "primary_key": "id",
+        "redact_fields": [],
+        "source_table": "projects"
+      }
+    },
+    "parameters": {
+      "minimum": "3"
+    },
+    "view": "active_project_summaries"
+  },
+  "QL005": {
+    "attempts": [
+      {
+        "domain": {
+          "joins": {
+            "items": {
+              "name": "Items",
+              "type": "left"
+            }
+          },
+          "name": "Certification Query Library",
+          "query_library": {
+            "orderings": {
+              "highest_priority": {
+                "order_by": [
+                  [
+                    "priority",
+                    "desc"
+                  ],
+                  [
+                    "id",
+                    "asc"
+                  ]
+                ]
+              }
+            },
+            "projections": {
+              "broken": {
+                "fields": [
+                  "missing_field"
+                ]
+              },
+              "item_identity": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "id"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "item_name": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "name"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "project_identity": {
+                "associations": [],
+                "fields": [
+                  "id",
+                  "name"
+                ],
+                "projections": []
+              },
+              "project_status": {
+                "associations": [],
+                "fields": [
+                  "status",
+                  "priority"
+                ],
+                "projections": []
+              },
+              "project_summary": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "project_status"
+                ]
+              },
+              "project_with_items": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "item_identity",
+                  "item_name"
+                ]
+              }
+            },
+            "segments": {
+              "active_or_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "or",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_priority_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "and",
+                    "segments": [
+                      "active_projects",
+                      "priority_at_least"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "active"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "active_xor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "archived_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "archived"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "inactive_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "not",
+                    "segments": [
+                      "active_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "neither_active_nor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "nor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "priority_at_least": {
+                "filters": [
+                  [
+                    "gte",
+                    "priority",
+                    [
+                      "param",
+                      "minimum"
+                    ]
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "required": true,
+                    "type": "integer"
+                  }
+                },
+                "segment_groups": [],
+                "segments": []
+              }
+            },
+            "views": {
+              "active_project_summaries": {
+                "ordering": "highest_priority",
+                "projection": "project_summary",
+                "segments": [
+                  "active_priority_projects"
+                ]
+              }
+            }
+          },
+          "required_filters": [
+            [
+              "visible",
+              true
+            ]
+          ],
+          "required_order_by": [
+            [
+              "id",
+              "asc"
+            ]
+          ],
+          "required_selected": [
+            "id"
+          ],
+          "schema_version": 1,
+          "schemas": {
+            "items": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "project_id": {
+                  "type": "integer"
+                }
+              },
+              "fields": [
+                "id",
+                "name",
+                "project_id"
+              ],
+              "primary_key": "id",
+              "redact_fields": [],
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {
+              "items": {
+                "field": "items",
+                "owner_key": "id",
+                "queryable": "items",
+                "related_key": "project_id"
+              }
+            },
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "inserted_at": {
+                "type": "utc_datetime"
+              },
+              "name": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "integer"
+              },
+              "status": {
+                "type": "string"
+              },
+              "visible": {
+                "type": "boolean"
+              }
+            },
+            "fields": [
+              "id",
+              "name",
+              "status",
+              "priority",
+              "visible",
+              "inserted_at"
+            ],
+            "primary_key": "id",
+            "redact_fields": [],
+            "source_table": "projects"
+          }
+        },
+        "id": "invalid_field"
+      },
+      {
+        "domain": {
+          "joins": {
+            "items": {
+              "name": "Items",
+              "type": "left"
+            }
+          },
+          "name": "Certification Query Library",
+          "query_library": {
+            "orderings": {
+              "highest_priority": {
+                "order_by": [
+                  [
+                    "priority",
+                    "desc"
+                  ],
+                  [
+                    "id",
+                    "asc"
+                  ]
+                ]
+              }
+            },
+            "projections": {
+              "item_identity": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "id"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "item_name": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "name"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "project_identity": {
+                "associations": [],
+                "fields": [
+                  "id",
+                  "name"
+                ],
+                "projections": []
+              },
+              "project_status": {
+                "associations": [],
+                "fields": [
+                  "status",
+                  "priority"
+                ],
+                "projections": []
+              },
+              "project_summary": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "project_status"
+                ]
+              },
+              "project_with_items": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "item_identity",
+                  "item_name"
+                ]
+              }
+            },
+            "segments": {
+              "active_or_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "or",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_priority_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "and",
+                    "segments": [
+                      "active_projects",
+                      "priority_at_least"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "active"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "active_xor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "archived_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "archived"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "inactive_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "not",
+                    "segments": [
+                      "active_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "neither_active_nor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "nor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "priority_at_least": {
+                "filters": [
+                  [
+                    "gte",
+                    "priority",
+                    [
+                      "param",
+                      "minimum"
+                    ]
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "required": true,
+                    "type": "integer"
+                  }
+                },
+                "segment_groups": [],
+                "segments": []
+              }
+            },
+            "views": {
+              "active_project_summaries": {
+                "ordering": "highest_priority",
+                "projection": "project_summary",
+                "segments": [
+                  "active_priority_projects"
+                ]
+              },
+              "broken": {
+                "segments": [
+                  "missing_segment"
+                ]
+              }
+            }
+          },
+          "required_filters": [
+            [
+              "visible",
+              true
+            ]
+          ],
+          "required_order_by": [
+            [
+              "id",
+              "asc"
+            ]
+          ],
+          "required_selected": [
+            "id"
+          ],
+          "schema_version": 1,
+          "schemas": {
+            "items": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "project_id": {
+                  "type": "integer"
+                }
+              },
+              "fields": [
+                "id",
+                "name",
+                "project_id"
+              ],
+              "primary_key": "id",
+              "redact_fields": [],
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {
+              "items": {
+                "field": "items",
+                "owner_key": "id",
+                "queryable": "items",
+                "related_key": "project_id"
+              }
+            },
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "inserted_at": {
+                "type": "utc_datetime"
+              },
+              "name": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "integer"
+              },
+              "status": {
+                "type": "string"
+              },
+              "visible": {
+                "type": "boolean"
+              }
+            },
+            "fields": [
+              "id",
+              "name",
+              "status",
+              "priority",
+              "visible",
+              "inserted_at"
+            ],
+            "primary_key": "id",
+            "redact_fields": [],
+            "source_table": "projects"
+          }
+        },
+        "id": "missing_definition"
+      },
+      {
+        "domain": {
+          "joins": {
+            "items": {
+              "name": "Items",
+              "type": "left"
+            }
+          },
+          "name": "Certification Query Library",
+          "query_library": {
+            "orderings": {
+              "highest_priority": {
+                "order_by": [
+                  [
+                    "priority",
+                    "desc"
+                  ],
+                  [
+                    "id",
+                    "asc"
+                  ]
+                ]
+              }
+            },
+            "projections": {
+              "item_identity": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "id"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "item_name": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "name"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "project_identity": {
+                "associations": [],
+                "fields": [
+                  "id",
+                  "name"
+                ],
+                "projections": []
+              },
+              "project_status": {
+                "associations": [],
+                "fields": [
+                  "status",
+                  "priority"
+                ],
+                "projections": []
+              },
+              "project_summary": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "project_status"
+                ]
+              },
+              "project_with_items": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "item_identity",
+                  "item_name"
+                ]
+              }
+            },
+            "segments": {
+              "active_or_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "or",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_priority_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "and",
+                    "segments": [
+                      "active_projects",
+                      "priority_at_least"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "active"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "and",
+                    "segments": [
+                      "active_priority_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_xor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "archived_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "archived"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "inactive_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "not",
+                    "segments": [
+                      "active_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "neither_active_nor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "nor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "priority_at_least": {
+                "filters": [
+                  [
+                    "gte",
+                    "priority",
+                    [
+                      "param",
+                      "minimum"
+                    ]
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "required": true,
+                    "type": "integer"
+                  }
+                },
+                "segment_groups": [],
+                "segments": []
+              }
+            },
+            "views": {
+              "active_project_summaries": {
+                "ordering": "highest_priority",
+                "projection": "project_summary",
+                "segments": [
+                  "active_priority_projects"
+                ]
+              }
+            }
+          },
+          "required_filters": [
+            [
+              "visible",
+              true
+            ]
+          ],
+          "required_order_by": [
+            [
+              "id",
+              "asc"
+            ]
+          ],
+          "required_selected": [
+            "id"
+          ],
+          "schema_version": 1,
+          "schemas": {
+            "items": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "project_id": {
+                  "type": "integer"
+                }
+              },
+              "fields": [
+                "id",
+                "name",
+                "project_id"
+              ],
+              "primary_key": "id",
+              "redact_fields": [],
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {
+              "items": {
+                "field": "items",
+                "owner_key": "id",
+                "queryable": "items",
+                "related_key": "project_id"
+              }
+            },
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "inserted_at": {
+                "type": "utc_datetime"
+              },
+              "name": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "integer"
+              },
+              "status": {
+                "type": "string"
+              },
+              "visible": {
+                "type": "boolean"
+              }
+            },
+            "fields": [
+              "id",
+              "name",
+              "status",
+              "priority",
+              "visible",
+              "inserted_at"
+            ],
+            "primary_key": "id",
+            "redact_fields": [],
+            "source_table": "projects"
+          }
+        },
+        "id": "segment_cycle"
+      },
+      {
+        "domain": {
+          "joins": {
+            "items": {
+              "name": "Items",
+              "type": "left"
+            }
+          },
+          "name": "Certification Query Library",
+          "query_library": {
+            "orderings": {
+              "highest_priority": {
+                "order_by": [
+                  [
+                    "priority",
+                    "desc"
+                  ],
+                  [
+                    "id",
+                    "asc"
+                  ]
+                ]
+              }
+            },
+            "projections": {
+              "item_identity": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "id"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "item_name": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "name"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "project_identity": {
+                "associations": [],
+                "fields": [
+                  "id",
+                  "name"
+                ],
+                "projections": [
+                  "project_summary"
+                ]
+              },
+              "project_status": {
+                "associations": [],
+                "fields": [
+                  "status",
+                  "priority"
+                ],
+                "projections": []
+              },
+              "project_summary": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "project_status"
+                ]
+              },
+              "project_with_items": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "item_identity",
+                  "item_name"
+                ]
+              }
+            },
+            "segments": {
+              "active_or_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "or",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_priority_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "and",
+                    "segments": [
+                      "active_projects",
+                      "priority_at_least"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "active"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "active_xor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "archived_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "archived"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "inactive_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "not",
+                    "segments": [
+                      "active_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "neither_active_nor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "nor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "priority_at_least": {
+                "filters": [
+                  [
+                    "gte",
+                    "priority",
+                    [
+                      "param",
+                      "minimum"
+                    ]
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "required": true,
+                    "type": "integer"
+                  }
+                },
+                "segment_groups": [],
+                "segments": []
+              }
+            },
+            "views": {
+              "active_project_summaries": {
+                "ordering": "highest_priority",
+                "projection": "project_summary",
+                "segments": [
+                  "active_priority_projects"
+                ]
+              }
+            }
+          },
+          "required_filters": [
+            [
+              "visible",
+              true
+            ]
+          ],
+          "required_order_by": [
+            [
+              "id",
+              "asc"
+            ]
+          ],
+          "required_selected": [
+            "id"
+          ],
+          "schema_version": 1,
+          "schemas": {
+            "items": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "project_id": {
+                  "type": "integer"
+                }
+              },
+              "fields": [
+                "id",
+                "name",
+                "project_id"
+              ],
+              "primary_key": "id",
+              "redact_fields": [],
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {
+              "items": {
+                "field": "items",
+                "owner_key": "id",
+                "queryable": "items",
+                "related_key": "project_id"
+              }
+            },
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "inserted_at": {
+                "type": "utc_datetime"
+              },
+              "name": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "integer"
+              },
+              "status": {
+                "type": "string"
+              },
+              "visible": {
+                "type": "boolean"
+              }
+            },
+            "fields": [
+              "id",
+              "name",
+              "status",
+              "priority",
+              "visible",
+              "inserted_at"
+            ],
+            "primary_key": "id",
+            "redact_fields": [],
+            "source_table": "projects"
+          }
+        },
+        "id": "projection_cycle"
+      },
+      {
+        "domain": {
+          "joins": {
+            "items": {
+              "name": "Items",
+              "type": "left"
+            }
+          },
+          "name": "Certification Query Library",
+          "query_library": {
+            "orderings": {
+              "highest_priority": {
+                "order_by": [
+                  [
+                    "priority",
+                    "desc"
+                  ],
+                  [
+                    "id",
+                    "asc"
+                  ]
+                ]
+              }
+            },
+            "projections": {
+              "item_identity": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "id"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "item_name": {
+                "associations": [
+                  {
+                    "associations": [],
+                    "fields": [
+                      "name"
+                    ],
+                    "name": "items"
+                  }
+                ],
+                "fields": [],
+                "projections": []
+              },
+              "project_identity": {
+                "associations": [],
+                "fields": [
+                  "id",
+                  "name"
+                ],
+                "projections": []
+              },
+              "project_status": {
+                "associations": [],
+                "fields": [
+                  "status",
+                  "priority"
+                ],
+                "projections": []
+              },
+              "project_summary": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "project_status"
+                ]
+              },
+              "project_with_items": {
+                "associations": [],
+                "fields": [],
+                "projections": [
+                  "project_identity",
+                  "item_identity",
+                  "item_name"
+                ]
+              }
+            },
+            "segments": {
+              "active_or_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "or",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_priority_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "and",
+                    "segments": [
+                      "active_projects",
+                      "priority_at_least"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "active_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "active"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "active_xor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "archived_projects": {
+                "filters": [
+                  [
+                    "eq",
+                    "status",
+                    "archived"
+                  ]
+                ],
+                "parameters": {},
+                "segment_groups": [],
+                "segments": []
+              },
+              "inactive_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "not",
+                    "segments": [
+                      "active_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "neither_active_nor_archived_projects": {
+                "filters": [],
+                "parameters": {},
+                "segment_groups": [
+                  {
+                    "operator": "nor",
+                    "segments": [
+                      "active_projects",
+                      "archived_projects"
+                    ]
+                  }
+                ],
+                "segments": []
+              },
+              "priority_at_least": {
+                "filters": [
+                  [
+                    "gte",
+                    "priority",
+                    [
+                      "param",
+                      "minimum"
+                    ]
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "required": true,
+                    "type": "integer"
+                  }
+                },
+                "segment_groups": [],
+                "segments": []
+              }
+            },
+            "views": {
+              "active_project_summaries": {
+                "ordering": "highest_priority",
+                "projection": "project_summary",
+                "segments": [
+                  "active_priority_projects"
+                ]
+              }
+            }
+          },
+          "required_filters": [
+            [
+              "visible",
+              true
+            ]
+          ],
+          "required_order_by": [
+            [
+              "id",
+              "asc"
+            ]
+          ],
+          "required_selected": [
+            "id"
+          ],
+          "schema_version": 1,
+          "schemas": {
+            "items": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "project_id": {
+                  "type": "integer"
+                }
+              },
+              "fields": [
+                "id",
+                "name",
+                "project_id"
+              ],
+              "primary_key": "id",
+              "redact_fields": [],
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {
+              "items": {
+                "field": "items",
+                "owner_key": "id",
+                "queryable": "items",
+                "related_key": "project_id"
+              }
+            },
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "inserted_at": {
+                "type": "utc_datetime"
+              },
+              "name": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "integer"
+              },
+              "status": {
+                "type": "string"
+              },
+              "visible": {
+                "type": "boolean"
+              }
+            },
+            "fields": [
+              "id",
+              "name",
+              "status",
+              "priority",
+              "visible",
+              "inserted_at"
+            ],
+            "primary_key": "id",
+            "redact_fields": [],
+            "source_table": "projects"
+          }
+        },
+        "id": "xor_arity"
+      }
+    ],
+    "domain": {
+      "joins": {
+        "items": {
+          "name": "Items",
+          "type": "left"
+        }
+      },
+      "name": "Certification Query Library",
+      "query_library": {
+        "orderings": {
+          "highest_priority": {
+            "order_by": [
+              [
+                "priority",
+                "desc"
+              ],
+              [
+                "id",
+                "asc"
+              ]
+            ]
+          }
+        },
+        "projections": {
+          "item_identity": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "id"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "item_name": {
+            "associations": [
+              {
+                "associations": [],
+                "fields": [
+                  "name"
+                ],
+                "name": "items"
+              }
+            ],
+            "fields": [],
+            "projections": []
+          },
+          "project_identity": {
+            "associations": [],
+            "fields": [
+              "id",
+              "name"
+            ],
+            "projections": []
+          },
+          "project_status": {
+            "associations": [],
+            "fields": [
+              "status",
+              "priority"
+            ],
+            "projections": []
+          },
+          "project_summary": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "project_status"
+            ]
+          },
+          "project_with_items": {
+            "associations": [],
+            "fields": [],
+            "projections": [
+              "project_identity",
+              "item_identity",
+              "item_name"
+            ]
+          }
+        },
+        "segments": {
+          "active_or_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "or",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_priority_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "and",
+                "segments": [
+                  "active_projects",
+                  "priority_at_least"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "active_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "active"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "active_xor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "xor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "archived_projects": {
+            "filters": [
+              [
+                "eq",
+                "status",
+                "archived"
+              ]
+            ],
+            "parameters": {},
+            "segment_groups": [],
+            "segments": []
+          },
+          "inactive_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "not",
+                "segments": [
+                  "active_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "neither_active_nor_archived_projects": {
+            "filters": [],
+            "parameters": {},
+            "segment_groups": [
+              {
+                "operator": "nor",
+                "segments": [
+                  "active_projects",
+                  "archived_projects"
+                ]
+              }
+            ],
+            "segments": []
+          },
+          "priority_at_least": {
+            "filters": [
+              [
+                "gte",
+                "priority",
+                [
+                  "param",
+                  "minimum"
+                ]
+              ]
+            ],
+            "parameters": {
+              "minimum": {
+                "required": true,
+                "type": "integer"
+              }
+            },
+            "segment_groups": [],
+            "segments": []
+          }
+        },
+        "views": {
+          "active_project_summaries": {
+            "ordering": "highest_priority",
+            "projection": "project_summary",
+            "segments": [
+              "active_priority_projects"
+            ]
+          }
+        }
+      },
+      "required_filters": [
+        [
+          "visible",
+          true
+        ]
+      ],
+      "required_order_by": [
+        [
+          "id",
+          "asc"
+        ]
+      ],
+      "required_selected": [
+        "id"
+      ],
+      "schema_version": 1,
+      "schemas": {
+        "items": {
+          "associations": {},
+          "columns": {
+            "id": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "integer"
+            }
+          },
+          "fields": [
+            "id",
+            "name",
+            "project_id"
+          ],
+          "primary_key": "id",
+          "redact_fields": [],
+          "source_table": "items"
+        }
+      },
+      "source": {
+        "associations": {
+          "items": {
+            "field": "items",
+            "owner_key": "id",
+            "queryable": "items",
+            "related_key": "project_id"
+          }
+        },
+        "columns": {
+          "id": {
+            "type": "integer"
+          },
+          "inserted_at": {
+            "type": "utc_datetime"
+          },
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "visible": {
+            "type": "boolean"
+          }
+        },
+        "fields": [
+          "id",
+          "name",
+          "status",
+          "priority",
+          "visible",
+          "inserted_at"
+        ],
+        "primary_key": "id",
+        "redact_fields": [],
+        "source_table": "projects"
+      }
+    }
+  }
+}

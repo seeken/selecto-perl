@@ -19,7 +19,7 @@ my %COLLISION_SECTION = map { $_ => 1 } qw(
     actions capabilities source_relationships choice_sources
 );
 my %LIST_SECTION = map { $_ => 1 } qw(
-    default_selected required_selected required_order_by redact_fields
+    default_selected required_selected required_order_by required_group_by redact_fields
 );
 
 sub compose {

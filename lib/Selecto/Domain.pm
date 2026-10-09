@@ -14,7 +14,7 @@ use Selecto::Write::Scope ();
 
 my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
-    default_selected required_selected required_order_by required_filters
+    default_selected required_selected required_order_by required_group_by required_filters
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions imports editors extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
@@ -25,7 +25,7 @@ my %RELATION = map { $_ => 1 } qw(
     source_table values primary_key fields columns associations tenant_field redact_fields
 );
 my %ASSOCIATION = map { $_ => 1 } qw(
-    queryable owner_key related_key cardinality through source_scope_key target_scope_key where
+    queryable field owner_key related_key cardinality through source_scope_key target_scope_key where
     join_strategy
 );
 my %JOIN = map { $_ => 1 } qw(
@@ -52,6 +52,14 @@ my %EDITOR_COLLECTION = map { $_ => 1 } qw(
 my %EDITOR_COLLECTION_FIELD = map { $_ => 1 } qw(field label);
 
 sub new {
+    my ($class, %args) = @_;
+    my $self = $class->_construct(%args);
+    $self->validate_query_library;
+    return $self;
+}
+
+# Canonical parsing attaches its full schema graph before library validation.
+sub _construct {
     my ($class, %args) = @_;
     my $fields = _normalize_fields($args{fields}, 'fields');
     my %associations;
@@ -262,6 +270,10 @@ sub parse {
             unless $ok;
     }
     _object($raw, 'domain');
+    if (defined($raw->{query_library})) {
+        require Selecto::OperationBudget;
+        Selecto::OperationBudget->new(code => 'invalid_query_library')->check_tree($raw->{query_library}, label => 'query library');
+    }
     _reject_unknown($raw, \%TOP_LEVEL, 'domain') if $strict;
     _required_key($raw, 'source', 'domain');
     _object($raw->{source}, 'source');
@@ -317,7 +329,7 @@ sub _parse_canonical {
 
     _required_key($raw, 'name', 'domain');
     _required_key($source, 'source_table', 'source');
-    my $domain = $class->new(
+    my $domain = $class->_construct(
         name => $raw->{name},
         table => $source->{source_table},
         fields => _canonical_fields($source),
@@ -352,6 +364,7 @@ sub _parse_canonical {
     $domain->{detail_actions} = _validate_detail_actions(
         $domain, $raw->{detail_actions},
     );
+    $domain->validate_query_library;
     my $fingerprint_document = dclone($raw);
     delete $fingerprint_document->{domain_fingerprint};
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
@@ -392,6 +405,7 @@ sub _apply_required_filters {
     };
     Selecto::Error->throw('invalid_domain', 'required_filters contains an unsupported or invalid guard') unless $ok;
     $domain->{required_predicate} = Selecto::QueryEnforcement::combine(@predicates);
+    $domain->{required_predicate}{_query_filter_list} = 1 if @predicates > 1;
     return $domain->_refresh_fingerprint;
 }
 
@@ -508,6 +522,7 @@ sub _canonical_associations {
         _object($association, "association $path");
         _reject_unknown($association, \%ASSOCIATION, "association $path") if $strict;
         _required_key($association, 'queryable', "association $path");
+        _identifier($association->{field}, 'association field') if exists $association->{field};
         my $queryable = $association->{queryable};
         Selecto::Error->throw('invalid_domain', "missing schema $queryable")
             unless exists $schemas->{$queryable};
@@ -1542,11 +1557,13 @@ sub _normalize_query_library {
     my ($value) = @_;
     return {} unless defined $value;
     _object($value, 'query_library');
+    require Selecto::OperationBudget;
+    Selecto::OperationBudget->new(code => 'invalid_query_library')->check_tree($value, label => 'query library');
     my %known = map { $_ => 1 } qw(segments projections orderings views segment_picker_groups);
     _reject_unknown($value, \%known, 'query_library');
     my %library;
     for my $registry (qw(segments projections orderings views)) {
-        my $definitions = $value->{$registry} // {};
+        my $definitions = exists($value->{$registry}) ? $value->{$registry} : {};
         _object($definitions, "query_library $registry");
         $library{$registry} = dclone($definitions);
     }
@@ -2328,6 +2345,19 @@ sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->{contract} // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }
 sub query_library { return dclone($_[0]->{query_library} // {}); }
+sub query_contract {
+    my ($self) = @_;
+    require Selecto::Domain::Identity;
+    return Selecto::Domain::Identity->normalize($self)->{normalized}{query};
+}
+sub validate_query_library {
+    my ($self, $limits) = @_;
+    require Selecto::QueryLibrary;
+    my $report = Selecto::QueryLibrary->validate($self, $limits);
+    Selecto::Error->throw('invalid_query_library', 'query-library declaration failed validation', $report)
+        unless $report->{valid};
+    return $report;
+}
 sub co_domains   { return dclone($_[0]->{co_domains} // {}); }
 sub domain_dependencies { return dclone($_[0]->{domain_dependencies} // []); }
 sub contract_snapshot {

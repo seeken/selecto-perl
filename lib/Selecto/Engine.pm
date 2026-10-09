@@ -82,6 +82,7 @@ sub new {
     my $limits = $args{limits} // Selecto::Limits->new;
     Selecto::Error->throw('invalid_limits', 'engine limits must be a Selecto::Limits object')
         unless blessed($limits) && $limits->isa('Selecto::Limits');
+    $args{domain}->validate_query_library($limits);
     return bless {
         domain => $args{domain},
         adapter => $args{adapter},
@@ -179,6 +180,11 @@ sub domain  { return $_[0]->{domain}; }
 sub adapter { return $_[0]->{adapter}; }
 sub domain_ref { return $_[0]->{domain_ref}; }
 sub query   { return Selecto::Query->new; }
+sub query_filters {
+    my ($self, $query) = @_;
+    require Selecto::QueryPolicy;
+    return Selecto::QueryPolicy->filters($self->read_domain, $query, $self->{limits});
+}
 sub compile {
     my ($self, $query) = @_;
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(

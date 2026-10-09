@@ -76,6 +76,8 @@ sub _engine_admitted {
 
 sub _compile_query {
     my ($self, $domain, $query) = @_;
+    require Selecto::QueryPolicy;
+    $query = Selecto::QueryPolicy->apply($domain, $query, $self->{_selecto_compile_limits});
     Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')->check_tree(
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
         allowed_base_classes => ['Selecto::Query'])

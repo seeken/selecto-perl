@@ -212,3 +212,7 @@ t/sqlite_numeric_parameters.t
 lib/Selecto/Domain/Identity.pm
 t/domain_identity.t
 t/fixtures/domain_identity.json
+lib/Selecto/QueryLibrary/Contract.pm
+lib/Selecto/QueryPolicy.pm
+t/fixtures/query_library.json
+t/sqlite_query_library.t

@@ -6,11 +6,16 @@ use warnings;
 use JSON::PP ();
 use Scalar::Util qw(blessed looks_like_number);
 use Storable qw(dclone);
+use POSIX qw(isfinite);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Limits ();
 
 my @REGISTRIES = qw(segments projections orderings views);
+sub validate {
+    require Selecto::QueryLibrary::Contract;
+    return Selecto::QueryLibrary::Contract->validate($_[1], $_[2]);
+}
 
 sub library {
     my ($class, $domain) = @_;
@@ -167,10 +172,14 @@ sub apply_segments {
     my @predicates = map { _filter_expression($_, $values, $limits) } @{$resolved->{filters}};
     my $predicate = @predicates == 1 ? $predicates[0]
         : @predicates ? Selecto::Expression->all(\@predicates) : undef;
+    $predicate->{_query_filter_list} = 1 if @predicates > 1;
     if ($predicate) {
         my $existing = $query->predicate;
-        $query = $query->where($existing
-            ? Selecto::Expression->all([$existing, $predicate]) : $predicate);
+        if ($existing) {
+            $predicate = Selecto::Expression->all([$existing, $predicate]);
+            $predicate->{_query_filter_list} = 1;
+        }
+        $query = $query->where($predicate);
     }
     my $applied = $query->applied_query_library;
     _append_unique($applied->{segments}, $_) for @{$resolved->{ids}};
@@ -182,10 +191,11 @@ sub apply_projection {
     _query($query);
     my @ids = ref($projection_ids) eq 'ARRAY' ? @$projection_ids : ($projection_ids);
     my $library = $class->library($domain);
-    my (%seen, @fields, @applied_ids);
+    my (%seen, @fields, @applied_ids, @associations);
     for my $id (@ids) {
         my $resolved = _resolve_projection($library, $id, []);
-        push @fields, grep { !$seen{$_}++ } @{$resolved->{fields}};
+        push @fields, grep { !$seen{$_}++ } @{$resolved->{root_fields}};
+        _merge_associations(\@associations, $resolved->{associations});
         _append_unique(\@applied_ids, $_) for @{$resolved->{ids}};
     }
     my $contract = $domain->contract // {};
@@ -193,9 +203,11 @@ sub apply_projection {
         ? @{$contract->{required_selected}} : ();
     @fields = grep { !$seen{"required\0$_"}++ } (@required, @fields);
     Selecto::Error->throw('invalid_query_library', 'projection does not select any fields')
-        unless @fields;
+        unless @fields || @associations;
     $domain->resolve($_) for @fields;
-    $query = $query->replace_selections(\@fields);
+    my @selections = (map { Selecto::Expression->field($_) } @fields);
+    push @selections, map { _association_expression($domain, $_) } @associations;
+    $query = $query->replace_selections(\@selections);
     my $applied = $query->applied_query_library;
     _append_unique($applied->{projections}, $_) for @applied_ids;
     $applied->{projection} = "$ids[-1]";
@@ -311,18 +323,48 @@ sub _resolve_projection {
     Selecto::Error->throw('query_library_cycle', 'query-library projection cycle detected')
         if grep { $_ eq $key } @$stack;
     my $spec = _definition($library->{projections}, 'projections', $key);
-    my (%seen, @fields, @ids);
+    my (%seen, %root_seen, @fields, @root_fields, @associations, @ids);
     for my $child (@{$spec->{projections} // []}) {
         my $part = _resolve_projection($library, $child, [@$stack, $key]);
         push @fields, grep { !$seen{$_}++ } @{$part->{fields}};
+        push @root_fields, grep { !$root_seen{$_}++ } @{$part->{root_fields}};
+        _merge_associations(\@associations, $part->{associations});
         _append_unique(\@ids, $_) for @{$part->{ids}};
     }
     push @fields, grep { !$seen{$_}++ } map { "$_" } @{$spec->{fields} // []};
+    push @root_fields, grep { !$root_seen{$_}++ } map { "$_" } @{$spec->{fields} // []};
     for my $association (@{$spec->{associations} // []}) {
         push @fields, grep { !$seen{$_}++ } @{_association_fields($association, undef)};
     }
+    _merge_associations(\@associations, $spec->{associations} // []);
     _append_unique(\@ids, $key);
-    return {fields => \@fields, ids => \@ids};
+    return {fields => \@fields, root_fields => \@root_fields, associations => \@associations, ids => \@ids};
+}
+
+sub _merge_associations {
+    my ($target, $incoming) = @_;
+    _array($incoming, 'projection associations');
+    for my $entry (@$incoming) {
+        Selecto::Error->throw('invalid_query_library', 'projection association must be an object') unless ref($entry) eq 'HASH';
+        my $name = _id($entry->{name}, 'association');
+        _array($entry->{fields} // [], 'association fields');
+        my ($existing) = grep { $_->{name} eq $name } @$target;
+        unless ($existing) { $existing = {name => $name, fields => [], associations => []}; push @$target, $existing }
+        _append_unique($existing->{fields}, $_) for @{$entry->{fields} // []};
+        _merge_associations($existing->{associations}, $entry->{associations} // []);
+    }
+}
+
+sub _association_expression {
+    my ($domain, $association) = @_;
+    Selecto::Error->throw('unsupported_feature', 'nested library collections require a separately bounded profile')
+        if @{$association->{associations}};
+    my $name = $association->{name};
+    my $resolved = $domain->resolve_association($name)->{association};
+    Selecto::Error->throw('invalid_query_library', 'library collections require a to-many association')
+        unless $resolved->cardinality eq 'many';
+    $domain->resolve("$name.$_") for @{$association->{fields}};
+    return Selecto::Expression->related_collection($name, $association->{fields})->as($name);
 }
 
 sub _association_fields {
@@ -401,13 +443,20 @@ sub _cast_parameter {
     }
     if ($type eq 'integer') {
         Selecto::Error->throw('invalid_query_library', "segment parameter $id must be integer")
-            unless !ref($value) && "$value" =~ /\A[+-]?\d+\z/;
-        return 0 + $value;
+            unless !ref($value) && "$value" =~ /\A[+-]?[0-9]+\z/;
+        my $digits = "$value";
+        my $negative = $digits =~ s/\A-//;
+        $digits =~ s/\A\+//;
+        $digits =~ s/\A0+(?=[0-9])//;
+        my $bound = $negative ? '9223372036854775808' : '9223372036854775807';
+        Selecto::Error->throw('invalid_query_library', "segment parameter $id exceeds signed 64-bit integer range")
+            if length($digits) > length($bound) || (length($digits) == length($bound) && $digits gt $bound);
+        return 0 + ($negative ? "-$digits" : $digits);
     }
     if ($type eq 'float' || $type eq 'decimal') {
         Selecto::Error->throw('invalid_query_library', "segment parameter $id must be $type")
-            unless !ref($value) && looks_like_number($value);
-        return "$value";
+            unless !ref($value) && looks_like_number($value) && isfinite(0 + $value);
+        return 0 + $value;
     }
     if ($type eq 'boolean') {
         return $value ? 1 : 0 if JSON::PP::is_bool($value);
@@ -757,5 +806,28 @@ This software is Copyright (c) 2026 by Chris Rohlfs.
 This is free software, licensed under:
 
   The Artistic License 2.0 (GPL Compatible)
+
+=cut
+
+
+=head1 QUERY-LIBRARY ADMISSION AND COLLECTIONS
+
+Domains validate named declarations before SQL and expose structured errors
+through C<validate> and C<< $domain->validate_query_library >>. The public
+C<< $domain->query_contract >> returns an isolated projection of query sections.
+C<apply_projection> merges declared direct to-many association fields into one
+related collection per association, preserving definition provenance and parent
+row identity. Use C<Selecto::BoundedQuery> to execute these projections with
+finite child counts, result transfer guards and database deadlines. Deeper
+collection nesting needs a separately bounded profile and is refused here.
+
+C<integer> parameters accept ASCII signed 64-bit integers; C<float> and
+C<decimal> parameters use finite native numeric bindings. Application-specific
+types retain their existing portable value behavior. Missing and unknown
+parameters are refused. Required filters remain part of the domain predicate.
+Required selected fields, ordering and grouping are also installed at SQL
+compilation, so later optional query replacement cannot remove them. This
+policy port accepts governed field paths; retargeting such root clauses is
+refused until its independent policy profile is implemented.
 
 =cut
