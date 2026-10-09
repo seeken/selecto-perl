@@ -2,7 +2,6 @@ package Selecto::Action::Plan;
 
 use 5.034;
 use Mojo::Base -base, -signatures;
-use Storable qw(dclone);
 
 has [qw(
     action type operation scope capability target filters changes expected_cardinality
@@ -10,7 +9,9 @@ has [qw(
 )];
 
 sub to_hash ($self) {
-    return dclone({
+    require Selecto::Action::Planner;
+    Selecto::Action::Planner->_admit_provenance_tree($self);
+    return Selecto::Action::Planner->_copy_values({
         action               => $self->action,
         type                 => $self->type,
         operation            => $self->operation,
@@ -28,7 +29,7 @@ sub to_hash ($self) {
         collection_patches   => $self->collection_patches,
         conflict_target      => $self->conflict_target,
         system_values        => $self->system_values,
-    });
+    }, code => 'invalid_action_plan');
 }
 
 1;

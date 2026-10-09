@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Preserve native integer, unsigned integer, floating and authored text
+      identity through bounded rule/policy copies, including canonical domain
+      parsing and returned subjects. Admit literal opening brackets in bounded
+      ASCII character classes while refusing POSIX/intersection syntax.
+    - Preserve rule, validator and action scalar identity through domain
+      composition, overlay DSL construction and action planning/serialization,
+      including submitted JSON and declared action literals/defaults.
     - Compile sealed portable operations through trusted tenant/context fills,
       native foreign-key guards, required/captured query predicates and SQLite
       typed insert admission. Preserve nested generated-key ownership and named

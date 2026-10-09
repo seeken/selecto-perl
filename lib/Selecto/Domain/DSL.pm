@@ -5,6 +5,9 @@ use strict;
 use warnings;
 use JSON::PP ();
 use Storable qw(dclone);
+use Selecto::Domain ();
+use Selecto::DataRules ();
+use Selecto::Limits ();
 use Selecto::Error ();
 
 sub new {
@@ -21,13 +24,13 @@ sub define {
     return $dsl->overlay;
 }
 
-sub overlay { return dclone($_[0]->{fragment}); }
+sub overlay { return Selecto::Domain::_clone_with_rules($_[0]->{fragment}); }
 sub build   { return $_[0]->overlay; }
 
 sub section {
     my ($self, $name, $value) = @_;
     $name = _name($name, 'section');
-    $self->{fragment}{$name} = _clone($value);
+    $self->{fragment}{$name} = _clone($value, $name eq 'writes' || $name eq 'rules' || $name eq 'actions');
     return $self;
 }
 
@@ -82,7 +85,7 @@ sub write_hook         { my $self = shift; return $self->_named_path(['writes', 
 
 sub write_tenant_scope {
     my ($self, @config) = @_;
-    return $self->_merge_path(['writes', 'scope', 'tenant'], _config('tenant scope', @config));
+    return $self->_merge_path(['writes', 'scope', 'tenant'], _policy_config('tenant scope', @config));
 }
 
 sub write_validation {
@@ -106,14 +109,15 @@ sub _named_path {
     my ($self, $path, $name, @config) = @_;
     $name = _name($name, 'entry');
     my $target = $self->_hash_path($path);
-    $target->{$name} = _config($name, @config);
+    $target->{$name} = $path->[0] eq 'writes' || $path->[0] eq 'actions'
+        ? _policy_config($name, @config) : _config($name, @config);
     return $self;
 }
 
 sub _merge_path {
     my ($self, $path, $config) = @_;
     my $target = $self->_hash_path($path);
-    _deep_merge_into($target, $config);
+    _deep_merge_into($target, $config, $path->[0] eq 'writes' || $path->[0] eq 'actions');
     return $self;
 }
 
@@ -127,7 +131,7 @@ sub _append_path {
     $parent->{$key} //= [];
     Selecto::Error->throw('invalid_domain_overlay', "$label list is not an array")
         unless ref($parent->{$key}) eq 'ARRAY';
-    push @{$parent->{$key}}, dclone($value);
+    push @{$parent->{$key}}, _clone($value, $path->[0] eq 'writes' || $path->[0] eq 'actions');
     return $self;
 }
 
@@ -174,22 +178,32 @@ sub _hash_path {
 
 sub _config {
     my ($label, @config) = @_;
+    return _configured($label, 0, @config);
+}
+
+sub _policy_config {
+    my ($label, @config) = @_;
+    return _configured($label, 1, @config);
+}
+
+sub _configured {
+    my ($label, $policy, @config) = @_;
     if (@config == 1 && ref($config[0]) eq 'HASH') {
-        return dclone($config[0]);
+        return _clone($config[0], $policy);
     }
     Selecto::Error->throw('invalid_domain_overlay', "$label configuration must be an object")
         if @config % 2;
     my %config = @config;
-    return dclone(\%config);
+    return _clone(\%config, $policy);
 }
 
 sub _deep_merge_into {
-    my ($target, $overlay) = @_;
+    my ($target, $overlay, $policy) = @_;
     for my $key (keys %$overlay) {
         if (ref($target->{$key}) eq 'HASH' && ref($overlay->{$key}) eq 'HASH') {
-            _deep_merge_into($target->{$key}, $overlay->{$key});
+            _deep_merge_into($target->{$key}, $overlay->{$key}, $policy);
         } else {
-            $target->{$key} = _clone($overlay->{$key});
+            $target->{$key} = _clone($overlay->{$key}, $policy);
         }
     }
 }
@@ -202,7 +216,9 @@ sub _name {
 }
 
 sub _clone {
-    my ($value) = @_;
+    my ($value, $policy) = @_;
+    return Selecto::DataRules::_copy_plain($value, Selecto::Limits->new,
+        'invalid_domain_overlay', 'policy overlay') if $policy;
     return ref($value) ? dclone($value) : $value;
 }
 

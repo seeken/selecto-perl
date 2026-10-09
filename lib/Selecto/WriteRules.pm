@@ -3,7 +3,6 @@ use 5.034;
 use strict;
 use warnings;
 use Scalar::Util qw(blessed refaddr);
-use Storable qw(dclone);
 use JSON::PP ();
 use Math::BigInt ();
 use Math::BigFloat ();
@@ -329,7 +328,8 @@ sub _normalize {
     my ($class, $engine, $command, $values) = @_;
     my $rules = $engine->domain->rules;
     return ($command, _typed_subject($engine, $values)) unless $rules;
-    my $before = dclone($values);
+    my $before = Selecto::DataRules::_copy_plain($values, $engine->limits,
+        'evaluation_limit', 'rule subject');
     $values = _typed_subject($engine, $values);
     $values = $engine->adapter->rule_project_subject($command, $values)
         if $engine->adapter->can('rule_project_subject');
