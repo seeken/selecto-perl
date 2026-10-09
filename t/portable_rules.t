@@ -4,6 +4,7 @@ use warnings;
 use utf8;
 use Test::More;
 use JSON::PP ();
+use B ();
 use Storable qw(dclone);
 use Selecto::DataRules;
 use Selecto::Limits;
@@ -57,6 +58,40 @@ is evaluate({op => 'type.is', type => 'decimal'}, 0.1)->{state}, 'passed', 'nati
 is evaluate({op => 'number.gt', bound => '0'}, 1e-100)->{state}, 'passed', 'native numeric exponent retains bounded exact decimal semantics';
 is evaluate({op => 'type.is', type => 'integer'}, 1e20)->{state}, 'passed', 'native integral numeric exponent stays numeric';
 is evaluate({op => 'number.gt', bound => 0.1}, 1)->{code}, 'invalid_data_rules_contract', 'binary float operand refused';
+for my $wire ('9007199254740992', '9223372036854775807', '-9223372036854775808', '18446744073709551615') {
+    my $value = JSON::PP->new->decode($wire);
+    ok(B::svref_2object(\$value)->FLAGS & B::SVp_IOK(), 'wide operand is an actual native IV/UV');
+    is evaluate({op => 'number.gte', bound => $value}, $value)->{state}, 'passed', 'native exact wide number bound evaluates';
+    is evaluate({op => 'text.length', max => $value}, 'x')->{state}, 'passed', 'native exact wide length bound evaluates' unless $wire =~ /^-/;
+    is evaluate({op => 'membership.in', values => [$value]}, $value)->{state}, 'passed', 'native exact wide membership literal evaluates';
+    is evaluate({op => 'membership.in', values => [{nested => [$value]}]}, {nested => [$value]})->{state}, 'passed', 'recursive native wide membership literal evaluates';
+}
+my $below = JSON::PP->new->decode('9007199254740992');
+my $above = JSON::PP->new->decode('9007199254740993');
+is evaluate({op => 'number.gt', bound => $below}, $above)->{state}, 'passed', 'adjacent wide native integers never round together';
+for my $wire ('1.0', '1.25') {
+    for my $form (qw(number length member nested)) {
+        my $value = JSON::PP->new->decode($wire);
+        my $flags = B::svref_2object(\$value)->FLAGS;
+        ok(($flags & B::SVp_NOK()) && !($flags & B::SVp_IOK()), 'direct RuleTest receives actual NOK-only float');
+        my $test = $form eq 'number' ? {op => 'number.gte', bound => $value}
+            : $form eq 'length' ? {op => 'text.length', max => $value}
+            : {op => 'membership.in', values => [$form eq 'member' ? $value : {nested => [$value]}]};
+        my $ok = eval {Selecto::RuleTest->compile($test, Selecto::Limits->new);1};
+        is !$ok && ref($@) eq 'Selecto::Error' ? $@->code : undef, 'invalid_data_rules_contract',
+            'direct delivered float literal is refused before any generic DataRules clone';
+    }
+}
+for my $value ((1 == 1), (1 == 2), JSON::PP::true, JSON::PP::false) {
+    is evaluate({op => 'number.gte', bound => $value}, 2)->{code}, 'invalid_data_rules_contract', 'native/JSON Boolean is not a numeric operand';
+    is evaluate({op => 'text.length', max => $value}, 'x')->{code}, 'invalid_data_rules_contract', 'native/JSON Boolean is not a numeric count';
+    is evaluate({op => 'number.gte', bound => 0}, $value)->{state}, 'failed', 'native/JSON Boolean is not a numeric runtime subject';
+}
+my $dual_decimal = '1.0'; my $observation = 0 + $dual_decimal;
+is evaluate({op => 'number.gte', bound => $dual_decimal}, 1)->{state}, 'passed', 'observed decimal POK text remains an exact operand';
+my $wide_limited = eval { Selecto::DataRules->parse(contract({op => 'number.gte', bound => $above}),
+    limits => Selecto::Limits->new(max_rule_numeric_digits => 10));1 };
+ok !$wide_limited, 'exact native integers do not bypass trusted numeric digit ceiling';
 is evaluate({op => 'number.gt', bound => '0'}, 0, enforcement => 'advisory')->{state}, 'passed', 'ordinary advisory failure stays advisory';
 
 for my $probe (

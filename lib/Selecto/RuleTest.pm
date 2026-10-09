@@ -5,7 +5,8 @@ use warnings;
 use JSON::PP ();
 use Math::BigRat ();
 use Math::BigFloat ();
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed reftype);
+use B ();
 use bytes ();
 use Selecto::Error ();
 use Selecto::Pattern ();
@@ -44,7 +45,11 @@ sub check_text {
 }
 sub number {
     my ($value, $limits, $work, $literal) = @_;
-    return undef if !defined($value) || ref($value);
+    return undef if !defined($value) || defined(reftype($value)) || JSON::PP::is_bool($value);
+    # Capture delivered native identity before kind/byte checks stringify the
+    # scalar. Exact IV/UV integers need no floating interoperability limit;
+    # decimal text remains valid even after a caller's numeric observation.
+    my $flags = B::svref_2object(\$value)->FLAGS;
     my $kind = kind($value);
     my $maximum = $limits->get('max_rule_numeric_digits');
     if (!$literal && $kind eq 'number' && "$value" =~ /\A(-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?)[eE]([+-]?[0-9]+)\z/) {
@@ -57,10 +62,9 @@ sub number {
     return undef unless "$value" =~ /\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/;
     spend($limits, $work, bytes::length($value) + 1);
     my $number = Math::BigRat->new("$value");
-    if ($literal && $kind eq 'number') {
-        _fail('invalid_data_rules_contract', 'exact JSON operands must be interoperable integers')
-            unless "$value" =~ /\A-?(?:0|[1-9][0-9]*)\z/
-                && $number->copy->babs->bcmp('9007199254740991') <= 0;
+    if ($literal && !($flags & B::SVp_POK())) {
+        _fail('invalid_data_rules_contract', 'native numeric operands must be delivered integers')
+            unless ($flags & B::SVp_IOK()) && "$value" =~ /\A-?(?:0|[1-9][0-9]*)\z/;
     }
     return $number;
 }
@@ -104,9 +108,10 @@ sub _bounds {
     my %bounds;
     for my $key (qw(exact min max)) {
         next unless exists $test->{$key};
-        my $n = _operand($test->{$key}, $limits, $work);
+        my $bound = $test->{$key};
+        my $n = _operand($bound, $limits, $work);
         _fail('invalid_data_rules_contract', 'invalid count bound')
-            if $count && ($n->is_neg || !$n->is_int || "$test->{$key}" !~ /\A(?:0|[1-9][0-9]*)\z/);
+            if $count && ($n->is_neg || !$n->is_int || "$bound" !~ /\A(?:0|[1-9][0-9]*)\z/);
         $bounds{$key} = $n;
     }
     _fail('invalid_data_rules_contract', 'invalid rule bounds') if !keys(%bounds)
