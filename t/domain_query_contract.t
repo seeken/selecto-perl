@@ -129,4 +129,14 @@ isnt($invalid->{source}{source_table},'changed','shared metadata copy is isolate
 my$copyerror=caught(sub{Selecto::Domain::QueryContract->copy_declaration({evil=>bless({},'QueryContractEvil')})});
 is(ref($copyerror)?$copyerror->code:'none','invalid_query_contract','shared admission rejects executable objects');
 is($calls,0,'shared admission still invokes no hooks');
+my$boolean_input=JSON::PP->new->decode(q({"source":{"columns":{"id":{"type":"integer"}}},"extension":{"enabled":true}}));
+my$boolean_copy=Selecto::Domain::QueryContract->copy_declaration($boolean_input);
+${$boolean_copy->{extension}{enabled}}=0;
+ok($boolean_input->{extension}{enabled},'copy_declaration isolates actual Boolean scalar referents');
+my$valid_report=Selecto::Domain::QueryContract->validate($boolean_input);
+${$valid_report->{valid}}=0;
+ok($boolean_input->{extension}{enabled},'validation flag cannot mutate global/input Boolean singleton');
+my$boolean_project=Selecto::Domain::QueryContract->project($boolean_input);
+${$boolean_project->{declaration}{extension}{enabled}}=0;
+ok($boolean_input->{extension}{enabled},'query metadata declaration Boolean copy remains isolated');
 done_testing;
