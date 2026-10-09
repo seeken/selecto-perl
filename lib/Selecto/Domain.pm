@@ -2421,6 +2421,16 @@ sub project {
     require Selecto::Domain::Projection;
     return Selecto::Domain::Projection->project($contract, $projection);
 }
+sub validate_source_relationships {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::SourceRelationships;
+    return Selecto::Domain::SourceRelationships->validate($contract);
+}
+sub project_source_relationships {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::SourceRelationships;
+    return Selecto::Domain::SourceRelationships->project($contract);
+}
 sub validate_query_library {
     my ($self, $limits) = @_;
     require Selecto::QueryLibrary;
