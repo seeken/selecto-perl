@@ -804,17 +804,28 @@ sub _compile_dialect_expression {
 sub _fts5_available {
     my ($self) = @_;
     return $self->{_sqlite_fts5_available} if exists $self->{_sqlite_fts5_available};
-    my $available = eval { $self->dbh->isa('DBI::db') && $self->dbh->{Driver}{Name} eq 'SQLite'
-        && ($self->dbh->selectrow_array(q{SELECT 1 FROM pragma_module_list WHERE name = 'fts5'}))[0] };
+    my $available = eval {
+        require Selecto::SQLite::FtsIndex;
+        $self->dbh->isa('DBI::db') && $self->dbh->{Driver}{Name} eq 'SQLite'
+            && grep { $_->[0] eq 'fts5' } @{Selecto::SQLite::FtsIndex::_rows($self->dbh, 'PRAGMA module_list')};
+    };
     return $self->{_sqlite_fts5_available} = $available ? 1 : 0;
 }
+
+# Native BM25 scores are smaller for stronger matches. Public rank values
+# retain that native representation; lookup ordering chooses the best first.
+sub text_search_rank_direction { return 'asc'; }
 
 sub _compile_text_search {
     my ($self, $domain, $expression, $params) = @_;
     Selecto::Error->throw('unsupported_feature', 'SQLite FTS5 is unavailable') unless $self->_fts5_available;
     my ($fields, $literal, $options) = @{$expression->arguments};
+    if (defined $domain->fts5_index) {
+        require Selecto::SQLite::FtsIndex;
+        return Selecto::SQLite::FtsIndex->compile($self, $domain, $expression, $params);
+    }
     Selecto::Error->throw('invalid_query', 'SQLite text search requires governed FTS5 fields')
-        unless ref($fields) eq 'ARRAY' && @$fields;
+        unless ref($fields) eq 'ARRAY' && @$fields && @$fields <= 128;
     my @columns;
     for my $field (@$fields) {
         my $resolved = $self->_governed_dialect_field($domain, $field);
@@ -822,16 +833,17 @@ sub _compile_text_search {
             unless !$resolved->{association} && ($resolved->{type} // '') =~ /\A(?:fts5|text_search_document)\z/;
         push @columns, $resolved->{field};
     }
-    my ($ddl) = $self->dbh->selectrow_array(q{SELECT sql FROM sqlite_master WHERE name = ?}, undef, $domain->table);
-    Selecto::Error->throw('unsupported_feature', 'SQLite text search requires a supplied FTS5 virtual table')
-        unless defined($ddl) && $ddl =~ /\bUSING\s+fts5\s*\(/i;
+    require Selecto::SQLite::FtsIndex;
+    Selecto::SQLite::FtsIndex->prove_root($self, $domain, \@columns);
     Selecto::Error->throw('invalid_query', 'SQLite text search requires the simple configuration')
         unless ($options->{configuration} // '') eq 'simple';
     Selecto::Error->throw('invalid_query', 'SQLite text search query must be a non-empty literal string')
         unless blessed($literal) && $literal->isa('Selecto::Expression') && $literal->kind eq 'literal'
-        && defined($literal->arguments->[0]) && !ref($literal->arguments->[0]) && length($literal->arguments->[0]);
+        && defined($literal->arguments->[0]) && !ref($literal->arguments->[0]) && length($literal->arguments->[0])
+        && bytes::length($literal->arguments->[0]) <= 4096;
     my $query = $literal->arguments->[0];
     my $mode = $options->{mode} // 'plain';
+    my $prefix = $mode eq 'prefix';
     if ($mode eq 'plain') {
         my @terms = grep { length } split /\s+/, "$query";
         Selecto::Error->throw('invalid_query', 'SQLite text search requires a non-empty term') unless @terms;
@@ -839,11 +851,20 @@ sub _compile_text_search {
     } elsif ($mode eq 'phrase') {
         $query =~ s/"/""/g;
         $query = '"' . $query . '"';
+    } elsif ($prefix) {
+        Selecto::Error->throw('invalid_query', 'SQLite prefix search requires normalized word prefixes')
+            unless $query =~ /\A[\p{L}\p{N}_]+:\*(?: & [\p{L}\p{N}_]+:\*)*\z/u;
     } elsif ($mode ne 'boolean' && $mode ne 'websearch') {
         Selecto::Error->throw('invalid_query', 'SQLite text search mode is unavailable');
     }
     my $table = $self->quote_identifier($domain->table);
     return "BM25($table)" if $expression->kind eq 'text_rank';
+    if ($prefix) {
+        push @$params, $query;
+        my $placeholder = $self->placeholder(scalar @$params);
+        return $self->_qualified($self->_root_alias, $domain->table)
+            . " MATCH ('{" . join(' ', @columns) . "}:(' || replace(replace($placeholder, ':*', '*'), ' & ', ' AND ') || ')')";
+    }
     push @$params, '{' . join(' ', @columns) . '}:(' . $query . ')';
     return $self->_qualified($self->_root_alias, $domain->table) . ' MATCH ' . $self->placeholder(scalar @$params);
 }
@@ -1137,11 +1158,19 @@ floating-point storage and cannot promise fixed-scale decimal precision.
 
 =item *
 
-FTS5 is probed on the connected handle. Search fields must be declared C<fts5>
-or C<text_search_document> on a supplied root FTS5 virtual table. Plain and
-phrase modes quote their terms; boolean and websearch modes accept FTS5 query
-grammar. Ranking uses the matched cursor's C<BM25> score. Configuration must
-be C<simple>; tokenization comes from the virtual table's own configuration.
+FTS5 is probed through the connected native catalog. Search uses either a
+supplied root FTS5 virtual table with fields declared C<fts5> or
+C<text_search_document>, or an ordinary table with public string fields and
+C<source.fts5_index =E<gt> {table =E<gt> 'items_search', key =E<gt> 'id'}>.
+The external index must name that main content table and its sole INTEGER
+PRIMARY KEY rowid alias, index the requested stored text columns, and use
+C<unicode61> tokenization with full detail. Declarations are checked on each
+compilation, including TEMP shadows; the host owns index creation and upkeep.
+Plain and phrase modes quote their terms; boolean and websearch modes accept
+FTS5 query grammar. Prefix mode binds normalized C<word:*> terms from
+L<Selecto::CoDomain>. Search text is bounded to 4096 bytes. Public ranking
+retains native negative C<BM25> scores; lookups sort ascending to return
+stronger matches first. Configuration must be C<simple>.
 
 =item *
 
