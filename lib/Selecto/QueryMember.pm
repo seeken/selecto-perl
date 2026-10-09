@@ -30,16 +30,16 @@ use Selecto::Expression ();
 #
 # Members are activated by name: $query->with_member('usage_totals').
 
-my %GROUPS = map { $_ => 1 } qw(ctes laterals unnests);
+my %GROUPS = map { $_ => 1 } qw(ctes values subqueries laterals unnests);
 my %QUERY_KEYS = map { $_ => 1 } qw(select filter group_by order_by limit);
 my %AGGREGATES = map { $_ => 1 } qw(count sum avg min max);
 my $IDENTIFIER = qr/\A[A-Za-z_][A-Za-z0-9_]*\z/;
 our $DEFAULT_MAX_DEPTH = 100;
 my $MAX_DEPTH_LIMIT = 10_000;
 
-# Validates every data member of a domain. Groups this runtime does not
-# execute (for example Elixir `values` or function members) are left alone and
-# fail only if a query activates them.
+# Validate native data plans and inert portable callback declarations. Native
+# activation still requires the configured host's explicit callback registry;
+# a portable marker is never itself executable.
 sub validate {
     my ($class, $domain) = @_;
     my $members = _members($domain);
@@ -49,6 +49,14 @@ sub validate {
         _fail("query_members.$group must be an object") unless ref($specs) eq 'HASH';
         for my $name (sort keys %$specs) {
             _fail("query member name $name must be an identifier") unless $name =~ $IDENTIFIER;
+            my $spec = $specs->{$name};
+            if (ref($spec) eq 'HASH' && (_callback($spec->{query}) || _callback($spec->{query_builder})
+                    || $group eq 'laterals' && ref($spec->{source}) eq 'ARRAY')) {
+                require Selecto::Domain::QueryMembers;
+                my $report = Selecto::Domain::QueryMembers->validate({query_members => {$group => {$name => $spec}}});
+                _fail("query member $name declaration is invalid") unless $report->{valid};
+                next;
+            }
             $class->_source($domain, $group, $name, $specs->{$name});
         }
     }
@@ -57,11 +65,14 @@ sub validate {
 
 # Returns $query with every activated member added as a query source.
 sub expand {
-    my ($class, $domain, $query) = @_;
+    my ($class, $domain, $query, $engine) = @_;
     my $members = _members($domain);
-    my $expanded = $query->without_members;
-    for my $name (@{$query->members}) {
-        my @found = grep { ref($members->{$_}) eq 'HASH' && exists $members->{$_}{$name} } sort keys %$members;
+    # Expand only after the original intent and configured authority have been
+    # validated. Transient plans are never exposed as declaration authority.
+    my $expanded = Selecto::Query->new(%{$query->without_members});
+    for my $activation (@{$query->members}) {
+        my ($requested, $name) = $activation =~ /\A([^:]+):(.+)\z/ ? ($1, $2) : (undef, $activation);
+        my @found = grep { (!defined($requested) || $_ eq $requested) && ref($members->{$_}) eq 'HASH' && exists $members->{$_}{$name} } sort keys %$members;
         Selecto::Error->throw('unknown_query_member', "query member $name is not declared by the domain",
             {member => $name}) unless @found;
         Selecto::Error->throw('invalid_domain', "query member $name is declared in several groups",
@@ -69,11 +80,41 @@ sub expand {
         my ($group) = @found;
         Selecto::Error->throw('unsupported_query_member', "query member group $group is not supported",
             {member => $name, group => $group}) unless $GROUPS{$group};
-        $expanded = $class->_source($domain, $group, $name, $members->{$group}{$name}, $expanded);
+        my $spec = $members->{$group}{$name};
+        if (($group eq 'ctes' || $group eq 'subqueries') && (_callback($spec->{query}) || _callback($spec->{query_builder}))) {
+            _fail('callback member requires a configured engine') unless $engine;
+            require Selecto::QueryBinding;
+            my ($child_domain, $child) = Selecto::QueryBinding->builder($engine, $group, $name);
+            if ($group eq 'ctes') {
+                my $join = defined($spec->{join}) ? _pairs($spec->{join}, "query member $name join") : undef;
+                delete $join->{fields} if $join && ($join->{fields} // '') eq 'infer';
+                $expanded = $expanded->with_cte($name, $child_domain, $child,
+                    (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()), join => $join);
+            } else {
+                $expanded = $expanded->subquery_join($spec->{join_id} // $name, $child_domain, $child,
+                    on => $spec->{on}, type => $spec->{type} // 'left',
+                    (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()));
+            }
+        } else {
+            $expanded = $class->_source($domain, $group, $name, $spec, $expanded);
+        }
     }
     return $expanded;
 }
 
+sub _callback { ref($_[0]) eq 'HASH' && keys(%{$_[0]}) == 1 && !ref($_[0]{kind}) && ($_[0]{kind} // '') eq 'declared_callback' }
+sub _pairs {
+    my ($given, $label) = @_;
+    return {%$given} if ref($given) eq 'HASH';
+    _fail("$label must be an object or keyword pairs") unless ref($given) eq 'ARRAY';
+    my %pairs;
+    for my $pair (@$given) {
+        _fail("$label has malformed or duplicate keys")
+            unless ref($pair) eq 'ARRAY' && @$pair == 2 && defined($pair->[0]) && !ref($pair->[0]) && !exists($pairs{$pair->[0]});
+        $pairs{$pair->[0]} = $pair->[1];
+    }
+    return \%pairs;
+}
 sub _members {
     my ($domain) = @_;
     my $contract = $domain->contract // {};
@@ -87,6 +128,25 @@ sub _source {
     my ($class, $domain, $group, $name, $spec, $query) = @_;
     my $label = "query member $name";
     _fail("$label must be an object") unless ref($spec) eq 'HASH';
+    if ($group eq 'values') {
+        my $join = defined($spec->{join}) ? _pairs($spec->{join}, "$label join") : undef;
+        delete $join->{fields} if $join && ($join->{fields} // '') eq 'infer';
+        my $base = $query // Selecto::Query->new;
+        my $result = $base->with_values($spec->{rows} // $spec->{data}, columns => $spec->{columns},
+            as => $spec->{as} // $spec->{alias} // $name, (defined($join) ? (join => $join) : ()));
+        $domain->resolve($join->{owner_key}) if $join;
+        return $query ? $result : 1;
+    }
+    if ($group eq 'laterals' && ref($spec->{source}) eq 'ARRAY') {
+        my $source = $spec->{source};
+        _fail("$label requires a declared function tuple")
+            unless @$source == 3 && !ref($source->[0]) && $source->[0] eq 'function';
+        my $base = $query // Selecto::Query->new;
+        my $result = $base->function_lateral($source->[1], $source->[2],
+            as => $spec->{as} // $name, type => $spec->{join_type} // 'inner',
+            (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()));
+        return $query ? $result : 1;
+    }
     if ($group eq 'unnests') {
         _keys($spec, [qw(array_field field as alias ordinality)], $label);
         my $field = $spec->{array_field} // $spec->{field};
@@ -98,6 +158,15 @@ sub _source {
             (defined($spec->{ordinality}) ? (ordinality => $spec->{ordinality}) : ()));
     }
     my $member_domain = _source_domain($domain, $spec->{source}, $label);
+    if ($group eq 'subqueries') {
+        _keys($spec, [qw(source query columns on type join_id kind capability)], $label);
+        my $child = build_query($member_domain, $spec->{query}, "$label query");
+        my $base = $query // Selecto::Query->new;
+        my $result = $base->subquery_join($spec->{join_id} // $name, $member_domain, $child,
+            on => $spec->{on}, type => $spec->{type} // 'left',
+            (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()));
+        return $query ? $result : 1;
+    }
     if ($group eq 'laterals') {
         _keys($spec, [qw(source query correlations join_type columns)], $label);
         my $member = build_query($member_domain, $spec->{query}, "$label query");
@@ -170,6 +239,7 @@ sub _source_domain {
         schemas => {},
         joins => {},
     });
+    $member = bless {%$member, _read_prefix => $domain->{_read_prefix}}, ref($member) if defined $domain->{_read_prefix};
     return _scoped_member_domain($domain, $member, $relation, $label);
 }
 
@@ -371,7 +441,7 @@ Selecto::QueryMember - named query members declared as domain data
 
 =head1 DESCRIPTION
 
-Query members are reusable CTE, recursive CTE, lateral and array-expansion
+Query members are reusable CTE, recursive CTE, VALUES, derived-subquery, lateral and array-expansion
 sources declared as data in the domain, activated by name with
 L<Selecto::Query/with_member>. A member's query is rooted at a relation in
 the domain's own C<schemas> and is written as data, never SQL, so the same
@@ -398,8 +468,13 @@ data.
 
 Members are validated when the domain is parsed and are part of its
 fingerprint. Naming an undeclared member fails with C<unknown_query_member>.
-Member groups this runtime does not execute are ignored until a query
-activates them.
+All five groups receive structural validation. Native activation remains
+subject to adapter support; SQLite refuses lateral table-function execution.
+Portable C<{kind =E<gt> 'declared_callback'}> markers are inert metadata.
+An application may separately configure explicit C<ctes:id> or C<subqueries:id>
+host builders on L<Selecto::Engine>; those callbacks must return compatible
+configured queries. They are trusted application code, not portable imports.
+Use family-specific query methods when an ID occurs in more than one group.
 
 This module's Perl interface (C<validate>, C<expand>, C<build_query>) is
 used internally by L<Selecto::Domain> and the SQL compiler and may change;

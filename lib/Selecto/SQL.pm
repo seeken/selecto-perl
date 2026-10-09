@@ -11,6 +11,7 @@ use Selecto::Identifier ();
 use Selecto::InsertAdmission ();
 use Selecto::OperationBudget ();
 use Selecto::QueryEnforcement ();
+use Selecto::ConfiguredDomain ();
 use Selecto::Statement ();
 use Selecto::Stream ();
 use Selecto::Write ();
@@ -58,6 +59,9 @@ sub quote_identifier {
 
 sub compile {
     my ($self, $domain, $query) = @_;
+    local $self->{_source_expansions} = $self->{_source_expansions} // {};
+    local $self->{_source_budget} = $self->{_source_budget}
+        // Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query');
     my $statement = $self->_compile_query($domain, $query);
     # Selecto::Engine::compile admits these parameters itself, with the same
     # limits, code and label, as soon as this returns.
@@ -79,6 +83,7 @@ sub _engine_admitted {
 sub _compile_query {
     my ($self, $domain, $query) = @_;
     require Selecto::QueryPolicy;
+    $query = $self->_expand_query($domain, $query);
     $query = Selecto::QueryPolicy->apply($domain, $query, $self->{_selecto_compile_limits});
     Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')->check_tree(
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
@@ -155,16 +160,20 @@ sub _compile_single {
     my ($self, $domain, $query, %options) = @_;
     return $self->_compile_retargeted($domain, $query, %options)
         if defined $query->retarget_spec;
-    if (@{$query->members}) {
-        require Selecto::QueryMember;
-        $query = Selecto::QueryMember->expand($domain, $query);
-    }
+    $query = $self->_expand_query($domain, $query);
     return $self->_compile_rollup($domain, $query, %options)
         if $query->grouping_mode eq 'rollup' && $self->_emulates_rollup;
     local $self->{_root_alias} = $options{root_alias} // 's0';
     local $self->{_timezone} = $query->timezone;
+    local $self->{_read_prefix} = $domain->{_read_prefix};
     my $selections = $query->selections;
     Selecto::Error->throw('invalid_query', 'query must select at least one expression') unless @$selections;
+    my $physical = $self->_physical_relations($domain, $query);
+    my %cte_names;
+    for my $spec (@{$query->ctes}, @{$query->values_sources}) {
+        Selecto::Error->throw('invalid_query', 'CTE source cannot shadow a domain physical relation') if $physical->{lc $spec->{name}};
+        Selecto::Error->throw('invalid_query', 'duplicate CTE source') if $cte_names{lc $spec->{name}}++;
+    }
     my $sources = $self->_query_sources($domain, $query);
     local $self->{_query_sources} = $sources;
     my ($with_sql, $cte_params) = $self->_compile_cte_prefix($query);
@@ -178,7 +187,7 @@ sub _compile_single {
     local $self->{_through_aliases} = $through_aliases;
     $self->_validate_query_aliases($sources, @association_paths);
     $with_sql = $self->_append_values_ctes(
-        $with_sql, \@params, $domain, $sources, @association_paths,
+        $with_sql, \@params, $domain, $sources, $physical, \%cte_names, @association_paths,
     );
     my @columns = map { $self->_selection_name($_) } @$selections;
     my %column_counts;
@@ -260,9 +269,9 @@ sub _compile_single {
                     $self->_qualified($target_alias, $through->{target_scope_key});
             }
             push @joins,
-                $keyword . ' (' . $self->quote_identifier($through->{table}) .
+                $keyword . ' (' . $self->_physical_source_sql($through->{table}) .
                 ' AS ' . $self->quote_identifier($bridge_alias) .
-                ' INNER JOIN ' . $self->quote_identifier($association->table) .
+                ' INNER JOIN ' . $self->_association_source_sql($association) .
                 ' AS ' . $self->quote_identifier($target_alias) .
                 ' ON ' . join(' AND ', @target_on) . ')' .
                 ' ON ' . join(' AND ', @bridge_on);
@@ -318,6 +327,9 @@ sub _compile_single {
         }
     }
     push @joins, @{$self->_compile_cte_joins($domain, $query)};
+    push @joins, @{$self->_compile_values_joins($domain, $query)};
+    push @joins, @{$self->_compile_subquery_joins($domain, $query, \@params)};
+    push @joins, @{$self->_compile_function_laterals($query, \@params)};
     push @joins, @{$self->_compile_lateral_joins($domain, $query, \@params)};
     push @joins, @{$self->_compile_json_rowsets($domain, $query, \@params)};
     push @joins, @{$self->_compile_array_rowsets($domain, $query, \@params)};
@@ -450,30 +462,45 @@ sub _compile_retargeted {
 
 sub _association_source_sql {
     my ($self, $association) = @_;
-    return $self->quote_identifier($association->table);
+    return defined($association->values) ? $self->quote_identifier($association->table)
+        : $self->_physical_source_sql($association->table);
+}
+sub _physical_source_sql {
+    my ($self, $table) = @_;
+    return (defined($self->{_read_prefix}) ? $self->quote_identifier($self->{_read_prefix}) . '.' : '')
+        . $self->quote_identifier($table);
 }
 
 sub _append_values_ctes {
-    my ($self, $with_sql, $params, $domain, $sources, @paths) = @_;
+    my ($self, $with_sql, $params, $domain, $sources, $physical, $cte_names, @paths) = @_;
     my (@entries, %seen);
     for my $path (@paths) {
         my $association = $domain->resolve_association($path)->{association};
         my $rows = $association->values;
         next unless defined $rows;
         my $table = $association->table;
-        next if $seen{$table}++;
+        my $fields = $association->value_fields;
+        my $field_types = $association->fields;
+        my $payload = {rows => $rows, fields => $fields, types => $field_types};
+        my $signature = Selecto::ConfiguredDomain->digest($payload, {});
+        if (exists $seen{lc $table}) {
+            Selecto::Error->throw('invalid_query', 'inline VALUES sources with the same SQL identity must have identical declarations')
+                unless $seen{lc $table} eq $signature;
+            next;
+        }
+        $seen{lc $table} = $signature;
+        $self->{_source_budget}->check_tree($payload, label => 'inline VALUES source');
         Selecto::Error->throw(
             'invalid_query',
             "query source $table conflicts with an inline values relation",
-        ) if exists $sources->{$table};
+        ) if $physical->{lc $table} || $cte_names->{lc $table}
+            || grep { lc($_) eq lc($table) } keys %$sources;
         Selecto::Error->throw('unsupported_feature', 'adapter does not support values relations')
             unless $self->supports('cte');
-        my $fields = $association->value_fields;
         Selecto::Error->throw('invalid_domain', 'values relation has no fields')
             unless ref($fields) eq 'ARRAY' && @$fields;
         # Bound cells have no type of their own; without a cast the database
         # infers one (PostgreSQL: text), so integers would sort as strings.
-        my $field_types = $association->fields;
         my %casts = map {
             my $field = $_;
             my $cast = $self->_values_column_type_sql(
@@ -561,47 +588,125 @@ sub _renumber_dollar_placeholders {
     return $sql;
 }
 
+sub _expand_query {
+    my ($self, $domain, $query) = @_;
+    require Selecto::QueryBinding;
+    if (my $owner = Selecto::QueryBinding->owner($query)) {
+        Selecto::QueryBinding->validate($owner, $query);
+    }
+    return $query unless @{$query->members};
+    my $key = refaddr($domain) . ':' . refaddr($query);
+    return $self->{_source_expansions}{$key} if exists $self->{_source_expansions}{$key};
+    $self->{_source_budget}->consume_count('max_expression_nodes', 1, label => 'named source expansions');
+    require Selecto::QueryMember;
+    my $engine = Selecto::QueryBinding->owner($query) // $self->{_selecto_compile_engine};
+    my $has_set = @{$query->set_operations};
+    my $expanded = Selecto::QueryMember->expand($domain, $has_set ? $query->_set_base_query : $query, $engine);
+    $expanded = $expanded->_copy(set_operations => $query->set_operations, orders => $query->orders,
+        limit_value => $query->limit_value, offset_value => $query->offset_value) if $has_set;
+    $self->{_source_budget}->check_tree($expanded, label => 'expanded source query',
+        allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
+        allowed_base_classes => ['Selecto::Query']);
+    return $self->{_source_expansions}{$key} = $expanded;
+}
+
+sub _physical_relations {
+    my ($self, $domain, $query) = @_;
+    my (%physical, %visited);
+    my @pending = ([$domain, $query, {}, 0]);
+    while (my $entry = shift @pending) {
+        my ($current, $intent, $dependencies, $depth) = @$entry;
+        $self->{_source_budget}->consume_count('max_expression_nodes', 1, label => 'source proof work');
+        $self->{_source_budget}->limits->check_count('max_expression_depth', $depth, 'invalid_query', 'source proof depth');
+        my $key = refaddr($current) . ':' . refaddr($intent) . ':' . join(',', sort keys %$dependencies);
+        next if $visited{$key}++;
+        $intent = $self->_expand_query($current, $intent);
+        $physical{lc $current->table} = 1 unless $dependencies->{lc $current->table};
+        my @edges = values %{$current->associations};
+        while (my $edge = shift @edges) {
+            $self->{_source_budget}->consume_count('max_expression_nodes', 1, label => 'association proof work');
+            $physical{lc $edge->table} = 1 unless defined $edge->values;
+            my $bridge = $edge->through;
+            $physical{lc $bridge->{table}} = 1 if $bridge;
+            push @edges, values %{$edge->associations};
+        }
+        my %available;
+        for my $spec (@{$intent->ctes}) {
+            my $dependencies = $spec->{dependencies} // [];
+            Selecto::Error->throw('invalid_query', 'CTE dependencies must name earlier CTEs')
+                unless ref($dependencies) eq 'ARRAY' && !grep { ref($_) || !exists($available{lc $_}) } @$dependencies;
+            my %authorized = map { (lc($_) => 1) } @$dependencies;
+            if ($authorized{lc $spec->{domain}->table}) {
+                my @expected = sort @{$available{lc $spec->{domain}->table}};
+                my @actual = sort keys %{$spec->{domain}->fields};
+                Selecto::Error->throw('invalid_query', 'dependent CTE domain must match the earlier projection')
+                    unless join("\0", @expected) eq join("\0", @actual);
+            }
+            push @pending, map { [$spec->{domain}, $_, \%authorized, $depth + 1] }
+                grep { defined } @{$spec}{qw(query anchor recursive_query)};
+            $available{lc $spec->{name}} = $spec->{columns};
+        }
+        push @pending, map { [$_->{domain}, $_->{query}, {}, $depth + 1] }
+            (@{$intent->lateral_joins}, @{$intent->subqueries});
+        push @pending, map { [$current, $_->{query}, $dependencies, $depth + 1] } @{$intent->set_operations};
+    }
+    return \%physical;
+}
+
 sub _query_sources {
     my ($self, $domain, $query) = @_;
     my %sources;
     my $domain_associations = $domain->associations;
-    for my $spec (@{$query->ctes}, @{$query->lateral_joins}) {
+    my $register = sub {
+        my ($name, $fields) = @_;
+        Selecto::Error->throw('invalid_query', "duplicate query source $name")
+            if grep { lc($_) eq lc($name) } keys %sources;
+        Selecto::Error->throw('invalid_query', "query source $name conflicts with a domain relationship")
+            if grep { lc($_) eq lc($name) } keys %$domain_associations;
+        $sources{$name} = $fields;
+    };
+    for my $spec (grep { defined($_->{join}) } @{$query->ctes}) {
         Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
             if exists $domain_associations->{$spec->{name}};
-        $sources{$spec->{name}} = {map { $_ => 1 } @{$spec->{columns}}};
+        $register->($spec->{name}, {map { $_ => 1 } @{$spec->{columns}}});
+    }
+    for my $spec (@{$query->lateral_joins}, @{$query->values_sources}, @{$query->subqueries}, @{$query->function_laterals}) {
+        Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
+            if exists $domain_associations->{$spec->{name}};
+        $register->($spec->{name}, {map { $_ => 1 } @{$spec->{columns}}});
     }
     for my $spec (@{$query->json_rowsets}) {
         Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
             if exists $domain_associations->{$spec->{name}};
-        $sources{$spec->{name}} = {map { $_ => 1 } keys %{$spec->{columns}}};
+        $register->($spec->{name}, {map { $_ => 1 } keys %{$spec->{columns}}});
     }
     for my $spec (@{$query->array_rowsets}) {
         Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
             if exists $domain_associations->{$spec->{name}};
-        $sources{$spec->{name}} = {value => 1, (defined($spec->{ordinality}) ? ($spec->{ordinality} => 1) : ())};
+        $register->($spec->{name}, {value => 1, (defined($spec->{ordinality}) ? ($spec->{ordinality} => 1) : ())});
     }
     return \%sources;
 }
 
 sub _validate_query_aliases {
     my ($self, $sources, @association_paths) = @_;
-    my %internal = ($self->_root_alias => 1);
+    my %internal = (lc($self->_root_alias) => 1);
     for my $path (@association_paths) {
-        $internal{$self->_join_alias($path)} = 1;
-        $internal{$self->_through_alias($path)} = 1;
+        $internal{lc $self->_join_alias($path)} = 1;
+        $internal{lc $self->_through_alias($path)} = 1;
     }
     for my $name (sort keys %$sources) {
         Selecto::Error->throw(
             'invalid_query',
             "query source $name conflicts with an internal relation alias",
-        ) if $internal{$name};
+        ) if $internal{lc $name};
     }
 }
 
 sub _compile_cte_prefix {
     my ($self, $query) = @_;
     my $ctes = $query->ctes;
-    return ('', []) unless @$ctes;
+    return ('', []) unless @$ctes || @{$query->values_sources};
     Selecto::Error->throw('unsupported_feature', 'adapter does not support CTEs')
         unless $self->supports('cte');
     my (@entries, @params);
@@ -660,6 +765,24 @@ sub _compile_cte_prefix {
             join(', ', map { $self->quote_identifier($_) } @$columns) .
             ") AS ($body)";
     }
+    for my $spec (@{$query->values_sources}) {
+        my @rows;
+        for my $row (@{$spec->{rows}}) {
+            my @cells;
+            for my $value (@$row) {
+                push @params, $value;
+                my $sql = $self->placeholder(scalar @params);
+                my $type = _numeric_scalar_type($value);
+                $sql = 'CAST(' . $sql . ' AS ' . ($type eq 'INTEGER' ? 'BIGINT' : 'DOUBLE PRECISION') . ')' if defined $type;
+                push @cells, $sql;
+            }
+            push @rows, 'SELECT ' . join(', ', @cells);
+        }
+        push @rows, 'SELECT ' . join(', ', map { 'NULL' } @{$spec->{columns}}) . ' WHERE 1 = 0' unless @rows;
+        push @entries, $self->quote_identifier($spec->{name}) . ' ('
+            . join(', ', map { $self->quote_identifier($_) } @{$spec->{columns}}) . ') AS ('
+            . join(' UNION ALL ', @rows) . ')';
+    }
     return (
         'WITH ' . ($recursive ? 'RECURSIVE ' : '') . join(', ', @entries) . ' ',
         \@params,
@@ -696,6 +819,7 @@ sub _compile_cte_joins {
     my @joins;
     for my $spec (@{$query->ctes}) {
         my $join = $spec->{join};
+        next unless defined $join;
         my $owner = $domain->resolve($join->{owner_key});
         Selecto::Error->throw('invalid_query', 'CTE owner key must be a root field')
             if $owner->{association};
@@ -709,6 +833,61 @@ sub _compile_cte_joins {
     return \@joins;
 }
 
+sub _compile_values_joins {
+    my ($self, $domain, $query) = @_;
+    my @joins;
+    for my $spec (@{$query->values_sources}) {
+        my $join = $spec->{join};
+        my $sql = (defined($join) ? uc($join->{type}) . ' JOIN ' : 'CROSS JOIN ')
+            . $self->quote_identifier($spec->{name}) . ' AS ' . $self->quote_identifier($spec->{name});
+        if ($join) {
+            my $owner = $domain->resolve($join->{owner_key});
+            Selecto::Error->throw('invalid_query', 'VALUES owner key must be a root field') if $owner->{association};
+            $sql .= ' ON ' . $self->_qualified($self->_root_alias, $join->{owner_key}) . ' = '
+                . $self->_qualified($spec->{name}, $join->{related_key});
+        }
+        push @joins, $sql;
+    }
+    return \@joins;
+}
+sub _compile_subquery_joins {
+    my ($self, $domain, $query, $params) = @_;
+    my @joins;
+    for my $spec (@{$query->subqueries}) {
+        my $statement = $self->compile($spec->{domain}, $spec->{query});
+        Selecto::Error->throw('invalid_query', 'subquery projection must match declared columns')
+            unless @{$statement->columns} == @{$spec->{columns}}
+                && join("\0", @{$statement->columns}) eq join("\0", @{$spec->{columns}});
+        my $body = $self->_shift_placeholders($statement->sql, scalar @$params);
+        push @$params, @{$statement->params};
+        my @on;
+        for my $condition (@{$spec->{on}}) {
+            my $owner = $domain->resolve($condition->{left});
+            Selecto::Error->throw('invalid_query', 'subquery owner key must be a root field') if $owner->{association};
+            push @on, $self->_qualified($self->_root_alias, $condition->{left}) . ' = '
+                . $self->_qualified($spec->{name}, $condition->{right});
+        }
+        push @joins, uc($spec->{type}) . ' JOIN (' . $body . ') AS ' . $self->quote_identifier($spec->{name})
+            . ' ON ' . join(' AND ', @on);
+    }
+    return \@joins;
+}
+sub _compile_function_laterals {
+    my ($self, $query, $params) = @_;
+    my $plans = $query->function_laterals;
+    return [] unless @$plans;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support function lateral sources')
+        unless $self->supports('lateral_join');
+    my @joins;
+    for my $spec (@$plans) {
+        my @arguments = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$spec->{arguments}};
+        push @joins, uc($spec->{type}) . ' JOIN LATERAL ' . $self->quote_identifier($spec->{function})
+            . '(' . join(', ', @arguments) . ') AS ' . $self->quote_identifier($spec->{name})
+            . ' (' . join(', ', map { $self->quote_identifier($_) } @{$spec->{columns}}) . ')'
+            . ($spec->{type} eq 'cross' ? '' : ' ON TRUE');
+    }
+    return \@joins;
+}
 sub _compile_lateral_joins {
     my ($self, $domain, $query, $params) = @_;
     my $laterals = $query->lateral_joins;
@@ -1578,7 +1757,7 @@ sub _compile_related_collection_at {
     }
 
     my $quoted_alias = $self->quote_identifier($alias);
-    my $table = $self->quote_identifier($association->table);
+    my $table = $self->_association_source_sql($association);
     my $related_key = $quoted_alias . '.' . $self->quote_identifier($association->related_key);
     my $owner_key = $self->quote_identifier($parent_alias) . '.' .
         $self->quote_identifier($association->owner_key);
@@ -1592,7 +1771,7 @@ sub _compile_related_collection_at {
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
         my $quoted_bridge_alias = $self->quote_identifier($bridge_alias);
-        my $bridge_table = $self->quote_identifier($through->{table});
+        my $bridge_table = $self->_physical_source_sql($through->{table});
         my @target_on = (
             $quoted_bridge_alias . '.' . $self->quote_identifier($through->{related_key}) .
             ' = ' . $self->_join_target_key($related_key, $through->{target_key_cast}),
@@ -1955,7 +2134,7 @@ sub _compile_computed_field {
     push @predicates, $self->_constant_join_predicates(
         $alias, $association->where, $params
     );
-    return 'EXISTS (SELECT 1 FROM ' . $self->quote_identifier($association->table) .
+    return 'EXISTS (SELECT 1 FROM ' . $self->_association_source_sql($association) .
         ' AS ' . $self->quote_identifier($alias) . ' WHERE ' .
         join(' AND ', @predicates) . ')';
 }

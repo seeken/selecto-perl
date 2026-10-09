@@ -6,7 +6,7 @@ use warnings;
 use JSON::PP ();
 use Time::HiRes ();
 use Storable ();
-use Scalar::Util qw(blessed refaddr);
+use Scalar::Util qw(blessed refaddr reftype);
 use Hash::Util::FieldHash qw(fieldhash);
 use Digest::SHA qw(sha256_hex);
 use Selecto::Domain ();
@@ -33,13 +33,14 @@ use Selecto::DataRules ();
 use Selecto::Action::Graph ();
 use Selecto::ConfiguredDomain ();
 use Selecto::Tenant::Context ();
+use Selecto::QueryBinding ();
 
 fieldhash my %ACTION_COMMAND_WORK;
 fieldhash my %CONFIGURED_DOMAIN;
 
 sub _read_authority {
     my ($self) = @_;
-    return [$self->{scope}, $self->{tenant_context}, $self->{tenant_required_filters}];
+    return [$self->{scope}, $self->{tenant_context}, $self->{tenant_required_filters}, $self->{query_mode}];
 }
 
 my $seal_domain = sub {
@@ -116,7 +117,11 @@ sub new {
     Selecto::Error->throw('invalid_limits', 'engine limits must be a Selecto::Limits object')
         unless blessed($limits) && $limits->isa('Selecto::Limits');
     $args{domain}->validate_query_library($limits);
+    my $mode = $args{mode} // 'permissive';
+    Selecto::Error->throw('invalid_query_policy', 'mode must be strict or permissive')
+        unless !defined(reftype($mode)) && ($mode eq 'strict' || $mode eq 'permissive');
     my $self = bless {
+        query_mode => $mode,
         domain => $args{domain},
         adapter => $args{adapter},
         domain_ref => $args{domain_ref},
@@ -124,6 +129,7 @@ sub new {
         write_policy => _write_policy($args{write_policy}),
         limits => $limits,
     }, $class;
+    Selecto::QueryBinding->configure_engine($self, $args{member_builders});
     return $seal_domain->($self);
 }
 
@@ -179,7 +185,11 @@ sub with_tenant {
     }
     my $copy = bless {%$self, tenant_context => $context}, ref($self);
     delete $copy->{_read_domain};
-    return $seal_domain->($copy);
+    # Initial attachment may consume this engine's existing flat intent. The
+    # target still enforces its required scope; attached-context rewrites do
+    # not establish another input lineage.
+    return $seal_domain->(Selecto::QueryBinding->inherit_engine($self, $copy,
+        flat_input => !keys(%$old_context)));
 }
 sub tenant_context {
     my ($self) = @_;
@@ -195,7 +205,7 @@ sub require_tenant_filter {
     my $filters = Selecto::Tenant::Context->unique_filters([@{$self->{tenant_required_filters} // []}, $filter]);
     my $copy = bless {%$self, tenant_required_filters => $filters}, ref($self);
     delete $copy->{_read_domain};
-    return $seal_domain->($copy);
+    return $seal_domain->(Selecto::QueryBinding->inherit_engine($self, $copy, flat_input => 1));
 }
 sub validate_tenant_scope {
     my ($self) = @_;
@@ -282,7 +292,7 @@ sub with_limits {
     $self->assert_domain_identity;
     my $copy = bless {%$self, limits => $self->{limits}->intersect($limits)}, ref($self);
     $CONFIGURED_DOMAIN{$copy} = {%{$CONFIGURED_DOMAIN{$self}}};
-    return $copy;
+    return Selecto::QueryBinding->inherit_engine($self, $copy, flat_input => 1);
 }
 
 # A copy of this engine bound to trusted scope. An engine that already holds a
@@ -300,7 +310,7 @@ sub with_scope {
     my $copy = bless {%$self}, ref($self);
     $copy->{scope} = {%{$self->{scope}}, %$next};
     delete $copy->{_read_domain};
-    return $seal_domain->($copy);
+    return $seal_domain->(Selecto::QueryBinding->inherit_engine($self, $copy, flat_input => 1));
 }
 
 # A copy of this engine whose domain omits the prerequisite columns of the
@@ -313,7 +323,7 @@ sub without_action_prerequisites {
     my $copy = bless {%$self}, ref($self);
     $copy->{domain} = $domain;
     delete $copy->{_read_domain};
-    return $seal_domain->($copy);
+    return $seal_domain->(Selecto::QueryBinding->inherit_engine($self, $copy));
 }
 
 sub from_registry {
@@ -337,13 +347,26 @@ sub from_registry {
         (defined($args{scope}) ? (scope => $args{scope}) : ()),
         (defined($args{write_policy}) ? (write_policy => $args{write_policy}) : ()),
         (defined($args{limits}) ? (limits => $args{limits}) : ()),
+        (defined($args{mode}) ? (mode => $args{mode}) : ()),
+        (defined($args{member_builders}) ? (member_builders => $args{member_builders}) : ()),
     );
 }
 
 sub domain  { $_[0]->assert_domain_identity; return $_[0]->{domain}; }
 sub adapter { return $_[0]->{adapter}; }
 sub domain_ref { return $_[0]->{domain_ref}; }
-sub query   { return Selecto::Query->new; }
+sub query_mode { $_[0]->assert_domain_identity; return $_[0]->{query_mode}; }
+sub query   { $_[0]->assert_domain_identity; return Selecto::QueryBinding->bind($_[0], Selecto::Query->new); }
+sub validate_query {
+    my ($self, $query) = @_;
+    $self->assert_domain_identity;
+    $self->_ensure_read_scope;
+    Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(
+        $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
+        allowed_base_classes => ['Selecto::Query']);
+    Selecto::QueryBinding->validate($self, $query);
+    return 1;
+}
 sub query_filters {
     my ($self, $query) = @_;
     require Selecto::QueryPolicy;
@@ -356,11 +379,12 @@ sub compile {
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
         allowed_base_classes => ['Selecto::Query']);
+    Selecto::QueryBinding->validate($self, $query);
     if (defined(($self->{tenant_context} // {})->{prefix})) {
-        Selecto::Error->throw('unsupported_feature', 'prefix read contexts currently require an ordinary root query')
-            if keys(%{$self->{domain}{associations}}) || $query->retarget_spec
-                || grep { @{$query->{$_} // []} } qw(set_operations ctes lateral_joins json_rowsets array_rowsets members);
+        Selecto::Error->throw('unsupported_feature', 'prefix read contexts do not support retargeted queries')
+            if $query->retarget_spec;
     }
+    local $self->{adapter}{_selecto_compile_engine} = $self;
     local $self->{adapter}{_selecto_compile_limits} = $self->{limits};
     # This query was just admitted under these limits, and its parameters are
     # admitted below under them too, so the SQL adapter skips repeating the
@@ -1976,7 +2000,8 @@ from a client.
       domain       => $domain,          # required, a Selecto::Domain
       adapter      => $adapter,         # required, a Selecto::Adapter
       scope        => {tenant => 42},   # optional trusted scope
-      write_policy => 'strict',         # optional; strict is the only policy
+      write_policy => 'strict',         # optional; strict is the only write policy
+      mode         => 'strict',         # optional read policy; default permissive
       domain_ref   => $ref,             # optional Selecto::Domain::Ref
   );
 
@@ -1992,6 +2017,21 @@ domain and grants its operations through C<allowed_ops>. The argument may be
 omitted or given as C<strict>; any other value, including the removed
 C<permissive> policy, throws C<invalid_write_policy>. There is no mode that
 writes a domain without a declared write policy.
+
+C<mode> is C<permissive> by default. C<strict> admits declared associations and
+named query members, and refuses ad-hoc row sources before dispatch. It does
+not change write grants. Query copies retain private configured-domain, mode
+and tenant provenance; set operands with different modes or scopes refuse.
+C<validate_query($query)> checks that public composition boundary without
+executing SQL. The private binding helper is internal lifecycle machinery.
+
+C<member_builders> is an explicit trusted-host registry keyed by
+C<ctes:member_id> or C<subqueries:member_id>. Each CODE callback receives the
+configured engine and must return a query made by a compatible configured
+engine. This registry is outside portable metadata. Inert
+C<{kind =E<gt> 'declared_callback'}> declarations never execute themselves.
+Scope mismatches, changed configured domains and unconfigured scoped children
+are refused. Hosts remain responsible for effects inside callbacks they supply.
 
 Throws C<invalid_domain>, C<invalid_adapter>, C<invalid_tenant_scope> or
 C<invalid_write_policy>.
@@ -2064,14 +2104,16 @@ plain metadata copies. Scope and read-cache structures join the engine's
 private configured-domain identity; mutating their public records is refused.
 
 A prefix names a separately quoted schema identifier. Prefix/compound reads
-currently support ordinary root queries only; association/advanced-source
-queries fail closed. Execution options cannot substitute the attached prefix.
+support declared associations, native CTEs/subqueries and set operations.
+Every physical relation uses the separately quoted attached prefix; local
+VALUES/CTE names remain local. Retargeted prefix queries still fail closed. Execution options cannot substitute the attached prefix.
 C<merge_execution_options(prefix =E<gt> ...)> checks that identity; C<all>,
 C<stream> and bounded execution enforce the same check. The attached read
 context does not authorize writes; all engine write dispatch refuses it.
 Existing C<with_scope> and declared C<writes.scope.tenant> remain the separate
 trusted write-authority lifecycle. This API does not execute declared UDFs or
-callback query members. See L<Selecto::Verification::QuerySafety> for the
+portable callback markers. Explicit host member builders use the separate
+constructor registry above. See L<Selecto::Verification::QuerySafety> for the
 finite read-scope model.
 
 =head2 stream

@@ -238,6 +238,7 @@ lib/Selecto/Verification/QuerySafety.pm
 t/sqlite_query_safety.t
 t/sqlite_required_boolean.integration.t
 lib/Selecto/Domain/Schema.pm
+lib/Selecto/Domain/QueryMembers.pm
 t/domain_schema_query_boundary.t
 t/fixtures/schema_query_boundary.json
 t/fixtures/schema_query_boundary_expected.json
@@ -268,3 +269,9 @@ t/sqlite_write_cardinality.integration.t
 t/write_capabilities.t
 t/write_policy_bounds.t
 t/sqlite_write_policy_owned_cleanup.integration.t
+lib/Selecto/QueryBinding.pm
+lib/Selecto/Verification/GovernedQueryComposition.pm
+t/sqlite_query_members_composition.t
+t/fixtures/query_members.json
+t/fixtures/query_members_expected.json
+t/query_member_metadata.t

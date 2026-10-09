@@ -8,6 +8,7 @@ use B ();
 use JSON::PP ();
 use Scalar::Util qw(blessed reftype);
 use Selecto::Domain::QueryContract ();
+use Selecto::Domain::QueryMembers ();
 use Selecto::QueryLibrary::Contract ();
 use Selecto::OperationBudget ();
 use Selecto::Limits ();
@@ -143,9 +144,11 @@ sub validate {
         my $library = Selecto::QueryLibrary::Contract->validate_declaration($raw);
         _error($state, $_->{code}, $_->{path}) for @{$library->{errors}};
     }
+    my $members = Selecto::Domain::QueryMembers->validate($raw);
+    _error($state, $_->{code}, $_->{path}) for @{$members->{errors}};
     my $valid = @{$state->{errors}} ? 0 : 1;
     return Selecto::Domain::QueryContract->copy_declaration({valid => bless(\$valid, 'JSON::PP::Boolean'),
-        errors => $state->{errors}, warnings => [], validated_sections => [qw(source schemas query_contract query_library events operations experiences)]});
+        errors => $state->{errors}, warnings => [], validated_sections => [qw(source schemas query_contract query_members query_library events operations experiences)]});
 }
 
 1;
