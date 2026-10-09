@@ -234,3 +234,7 @@ lib/Selecto/Tenant/Context.pm
 lib/Selecto/Verification/QuerySafety.pm
 t/sqlite_query_safety.t
 t/sqlite_required_boolean.integration.t
+lib/Selecto/Domain/Schema.pm
+t/domain_schema_query_boundary.t
+t/fixtures/schema_query_boundary.json
+t/fixtures/schema_query_boundary_expected.json
