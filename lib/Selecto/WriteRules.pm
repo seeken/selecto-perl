@@ -12,6 +12,7 @@ use Selecto::Error ();
 use Selecto::Query ();
 use Selecto::Expression ();
 use Selecto::QueryEnforcement ();
+use Selecto::Write::FieldValidators ();
 our $HYDRATION;
 my $STORED_FAILURES;
 
@@ -258,25 +259,63 @@ sub _typed_subject {
     }
     return \%values;
 }
+# INPUT and field validators consume submitted assignments before any stored
+# candidate is hydrated. Native mutation expressions remain executable only
+# when no active validator consumes their unknown prospective value.
+sub prepare_submitted {
+    my ($class,$engine,$command,%options)=@_;
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        my $writes=$engine->domain->writes;
+        my $fields=ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : {};
+        my $assignments=$command->assignments;
+        my $rules=$engine->domain->rules;
+        my $has_input=$rules && @{$rules->applicable_paths('input',$command->operation)};
+        my $has_validators=grep {
+            ref($fields->{$_}) eq 'HASH' && exists($fields->{$_}{validators})
+                && !(ref($fields->{$_}{validators}) eq 'ARRAY' && !@{$fields->{$_}{validators}})
+        } keys %$assignments;
+        return $command unless $has_input || $has_validators;
+        my $original=$options{input} // $class->literal_input($command);
+        my $input=$original;
+        if ($has_input) {
+            $input=$class->evaluate($rules,'input',$command->operation,$original);
+        }
+        for my $field (keys %$assignments) {
+            my $value=$assignments->{$field};
+            $assignments->{$field}=$value->arguments->[0]
+                if ref($value) eq 'Selecto::Write::Expression' && $value->kind eq 'literal';
+        }
+        for my $field (keys %$input) {
+            next if blessed($input->{$field}) && !JSON::PP::is_bool($input->{$field});
+            $assignments->{$field}=$input->{$field}
+                if !exists($original->{$field}) || _changed($input->{$field},$original->{$field});
+        }
+        $command=$engine->governed_write($command->with_assignments(
+            $engine->domain->normalize_write_assignments($assignments)));
+        $assignments=$command->assignments;
+        my $bundle=Selecto::Write::FieldValidators->admit($fields,
+            fields=>[sort keys %$assignments],limits=>$engine->limits);
+        my (%values,@nonliteral);
+        for my $field (sort keys %$assignments) {
+            my $spec=$fields->{$field};
+            next unless ref($spec) eq 'HASH' && ref($spec->{validators}) eq 'ARRAY' && @{$spec->{validators}};
+            my $value=$assignments->{$field};
+            if (ref($value) eq 'Selecto::Write::Expression') {
+                if ($value->kind eq 'literal') { $value=$value->arguments->[0] }
+                else { push @nonliteral,$field;next }
+            }
+            $values{$field}=$value;
+        }
+        Selecto::Write::FieldValidators->validate_values($bundle,\%values,
+            nonliteral_fields=>\@nonliteral,limits=>$engine->limits);
+        return $command;
+    },limits=>$engine->limits);
+}
 sub _normalize {
-    my ($class, $engine, $command, $values, $submitted) = @_;
+    my ($class, $engine, $command, $values) = @_;
     my $rules = $engine->domain->rules;
     return ($command, _typed_subject($engine, $values)) unless $rules;
     my $before = dclone($values);
-    my $original_input = $submitted // $class->literal_input($command);
-    my $input = $class->evaluate($rules, 'input', $command->operation, $original_input);
-    # INPUT runs before native conversion. Materialize its actual mutations
-    # independently of candidate availability (a NULL rowid alias is unknown).
-    my $input_assignments = $command->assignments;
-    # Unchanged raw inputs must never replace an already projected storage value.
-    for my $field (keys %$input) {
-        next if blessed($input->{$field}) && !JSON::PP::is_bool($input->{$field});
-        if (!exists($original_input->{$field}) || _changed($input->{$field}, $original_input->{$field})) {
-            $values->{$field} = $input->{$field};
-            $input_assignments->{$field} = $input->{$field};
-        }
-    }
-    $command = $command->with_assignments($input_assignments);
     $values = _typed_subject($engine, $values);
     $values = $engine->adapter->rule_project_subject($command, $values)
         if $engine->adapter->can('rule_project_subject');
@@ -304,12 +343,13 @@ sub govern {
 sub _govern {
     my ($class, $engine, $command, %options) = @_;
     return $command unless $class->has_rules($engine->domain, $command->operation);
+    $command=$class->prepare_submitted($engine,$command,input=>$options{input}) unless $options{input_prepared};
     local $HYDRATION = $HYDRATION // {loaded => 0};
     _check_storage($engine, $command);
     my $relationships = $engine->domain->writes->{relationships} // {};
     if (grep { my $stage = $_; grep { exists($relationships->{$_->[0]}) }
         @{$engine->domain->rules->applicable_paths($stage, $command->operation)} } qw(candidate transaction evidence)) {
-        my ($graph, $contexts) = $engine->_prepared_graph(Selecto::Write::Graph->new(nodes => [{id => 'root', command => $command}]));
+        my ($graph, $contexts) = $engine->_prepared_graph(Selecto::Write::Graph->new(nodes => [{id => 'root', command => $command}]),submitted_prepared=>1);
         $contexts->{root}{rule_input} = $options{input} if defined $options{input};
         return $class->admit_graph($engine, $graph, $contexts)->nodes->[0]{command};
     }
@@ -470,7 +510,7 @@ sub _admit_graph {
         else { delete $metadata->{returning} }
         $node->{command}=$node->{command}->with_metadata($metadata);
     }
-    my ($prepared) = $root->_prepared_graph(Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets));
+    my ($prepared) = $root->_prepared_graph(Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets),submitted_prepared=>1);
     return $prepared;
 }
 {
