@@ -79,14 +79,18 @@ subtest 'PostgreSQL DATE midnight follows the requested timezone, not the sessio
                 [[1, @expected, '1969-12-31']], "$zone DATE midnight ignores session $session";
             my $all = {select => [map {{field => 'day', format => $_, alias => $_}} @formats],
                 timezone => $zone, filters => [{field => 'id', op => 'eq', value => 1}]};
-            my @expected_all = (
-                '1969-12-31', $expected[0], $expected[1], $expected[1] * 1000,
-                '1969-12-31', '00:00:00', '1969-12-31 00', '1970-W01', '1970-W01',
-                '1970-W01-3', '1969-12', '1969-Q4', '1969', '12', '31',
-                'Wednesday', '3', '365', '00', $expected[2],
+            my %expected_all = (
+                iso8601 => '1969-12-31', rfc3339_millis => $expected[0], epoch_seconds => $expected[1],
+                epoch_milliseconds => $expected[1] * 1000, day => '1969-12-31', time => '00:00:00',
+                day_hour => '1969-12-31 00', day_minute => '1969-12-31 00:00', week => '1970-W01',
+                iso_week => '1970-W01', iso_week_date => '1970-W01-3', month => '1969-12', quarter => '1969-Q4',
+                year => '1969', month_of_year => '12', day_of_month => '31', day_of_week => 'Wednesday',
+                day_of_week_num => '3', day_of_year => '365', hour => '00', timezone_offset => $expected[2],
+                us_date => '12/31/1969', us_datetime => '12/31/1969 12:00 AM',
             );
-            is_deeply $handler->query($engine, $all)->{rows}, [[1, @expected_all]],
-                "$zone all 20 DATE formats ignore session $session";
+            is_deeply [sort keys %expected_all], [sort @formats], 'an expected DATE value for every format';
+            is_deeply $handler->query($engine, $all)->{rows}, [[1, @expected_all{@formats}]],
+                "$zone every DATE format ignores session $session";
             my $naive = {select => [map {{field => 'naive', format => $_, alias => $_}}
                 qw(iso8601 rfc3339_millis epoch_seconds day_hour)], timezone => $zone,
                 filters => [{field => 'id', op => 'eq', value => 1}]};
@@ -154,22 +158,29 @@ subtest 'all temporal formats execute equivalently on PostgreSQL and DuckDB' => 
     }
     my $handler = Selecto::API::EngineHandler->new;
     for my $case (
-        ['UTC', '1969-12-31T23:59:59Z', '1969-12-31T23:59:59.999Z', '23:59:59', '23', '+00:00'],
-        ['America/New_York', '1969-12-31T18:59:59-05:00', '1969-12-31T18:59:59.999-05:00', '18:59:59', '18', '-05:00'],
+        ['UTC', '1969-12-31T23:59:59Z', '1969-12-31T23:59:59.999Z', '23:59:59', '23', '+00:00', '11:59 PM'],
+        ['America/New_York', '1969-12-31T18:59:59-05:00', '1969-12-31T18:59:59.999-05:00', '18:59:59', '18', '-05:00',
+            '6:59 PM'],
     ) {
-        my ($zone, $iso, $rfc, $time, $hour, $offset) = @$case;
+        my ($zone, $iso, $rfc, $time, $hour, $offset, $us_time) = @$case;
+        my %expected = (
+            iso8601 => $iso, rfc3339_millis => $rfc, epoch_seconds => -1, epoch_milliseconds => -1,
+            day => '1969-12-31', time => $time, day_hour => "1969-12-31 $hour", day_minute => "1969-12-31 $hour:59",
+            week => '1970-W01', iso_week => '1970-W01', iso_week_date => '1970-W01-3', month => '1969-12',
+            quarter => '1969-Q4', year => '1969', month_of_year => '12', day_of_month => '31',
+            day_of_week => 'Wednesday', day_of_week_num => '3', day_of_year => '365', hour => $hour,
+            timezone_offset => $offset, us_date => '12/31/1969', us_datetime => "12/31/1969 $us_time",
+        );
+        is_deeply [sort keys %expected], [sort @formats], 'an expected epoch value for every format';
         my $request = {select => ['id', map {{field => 'epoch', format => $_, alias => $_}} @formats],
             timezone => $zone, filters => [{field => 'id', op => 'eq', value => 1}]};
         my $nullable = {select => ['id', map {{field => 'epoch', format => $_, alias => $_}} @formats],
             timezone => $zone, filters => [{field => 'id', op => 'eq', value => 5}]};
         for my $session ('UTC', 'Pacific/Honolulu') {
             $handles[0]->do("SET TIME ZONE '$session'"); # Authored fixture zones only.
-            is_deeply $handler->query($engines[0], $request)->{rows}, [[1,
-                $iso, $rfc, -1, -1, '1969-12-31', $time, "1969-12-31 $hour",
-                '1970-W01', '1970-W01', '1970-W01-3', '1969-12', '1969-Q4',
-                '1969', '12', '31', 'Wednesday', '3', '365', $hour, $offset]],
+            is_deeply $handler->query($engines[0], $request)->{rows}, [[1, @expected{@formats}]],
                 "$zone negative fractional epoch follows floor under session $session";
-            is_deeply $handler->query($engines[0], $nullable)->{rows}, [[5, (undef) x 20]],
+            is_deeply $handler->query($engines[0], $nullable)->{rows}, [[5, (undef) x @formats]],
                 "$zone NULL epoch preserves all formatted NULLs under session $session";
         }
     }
@@ -200,7 +211,7 @@ subtest 'all temporal formats execute equivalently on PostgreSQL and DuckDB' => 
                 filters => [{field => 'id', op => 'gte', value => 1}]};
             my @observations = map { $handler->query($_, $request) } @engines;
             is_deeply $observations[1]{columns}, $observations[0]{columns}, "$field in $zone preserves formatted aliases";
-            is_deeply $observations[1]{rows}, $observations[0]{rows}, "$field in $zone matches live PostgreSQL for all 20 formats";
+            is_deeply $observations[1]{rows}, $observations[0]{rows}, "$field in $zone matches live PostgreSQL for every format";
             is scalar @{$observations[1]{rows}}, 5, "$field in $zone retains required scope and NULL row";
         }
     }
