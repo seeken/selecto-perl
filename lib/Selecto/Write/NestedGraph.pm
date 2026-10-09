@@ -282,6 +282,7 @@ sub _relationships {
             my $compiled=Selecto::Write::PortableCommand->compile_flat($op,%{$state->{options}},context=>$state->{context});
             _fail('tenant_mismatch','nested child context differs from root context',$row_path) unless _json($compiled->{context}) eq _json($state->{context});
             my $command=$compiled->{command};
+            my $input_source=$command;
             my $metadata=$command->metadata;
             $metadata->{nested_graph}={relationship=>$relationship,path=>$row_path,strategy=>$strategy,identity_fields=>$fields,
                 identity=>_identity($attrs,$fields),client_identity=>$entry->{client_identity},semantic_operation=>$effective,
@@ -290,6 +291,7 @@ sub _relationships {
             # Native IDs encode structural components rather than interpolated path text.
             $state->{generated}->consume_count('max_state_bytes',2*bytes::length($parent_id)+2*bytes::length($relationship)+32,label=>'generated native graph identities');
             my $id='nested:'._json([$parent_id,$relationship,$index]);
+            $state->{input_sources}{$id}=$input_source;
             my $node={id=>$id,command=>$command,bindings=>[{field=>$child_key,from=>$parent_id,key=>$parent_key}]};
             $state->{budget}->check_tree($node,label=>'cumulative lowered graph',allowed_classes=>[qw(Selecto::Write::Command Selecto::Expression Selecto::Write::Expression Selecto::QueryEnforcement)]);
             _fail('invalid_graph','nested graph exceeds native node limit',$row_path) if @{$state->{nodes}}>=1000;
@@ -323,6 +325,7 @@ sub _compile {
     my $compiled=Selecto::Write::PortableCommand->compile_flat(_operation($operation,$snapshot,$flat),%$admitted);
     my $key=_primary($snapshot->{domain},[]);my $root=$compiled->{command};
     my $state={nodes=>[{id=>'root',command=>$root,bindings=>[]}],owned_sets=>[],context=>$compiled->{context},options=>$admitted,
+        input_sources=>{root=>$root},
         internal_returning=>{root=>[$key]},validation=>{limits=>Selecto::Limits->new,work=>0},generated=>Selecto::OperationBudget->new(code=>'invalid_graph'),budget=>Selecto::OperationBudget->new(code=>'invalid_graph')};
     $state->{budget}->check_tree($state->{nodes}[0],label=>'lowered root',allowed_classes=>[qw(Selecto::Write::Command Selecto::Expression Selecto::Write::Expression Selecto::QueryEnforcement)]);
     _relationships($state,$contract,$nested,$snapshot->{type},'root',$key,[],1);
@@ -335,6 +338,7 @@ sub _compile {
     for my $node (@{$graph->{nodes}}) {
         $node->{command}=_returning($node->{command},$state->{internal_returning}{$node->{id}} // []);
     }
+    Selecto::Write::PortableCommand->_capture_graph_inputs($graph,$state->{input_sources});
     return {command=>$graph,context=>_copy($state->{context})};
 }
 1;

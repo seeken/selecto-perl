@@ -300,3 +300,6 @@ lib/Selecto/Write/FieldValidators.pm
 t/write_field_validators.t
 t/portable_field_validators.t
 t/sqlite_field_validators.integration.t
+t/write_rules_phases.t
+t/write_input_receipts.t
+t/sqlite_input_only_rules.integration.t
