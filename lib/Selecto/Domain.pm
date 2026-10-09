@@ -2355,6 +2355,18 @@ sub query_contract {
     require Selecto::Domain::Identity;
     return Selecto::Domain::Identity->normalize($self)->{normalized}{query};
 }
+sub project_query_contract {
+    # Additive raw portable metadata API. Keep query_contract's independently
+    # published raw identity projection and native parser semantics unchanged.
+    my ($class, $contract) = @_;
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->project($contract);
+}
+sub validate_query_contract {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->validate($contract);
+}
 sub validate_query_library {
     my ($self, $limits) = @_;
     require Selecto::QueryLibrary;

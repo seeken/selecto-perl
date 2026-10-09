@@ -129,11 +129,20 @@ sub _build {
 sub select {
     my ($self, @values) = @_;
     $self->_ensure_pre_set_mutation('select');
+    Selecto::Error->throw('raw_sql_forbidden', 'raw SQL is not a governed selection', {path => []})
+        if @values == 1 && ref($values[0]) eq 'ARRAY' && @{$values[0]}
+            && !ref($values[0][0]) && defined($values[0][0]) && $values[0][0] eq 'raw_sql';
     @values = @{$values[0]} if @values == 1 && ref($values[0]) eq 'ARRAY';
     my @expressions = map {
         blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
     } @values;
     return $self->_copy(selections => \@expressions);
+}
+
+# The domain owns the relation graph. Declared associations and query members
+# use their existing governed APIs; caller-created relation overrides do not.
+sub join {
+    Selecto::Error->throw('ad_hoc_join_forbidden', 'ad-hoc joins are outside the configured domain', {path => []});
 }
 
 sub where {

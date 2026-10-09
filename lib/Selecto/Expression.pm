@@ -10,6 +10,8 @@ our $_CONSTRUCTION_LIMITS;
 
 sub new {
     my ($class, $kind, @arguments) = @_;
+    Selecto::Error->throw('raw_sql_forbidden', 'raw SQL is outside governed expressions', {path => []})
+        if defined($kind) && !ref($kind) && $kind eq 'raw_sql';
     my $budget = Selecto::OperationBudget->new(
         (defined($_CONSTRUCTION_LIMITS) ? (limits => $_CONSTRUCTION_LIMITS) : ()), code => 'invalid_query');
     $budget->check_tree(\@arguments, label => 'expression arguments', allowed_classes => ['Selecto::Expression']);
