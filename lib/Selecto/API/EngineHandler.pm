@@ -654,7 +654,7 @@ sub _for_engine ($self, $engine) {
 # original engine's. Copy request-local state; never mutate a shared engine's
 # policy while a callback or adapter can re-enter it.
 sub _engine_with_limits ($self, $engine) {
-    return bless {%$engine, limits => $self->limits->intersect($engine->limits)}, ref($engine);
+    return $engine->with_limits($self->limits);
 }
 
 sub describe_openapi ($self, $api) {

@@ -271,8 +271,8 @@ sub parse {
     }
     _object($raw, 'domain');
     if (defined($raw->{query_library})) {
-        require Selecto::OperationBudget;
-        Selecto::OperationBudget->new(code => 'invalid_query_library')->check_tree($raw->{query_library}, label => 'query library');
+        require Selecto::ConfiguredDomain;
+        Selecto::ConfiguredDomain->admit_library($raw->{query_library});
     }
     _reject_unknown($raw, \%TOP_LEVEL, 'domain') if $strict;
     _required_key($raw, 'source', 'domain');
@@ -1557,8 +1557,8 @@ sub _normalize_query_library {
     my ($value) = @_;
     return {} unless defined $value;
     _object($value, 'query_library');
-    require Selecto::OperationBudget;
-    Selecto::OperationBudget->new(code => 'invalid_query_library')->check_tree($value, label => 'query library');
+    require Selecto::ConfiguredDomain;
+    Selecto::ConfiguredDomain->admit_library($value);
     my %known = map { $_ => 1 } qw(segments projections orderings views segment_picker_groups);
     _reject_unknown($value, \%known, 'query_library');
     my %library;
@@ -2344,7 +2344,12 @@ sub editors      { return dclone($_[0]->{editors} // {}); }
 sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->{contract} // {}; return dclone($contract->{capabilities} // {}); }
 sub components   { return dclone($_[0]->{components} // {}); }
-sub query_library { return dclone($_[0]->{query_library} // {}); }
+sub query_library {
+    require Selecto::ConfiguredDomain;
+    my $library = $_[0]->{query_library} // {};
+    Selecto::ConfiguredDomain->admit_library($library);
+    return dclone($library);
+}
 sub query_contract {
     my ($self) = @_;
     require Selecto::Domain::Identity;

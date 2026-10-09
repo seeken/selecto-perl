@@ -21,6 +21,7 @@ t/api_field_roles_adversarial.t
 lib/Selecto/API/ResultFormatter.pm
 lib/Selecto/CannedPage.pm
 lib/Selecto/CoDomain.pm
+lib/Selecto/ConfiguredDomain.pm
 lib/Selecto/DataRules.pm
 lib/Selecto/RuleTest.pm
 lib/Selecto/DateFormat.pm
@@ -216,3 +217,5 @@ lib/Selecto/QueryLibrary/Contract.pm
 lib/Selecto/QueryPolicy.pm
 t/fixtures/query_library.json
 t/sqlite_query_library.t
+t/sqlite_query_library_budget.t
+t/sqlite_configured_domain.t

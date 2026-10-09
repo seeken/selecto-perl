@@ -4,12 +4,13 @@ use 5.034;
 use strict;
 use warnings;
 use JSON::PP ();
-use Scalar::Util qw(blessed looks_like_number);
+use Scalar::Util qw(blessed looks_like_number reftype);
 use Storable qw(dclone);
 use POSIX qw(isfinite);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Limits ();
+use Selecto::OperationBudget ();
 
 my @REGISTRIES = qw(segments projections orderings views);
 sub validate {
@@ -94,12 +95,17 @@ sub view_segments {
 
 sub parameter_specs {
     my ($class, $domain, %selection) = @_;
-    my @segments = @{$selection{segments} // []};
+    my $context = _resolution($selection{limits});
+    my $names = $selection{segments} // [];
+    _names($context, $names, 'segment selection');
+    my @segments = @$names;
     push @segments, @{$class->view_segments($domain, $selection{view})}
         if defined($selection{view}) && "$selection{view}" ne '';
     my $library = $class->library($domain);
     my (%specs, %visiting);
-    _collect_segment_parameters($library, $_, \%specs, \%visiting) for @segments;
+    _names($context, \@segments, 'segment selection');
+    _collect_segment_parameters($library, $_, \%specs, \%visiting, $context, 0) for @segments;
+    $context->{work}->check_tree(\%specs, label => 'returned parameter definitions');
     return dclone(\%specs);
 }
 
@@ -114,19 +120,22 @@ sub normalize_parameters_for_selection {
     my $specs = $class->parameter_specs(
         $domain,
         view => $selection->{view},
-        segments => $selection->{segments} // [],
+        segments => $selection->{segments} // [], limits => $limits,
     );
     return _normalize_parameters($specs, $params, $limits);
 }
 
 sub projection_fields {
-    my ($class, $domain, $projection_ids) = @_;
+    my ($class, $domain, $projection_ids, $limits) = @_;
+    my $context = _resolution($limits);
+    _names($context, $projection_ids, 'projection selection') if ref($projection_ids) eq 'ARRAY';
     my @ids = ref($projection_ids) eq 'ARRAY' ? @$projection_ids : ($projection_ids);
     Selecto::Error->throw('invalid_query_library', 'projection names must not be empty') unless @ids;
     my $library = $class->library($domain);
     my (%seen, @fields);
     for my $id (@ids) {
-        my $resolved = _resolve_projection($library, $id, []);
+        my $resolved = _resolve_projection($library, $id, [], $context);
+        _work($context, scalar(@{$resolved->{fields}}));
         push @fields, grep { !$seen{$_}++ } @{$resolved->{fields}};
     }
     return \@fields;
@@ -157,7 +166,9 @@ sub apply_segments {
         unless ref($params) eq 'HASH';
     my $library = $class->library($domain);
     my $resolved = {filters => [], parameters => {}, ids => []};
-    _merge_segment($resolved, _resolve_segment($library, $_, [])) for @$segment_ids;
+    my $context = _resolution($limits);
+    _names($context, $segment_ids, 'segment selection');
+    _merge_segment($resolved, _resolve_segment($library, $_, [], $context), $context) for @$segment_ids;
     my %selected = map { $_ => 1 } (
         @{$query->applied_query_library->{segments} // []}, @{$resolved->{ids}},
     );
@@ -182,21 +193,24 @@ sub apply_segments {
         $query = $query->where($predicate);
     }
     my $applied = $query->applied_query_library;
-    _append_unique($applied->{segments}, $_) for @{$resolved->{ids}};
+    _append_unique($applied->{segments}, $_, $context) for @{$resolved->{ids}};
     return $query->with_applied_query_library($applied);
 }
 
 sub apply_projection {
-    my ($class, $domain, $query, $projection_ids) = @_;
+    my ($class, $domain, $query, $projection_ids, $limits) = @_;
     _query($query);
+    my $context = _resolution($limits);
+    _names($context, $projection_ids, 'projection selection') if ref($projection_ids) eq 'ARRAY';
     my @ids = ref($projection_ids) eq 'ARRAY' ? @$projection_ids : ($projection_ids);
     my $library = $class->library($domain);
     my (%seen, @fields, @applied_ids, @associations);
     for my $id (@ids) {
-        my $resolved = _resolve_projection($library, $id, []);
+        my $resolved = _resolve_projection($library, $id, [], $context);
+        _work($context, scalar(@{$resolved->{root_fields}}));
         push @fields, grep { !$seen{$_}++ } @{$resolved->{root_fields}};
-        _merge_associations(\@associations, $resolved->{associations});
-        _append_unique(\@applied_ids, $_) for @{$resolved->{ids}};
+        _merge_associations(\@associations, $resolved->{associations}, $context);
+        _append_unique(\@applied_ids, $_, $context) for @{$resolved->{ids}};
     }
     my $contract = $domain->contract // {};
     my @required = ref($contract->{required_selected}) eq 'ARRAY'
@@ -209,7 +223,7 @@ sub apply_projection {
     push @selections, map { _association_expression($domain, $_) } @associations;
     $query = $query->replace_selections(\@selections);
     my $applied = $query->applied_query_library;
-    _append_unique($applied->{projections}, $_) for @applied_ids;
+    _append_unique($applied->{projections}, $_, $context) for @applied_ids;
     $applied->{projection} = "$ids[-1]";
     return $query->with_applied_query_library($applied);
 }
@@ -238,7 +252,7 @@ sub apply_view {
     my $view = $class->definition($domain, 'views', $view_id);
     my @segments = @{$view->{segments} // []};
     $query = $class->apply_segments($domain, $query, \@segments, $params // {}, $limits);
-    $query = $class->apply_projection($domain, $query, $view->{projection})
+    $query = $class->apply_projection($domain, $query, $view->{projection}, $limits)
         if defined($view->{projection}) && "$view->{projection}" ne '';
     $query = $class->apply_ordering($domain, $query, $view->{ordering})
         if defined($view->{ordering}) && "$view->{ordering}" ne '';
@@ -248,45 +262,51 @@ sub apply_view {
 }
 
 sub _resolve_segment {
-    my ($library, $id, $stack) = @_;
+    my ($library, $id, $stack, $context) = @_;
+    $context //= _resolution();
+    _work($context, 1);
+    $context->{limits}->check_count('max_expression_depth', scalar(@$stack), 'invalid_query_library', 'segment reference depth');
     my $key = _id($id, 'segment');
     Selecto::Error->throw('query_library_cycle', 'query-library segment cycle detected')
         if grep { $_ eq $key } @$stack;
+    return $context->{segments}{$key} if exists $context->{segments}{$key};
     my $spec = _definition($library->{segments}, 'segments', $key);
     my $resolved = {filters => [], parameters => {}, ids => []};
     for my $child (@{$spec->{segments} // []}) {
-        _merge_segment($resolved, _resolve_segment($library, $child, [@$stack, $key]));
+        _merge_segment($resolved, _resolve_segment($library, $child, [@$stack, $key], $context), $context);
     }
     for my $group (@{$spec->{segment_groups} // []}) {
-        _merge_segment($resolved, _resolve_group($library, $group, [@$stack, $key]));
+        _merge_segment($resolved, _resolve_group($library, $group, [@$stack, $key], $context), $context);
     }
+    _emit($context, $resolved->{filters}, $spec->{filters} // []);
     push @{$resolved->{filters}}, @{$spec->{filters} // []};
     for my $name (keys %{$spec->{parameters} // {}}) {
+        _work($context, 1);
         my $parameter_key = _id($name, 'parameter');
         my $candidate = $spec->{parameters}{$name};
         if (exists($resolved->{parameters}{$parameter_key})
-            && _canonical($resolved->{parameters}{$parameter_key}) ne _canonical($candidate)) {
+            && _different_parameters($context, $resolved->{parameters}{$parameter_key}, $candidate)) {
             Selecto::Error->throw('invalid_query_library', "conflicting segment parameter $parameter_key");
         }
-        $resolved->{parameters}{$parameter_key} = dclone($candidate);
+        $resolved->{parameters}{$parameter_key} = _copy_parameter($context, $candidate);
     }
-    _append_unique($resolved->{ids}, $key);
-    return $resolved;
+    _append_unique($resolved->{ids}, $key, $context);
+    return $context->{segments}{$key} = $resolved;
 }
 
 sub _resolve_group {
-    my ($library, $group, $stack) = @_;
+    my ($library, $group, $stack, $context) = @_;
     Selecto::Error->throw('invalid_query_library', 'segment group must be an object')
         unless ref($group) eq 'HASH';
     my $operator = lc($group->{operator} // '');
     my $ids = $group->{segments} // [];
     _array($ids, 'segment group segments');
-    my @parts = map { _resolve_segment($library, $_, $stack) } @$ids;
+    $context->{limits}->check_count('max_expression_arity', scalar(@$ids), 'invalid_query_library', 'segment group references');
+    my @parts = map { _resolve_segment($library, $_, $stack, $context) } @$ids;
     my $merged = {filters => [], parameters => {}, ids => []};
-    _merge_segment($merged, $_) for @parts;
+    _merge_segment($merged, $_, $context, $operator eq 'and') for @parts;
     my $predicate;
     if ($operator eq 'and') {
-        $merged->{filters} = [map { @{$_->{filters}} } @parts];
         return $merged;
     } elsif ($operator eq 'or') {
         if (!@parts || grep { !@{$_->{filters}} } @parts) {
@@ -313,45 +333,57 @@ sub _resolve_group {
     } else {
         Selecto::Error->throw('invalid_query_library', 'unsupported segment group operator');
     }
+    _emit($context, [], [$predicate]);
     $merged->{filters} = [$predicate];
     return $merged;
 }
 
 sub _resolve_projection {
-    my ($library, $id, $stack) = @_;
+    my ($library, $id, $stack, $context) = @_;
+    $context //= _resolution();
+    _work($context, 1);
+    $context->{limits}->check_count('max_expression_depth', scalar(@$stack), 'invalid_query_library', 'projection reference depth');
     my $key = _id($id, 'projection');
     Selecto::Error->throw('query_library_cycle', 'query-library projection cycle detected')
         if grep { $_ eq $key } @$stack;
+    return $context->{projections}{$key} if exists $context->{projections}{$key};
     my $spec = _definition($library->{projections}, 'projections', $key);
     my (%seen, %root_seen, @fields, @root_fields, @associations, @ids);
     for my $child (@{$spec->{projections} // []}) {
-        my $part = _resolve_projection($library, $child, [@$stack, $key]);
+        my $part = _resolve_projection($library, $child, [@$stack, $key], $context);
+        _work($context, scalar(@{$part->{fields}}) + scalar(@{$part->{root_fields}}));
         push @fields, grep { !$seen{$_}++ } @{$part->{fields}};
         push @root_fields, grep { !$root_seen{$_}++ } @{$part->{root_fields}};
-        _merge_associations(\@associations, $part->{associations});
-        _append_unique(\@ids, $_) for @{$part->{ids}};
+        _merge_associations(\@associations, $part->{associations}, $context);
+        _append_unique(\@ids, $_, $context) for @{$part->{ids}};
     }
+    _work($context, 2 * scalar(@{$spec->{fields} // []}));
     push @fields, grep { !$seen{$_}++ } map { "$_" } @{$spec->{fields} // []};
     push @root_fields, grep { !$root_seen{$_}++ } map { "$_" } @{$spec->{fields} // []};
     for my $association (@{$spec->{associations} // []}) {
-        push @fields, grep { !$seen{$_}++ } @{_association_fields($association, undef)};
+        my $part = _association_fields($association, undef, $context, 0);
+        _work($context, scalar(@$part));
+        push @fields, grep { !$seen{$_}++ } @$part;
     }
-    _merge_associations(\@associations, $spec->{associations} // []);
-    _append_unique(\@ids, $key);
-    return {fields => \@fields, root_fields => \@root_fields, associations => \@associations, ids => \@ids};
+    _merge_associations(\@associations, $spec->{associations} // [], $context);
+    _append_unique(\@ids, $key, $context);
+    return $context->{projections}{$key} = {fields => \@fields, root_fields => \@root_fields, associations => \@associations, ids => \@ids};
 }
 
 sub _merge_associations {
-    my ($target, $incoming) = @_;
+    my ($target, $incoming, $context, $depth) = @_;
+    $depth //= 0;
+    $context->{limits}->check_count('max_expression_depth', $depth, 'invalid_query_library', 'association merge depth');
     _array($incoming, 'projection associations');
     for my $entry (@$incoming) {
+        _work($context, 1 + scalar(@$target));
         Selecto::Error->throw('invalid_query_library', 'projection association must be an object') unless ref($entry) eq 'HASH';
         my $name = _id($entry->{name}, 'association');
         _array($entry->{fields} // [], 'association fields');
         my ($existing) = grep { $_->{name} eq $name } @$target;
         unless ($existing) { $existing = {name => $name, fields => [], associations => []}; push @$target, $existing }
-        _append_unique($existing->{fields}, $_) for @{$entry->{fields} // []};
-        _merge_associations($existing->{associations}, $entry->{associations} // []);
+        _append_unique($existing->{fields}, $_, $context) for @{$entry->{fields} // []};
+        _merge_associations($existing->{associations}, $entry->{associations} // [], $context, $depth + 1);
     }
 }
 
@@ -368,41 +400,54 @@ sub _association_expression {
 }
 
 sub _association_fields {
-    my ($association, $parent) = @_;
+    my ($association, $parent, $context, $depth) = @_;
     Selecto::Error->throw('invalid_query_library', 'projection association must be an object')
         unless ref($association) eq 'HASH';
+    _work($context, 1 + scalar(@{$association->{fields} // []}));
+    $context->{limits}->check_count('max_expression_depth', $depth, 'invalid_query_library', 'association projection depth');
     my $name = _id($association->{name}, 'association');
     my $path = defined($parent) ? "$parent.$name" : $name;
     my @fields = map { "$path.$_" } @{$association->{fields} // []};
-    push @fields, @{_association_fields($_, $path)} for @{$association->{associations} // []};
+    for my $child (@{$association->{associations} // []}) {
+        my $part = _association_fields($child, $path, $context, $depth + 1);
+        _work($context, scalar(@$part));
+        push @fields, @$part;
+    }
     return \@fields;
 }
 
 sub _collect_segment_parameters {
-    my ($library, $id, $specs, $visiting) = @_;
+    my ($library, $id, $specs, $visiting, $context, $depth) = @_;
+    _work($context, 1);
+    $context->{limits}->check_count('max_expression_depth', $depth, 'invalid_query_library', 'parameter reference depth');
     my $key = _id($id, 'segment');
     Selecto::Error->throw('query_library_cycle', 'query-library segment cycle detected')
         if $visiting->{$key};
+    return if $context->{parameters}{$key};
     local $visiting->{$key} = 1;
     my $segment = _definition($library->{segments}, 'segments', $key);
     for my $name (keys %{$segment->{parameters} // {}}) {
+        _work($context, 1);
         my $parameter_key = _id($name, 'parameter');
         my $candidate = $segment->{parameters}{$name};
         Selecto::Error->throw('invalid_query_library', "conflicting segment parameter $parameter_key")
             if exists($specs->{$parameter_key})
-                && _canonical($specs->{$parameter_key}) ne _canonical($candidate);
-        $specs->{$parameter_key} = dclone($candidate);
+                && _different_parameters($context, $specs->{$parameter_key}, $candidate);
+        $specs->{$parameter_key} = _copy_parameter($context, $candidate);
     }
-    _collect_segment_parameters($library, $_, $specs, $visiting)
+    _collect_segment_parameters($library, $_, $specs, $visiting, $context, $depth + 1)
         for @{$segment->{segments} // []};
     for my $group (@{$segment->{segment_groups} // []}) {
         next unless ref($group) eq 'HASH' && ref($group->{segments}) eq 'ARRAY';
-        _collect_segment_parameters($library, $_, $specs, $visiting) for @{$group->{segments}};
+        _collect_segment_parameters($library, $_, $specs, $visiting, $context, $depth + 1) for @{$group->{segments}};
     }
+    $context->{parameters}{$key} = 1;
 }
 
 sub _normalize_parameters {
     my ($specs, $params, $limits) = @_;
+    require Selecto::ConfiguredDomain;
+    Selecto::ConfiguredDomain->admit_library($params);
     $limits //= Selecto::Limits->new;
     Selecto::Error->throw('invalid_limits', 'query library limits must be a Selecto::Limits')
         unless blessed($limits) && $limits->isa('Selecto::Limits');
@@ -575,21 +620,26 @@ sub _filters_operand {
 }
 
 sub _merge_segment {
-    my ($target, $source) = @_;
-    push @{$target->{filters}}, @{$source->{filters}};
+    my ($target, $source, $context, $include_filters) = @_;
+    $include_filters //= 1;
+    if ($include_filters) {
+        _emit($context, $target->{filters}, $source->{filters});
+        push @{$target->{filters}}, @{$source->{filters}};
+    }
+    _work($context, scalar(keys %{$source->{parameters}}));
     for my $name (keys %{$source->{parameters}}) {
         Selecto::Error->throw('invalid_query_library', "conflicting segment parameter $name")
             if exists($target->{parameters}{$name})
-                && _canonical($target->{parameters}{$name}) ne _canonical($source->{parameters}{$name});
-        $target->{parameters}{$name} = dclone($source->{parameters}{$name});
+                && _different_parameters($context, $target->{parameters}{$name}, $source->{parameters}{$name});
+        $target->{parameters}{$name} = _copy_parameter($context, $source->{parameters}{$name});
     }
-    _append_unique($target->{ids}, $_) for @{$source->{ids}};
+    _append_unique($target->{ids}, $_, $context) for @{$source->{ids}};
 }
 
 sub _definition {
     my ($registry, $kind, $id) = @_;
     my $key = _id($id, $kind);
-    my ($stored) = grep { "$_" eq $key } keys %$registry;
+    my $stored = exists($registry->{$key}) ? $key : undef;
     Selecto::Error->throw('unknown_query_library_definition', "unknown query-library $kind $key")
         unless defined($stored) && ref($registry->{$stored}) eq 'HASH';
     return $registry->{$stored};
@@ -621,15 +671,53 @@ sub _array {
 sub _id {
     my ($value, $kind) = @_;
     Selecto::Error->throw('invalid_query_library', "$kind name must be a non-empty string")
-        if !defined($value) || ref($value) || "$value" eq '';
+        if !defined($value) || defined(reftype($value)) || "$value" eq '';
     return "$value";
 }
 
 sub _append_unique {
-    my ($values, $value) = @_;
+    my ($values, $value, $context) = @_;
+    _work($context, 1 + scalar(@$values)) if $context;
     push @$values, "$value" unless grep { $_ eq "$value" } @$values;
 }
 
+sub _resolution {
+    my ($limits) = @_;
+    $limits //= Selecto::Limits->new;
+    Selecto::Error->throw('invalid_limits', 'query-library resolution requires trusted limits')
+        unless blessed($limits) && $limits->isa('Selecto::Limits');
+    return {limits => $limits, segments => {}, projections => {}, parameters => {},
+        work => Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query_library'),
+        emitted => Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query_library')};
+}
+sub _names {
+    my ($context, $names, $label) = @_;
+    _array($names, $label);
+    $context->{limits}->check_count('max_expression_arity', scalar(@$names), 'invalid_query_library', $label);
+}
+sub _work {
+    my ($context, $count) = @_;
+    $context->{work}->consume_count('max_expression_nodes', $count, label => 'query-library resolution work');
+}
+sub _emit {
+    my ($context, $existing, $incoming) = @_;
+    $context->{limits}->check_count('max_expression_arity', scalar(@$existing) + scalar(@$incoming),
+        'invalid_query_library', 'emitted segment filters');
+    # Admission precedes growth. Shared cached fragments are charged once for
+    # every emitted occurrence, preserving authored repeated-filter semantics.
+    $context->{emitted}->check_tree($incoming, label => 'emitted segment filters');
+}
+sub _copy_parameter {
+    my ($context, $candidate) = @_;
+    $context->{work}->check_tree($candidate, label => 'cloned parameter definition');
+    return dclone($candidate);
+}
+sub _different_parameters {
+    my ($context, $left, $right) = @_;
+    $context->{work}->check_tree($left, label => 'compared parameter definition');
+    $context->{work}->check_tree($right, label => 'compared parameter definition');
+    return _canonical($left) ne _canonical($right);
+}
 sub _canonical {
     my ($value) = @_;
     require JSON::PP;
@@ -786,6 +874,17 @@ Apply a view's segments, projection and ordering.
 Introspection helpers for user interfaces and API handlers.
 
 =back
+
+=head1 RESOLUTION BUDGETS
+
+Each segment/projection/parameter resolution memoizes completed declarations.
+Shared acyclic references consume cumulative merge/reference work under trusted
+C<max_expression_nodes>, with C<max_expression_depth> and root/reference arity
+limits. Every emitted segment-filter occurrence consumes a cumulative structural
+node/byte budget before append; C<max_expression_arity> bounds each merged filter
+list. Repeated filters retain their authored occurrences until a typed
+C<invalid_query_library> resource refusal. Memoization does not deduplicate their
+semantics. Public parameter/projection introspection uses the same admission.
 
 =head1 ERRORS
 
