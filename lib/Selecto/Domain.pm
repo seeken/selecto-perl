@@ -2431,6 +2431,11 @@ sub project_source_relationships {
     require Selecto::Domain::SourceRelationships;
     return Selecto::Domain::SourceRelationships->project($contract);
 }
+sub validate_choice_sources {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::ChoiceSources;
+    return Selecto::Domain::ChoiceSources->validate($contract);
+}
 sub validate_query_library {
     my ($self, $limits) = @_;
     require Selecto::QueryLibrary;
