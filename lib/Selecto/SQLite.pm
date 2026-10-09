@@ -4,6 +4,8 @@ use Mojo::Base 'Selecto::SQL';
 use Selecto::Error ();
 use Selecto::Statement ();
 use Scalar::Util qw(blessed);
+use POSIX qw(isfinite);
+use DBI qw(SQL_INTEGER SQL_DOUBLE SQL_VARCHAR);
 use Selecto::SQLite::Ownership ();
 
 sub ownership_storage {
@@ -347,6 +349,29 @@ sub _compile_expression {
     return $self->SUPER::_compile_expression($domain, $expression, $params, $compiled_selections);
 }
 
+sub _validate_numeric_parameter {
+    my ($self, $value) = @_;
+    my $type = Selecto::SQL::_numeric_scalar_type($value);
+    return unless defined $type;
+    if ($type eq 'INTEGER') {
+        my $text = "$value";
+        my $bound = $text =~ s/\A-// ? '9223372036854775808' : '9223372036854775807';
+        Selecto::Error->throw('invalid_query', 'SQLite integer literal exceeds signed 64-bit storage')
+            if length($text) > length($bound)
+                || (length($text) == length($bound) && $text gt $bound);
+    } elsif ($type eq 'REAL') {
+        Selecto::Error->throw('invalid_query', 'SQLite numeric literal must be finite') unless isfinite($value);
+    }
+    return $type;
+}
+
+sub admit_parameters {
+    my ($self, $budget, $parameters, @options) = @_;
+    my $result = $self->SUPER::admit_parameters($budget, $parameters, @options);
+    $self->_validate_numeric_parameter($_) for @$parameters;
+    return $result;
+}
+
 # SQLite stores bound text as TEXT; only integer affinity changes ordering.
 sub _values_cast_types {
     return { integer => 'INTEGER', int => 'INTEGER', bigint => 'INTEGER' };
@@ -478,7 +503,22 @@ sub execute_query_unsafe {
 
 sub _execute_statement {
     my ($self, $sth, $params) = @_;
-    my $result = $self->SUPER::_execute_statement($sth, $params);
+    my $native = blessed($sth) && $sth->isa('DBI::st')
+        && $sth->{Database}{Driver}{Name} eq 'SQLite';
+    my $result;
+    if ($native) {
+        for my $index (0 .. $#$params) {
+            my $value = $params->[$index];
+            my $type = $self->_validate_numeric_parameter($value);
+            $value = $value ? 1 : 0 if JSON::PP::is_bool($value);
+            my $bound = $sth->bind_param($index + 1, $value,
+                !defined($type) ? SQL_VARCHAR : $type eq 'INTEGER' ? SQL_INTEGER : SQL_DOUBLE);
+            die Selecto::SQL::_dbi_error($sth, 'database parameter binding failed') unless defined $bound;
+        }
+        $result = $sth->execute;
+    } else {
+        $result = $self->SUPER::_execute_statement($sth, $params);
+    }
     die Selecto::SQL::_dbi_error($sth, 'database statement execution failed') unless defined $result;
     return $result;
 }
@@ -1066,6 +1106,14 @@ dimensions, literals, closed aggregates, or scalar compositions of these.
 C<GROUPING> emits explicit integer masks, keeping real NULL groups distinct
 from subtotal NULLs. Ordering uses selected expressions or aliases; pagination
 applies to the combined result. The grand total exists even on empty input.
+
+=item *
+
+Numeric Perl/JSON parameters use explicit integer or real DBI bindings,
+so aggregate comparisons retain numeric semantics. Authored strings use text
+bindings even when the host enables numeric guessing, preserving exact decimal
+text and leading zeroes. Native integers must fit signed 64-bit storage and
+real parameters must be finite.
 
 =item *
 
