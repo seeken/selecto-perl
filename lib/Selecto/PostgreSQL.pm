@@ -39,6 +39,38 @@ sub bounded_stream_supported {
     return eval { $self->dbh->isa('DBI::db') && $self->dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0;
 }
 
+# A bounded result that its own LIMIT keeps to one fetch batch can run as a plain
+# statement inside the host's transaction, under a savepoint budget (see
+# Selecto::QueryBudget): no cursor and no extra FETCH.
+sub bounded_direct_supported {
+    my ($self) = @_;
+    return $self->bounded_stream_supported && $self->_transaction_open ? 1 : 0;
+}
+
+# $statement with one more column, $alias, holding the single value of $scalar
+# (a one-row, one-column statement such as a total), so both run in one round
+# trip. The scalar is an uncorrelated subquery, evaluated once. Its placeholders
+# follow the outer statement's. The outer rows keep their order, as the bounded
+# result guard's own wrapping relies on.
+sub scalar_column_statement {
+    my ($self, $statement, $scalar, $alias) = @_;
+    Selecto::Error->throw('invalid_query', 'scalar columns join two Selecto statements')
+        unless blessed($statement) && $statement->isa('Selecto::Statement')
+            && blessed($scalar) && $scalar->isa('Selecto::Statement')
+            && @{$scalar->columns} == 1;
+    Selecto::Error->throw('invalid_query', 'scalar column alias is invalid or taken')
+        unless defined($alias) && $alias =~ /\A[a-z][a-z0-9_]*\z/
+            && !grep { defined($_) && $_ eq $alias } @{$statement->columns};
+    my $scalar_sql = $self->_renumber_dollar_placeholders($scalar->sql, scalar @{$statement->params});
+    return Selecto::Statement->new(
+        sql => 'SELECT selecto_rows.*, (' . $scalar_sql . ') AS ' . $self->quote_identifier($alias)
+            . ' FROM (' . $statement->sql . ') AS selecto_rows',
+        params => [@{$statement->params}, @{$scalar->params}],
+        columns => [@{$statement->columns}, $alias],
+        adapter_name => $self->name,
+    );
+}
+
 sub stream_query {
     my ($self, $statement, %options) = @_;
     unless ($options{bounded}) {
