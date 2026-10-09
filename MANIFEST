@@ -238,3 +238,4 @@ lib/Selecto/Domain/Schema.pm
 t/domain_schema_query_boundary.t
 t/fixtures/schema_query_boundary.json
 t/fixtures/schema_query_boundary_expected.json
+t/field_policy_boundaries.t
