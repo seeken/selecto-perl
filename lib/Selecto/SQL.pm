@@ -2,6 +2,7 @@ package Selecto::SQL;
 
 use Mojo::Base 'Selecto::Adapter';
 use JSON::PP ();
+use B ();
 use Digest::SHA qw(sha1_hex);
 use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
@@ -1167,8 +1168,25 @@ sub _value_key {
         if ref($value) eq 'ARRAY';
     return 'h:{' . join(',', map { _value_key($_) . '=' . _value_key($value->{$_}) } sort keys %$value) . '}'
         if ref($value) eq 'HASH';
-    return 's:' . length("$value") . ':' . "$value" unless ref($value);
+    unless (ref($value)) {
+        my $type = _numeric_scalar_type($value);
+        return (defined($type) ? 'n:' . $type . ':' : 's:') . length("$value") . ':' . "$value";
+    }
     return 'r:' . ref($value);
+}
+
+# Match JSON's scalar distinction. A numeric-looking authored string keeps its
+# string identity, including when Perl has cached a numeric interpretation.
+sub _numeric_scalar_type {
+    my ($value) = @_;
+    return undef unless defined $value;
+    return 'INTEGER' if JSON::PP::is_bool($value);
+    return undef if ref($value);
+    my $flags = B::svref_2object(\$value)->FLAGS;
+    return undef if $flags & B::SVp_POK();
+    return 'INTEGER' if $flags & B::SVf_IOK();
+    return 'REAL' if $flags & (B::SVp_NOK() | B::SVp_IOK());
+    return undef;
 }
 
 sub _selection_name {

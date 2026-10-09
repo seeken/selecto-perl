@@ -208,3 +208,4 @@ lib/Selecto/Verification/ContractSafety.pm
 t/contract_compatibility.t
 t/fixtures/contract_compatibility.json
 docs/contract-compatibility.md
+t/sqlite_numeric_parameters.t
