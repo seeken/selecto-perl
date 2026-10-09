@@ -42,14 +42,16 @@ my $db=DBI->connect('dbi:SQLite:dbname=:memory:','','',{RaiseError=>1,PrintError
 $db->do('PRAGMA temp_store=MEMORY');
 $db->do('CREATE TABLE items(id INTEGER PRIMARY KEY,name TEXT,amount INTEGER,code TEXT,other TEXT,parent_id INTEGER)');
 $db->do('CREATE TABLE children(id INTEGER PRIMARY KEY,name TEXT,amount INTEGER,code TEXT,other TEXT,parent_id INTEGER)');
+$db->do('CREATE TABLE numeric_items(id INTEGER PRIMARY KEY,name TEXT,amount NUMERIC,code TEXT,other TEXT,parent_id INTEGER)');
 $db->do(q{INSERT INTO items VALUES(1,'before',3,'ABC','stored',NULL)});
+$db->do(q{INSERT INTO numeric_items VALUES(1,'decimal',3,'ABC','stored',NULL)});
 my $adapter=FieldValidatorAdapter->new(dbh=>$db);
 my $engine=sub { Selecto::Engine->new(domain=>Selecto::Domain->parse($_[0]),adapter=>$adapter,($_[1]?(limits=>$_[1]):())) };
 my (@sql,@authorizer,@hooks);
 $db->sqlite_trace(sub { push @sql,$_[0] });
 $db->sqlite_set_authorizer(sub { push @authorizer,[@_];0 });
 $db->sqlite_update_hook(sub { push @hooks,[@_] });
-my $snapshot=sub { $db->selectall_arrayref('SELECT * FROM items ORDER BY id') };
+my $snapshot=sub { +{map { $_=>$db->selectall_arrayref("SELECT * FROM $_ ORDER BY id") } qw(items children numeric_items)} };
 my $zero=sub {
     my ($label,$code,$work)=@_;my $before=$snapshot->();
     @sql=();@authorizer=();@hooks=();@$adapter{qw(providers hydrations projections)}=(0,0,0);
@@ -58,6 +60,7 @@ my $zero=sub {
     is(scalar @hooks,0,"$label: no mutation hooks");is($adapter->{providers},0,"$label: no capability provider");
     is($adapter->{hydrations},0,"$label: no stored hydration");is($adapter->{projections},0,"$label: no native candidate projection");
     is_deeply($snapshot->(),$before,"$label: complete business rows unchanged");
+    return $error;
 };
 my $raw=domain('items');$raw->{writes}{fields}{name}{validators}=['unsupported-validator'];
 my $unknown=$engine->($raw);
@@ -93,6 +96,23 @@ is($db->selectrow_array('SELECT name FROM items WHERE id=1'),'AB','INPUT/domain 
 $zero->('INPUT-normalized validator failure precedes hydration','data_rule_failed',sub { $input_engine->execute_write(update('items',{name=>' bad '})) });
 $zero->('active mutation expression has no forged scalar value','required_data_rule_pending',sub { $normalized_engine->execute_write(update('items',{name=>Selecto::Write::Expression->field('other')})) });
 my $number=domain('items');$number->{writes}{fields}{amount}{validators}=[['number',[['greater_than',0]]]];
+for my $case (['1.0',1.0],['1.5',1.5]) {
+    my ($label,$value)=@$case;
+    my $error=$zero->("native float $label is not a legacy number subject",'data_rule_failed',sub {
+        $engine->($number)->execute_write(update('items',{amount=>$value}));
+    });
+    is($error ? $error->details->{rule_code} : undef,'invalid_type',"native float $label reports the legacy subject type failure");
+}
+ok(!failure(sub { $engine->($number)->execute_write(update('items',{amount=>9_007_199_254_740_993})) }),
+    'exact native integer beyond binary-float precision passes the number validator');
+is_deeply($db->selectrow_arrayref('SELECT CAST(amount AS TEXT),typeof(amount) FROM items WHERE id=1'),
+    ['9007199254740993','integer'],'exact signed integer is physically preserved without binary-float rounding');
+my $decimal=domain('numeric_items');$decimal->{source}{columns}{amount}{type}='decimal';
+$decimal->{writes}{fields}{amount}{validators}=[['number',[['greater_than',0]]]];
+ok(!failure(sub { $engine->($decimal)->execute_write(update('numeric_items',{amount=>'1.5'})) }),
+    'decimal text remains a valid legacy number subject');
+is_deeply($db->selectrow_arrayref('SELECT CAST(amount AS TEXT),typeof(amount) FROM numeric_items WHERE id=1'),
+    ['1.5','real'],'representable decimal text reaches actual NUMERIC storage');
 $zero->('numeric increment requires a real prospective value','required_data_rule_pending',sub { $engine->($number)->execute_write(update('items',{amount=>Selecto::Write::Expression->increment('amount',1)})) });
 ok(!failure(sub { $engine->(domain('items'))->execute_write(update('items',{amount=>Selecto::Write::Expression->increment('amount',1)})) }),'unvalidated native mutation expression retains existing behavior');
 

@@ -4,6 +4,7 @@ use warnings;
 use utf8;
 use Test::More;
 use JSON::PP ();
+use B ();
 use Selecto::Error;
 use Selecto::Limits;
 use Selecto::DataRules;
@@ -31,9 +32,33 @@ subtest 'number translates every comparison and conjunction' => sub {
     error('data_rule_failed', sub { validates($validators, 6) }, 'upper boundary');
     is_deeply(validates([['number', [[greater_than => 0], [greater_than => 2]]]], 3), {value => 3}, 'duplicate number comparisons all retained');
     error('data_rule_failed', sub { validates([['number', [[greater_than => 0], [greater_than => 2]]]], 1) }, 'duplicate number comparisons not last-wins');
-    for my $bad ([], [[unknown => 1]], [[greater_than => 1.5]], [[greater_than => 'not-a-number']], [[greater_than => '1e2']], [[greater_than => 9007199254740992]]) {
+    for my $bad ([], [[unknown => 1]], [[greater_than => 1.5]], [[greater_than => 'not-a-number']], [[greater_than => '1e2']]) {
         error('unsupported_write_rule', sub { $FV->compile([['number', $bad]]) }, 'bad number declaration');
     }
+};
+subtest 'native exact signed and unsigned integers retain every operand bit' => sub {
+    for my $wire ('9007199254740992', '9223372036854775807', '-9223372036854775808', '18446744073709551615') {
+        my $value = JSON::PP->new->decode($wire);
+        ok(B::svref_2object(\$value)->FLAGS & B::SVp_IOK(), 'actual native exact integer delivered');
+        my $number = $FV->compile([['number', [[greater_than_or_equal_to => $value]]]]);
+        is(JSON::PP->new->canonical->encode($number->[0]{bound}), $wire, 'number bound remains exact numeric scalar');
+        is_deeply(validates([['number', [[greater_than_or_equal_to => $value]]]], $value), {value => $value}, 'exact native integer evaluates');
+        unless ($wire =~ /^-/) {
+            my $length = $FV->compile([['length', [[max => $value]]]]);
+            is(JSON::PP->new->canonical->encode($length->[0]{max}), $wire, 'length bound remains exact numeric scalar');
+            is_deeply(validates([['length', [[max => $value]]]], 'x'), {value => 'x'}, 'wide positive length bound evaluates');
+        }
+        for my $kind (qw(inclusion exclusion)) {
+            my $tests = $FV->compile([[$kind, [{nested => [$value]}]]]);
+            is(JSON::PP->new->canonical->encode($tests->[0]{values}[0]{nested}[0]), $wire, 'recursive membership literal remains exact numeric scalar');
+        }
+        is_deeply(validates([['inclusion', [{nested => [$value]}]]], {nested => [$value]}), {value => {nested => [$value]}}, 'wide recursive integer member matches exactly');
+        error('data_rule_failed', sub { validates([['inclusion', [$value]]], substr($wire, 0)) }, 'wide numeric member differs from decimal text');
+    }
+    my $left = JSON::PP->new->decode('9007199254740992');
+    my $right = JSON::PP->new->decode('9007199254740993');
+    is_deeply(validates([['number', [[greater_than => $left]]]], $right), {value => $right}, 'adjacent above2^53 integers compare without rounding');
+    error('unsupported_write_rule', sub { $FV->compile([['number', [[greater_than => $left]]]], limits => Selecto::Limits->new(max_rule_numeric_digits => 10)) }, 'native wide integers retain trusted numeric digit ceiling');
 };
 subtest 'length uses Unicode scalars and exact highest duplicate behavior' => sub {
     my $validators = [['length', [[min => 9], [min => 2], [max => 4]]]];
@@ -128,6 +153,44 @@ subtest 'inclusion and exclusion use portable typed literal equality' => sub {
         error('unsupported_write_rule', sub { $FV->compile([[$kind, []]]) }, 'empty membership');
         error('unsupported_write_rule', sub { $FV->compile([[$kind, {}]]) }, 'membership must be list');
     }
+};
+subtest 'membership declaration literals exclude native floats at every depth' => sub {
+    my $float = JSON::PP->new->decode('1.0');
+    my $fraction = JSON::PP->new->decode('1.25');
+    my $integer = JSON::PP->new->decode('1');
+    my @positive = (undef, JSON::PP::true, JSON::PP::false, (1 == 1), (1 == 2), $integer,
+        '1.0', '', [undef, JSON::PP::true, 1, 'one', []],
+        {nested => [undef, JSON::PP::false, 1, 'one', {inner => []}]});
+    for my $kind (qw(inclusion exclusion)) {
+        for my $value (@positive) {
+            my $tests = $FV->compile([[$kind, [$value]]]);
+            is(JSON::PP->new->canonical->encode($tests->[0]{values}),
+                JSON::PP->new->canonical->encode([$value]), 'complete portable primitive/container literal retains type');
+        }
+        for my $value ($float, $fraction, [$float], [$fraction], {nested => $float},
+            {nested => [$fraction]}, [undef, {deeper => [JSON::PP::true, $float]}]) {
+            error('unsupported_write_rule', sub { $FV->compile([[$kind, [$value]]]) }, 'native floating declaration literal refused recursively');
+        }
+    }
+    is_deeply($FV->validate_values(specs([['inclusion', [$float]]]), {other => 'unchanged'}),
+        {other => 'unchanged'}, 'wholly unassigned membership syntax stays inactive');
+    my $runtime = $FV->validate_values(specs([]), {value => $float});
+    my $flags = B::svref_2object(\$runtime->{value})->FLAGS;
+    ok(($flags & B::SVp_NOK()) && !($flags & B::SVp_IOK()), 'assigned native float is not coerced by declaration-only guard');
+    my $runtime_error = error('data_rule_failed', sub { validates([['number', [[greater_than => 0]]]], $fraction) },
+        'legacy number runtime subject rejects native fraction');
+    is($runtime_error->details->{rule_code}, 'invalid_type', 'legacy native fraction uses actual invalid_type');
+    for my $value ($float, undef, JSON::PP::true, JSON::PP::false, [], {}) {
+        my $caught = error('data_rule_failed', sub { validates([['number', [[greater_than => 0], [less_than => 9]]]], $value) },
+            'all-number legacy group rejects noninteger/nonbinary runtime type');
+        is($caught->details->{rule_code}, 'invalid_type', 'all-number group preserves invalid_type');
+    }
+    is_deeply(validates([['number', [[greater_than => 0], [less_than => 9]]]], '1.25'), {value => '1.25'},
+        'legacy decimal text remains an exact numeric subject');
+    my $resource_specs = {a => {validators => [['number', [[greater_than => 0]]]]},
+        z => {validators => [['length', [[min => 1]]]]}};
+    error('evaluation_limit', sub { $FV->validate_values($resource_specs, {a => $float, z => 'x' x 4097}) },
+        'later consumed resource limit precedes earlier legacy numeric type failure');
 };
 subtest 'entire active bundle compiles before any value evaluates' => sub {
     my $specs = {a => {validators => [['number', [[greater_than => 9]]]]}, z => {validators => ['unknown']}};

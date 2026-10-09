@@ -170,6 +170,27 @@ sub prepare_contract {
 }
 sub admit_domain { &_check_args; shift->prepare_contract(@_) }
 
+sub _portable_literal {
+    my ($value, $field, $index) = @_;
+    _spend();
+    return if !defined($value) || JSON::PP::is_bool($value);
+    unless (defined(reftype($value))) {
+        return if _integer_scalar($value) || _binary_scalar($value);
+        _unsupported($field, $index);
+    }
+    # The complete plain walk has already rejected hooks, cycles and unknown
+    # classes. This narrower declaration grammar excludes native floats at
+    # every depth; RuleTest's general literal grammar also supports decimals.
+    if (ref($value) eq 'ARRAY') {
+        _portable_literal($_, $field, $index) for @$value;
+        return;
+    }
+    if (ref($value) eq 'HASH') {
+        _portable_literal($_, $field, $index) for values %$value;
+        return;
+    }
+    _unsupported($field, $index);
+}
 sub _translate {
     my ($validator, $field, $index) = @_;
     _unsupported($field, $index) unless ref($validator) eq 'ARRAY' && @$validator == 2
@@ -217,6 +238,7 @@ sub _translate {
     }
     if ($kind eq 'inclusion' || $kind eq 'exclusion') {
         _unsupported($field, $index) unless ref($payload) eq 'ARRAY' && @$payload;
+        _portable_literal($_, $field, $index) for @$payload;
         return {op => $kind eq 'inclusion' ? 'membership.in' : 'membership.not_in', values => $payload};
     }
     _unsupported($field, $index);
@@ -248,7 +270,9 @@ sub _compile_fields {
             # Charge emitted occurrences before storing another generated AST.
             _walk($output, {$field => []}, 0) unless exists $tests{$field};
             _walk($output, $test, 0);
-            push @{$prepared{$field}}, _compile_test($test, $field, $index);
+            my $compiled = _compile_test($test, $field, $index);
+            $compiled->{legacy_number} = 1 if $validators->[$index][0] eq 'number';
+            push @{$prepared{$field}}, $compiled;
             push @{$tests{$field}}, $test;
         }
     }
@@ -315,6 +339,12 @@ sub validate_values {
         for my $field (sort keys %$prepared) {
             next unless exists $values->{$field};
             for my $index (0 .. $#{$prepared->{$field}}) {
+                my $test = $prepared->{$field}[$index];
+                # Legacy number subjects admit integer or decimal text, not
+                # native floats. Delay this type failure until after the
+                # complete consumed-value resource preflight above.
+                _fail('data_rule_failed', 'write field validation failed', $field, $index, 'invalid_type')
+                    if $test->{legacy_number} && !_integer_scalar($values->{$field}) && !_binary_scalar($values->{$field});
                 my ($passed, $reason) = Selecto::RuleTest->evaluate($prepared->{$field}[$index], $values->{$field}, 1,
                     _current_limits(), $BUDGET->{work});
                 _fail('data_rule_failed', 'write field validation failed', $field, $index, $reason) unless $passed;
