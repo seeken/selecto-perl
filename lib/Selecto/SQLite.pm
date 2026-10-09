@@ -818,6 +818,11 @@ sub text_search_rank_direction { return 'asc'; }
 
 sub _compile_text_search {
     my ($self, $domain, $expression, $params) = @_;
+    # Both supported FTS shapes prove their catalog and index in main. A
+    # prefixed root must not borrow those matches solely through equal rowids.
+    my $prefix = $domain->{_read_prefix};
+    Selecto::Error->throw('unsupported_feature', 'SQLite FTS5 currently requires a main-schema read root')
+        if defined($prefix) && $prefix !~ /\A[mM][aA][iI][nN]\z/;
     Selecto::Error->throw('unsupported_feature', 'SQLite FTS5 is unavailable') unless $self->_fts5_available;
     my ($fields, $literal, $options) = @{$expression->arguments};
     if (defined $domain->fts5_index) {
