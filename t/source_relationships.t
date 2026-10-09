@@ -42,6 +42,10 @@ $c={source=>{columns=>{id=>{type=>'integer'}},associations=>{first=>{queryable=>
 ok(Selecto::Domain->validate_source_relationships($c)->{valid},'nested aliases preserve the complete declared join path');
 $c->{source_relationships}{r}{source_field}='next.name';
 ok(contains($c,'source_relationship_source_field_not_found'),'nested join cannot leak an unqualified alias');
+$c={source=>{columns=>{id=>{type=>'integer'},name=>{type=>'string'}},associations=>{manager=>{queryable=>'source'}}},schemas=>{source=>{columns=>{shadow=>{type=>'string'}}}},joins=>{manager=>{}},source_relationships=>{r=>{target_domain=>'people',source_field=>'manager.name',target_field=>'name'}}};
+ok(Selecto::Domain->validate_source_relationships($c)->{valid},'explicit source self-association resolves actual root fields');
+$c->{source_relationships}{r}{source_field}='manager.shadow';
+ok(contains($c,'source_relationship_source_field_not_found'),'schema named source cannot replace an explicit source self-association');
 
 for my $control (
  ['section',sub{$_[0]{source_relationships}=[]},'invalid_section_shape'],
