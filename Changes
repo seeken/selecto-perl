@@ -1,6 +1,9 @@
 Revision history for Selecto
 
 Unreleased
+    - Add bounded plain-domain schema validation for relation metadata, query
+      libraries, event payload schemas and consumer registry envelopes. Cover
+      imported native required filters when caller queries add disjunctions.
     - Add public metadata domain identity APIs and native identity observations.
     - Publish stable provider contract snapshots and verify consumer fields,
       filters, query members, versions, fingerprints, and required scopes.

@@ -7,10 +7,69 @@ use JSON::PP ();
 use Selecto::QueryLibrary ();
 use Selecto::OperationBudget ();
 use Selecto::Limits ();
+use Selecto::Domain::QueryContract ();
+use Selecto::Error ();
+
+our $DECLARATION_BUDGET;
 
 sub validate {
     my ($class, $domain, $limits) = @_;
     my $library = Selecto::QueryLibrary->library($domain);
+    return _validate($domain, $library, $limits, 0);
+}
+
+# Pure portable declaration validation. This admits the entire raw contract
+# before deriving metadata, and never constructs an executable native domain.
+sub validate_declaration {
+    my ($class, $given) = @_;
+    my $raw = Selecto::Domain::QueryContract->copy_declaration($given);
+    my $limits = Selecto::Limits->new;
+    local $DECLARATION_BUDGET = Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query_library');
+    my $library = exists($raw->{query_library}) ? $raw->{query_library} : {};
+    return _declaration_result({valid => JSON::PP::false, errors => [{code => 'invalid_query_library', path => ['query_library']}]})
+        unless ref($library) eq 'HASH';
+    my %normalized;
+    for my $registry (qw(segments projections orderings views segment_picker_groups)) {
+        my $value = exists($library->{$registry}) ? $library->{$registry} : {};
+        return _declaration_result({valid => JSON::PP::false, errors => [{code => 'invalid_query_library', path => ['query_library', $registry]}]})
+            unless ref($value) eq 'HASH';
+        $normalized{$registry} = $value;
+    }
+    my $projected = Selecto::Domain::QueryContract->project($raw);
+    my $index = bless {fields => {map { $_->{id} => 1 } @{$projected->{fields}}}, associations => {}},
+        'Selecto::QueryLibrary::Contract::_MetadataIndex';
+    _metadata_associations($index, $raw->{source}, $raw->{schemas}, $raw->{joins} // {}, '', 0);
+    return _declaration_result(_validate($index, \%normalized, $limits, 1));
+}
+sub _declaration_result { Selecto::Domain::QueryContract->copy_declaration($_[0]) }
+sub _metadata_path {
+    my ($prefix, $id) = @_;
+    if ($DECLARATION_BUDGET) {
+        $DECLARATION_BUDGET->check_tree([$prefix, $id], label => 'query-library generated path', bytes_limit => 'max_state_bytes');
+    }
+    return $prefix . $id;
+}
+sub _metadata_associations {
+    my ($index, $relation, $schemas, $joins, $prefix, $depth) = @_;
+    Selecto::Error->throw('invalid_query_library', 'query-library association depth exceeded') if $depth > 64;
+    return unless ref($relation) eq 'HASH' && ref($schemas) eq 'HASH' && ref($joins) eq 'HASH';
+    my $associations = $relation->{associations};
+    return unless ref($associations) eq 'HASH';
+    for my $id (sort keys %$joins) {
+        $DECLARATION_BUDGET->consume_count('max_expression_nodes', 1, label => 'query-library association work');
+        my $join = $joins->{$id};
+        my $association = $associations->{$id};
+        next unless ref($join) eq 'HASH' && ref($association) eq 'HASH'
+            && defined($association->{queryable}) && !ref($association->{queryable})
+            && ref($schemas->{$association->{queryable}}) eq 'HASH';
+        my $target = $schemas->{$association->{queryable}};
+        my $path = _metadata_path($prefix, $id);
+        $index->{associations}{$path} = 1;
+        _metadata_associations($index, $target, $schemas, $join->{joins}, _metadata_path($path, '.'), $depth + 1);
+    }
+}
+sub _validate {
+    my ($domain, $library, $limits, $metadata) = @_;
     $limits //= Selecto::Limits->new;
     return {valid => JSON::PP::true, errors => []} unless grep { keys %{$library->{$_}} } qw(segments projections orderings views segment_picker_groups);
     my $work = Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query_library');
@@ -63,7 +122,9 @@ sub validate {
                 _association($domain, $_, undef, [@$path, 'associations'], \@errors) for @{$spec->{associations} // []};
             } elsif ($registry eq 'orderings') {
                 for my $entry (@{$spec->{order_by} // []}) {
-                    if (ref($entry) eq 'ARRAY' && @$entry == 2 && defined($entry->[1]) && !ref($entry->[1]) && $entry->[1] =~ /\A(?:asc|desc)\z/) {
+                    if ($metadata && defined($entry) && !ref($entry)) {
+                        _field($domain, $entry, [@$path, 'order_by'], \@errors);
+                    } elsif (ref($entry) eq 'ARRAY' && @$entry == 2 && defined($entry->[1]) && !ref($entry->[1]) && $entry->[1] =~ /\A(?:asc|desc)\z/) {
                         _field($domain, $entry->[0], [@$path, 'order_by'], \@errors);
                     } else { _error(\@errors, 'invalid_query_library', [@$path, 'order_by']) }
                 }
@@ -171,12 +232,27 @@ sub _association {
         (!exists($entry->{associations}) || ref($entry->{associations}) eq 'ARRAY')) {
         _error($errors, 'invalid_query_projection_association', $path); return;
     }
-    my $name = defined($parent) ? "$parent.$entry->{name}" : $entry->{name};
+    my $name = defined($parent) ? _metadata_path(_metadata_path($parent, '.'), $entry->{name}) : $entry->{name};
     _error($errors, 'query_field_not_found', $path) unless eval { $domain->resolve_association($name); 1 };
-    _field($domain, "$name.$_", $path, $errors) for @{$entry->{fields} // []};
+    for my $field (@{$entry->{fields} // []}) {
+        if ($DECLARATION_BUDGET && (!defined($field) || ref($field))) { _error($errors, 'query_field_not_found', $path); next }
+        _field($domain, _metadata_path(_metadata_path($name, '.'), $field), $path, $errors);
+    }
     _association($domain, $_, $name, $path, $errors) for @{$entry->{associations} // []};
 }
-sub _error { push @{$_[0]}, {code => $_[1], path => [@{$_[2]}], message => 'invalid query-library declaration'} }
+sub _error {
+    my $error = {code => $_[1], path => [@{$_[2]}], message => 'invalid query-library declaration'};
+    $DECLARATION_BUDGET->check_tree($error, label => 'query-library diagnostics', bytes_limit => 'max_state_bytes') if $DECLARATION_BUDGET;
+    push @{$_[0]}, $error;
+}
+
+package Selecto::QueryLibrary::Contract::_MetadataIndex;
+use strict;
+use warnings;
+sub resolve { Selecto::Error->throw('query_field_not_found', 'unknown metadata field') unless defined($_[1]) && !ref($_[1]) && $_[0]{fields}{$_[1]}; return 1 }
+sub resolve_association { Selecto::Error->throw('query_field_not_found', 'unknown metadata association') unless defined($_[1]) && !ref($_[1]) && $_[0]{associations}{$_[1]}; return 1 }
+
+package Selecto::QueryLibrary::Contract;
 
 1;
 
@@ -194,5 +270,13 @@ fields, segment operators and arity, parameter metadata, and reference cycles.
 Tree size, depth and reference work use trusted C<Selecto::Limits>. Validation
 never executes metadata callbacks. This port accepts field paths and scalar
 collection fields; arbitrary selection expressions are not library declarations.
+
+C<validate_declaration($plain_contract)> validates the portable metadata subset
+without creating an executable native domain. It accepts ordinary field-name
+ordering entries as well as field/direction pairs. Actual native library
+execution keeps its existing requirements. Full plain input, generated path
+bytes, diagnostics and reference work are bounded; no supplied resolver or
+metadata callback is invoked. This helper does not import rich declarations
+into a native engine or execute declared functions.
 
 =cut

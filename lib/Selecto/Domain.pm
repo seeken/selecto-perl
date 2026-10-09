@@ -2406,6 +2406,11 @@ sub validate_query_contract {
     require Selecto::Domain::QueryContract;
     return Selecto::Domain::QueryContract->validate($contract);
 }
+sub validate_schema {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::Schema;
+    return Selecto::Domain::Schema->validate($contract);
+}
 sub project {
     my ($class, $contract, $projection) = @_;
     require Selecto::Domain::Projection;
