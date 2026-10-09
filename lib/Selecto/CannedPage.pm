@@ -410,10 +410,28 @@ sub run {
             ? Selecto::BoundedQuery->all($engine, $_[0], %$execution_options, canonical_values => 1)
             : $engine->all($_[0], canonical_values => 1);
     };
-    my $rows = $run->($plan->{query});
+    my ($rows, $total);
+    my $adapter = $engine->can('adapter') ? $engine->adapter : undef;
+    if ($execution_options && blessed($adapter) && $adapter->can('scalar_column_statement')) {
+        # One round trip: the total rides on the result rows as a last column (an
+        # uncorrelated subquery, evaluated once), then is taken off again.
+        my %options = (%$execution_options, canonical_values => 1);
+        my $prepared = Selecto::BoundedQuery->prepare($engine, $plan->{query}, %options);
+        my $total_statement = Selecto::BoundedQuery->prepare($engine, $plan->{total_query}, %options)->{statement};
+        $rows = Selecto::BoundedQuery->execute($engine, {%$prepared,
+            statement => $adapter->scalar_column_statement($prepared->{statement}, $total_statement, 'selecto_total'),
+        }, %options);
+        pop @{$rows->{columns}};
+        my @totals = map { pop @$_ } @{$rows->{rows}};
+        # A page past the end has no rows to carry the total.
+        $total = @totals ? $totals[0]
+            : $plan->{state}{page} > 1 ? $run->($plan->{total_query})->{rows}[0][0] : 0;
+    } else {
+        $rows = $run->($plan->{query});
+        $total = $run->($plan->{total_query})->{rows}[0][0];
+    }
     my $has_more = @{$rows->{rows}} > $plan->{state}{limit} ? 1 : 0;
     pop @{$rows->{rows}} if $has_more;
-    my $total_rows = $run->($plan->{total_query})->{rows};
     my %facets;
     for my $control (@{$self->{controls}}) {
         next unless $control->{kind} eq 'facet';
@@ -448,7 +466,7 @@ sub run {
     }
     return {state => $plan->{state}, view => $plan->{view},
         columns => $rows->{columns}, rows => $rows->{rows},
-        total => $total_rows->[0][0] // 0, has_more => $has_more, facets => \%facets,
+        total => $total // 0, has_more => $has_more, facets => \%facets,
         elapsed_ms => int((time - $query_started) * 1000 + 0.5)};
 }
 

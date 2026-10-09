@@ -10,6 +10,15 @@ use Selecto::Error ();
 my %ACTIVE;
 sub _now { clock_gettime(CLOCK_MONOTONIC) }
 
+# Sets a transaction-scoped statement_timeout of the stricter of $1 milliseconds and the
+# current setting (0 is none). The subquery is evaluated first, so it reads the setting
+# in force before this statement changes it.
+use constant TRANSACTION_TIMEOUT_SQL => q{SELECT set_config('statement_timeout', }
+    . q{CAST(CASE WHEN current_ceiling.ms > 0 AND current_ceiling.ms < CAST($1 AS bigint) }
+    . q{THEN current_ceiling.ms ELSE CAST($1 AS bigint) END AS text) || 'ms', true) }
+    . q{FROM (SELECT CAST(setting AS bigint) AS ms FROM pg_settings }
+    . q{WHERE name = 'statement_timeout' OFFSET 0) AS current_ceiling};
+
 sub supported {
     my ($class, $adapter) = @_;
     my $name = $adapter->name;
@@ -60,6 +69,20 @@ sub begin {
                 return 1 if _now() >= $deadline;
                 return $callback ? $callback->() : 0;
             });
+        } elsif ($name eq 'postgresql' && !$dbh->{AutoCommit}) {
+            # Inside a transaction: SET LOCAL semantics. The setting lasts until the host's
+            # transaction ends, when PostgreSQL drops it, so nothing is read back or restored,
+            # and no budget can leave a session-wide timeout behind (a session-scoped restore
+            # would read back a transaction-scoped value and keep it). One statement reads the
+            # current ceiling and applies the stricter of it and the budget, so a stricter
+            # host ceiling is never replaced; re-arming the same way can only tighten it.
+            my $arm = sub {
+                my ($limit_ms) = @_;
+                defined(scalar $dbh->selectrow_array(TRANSACTION_TIMEOUT_SQL, undef, $limit_ms))
+                    or die 'query timeout configuration failed';
+            };
+            $arm->($ms);
+            $self->{rearm} = $arm;
         } elsif ($name eq 'postgresql') {
             my ($prior) = $dbh->selectrow_array(q{SELECT current_setting('statement_timeout')});
             $self->{restore} = sub {
@@ -173,6 +196,11 @@ Selecto::QueryBudget - scoped driver and server query deadlines
 =head1 DESCRIPTION
 
 Obtain a guard with C<< $adapter->begin_query_budget(timeout_ms => 5000) >>.
+On PostgreSQL inside a transaction (C<AutoCommit> off), the server timeout is
+set with C<SET LOCAL> semantics in one round trip: it applies to the rest of
+that transaction (never loosening a stricter setting) and PostgreSQL drops it
+when the transaction ends, so C<close> restores nothing. Outside a transaction
+the session setting is set and restored on C<close>.
 Keep it alive through execution and fetch, call C<check> between application
 operations, and call C<close> after closing result streams. Between rows of a
 bounded stream, C<< check(defer_rearm => 1) >> checks the wall deadline but

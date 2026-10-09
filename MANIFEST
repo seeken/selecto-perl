@@ -180,6 +180,7 @@ lib/Selecto/OperationBudget.pm
 lib/Selecto/Pattern.pm
 t/api_security_round2.t
 t/bounded_result.t
+t/bounded_direct.t
 t/security_insert_admission.t
 t/security_operation_budgets.t
 t/filter_ast_json_booleans.t
