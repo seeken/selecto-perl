@@ -125,14 +125,16 @@ sub execute {
         push @rows, $row;
     };
     # A result whose guard keeps it within one fetch batch buffers no more as a
-    # plain statement than a cursor would: run it directly, under a timeout that
-    # lasts for the host's transaction. Two round trips instead of a cursor's
-    # savepoint, declare, fetches, close and timeout restore.
+    # plain statement than a cursor would: run it directly inside the host's
+    # transaction, under a savepoint opened with its timeout and rolled back
+    # afterwards, so neither the timeout nor an error outlives it. Three round
+    # trips instead of a cursor's savepoint, declare, fetches, close and timeout
+    # restore.
     my $direct = $max_rows + 1 <= DIRECT_ROWS()
         && $adapter->can('bounded_direct_supported') && $adapter->bounded_direct_supported;
     my $ok = eval {
         if ($direct) {
-            $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
+            $deadline = $adapter->begin_query_budget(timeout_ms => $timeout, savepoint => 1);
             $deadline->check(defer_rearm => 1);
             $admit->($_) for @{$adapter->execute_query($guarded, @canonical)->{rows}};
         } else {

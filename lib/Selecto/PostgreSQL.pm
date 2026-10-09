@@ -40,7 +40,8 @@ sub bounded_stream_supported {
 }
 
 # A bounded result that its own LIMIT keeps to one fetch batch can run as a plain
-# statement inside the host's transaction: no cursor, savepoint or extra FETCH.
+# statement inside the host's transaction, under a savepoint budget (see
+# Selecto::QueryBudget): no cursor and no extra FETCH.
 sub bounded_direct_supported {
     my ($self) = @_;
     return $self->bounded_stream_supported && $self->_transaction_open ? 1 : 0;
