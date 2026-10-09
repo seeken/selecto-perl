@@ -29,8 +29,31 @@ use Selecto::Write::ConflictTarget ();
 use Selecto::WriteRules ();
 use Selecto::DataRules ();
 use Selecto::Action::Graph ();
+use Selecto::ConfiguredDomain ();
 
 fieldhash my %ACTION_COMMAND_WORK;
+fieldhash my %CONFIGURED_DOMAIN;
+
+my $seal_domain = sub {
+    my ($self) = @_;
+    $CONFIGURED_DOMAIN{$self} = {
+        domain => Selecto::ConfiguredDomain->digest($self->{domain}, $self->{scope}),
+    };
+    return $self;
+};
+
+sub assert_domain_identity {
+    my ($self) = @_;
+    my $record = $CONFIGURED_DOMAIN{$self};
+    Selecto::Error->throw('domain_modified_after_configuration',
+        'configured domain identity has changed', {path => []})
+        unless $record
+            && $record->{domain} eq Selecto::ConfiguredDomain->digest($self->{domain}, $self->{scope})
+            && (exists($record->{read}) == exists($self->{_read_domain}))
+            && (!exists($record->{read}) || $record->{read} eq
+                Selecto::ConfiguredDomain->digest($self->{_read_domain}, $self->{scope}));
+    return $self;
+}
 
 sub _action_command_digest {
     my ($self, $command) = @_;
@@ -72,18 +95,20 @@ sub _retain_command_work {
 sub new {
     my ($class, %args) = @_;
     Selecto::Error->throw('invalid_domain', 'engine requires a domain')
-        unless blessed($args{domain}) && $args{domain}->isa('Selecto::Domain');
+        unless blessed($args{domain}) && UNIVERSAL::isa($args{domain}, 'Selecto::Domain');
     Selecto::Error->throw('invalid_adapter', 'engine requires a Selecto database adapter')
         unless blessed($args{adapter}) && $args{adapter}->isa('Selecto::Adapter');
     Selecto::Error->throw('invalid_domain_ref', 'engine domain_ref must be a Selecto domain reference')
         if defined($args{domain_ref})
             && !(blessed($args{domain_ref}) && $args{domain_ref}->isa('Selecto::Domain::Ref'));
+    # Admit the raw structure before domain validation can inspect metadata.
+    Selecto::ConfiguredDomain->digest($args{domain}, {});
     $args{adapter}->assert_contract;
     my $limits = $args{limits} // Selecto::Limits->new;
     Selecto::Error->throw('invalid_limits', 'engine limits must be a Selecto::Limits object')
         unless blessed($limits) && $limits->isa('Selecto::Limits');
     $args{domain}->validate_query_library($limits);
-    return bless {
+    my $self = bless {
         domain => $args{domain},
         adapter => $args{adapter},
         domain_ref => $args{domain_ref},
@@ -91,6 +116,7 @@ sub new {
         write_policy => _write_policy($args{write_policy}),
         limits => $limits,
     }, $class;
+    return $seal_domain->($self);
 }
 
 # Trusted scope comes from the host that built the engine (for example from an
@@ -126,10 +152,21 @@ sub limits { return $_[0]->{limits}; }
 
 sub scope { return {%{$_[0]->{scope}}}; }
 
+# Trusted hosts may tighten a request's budget without reconfiguring its
+# domain. Preserve the already checked private evidence on the new engine.
+sub with_limits {
+    my ($self, $limits) = @_;
+    $self->assert_domain_identity;
+    my $copy = bless {%$self, limits => $self->{limits}->intersect($limits)}, ref($self);
+    $CONFIGURED_DOMAIN{$copy} = {%{$CONFIGURED_DOMAIN{$self}}};
+    return $copy;
+}
+
 # A copy of this engine bound to trusted scope. An engine that already holds a
 # tenant cannot be re-scoped to a different one.
 sub with_scope {
     my ($self, %scope) = @_;
+    $self->assert_domain_identity;
     my $next = _trusted_scope(\%scope);
     my $current = $self->{scope}{tenant};
     Selecto::Error->throw('tenant_mismatch', 'engine is already scoped to a different tenant')
@@ -137,19 +174,20 @@ sub with_scope {
     my $copy = bless {%$self}, ref($self);
     $copy->{scope} = {%{$self->{scope}}, %$next};
     delete $copy->{_read_domain};
-    return $copy;
+    return $seal_domain->($copy);
 }
 
 # A copy of this engine whose domain omits the prerequisite columns of the
 # named actions; see Selecto::Domain::without_action_prerequisites.
 sub without_action_prerequisites {
     my ($self, @action_ids) = @_;
+    $self->assert_domain_identity;
     my $domain = $self->{domain}->without_action_prerequisites(@action_ids);
     return $self if $domain == $self->{domain};
     my $copy = bless {%$self}, ref($self);
     $copy->{domain} = $domain;
     delete $copy->{_read_domain};
-    return $copy;
+    return $seal_domain->($copy);
 }
 
 sub from_registry {
@@ -176,7 +214,7 @@ sub from_registry {
     );
 }
 
-sub domain  { return $_[0]->{domain}; }
+sub domain  { $_[0]->assert_domain_identity; return $_[0]->{domain}; }
 sub adapter { return $_[0]->{adapter}; }
 sub domain_ref { return $_[0]->{domain_ref}; }
 sub query   { return Selecto::Query->new; }
@@ -187,6 +225,7 @@ sub query_filters {
 }
 sub compile {
     my ($self, $query) = @_;
+    $self->assert_domain_identity;
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
         allowed_base_classes => ['Selecto::Query']);
@@ -199,15 +238,18 @@ sub compile {
     $self->{adapter}->admit_parameters(
         Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query'),
         $statement->params, label => 'statement parameter');
+    $self->assert_domain_identity;
     return $statement;
 }
 sub all {
     my ($self, $query, %options) = @_;
-    return $self->{adapter}->execute_query($self->compile($query)) unless $options{export_scalars};
+    my $statement = $self->compile($query);
+    $self->assert_domain_identity;
+    return $self->{adapter}->execute_query($statement) unless $options{export_scalars};
     # Export scalars are opt-in: only adapters that provide them may be asked.
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not provide export scalars')
         unless $self->{adapter}->supports('export_scalars');
-    return $self->{adapter}->execute_query($self->compile($query), export_scalars => 1);
+    return $self->{adapter}->execute_query($statement, export_scalars => 1);
 }
 
 # The domain reads compile against. An engine holding a trusted tenant scopes
@@ -218,7 +260,9 @@ sub all {
 # trusted tenant is a host error rather than an empty result.
 sub read_domain {
     my ($self) = @_;
-    return $self->{_read_domain} //= do {
+    $self->assert_domain_identity;
+    return $self->{_read_domain} if exists $self->{_read_domain};
+    my $read = do {
         my $domain = $self->{domain};
         my $tenant = $self->{scope}{tenant};
         my $field = $domain->tenant_field;
@@ -234,6 +278,9 @@ sub read_domain {
         }
         $domain;
     };
+    $self->{_read_domain} = $read;
+    $CONFIGURED_DOMAIN{$self}{read} = Selecto::ConfiguredDomain->digest($read, $self->{scope});
+    return $read;
 }
 
 # The tenant boundary public surfaces (the API write and query handlers,
@@ -246,6 +293,7 @@ sub read_domain {
 # host reads that deliberately span tenants.
 sub assert_tenant_boundary {
     my ($self, %args) = @_;
+    $self->assert_domain_identity;
     my $access = $args{access} // '';
     Selecto::Error->throw('invalid_tenant_scope', 'tenant boundary access must be read or write')
         unless $access eq 'read' || $access eq 'write';
@@ -293,10 +341,13 @@ sub stream {
     my ($self, $query, %options) = @_;
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not support streaming')
         unless $self->{adapter}->supports('stream') && $self->{adapter}->can('stream_query');
-    return $self->{adapter}->stream_query($self->compile($query), %options);
+    my $statement = $self->compile($query);
+    $self->assert_domain_identity;
+    return $self->{adapter}->stream_query($statement, %options);
 }
 sub preview_write {
     my ($self, $command) = @_;
+    $self->assert_domain_identity;
     return Selecto::DataRules->_with_proof_budget(sub { $self->_preview_write($command) },
         accepted_work => $self->_accepted_command_work($command), limits => $self->{limits});
 }
@@ -311,6 +362,7 @@ sub _preview_write {
 }
 sub execute_write {
     my ($self, $command) = @_;
+    $self->assert_domain_identity;
     return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_write($command) },
         accepted_work => $self->_accepted_command_work($command), limits => $self->{limits});
 }
@@ -328,6 +380,7 @@ sub _execute_write {
 # authorization for it.
 sub _execute_governed {
     my ($self, $method, $subject) = @_;
+    $self->assert_domain_identity;
     return $self->{adapter}->$method($subject, Selecto::Write::Authorization->_issue($subject));
 }
 sub _rules_transaction {
@@ -339,6 +392,7 @@ sub _rules_transaction {
 }
 sub execute_batch {
     my ($self, $batch) = @_;
+    $self->assert_domain_identity;
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
     my @work = map { $self->_accepted_command_work($_) } @{$batch->commands};
@@ -367,6 +421,7 @@ sub _execute_batch {
 }
 sub execute_graph {
     my ($self, $graph) = @_;
+    $self->assert_domain_identity;
     my ($prepared, $contexts) = $self->_prepared_graph($graph);
     my $work = sub {
         $prepared = Selecto::WriteRules->admit_graph($self, $prepared, $contexts) if $prepared->{_requires_rules};
@@ -523,6 +578,7 @@ sub write_command {
 # the domain contract.
 sub governed_write {
     my ($self, $command, %details) = @_;
+    $self->assert_domain_identity;
     Selecto::Error->throw('invalid_write', 'write command required')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
     my $accepted_work = $self->_accepted_command_work($command);
@@ -882,6 +938,7 @@ sub _has_conjunct {
 
 sub plan_action {
     my ($self, $intent) = @_;
+    $self->assert_domain_identity;
     return Selecto::Action::Planner->plan($self->{domain}, $intent, limits => $self->{limits});
 }
 
@@ -892,6 +949,7 @@ my %ACTION_COMPARATOR = (eq => 'eq', neq => 'ne', gt => 'gt', gte => 'gte', lt =
 # preconditions; the planned cardinality becomes the expected row count.
 sub action_command {
     my ($self, $plan, %options) = @_;
+    $self->assert_domain_identity;
     my $command = $self->_action_command($plan, %options);
     my $work = Selecto::Action::Planner->_accepted_proof_work($plan);
     if (defined($work) || $self->{domain}->rules
@@ -970,6 +1028,7 @@ sub _action_upsert_metadata {
 
 sub preview_action {
     my ($self, $plan, %options) = @_;
+    $self->assert_domain_identity;
     $self->_validate_selected_action($plan) unless exists($options{grant});
     my $decision = $self->_authorize_action($plan, 'preview', %options);
     $self->_validate_selected_action($plan) if exists($options{grant});
@@ -991,6 +1050,7 @@ sub preview_action {
 
 sub execute_action {
     my ($self, $plan, %options) = @_;
+    $self->assert_domain_identity;
     $self->_validate_selected_action($plan) unless exists($options{grant});
     my $decision = $self->_authorize_action($plan, 'execute', %options);
     $self->_validate_selected_action($plan) if exists($options{grant});
@@ -1041,6 +1101,7 @@ sub _validate_selected_action {
 }
 sub grant_action {
     my ($self, $plan, %options) = @_;
+    $self->assert_domain_identity;
     $self->_validate_selected_action($plan);
     Selecto::Action::Planner->validate_plan_limits($self->{domain}, $plan, limits => $self->{limits});
     my $phase = $options{phase} // 'execute';
@@ -1158,7 +1219,7 @@ sub apply_segments {
 }
 sub apply_projection {
     my ($self, $query, $ids) = @_;
-    return Selecto::QueryLibrary->apply_projection($self->domain, $query, $ids);
+    return Selecto::QueryLibrary->apply_projection($self->domain, $query, $ids, $self->{limits});
 }
 sub apply_ordering {
     my ($self, $query, $id) = @_;
@@ -1806,6 +1867,21 @@ L</assert_tenant_boundary> first.
 Returns a L<Selecto::Stream> that decodes one row at a time. Requires the
 adapter's C<stream> capability. Server-side cursor behavior is up to the
 DBI driver.
+
+=head2 assert_domain_identity
+
+Recheck the private structural identity retained when this engine was configured.
+Changing the domain, trusted scope or cached read domain throws
+C<domain_modified_after_configuration> with C<path> C<[]> before compilation or
+execution. The public fingerprint does not authorize changes. Prepared bounded
+queries recheck this identity before dispatch. Raw adapter tooling has its own
+independent contract.
+
+C<with_scope>, C<without_action_prerequisites> and C<with_limits> are checked
+host transitions. C<with_limits> intersects a trusted C<Selecto::Limits> with
+current ceilings and preserves existing private domain evidence. There is no
+public reseal operation. Configured identity does not implement unsupported
+filter/function policy metadata or establish native catalog authority.
 
 =head2 compile
 

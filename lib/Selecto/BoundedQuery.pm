@@ -15,6 +15,7 @@ use Selecto::OperationBudget ();
 # real database deadline. A post-fetch byte check is not a buffering capability.
 sub prepare {
     my ($class, $engine, $query, %args) = @_;
+    $engine->assert_domain_identity;
     my $limits = _limits($engine, $args{limits});
     my $adapter = $engine->adapter;
     _capabilities($adapter);
@@ -77,6 +78,7 @@ sub all {
 
 sub execute {
     my ($class, $engine, $prepared, %args) = @_;
+    $engine->assert_domain_identity;
     my $statement = ref($prepared) eq 'HASH' ? $prepared->{statement} : $prepared;
     my $collections = ref($prepared) eq 'HASH' ? $prepared->{collections} : [];
     my $limits = _limits($engine, $args{limits} // (ref($prepared) eq 'HASH' ? $prepared->{limits} : undef));
@@ -100,6 +102,7 @@ sub execute {
     my $budget = $class->result_budget($limits);
     my $ok = eval {
         $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
+        $engine->assert_domain_identity;
         $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows));
         while (my $row = $stream->next) {
             $deadline->check(defer_rearm => 1);
