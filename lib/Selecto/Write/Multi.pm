@@ -94,6 +94,11 @@ sub _merge_context {
 }
 sub compile {
     my ($self, %opts) = @_;
+    require Selecto::Write::PortableCommand;
+    return Selecto::Write::PortableCommand->_with_field_validator_scope(sub {$self->_compile(%opts)});
+}
+sub _compile {
+    my ($self, %opts) = @_;
     my $operations = $self->operations;
     _error('invalid_operation', 'Atomic write batches must contain operations') unless @$operations;
     my (%seen, %duplicates);
@@ -124,6 +129,11 @@ sub run {
     _error('configured_selecto_required', 'Multi writes require a configured Selecto engine')
         unless blessed($engine) && UNIVERSAL::isa($engine, 'Selecto::Engine');
     Selecto::Engine::assert_domain_identity($engine);
+    require Selecto::Write::FieldValidators;
+    return Selecto::Write::FieldValidators->with_budget(sub {$self->_run($engine,%opts)},limits=>$engine->limits);
+}
+sub _run {
+    my ($self, $engine, %opts) = @_;
     require Selecto::Write::Context;
     my %context_options=%opts;my $resolver=delete $context_options{choice_membership_resolver};
     $context_options{context}=Selecto::Write::Context->resolve({opts=>{context=>$engine->write_context}},\%context_options);

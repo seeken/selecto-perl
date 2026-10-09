@@ -296,3 +296,7 @@ t/sqlite_portable_command.integration.t
 t/sqlite_portable_nested_multi.integration.t
 t/write_context_authority.t
 t/sqlite_modern_relationship_bridge.t
+lib/Selecto/Write/FieldValidators.pm
+t/write_field_validators.t
+t/portable_field_validators.t
+t/sqlite_field_validators.integration.t

@@ -42,6 +42,14 @@ sub _with_proof_budget {
     return $work->();
 }
 
+# Internal first-party evaluators join the same protected counter. The
+# reference is never accepted from request options or declaration metadata.
+sub _rule_work_context {
+    my ($class, $limits) = @_;
+    _fail('required_data_rule_pending', 'rule work requires a protected scope') unless $PROOF_WORK;
+    return ($PROOF_WORK, ($limits // Selecto::Limits->new)->tightened(max_rule_work => $PROOF_LIMIT));
+}
+
 sub _charge_accepted_work {
     my ($class, $tickets) = @_;
     $tickets = [] unless defined $tickets;

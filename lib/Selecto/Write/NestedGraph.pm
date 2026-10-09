@@ -307,6 +307,11 @@ sub _relationships {
 sub compile {
     my ($class,$operation,%given)=@_;
     require Selecto::Write::PortableCommand;
+    return Selecto::Write::PortableCommand->_with_field_validator_scope(sub {$class->_compile($operation,%given)});
+}
+sub _compile {
+    my ($class,$operation,%given)=@_;
+    require Selecto::Write::PortableCommand;
     my $snapshot=Selecto::Write::Operation::snapshot($operation);
     my %options=%given;my $resolver=delete $options{choice_membership_resolver};
     my $admitted=_copy(\%options);$admitted->{choice_membership_resolver}=$resolver if defined $resolver;

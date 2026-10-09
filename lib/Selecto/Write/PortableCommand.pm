@@ -49,11 +49,35 @@ sub _options {
     # are admitted before any resolver may be invoked.
     return (_copy(\%opts), $resolver);
 }
+# A pure graph/batch must finish compiling every effective assignment before
+# the first trusted membership callback. The ephemeral queue never escapes a
+# successful public compiler call and INPUT normalization runs only once.
+my $CHOICE_CHECKS;
+sub _with_field_validator_scope {
+    my ($class, $work) = @_;
+    require Selecto::Write::FieldValidators;
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return $work->() if defined($CHOICE_CHECKS);
+        my $checks = [];
+        $CHOICE_CHECKS = $checks;
+        my ($result, $ok, $error);
+        { local $@; $ok = eval { $result = $work->(); 1 }; $error = $@ unless $ok; }
+        $CHOICE_CHECKS = undef;
+        die $error unless $ok;
+        $_->() for @$checks;
+        return $result;
+    });
+}
 sub compile {
+    my ($class, $operation, %given) = @_;
+    return $class->_with_field_validator_scope(sub { $class->_compile($operation, %given) });
+}
+sub _compile {
     my ($class, $operation, %given) = @_;
     my $state = _snapshot($operation);
     my ($opts) = _options(\%given);
     my $contract = Selecto::Domain::WriteContract->compile($state->{domain});
+    Selecto::Write::FieldValidators->prepare_contract($contract);
     require Selecto::Write::NestedGraph;
     if (Selecto::Write::NestedGraph->nested($operation)) {
         return Selecto::Write::NestedGraph->compile($operation, %given);
@@ -188,6 +212,14 @@ sub _assignment_policy {
     }
 }
 sub _choices {
+    my @arguments = @_;
+    if (defined($CHOICE_CHECKS)) {
+        push @$CHOICE_CHECKS, sub { _choices_now(@arguments) };
+        return;
+    }
+    return _choices_now(@arguments);
+}
+sub _choices_now {
     my ($domain, $contract, $values, $context, $resolver, $type, $filters) = @_;
     my @fields = grep {
         my $spec = $contract->{source}{columns}{$_} // {};
@@ -208,9 +240,14 @@ sub _choices {
 }
 sub compile_flat {
     my ($class, $operation, %given) = @_;
+    return $class->_with_field_validator_scope(sub { $class->_compile_flat($operation, %given) });
+}
+sub _compile_flat {
+    my ($class, $operation, %given) = @_;
     my $state = _snapshot($operation);
     my ($opts, $resolver) = _options(\%given);
     my $contract = Selecto::Domain::WriteContract->compile($state->{domain});
+    Selecto::Write::FieldValidators->prepare_contract($contract);
     my $type = $state->{type};
     _fail('unsupported_operation', 'portable operation type is missing or unsupported')
         unless defined($type) && !ref($type) && $type =~ /\A(?:insert|update|upsert|delete)\z/;
@@ -263,6 +300,9 @@ sub compile_flat {
     $values = Selecto::Write::Context->materialize($contract, $values, $type, $context);
     _required($contract, $values, $context, $type, 0);
     _assignment_policy($contract, $values, $type, $tenant_field) unless $type eq 'delete';
+    # The helper compiles the complete effective assigned bundle before any
+    # evaluation. Its shared scope also spans every nested/batch member.
+    $values = Selecto::Write::FieldValidators->validate_values($contract->{fields}, $values);
     _choices($state->{domain}, $contract, $values, $context, $resolver, $type, $filters);
     my $guards = Selecto::Write::Context->foreign_key_guards($state->{domain}, $contract, $values, $type, $context);
     my $relation = $contract->{source}{source_table} // $contract->{source}{table};

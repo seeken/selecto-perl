@@ -24,6 +24,7 @@ use Selecto::Write::Authorization ();
 use Selecto::Write::Capabilities ();
 use Selecto::Write::Policy ();
 use Selecto::Write::Context ();
+use Selecto::Write::FieldValidators ();
 use Selecto::Action::Capability ();
 use Selecto::Action::Grant ();
 use Selecto::Action::Planner ();
@@ -118,10 +119,10 @@ sub new {
     my $write_context=Selecto::Write::Context->resolve({}, {context=>$args{write_context}//{},
         (defined($scope->{tenant}) ? (tenant_id=>$scope->{tenant}) : ())});
     $scope->{tenant}=$write_context->{tenant_id} if defined $write_context->{tenant_id};
-    $args{adapter}->assert_contract;
     my $limits = $args{limits} // Selecto::Limits->new;
     Selecto::Error->throw('invalid_limits', 'engine limits must be a Selecto::Limits object')
         unless blessed($limits) && $limits->isa('Selecto::Limits');
+    $args{adapter}->assert_contract;
     $args{domain}->validate_query_library($limits);
     my $mode = $args{mode} // 'permissive';
     Selecto::Error->throw('invalid_query_policy', 'mode must be strict or permissive')
@@ -545,34 +546,40 @@ sub preview_write {
     my ($self, $command) = @_;
     $self->assert_domain_identity;
     Selecto::Write::Capabilities->requirements($command);
-    return Selecto::DataRules->_with_proof_budget(sub { $self->_preview_write($command) },
-        accepted_work => $self->_accepted_command_work($command), limits => $self->{limits});
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return Selecto::DataRules->_with_proof_budget(sub { $self->_preview_write($command) },
+            accepted_work => $self->_accepted_command_work($command), limits => $self->{limits});
+    },limits=>$self->{limits});
 }
 sub _preview_write {
     my ($self, $command) = @_;
     my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
+    $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input);
     $self->preflight_write($command);
     return $self->{adapter}->preview_write($command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
-        return $self->{adapter}->preview_write(Selecto::WriteRules->govern($self, $command, input => $input));
+        return $self->{adapter}->preview_write(Selecto::WriteRules->govern($self, $command, input_prepared => 1));
     });
 }
 sub execute_write {
     my ($self, $command) = @_;
     $self->assert_domain_identity;
     Selecto::Write::Capabilities->requirements($command);
-    return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_write($command) },
-        accepted_work => $self->_accepted_command_work($command), limits => $self->{limits});
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_write($command) },
+            accepted_work => $self->_accepted_command_work($command), limits => $self->{limits});
+    },limits=>$self->{limits});
 }
 sub _execute_write {
     my ($self, $command) = @_;
     my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
+    $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input);
     $self->preflight_write($command);
     return $self->_execute_governed(execute_write => $command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
-        return $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $command, input => $input));
+        return $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $command, input_prepared => 1));
     });
 }
 
@@ -608,8 +615,10 @@ sub execute_batch {
     my $engines=$self->_batch_engines($batch,\@options);
     my $commands=$batch->commands;
     my @work = map { $engines->[$_]->_accepted_command_work($commands->[$_]) } 0..$#$commands;
-    return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_batch($batch,$engines) },
-        accepted_work => \@work, limits => $self->{limits});
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_batch($batch,$engines) },
+            accepted_work => \@work, limits => $self->{limits});
+    },limits=>$self->{limits});
 }
 sub _batch_engines {
     my ($self,$batch,$options)=@_;
@@ -646,6 +655,7 @@ sub _execute_batch {
     $engines//=[map{$self}@{$batch->commands}];
     my $original=$batch->commands;
     my @commands = map { $engines->[$_]->governed_write($original->[$_]) } 0..$#$original;
+    @commands = map { Selecto::WriteRules->prepare_submitted($engines->[$_],$commands[$_],input=>$input[$_]) } 0..$#commands;
     my $prepared = Selecto::Write::Batch->new(@commands);
     $self->preflight_write($prepared);
     return $self->_execute_governed(execute_batch => $prepared)
@@ -656,13 +666,19 @@ sub _execute_batch {
         Selecto::Error->throw('required_data_rule_pending', 'protected stored batch deltas require a whole-plan candidate provider')
             if grep { $_->operation ne 'insert' } @commands;
         my $admitted = Selecto::WriteRules->_with_stored_failure_deferral(sub {
-            my @admitted = map { Selecto::WriteRules->govern($engines->[$_], $commands[$_], input => $input[$_]) } 0 .. $#commands;
+            my @admitted = map { Selecto::WriteRules->govern($engines->[$_], $commands[$_], input_prepared => 1) } 0 .. $#commands;
             return Selecto::Write::Batch->new(@admitted);
         });
         return $self->_execute_governed(execute_batch => $admitted);
     });
 }
 sub execute_graph {
+    my ($self,$graph)=@_;
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_graph($graph) },limits=>$self->{limits});
+    },limits=>$self->{limits});
+}
+sub _execute_graph {
     my ($self, $graph) = @_;
     $self->assert_domain_identity;
     Selecto::Write::Capabilities->requirements($graph);
@@ -680,7 +696,11 @@ sub execute_graph {
     }, accepted_work => \@accepted, limits => $self->{limits});
 }
 sub _prepared_graph {
-    my ($self, $graph) = @_;
+    my ($self,$graph,%options)=@_;
+    return Selecto::Write::FieldValidators->with_budget(sub { $self->_prepare_graph($graph,%options) },limits=>$self->{limits});
+}
+sub _prepare_graph {
+    my ($self, $graph,%options) = @_;
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
     my @nodes = @{$graph->nodes};
@@ -716,6 +736,11 @@ sub _prepared_graph {
         ($contexts{$node->{id}}, $node->{command}) =
             $self->_validate_graph_node($node, \%contexts, $root_scope, $tenants,$graph->owned_sets,$relationship_work);
         $contexts{$node->{id}}{rule_input} = $rule_inputs{$node->{id}};
+    }
+    for my $node ($options{submitted_prepared} ? () : @nodes) {
+        my $engine=ref($self)->new(domain=>$contexts{$node->{id}}{domain},adapter=>$self->{adapter},
+            scope=>$self->{scope},write_context=>$self->{write_context},limits=>$self->{limits});
+        $node->{command}=Selecto::WriteRules->prepare_submitted($engine,$node->{command},input=>$rule_inputs{$node->{id}});
     }
     my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets,metadata=>$graph->metadata);
     my $sets = $self->_govern_owned_sets($graph->owned_sets, $prepared->{nodes}, \%contexts,$relationship_work);
@@ -849,6 +874,9 @@ sub governed_write {
         {assignments => $command->{assignments}, predicate => $command->{predicate},
             scope_predicate => $command->{scope_predicate}, query_enforcement => $command->{query_enforcement}},
         label => 'write', allowed_classes => [qw(Selecto::Expression Selecto::Write::Expression Selecto::QueryEnforcement)]);
+    # Command admission owns write-shape errors. Inspect the sealed trusted
+    # policy only after that boundary, before normalization or any provider.
+    Selecto::Write::FieldValidators->admit_domain({writes=>$self->{domain}->writes},limits=>$self->{limits});
     Selecto::Error->throw(
         'write_relation_mismatch',
         'write relation must be the domain table',
@@ -1250,7 +1278,9 @@ sub _has_conjunct {
 sub plan_action {
     my ($self, $intent) = @_;
     $self->assert_domain_identity;
-    return Selecto::Action::Planner->plan($self->{domain}, $intent, limits => $self->{limits});
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return Selecto::Action::Planner->plan($self->{domain}, $intent, limits => $self->{limits});
+    },limits=>$self->{limits});
 }
 
 my %ACTION_COMPARATOR = (eq => 'eq', neq => 'ne', gt => 'gt', gte => 'gte', lt => 'lt', lte => 'lte');
@@ -1259,6 +1289,12 @@ my %ACTION_COMPARATOR = (eq => 'eq', neq => 'ne', gt => 'gt', gte => 'gte', lt =
 # already carry the target, transition source state, and declared
 # preconditions; the planned cardinality becomes the expected row count.
 sub action_command {
+    my ($self,$plan,%options)=@_;
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return $self->_action_command_with_work($plan,%options);
+    },limits=>$self->{limits});
+}
+sub _action_command_with_work {
     my ($self, $plan, %options) = @_;
     $self->assert_domain_identity;
     my $command = $self->_action_command($plan, %options);
@@ -1338,6 +1374,12 @@ sub _action_upsert_metadata {
 }
 
 sub preview_action {
+    my ($self,$plan,%options)=@_;
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return $self->_preview_action($plan,%options);
+    },limits=>$self->{limits});
+}
+sub _preview_action {
     my ($self, $plan, %options) = @_;
     $self->assert_domain_identity;
     $self->_validate_selected_action($plan) unless exists($options{grant});
@@ -1360,6 +1402,12 @@ sub preview_action {
 }
 
 sub execute_action {
+    my ($self,$plan,%options)=@_;
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return $self->_execute_action($plan,%options);
+    },limits=>$self->{limits});
+}
+sub _execute_action {
     my ($self, $plan, %options) = @_;
     $self->assert_domain_identity;
     $self->_validate_selected_action($plan) unless exists($options{grant});
@@ -1389,6 +1437,8 @@ sub _validate_selected_action {
     Selecto::Error->throw('invalid_action_plan', 'action plan required')
         unless blessed($plan) && $plan->isa('Selecto::Action::Plan');
     Selecto::Action::Planner->validate_plan_limits($self->{domain}, $plan, limits => $self->{limits});
+    Selecto::Write::FieldValidators->admit($self->{domain}->writes->{fields}//{},
+        fields=>[sort keys %{$plan->changes // {}}],limits=>$self->{limits});
     return 1 if Selecto::Action::Planner->_accepted_plan($self->{domain}, $plan);
     Selecto::Error->throw('required_data_rule_pending', 'ACTION_INPUT requires an original accepted plan')
         if $self->{domain}->rules && @{$self->{domain}->rules->applicable_paths('action_input', $plan->operation, $plan->action)};
@@ -1411,6 +1461,12 @@ sub _validate_selected_action {
     return 1;
 }
 sub grant_action {
+    my ($self,$plan,%options)=@_;
+    return Selecto::Write::FieldValidators->with_budget(sub {
+        return $self->_grant_action($plan,%options);
+    },limits=>$self->{limits});
+}
+sub _grant_action {
     my ($self, $plan, %options) = @_;
     $self->assert_domain_identity;
     $self->_validate_selected_action($plan);
