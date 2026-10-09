@@ -303,3 +303,4 @@ t/sqlite_field_validators.integration.t
 t/write_rules_phases.t
 t/write_input_receipts.t
 t/sqlite_input_only_rules.integration.t
+t/sqlite_rollback_policy.integration.t

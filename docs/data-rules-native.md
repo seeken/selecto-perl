@@ -100,11 +100,16 @@ normalizer-added key assignments and the actual upsert update fields. Automatic
 CASCADE, SET NULL and SET DEFAULT deletes remain pending, including an empty
 child relation. NO ACTION and RESTRICT retain native constraint behavior.
 Catalog scans have ceilings of 1,024 main tables and 4,096 FK components.
-INSERT, UPDATE and upsert targets also refuse schema-level `ON CONFLICT REPLACE`.
-That policy can implicitly delete another row or substitute a NULL default,
-effects which are not authorized by the ordinary command. Bounded stored-DDL
+INSERT, UPDATE and upsert targets also refuse schema-level `ON CONFLICT REPLACE`
+and `ON CONFLICT ROLLBACK`. REPLACE can implicitly delete another row or
+substitute a NULL default, effects which are not authorized by the ordinary
+command. ROLLBACK can discard the caller's entire transaction and savepoints
+when a native constraint fails. An owned savepoint cannot contain that effect.
+Bounded stored-DDL
 tokenization distinguishes actual policies from quoted names, string values and
-comments. DELETE does not activate conflict replacement, and readonly graph
+comments. The returned catalog name must independently match the target's
+canonical physical name; a custom lookup collation cannot supply another
+table's DDL. DELETE does not activate these conflict policies, and readonly graph
 anchors remain reads; their other physical authority checks still apply.
 
 A single exact INTEGER primary key in an ordinary rowid table is a generated
