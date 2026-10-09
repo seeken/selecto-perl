@@ -245,3 +245,14 @@ t/field_policy_boundaries.t
 t/fixtures/source_relationships.json
 t/source_relationships.t
 lib/Selecto/Domain/SourceRelationships.pm
+lib/Selecto/Domain/ChoiceSources.pm
+lib/Selecto/Domain/Choices.pm
+lib/Selecto/Domain/StaticFilters.pm
+lib/Selecto/Domain/Choices/Result.pm
+lib/Selecto/Domain/Choices/OptionsResult.pm
+t/choice_sources.t
+t/choice_results.t
+t/sqlite_choice_sources.integration.t
+t/fixtures/choice_sources.json
+t/fixtures/choice_sources_expected.json
+t/fixtures/choice_sources_case_metadata.json

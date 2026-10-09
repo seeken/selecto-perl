@@ -105,6 +105,11 @@ sub _joins {
         my $target = $association->{queryable} eq 'source' ? $state->{source} : $schemas->{$association->{queryable}};
         next unless ref($target) eq 'HASH';
         my $alias = _key($state, $prefix, $id);
+        $state->{full_join_aliases}{$alias} = 1;
+        if (length($prefix)) {
+            my $local = $state->{local_joins}{$id} //= {count => 0, target => $target, join => $join};
+            $local->{count}++;
+        }
         my $child_prefix = _key($state, $alias, '.');
         _relation($state, $target, $child_prefix);
         if (_string($join->{type}) && $join->{type} eq 'star_dimension' && _path($join->{display_field})) {
@@ -123,6 +128,17 @@ sub _known_field {
         _error($state, "source_relationship_${part}_not_found", $path,
             source_relationship => $id, $part => $value);
     }
+}
+sub _claimed_field {
+    my ($state, $field) = @_;
+    my $position = -1;
+    while (($position = index($field, '.', $position + 1)) >= 0) {
+        _work($state);
+        _bytes($state->{output}, $field);
+        my $prefix = substr($field, 0, $position);
+        return 1 if $state->{full_join_aliases}{$prefix} || exists($state->{local_joins}{$prefix});
+    }
+    return 0;
 }
 sub _static_path {
     my ($state, $id, $value, $path, $code) = @_;
@@ -225,10 +241,28 @@ sub _state {
     $state->{source} = $source;
     my $schemas = _object($state, $contract->{schemas} // {}, ['schemas']);
     _relation($state, $source, '');
-    for my $id (sort keys %$schemas) { _relation($state, $schemas->{$id}, _key($state, $id, '.')); }
     my $custom = _object($state, $contract->{custom_columns} // {}, ['custom_columns']);
-    $state->{fields}{_key($state, '', $_)} = 1 for sort keys %$custom;
     _joins($state, $source, $schemas, _object($state, $contract->{joins} // {}, ['joins']), '');
+    for my $id (sort keys %$schemas) {
+        # Actual aliases own their namespace, including missing fields and
+        # ambiguous nested shorthand. Unjoined schemas cannot fill those gaps.
+        next if _claimed_field($state, _key($state, $id, '.'));
+        _relation($state, $schemas->{$id}, _key($state, $id, '.'));
+    }
+    for my $id (sort keys %$custom) {
+        next if _claimed_field($state, $id);
+        $state->{fields}{_key($state, '', $id)} = 1;
+    }
+    for my $id (sort keys %{$state->{local_joins} // {}}) {
+        _work($state);
+        my $local = $state->{local_joins}{$id};
+        next if $local->{count} != 1 || $state->{full_join_aliases}{$id};
+        _relation($state, $local->{target}, _key($state, $id, '.'));
+        if (_string($local->{join}{type}) && $local->{join}{type} eq 'star_dimension'
+            && _path($local->{join}{display_field})) {
+            $state->{fields}{_key($state, $id, '_display')} = 1;
+        }
+    }
     $state->{capabilities} = _object($state, $contract->{capabilities} // {}, ['capabilities']);
     my $relationships = exists($contract->{source_relationships}) ? $contract->{source_relationships} : {};
     $state->{relationships} = _object($state, $relationships, ['source_relationships']);
@@ -241,6 +275,11 @@ sub validate {
     my $valid = @{$state->{errors}} ? 0 : 1;
     return Selecto::Domain::QueryContract->copy_declaration({
         valid => bless(\$valid, 'JSON::PP::Boolean'), errors => $state->{errors}, warnings => []});
+}
+sub declared_field_ids {
+    my ($class, $given) = @_;
+    my $state = _state($given);
+    return Selecto::Domain::QueryContract->copy_declaration({fields => [sort keys %{$state->{fields}}]})->{fields};
 }
 sub project {
     my ($class, $given) = @_;
@@ -281,6 +320,12 @@ association joins. Static dotted paths, nested logical filters and virtual-join
 metadata are validated without SQL, target-domain lookup, context resolution or
 authorization. A relationship capability, when supplied, must name a declared
 capability; this metadata validation does not grant it. Optional null metadata follows the portable domain contract.
+C<declared_field_ids($plain_domain)> inventories actual declared fields for
+metadata reference validation, with the same bounded association resolution.
 The existing raw consumer projection and native parser remain separate APIs.
+Complete join aliases and unique established nested shorthand resolve from the
+actual association target. Claimed alias namespaces cannot obtain missing or
+ambiguous fields from unrelated schemas or custom columns; root fields retain
+priority.
 
 =cut

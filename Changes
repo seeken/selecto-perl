@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 Unreleased
+    - Add complete bounded choice-source metadata validation and public choice
+      binding/request/options APIs with explicit trusted host providers and
+      sealed native membership/options results. Preserve actual join target
+      authority, full aliases and unique established nested shorthand.
     - Add bounded plain-domain schema validation for relation metadata, query
       libraries, event payload schemas and consumer registry envelopes. Cover
       imported native required filters when caller queries add disjunctions.
