@@ -154,6 +154,13 @@ sub _relation_errors {
         if exists($relation->{source_table}) && !_string($relation->{source_table});
     push @$errors, _diagnostic('invalid_root_values', [@$path, 'values'], 'root source must use source_table')
         if $kind eq 'source' && exists $relation->{values};
+    if ($kind ne 'source') {
+        my $has_table = exists $relation->{source_table};
+        my $has_values = exists $relation->{values};
+        push @$errors, _diagnostic('invalid_relation_source', $path, 'schema must declare exactly one of source_table or values')
+            if $has_table == $has_values;
+        _values_errors($relation, $path, $errors) if $has_values;
+    }
     my $fields = $relation->{fields};
     my $columns = $relation->{columns};
     push @$errors, _diagnostic('invalid_fields', [@$path, 'fields'], 'fields must be an array of identifiers')
@@ -183,6 +190,29 @@ sub _relation_errors {
         }
     }
 }
+
+sub _values_errors {
+    my ($relation, $path, $errors) = @_;
+    my ($fields, $rows) = @{$relation}{qw(fields values)};
+    unless (ref($fields) eq 'ARRAY' && @$fields && !grep { !_string($_) } @$fields) {
+        push @$errors, _diagnostic('invalid_relation_values', [@$path, 'values'], 'values require a non-empty field list');
+        return;
+    }
+    unless (ref($rows) eq 'ARRAY' && @$rows) {
+        push @$errors, _diagnostic('invalid_relation_values', [@$path, 'values'], 'values must be a non-empty row list');
+        return;
+    }
+    my %fields = map { $_ => 1 } @$fields;
+    for my $index (0 .. $#$rows) {
+        my $row = $rows->[$index];
+        my $valid = ref($row) eq 'HASH' && keys(%$row) == keys(%fields) &&
+            !grep { !exists($fields{$_}) || !_scalar_literal($row->{$_}) } keys %$row;
+        push @$errors, _diagnostic('invalid_relation_values_row', [@$path, 'values', $index],
+            'values row must contain exactly the declared scalar fields') unless $valid;
+    }
+}
+
+sub _scalar_literal { !ref($_[0]) || JSON::PP::is_bool($_[0]) }
 
 sub _merge {
     my ($base, $overlay, $path) = @_;
@@ -276,7 +306,8 @@ Selecto::Domain::Identity - metadata-only domain identity normalization
 C<normalize>, C<validate>, C<compose>, and C<query_identity> return an object
 containing C<ok>, C<normalized>, and structured C<diagnostics>. Validation checks
 the required source/schemas identity sections, relation fields, column shapes,
-and primary keys. It does not authorize executable query, write, action, or
+primary keys, and schema table/VALUES source identity. VALUES rows must be
+non-empty, scalar, and contain exactly the declared fields. It does not authorize executable query, write, action, or
 extension policy; use C<Selecto::Domain-E<gt>parse> at that boundary.
 
 Declared versions and fingerprints are opaque metadata. Schema versions are
