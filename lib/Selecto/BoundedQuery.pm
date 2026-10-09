@@ -95,6 +95,12 @@ sub execute {
         Selecto::Error->throw('invalid_query', 'bounded execution limits must be positive integers')
             unless defined($_) && !ref($_) && "$_" =~ /\A[1-9][0-9]{0,8}\z/;
     }
+    # The query's own LIMIT is a firmer row ceiling than the caller's allowance.
+    my $query = ref($prepared) eq 'HASH' ? $prepared->{query} : undef;
+    my $query_limit = blessed($query) && $query->can('limit_value') ? $query->limit_value : undef;
+    $max_rows = 0 + $query_limit
+        if defined($query_limit) && !ref($query_limit) && "$query_limit" =~ /\A[1-9][0-9]{0,8}\z/
+            && $query_limit < $max_rows;
     my $adapter = $engine->adapter;
     _capabilities($adapter);
     Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query')->consume_parameters($statement->params);
@@ -107,18 +113,34 @@ sub execute {
     my $guarded = $adapter->bounded_result_statement($statement, max_cell_bytes => $cell_limit, max_rows => $max_rows + 1);
     my ($stream, $deadline, @rows);
     my $budget = $class->result_budget($limits);
+    my @canonical = exists($args{canonical_values}) && $adapter->supports('canonical_values')
+        ? (canonical_values => $args{canonical_values} ? 1 : 0) : ();
+    my $admit = sub {
+        my ($row) = @_;
+        $deadline->check(defer_rearm => 1);
+        Selecto::Error->throw('result_limit_exceeded', 'Result exceeds its transfer limit')
+            unless @$row == @columns + 1 && !pop(@$row);
+        Selecto::Error->throw('result_limit_exceeded', 'Result row limit exceeded') if @rows >= $max_rows;
+        $class->admit_row($budget, $row, $collections);
+        push @rows, $row;
+    };
+    # A result whose guard keeps it within one fetch batch buffers no more as a
+    # plain statement than a cursor would: run it directly, under a timeout that
+    # lasts for the host's transaction. Two round trips instead of a cursor's
+    # savepoint, declare, fetches, close and timeout restore.
+    my $direct = $max_rows + 1 <= DIRECT_ROWS()
+        && $adapter->can('bounded_direct_supported') && $adapter->bounded_direct_supported;
     my $ok = eval {
-        $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
-        $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows),
-            exists($args{canonical_values}) && $adapter->supports('canonical_values')
-                ? (canonical_values => $args{canonical_values} ? 1 : 0) : ());
-        while (my $row = $stream->next) {
+        if ($direct) {
+            $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
             $deadline->check(defer_rearm => 1);
-            Selecto::Error->throw('result_limit_exceeded', 'Result exceeds its transfer limit')
-                unless @$row == @columns + 1 && !pop(@$row);
-            Selecto::Error->throw('result_limit_exceeded', 'Result row limit exceeded') if @rows >= $max_rows;
-            $class->admit_row($budget, $row, $collections);
-            push @rows, $row;
+            $admit->($_) for @{$adapter->execute_query($guarded, @canonical)->{rows}};
+        } else {
+            $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
+            $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows), @canonical);
+            while (my $row = $stream->next) {
+                $admit->($row);
+            }
         }
         1;
     };
@@ -134,6 +156,11 @@ sub execute {
 # is already capped by the transfer guard, so a batch is bounded too.
 use constant FETCH_ROWS => 100;
 sub fetch_rows { my ($max_rows) = @_; return $max_rows + 1 < FETCH_ROWS ? $max_rows + 1 : FETCH_ROWS; }
+
+# Rows a guarded result may hold and still run as one plain statement: a page of
+# up to 100 rows, the row that detects another page and the row that detects
+# excess, about one FETCH_ROWS batch.
+use constant DIRECT_ROWS => 102;
 
 sub result_budget {
     my ($class, $limits) = @_;
