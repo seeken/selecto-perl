@@ -23,6 +23,14 @@ is_deeply({map { $_ => $snapshot->{provider}{$_} } qw(name domain_version domain
 is_deeply([map { $_->{id} } @{$snapshot->{surfaces}}], ['manager_rollup'], 'D014 surface ids');
 is_deeply($snapshot->{surfaces}[0]{fields}, [qw(state total)], 'output fields come from published result columns');
 is_deeply($provider, $original, 'snapshot leaves callback-bearing input untouched');
+my $native_callbacks = dclone($provider);
+my $callback_calls = 0;
+my $callback = sub { ++$callback_calls; die 'metadata verification must not execute callbacks' };
+$native_callbacks->{published_views}{manager_rollup}{query} = $callback;
+$native_callbacks->{query_members}{ctes}{open_items}{query} = $callback;
+is_deeply($api->snapshot($native_callbacks), $snapshot, 'actual native callbacks remain opaque snapshot metadata');
+ok($api->verify($native_callbacks, $fixtures->{D015}{consumer_domain})->{compatible}, 'actual callbacks do not prevent interface-only verification');
+is($callback_calls, 0, 'snapshot and verification execute no native callback');
 my $encoded = JSON::PP->new->canonical->encode($snapshot);
 unlike($encoded, qr/declared_callback|work_item_manager_rollup/, 'snapshot excludes executable definitions and physical view names');
 $snapshot->{surfaces}[0]{fields}[0] = 'altered';
