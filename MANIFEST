@@ -233,3 +233,4 @@ t/sqlite_prefix_fts.integration.t
 lib/Selecto/Tenant/Context.pm
 lib/Selecto/Verification/QuerySafety.pm
 t/sqlite_query_safety.t
+t/sqlite_required_boolean.integration.t
