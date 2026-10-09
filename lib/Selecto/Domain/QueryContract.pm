@@ -74,7 +74,10 @@ sub _bytes {
 sub _copy {
     my ($value) = @_;
     return $value unless ref($value);
-    return $$value ? JSON::PP::true : JSON::PP::false if $BOOL{blessed($value) // ''};
+    if ($BOOL{blessed($value) // ''}) {
+        my $boolean = $$value ? 1 : 0;
+        return bless \$boolean, 'JSON::PP::Boolean';
+    }
     return [map { _copy($_) } @$value] if ref($value) eq 'ARRAY';
     return {map { $_ => _copy($value->{$_}) } keys %$value};
 }
@@ -292,7 +295,8 @@ sub _comparators {
 sub validate {
     my ($class, $given) = @_;
     my $state = _state(_contract($given));
-    return {valid => @{$state->{errors}} ? JSON::PP::false : JSON::PP::true, errors => $state->{errors}, warnings => []};
+    my $valid = @{$state->{errors}} ? 0 : 1;
+    return {valid => bless(\$valid, 'JSON::PP::Boolean'), errors => $state->{errors}, warnings => []};
 }
 sub copy_declaration {
     my ($class, $given) = @_;
