@@ -16,6 +16,8 @@ use Selecto::Stream ();
 use Selecto::Write ();
 use Selecto::Write::Expression ();
 use Selecto::Write::Authorization ();
+use Selecto::Write::Capabilities ();
+use Selecto::Write::Policy ();
 
 our @FEATURE_INVENTORY = qw(
     cte recursive_cte window_functions set_operations transactions returning rollup stream
@@ -41,7 +43,7 @@ sub begin_query_budget {
 }
 
 sub feature_inventory { return [@FEATURE_INVENTORY]; }
-sub write_capabilities { return { %WRITE_CAPABILITIES }; }
+sub write_capabilities { return { protocol_version => 1, %WRITE_CAPABILITIES }; }
 
 # Anonymous DBI parameters are separate occurrences, even when their values
 # happen to be equal. Dialects with reusable numbered parameters opt in.
@@ -896,6 +898,8 @@ sub _statement_cache_enabled { return 0; }
 
 sub preview_write {
     my ($self, $command) = @_;
+    Selecto::Write::Capabilities->preflight($self, $command);
+    $self->_validate_write_cardinality($command);
     my $statement = $self->_compile_write($command);
     return { sql => $statement->{sql}, params => [@{$statement->{params}}] };
 }
@@ -938,13 +942,17 @@ sub execute_transaction {
 
 sub execute_write_unsafe {
     my ($self, $command) = @_;
+    Selecto::Write::Capabilities->preflight($self, $command);
+    $self->_validate_write_cardinality($command);
     my $compiled = $self->_compile_write($command);
     return $self->_transaction(sub { return $self->_execute_compiled_write_in_transaction($command, $compiled); });
 }
 
 sub execute_batch_unsafe {
     my ($self, $batch) = @_;
+    Selecto::Write::Capabilities->preflight($self, $batch);
     my @commands = @{$batch->commands};
+    $self->_validate_write_cardinality($_) for @commands;
     my @compiled = map { $self->_compile_write($_) } @commands;
     return $self->_transaction(sub {
         $self->_admit_plan_storage(\@commands);
@@ -955,6 +963,9 @@ sub execute_batch_unsafe {
 
 sub execute_graph_unsafe {
     my ($self, $graph) = @_;
+    Selecto::Write::Capabilities->preflight($self, $graph);
+    $self->_validate_write_cardinality($_->{command}) for @{$graph->nodes};
+    $self->_validate_write_cardinality($_->{cleanup}) for @{$graph->{_governed_owned_sets} // []};
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
     Selecto::Error->throw('write_capability_missing', 'adapter does not support write graphs')
@@ -2170,6 +2181,7 @@ sub _qualified {
 
 sub _compile_write {
     my ($self, $command) = @_;
+    $self->_validate_write_cardinality($command);
     my $relation = Selecto::Identifier::checked($command->relation);
     my $operation = $command->operation;
     my $assignments = $command->assignments;
@@ -2522,8 +2534,51 @@ sub _typed_insert_admission_probe {
         {truth_value => 'false_or_unknown'}) unless defined($row[0]) && "$row[0]" eq '1';
 }
 
+# Resolve declared cardinality independently of SQL rendering. A caller's
+# legacy exact count remains an additional constraint; trusted engine ceilings
+# bound both probes and the final effect, even for an otherwise unbounded range.
+sub _validate_write_cardinality {
+    my ($self, $command) = @_;
+    my $metadata = $command->metadata;
+    my $declared = exists $metadata->{expected_cardinality};
+    my $expected = $command->expected_count;
+    my ($minimum, $maximum) = (0, undef);
+    if ($declared) {
+        ($minimum, $maximum) = @{Selecto::Write::Policy->cardinality_bounds($metadata->{expected_cardinality})};
+        Selecto::Error->throw('invalid_expected_cardinality', 'legacy count conflicts with declared write cardinality')
+            if defined($expected) && (ref($expected) || "$expected" !~ /\A\d{1,9}\z/
+                || $expected < $minimum || defined($maximum) && $expected > $maximum);
+    }
+    if (exists $metadata->{__selecto_primary_key}) {
+        my $ceiling = $metadata->{__selecto_write_limit} // 1000;
+        Selecto::Error->throw('invalid_write', 'write row ceiling must be a positive integer')
+            if ref($ceiling) || "$ceiling" !~ /\A[1-9]\d{0,8}\z/;
+        Selecto::Error->throw('invalid_write', 'write cardinality requires a finite nonnegative integer')
+            if defined($expected) && (ref($expected) || "$expected" !~ /\A\d{1,9}\z/);
+        Selecto::Error->throw('invalid_write', 'write cardinality exceeds the trusted row ceiling')
+            if defined($expected) && $expected > $ceiling || $minimum > $ceiling;
+        $maximum = 0 + $ceiling if !defined($maximum) || $maximum > $ceiling;
+    }
+    if (defined $expected) {
+        $minimum = 0 + $expected;
+        $maximum = 0 + $expected;
+    }
+    return { minimum => $minimum, maximum => $maximum, declared => $declared,
+        expected => $declared ? $metadata->{expected_cardinality} : $expected };
+}
+
+sub _check_write_cardinality {
+    my ($self, $command, $affected, $bounds) = @_;
+    $bounds //= $self->_validate_write_cardinality($command);
+    Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
+        { expected => $bounds->{expected} })
+        if $affected < $bounds->{minimum} || defined($bounds->{maximum}) && $affected > $bounds->{maximum};
+    return 1;
+}
+
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
+    my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
     my $bounded = $self->_bounded_write_command($command);
@@ -2545,28 +2600,24 @@ sub _execute_compiled_write_in_transaction {
                 if !@row && eval { $sth->err };
             # A guarded write that yields no row was refused by its guard.
             _guarded_cardinality($command, 0) if !@row && @{$command->foreign_key_guards};
-            Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
-                {expected => $command->expected_count})
-                if !@row && defined($command->expected_count) && $command->expected_count > 0;
-            Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
-            @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row);
+            $self->_check_write_cardinality($command, 0, $bounds) unless @row;
+            Selecto::Error->throw('write_returning_missing', 'write did not return the requested row')
+                if !@row && !$bounds->{declared};
+            @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row) if @row;
             # RETURNING emits one row per affected row. Some DBI drivers report
             # provisional counts until the result is exhausted. Drain before
-             # checking cardinality or committing, retaining only the first row.
-             my $returned = 1;
-             while (my @remaining = $sth->fetchrow_array) { ++$returned; }
-             $affected = $self->_logical_affected_rows($command->operation, $returned);
-         } else {
-             $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
+            # checking cardinality or committing, retaining only the first row.
+            my $returned = @row ? 1 : 0;
+            while (my @remaining = $sth->fetchrow_array) { ++$returned; }
+            die _dbi_error($sth, 'database returning fetch failed') if eval { $sth->err };
+            $affected = $self->_logical_affected_rows($command->operation, $returned);
+        } else {
+            $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
         }
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    if (defined($command->expected_count) && $affected != $command->expected_count) {
-        Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows', {
-            expected => $command->expected_count,
-        });
-    }
+    $self->_check_write_cardinality($command, $affected, $bounds);
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
@@ -2581,15 +2632,8 @@ sub _bounded_write_command {
     # authorization. Explicit *_unsafe calls remain a trusted adapter escape.
     return $command unless exists $metadata->{__selecto_primary_key};
     my $key = Selecto::Identifier::checked($metadata->{__selecto_primary_key});
-    my $maximum = $metadata->{__selecto_write_limit} // 1000;
-    my $expected = $command->expected_count;
-    Selecto::Error->throw('invalid_write', 'write cardinality requires a finite nonnegative integer')
-        if defined($expected) && (ref($expected) || "$expected" !~ /\A\d{1,9}\z/);
-    Selecto::Error->throw('invalid_write', 'write row ceiling must be a positive integer')
-        if ref($maximum) || "$maximum" !~ /\A[1-9]\d{0,8}\z/;
-    Selecto::Error->throw('invalid_write', 'write cardinality exceeds the trusted row ceiling')
-        if defined($expected) && $expected > $maximum;
-    my $limit = defined($expected) ? 0 + $expected : 0 + $maximum;
+    my $bounds = $self->_validate_write_cardinality($command);
+    my $limit = $bounds->{maximum};
     my $predicate = Selecto::QueryEnforcement::combine(
         $command->predicate, $command->scope_predicate,
         defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
@@ -2644,9 +2688,7 @@ sub _bounded_write_command {
         Selecto::Error->throw('query_budget_restore_failed', 'bounded write could not restore its execution scope');
     }
     die $error unless $ok;
-    Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
-        {defined($expected) ? (expected => $expected) : ()})
-        if @keys > $limit || (defined($expected) && @keys != $expected);
+    $self->_check_write_cardinality($command, scalar(@keys), $bounds);
     # Keep every original scope and precondition, then constrain DML to the
     # exact locked keys. New matching rows can never join this mutation.
     my $keys = @keys ? Selecto::Expression->in($key, \@keys)

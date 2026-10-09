@@ -20,6 +20,8 @@ use Selecto::Write ();
 use Selecto::Write::Expression ();
 use Selecto::Write::Scope ();
 use Selecto::Write::Authorization ();
+use Selecto::Write::Capabilities ();
+use Selecto::Write::Policy ();
 use Selecto::Action::Capability ();
 use Selecto::Action::Grant ();
 use Selecto::Action::Planner ();
@@ -492,6 +494,7 @@ sub stream {
 sub preview_write {
     my ($self, $command) = @_;
     $self->assert_domain_identity;
+    Selecto::Write::Capabilities->requirements($command);
     return Selecto::DataRules->_with_proof_budget(sub { $self->_preview_write($command) },
         accepted_work => $self->_accepted_command_work($command), limits => $self->{limits});
 }
@@ -499,6 +502,7 @@ sub _preview_write {
     my ($self, $command) = @_;
     my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
+    $self->preflight_write($command);
     return $self->{adapter}->preview_write($command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
         return $self->{adapter}->preview_write(Selecto::WriteRules->govern($self, $command, input => $input));
@@ -507,6 +511,7 @@ sub _preview_write {
 sub execute_write {
     my ($self, $command) = @_;
     $self->assert_domain_identity;
+    Selecto::Write::Capabilities->requirements($command);
     return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_write($command) },
         accepted_work => $self->_accepted_command_work($command), limits => $self->{limits});
 }
@@ -514,6 +519,7 @@ sub _execute_write {
     my ($self, $command) = @_;
     my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
+    $self->preflight_write($command);
     return $self->_execute_governed(execute_write => $command) unless Selecto::WriteRules->has_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
         return $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $command, input => $input));
@@ -526,7 +532,15 @@ sub _execute_governed {
     my ($self, $method, $subject) = @_;
     $self->assert_domain_identity;
     $self->_ensure_write_context;
+    $self->preflight_write($subject) unless $method eq 'execute_transaction';
     return $self->{adapter}->$method($subject, Selecto::Write::Authorization->_issue($subject));
+}
+
+# Capability discovery belongs to real dispatch, not adapter-neutral domain
+# governance/portable compilation. Admit the write before invoking a provider.
+sub preflight_write {
+    my ($self, $write) = @_;
+    return Selecto::Write::Capabilities->preflight($self->{adapter}, $write);
 }
 sub _rules_transaction {
     my ($self, $work) = @_;
@@ -538,6 +552,7 @@ sub _rules_transaction {
 sub execute_batch {
     my ($self, $batch) = @_;
     $self->assert_domain_identity;
+    Selecto::Write::Capabilities->requirements($batch);
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
     my @work = map { $self->_accepted_command_work($_) } @{$batch->commands};
@@ -550,7 +565,9 @@ sub _execute_batch {
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
     my @input = map { Selecto::WriteRules->literal_input($_) } @{$batch->commands};
     my @commands = map { $self->governed_write($_) } @{$batch->commands};
-    return $self->_execute_governed(execute_batch => Selecto::Write::Batch->new(@commands))
+    my $prepared = Selecto::Write::Batch->new(@commands);
+    $self->preflight_write($prepared);
+    return $self->_execute_governed(execute_batch => $prepared)
         unless $self->{domain}->rules;
     return $self->_rules_transaction(sub {
         # Stored batch deltas may overlap or depend on earlier mutations. They
@@ -567,7 +584,9 @@ sub _execute_batch {
 sub execute_graph {
     my ($self, $graph) = @_;
     $self->assert_domain_identity;
+    Selecto::Write::Capabilities->requirements($graph);
     my ($prepared, $contexts) = $self->_prepared_graph($graph);
+    $self->preflight_write($prepared);
     my $work = sub {
         $prepared = Selecto::WriteRules->admit_graph($self, $prepared, $contexts) if $prepared->{_requires_rules};
         return $self->_execute_governed(execute_graph => $prepared);
@@ -622,8 +641,6 @@ sub _prepared_graph {
 sub _govern_owned_sets {
     my ($self, $sets, $nodes, $contexts) = @_;
     return [] unless @$sets;
-    Selecto::Error->throw('write_capability_missing', 'adapter does not support owned-set sync')
-        unless $self->{adapter}->write_capabilities->{owned_set_sync};
     my %nodes = map { ($_->{id} => $_) } @$nodes;
     my %position = map { ($nodes->[$_]{id} => $_) } 0 .. $#$nodes;
     my %physical;
@@ -679,8 +696,16 @@ sub _govern_owned_sets {
         $nodes{$set->{parent}}{command} = $nodes{$set->{parent}}{command}->with_metadata($root_metadata);
         my $child_engine = ref($self)->new(domain => $child, adapter => $self->{adapter},
             scope => $self->{scope}, limits => $self->{limits});
+        # Cleanup is limited to owned rows. Its exact parent key is supplied
+        # from the root's actual RETURNING result during graph execution; this
+        # necessary ownership condition survives alongside that later binding.
+        # A tenant ownership key instead receives Scope's trusted equality.
+        my $child_scope = $child->write_tenant_scope;
+        my $ownership_scope = $child_scope && $child_scope->{field} eq $child_key
+            ? undef : Selecto::Expression->not_null($child_key);
         my $cleanup = $child_engine->governed_write(Selecto::Write::Command->new(
-            operation => 'delete', relation => $child->table, expected_count => undef));
+            operation => 'delete', relation => $child->table, expected_count => undef,
+            scope_predicate => $ownership_scope));
         push @prepared, {%$set, parent_key => $parent_key, child_key => $child_key,
             identity_fields => [@$identity], cleanup => $cleanup};
     }
@@ -754,6 +779,8 @@ sub governed_write {
             || (defined($command->query_enforcement)
                 && _has_conjunct($command->query_enforcement->predicate, $required));
     }
+    $command = Selecto::Write::Policy->apply($command, $self->{domain}->writes, $self->{domain}->fields,
+        trusted_field => $scope ? $scope->{field} : undef);
     $self->_validate_write_command($command, trusted_field => $scope ? $scope->{field} : undef);
     $self->_check_required_tenant_assignment($command, $required, %details);
     # Adapter bounded-write preflight must use the governing domain identity,
@@ -1686,9 +1713,9 @@ sub _mutation_reference_fields {
     return sort keys %fields;
 }
 
-# Graph authorization is edge-aware: every child node must bind through a
-# writable relationship declared on the exact parent node it references, and
-# the binding must name that relationship's parent_key and child_key.
+# Bound graph children must follow a declared writable relationship. An
+# independent row can use only the actual root relation and root governance;
+# absence of a binding never infers a grant from another table's shape.
 sub _validate_graph_node {
     my ($self, $node, $contexts, $root_scope, $tenants) = @_;
     my $command = $node->{command};
@@ -1699,8 +1726,16 @@ sub _validate_graph_node {
             scope_predicate => $command->{scope_predicate}, query_enforcement => $command->{query_enforcement}},
         label => 'write', allowed_classes => [qw(Selecto::Expression Selecto::Write::Expression Selecto::QueryEnforcement)]);
     my $bindings = $node->{bindings} // [];
-    Selecto::Error->throw('invalid_write_graph', 'graph child must bind to its declared parent')
-        unless @$bindings;
+    unless (@$bindings) {
+        Selecto::Error->throw('write_relation_mismatch', 'independent graph row must use the root domain relation')
+            unless $command->relation eq $self->{domain}->table;
+        $command = $self->governed_write($command, graph_node => $node->{id});
+        my $writes = _checked_writes($self->{domain}->writes);
+        return ({table => $self->{domain}->table, primary_key => $self->{domain}->primary_key,
+            fields => $self->{domain}->fields, fields_known => 1, writes => $writes,
+            relationships => $writes->{relationships}, tenant_scope => $self->{domain}->write_tenant_scope,
+            domain => $self->{domain}}, $command);
+    }
     my $edge;
     my $edge_id;
     for my $binding (@$bindings) {
@@ -1761,6 +1796,8 @@ sub _validate_graph_node {
     $command = $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $required)) if defined $required;
     my %nested_fields = %{$edge->{fields} // {}};
+    $command = Selecto::Write::Policy->apply($command, $edge->{writes}, \%nested_fields,
+        trusted_field => $scope ? $scope->{field} : undef);
     $self->_validate_command_against_contract($command,
         ($edge->{fields_known} ? (fields => \%nested_fields) : (fields => undef)),
         writes      => $edge->{writes},

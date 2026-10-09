@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Validate the complete bounded portable write contract and expose sealed
+      authored operation snapshots. Keep declarations separate from grants.
+    - Preflight versioned native write capabilities before dispatch, preserving
+      requested returning, generated bindings, transactions and atomic graphs.
+      Exercise the complete 30-state capability safety model.
+    - Enforce explicit returning/cardinality limits, required insert fields,
+      protected upsert fields and atomic write-once guards. Check cardinality
+      ranges before commit and retain caller-owned transaction/savepoint work.
     - Add complete bounded choice-source metadata validation and public choice
       binding/request/options APIs with explicit trusted host providers and
       sealed native membership/options results. Preserve actual join target

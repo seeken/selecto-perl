@@ -256,3 +256,15 @@ t/sqlite_choice_sources.integration.t
 t/fixtures/choice_sources.json
 t/fixtures/choice_sources_expected.json
 t/fixtures/choice_sources_case_metadata.json
+lib/Selecto/Domain/WriteContract.pm
+lib/Selecto/Verification/WriteCapabilitySafety.pm
+lib/Selecto/Write/Capabilities.pm
+lib/Selecto/Write/Operation.pm
+lib/Selecto/Write/Policy.pm
+t/domain_write_contract.t
+t/portable_write_operation.t
+t/sqlite_write_capabilities.integration.t
+t/sqlite_write_cardinality.integration.t
+t/write_capabilities.t
+t/write_policy_bounds.t
+t/sqlite_write_policy_owned_cleanup.integration.t
