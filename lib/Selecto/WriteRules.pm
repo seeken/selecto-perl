@@ -194,8 +194,12 @@ sub _known_path {
     my $edges = $domain ? $domain->writes->{relationships} // {} : {};
     my $edge = ref($edges->{$head}) eq 'HASH' ? $edges->{$head} : {};
     my $child = $edge->{domain};
-    $domain = ref($child) eq 'HASH' ? Selecto::Domain->parse($child) : undef;
+    $domain = ref($child) eq 'HASH' ? _relationship_domain($child) : undef;
     return _known_path($domain, $value->{$head}, \@tail);
+}
+sub _relationship_domain {
+    require Selecto::Engine;
+    return Selecto::Engine::_native_relationship_domain($_[0]);
 }
 sub _complete_rows {
     my ($domain, $value) = @_;
@@ -208,7 +212,7 @@ sub _complete_rows {
             my $edge = $domain->writes->{relationships}{$name};
             next unless ($edge->{ownership} // '') =~ /\A(?:owned|composition)\z/;
             return 0 unless exists($row->{$name}) && ref($edge->{domain}) eq 'HASH'
-                && _complete_rows(Selecto::Domain->parse($edge->{domain}), $row->{$name});
+                && _complete_rows(_relationship_domain($edge->{domain}), $row->{$name});
         }
     }
     return 1;
@@ -334,7 +338,8 @@ sub _admit_graph {
     my @nodes = @{$graph->nodes};
     my %nodes = map { ($_->{id} => $_) } @nodes;
     my %engines = map { ($_ => ref($root)->new(domain => $contexts->{$_}{domain},
-        adapter => $root->adapter, scope => $root->scope, limits => $root->limits)) } keys %$contexts;
+        adapter => $root->adapter, scope => $root->scope, write_context => $root->write_context,
+        limits => $root->limits)) } keys %$contexts;
     my (%children, %edges, %sets, %values);
     for my $node (@nodes[1 .. $#nodes]) {
         _pending('protected graph candidates require one ownership binding') unless @{$node->{bindings}} == 1;
@@ -380,9 +385,9 @@ sub _admit_graph {
         for my $name (sort keys %names) {
             my $edge = $relationships->{$name};
             _pending('collection rules require an authored child domain') unless ref($edge->{domain}) eq 'HASH';
-            my $domain = Selecto::Domain->parse($edge->{domain});
+            my $domain = _relationship_domain($edge->{domain});
             my $child_engine = ref($root)->new(domain => $domain, adapter => $root->adapter,
-                scope => $root->scope, limits => $root->limits);
+                scope => $root->scope, write_context => $root->write_context, limits => $root->limits);
             my $parent_key = $edge->{parent_key} // $engine->domain->primary_key;
             my $child_key = $edge->{child_key} // $edge->{foreign_key};
             _pending('stored collection ownership key cannot be reassigned')
@@ -458,6 +463,13 @@ sub _admit_graph {
     };
     $walk->($nodes[0]{id}, undef);
     # Re-run domain governance after every normalizer, including trusted tenant checks.
+    for my $node (@nodes) {
+        my $metadata=$node->{command}->metadata;
+        my $returning=$graph->public_returning($node->{id});
+        if (defined $returning) { $metadata->{returning}=$returning }
+        else { delete $metadata->{returning} }
+        $node->{command}=$node->{command}->with_metadata($metadata);
+    }
     my ($prepared) = $root->_prepared_graph(Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets));
     return $prepared;
 }

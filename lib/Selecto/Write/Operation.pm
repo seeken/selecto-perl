@@ -38,6 +38,10 @@ sub new {
     my $state = _copy({domain => $domain, opts => $opts // {}, filters => []});
     Selecto::Error->throw('invalid_domain', 'portable write domain must be a plain object')
         unless ref($state->{domain}) eq 'HASH';
+    my $input = $state->{domain};
+    $state->{domain} = $input->{domain}
+        if exists($input->{schema_version}) && ref($input->{domain}) eq 'HASH'
+            && ref($input->{query}) eq 'HASH' && ref($input->{projection}) eq 'HASH';
     return _seal($state);
 }
 sub _with {
@@ -73,7 +77,38 @@ sub with_tenant { return $_[0]->_with(tenant => _copy($_[1])); }
 sub returning { return $_[0]->_with(returning => _copy($_[1])); }
 sub expected_cardinality { return $_[0]->_with(expected_cardinality => _copy($_[1])); }
 sub conflict_target { return $_[0]->_with(conflict_target => _copy($_[1])); }
+sub enforce_query {
+    my ($self, @query) = @_;
+    $self->snapshot;
+    require Selecto::Write::QueryEnforcement;
+    return $self->_with(query_enforcement => Selecto::Write::QueryEnforcement->capture(@query));
+}
 sub with_execution_scope { return $_[0]->_with(execution_scope => _copy($_[1])); }
+sub has_filters { return scalar(@{$_[0]->snapshot->{filters}}) ? 1 : 0; }
+sub apply_execution_scope {
+    my ($self, @options) = @_;
+    Selecto::Error->throw('invalid_write_context', 'execution scope options must be key/value pairs')
+        if @options != 1 && @options % 2;
+    my $options = @options == 1 && ref($options[0]) ? _copy($options[0]) : _copy({@options});
+    require Selecto::Write::Context;
+    return _seal(Selecto::Write::Context->apply_execution_scope($self->snapshot, $options));
+}
+sub validate_tenant_scope {
+    my ($self) = @_;
+    require Selecto::Write::Context;
+    return Selecto::Write::Context->validate_tenant_scope($self->snapshot);
+}
+sub applied_scope { return _copy($_[0]->snapshot->{applied_scope}); }
+sub compile {
+    my ($self, %options) = @_;
+    require Selecto::Write::PortableCommand;
+    return Selecto::Write::PortableCommand->compile($self, %options);
+}
+sub compile_flat {
+    my ($self, %options) = @_;
+    require Selecto::Write::PortableCommand;
+    return Selecto::Write::PortableCommand->compile_flat($self, %options);
+}
 
 1;
 
@@ -93,5 +128,14 @@ tied data, cycles and excessive metadata are rejected before interpretation.
 Assignments accept an object or ordered C<[field, value]> pairs. Pairs retain
 repeated identifiers so compilation can reject ambiguity before dispatch.
 Trusted host tenant and execution context are supplied separately from values.
+
+C<compile(%trusted_host_options)> returns C<{command, context}>. Execute the
+command through the configured native Engine, which independently enforces its
+host domain and trusted write context. C<enforce_query($query)> captures a
+query bound to its genuine Engine; C<enforce_query($engine, $query)> also checks
+that exact owner. Captured predicates and source identity survive later query
+mutation and operation builders. Required and captured predicates refuse
+upsert. SQLite inserts defer predicate admission to actual typed storage; other
+portable inserts check their explicit candidate values before compilation.
 
 =cut

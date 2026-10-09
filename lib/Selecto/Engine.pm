@@ -6,6 +6,7 @@ use warnings;
 use JSON::PP ();
 use Time::HiRes ();
 use Storable ();
+use B ();
 use Scalar::Util qw(blessed refaddr reftype);
 use Hash::Util::FieldHash qw(fieldhash);
 use Digest::SHA qw(sha256_hex);
@@ -22,6 +23,7 @@ use Selecto::Write::Scope ();
 use Selecto::Write::Authorization ();
 use Selecto::Write::Capabilities ();
 use Selecto::Write::Policy ();
+use Selecto::Write::Context ();
 use Selecto::Action::Capability ();
 use Selecto::Action::Grant ();
 use Selecto::Action::Planner ();
@@ -40,7 +42,7 @@ fieldhash my %CONFIGURED_DOMAIN;
 
 sub _read_authority {
     my ($self) = @_;
-    return [$self->{scope}, $self->{tenant_context}, $self->{tenant_required_filters}, $self->{query_mode}];
+    return [$self->{scope}, $self->{write_context}, $self->{tenant_context}, $self->{tenant_required_filters}, $self->{query_mode}];
 }
 
 my $seal_domain = sub {
@@ -112,6 +114,10 @@ sub new {
             && !(blessed($args{domain_ref}) && $args{domain_ref}->isa('Selecto::Domain::Ref'));
     # Admit the raw structure before domain validation can inspect metadata.
     Selecto::ConfiguredDomain->digest($args{domain}, {});
+    my $scope=_trusted_scope($args{scope});
+    my $write_context=Selecto::Write::Context->resolve({}, {context=>$args{write_context}//{},
+        (defined($scope->{tenant}) ? (tenant_id=>$scope->{tenant}) : ())});
+    $scope->{tenant}=$write_context->{tenant_id} if defined $write_context->{tenant_id};
     $args{adapter}->assert_contract;
     my $limits = $args{limits} // Selecto::Limits->new;
     Selecto::Error->throw('invalid_limits', 'engine limits must be a Selecto::Limits object')
@@ -125,7 +131,8 @@ sub new {
         domain => $args{domain},
         adapter => $args{adapter},
         domain_ref => $args{domain_ref},
-        scope => _trusted_scope($args{scope}),
+        scope => $scope,
+        write_context=>$write_context,
         write_policy => _write_policy($args{write_policy}),
         limits => $limits,
     }, $class;
@@ -138,6 +145,7 @@ sub new {
 sub _trusted_scope {
     my ($scope) = @_;
     return {} unless defined $scope;
+    $scope=Selecto::Domain::QueryContract->copy_declaration({scope=>$scope})->{scope};
     Selecto::Error->throw('invalid_tenant_scope', 'engine scope must be an object')
         unless ref($scope) eq 'HASH';
     my @unknown = sort grep { $_ ne 'tenant' } keys %$scope;
@@ -165,6 +173,21 @@ sub write_policy { return $_[0]->{write_policy}; }
 sub limits { return $_[0]->{limits}; }
 
 sub scope { return {%{$_[0]->{scope}}}; }
+sub write_context {
+    my ($self)=@_;$self->assert_domain_identity;
+    return Selecto::Domain::QueryContract->copy_declaration({context=>$self->{write_context}})->{context};
+}
+sub with_write_context {
+    my ($self,$context)=@_;$self->assert_domain_identity;
+    my $next=Selecto::Write::Context->resolve({opts=>{context=>$self->{write_context}}},{context=>$context});
+    my $read=$self->{tenant_context}//{};
+    Selecto::Error->throw('tenant_context_mismatch','trusted write context conflicts with attached read context')
+        if defined($read->{tenant_id}) && defined($next->{tenant_id}) && "$read->{tenant_id}" ne "$next->{tenant_id}";
+    my $copy=bless {%$self,write_context=>$next,scope=>{%{$self->{scope}}}},ref($self);
+    $copy->{scope}{tenant}=$next->{tenant_id} if defined $next->{tenant_id};
+    delete $copy->{_read_domain};
+    return $seal_domain->(Selecto::QueryBinding->inherit_engine($self,$copy,flat_input=>1));
+}
 
 # Read context is attached independently of the existing trusted write scope.
 # A row context must be explicitly applied as required query obligations.
@@ -309,6 +332,8 @@ sub with_scope {
         if defined($current) && defined($next->{tenant}) && "$current" ne "$next->{tenant}";
     my $copy = bless {%$self}, ref($self);
     $copy->{scope} = {%{$self->{scope}}, %$next};
+    $copy->{write_context}=Selecto::Write::Context->resolve({}, {context=>$self->{write_context},
+        (defined($copy->{scope}{tenant}) ? (tenant_id=>$copy->{scope}{tenant}) : ())});
     delete $copy->{_read_domain};
     return $seal_domain->(Selecto::QueryBinding->inherit_engine($self, $copy, flat_input => 1));
 }
@@ -345,6 +370,7 @@ sub from_registry {
         domain_ref => $ref,
         adapter => $args{adapter},
         (defined($args{scope}) ? (scope => $args{scope}) : ()),
+        (defined($args{write_context}) ? (write_context => $args{write_context}) : ()),
         (defined($args{write_policy}) ? (write_policy => $args{write_policy}) : ()),
         (defined($args{limits}) ? (limits => $args{limits}) : ()),
         (defined($args{mode}) ? (mode => $args{mode}) : ()),
@@ -574,32 +600,63 @@ sub _rules_transaction {
     return $self->_execute_governed(execute_transaction => $request);
 }
 sub execute_batch {
-    my ($self, $batch) = @_;
+    my ($self, $batch, @options) = @_;
     $self->assert_domain_identity;
     Selecto::Write::Capabilities->requirements($batch);
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
-    my @work = map { $self->_accepted_command_work($_) } @{$batch->commands};
-    return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_batch($batch) },
+    my $engines=$self->_batch_engines($batch,\@options);
+    my $commands=$batch->commands;
+    my @work = map { $engines->[$_]->_accepted_command_work($commands->[$_]) } 0..$#$commands;
+    return Selecto::DataRules->_with_proof_budget(sub { $self->_execute_batch($batch,$engines) },
         accepted_work => \@work, limits => $self->{limits});
 }
+sub _batch_engines {
+    my ($self,$batch,$options)=@_;
+    $self->_ensure_write_context;
+    Selecto::Error->throw('invalid_write','batch options require key/value pairs') if @$options % 2;
+    return [map{$self}@{$batch->commands}] unless @$options;
+    Selecto::Error->throw('invalid_write','batch accepts only one trusted engines option')
+        unless @$options==2 && !defined(reftype($options->[0])) && defined($options->[0]) && $options->[0] eq 'engines';
+    my $engines=$options->[1];
+    Selecto::Error->throw('invalid_write','batch engines must match every command')
+        unless ref($engines) eq 'ARRAY' && !defined(tied(@$engines)) && @$engines==@{$batch->commands};
+    Selecto::OperationBudget->new(limits=>$self->{limits},code=>'invalid_write')->consume_count(
+        'max_expression_nodes',scalar(@$engines),label=>'configured batch engines');
+    my $context=JSON::PP->new->canonical->encode($self->{write_context});
+    for my $index (0..$#$engines) {
+        Selecto::Error->throw('invalid_write','batch engines cannot contain tied values') if defined(tied($engines->[$index]));
+        my $engine=$engines->[$index];
+        Selecto::Error->throw('invalid_write','batch requires genuinely configured engines')
+            unless ref($engine) eq 'Selecto::Engine' && $CONFIGURED_DOMAIN{$engine};
+        $engine->assert_domain_identity;
+        $engine->_ensure_write_context;
+        Selecto::Error->throw('invalid_write','batch engines must use the identical adapter')
+            unless refaddr($engine->{adapter})==refaddr($self->{adapter});
+        Selecto::Error->throw('tenant_mismatch','batch engines must agree on trusted write context')
+            unless JSON::PP->new->canonical->encode($engine->{write_context}) eq $context;
+    }
+    return [@$engines];
+}
 sub _execute_batch {
-    my ($self, $batch) = @_;
+    my ($self, $batch, $engines) = @_;
     Selecto::Error->throw('invalid_write', 'execute_batch requires a Selecto::Write::Batch')
         unless blessed($batch) && $batch->isa('Selecto::Write::Batch');
     my @input = map { Selecto::WriteRules->literal_input($_) } @{$batch->commands};
-    my @commands = map { $self->governed_write($_) } @{$batch->commands};
+    $engines//=[map{$self}@{$batch->commands}];
+    my $original=$batch->commands;
+    my @commands = map { $engines->[$_]->governed_write($original->[$_]) } 0..$#$original;
     my $prepared = Selecto::Write::Batch->new(@commands);
     $self->preflight_write($prepared);
     return $self->_execute_governed(execute_batch => $prepared)
-        unless $self->{domain}->rules;
+        unless grep { $_->{domain}->rules } @$engines;
     return $self->_rules_transaction(sub {
         # Stored batch deltas may overlap or depend on earlier mutations. They
         # need a prospective whole-plan provider; do not dispatch a prefix.
         Selecto::Error->throw('required_data_rule_pending', 'protected stored batch deltas require a whole-plan candidate provider')
             if grep { $_->operation ne 'insert' } @commands;
         my $admitted = Selecto::WriteRules->_with_stored_failure_deferral(sub {
-            my @admitted = map { Selecto::WriteRules->govern($self, $commands[$_], input => $input[$_]) } 0 .. $#commands;
+            my @admitted = map { Selecto::WriteRules->govern($engines->[$_], $commands[$_], input => $input[$_]) } 0 .. $#commands;
             return Selecto::Write::Batch->new(@admitted);
         });
         return $self->_execute_governed(execute_batch => $admitted);
@@ -627,6 +684,17 @@ sub _prepared_graph {
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
     my @nodes = @{$graph->nodes};
+    # The constructor materializes downstream keys for execution, but result
+    # policy governs only the caller's public returning intent. Re-derive the
+    # internal keys after every node has passed its actual domain policy.
+    for my $node (@nodes) {
+        my $metadata=$node->{command}->metadata;
+        my $returning=$graph->public_returning($node->{id});
+        if (defined $returning) { $metadata->{returning}=$returning }
+        else { delete $metadata->{returning} }
+        $node->{command}=$node->{command}->with_metadata($metadata);
+    }
+    my $relationship_work=Selecto::OperationBudget->new(limits=>$self->{limits},code=>'invalid_write_graph');
     my %rule_inputs = map { ($_->{id} => Selecto::WriteRules->literal_input($_->{command})) } @nodes;
     $nodes[0]{command} = $self->governed_write($nodes[0]{command}, graph_node => $nodes[0]{id});
     my $writes = _checked_writes($self->{domain}->writes);
@@ -640,16 +708,17 @@ sub _prepared_graph {
         tenant_scope  => $self->{domain}->write_tenant_scope,
         domain        => $self->{domain},
         rule_input    => $rule_inputs{$nodes[0]{id}},
+        operation     => $nodes[0]{command}->operation,
     });
     my $root_scope = $self->{domain}->write_tenant_scope;
     my $tenants = $self->_trusted_write_tenants($self->{domain}->required_predicate);
     for my $node (@nodes[1 .. $#nodes]) {
         ($contexts{$node->{id}}, $node->{command}) =
-            $self->_validate_graph_node($node, \%contexts, $root_scope, $tenants);
+            $self->_validate_graph_node($node, \%contexts, $root_scope, $tenants,$graph->owned_sets,$relationship_work);
         $contexts{$node->{id}}{rule_input} = $rule_inputs{$node->{id}};
     }
-    my $sets = $self->_govern_owned_sets($graph->owned_sets, \@nodes, \%contexts);
-    my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets);
+    my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets,metadata=>$graph->metadata);
+    my $sets = $self->_govern_owned_sets($graph->owned_sets, $prepared->{nodes}, \%contexts,$relationship_work);
     $prepared->{_governed_owned_sets} = $sets;
     $prepared->{_reference_domains} = {map { ($_ => $contexts{$_}{domain}) } keys %contexts};
     $prepared->{_requires_rules} = scalar(grep {
@@ -657,13 +726,13 @@ sub _prepared_graph {
     } @nodes);
     for my $set (@{$graph->owned_sets}) {
         my $edge = $contexts{$set->{parent}}{relationships}{$set->{relationship}};
-        $prepared->{_requires_rules} ||= Selecto::WriteRules->has_rules(Selecto::Domain->parse($edge->{domain}), 'delete');
+        $prepared->{_requires_rules} ||= Selecto::WriteRules->has_rules(_native_relationship_domain($edge->{domain}), 'delete');
     }
     return ($prepared, \%contexts);
 }
 
 sub _govern_owned_sets {
-    my ($self, $sets, $nodes, $contexts) = @_;
+    my ($self, $sets, $nodes, $contexts,$relationship_work) = @_;
     return [] unless @$sets;
     my %nodes = map { ($_->{id} => $_) } @$nodes;
     my %position = map { ($nodes->[$_]{id} => $_) } 0 .. $#$nodes;
@@ -672,14 +741,12 @@ sub _govern_owned_sets {
     for my $set (@$sets) {
         my $parent = $contexts->{$set->{parent}};
         my $edge = $parent->{relationships}{$set->{relationship}};
+        my $policy=_relationship_policy($edge,$relationship_work);
         Selecto::Error->throw('write_relation_mismatch', 'owned sync requires a declared writable relationship')
-            unless ref($edge) eq 'HASH' && $edge->{writable} && ref($edge->{domain}) eq 'HASH';
+            unless $policy->{writable} && ref($edge->{domain}) eq 'HASH';
         Selecto::Error->throw('write_operation_not_enabled', 'relationship does not grant owned sync cleanup')
-            unless ($edge->{ownership} // '') =~ /\A(?:owned|composition)\z/
-                && ($edge->{strategy} // '') eq 'sync' && $edge->{delete_missing}
-                && ref($edge->{allowed_ops}) eq 'ARRAY'
-                && grep { $_ eq 'delete' } @{$edge->{allowed_ops}};
-        my $child = Selecto::Domain->parse($edge->{domain});
+            unless $policy->{owned_sync};
+        my $child = _native_relationship_domain($edge->{domain});
         my $parent_key = $edge->{parent_key} // $parent->{primary_key};
         my $child_key = $edge->{child_key} // $edge->{foreign_key};
         my $identity = $edge->{identity_fields};
@@ -700,6 +767,7 @@ sub _govern_owned_sets {
                 && $nodes{$set->{parent}}{command}->operation ne 'delete';
         my %members = map { ($_ => 1) } @{$set->{nodes}};
         for my $node (@$nodes) {
+            $relationship_work->consume_count('max_expression_nodes',1,label=>'owned relationship work') if $relationship_work;
             my @matches = grep { $_->{from} eq $set->{parent} && $_->{field} eq $child_key
                 && $_->{key} eq $parent_key } @{$node->{bindings}};
             next unless $members{$node->{id}} || (@matches && $node->{command}->relation eq $child->table);
@@ -719,7 +787,7 @@ sub _govern_owned_sets {
         $root_metadata->{returning} = [grep { !$returned{$_}++ } @{$root_metadata->{returning}}];
         $nodes{$set->{parent}}{command} = $nodes{$set->{parent}}{command}->with_metadata($root_metadata);
         my $child_engine = ref($self)->new(domain => $child, adapter => $self->{adapter},
-            scope => $self->{scope}, limits => $self->{limits});
+            scope => $self->{scope}, write_context=>$self->{write_context}, limits => $self->{limits});
         # Cleanup is limited to owned rows. Its exact parent key is supplied
         # from the root's actual RETURNING result during graph execution; this
         # necessary ownership condition survives alongside that later binding.
@@ -786,6 +854,7 @@ sub governed_write {
         'write relation must be the domain table',
         { relation => $command->relation, expected => $self->{domain}->table },
     ) unless $command->relation eq $self->{domain}->table;
+    $command = $self->_materialize_write_context($command);
     $command = $self->_normalize_write_command($command);
     my $required = $self->required_write_guard($command->operation, %details);
     my $scope = $self->{domain}->write_tenant_scope;
@@ -831,7 +900,10 @@ sub governed_write {
 # insert candidates against it before the transaction opens.
 sub required_write_guard {
     my ($self, $operation, %details) = @_;
-    my $required = $self->{domain}->required_predicate;
+    my $contract=$self->{domain}->_contract_view // {};
+    my $source=$contract->{source} // {fields=>[sort keys %{$self->{domain}->fields}]};
+    my $required = Selecto::QueryEnforcement::combine($self->{domain}->required_predicate,
+        Selecto::Write::Context->required_predicate({source=>$source},$self->{write_context}));
     return undef unless defined $required;
     my $relation = $self->{domain}->table;
     my @paths = _association_paths($required);
@@ -846,6 +918,39 @@ sub required_write_guard {
         { relation => $relation, %details },
     ) if ($operation // '') eq 'upsert';
     return $required;
+}
+
+# Context-owned fields are checked as authored literal values before native
+# type normalization. Other native mutation expressions keep their ordinary
+# meaning; none can supply a context-owned identity.
+sub _materialize_write_context {
+    my ($self,$command)=@_;
+    my $keys=_declared_foreign_keys($self->{domain}->writes);
+    return $command unless keys %$keys;
+    my $assignments=$command->assignments;my (%context_keys,%plain);
+    for my $field (sort keys %$keys) {
+        my $spec=$keys->{$field};
+        Selecto::Error->throw('invalid_domain','foreign key must have a declaration') unless ref($spec) eq 'HASH';
+        my $source=$spec->{source};
+        my $context=ref($source) eq 'ARRAY' || ref($source) eq 'HASH';
+        if (!$context) {
+            Selecto::Error->throw('missing_foreign_key','required foreign-key value is missing',{field=>$field})
+                if $command->operation =~ /\A(?:insert|upsert)\z/ && $spec->{required} && !exists($assignments->{$field});
+            next;
+        }
+        $context_keys{$field}=$spec;
+        next unless exists $assignments->{$field};
+        my $value=$assignments->{$field};
+        if (blessed($value) && ref($value) eq 'Selecto::Write::Expression' && $value->kind eq 'literal') {
+            $value=$value->arguments->[0];
+        }
+        Selecto::Error->throw('foreign_key_source_mismatch','context-owned foreign key must be a literal',{field=>$field})
+            if ref($value) && !JSON::PP::is_bool($value);
+        $plain{$field}=$value;
+    }
+    my $values=Selecto::Write::Context->materialize({constraints=>{foreign_keys=>\%context_keys}},\%plain,
+        $command->operation,$self->{write_context});
+    return $command->with_assignments({%$assignments,%$values});
 }
 
 # The required predicate limits the rows an update matches, not the values it
@@ -992,10 +1097,14 @@ sub _foreign_key_guards {
     my $tenant_scoped = $tenants && $references->{tenant_data};
     my $relation = $command->relation;
     my (@candidates, %declared);
+    my $work=Selecto::OperationBudget->new(code=>'invalid_domain');
+    my $output=Selecto::OperationBudget->new(code=>'invalid_write');
     my $foreign_keys = $references->{foreign_keys};
     for my $field (sort keys %$foreign_keys) {
+        $work->consume_count('max_expression_nodes',1,label=>'foreign-key work');
         $declared{$field} = 1;
         next unless exists $assignments->{$field};
+        $work->consume_count('max_expression_nodes',scalar(@{$references->{schemas}}),label=>'foreign-key work');
         my $spec = $foreign_keys->{$field};
         my $target = ref($spec) eq 'HASH' ? $spec->{references} : undef;
         Selecto::Error->throw('invalid_domain', 'foreign key references must name a relation and field',
@@ -1006,9 +1115,11 @@ sub _foreign_key_guards {
         push @candidates, {
             field => $field, relation => "$target->{relation}", target_field => "$target->{field}", declared => 1,
             tenancy => _declared_tenancy($references, $target),
+            context_owned => ref($spec->{source}) ? 1 : 0,
         };
     }
     for my $association (@{$references->{associations}}) {
+        $work->consume_count('max_expression_nodes',1,label=>'foreign-key work');
         my $field = $association->{owner_key};
         next if !defined($field) || $declared{$field} || !exists($assignments->{$field});
         # Only a reference from this row to another: not the row's own key, a
@@ -1027,6 +1138,7 @@ sub _foreign_key_guards {
     }
     my (%seen, @guards);
     for my $candidate (@candidates) {
+        $work->consume_count('max_expression_nodes',1,label=>'foreign-key work');
         my ($kind, $tenant_field) = @{$candidate->{tenancy}};
         my $value = $assignments->{$candidate->{field}};
         $value = $value->kind eq 'literal' ? $value->arguments->[0] : $value
@@ -1036,16 +1148,17 @@ sub _foreign_key_guards {
         Selecto::Error->throw('invalid_domain', 'foreign-key tenant scope is invalid',
             {%where, code => $tenant_field, referenced => $candidate->{relation}},
         ) if $kind eq 'error';
-        next if $kind eq 'shared';
+        my $existence=$candidate->{context_owned} || $command->{metadata}{portable_foreign_key_guards};
+        next if $kind eq 'shared' && !$existence;
         if ($kind eq 'undeclared') {
             Selecto::Error->throw('invalid_domain',
                 'a reference on a tenant-scoped write must declare the referenced relation\'s tenant field',
                 {%where, code => 'foreign_key_tenant_scope_undeclared', referenced => $candidate->{relation},
                     required => ['references', 'tenant_field']},
-            ) if $tenant_scoped;
-            next;
+            ) if $tenant_scoped && !$candidate->{context_owned};
+            next unless $existence;
         }
-        unless ($tenants) {
+        if ($kind eq 'tenant' && !$tenants) {
             Selecto::Error->throw('missing_tenant_scope',
                 'a foreign key to a tenant-scoped relation requires a trusted tenant',
                 {%where, referenced => $candidate->{relation}, tenant_field => $tenant_field},
@@ -1055,13 +1168,14 @@ sub _foreign_key_guards {
         Selecto::Error->throw('invalid_write', 'a reference on a tenant-scoped write must be a literal value',
             \%where,
         ) if ref($value);
-        my $key = join "\0", @{$candidate}{qw(field relation target_field)}, $tenant_field;
+        my $key = join "\0", @{$candidate}{qw(field relation target_field)}, $tenant_field//'';
         next if $seen{$key}++;
-        push @guards, {
+        my $guard={
             field => $candidate->{field}, relation => $candidate->{relation},
-            target_field => $candidate->{target_field}, tenant_field => $tenant_field,
-            value => $value, tenants => [@$tenants],
+            target_field => $candidate->{target_field}, value => $value,
+            ($kind eq 'tenant' ? (tenant_field => $tenant_field,tenants => [@$tenants]) : ()),
         };
+        $output->check_tree($guard,label=>'foreign-key guards');push @guards,$guard;
     }
     return \@guards;
 }
@@ -1741,7 +1855,7 @@ sub _mutation_reference_fields {
 # independent row can use only the actual root relation and root governance;
 # absence of a binding never infers a grant from another table's shape.
 sub _validate_graph_node {
-    my ($self, $node, $contexts, $root_scope, $tenants) = @_;
+    my ($self, $node, $contexts, $root_scope, $tenants,$owned_sets,$relationship_work) = @_;
     my $command = $node->{command};
     Selecto::Error->throw('invalid_write_graph', 'graph node requires a write command')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
@@ -1758,7 +1872,7 @@ sub _validate_graph_node {
         return ({table => $self->{domain}->table, primary_key => $self->{domain}->primary_key,
             fields => $self->{domain}->fields, fields_known => 1, writes => $writes,
             relationships => $writes->{relationships}, tenant_scope => $self->{domain}->write_tenant_scope,
-            domain => $self->{domain}}, $command);
+            domain => $self->{domain},operation=>$command->operation}, $command);
     }
     my $edge;
     my $edge_id;
@@ -1768,7 +1882,7 @@ sub _validate_graph_node {
         my $parent = $contexts->{$binding->{from}};
         Selecto::Error->throw('invalid_write_graph', "graph binding references unavailable node $binding->{from}")
             unless $parent;
-        my $found = $self->_match_relationship($parent, $binding, $command->relation);
+        my $found = $self->_match_relationship($parent, $binding, $command->relation,$relationship_work);
         Selecto::Error->throw(
             'write_relation_mismatch',
             'graph binding does not match a declared writable relationship of its parent',
@@ -1794,10 +1908,27 @@ sub _validate_graph_node {
         'nested writes must declare their relationship domain',
         {relation => $command->relation, graph_node => $node->{id}},
     ) unless $edge->{fields_known};
+    if ($edge->{relationship_policy}{requires_owned_set}
+        && ($contexts->{$bindings->[0]{from}}{operation}//'') eq 'update') {
+        # A full-set omission request has an actual owned-set operation. An
+        # informational command mode cannot replace that cleanup structure.
+        my $binding=$bindings->[0];my $parent=$contexts->{$binding->{from}};my $matched=0;
+        for my $set (@{$owned_sets//[]}) {
+            $relationship_work->consume_count('max_expression_nodes',1,label=>'owned relationship work') if $relationship_work;
+            next unless $set->{parent} eq $binding->{from};
+            my $spec=$parent->{relationships}{$set->{relationship}};next unless ref($spec) eq 'HASH';
+            my $table=$spec->{table}//(ref($spec->{domain}) eq 'HASH' && ref($spec->{domain}{source}) eq 'HASH' ? $spec->{domain}{source}{source_table} : undef);
+            $matched=1 if defined($table) && $table eq $command->relation
+                && ($spec->{child_key}//$spec->{foreign_key}//'') eq $binding->{field}
+                && ($spec->{parent_key}//$parent->{primary_key}) eq $binding->{key};
+        }
+        Selecto::Error->throw('invalid_write_graph','declared full-set omission requires its actual owned-set operation') unless $matched;
+    }
     my $scope = $edge->{tenant_scope};
-    my $nested_domain = Selecto::Domain->parse($edge->{contract});
+    my $nested_domain = _native_relationship_domain($edge->{contract});
     my $nested_engine = ref($self)->new(domain => $nested_domain, adapter => $self->{adapter},
-        scope => $self->{scope}, limits => $self->{limits});
+        scope => $self->{scope}, write_context=>$self->{write_context}, limits => $self->{limits});
+    $command=$nested_engine->_materialize_write_context($command);
     $command = $command->with_assignments($nested_domain->normalize_write_assignments($command->assignments));
     if (!$scope && $root_scope) {
         # A tenant-scoped graph cannot reach a node whose tenant it cannot see.
@@ -1849,17 +1980,34 @@ sub _validate_graph_node {
         relationships => $edge->{relationships},
         tenant_scope  => $scope,
         domain        => $nested_domain,
+        operation     => $command->operation,
     }, $command);
 }
 
+# Portable relationship domains do not require a display name. The native
+# parser's name is descriptive only; take it from the actual declared source
+# without modifying the authored domain or inventing a relation/grant.
+sub _native_relationship_domain {
+    my ($raw)=@_;
+    return Selecto::Domain->parse($raw) if ref($raw) eq 'HASH' && exists($raw->{name});
+    my $copy=Selecto::Domain::QueryContract->copy_declaration({domain=>$raw})->{domain};
+    Selecto::Error->throw('invalid_domain','relationship domain must declare its native source relation')
+        unless ref($copy) eq 'HASH' && ref($copy->{source}) eq 'HASH'
+            && defined($copy->{source}{source_table}) && !ref($copy->{source}{source_table});
+    $copy->{name}=Selecto::Identifier::checked($copy->{source}{source_table});
+    return Selecto::Domain->parse($copy);
+}
+
 sub _match_relationship {
-    my (undef, $parent_context, $binding, $relation) = @_;
+    my (undef, $parent_context, $binding, $relation,$relationship_work) = @_;
     my $relationships = $parent_context->{relationships};
     return undef unless ref($relationships) eq 'HASH';
     my $chosen;
     for my $name (sort keys %$relationships) {
         my $spec = $relationships->{$name};
-        next unless ref($spec) eq 'HASH' && $spec->{writable};
+        next unless ref($spec) eq 'HASH';
+        my $policy=_relationship_policy($spec,$relationship_work);
+        next unless $policy->{writable};
         my $table = defined($spec->{table}) ? "$spec->{table}"
             : ref($spec->{domain}) eq 'HASH' && ref($spec->{domain}{source}) eq 'HASH'
                 ? "$spec->{domain}{source}{source_table}" : undef;
@@ -1869,10 +2017,12 @@ sub _match_relationship {
         next unless defined($child_key) && "$binding->{field}" eq $child_key;
         my $parent_key = defined($spec->{parent_key}) ? "$spec->{parent_key}" : $parent_context->{primary_key};
         next unless defined($parent_key) && "$binding->{key}" eq $parent_key;
+        Selecto::Error->throw('write_operation_not_enabled','nested parent insert requires declared relationship create permission')
+            if $policy->{modern} && ($parent_context->{operation}//'') eq 'insert' && !$policy->{semantic}{create};
         my $candidate = _relationship_context($spec, $table,
-            "$parent_context->{table}>$table/$child_key/$parent_key");
+            "$parent_context->{table}>$table/$child_key/$parent_key",$policy);
         Selecto::Error->throw(
-            'invalid_domain',
+            'unknown_field',
             'relationship parent_key is not declared by its parent domain',
             {relationship => $name, field => $parent_key},
         ) if $parent_context->{fields_known}
@@ -1908,7 +2058,7 @@ sub _same_contract {
 }
 
 sub _relationship_context {
-    my ($spec, $table, $edge_id) = @_;
+    my ($spec, $table, $edge_id,$policy) = @_;
     $spec //= {};
     if (exists($spec->{allowed_ops}) && defined($spec->{allowed_ops})) {
         Selecto::Error->throw('invalid_domain', 'relationship allowed_ops must be an array of operation names')
@@ -1918,6 +2068,10 @@ sub _relationship_context {
             } @{$spec->{allowed_ops}};
     }
     my $nested = ref($spec->{domain}) eq 'HASH' ? $spec->{domain} : {};
+    Selecto::Error->throw('write_relation_mismatch','relationship domain must own its actual native relation')
+        if ref($nested->{source}) eq 'HASH' && defined($nested->{source}{source_table})
+            && $nested->{source}{source_table} ne $table;
+    $policy//=_relationship_policy($spec);
     my $nested_writes = _checked_writes($nested->{writes});
     my $fields_known = ref($nested->{source}) eq 'HASH' && ref($nested->{source}{fields}) eq 'ARRAY';
     my $tenant_scope = Selecto::Write::Scope->parse_tenant(
@@ -1939,9 +2093,79 @@ sub _relationship_context {
         fields_known  => $fields_known,
         writes        => $nested_writes,
         relationships => $nested_writes->{relationships},
-        allowed_ops   => [map { "$_" } @{$spec->{allowed_ops} // []}],
+        allowed_ops   => $policy->{allowed_ops},
+        relationship_policy=>$policy,
         ($tenant_scope ? (tenant_scope => $tenant_scope) : ()),
     };
+}
+
+sub _relationship_flag {
+    my ($value)=@_;return 0 unless defined $value;
+    return $$value ? 1 : 0 if JSON::PP::is_bool($value);
+    Selecto::Error->throw('invalid_domain','relationship write grants must be explicit Booleans')
+        if defined(reftype($value)) || !(B::svref_2object(\$value)->FLAGS & B::SVf_IOK())
+            || ($value!=0 && $value!=1);
+    return $value==1 ? 1 : 0;
+}
+
+# This is a bridge from authored host declarations to physical operations,
+# not a grant carried by the compiled graph's informational metadata.
+sub _relationship_policy {
+    my ($spec,$work)=@_;
+    Selecto::Error->throw('invalid_domain','relationship must be an object') unless ref($spec) eq 'HASH';
+    ($work//Selecto::OperationBudget->new(code=>'invalid_domain'))->check_tree(
+        {map{exists($spec->{$_})?($_=>$spec->{$_}):()}qw(allowed_ops writable enabled ownership cardinality strategy delete_missing write)},
+        label=>'relationship policy work');
+    my $legacy=$spec->{allowed_ops}//[];
+    Selecto::Error->throw('invalid_domain','relationship allowed_ops must name native operations')
+        unless ref($legacy) eq 'ARRAY' && !grep { !defined($_) || ref($_) || $_ !~ /\A(?:insert|update|delete|upsert)\z/ } @$legacy;
+    my %legacy=map{$_=>1}@$legacy;
+    my $write=$spec->{write};
+    unless (defined $write) {
+        return {modern=>0,writable=>(_relationship_flag($spec->{writable})||_relationship_flag($spec->{enabled}))?1:0,allowed_ops=>[sort keys%legacy],
+            owned_sync=>(!defined(reftype($spec->{ownership})) && ($spec->{ownership}//'') =~ /\A(?:owned|composition)\z/
+                && !defined(reftype($spec->{strategy})) && ($spec->{strategy}//'') eq 'sync'
+                && _relationship_flag($spec->{delete_missing}) && $legacy{delete})?1:0};
+    }
+    Selecto::Error->throw('invalid_domain','relationship write policy must be an object') unless ref($write) eq 'HASH';
+    my $modes=$write->{modes}//[];
+    Selecto::Error->throw('invalid_domain','relationship mutation modes must be a declared list')
+        unless ref($modes) eq 'ARRAY' && !grep { !defined($_) || ref($_) || $_ !~ /\A(?:append_only|delta|full_set|replace_one|link_delta)\z/ } @$modes;
+    my %modes=map{$_=>1}@$modes;
+    Selecto::Error->throw('invalid_domain','relationship ownership and cardinality must be scalar names')
+        if defined(reftype($spec->{ownership})) || defined(reftype($spec->{cardinality}));
+    my $ownership=$spec->{ownership}//'';
+    $ownership={owned=>'composition',shared_reference=>'shared_association',join_only=>'join_association'}->{$ownership}//$ownership;
+    Selecto::Error->throw('invalid_domain','native relationship needs declared writable ownership and cardinality')
+        unless $ownership =~ /\A(?:composition|shared_association|join_association)\z/
+            && ($spec->{cardinality}//'') =~ /\A(?:one|many)\z/;
+    my %semantic=map {$_=>_relationship_flag($write->{$_})} qw(create update delete reorder link unlink);
+    $semantic{create}||=$legacy{insert}//0;$semantic{update}||=$legacy{update}//0;$semantic{delete}||=$legacy{delete}//0;
+    my $shared=$ownership ne 'composition';
+    Selecto::Error->throw('invalid_domain','relationship ownership cannot grant this mutation mode')
+        if $shared ? grep {$_ ne 'link_delta'} keys %modes : $modes{link_delta};
+    Selecto::Error->throw('invalid_domain','shared association policy cannot mutate target rows')
+        if $shared && grep {$semantic{$_}} qw(create update delete reorder);
+    Selecto::Error->throw('invalid_domain','composition policy cannot grant link mutations')
+        if !$shared && ($semantic{link} || $semantic{unlink});
+    Selecto::Error->throw('invalid_domain','relationship cardinality is incompatible with its mutation mode')
+        if ($spec->{cardinality} eq 'one' && ($modes{append_only} || $modes{full_set}))
+            || ($spec->{cardinality} eq 'many' && $modes{replace_one});
+    my %physical;
+    if ($shared) {
+        $physical{insert}=1 if $semantic{link};$physical{delete}=1 if $semantic{unlink};
+    } else {
+        $physical{insert}=1 if $semantic{create};
+        $physical{update}=1 if $semantic{update} && (!%modes || $modes{delta} || $modes{full_set} || $modes{replace_one});
+        $physical{delete}=1 if $semantic{delete} && (!%modes || $modes{delta} || $modes{replace_one});
+        $physical{upsert}=1 if $legacy{upsert};
+    }
+    my $delete_missing=($write->{omission}//'') eq 'delete_missing' || _relationship_flag($spec->{delete_missing});
+    my $full=$modes{full_set} || !%modes && ($spec->{strategy}//'') eq 'sync';
+    my $owned_sync=!$shared && $full && $delete_missing && $semantic{delete};
+    return {modern=>1,writable=>(_relationship_flag($spec->{writable})||_relationship_flag($spec->{enabled})||%modes)?1:0,
+        allowed_ops=>[sort keys%physical],semantic=>\%semantic,ownership=>$ownership,modes=>[sort keys%modes],owned_sync=>$owned_sync?1:0,
+        requires_owned_set=>($owned_sync && keys(%modes)==1 && $modes{full_set})?1:0};
 }
 
 1;
@@ -2000,6 +2224,7 @@ from a client.
       domain       => $domain,          # required, a Selecto::Domain
       adapter      => $adapter,         # required, a Selecto::Adapter
       scope        => {tenant => 42},   # optional trusted scope
+      write_context => {tenant_id => 42, account_id => 7}, # optional trusted host values
       write_policy => 'strict',         # optional; strict is the only write policy
       mode         => 'strict',         # optional read policy; default permissive
       domain_ref   => $ref,             # optional Selecto::Domain::Ref
@@ -2009,14 +2234,34 @@ C<scope> accepts only a C<tenant> key. When the domain has a C<tenant_field>,
 reads are restricted to that tenant, inserts receive it, and updates and
 deletes are confined to it (see L</TENANT SCOPE>).
 
+C<write_context> supplies bounded plain trusted values independently of write
+commands. Its tenant must agree with C<scope>; context-owned foreign keys are
+materialized and checked before normalization and field policy validation.
+The engine's private identity seals the entire context. C<write_context()>
+returns an independent snapshot; C<with_write_context($values)> creates a
+copy that can add equal or new obligations but cannot replace an identity.
+Trusted required filters become native write guards. A compiler's context or
+command metadata cannot supply this execution authority.
+
 C<write_policy> is always C<strict>: a domain must declare
 C<writes.operations> (with the operation enabled) and, for everything except
 deletes, C<writes.fields> before anything is written; otherwise writes fail
 with C<write_policy_missing>. A graph edge must declare its relationship
-domain and grants its operations through C<allowed_ops>. The argument may be
+domain and grants its operations through C<allowed_ops> or explicit modern
+C<write> grants and mutation modes. Composition and membership operations are
+checked against their actual ownership, child relation and native operation;
+informational graph metadata grants nothing. The argument may be
 omitted or given as C<strict>; any other value, including the removed
 C<permissive> policy, throws C<invalid_write_policy>. There is no mode that
 writes a domain without a declared write policy.
+
+Ordinary C<execute_batch($batch)> keeps this engine's single-domain boundary.
+A trusted host may use C<execute_batch($batch, engines =E<gt> \@engines)> for
+multiple configured domains. Each member requires its own real engine, the
+identical adapter and equal canonical write context. Every member is governed
+before capability discovery or mutation, then the complete native batch is
+authorized once. Protected stored deltas still require a whole-plan candidate
+provider and fail closed when one is unavailable.
 
 C<mode> is C<permissive> by default. C<strict> admits declared associations and
 named query members, and refuses ad-hoc row sources before dispatch. It does

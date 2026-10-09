@@ -1274,6 +1274,19 @@ sub execute_graph_unsafe {
             }
         }
         my $root = $graph->nodes->[0]{id};
+        # Generated keys remain available until every binding and owned-set
+        # cleanup has finished. Only then apply the separately governed public
+        # projection; graph metadata never controls result visibility.
+        for my $node (@{$graph->nodes}) {
+            my $returning=$graph->public_returning($node->{id});
+            next unless defined $returning; # Preserve legacy absent intent.
+            my $result=$results{$node->{id}};
+            my $values=$result->values;
+            $results{$node->{id}}=Selecto::Write::Result->new(
+                operation=>$result->operation,affected_rows=>$result->affected_rows,
+                values=>{map { exists($values->{$_}) ? ($_=>$values->{$_}) : () } @$returning},
+                metadata=>$result->metadata);
+        }
         return Selecto::Write::Graph::Result->new(nodes => \%results, root => $results{$root},
             metadata => {owned_sync => scalar(@cleanup), cleanup_affected_rows =>
                 [map { $_->affected_rows } @cleanup]});
@@ -2464,18 +2477,19 @@ sub _compile_foreign_key_guards {
     my $alias = $self->quote_identifier('selecto_fk_parent');
     return join ' AND ', map {
         my $guard = $_;
-        Selecto::Error->throw('invalid_write', 'foreign-key guard must name its parent and tenants')
+        Selecto::Error->throw('invalid_write', 'foreign-key guard must name its parent and literal value')
             unless ref($guard) eq 'HASH' && defined($guard->{value}) && !ref($guard->{value})
-                && ref($guard->{tenants}) eq 'ARRAY' && @{$guard->{tenants}}
-                && !grep { !defined($_) || ref($_) } @{$guard->{tenants}};
+                && (!exists($guard->{tenant_field}) && !exists($guard->{tenants})
+                    || defined($guard->{tenant_field}) && ref($guard->{tenants}) eq 'ARRAY'
+                        && @{$guard->{tenants}} && !grep { !defined($_) || ref($_) } @{$guard->{tenants}});
         push @$params, $guard->{value};
         my $value = $self->placeholder(scalar @$params);
-        my @tenants = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$guard->{tenants}};
+        my @tenants = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$guard->{tenants}//[]};
         $self->_foreign_key_exists_sql(
             'SELECT 1 FROM ' . $self->quote_identifier(Selecto::Identifier::checked($guard->{relation})) . " AS $alias"
             . " WHERE $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{target_field})) . " = $value"
-            . " AND $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{tenant_field}))
-            . (@tenants == 1 ? " = $tenants[0]" : ' IN (' . join(', ', @tenants) . ')'),
+            . (@tenants ? " AND $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{tenant_field}))
+                . (@tenants == 1 ? " = $tenants[0]" : ' IN (' . join(', ', @tenants) . ')') : ''),
         );
     } @guards;
 }

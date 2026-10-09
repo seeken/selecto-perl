@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Compile sealed portable operations through trusted tenant/context fills,
+      native foreign-key guards, required/captured query predicates and SQLite
+      typed insert admission. Preserve nested generated-key ownership and named
+      atomic batches across explicitly configured domains. Keep internal graph
+      identity keys separate from public returning ceilings. Refuse authored
+      document action policies until their full native mutation path exists.
+    - Verify the complete six portable write models through production APIs,
+      and expose genuine private planned-operation authorization/execution.
     - Validate the complete bounded portable write contract and expose sealed
       authored operation snapshots. Keep declarations separate from grants.
     - Preflight versioned native write capabilities before dispatch, preserving

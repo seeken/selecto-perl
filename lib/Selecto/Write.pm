@@ -134,16 +134,26 @@ package Selecto::Write::Graph;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed reftype);
+use Hash::Util::FieldHash qw(fieldhash);
 use Selecto::Error ();
+
+# Original caller result intent is kept outside mutable graph metadata. Generated
+# binding keys may be added to native commands, but governance rechecks this
+# original intent and result projection never grants execution authority.
+fieldhash my %PUBLIC_RETURNING;
 
 sub new {
     my ($class, %args) = @_;
+    require Selecto::Domain::QueryContract;
+    my $metadata = Selecto::Domain::QueryContract->copy_declaration({value => $args{metadata} // {}})->{value};
+    Selecto::Error->throw('invalid_write_graph', 'graph metadata must be bounded plain informational data')
+        unless ref($metadata) eq 'HASH';
     my $nodes = $args{nodes};
     Selecto::Error->throw('invalid_write_graph', 'graph nodes must be a non-empty array')
         unless ref($nodes) eq 'ARRAY' && @$nodes && @$nodes <= 1000;
 
-    my (%seen, %required_returning, %required_returning_seen);
+    my (%seen, %required_returning, %required_returning_seen, %public_returning);
     my @normalized;
     for my $index (0 .. $#$nodes) {
         my $node_spec = $nodes->[$index];
@@ -196,6 +206,10 @@ sub new {
             }
             { field => $field, from => $from, key => $key, (defined($scope_field) ? (scope_field => $scope_field) : ()) };
         } @$bindings;
+        my $original_returning = $node_spec->{command}->metadata;
+        $public_returning{$id} = exists($original_returning->{returning})
+            ? Selecto::Domain::QueryContract->copy_declaration({value => $original_returning->{returning}})->{value}
+            : undef;
         push @normalized, {
             id => $id,
             command => $node_spec->{command},
@@ -248,7 +262,35 @@ sub new {
         push @sets, {parent => "$parent", relationship => "$relationship",
             nodes => [@{$set->{nodes}}], delete_missing => 1};
     }
-    return bless { nodes => \@normalized, owned_sets => \@sets }, $class;
+    my $self = bless { nodes => \@normalized, owned_sets => \@sets, metadata => $metadata }, $class;
+    $PUBLIC_RETURNING{$self} = \%public_returning;
+    return $self;
+}
+
+sub public_returning {
+    my ($self, $id) = @_;
+    Selecto::Error->throw('invalid_write_graph', 'public returning requires a constructed graph and declared node')
+        unless exists($PUBLIC_RETURNING{$self}) && defined($id) && !defined(reftype($id))
+            && exists($PUBLIC_RETURNING{$self}{$id});
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->copy_declaration({value => $PUBLIC_RETURNING{$self}{$id}})->{value};
+}
+
+sub metadata {
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->copy_declaration({value => $_[0]->{metadata} // {}})->{value};
+}
+sub validate {
+    my ($self) = @_;
+    my $nodes = $self->nodes;
+    for my $node (@$nodes) {
+        my $metadata = $node->{command}->metadata;
+        my $returning = $self->public_returning($node->{id});
+        if (defined($returning)) { $metadata->{returning} = $returning }
+        else { delete $metadata->{returning} }
+        $node->{command} = $node->{command}->with_metadata($metadata);
+    }
+    return __PACKAGE__->new(nodes => $nodes, owned_sets => $self->owned_sets, metadata => $self->metadata);
 }
 
 sub owned_sets {
@@ -279,7 +321,17 @@ use 5.034;
 use strict;
 use warnings;
 
-sub new { my ($class, %args) = @_; return bless { %args }, $class; }
+sub new {
+    my ($class, %args) = @_;
+    require Selecto::Domain::QueryContract;
+    my $metadata = Selecto::Domain::QueryContract->copy_declaration({value => $args{metadata} // {}})->{value};
+    Selecto::Error->throw('invalid_write', 'result metadata must be a bounded plain object') unless ref($metadata) eq 'HASH';
+    return bless { %args, metadata => $metadata }, $class;
+}
+sub metadata {
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->copy_declaration({value => $_[0]->{metadata} // {}})->{value};
+}
 sub operation { return $_[0]->{operation}; }
 sub affected_rows { return $_[0]->{affected_rows}; }
 sub values { return { %{$_[0]->{values} // {}} }; }
@@ -287,6 +339,7 @@ sub to_hash {
     my ($self) = @_;
     my $value = { operation => $self->{operation}, affected_rows => $self->{affected_rows} };
     $value->{values} = $self->values if keys %{$self->{values} // {}};
+    $value->{metadata} = $self->metadata if keys %{$self->{metadata} // {}};
     return $value;
 }
 

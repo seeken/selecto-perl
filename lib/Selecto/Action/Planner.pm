@@ -3,6 +3,7 @@ package Selecto::Action::Planner;
 use 5.034;
 use strict;
 use warnings;
+use bytes ();
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
@@ -44,6 +45,84 @@ sub _accepted_plan {
     return 1;
 }
 
+# Native accepted plans can contain fixed first-party expression objects, so
+# the plain metadata copier is not their admission boundary. Check every tie
+# and slot before fetching, then bound occurrences, depth and bytes before any
+# cloning or digest method. Keep this new boundary local to action provenance.
+sub _admit_provenance_tree {
+    my ($class, $tree, $allow_limits) = @_;
+    my ($nodes, $bytes) = (1, 0);
+    my (%active, @stack);
+    push @stack, [$tree, 0, undef];
+    my $fail = sub { Selecto::Error->throw('invalid_planned_operation',
+        'accepted action plan contains unsupported or excessive native data',
+        {code => 'invalid_planned_operation'}) };
+    while (@stack) {
+        my ($node, $depth, $leave) = @{pop @stack};
+        if (defined $leave) { delete $active{$leave}; next }
+        $fail->() if $depth > 64 || $nodes > 10_000 || $bytes > 131_072;
+        my $type = Scalar::Util::reftype($node);
+        if (!defined $type) {
+            $bytes += defined($node) ? bytes::length($node) : 0;
+            $fail->() if $bytes > 131_072;
+            next;
+        }
+        my $native_class = Scalar::Util::blessed($node);
+        if (defined($native_class) && $native_class eq 'JSON::PP::Boolean') {
+            $fail->() unless $type eq 'SCALAR' && !defined(tied($$node));
+            my $value = $$node;
+            $fail->() unless defined($value) && !defined(Scalar::Util::reftype($value)) && ($value eq '0' || $value eq '1');
+            ++$bytes;
+            $fail->() if $bytes > 131_072;
+            next;
+        }
+        $fail->() if defined($native_class) && $native_class ne 'Selecto::Action::Plan'
+            && $native_class ne 'Selecto::Write::Expression'
+            && !($allow_limits && $native_class eq 'Selecto::Limits');
+        $fail->() unless $type eq 'HASH' || $type eq 'ARRAY';
+        $fail->() if defined($native_class) && $type ne 'HASH';
+        if ($type eq 'HASH') { $fail->() if defined(tied(%$node)) }
+        else { $fail->() if defined(tied(@$node)) }
+        my $id = Scalar::Util::refaddr($node);
+        $fail->() if $active{$id};
+        $active{$id} = 1;
+        push @stack, [undef, 0, $id];
+        my $count = $type eq 'HASH' ? scalar(keys %$node) : scalar(@$node);
+        $nodes += $count;
+        $fail->() if $nodes > 10_000;
+        if ($type eq 'HASH') {
+            for my $key (keys %$node) {
+                $bytes += bytes::length($key);
+                $fail->() if $bytes > 131_072 || defined(tied($node->{$key}));
+                push @stack, [$node->{$key}, $depth + 1, undef];
+            }
+        } else {
+            for my $index (0 .. $#$node) {
+                $fail->() if defined(tied($node->[$index]));
+                push @stack, [$node->[$index], $depth + 1, undef];
+            }
+        }
+    }
+    return 1;
+}
+
+# Public provenance boundary for a previously accepted planning result. A
+# caller may inspect or serialize a plan, but cannot manufacture planning proof.
+sub validate_provenance {
+    my ($class, $plan) = @_;
+    Selecto::Error->throw('invalid_planned_operation', 'an original accepted action plan is required',
+        {code => 'invalid_planned_operation'})
+        unless (Scalar::Util::blessed($plan) // '') eq 'Selecto::Action::Plan'
+            && (Scalar::Util::reftype($plan) // '') eq 'HASH'
+            && !defined(tied(%$plan)) && exists($ACCEPTED_PLANS{$plan});
+    $class->_admit_provenance_tree($plan);
+    my $record = $ACCEPTED_PLANS{$plan};
+    Selecto::Error->throw('action_policy_mismatch', 'action plan differs from its accepted planning evidence',
+        {code => 'action_policy_mismatch', native_code => 'action_plan_mismatch'})
+        unless $record->{digest} eq Selecto::Action::Grant->plan_digest($plan);
+    return 1;
+}
+
 sub _accepted_proof_work {
     my ($class, $plan) = @_;
     my $record = blessed($plan) && $plan->isa('Selecto::Action::Plan') ? $ACCEPTED_PLANS{$plan} : undef;
@@ -69,6 +148,11 @@ sub _plan {
     my ($execution_case, $selected_execution) = _select_execution_case($execution, $inputs);
     $execution = $selected_execution;
     _object($execution, 'action execution');
+    # Document mutation declarations carry their own release, path, version
+    # and idempotency authority. This native protocol cannot compile them;
+    # never drop the declaration and execute only its ordinary assignments.
+    Selecto::Error->throw('unsupported_document_action', 'document action compilation is not supported')
+        if exists $execution->{document};
     Selecto::Error->throw('unsupported_action_executor', 'action execution must use the updato executor')
         unless _id($execution->{kind}) eq 'updato';
     my $operation = _id($execution->{operation});
@@ -80,7 +164,12 @@ sub _plan {
     Selecto::Error->throw('action_operation_not_enabled', 'action operation is not enabled by the write contract')
         unless ref($operation_spec) eq 'HASH' && $operation_spec->{enabled};
 
-    my $rules = defined($contract->{rules}) ? Selecto::DataRules->parse($contract->{rules}) : undef;
+    # The public write projection represents an absent rule registry as {}.
+    # It carries no definitions or bindings. Nonempty declarations retain the
+    # strict versioned native data-rules parser and its actual evaluation.
+    my $raw_rules = $contract->{rules};
+    my $rules = defined($raw_rules) && !(ref($raw_rules) eq 'HASH' && !keys(%$raw_rules))
+        ? Selecto::DataRules->parse($raw_rules) : undef;
     if ($rules) {
         my $display = _display_values($inputs);
         my $normalized = Selecto::WriteRules->evaluate($rules, 'action_input', $operation, $inputs, action => $action_id);
