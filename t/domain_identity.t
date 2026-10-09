@@ -66,6 +66,30 @@ $broken = dclone($base); $broken->{source}{primary_key} = 'missing';
 is(Selecto::Domain->validate_identity($broken)->{diagnostics}{errors}[0]{code}, 'primary_key_not_found', 'primary key must be among fields');
 $broken = dclone($base); $broken->{source}{columns}{id} = [];
 is(Selecto::Domain->validate_identity($broken)->{diagnostics}{errors}[0]{code}, 'invalid_column_definition', 'column shape rejects');
+my $schema = {primary_key => 'key', fields => [qw(key label)],
+    columns => {key => {type => 'integer'}, label => {type => 'string'}},
+    values => [{key => 1, label => 'one'}, {key => 2, label => undef}, {key => 3, label => JSON::PP::false}]};
+ok(Selecto::Domain->validate_identity({%$base, schemas => {lookup => $schema}})->{ok},
+    'scalar VALUES schema identity validates, including null and booleans');
+my $table_schema = dclone($schema); delete $table_schema->{values}; $table_schema->{source_table} = '';
+ok(Selecto::Domain->validate_identity({%$base, schemas => {lookup => $table_schema}})->{ok},
+    'canonical empty binary source_table remains allowed');
+for my $kind (qw(neither both)) {
+    my $relation = dclone($schema);
+    if ($kind eq 'neither') { delete $relation->{values} } else { $relation->{source_table} = 'lookup' }
+    my $result = Selecto::Domain->validate_identity({%$base, schemas => {lookup => $relation}});
+    ok(!$result->{ok}, "$kind schema source identity rejects");
+    is($result->{diagnostics}{errors}[0]{code}, 'invalid_relation_source', "$kind has stable source-kind diagnostics");
+}
+for my $rows (undef, [], {}, [undef], [{key => 1}], [{key => 1, label => 'one', extra => 2}],
+    [{key => 1, label => []}], [{key => 1, label => {nested => 'value'}}], [{key => 1, label => sub {die 'not executed'}}]) {
+    my $relation = {%$schema, values => $rows};
+    my $result = Selecto::Domain->validate_identity({%$base, schemas => {lookup => $relation}});
+    ok(!$result->{ok}, 'malformed VALUES rows reject');
+    like($result->{diagnostics}{errors}[0]{code}, qr/\Ainvalid_relation_values(?:_row)?\z/, 'VALUES failure is structured');
+}
+my $empty_fields = {%$schema, fields => []};
+ok(!Selecto::Domain->validate_identity({%$base, schemas => {lookup => $empty_fields}})->{ok}, 'VALUES requires declared fields');
 my $before = dclone($fixtures->{D011});
 my $composed = Selecto::Domain->compose_identity($fixtures->{D011}{base}, $fixtures->{D011}{overlays});
 ok($composed->{ok}, 'original identity overlay composition succeeds');
