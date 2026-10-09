@@ -1219,6 +1219,8 @@ sub _compile_expression {
     }
     my $kind = $expression->kind;
     my $arguments = $expression->arguments;
+    Selecto::Error->throw('raw_sql_forbidden', 'raw SQL is outside governed expressions', {path => []})
+        if $kind eq 'raw_sql';
     return $self->_field_sql($domain, $arguments->[0], $params) if $kind eq 'field';
     if ($kind eq 'recursion_depth') {
         # Internal level counter of a depth-bounded recursive CTE.
