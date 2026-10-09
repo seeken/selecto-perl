@@ -18,7 +18,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions imports editors extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
-    query_library co_domains domain_dependencies operations experiences rules
+    query_library co_domains domain_dependencies operations experiences rules tenant_required require_tenant
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields fts5_index);
 my %RELATION = map { $_ => 1 } qw(
@@ -61,6 +61,11 @@ sub new {
 # Canonical parsing attaches its full schema graph before library validation.
 sub _construct {
     my ($class, %args) = @_;
+    require Selecto::Tenant::Context;
+    my $tenant_required = Selecto::Tenant::Context->boolean($args{tenant_required} // $args{require_tenant} // 0, 'domain tenant_required');
+    Selecto::Error->throw('invalid_tenant_context', 'domain requirement aliases conflict')
+        if defined($args{tenant_required}) && defined($args{require_tenant})
+            && $tenant_required != Selecto::Tenant::Context->boolean($args{require_tenant}, 'domain require_tenant');
     my $fields = _normalize_fields($args{fields}, 'fields');
     my %associations;
     my $input = $args{associations} // {};
@@ -92,6 +97,7 @@ sub _construct {
         fts5_index   => _normalize_fts5_index($args{fts5_index}),
         required_predicate => $args{required_predicate},
         tenant_field => $args{tenant_field},
+        tenant_required => $tenant_required,
     }, $class;
     $self->{primary_key} = _identifier(
         $args{primary_key} // (exists($fields->{id}) ? 'id' : (sort keys %$fields)[0]),
@@ -183,6 +189,7 @@ sub _refresh_fingerprint {
         if keys %{$self->{detail_actions}};
     # Derived domains keep the governed write surface of their contract.
     my $contract = $self->{contract};
+    $fingerprint_value->{tenant_required} = 1 if $self->{tenant_required};
     if (ref($contract) eq 'HASH') {
         for my $key (qw(writes actions capabilities choice_sources query_members)) {
             $fingerprint_value->{$key} = $contract->{$key} if defined $contract->{$key};
@@ -272,6 +279,14 @@ sub parse {
             unless $ok;
     }
     _object($raw, 'domain');
+    require Selecto::Tenant::Context;
+    Selecto::Error->throw('invalid_query_contract', 'domain read requirement must be plain metadata')
+        if defined(tied(%$raw)) || grep { exists($raw->{$_}) && defined(tied($raw->{$_})) } qw(tenant_required require_tenant);
+    Selecto::Tenant::Context->boolean($raw->{$_}, "domain $_") for grep { defined $raw->{$_} } qw(tenant_required require_tenant);
+    Selecto::Error->throw('invalid_tenant_context', 'domain requirement aliases conflict')
+        if defined($raw->{tenant_required}) && defined($raw->{require_tenant})
+            && Selecto::Tenant::Context->boolean($raw->{tenant_required}, 'domain tenant_required')
+                != Selecto::Tenant::Context->boolean($raw->{require_tenant}, 'domain require_tenant');
     if (defined($raw->{query_library})) {
         require Selecto::ConfiguredDomain;
         Selecto::ConfiguredDomain->admit_library($raw->{query_library});
@@ -303,6 +318,7 @@ sub parse {
         experiences => $raw->{experiences},
         detail_actions => $raw->{detail_actions},
         rules => $raw->{rules},
+        tenant_required => $raw->{tenant_required} // $raw->{require_tenant},
     );
     return _apply_required_filters($domain, $raw->{required_filters});
 }
@@ -341,6 +357,7 @@ sub _parse_canonical {
         primary_key => $source->{primary_key} // 'id',
         fts5_index => $source->{fts5_index},
         tenant_field => $source->{tenant_field},
+        tenant_required => $raw->{tenant_required} // $raw->{require_tenant},
         components => $raw->{components},
         query_library => $raw->{query_library},
         co_domains => $raw->{co_domains},
@@ -2342,6 +2359,7 @@ sub fingerprint  { return $_[0]->{fingerprint}; }
 sub primary_key  { return $_[0]->{primary_key}; }
 sub required_predicate { return $_[0]->{required_predicate}; }
 sub tenant_field { return $_[0]->{tenant_field}; }
+sub tenant_required { return $_[0]->{tenant_required} // 0; }
 sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
 # The contract itself, for library code that only reads it; never modify it.
 sub _contract_view { return $_[0]->{contract}; }

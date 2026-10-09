@@ -321,7 +321,8 @@ sub _compile_single {
     push @joins, @{$self->_compile_array_rowsets($domain, $query, \@params)};
     push @joins, @{$options{extra_joins} // []};
     my $sql = 'SELECT ' . join(', ', @selection_sql) .
-        ' FROM ' . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier($self->_root_alias);
+        ' FROM ' . (defined($domain->{_read_prefix}) ? $self->quote_identifier($domain->{_read_prefix}) . '.' : '')
+            . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier($self->_root_alias);
     $sql .= ' ' . join(' ', @joins) if @joins;
     my @predicates;
     push @predicates, $self->_compile_expression($domain, $predicate, \@params) if $predicate;
