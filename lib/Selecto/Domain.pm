@@ -20,7 +20,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
     query_library co_domains domain_dependencies operations experiences rules
 );
-my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
+my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields fts5_index);
 my %RELATION = map { $_ => 1 } qw(
     source_table values primary_key fields columns associations tenant_field redact_fields
 );
@@ -89,6 +89,7 @@ sub _construct {
         detail_actions => {},
         rules        => undef,
         primary_key  => undef,
+        fts5_index   => _normalize_fts5_index($args{fts5_index}),
         required_predicate => $args{required_predicate},
         tenant_field => $args{tenant_field},
     }, $class;
@@ -167,6 +168,7 @@ sub _refresh_fingerprint {
         tenant_field => $self->{tenant_field},
     };
     $fingerprint_value->{components} = $self->{components} if keys %{$self->{components}};
+    $fingerprint_value->{fts5_index} = $self->{fts5_index} if defined $self->{fts5_index};
     $fingerprint_value->{query_library} = $self->{query_library}
         if keys %{$self->{query_library}};
     $fingerprint_value->{co_domains} = $self->{co_domains}
@@ -277,6 +279,7 @@ sub parse {
     _reject_unknown($raw, \%TOP_LEVEL, 'domain') if $strict;
     _required_key($raw, 'source', 'domain');
     _object($raw->{source}, 'source');
+    _normalize_fts5_index($raw->{source}{fts5_index}) if defined $raw->{source}{fts5_index};
 
     if (exists $raw->{source}{source_table}) {
         return $class->_parse_canonical($raw, $raw->{source}, $strict);
@@ -290,6 +293,7 @@ sub parse {
         name => $raw->{name},
         table => $raw->{source}{table},
         fields => $raw->{source}{fields},
+        fts5_index => $raw->{source}{fts5_index},
         associations => $raw->{associations} // {},
         components => $raw->{components},
         query_library => $raw->{query_library},
@@ -307,7 +311,7 @@ sub _parse_canonical {
     my ($class, $raw, $source, $strict) = @_;
     $raw = dclone($raw);
     $source = $raw->{source};
-    _reject_unknown($source, \%RELATION, 'source') if $strict;
+    _reject_unknown($source, {%RELATION, fts5_index => 1}, 'source') if $strict;
     Selecto::Error->throw(
         'invalid_domain', 'root source must use source_table rather than values',
     ) if exists $source->{values};
@@ -335,6 +339,7 @@ sub _parse_canonical {
         fields => _canonical_fields($source),
         associations => $associations,
         primary_key => $source->{primary_key} // 'id',
+        fts5_index => $source->{fts5_index},
         tenant_field => $source->{tenant_field},
         components => $raw->{components},
         query_library => $raw->{query_library},
@@ -1178,6 +1183,7 @@ sub as_contract {
             fields => [sort keys %{$self->{fields}}],
             columns => \%columns,
             associations => $source_associations,
+            (defined($self->{fts5_index}) ? (fts5_index => {%{$self->{fts5_index}}}) : ()),
             (defined($self->{tenant_field}) ? (tenant_field => $self->{tenant_field}) : ()),
         },
         schemas => \%schemas,
@@ -2315,6 +2321,21 @@ sub _identifier {
 
 sub name         { return $_[0]->{name}; }
 sub table        { return $_[0]->{table}; }
+sub fts5_index   {
+    my $index = $_[0]->{fts5_index};
+    return undef unless defined $index;
+    return _normalize_fts5_index($index);
+}
+
+sub _normalize_fts5_index {
+    my ($value) = @_;
+    return undef unless defined $value;
+    require Selecto::ConfiguredDomain;
+    Selecto::ConfiguredDomain->admit_library($value);
+    _object($value, 'source fts5_index');
+    _reject_unknown($value, {table => 1, key => 1}, 'source fts5_index');
+    return {map { $_ => _identifier($value->{$_}, "source fts5_index $_") } qw(table key)};
+}
 sub fields       { return { %{$_[0]->{fields}} }; }
 sub associations { return { %{$_[0]->{associations}} }; }
 sub fingerprint  { return $_[0]->{fingerprint}; }
@@ -2761,6 +2782,12 @@ written through an engine or hosted by L<Selecto::API>.
   {name => 'Items', source => {table => 'items', fields => {id => 'integer'}}}
 
 A compact JSON form equivalent to the constructor form.
+
+SQLite ordinary-table search may declare C<source.fts5_index> as
+C<{table =E<gt> 'items_search', key =E<gt> 'id'}>. The constructor accepts the
+same C<fts5_index> argument. It names a host-maintained external-content FTS5
+index; the adapter verifies native main-table, rowid-key and text-column
+identity on the connected handle before compiling a search.
 
 =item Constructor form (L</new>)
 

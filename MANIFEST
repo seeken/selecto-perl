@@ -226,3 +226,5 @@ lib/Selecto/Domain/QueryContract.pm
 t/fixtures/query_policy.json
 t/domain_query_contract.t
 t/sqlite_query_policy.t
+lib/Selecto/SQLite/FtsIndex.pm
+t/sqlite_fts_external.integration.t

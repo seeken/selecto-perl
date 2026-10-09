@@ -43,6 +43,7 @@ sub assert_contract ($self) {
 sub feature_inventory ($self) { return []; }
 sub write_capabilities ($self) { return {}; }
 sub supports ($self, $feature) { return 0; }
+sub text_search_rank_direction ($self) { return 'desc'; }
 sub capability ($self, $feature) { return { supported => $self->supports($feature) ? 1 : 0 }; }
 
 sub normalize_execution_result ($self, $result) {
