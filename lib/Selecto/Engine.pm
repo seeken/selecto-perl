@@ -5,11 +5,9 @@ use strict;
 use warnings;
 use JSON::PP ();
 use Time::HiRes ();
-use Storable ();
 use B ();
 use Scalar::Util qw(blessed refaddr reftype);
 use Hash::Util::FieldHash qw(fieldhash);
-use Digest::SHA qw(sha256_hex);
 use Selecto::Domain ();
 use Selecto::Domain::Ref ();
 use Selecto::Domain::Registry ();
@@ -80,8 +78,16 @@ sub _action_command_digest {
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_write')->check_tree(
         $state, label => 'accepted action command',
         allowed_classes => [qw(Selecto::Expression Selecto::Write::Expression Selecto::QueryEnforcement)]);
-    local $Storable::canonical = 1;
-    return sha256_hex(Storable::nfreeze($state));
+    # Serializing the live records with Storable can add an integer cache to
+    # a delivered NV (notably 1.0), changing later legacy-rule admission.
+    # This bounded identity inspects native records without rewriting them.
+    my $digest = eval { Selecto::Write::PortableCommand::_receipt_digest($state) };
+    if (my $error = $@) {
+        Selecto::Error->throw('invalid_write', 'accepted action command identity is invalid')
+            if ref($error) eq 'Selecto::Error' && $error->code eq 'compiled_input_mismatch';
+        die $error;
+    }
+    return $digest;
 }
 
 sub _accepted_command_work {
@@ -1447,7 +1453,8 @@ sub _validate_selected_action {
     return 1 if Selecto::Action::Planner->_accepted_plan($self->{domain}, $plan);
     Selecto::Error->throw('required_data_rule_pending', 'ACTION_INPUT requires an original accepted plan')
         if $self->{domain}->rules && @{$self->{domain}->rules->applicable_paths('action_input', $plan->operation, $plan->action)};
-    my $inputs = Storable::dclone($plan->inputs // {});
+    my $inputs = Selecto::Action::Planner->_copy_values($plan->inputs // {},
+        limits => $self->limits, code => 'invalid_action_plan');
     my $action = $self->domain->actions->{$plan->action};
     for my $declared ($action->{inputs} // {},
         Selecto::Action::Planner->input_form($action, $inputs)->{inputs}) {

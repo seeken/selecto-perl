@@ -7,6 +7,8 @@ use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Domain ();
+use Selecto::DataRules ();
+use Selecto::Limits ();
 use Selecto::Error ();
 
 my %MAP_SECTION = map { $_ => 1 } qw(
@@ -81,7 +83,7 @@ sub _overlay_fragment {
         {overlay_index => $index, actual => _value_type($value)},
     ) unless ref($value) eq 'HASH';
     _validate_section_shapes($value, $index);
-    return dclone($value);
+    return Selecto::Domain::_clone_with_rules($value);
 }
 
 sub _validate_section_shapes {
@@ -140,7 +142,7 @@ sub _validate_section_shapes {
 
 sub _merge_domain_maps {
     my ($base, $overlay) = @_;
-    my $result = dclone($base);
+    my $result = Selecto::Domain::_clone_with_rules($base);
     for my $key (sort keys %$overlay) {
         my $base_value = $result->{$key};
         my $overlay_value = $overlay->{$key};
@@ -162,12 +164,12 @@ sub _merge_section_value {
     if ($MAP_SECTION{$section} && ref($base) eq 'HASH' && ref($overlay) eq 'HASH') {
         return _deep_merge($base, $overlay, $path);
     }
-    return _clone($overlay);
+    return _clone($overlay, $path);
 }
 
 sub _deep_merge {
     my ($base, $overlay, $path) = @_;
-    my $result = dclone($base);
+    my $result = _clone($base, $path);
     for my $key (sort keys %$overlay) {
         my @next_path = (@$path, $key);
         if (@next_path == 2 && $next_path[0] eq 'source' && $next_path[1] eq 'redact_fields'
@@ -176,7 +178,7 @@ sub _deep_merge {
         } elsif (ref($result->{$key}) eq 'HASH' && ref($overlay->{$key}) eq 'HASH') {
             $result->{$key} = _deep_merge($result->{$key}, $overlay->{$key}, \@next_path);
         } else {
-            $result->{$key} = _clone($overlay->{$key});
+            $result->{$key} = _clone($overlay->{$key}, \@next_path);
         }
     }
     return $result;
@@ -221,7 +223,10 @@ sub _value_type {
 }
 
 sub _clone {
-    my ($value) = @_;
+    my ($value, $path) = @_;
+    return Selecto::DataRules::_copy_plain($value, Selecto::Limits->new,
+        'invalid_domain_overlay', 'policy overlay')
+        if $path && ($path->[0] eq 'rules' || $path->[0] eq 'writes' || $path->[0] eq 'actions');
     return ref($value) ? dclone($value) : $value;
 }
 

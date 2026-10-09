@@ -6,11 +6,11 @@ use warnings;
 use bytes ();
 use JSON::PP ();
 use Scalar::Util qw(blessed);
-use Storable qw(dclone);
 use Selecto::Action::Plan ();
 use Selecto::Domain ();
 use Selecto::Error ();
 use Selecto::Limits ();
+use Selecto::OperationBudget ();
 use Selecto::Write::ConflictTarget ();
 use Selecto::Write::Expression ();
 use Selecto::WriteRules ();
@@ -21,6 +21,39 @@ use Hash::Util::FieldHash qw(fieldhash);
 # Object identity owns accepted planning evidence. Serialized plans and caller
 # hash fields cannot assert that ACTION_INPUT has already been normalized.
 fieldhash my %ACCEPTED_PLANS;
+
+# Genuine plans contain display values rather than executable template
+# instructions. Preserve those submitted scalars before any serialization.
+# Legacy native expression records remain a narrowly admitted first-party
+# case, with no constructor, subclass or caller method invoked while copying.
+sub _copy_values {
+    Selecto::Error->throw('invalid_action_input', 'action values contain tied metadata')
+        if grep { defined(tied($_[$_])) } 0 .. $#_;
+    my ($class, $value, %options) = @_;
+    my $limits = _limits($options{limits});
+    my $code = $options{code} // 'invalid_action_input';
+    my $copy = eval { Selecto::DataRules::_copy_plain($value, $limits, $code, 'action values') };
+    return $copy unless $@;
+    my $error = $@;
+    die $error unless ref($error) eq 'Selecto::Error'
+        && $error->message eq 'action values contains an unsupported reference';
+    $class->_admit_provenance_tree($value);
+    Selecto::OperationBudget->new(limits => $limits, code => $code)->check_tree($value,
+        label => 'action values', allowed_classes => ['Selecto::Write::Expression']);
+    no overloading;
+    my $clone;
+    $clone = sub {
+        my ($node) = @_;
+        my $type = Scalar::Util::reftype($node);
+        return Selecto::DataRules::_copy_plain($node, $limits, $code, 'action scalar')
+            if !defined($type) || (Scalar::Util::blessed($node) // '') eq 'JSON::PP::Boolean';
+        return [map { $clone->($_) } @$node] if $type eq 'ARRAY';
+        my $result = {map { $_ => $clone->($node->{$_}) } keys %$node};
+        return (Scalar::Util::blessed($node) // '') eq 'Selecto::Write::Expression'
+            ? bless($result, 'Selecto::Write::Expression') : $result;
+    };
+    return $clone->($value);
+}
 
 sub plan {
     my ($class, $input, $intent, %options) = @_;
@@ -376,7 +409,7 @@ sub _declared_preconditions {
         Selecto::Error->throw('invalid_action_precondition_value', 'IN requires a non-empty list')
             if $comparator eq 'in' && (ref($value) ne 'ARRAY' || !@$value);
         push @result, {type => 'filter', field => $field, comparator => $comparator,
-            value => ref($value) ? dclone($value) : $value, reason => 'action_precondition'};
+            value => _clone($value), reason => 'action_precondition'};
     }
     return \@result;
 }
@@ -440,7 +473,7 @@ sub _select_execution_case {
     my ($execution, $inputs) = @_;
     _object($execution, 'action execution');
     my $cases = $execution->{cases};
-    return (undef, dclone($execution)) unless defined $cases;
+    return (undef, _clone($execution)) unless defined $cases;
     Selecto::Error->throw('invalid_action_execution_cases', 'action execution cases must be a non-empty list')
         unless ref($cases) eq 'ARRAY' && @$cases;
 
@@ -457,9 +490,9 @@ sub _select_execution_case {
             last;
         }
     }
-    my $selected = dclone($execution);
+    my $selected = _clone($execution);
     delete $selected->{cases};
-    my $case = dclone($matches[0]);
+    my $case = _clone($matches[0]);
     delete $case->{when};
     $selected->{$_} = $case->{$_} for keys %$case;
     return (defined($matches[0]{id}) ? _id($matches[0]{id}) : $index, $selected);
@@ -468,14 +501,14 @@ sub _select_execution_case {
 sub _input_specs {
     my ($value) = @_;
     return {} unless defined $value;
-    return dclone($value) if ref($value) eq 'HASH';
+    return _clone($value) if ref($value) eq 'HASH';
     if (ref($value) eq 'ARRAY') {
         my %specs;
         for my $spec (@$value) {
             _object($spec, 'action input specification');
             my $id = _id($spec->{id});
             Selecto::Error->throw('invalid_action_input', 'action input specification must include an id') if $id eq '';
-            my $copy = dclone($spec);
+            my $copy = _clone($spec);
             delete $copy->{id};
             $specs{$id} = $copy;
         }
@@ -526,7 +559,7 @@ sub _normalize_input_value {
         my $minimum = defined($spec->{min_items}) ? int($spec->{min_items}) : 0;
         Selecto::Error->throw('invalid_action_input', 'collection action input has too few entries', { input => $id })
             if @$value < $minimum;
-        return dclone($value);
+        return _clone($value);
     }
     if ($type eq 'json' || $type eq 'jsonb' || $type eq 'map') {
         # The submitted subtree is literal data. Never recurse through it as
@@ -622,11 +655,11 @@ sub _collection_patches {
                 if _id($entry->{op}) eq '';
         }
         $patches{$id} = {
-            target      => dclone($spec->{target}),
+            target      => _clone($spec->{target}),
             strategy    => _id($spec->{strategy}),
             identity    => _id($spec->{identity}),
             order_field => _id($spec->{order_field}),
-            entries     => dclone($entries),
+            entries     => _clone($entries),
         };
     }
     return \%patches;
@@ -641,7 +674,7 @@ sub _contract {
         return $contract;
     }
     _object($input, 'domain contract');
-    return dclone($input);
+    return Selecto::Domain::_clone_with_rules($input);
 }
 
 # Insert and upsert actions create one row from their changes; they name no
@@ -706,7 +739,7 @@ sub _target {
 sub _transition {
     my ($writes, $action, $changes) = @_;
     return (undef, []) unless ref($action->{transition}) eq 'HASH';
-    my $transition = dclone($action->{transition});
+    my $transition = _clone($action->{transition});
     my ($field, $from, $to) = map { defined($_) ? "$_" : '' } @{$transition}{qw(field from to)};
     Selecto::Error->throw('invalid_action_transition', 'transition must declare field, from, and to')
         if grep { $_ eq '' } ($field, $from, $to);
@@ -720,7 +753,7 @@ sub _transition {
         field      => $field,
         value      => $from,
         reason     => 'transition_from',
-        transition => dclone($transition),
+        transition => _clone($transition),
     }]);
 }
 
@@ -758,7 +791,7 @@ sub _target_value {
 
 sub _clone {
     my ($value) = @_;
-    return ref($value) ? dclone($value) : $value;
+    return __PACKAGE__->_copy_values($value);
 }
 
 sub _object {

@@ -237,7 +237,7 @@ sub without_action_prerequisites {
     my $copy = bless {%$self}, ref($self);
     $copy->{fields} = {%{$self->{fields}}};
     delete @{$copy->{fields}}{@remove};
-    my $contract = dclone($self->{contract});
+    my $contract = _clone_with_rules($self->{contract});
     delete @{$contract->{source}{columns}}{@remove};
     $contract->{source}{fields} = [grep { !$remove{$_} } @{$contract->{source}{fields}}];
     $contract->{actions}{$_}{prerequisite_column} = JSON::PP::false for @hidden;
@@ -325,9 +325,30 @@ sub parse {
     return _apply_required_filters($domain, $raw->{required_filters});
 }
 
+sub _clone_with_rules {
+    my ($raw) = @_;
+    # Preserve canonical rules, write validators and action values before
+    # Storable sees them. Nested relationship domains are in the same write
+    # component. Unrelated domain components retain their established paths.
+    my %policy;
+    for my $part (qw(rules writes actions)) {
+        next unless exists $raw->{$part};
+        $policy{$part} = Selecto::DataRules::_copy_plain($raw->{$part}, Selecto::Limits->new,
+            $part eq 'rules' ? 'invalid_data_rules_contract'
+                : $part eq 'writes' ? 'invalid_write_contract' : 'invalid_action_contract', "$part contract");
+    }
+    # Do not let Storable inspect the originals either: its integer encoding
+    # can populate an IV cache on an NV-only 1.0 in the source record.
+    my %other = %$raw;
+    delete @other{keys %policy};
+    my $copy = dclone(\%other);
+    @{$copy}{keys %policy} = values %policy;
+    return $copy;
+}
+
 sub _parse_canonical {
     my ($class, $raw, $source, $strict) = @_;
-    $raw = dclone($raw);
+    $raw = _clone_with_rules($raw);
     $source = $raw->{source};
     _reject_unknown($source, {%RELATION, fts5_index => 1}, 'source') if $strict;
     Selecto::Error->throw(
@@ -369,7 +390,7 @@ sub _parse_canonical {
         rules => $raw->{rules},
     );
     _apply_required_filters($domain, $raw->{required_filters});
-    $domain->{contract} = dclone($raw);
+    $domain->{contract} = _clone_with_rules($raw);
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
     _validate_value_expressions($domain, $source, $raw->{writes});
@@ -389,7 +410,7 @@ sub _parse_canonical {
         $domain, $raw->{detail_actions},
     );
     $domain->validate_query_library;
-    my $fingerprint_document = dclone($raw);
+    my $fingerprint_document = _clone_with_rules($raw);
     delete $fingerprint_document->{domain_fingerprint};
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
         encode_utf8(JSON::PP->new->canonical(1)->encode($fingerprint_document))
@@ -1205,7 +1226,7 @@ sub compose {
 
 sub as_contract {
     my ($self) = @_;
-    return dclone($self->{contract}) if defined $self->{contract};
+    return _clone_with_rules($self->{contract}) if defined $self->{contract};
     Selecto::Error->throw(
         'invalid_domain_overlay',
         'runtime predicate domains cannot be converted to portable overlay contracts',
@@ -2388,7 +2409,7 @@ sub primary_key  { return $_[0]->{primary_key}; }
 sub required_predicate { return $_[0]->{required_predicate}; }
 sub tenant_field { return $_[0]->{tenant_field}; }
 sub tenant_required { return $_[0]->{tenant_required} // 0; }
-sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
+sub contract     { return defined($_[0]->{contract}) ? _clone_with_rules($_[0]->{contract}) : undef; }
 # The contract itself, for library code that only reads it; never modify it.
 sub _contract_view { return $_[0]->{contract}; }
 sub retarget_config {
@@ -2404,8 +2425,10 @@ sub write_tenant_scope {
 }
 # Each section is deep-copied straight from the contract, rather than from a
 # deep copy of the whole contract; the caller receives the same fresh copy.
-sub writes       { my $contract = $_[0]->{contract} // {}; return dclone($contract->{writes} // {}); }
-sub actions      { my $contract = $_[0]->{contract} // {}; return dclone($contract->{actions} // {}); }
+sub writes       { my $contract = $_[0]->{contract} // {}; return Selecto::DataRules::_copy_plain(
+    $contract->{writes} // {}, Selecto::Limits->new, 'invalid_write_contract', 'writes contract'); }
+sub actions      { my $contract = $_[0]->{contract} // {}; return Selecto::DataRules::_copy_plain(
+    $contract->{actions} // {}, Selecto::Limits->new, 'invalid_action_contract', 'actions contract'); }
 sub imports      { my $contract = $_[0]->{contract} // {}; return dclone($contract->{imports} // {}); }
 sub editors      { return dclone($_[0]->{editors} // {}); }
 sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
