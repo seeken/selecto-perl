@@ -51,7 +51,7 @@ sub refuses {
     my ($label,$run) = @_;
     $events = 0;
     my ($value,$error);my $ok=eval{$value=$run->();1};$error=$@;
-    diag('unrefused native result: '.JSON::PP->new->canonical->encode($value)) if $ok;
+    diag('unrefused native result: '.JSON::PP->new->canonical->allow_blessed->encode($value)) if $ok;
     is(!$ok && ref($error) && UNIVERSAL::isa($error,'Selecto::Error') ? $error->code : 'none',
         'unsupported_feature',$label);
     is($events,0,"$label prepares no native SQL, including capability catalog reads");
