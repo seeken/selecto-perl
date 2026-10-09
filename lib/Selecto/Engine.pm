@@ -30,14 +30,20 @@ use Selecto::WriteRules ();
 use Selecto::DataRules ();
 use Selecto::Action::Graph ();
 use Selecto::ConfiguredDomain ();
+use Selecto::Tenant::Context ();
 
 fieldhash my %ACTION_COMMAND_WORK;
 fieldhash my %CONFIGURED_DOMAIN;
 
+sub _read_authority {
+    my ($self) = @_;
+    return [$self->{scope}, $self->{tenant_context}, $self->{tenant_required_filters}];
+}
+
 my $seal_domain = sub {
     my ($self) = @_;
     $CONFIGURED_DOMAIN{$self} = {
-        domain => Selecto::ConfiguredDomain->digest($self->{domain}, $self->{scope}),
+        domain => Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority),
     };
     return $self;
 };
@@ -48,10 +54,10 @@ sub assert_domain_identity {
     Selecto::Error->throw('domain_modified_after_configuration',
         'configured domain identity has changed', {path => []})
         unless $record
-            && $record->{domain} eq Selecto::ConfiguredDomain->digest($self->{domain}, $self->{scope})
+            && $record->{domain} eq Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority)
             && (exists($record->{read}) == exists($self->{_read_domain}))
             && (!exists($record->{read}) || $record->{read} eq
-                Selecto::ConfiguredDomain->digest($self->{_read_domain}, $self->{scope}));
+                Selecto::ConfiguredDomain->digest($self->{_read_domain}, $self->_read_authority));
     return $self;
 }
 
@@ -152,6 +158,121 @@ sub limits { return $_[0]->{limits}; }
 
 sub scope { return {%{$_[0]->{scope}}}; }
 
+# Read context is attached independently of the existing trusted write scope.
+# A row context must be explicitly applied as required query obligations.
+sub with_tenant {
+    my ($self, $given) = @_;
+    $self->assert_domain_identity;
+    my $context = Selecto::Tenant::Context->normalize($given);
+    my $old_context = $self->{tenant_context} // {};
+    for my $key (qw(tenant_id tenant_field prefix)) {
+        my $old = $old_context->{$key};
+        Selecto::Error->throw('tenant_context_mismatch', 'read tenant context cannot replace an attached identity')
+            if defined($old) && (!defined($context->{$key}) || "$old" ne "$context->{$key}");
+    }
+    if (defined($context->{tenant_id})) {
+        $self->{domain}->resolve($context->{tenant_field});
+        Selecto::Error->throw('tenant_context_mismatch', 'read context conflicts with trusted engine scope')
+            if defined($self->{scope}{tenant}) && "$self->{scope}{tenant}" ne "$context->{tenant_id}";
+    }
+    my $copy = bless {%$self, tenant_context => $context}, ref($self);
+    delete $copy->{_read_domain};
+    return $seal_domain->($copy);
+}
+sub tenant_context {
+    my ($self) = @_;
+    $self->assert_domain_identity;
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->copy_declaration($self->{tenant_context} // {});
+}
+sub require_tenant_filter {
+    my ($self, $field, $value) = @_;
+    $self->assert_domain_identity;
+    my $filter = Selecto::Tenant::Context->filter($field, $value);
+    $self->{domain}->resolve($filter->[0]);
+    my $filters = Selecto::Tenant::Context->unique_filters([@{$self->{tenant_required_filters} // []}, $filter]);
+    my $copy = bless {%$self, tenant_required_filters => $filters}, ref($self);
+    delete $copy->{_read_domain};
+    return $seal_domain->($copy);
+}
+sub validate_tenant_scope {
+    my ($self) = @_;
+    $self->assert_domain_identity;
+    require Selecto::QueryPolicy;
+    my $filters = $self->required_filters;
+    return Selecto::Tenant::Context->report($self->{domain}->tenant_required,
+        $self->{tenant_context} // {}, $filters);
+}
+sub required_filters {
+    my ($self) = @_;
+    $self->assert_domain_identity;
+    require Selecto::QueryPolicy;
+    my $filters = Selecto::QueryPolicy->filters($self->{domain}, $self->query, $self->{limits});
+    push @$filters, @{$self->{tenant_required_filters} // []};
+    push @$filters, [$self->{domain}->tenant_field, $self->{scope}{tenant}]
+        if defined($self->{domain}->tenant_field) && defined($self->{scope}{tenant});
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->copy_declaration({filters => $filters})->{filters};
+}
+sub apply_tenant_scope {
+    my ($self, %options) = @_;
+    $self->assert_domain_identity;
+    Selecto::Error->throw('invalid_tenant_context', 'scope application takes its attached context; overrides are unsupported') if keys %options;
+    my $report = $self->validate_tenant_scope;
+    Selecto::Error->throw($report->{error}{code}, 'attached tenant context conflicts with required query filters', $report->{error})
+        if !$report->{valid} && $report->{error}{code} ne 'tenant_scope_missing';
+    my $copy = $self;
+    my $context = $self->{tenant_context} // {};
+    $copy = $copy->require_tenant_filter(@$_) for @{$context->{required_filters} // []};
+    $copy = $copy->require_tenant_filter($context->{tenant_field}, $context->{tenant_id}) if defined $context->{tenant_id};
+    return $copy;
+}
+sub merge_execution_options {
+    my ($self, %options) = @_;
+    $self->assert_domain_identity;
+    Selecto::Error->throw('invalid_tenant_context', 'read execution options only support prefix') if grep { $_ ne 'prefix' } keys %options;
+    my $attached = ($self->{tenant_context} // {})->{prefix};
+    if (exists $options{prefix}) {
+        require Selecto::Domain::QueryContract;
+        my $copy = Selecto::Domain::QueryContract->copy_declaration({prefix => $options{prefix}});
+        $options{prefix} = Selecto::Identifier::checked($copy->{prefix});
+    }
+    Selecto::Error->throw('tenant_prefix_mismatch', 'execution prefix conflicts with attached tenant context')
+        if defined($attached) && exists($options{prefix}) && $options{prefix} ne $attached;
+    $options{prefix} = $attached if defined $attached;
+    return \%options;
+}
+sub _check_read_execution_options {
+    my ($self, $options) = @_;
+    $self->assert_domain_identity;
+    return unless exists $options->{prefix};
+    $self->merge_execution_options(prefix => $options->{prefix});
+    Selecto::Error->throw('invalid_tenant_context', 'execution prefix requires an attached read context')
+        unless defined(($self->{tenant_context} // {})->{prefix});
+}
+sub _ensure_write_context {
+    my ($self) = @_;
+    $self->assert_domain_identity;
+    Selecto::Error->throw('unsupported_feature', 'read tenant context does not authorize writes')
+        if keys %{$self->{tenant_context} // {}} || @{$self->{tenant_required_filters} // []};
+}
+sub _ensure_read_scope {
+    my ($self) = @_;
+    my $report = $self->validate_tenant_scope;
+    Selecto::Error->throw($report->{error}{code}, 'required read tenant scope is missing or inconsistent', $report->{error}) unless $report->{valid};
+    return;
+}
+sub _has_read_tenant_policy {
+    my ($self) = @_;
+    $self->assert_domain_identity;
+    return $self->{domain}->tenant_required || keys(%{$self->{tenant_context} // {}}) || @{$self->{tenant_required_filters} // []};
+}
+sub _read_policy_identity {
+    my ($self) = @_;
+    $self->assert_domain_identity;
+    return Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority);
+}
+
 # Trusted hosts may tighten a request's budget without reconfiguring its
 # domain. Preserve the already checked private evidence on the new engine.
 sub with_limits {
@@ -168,6 +289,9 @@ sub with_scope {
     my ($self, %scope) = @_;
     $self->assert_domain_identity;
     my $next = _trusted_scope(\%scope);
+    my $read_context = $self->{tenant_context} // {};
+    Selecto::Error->throw('tenant_context_mismatch', 'trusted engine scope conflicts with attached read context')
+        if defined($read_context->{tenant_id}) && defined($next->{tenant}) && "$read_context->{tenant_id}" ne "$next->{tenant}";
     my $current = $self->{scope}{tenant};
     Selecto::Error->throw('tenant_mismatch', 'engine is already scoped to a different tenant')
         if defined($current) && defined($next->{tenant}) && "$current" ne "$next->{tenant}";
@@ -226,9 +350,15 @@ sub query_filters {
 sub compile {
     my ($self, $query) = @_;
     $self->assert_domain_identity;
+    $self->_ensure_read_scope;
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
         allowed_base_classes => ['Selecto::Query']);
+    if (defined(($self->{tenant_context} // {})->{prefix})) {
+        Selecto::Error->throw('unsupported_feature', 'prefix read contexts currently require an ordinary root query')
+            if keys(%{$self->{domain}{associations}}) || $query->retarget_spec
+                || grep { @{$query->{$_} // []} } qw(set_operations ctes lateral_joins json_rowsets array_rowsets members);
+    }
     local $self->{adapter}{_selecto_compile_limits} = $self->{limits};
     # This query was just admitted under these limits, and its parameters are
     # admitted below under them too, so the SQL adapter skips repeating the
@@ -243,6 +373,7 @@ sub compile {
 }
 sub all {
     my ($self, $query, %options) = @_;
+    $self->_check_read_execution_options(\%options);
     my $statement = $self->compile($query);
     $self->assert_domain_identity;
     return $self->{adapter}->execute_query($statement) unless $options{export_scalars};
@@ -261,6 +392,7 @@ sub all {
 sub read_domain {
     my ($self) = @_;
     $self->assert_domain_identity;
+    $self->_ensure_read_scope;
     return $self->{_read_domain} if exists $self->{_read_domain};
     my $read = do {
         my $domain = $self->{domain};
@@ -276,10 +408,21 @@ sub read_domain {
             $domain = $domain->with_required_predicate(
                 defined($required) ? Selecto::Expression->all($required, $trusted) : $trusted);
         }
+        if (@{$self->{tenant_required_filters} // []}) {
+            my @required = map { Selecto::Expression->eq(@$_) } @{$self->{tenant_required_filters}};
+            unshift @required, $domain->required_predicate if defined $domain->required_predicate;
+            my $predicate = Selecto::Expression->all(@required);
+            $predicate->{_query_filter_list} = 1;
+            $domain = $domain->with_required_predicate($predicate);
+        }
+        my $prefix = ($self->{tenant_context} // {})->{prefix};
+        if (defined $prefix) {
+            $domain = bless {%$domain, _read_prefix => $prefix}, ref($domain);
+        }
         $domain;
     };
     $self->{_read_domain} = $read;
-    $CONFIGURED_DOMAIN{$self}{read} = Selecto::ConfiguredDomain->digest($read, $self->{scope});
+    $CONFIGURED_DOMAIN{$self}{read} = Selecto::ConfiguredDomain->digest($read, $self->_read_authority);
     return $read;
 }
 
@@ -339,6 +482,7 @@ sub projection_sum {
 }
 sub stream {
     my ($self, $query, %options) = @_;
+    $self->_check_read_execution_options(\%options);
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not support streaming')
         unless $self->{adapter}->supports('stream') && $self->{adapter}->can('stream_query');
     my $statement = $self->compile($query);
@@ -381,6 +525,7 @@ sub _execute_write {
 sub _execute_governed {
     my ($self, $method, $subject) = @_;
     $self->assert_domain_identity;
+    $self->_ensure_write_context;
     return $self->{adapter}->$method($subject, Selecto::Write::Authorization->_issue($subject));
 }
 sub _rules_transaction {
@@ -579,6 +724,7 @@ sub write_command {
 sub governed_write {
     my ($self, $command, %details) = @_;
     $self->assert_domain_identity;
+    $self->_ensure_write_context;
     Selecto::Error->throw('invalid_write', 'write command required')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
     my $accepted_work = $self->_accepted_command_work($command);
@@ -1854,9 +2000,42 @@ throw C<unsupported_feature>. Without the option C<all> returns exactly what
 it always has.
 
 C<all> applies the domain's required predicate and the engine's tenant, but
-it does not require a tenant boundary: it is meant for trusted host code,
-including deliberate cross-tenant reads. Public surfaces call
-L</assert_tenant_boundary> first.
+an explicit C<tenant_required> domain or attached read context also requires
+valid read scope. Hosts that omit read tenant policy retain ordinary trusted
+cross-tenant reads. Public surfaces also call L</assert_tenant_boundary>.
+
+=head2 with_tenant, apply_tenant_scope, validate_tenant_scope
+
+  my $attached = $engine->with_tenant({tenant_id => 'tenant-a'});
+  my $scoped = $attached->apply_tenant_scope;
+  my $report = $scoped->validate_tenant_scope; # {valid => JSON boolean, ...}
+
+Attaches bounded plain read context without silently applying row scope.
+Explicit application adds required field/value obligations; ordinary query
+filters cannot satisfy them. Context supports C<tenant_id> (alias C<id>),
+C<tenant_field> (default C<tenant_id>), C<prefix>, boolean C<required>
+(alias C<require_tenant>) and scalar-pair C<required_filters>. Callback/tied/
+cyclic inputs are refused before copying. An attached identity cannot be
+replaced. Domain C<tenant_required> (alias C<require_tenant>) fails closed;
+a context's false flag cannot weaken a required configured domain.
+
+Row scope requires a matching single trusted required value. Missing,
+contradictory and ambiguous scope produce typed errors before compilation or
+execution. C<require_tenant_filter($field, $value)> adds an obligation through
+an approved copy. C<required_filters> and C<tenant_context> return isolated
+plain metadata copies. Scope and read-cache structures join the engine's
+private configured-domain identity; mutating their public records is refused.
+
+A prefix names a separately quoted schema identifier. Prefix/compound reads
+currently support ordinary root queries only; association/advanced-source
+queries fail closed. Execution options cannot substitute the attached prefix.
+C<merge_execution_options(prefix =E<gt> ...)> checks that identity; C<all>,
+C<stream> and bounded execution enforce the same check. The attached read
+context does not authorize writes; all engine write dispatch refuses it.
+Existing C<with_scope> and declared C<writes.scope.tenant> remain the separate
+trusted write-authority lifecycle. This API does not execute declared UDFs or
+callback query members. See L<Selecto::Verification::QuerySafety> for the
+finite read-scope model.
 
 =head2 stream
 

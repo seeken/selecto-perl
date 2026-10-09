@@ -33,6 +33,26 @@ sub digest {
     return $state->{hash}->hexdigest;
 }
 
+# A prepared read binds its actual compiler output and transfer metadata, not
+# public cached fingerprints. Traverse the raw statement without accessors.
+sub prepared_digest {
+    my ($class, $prepared) = @_;
+    Selecto::Error->throw('domain_modified_after_configuration', 'prepared read metadata is invalid', {path => []})
+        unless ref($prepared) eq 'HASH' && !defined(tied(%$prepared))
+            && !grep { !exists($prepared->{$_}) || defined(tied($prepared->{$_})) } qw(statement collections limits);
+    my $statement = $prepared->{statement};
+    Selecto::Error->throw('domain_modified_after_configuration', 'prepared read statement is invalid', {path => []})
+        unless blessed($statement) && UNIVERSAL::isa($statement, 'Selecto::Statement')
+            && (reftype($statement) // '') eq 'HASH' && !defined(tied(%$statement));
+    my $state = {hash => Digest::SHA->new(256), nodes => 0, bytes => 0, active => {},
+        limits => $LIMITS, node_limit => 'max_response_nodes', byte_limit => 'max_response_bytes',
+        extra_record => 'Selecto::Statement'};
+    # Preserve subclass identity while admitting every raw field. Any nested
+    # unknown blessed value, tie or callback still fails the ordinary walker.
+    _walk($state, [$statement, $prepared->{collections}, $prepared->{limits}], 0);
+    return $state->{hash}->hexdigest;
+}
+
 # A plain portable library is admitted before any dclone or canonical encoder.
 # Keep the original native metadata ceilings, independently of compiled-record
 # identity ceilings. Unknown blessed values cannot execute serialization hooks.
@@ -82,7 +102,8 @@ sub _walk {
         return _part($state, 'B', $$value ? '1' : '0');
     }
     _refuse($state) if length($class) && ($state->{plain} || !$RECORD{$class}
-        && !grep { UNIVERSAL::isa($value, $_) } @RECORD_BASES);
+        && !(grep { UNIVERSAL::isa($value, $_) } @RECORD_BASES)
+        && !(defined($state->{extra_record}) && UNIVERSAL::isa($value, $state->{extra_record})));
     _refuse($state) unless $type eq 'HASH' || $type eq 'ARRAY';
     _refuse($state) if $type eq 'HASH' ? defined(tied(%$value)) : defined(tied(@$value));
     my $id = refaddr($value);

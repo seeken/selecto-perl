@@ -9,6 +9,19 @@ use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Limits ();
 use Selecto::OperationBudget ();
+use Hash::Util::FieldHash qw(fieldhash);
+use Selecto::ConfiguredDomain ();
+
+fieldhash my %PREPARED_POLICY;
+sub _assert_prepared_policy {
+    my ($engine, $prepared) = @_;
+    $engine->_ensure_read_scope;
+    my $record = ref($prepared) eq 'HASH' && $PREPARED_POLICY{$prepared};
+    return unless $engine->_has_read_tenant_policy || $record && $record->{tenant_policy};
+    Selecto::Error->throw('domain_modified_after_configuration', 'prepared read policy is absent or changed', {path => []})
+        unless $record && $record->{policy} eq $engine->_read_policy_identity
+            && $record->{statement} eq Selecto::ConfiguredDomain->prepared_digest($prepared);
+}
 
 # HTTP-neutral finite result consumption. Dialects own transfer guards; a host
 # adapter must explicitly implement that capability, bounded streaming and a
@@ -68,7 +81,10 @@ sub prepare {
         push @select, $expression;
     }
     my $bounded = $query->_copy(selections => \@select);
-    return {statement => $engine->compile($bounded), query => $bounded, collections => \@collections, limits => $limits};
+    my $prepared = {statement => $engine->compile($bounded), query => $bounded, collections => \@collections, limits => $limits};
+    $PREPARED_POLICY{$prepared} = {policy => $engine->_read_policy_identity, tenant_policy => $engine->_has_read_tenant_policy ? 1 : 0,
+        statement => Selecto::ConfiguredDomain->prepared_digest($prepared)};
+    return $prepared;
 }
 
 sub all {
@@ -79,6 +95,8 @@ sub all {
 sub execute {
     my ($class, $engine, $prepared, %args) = @_;
     $engine->assert_domain_identity;
+    _assert_prepared_policy($engine, $prepared);
+    $engine->_check_read_execution_options(\%args);
     my $statement = ref($prepared) eq 'HASH' ? $prepared->{statement} : $prepared;
     my $collections = ref($prepared) eq 'HASH' ? $prepared->{collections} : [];
     my $limits = _limits($engine, $args{limits} // (ref($prepared) eq 'HASH' ? $prepared->{limits} : undef));
@@ -103,6 +121,7 @@ sub execute {
     my $ok = eval {
         $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
         $engine->assert_domain_identity;
+        _assert_prepared_policy($engine, $prepared);
         $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows));
         while (my $row = $stream->next) {
             $deadline->check(defer_rearm => 1);
@@ -237,5 +256,11 @@ scalar-result statement. Never accept compiled SQL or execution options from
 request data. C<validate_result> admits cached result structures using the
 same trusted result limits; cache authorization namespacing belongs to the
 host, independently of this module.
+
+For engines with explicit read tenant policy, execution requires the actual
+prepared bundle and private evidence tying its statement, transfer metadata
+and configured read policy together. Changed bundles, another tenant context,
+or an unbound scalar statement fail before SQL. Approved C<with_limits> copies
+retain read authority while still intersecting execution resource limits.
 
 =cut

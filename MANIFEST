@@ -230,3 +230,6 @@ lib/Selecto/SQLite/FtsIndex.pm
 t/sqlite_fts_external.integration.t
 t/sqlite_projection_fts.integration.t
 t/sqlite_prefix_fts.integration.t
+lib/Selecto/Tenant/Context.pm
+lib/Selecto/Verification/QuerySafety.pm
+t/sqlite_query_safety.t
