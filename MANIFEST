@@ -32,6 +32,9 @@ lib/Selecto/Document/Missing.pm
 lib/Selecto/Document/Plan.pm
 lib/Selecto/Document/ShapeRelease.pm
 lib/Selecto/Domain.pm
+lib/Selecto/Domain/Projection.pm
+t/domain_projection.t
+t/fixtures/domain_projection.json
 lib/Selecto/Domain/DSL.pm
 lib/Selecto/Domain/Overlay.pm
 lib/Selecto/Domain/Ref.pm
