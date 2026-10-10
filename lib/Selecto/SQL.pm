@@ -2425,8 +2425,8 @@ sub _compile_write {
             my $updates = $metadata->{upsert_update_fields};
             Selecto::Error->throw('invalid_write', 'upsert conflict target must be a non-empty string array')
                 unless ref($conflict) eq 'ARRAY' && @$conflict && !grep { ref($_) } @$conflict;
-            Selecto::Error->throw('invalid_write', 'upsert update fields must be a non-empty string array')
-                unless ref($updates) eq 'ARRAY' && @$updates && !grep { ref($_) } @$updates;
+            Selecto::Error->throw('invalid_write', 'upsert update fields must be a string array')
+                unless ref($updates) eq 'ARRAY' && !grep { ref($_) } @$updates;
             $sql .= $self->_compile_upsert_clause($conflict, $updates);
         }
         return $self->_append_returning($sql, \@params, $command);
@@ -3096,8 +3096,9 @@ sub _compile_timezone_sql {
 
 sub _compile_upsert_clause {
     my ($self, $conflict, $updates) = @_;
-    return ' ON CONFLICT (' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$conflict) .
-        ') DO UPDATE SET ' . join(', ', map {
+    my $target = ' ON CONFLICT (' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$conflict) . ')';
+    return $target . ' DO NOTHING' unless @$updates;
+    return $target . ' DO UPDATE SET ' . join(', ', map {
             my $field = Selecto::Identifier::checked($_);
             $self->quote_identifier($field) . ' = EXCLUDED.' . $self->quote_identifier($field)
         } @$updates);

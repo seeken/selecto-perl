@@ -561,13 +561,15 @@ sub preview_write {
 sub _preview_write {
     my ($self, $command) = @_;
     my $accepted_input=Selecto::Write::PortableCommand->_accepted_input($command);
+    my $accepted_upsert=Selecto::Write::PortableCommand->_accepted_protected_upsert($command);
     my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
     $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input,accepted_input=>$accepted_input);
     $self->preflight_write($command);
     return $self->{adapter}->preview_write($command) unless Selecto::WriteRules->has_stored_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
-        return $self->{adapter}->preview_write(Selecto::WriteRules->govern($self, $command, input_prepared => 1));
+        return $self->{adapter}->preview_write(Selecto::WriteRules->govern(
+            $self, $command, input_prepared => 1, accepted_upsert => $accepted_upsert));
     });
 }
 sub execute_write {
@@ -582,13 +584,15 @@ sub execute_write {
 sub _execute_write {
     my ($self, $command) = @_;
     my $accepted_input=Selecto::Write::PortableCommand->_accepted_input($command);
+    my $accepted_upsert=Selecto::Write::PortableCommand->_accepted_protected_upsert($command);
     my $input = Selecto::WriteRules->literal_input($command);
     $command = $self->governed_write($command);
     $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input,accepted_input=>$accepted_input);
     $self->preflight_write($command);
     return $self->_execute_governed(execute_write => $command) unless Selecto::WriteRules->has_stored_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
-        return $self->_execute_governed(execute_write => Selecto::WriteRules->govern($self, $command, input_prepared => 1));
+        return $self->_execute_governed(execute_write => Selecto::WriteRules->govern(
+            $self, $command, input_prepared => 1, accepted_upsert => $accepted_upsert));
     });
 }
 
@@ -612,7 +616,14 @@ sub _rules_transaction {
     my ($self, $work) = @_;
     Selecto::Error->throw('required_data_rule_pending', 'adapter cannot protect stored candidates')
         unless $self->{adapter}->can('execute_transaction');
-    my $request = bless {work => sub { Selecto::DataRules->_with_proof_budget($work, limits => $self->{limits}) }}, 'Selecto::Write::Transaction';
+    my $protected_work = sub {
+        return $self->{adapter}->rule_upsert_scope($work)
+            if $self->{adapter}->can('rule_upsert_scope');
+        return $work->();
+    };
+    my $request = bless {work => sub {
+        Selecto::DataRules->_with_proof_budget($protected_work, limits => $self->{limits});
+    }}, 'Selecto::Write::Transaction';
     return $self->_execute_governed(execute_transaction => $request);
 }
 sub execute_batch {
@@ -1379,8 +1390,6 @@ sub _action_upsert_metadata {
     my @updates = sort grep {
         !$key{$_} && ref($fields->{$_}) eq 'HASH' && $fields->{$_}{updatable}
     } keys %{$plan->changes // {}};
-    Selecto::Error->throw('invalid_action_plan', 'upsert actions need at least one updatable change',
-        {action => $plan->action}) unless @updates;
     return (conflict_target => [map { "$_" } @$target], upsert_update_fields => \@updates);
 }
 
@@ -1833,7 +1842,7 @@ sub _validate_command_against_contract {
             $writes, $metadata->{conflict_target}, $domain_fields);
         my $updates = $metadata->{upsert_update_fields};
         Selecto::Error->throw('invalid_write', 'upsert requires declared update fields')
-            unless ref($updates) eq 'ARRAY' && @$updates;
+            unless ref($updates) eq 'ARRAY';
         for my $field (@$updates) {
             Selecto::Error->throw('invalid_write', 'upsert update fields must be field names') if ref($field);
             Selecto::Error->throw('unknown_field', "upsert update field is not declared by $label", { field => "$field" })

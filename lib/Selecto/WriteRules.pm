@@ -2,10 +2,11 @@ package Selecto::WriteRules;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(blessed refaddr);
+use Scalar::Util qw(blessed refaddr reftype);
 use JSON::PP ();
 use Math::BigInt ();
 use Math::BigFloat ();
+use B ();
 use Selecto::InsertAdmission ();
 use Selecto::Error ();
 use Selecto::Query ();
@@ -350,6 +351,167 @@ sub _normalize {
     return ($normalized, $values);
 }
 sub _changed { JSON::PP->new->canonical->encode([$_[0]]) ne JSON::PP->new->canonical->encode([$_[1]]) }
+
+# Native UPSERT owns its branch and physical row. Submitted INSERT attributes
+# outside the conflict-update mask must not replace that protected candidate.
+sub _upsert_dependencies {
+    my ($engine) = @_;
+    my %fields;
+    my $known = $engine->domain->fields;
+    my $rules = $engine->domain->rules;
+    for my $stage (qw(candidate transaction evidence)) {
+        for my $path (@{$rules->consumed_paths($stage, 'upsert')}) {
+            if (!@$path) { $fields{$_} = 1 for keys %$known; next }
+            my $field = $path->[0];
+            _pending('protected scalar UPSERT cannot establish a relationship-valued dependency')
+                if ref($field) || !exists($known->{$field});
+            $fields{$field} = 1;
+        }
+    }
+    return [sort keys %fields];
+}
+sub _upsert_state {
+    my ($engine, $state, $dependencies) = @_;
+    _pending('native UPSERT candidate is unavailable') unless ref($state) eq 'HASH' && !defined(tied(%$state));
+    for my $key (qw(values prior_values branch effect complete protection receipt)) {
+        _pending('native UPSERT candidate is incomplete')
+            unless exists($state->{$key}) && !defined(tied($state->{$key}));
+    }
+    my $complete = $state->{complete};
+    if (defined(reftype($complete))) {
+        _pending('native UPSERT candidate has an invalid complete flag')
+            unless (blessed($complete) // '') eq 'JSON::PP::Boolean' && reftype($complete) eq 'SCALAR'
+                && !defined(tied($$complete));
+        $complete = $$complete;
+    }
+    my $complete_true = defined($complete) && !defined(reftype($complete))
+        && (B::svref_2object(\$complete)->FLAGS & B::SVf_IOK())
+        && !(B::svref_2object(\$complete)->FLAGS & B::SVf_POK()) && $complete == 1;
+    _pending('native UPSERT candidate is unprotected')
+        unless $complete_true
+            && defined($state->{protection}) && !ref($state->{protection})
+            && $state->{protection} =~ /\A(?:locked|serializable)\z/
+            && ref($state->{receipt});
+    my $plain = Selecto::DataRules::_copy_plain({map { ($_ => $state->{$_}) }
+        qw(values prior_values branch effect)}, $engine->limits, 'evaluation_limit', 'upsert candidate');
+    _pending('native UPSERT candidate has an invalid branch')
+        unless ref($plain->{values}) eq 'HASH' && ref($plain->{prior_values}) eq 'HASH'
+            && defined($plain->{branch}) && !ref($plain->{branch})
+            && defined($plain->{effect}) && !ref($plain->{effect})
+            && ($plain->{branch} eq 'insert' && $plain->{effect} eq 'insert'
+                || $plain->{branch} eq 'conflict' && $plain->{effect} =~ /\A(?:update|nothing)\z/);
+    my $known = $engine->domain->fields;
+    _pending('native UPSERT candidate includes undeclared fields')
+        if grep { !exists($known->{$_}) } keys %{$plain->{values}}, keys %{$plain->{prior_values}};
+    _pending('native UPSERT candidate omits consumed fields')
+        if grep { !exists($plain->{values}{$_}) } @$dependencies;
+    _pending('native INSERT branch cannot have prior values')
+        if $plain->{branch} eq 'insert' && keys %{$plain->{prior_values}};
+    return {%$state, %$plain};
+}
+sub _upsert_project {
+    my ($engine, $command, $request) = @_;
+    _pending('adapter has no protected native UPSERT candidate strategy')
+        unless $engine->adapter->can('rule_upsert_candidate');
+    my $state = $engine->adapter->rule_upsert_candidate($command, $request);
+    return _upsert_state($engine, $state, $request->{dependencies});
+}
+sub _upsert_same {
+    my ($left, $right) = @_;
+    return Selecto::Write::PortableCommand::_receipt_digest($left)
+        eq Selecto::Write::PortableCommand::_receipt_digest($right);
+}
+sub _upsert_stable {
+    my ($before, $after, $subset) = @_;
+    _pending('UPSERT reprojection changed the protected branch or prior row')
+        unless $before->{branch} eq $after->{branch}
+            && _upsert_same($before->{prior_values}, $after->{prior_values});
+    if ($subset) {
+        _pending('expanded UPSERT projection changed known candidate values')
+            unless _upsert_same($before->{values},
+                {map { ($_ => $after->{values}{$_}) } keys %{$before->{values}}});
+    }
+}
+sub _govern_upsert {
+    my ($class, $engine, $command, %options) = @_;
+    require Selecto::Write::PortableCommand;
+    my $portable = 'Selecto::Write::PortableCommand';
+    my $metadata = $command->metadata;
+    my @required = @{$metadata->{required_capabilities} // []};
+    push @required, 'protected_upsert_candidates'
+        unless grep { !ref($_) && $_ eq 'protected_upsert_candidates' } @required;
+    $command = $command->with_metadata({%$metadata, required_capabilities => \@required});
+    $engine->preflight_write($command);
+    my $proof = $options{accepted_upsert};
+    my $dependencies = _upsert_dependencies($engine);
+    my $subject = \(my $identity = 0);
+    my $request = {field_types => $engine->domain->fields, dependencies => $dependencies,
+        context => $engine->write_context, subject => $subject, prior => undef};
+    my $state = _upsert_project($engine, $command, $request);
+    my $choice_fields = $portable->_protected_upsert_dependencies($proof, $engine, $state);
+    my %dependencies = map { ($_ => 1) } @$dependencies, @$choice_fields;
+    if (keys(%dependencies) != @$dependencies) {
+        $request = {%$request, dependencies => [sort keys %dependencies], prior => $state->{receipt}};
+        my $expanded = _upsert_project($engine, $command, $request);
+        _upsert_stable($state, $expanded, 1);
+        _pending('choice dependency projection changed UPSERT effect') unless $state->{effect} eq $expanded->{effect};
+        $state = $expanded;
+    }
+    my $rules = $engine->domain->rules;
+    my $normalized = Selecto::DataRules->_with_native_upsert_values($state->{values},
+        $engine->domain->fields, $engine->write_context, $state->{receipt}, $engine->limits, sub {
+            return $class->evaluate($rules, 'candidate', 'upsert', $state->{values}, domain => $engine->domain);
+        });
+    my $assignments = $command->assignments;
+    my %mask = map { ($_ => 1) } @{$command->metadata->{upsert_update_fields} // []};
+    for my $field (keys %$assignments) {
+        my $value = $assignments->{$field};
+        my $expression = blessed($value) && $value->isa('Selecto::Write::Expression') && $value->kind ne 'literal';
+        if ($state->{branch} eq 'conflict' && !$mask{$field}) {
+            _pending('candidate normalizer changed a field excluded from conflict updates')
+                unless exists($normalized->{$field}) == exists($state->{values}{$field})
+                    && (!exists($normalized->{$field}) || _upsert_same($normalized->{$field}, $state->{values}{$field}));
+            next;
+        }
+        if ($expression) {
+            _pending('candidate normalizer changed a native mutation expression')
+                if exists($normalized->{$field}) && (!exists($state->{values}{$field})
+                    || !_upsert_same($normalized->{$field}, $state->{values}{$field}));
+            next;
+        }
+        $assignments->{$field} = $normalized->{$field} if exists($normalized->{$field});
+    }
+    for my $field (keys %$normalized) {
+        next if exists($assignments->{$field}) || !exists($state->{values}{$field})
+            || _upsert_same($normalized->{$field}, $state->{values}{$field});
+        $assignments->{$field} = $normalized->{$field};
+    }
+    my $realized = $command->with_assignments($assignments);
+    my $final = $portable->_regovern_protected_upsert($proof, $engine, $command, $realized, $state);
+    _check_storage($engine, $final);
+    my $final_request = {%$request, prior => $state->{receipt}};
+    my $final_state = _upsert_project($engine, $final, $final_request);
+    _upsert_stable($state, $final_state, 0);
+    _pending('normalized UPSERT values differ from their actual storage projection')
+        unless _upsert_same($normalized, $final_state->{values});
+    Selecto::DataRules->_with_native_upsert_values($final_state->{values}, $engine->domain->fields,
+        $engine->write_context, $final_state->{receipt}, $engine->limits, sub {
+            $class->evaluate($rules, 'candidate', 'upsert', $final_state->{values}, domain => $engine->domain, test_only => 1);
+            my $checked = $final_state->{values};
+            for my $stage (qw(transaction evidence)) {
+                $checked = $class->evaluate($rules, $stage, 'upsert', $checked, domain => $engine->domain);
+            }
+            # The final projection is what persists. A later-stage normalizer
+            # would make its rule pass on a value that is never stored.
+            _pending('transaction normalizer would change a protected UPSERT value')
+                unless $STORED_FAILURES && @$STORED_FAILURES || _upsert_same($checked, $final_state->{values});
+        });
+    # Keep native availability/resource proofs unconditional, but never call a
+    # trusted external resolver after a required stored rule already failed.
+    $portable->_validate_protected_upsert_choices($proof, $engine, $final, $final_state)
+        unless $STORED_FAILURES && @$STORED_FAILURES;
+    return $final;
+}
 sub govern {
     my ($class, @args) = @_;
     return $class->_with_stored_failure_deferral(sub { $class->_govern(@args) });
@@ -361,6 +523,7 @@ sub _govern {
     return $command unless $class->has_stored_rules($engine->domain, $command->operation);
     local $HYDRATION = $HYDRATION // {loaded => 0};
     _check_storage($engine, $command);
+    return $class->_govern_upsert($engine, $command, %options) if $command->operation eq 'upsert';
     my $relationships = $engine->domain->writes->{relationships} // {};
     if (grep { my $stage = $_; grep { exists($relationships->{$_->[0]}) }
         @{$engine->domain->rules->applicable_paths($stage, $command->operation)} } qw(candidate transaction evidence)) {

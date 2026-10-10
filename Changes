@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Govern individual protected SQLite UPSERTs against their actual native
+      conflict branch, exact update mask, literal defaults and transaction-bound
+      private receipts. Compile empty masks as DO NOTHING while retaining caller
+      cardinality. Resolve choices from the final canonical persisted candidate.
+      Refuse UPSERTs whose TRANSACTION or EVIDENCE normalizers would change a
+      persisted value, since their rules would test a value that is never stored.
+    - Add bounded value.compare_path rules with absolute root dependencies,
+      exact related-value comparisons and unconditional resource preflight.
     - Preserve native integer, unsigned integer, floating and authored text
       identity through bounded rule/policy copies, including canonical domain
       parsing and returned subjects. Admit literal opening brackets in bounded

@@ -1,7 +1,10 @@
 # Portable rules and native write admission
 
-Domains support the complete DataRules v1 catalog of 27 operators and six
-normalizers. Definitions, binding conditions and normalizer steps are closed
+Domains support DataRules v1 operators and six text normalizers, including
+`value.compare_path` comparisons against another absolute semantic path in the
+current root subject. Related paths participate in dependency and resource
+checks even inside logical branches or false binding conditions.
+Definitions, binding conditions and normalizer steps are closed
 data contracts. Exact comparisons, multiples and sums use bounded arbitrary
 precision arithmetic; type and recursive value comparisons do not coerce text,
 numbers or booleans. Explicit null is different from a missing semantic path.
@@ -129,8 +132,35 @@ known stored-rule failures are retained while later available stages and graph
 or INSERT-batch candidates finish their resource checks. The first ordinary
 failure then refuses the plan if no later resource error occurs. Refused INPUT,
 unknown prospective values and unavailable storage still stop admission. Protected
-stored batch deltas and upserts with applicable stored-stage rules require a
-prospective whole-plan or selected branch provider and remain pending here.
+stored batch deltas require a prospective whole-plan provider and remain pending
+here. Individual SQLite upserts with stored rules use the native unique arbiter
+inside the actual transaction to select the insert or conflict branch. Conflict
+candidates overlay only the command's exact update mask on the physical stored
+row; an empty mask compiles to `DO NOTHING` and retains the command's declared
+cardinality. A zero-row no-op still fails an exact-one request.
+
+Protected upsert receipts are private and expire when the transaction callback
+exits. They bind the actual adapter, connection, command, context, arbiter,
+schema and prior physical row, and are rechecked immediately before dispatch.
+The strategy reports serializable snapshot protection. It does not claim a
+write lock for caller-owned deferred transactions. Native stale-snapshot write
+upgrades retain SQLite's failure behavior. Ordinary UNIQUE NULLs select the
+insert branch; builtin BINARY, NOCASE and RTRIM arbiters and complete ordinary
+unique indexes are supported. Partial/expression arbiters and ambiguous matching
+index collations remain pending. Consumed literal defaults are projected through
+actual native affinity; consumed generated identities and nonliteral defaults
+remain unavailable.
+
+Candidate normalization runs once, then native reprojection tests the realized
+values. TRANSACTION and EVIDENCE normalizers must leave those realized values
+unchanged; otherwise the upsert remains pending instead of storing a value its
+rule never tested. Genuine portable compilation may add permitted normalized fields to its
+update mask; an explicit native mask cannot widen. Choice membership uses only
+actual persisted fields and the complete final canonical root row. Compilation
+defers these callbacks until native branch projection. A no-op consumes no
+unused choice provider, and required stored failures prevent external callbacks.
+Protected same-table multi-command plans still require a whole-plan independence
+proof and remain pending.
 External evidence requires its exact
 authoritative stage. Unknown defaults or generated fields consumed by a rule,
 database-computed assignments and unmaterialized normalizer changes remain

@@ -60,6 +60,12 @@ lib/Selecto/Retarget.pm
 lib/Selecto/SQL.pm
 lib/Selecto/SQLite.pm
 lib/Selecto/SQLite/Ownership.pm
+lib/Selecto/SQLite/UpsertCandidate.pm
+t/sqlite_upsert_candidate_native.t
+t/sqlite_protected_upsert_lifecycle.t
+t/upsert_rule_flow.t
+t/rule_compare_path.t
+t/portable_protected_upsert.t
 t/sqlite_plan_authority.integration.t
 lib/Selecto/Statement.pm
 lib/Selecto/Stream.pm
