@@ -108,7 +108,7 @@ my $sqlite_dbh = TestSelecto::ModernSQLiteDBH->new(
     { affected => 1, rows => [[503]] },
 );
 my $sqlite = Selecto::SQLite->new(dbh => $sqlite_dbh);
-ok($sqlite->write_capabilities->{write_graph}, 'SQLite 3.35+ advertises native-returning graph execution');
+ok($sqlite->write_capabilities->{write_graph}, 'SQLite 3.37+ advertises graph execution with native catalog proof');
 my $deep_graph = Selecto::Write::Graph->new(nodes => [
     {
         id => 'parent',
@@ -132,16 +132,27 @@ my $deep_graph = Selecto::Write::Graph->new(nodes => [
         bindings => [{ field => 'child_id', from => 'child', key => 'id' }],
     },
 ]);
-my $deep_result = $sqlite->execute_graph_unsafe($deep_graph);
-is($deep_result->nodes->{grandchild}->values->{id}, 503,
-    'the portable graph executor carries generated keys through three SQLite nodes');
-is_deeply(
-    $sqlite_dbh->prepared->[2]->params,
-    [502, 'grandchild'],
-    'the grandchild binds to the immediate child result with positional placeholders',
-);
-like($sqlite_dbh->prepared->[1]->sql, qr/ RETURNING "id"\z/,
-    'an intermediate node automatically returns the key required at the next depth');
+SKIP: {
+    skip 'DBD::SQLite required for native graph storage proof', 3
+        unless eval { require DBI; require DBD::SQLite; 1 };
+    my $native_dbh = DBI->connect('dbi:SQLite:dbname=:memory:', undef, undef, {RaiseError => 1, PrintError => 0});
+    $native_dbh->do('CREATE TABLE parents(id INTEGER PRIMARY KEY,label TEXT)');
+    $native_dbh->do('CREATE TABLE children(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES parents(id),label TEXT)');
+    $native_dbh->do('CREATE TABLE grandchildren(id INTEGER PRIMARY KEY,child_id INTEGER REFERENCES children(id),label TEXT)');
+    $native_dbh->do("INSERT INTO parents VALUES(500,'prior')");
+    $native_dbh->do("INSERT INTO children VALUES(501,500,'prior')");
+    $native_dbh->do("INSERT INTO grandchildren VALUES(502,501,'prior')");
+    my @sql;
+    $native_dbh->sqlite_trace(sub { push @sql, $_[0] });
+    my $deep_result = Selecto::SQLite->new(dbh => $native_dbh)->execute_graph_unsafe($deep_graph);
+    is($deep_result->nodes->{grandchild}->values->{id}, 503,
+        'the portable graph executor carries actual generated keys through three SQLite nodes');
+    is_deeply($native_dbh->selectrow_arrayref('SELECT child_id,label FROM grandchildren WHERE id=503'),
+        [502, 'grandchild'], 'the grandchild stores the immediate child result');
+    ok(scalar(grep { /INSERT INTO "children".* RETURNING "id"/ } @sql),
+        'an intermediate node actually returns the key required at the next depth');
+    $native_dbh->disconnect;
+}
 
 eval {
     Selecto::Write::Graph->new(nodes => [

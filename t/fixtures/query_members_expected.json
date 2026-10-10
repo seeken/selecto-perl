@@ -1,0 +1,81 @@
+{
+  "D048": [
+    "equal",
+    {
+      "ctes": [
+        "open_items"
+      ],
+      "laterals": [
+        "priority_series"
+      ],
+      "subqueries": [
+        "active_owners"
+      ],
+      "unnests": [
+        "title_tokens"
+      ],
+      "values": [
+        "status_labels"
+      ]
+    }
+  ],
+  "D049": [
+    "equal",
+    [
+      "invalid_query_member_group",
+      "invalid_query_member_spec"
+    ]
+  ],
+  "D050": [
+    "equal",
+    {
+      "direct_source": "ad_hoc_source_forbidden",
+      "named_member": "accepted"
+    }
+  ],
+  "D051": [
+    "rows",
+    [
+      "id",
+      "status_label"
+    ],
+    [
+      "integer",
+      "string"
+    ],
+    [
+      [
+        101,
+        "Open"
+      ],
+      [
+        102,
+        "Closed"
+      ],
+      [
+        103,
+        "Open"
+      ],
+      [
+        104,
+        "Orphan"
+      ],
+      [
+        105,
+        "Open"
+      ]
+    ],
+    "ordered"
+  ],
+  "D061": [
+    "equal",
+    {
+      "check_count": 1320,
+      "counterexamples": [],
+      "invariant_count": 6,
+      "model": "selecto.governed_query_composition.v1",
+      "proof_level": "bounded_exhaustive",
+      "state_count": 220
+    }
+  ]
+}

@@ -114,8 +114,8 @@ my %bad = (
 for my $label (sort keys %bad) {
     isnt(code_of(sub { Selecto::Domain->parse(contract(%{$bad{$label}})) }), 'ok', "rejects $label");
 }
-is(code_of(sub { Selecto::Domain->parse(contract(values => {labels => {rows => []}})) }), 'ok',
-    'groups this runtime does not execute are left for their runtime');
+isnt(code_of(sub { Selecto::Domain->parse(contract(values => {labels => {rows => []}})) }), 'ok',
+    'VALUES activation requires explicit projected columns');
 
 isnt(Selecto::Domain->parse(contract())->with_required_predicate(Selecto::Expression->eq('id', 1))->fingerprint,
     Selecto::Domain->parse(do { my $c = contract(); delete $c->{query_members}{unnests}; $c })

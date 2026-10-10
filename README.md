@@ -33,6 +33,27 @@ database you use:
 | Microsoft SQL Server | `mssql`      | `DBD::ODBC` 1.61+ (Unicode build) and an ODBC driver |
 | DuckDB               | `duckdb`     | `DBD::DuckDB` 0.16+                         |
 
+SQLite checks the connected library for CTEs (3.8.3), modern window frames
+(3.28.0), RETURNING/write graphs and bounded materialization (3.35.0), JSON1
+and FTS5. It supports typed computed values, JSON extraction and structural
+containment, JSON/array rowsets, UTC calendar formats and buckets, streaming,
+schema introspection and query plans. JSON containment distinguishes missing
+keys, null, booleans, numbers and strings recursively. JSON-backed typed
+arrays use the existing array builders.
+
+SQLite related collections support stable ordering, per-parent limits/cursors,
+scoped through relations and bounded API subtables. A child overflow refuses
+the whole response; successful subtable metadata includes `limit` and
+`complete=true`. Query execution and streaming preserve the supplied DBI
+handle's transaction and `query_only` state. Trusted adapter tools may use
+the explicitly named `execute_query_unsafe` method.
+
+FTS5 queries require a supplied root virtual table with fields declared
+`fts5` or `text_search_document`; plain/phrase modes quote input, while
+boolean/websearch modes use FTS5 query grammar. SQLite named timezones,
+LATERAL, rollups and row locks remain unsupported. Decimal calculations use
+SQLite floating-point semantics, with no fixed-scale guarantee.
+
 To install from a git checkout:
 
 ```sh
@@ -328,6 +349,11 @@ print $@->code, "\n";                                  # cardinality_mismatch
 
 `perldoc Selecto::Action` covers inputs, variants, bulk targets and
 single-use grants for confirm-then-execute flows.
+
+Domains can also declare all 27 portable DataRules operators and six text
+normalizers. Public writes and collection actions evaluate actual prospective
+stored candidates before dispatch. See [native rule admission](docs/data-rules-native.md)
+for input boundaries, resource limits and explicit SQLite refusals.
 
 ### Errors
 

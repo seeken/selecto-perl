@@ -2,6 +2,7 @@ package Selecto::SQL;
 
 use Mojo::Base 'Selecto::Adapter';
 use JSON::PP ();
+use B ();
 use Digest::SHA qw(sha1_hex);
 use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
@@ -10,11 +11,14 @@ use Selecto::Identifier ();
 use Selecto::InsertAdmission ();
 use Selecto::OperationBudget ();
 use Selecto::QueryEnforcement ();
+use Selecto::ConfiguredDomain ();
 use Selecto::Statement ();
 use Selecto::Stream ();
 use Selecto::Write ();
 use Selecto::Write::Expression ();
 use Selecto::Write::Authorization ();
+use Selecto::Write::Capabilities ();
+use Selecto::Write::Policy ();
 
 our @FEATURE_INVENTORY = qw(
     cte recursive_cte window_functions set_operations transactions returning rollup stream
@@ -40,7 +44,7 @@ sub begin_query_budget {
 }
 
 sub feature_inventory { return [@FEATURE_INVENTORY]; }
-sub write_capabilities { return { %WRITE_CAPABILITIES }; }
+sub write_capabilities { return { protocol_version => 1, %WRITE_CAPABILITIES }; }
 
 # Anonymous DBI parameters are separate occurrences, even when their values
 # happen to be equal. Dialects with reusable numbered parameters opt in.
@@ -55,6 +59,9 @@ sub quote_identifier {
 
 sub compile {
     my ($self, $domain, $query) = @_;
+    local $self->{_source_expansions} = $self->{_source_expansions} // {};
+    local $self->{_source_budget} = $self->{_source_budget}
+        // Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query');
     my $statement = $self->_compile_query($domain, $query);
     # Selecto::Engine::compile admits these parameters itself, with the same
     # limits, code and label, as soon as this returns.
@@ -75,6 +82,9 @@ sub _engine_admitted {
 
 sub _compile_query {
     my ($self, $domain, $query) = @_;
+    require Selecto::QueryPolicy;
+    $query = $self->_expand_query($domain, $query);
+    $query = Selecto::QueryPolicy->apply($domain, $query, $self->{_selecto_compile_limits});
     Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query')->check_tree(
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
         allowed_base_classes => ['Selecto::Query'])
@@ -150,14 +160,20 @@ sub _compile_single {
     my ($self, $domain, $query, %options) = @_;
     return $self->_compile_retargeted($domain, $query, %options)
         if defined $query->retarget_spec;
-    if (@{$query->members}) {
-        require Selecto::QueryMember;
-        $query = Selecto::QueryMember->expand($domain, $query);
-    }
+    $query = $self->_expand_query($domain, $query);
+    return $self->_compile_rollup($domain, $query, %options)
+        if $query->grouping_mode eq 'rollup' && $self->_emulates_rollup;
     local $self->{_root_alias} = $options{root_alias} // 's0';
     local $self->{_timezone} = $query->timezone;
+    local $self->{_read_prefix} = $domain->{_read_prefix};
     my $selections = $query->selections;
     Selecto::Error->throw('invalid_query', 'query must select at least one expression') unless @$selections;
+    my $physical = $self->_physical_relations($domain, $query);
+    my %cte_names;
+    for my $spec (@{$query->ctes}, @{$query->values_sources}) {
+        Selecto::Error->throw('invalid_query', 'CTE source cannot shadow a domain physical relation') if $physical->{lc $spec->{name}};
+        Selecto::Error->throw('invalid_query', 'duplicate CTE source') if $cte_names{lc $spec->{name}}++;
+    }
     my $sources = $self->_query_sources($domain, $query);
     local $self->{_query_sources} = $sources;
     my ($with_sql, $cte_params) = $self->_compile_cte_prefix($query);
@@ -171,7 +187,7 @@ sub _compile_single {
     local $self->{_through_aliases} = $through_aliases;
     $self->_validate_query_aliases($sources, @association_paths);
     $with_sql = $self->_append_values_ctes(
-        $with_sql, \@params, $domain, $sources, @association_paths,
+        $with_sql, \@params, $domain, $sources, $physical, \%cte_names, @association_paths,
     );
     my @columns = map { $self->_selection_name($_) } @$selections;
     my %column_counts;
@@ -203,8 +219,8 @@ sub _compile_single {
     my @projection;
     my @selection_sql = map {
         $selection_position++;
-        my $expression_sql = $self->_compile_expression(
-            $domain, $_, \@params, \%compiled_selections,
+        my $expression_sql = $self->_compile_selection_expression(
+            $domain, $_, \@params, \%compiled_selections, \%options,
         );
         $compiled_selections{_expression_key($_)} //= $expression_sql;
         $selection_positions{_expression_key($_)} //= $selection_position;
@@ -257,9 +273,9 @@ sub _compile_single {
                     $self->_qualified($target_alias, $through->{target_scope_key});
             }
             push @joins,
-                $keyword . ' (' . $self->quote_identifier($through->{table}) .
+                $keyword . ' (' . $self->_physical_source_sql($through->{table}) .
                 ' AS ' . $self->quote_identifier($bridge_alias) .
-                ' INNER JOIN ' . $self->quote_identifier($association->table) .
+                ' INNER JOIN ' . $self->_association_source_sql($association) .
                 ' AS ' . $self->quote_identifier($target_alias) .
                 ' ON ' . join(' AND ', @target_on) . ')' .
                 ' ON ' . join(' AND ', @bridge_on);
@@ -315,12 +331,16 @@ sub _compile_single {
         }
     }
     push @joins, @{$self->_compile_cte_joins($domain, $query)};
+    push @joins, @{$self->_compile_values_joins($domain, $query)};
+    push @joins, @{$self->_compile_subquery_joins($domain, $query, \@params)};
+    push @joins, @{$self->_compile_function_laterals($query, \@params)};
     push @joins, @{$self->_compile_lateral_joins($domain, $query, \@params)};
     push @joins, @{$self->_compile_json_rowsets($domain, $query, \@params)};
     push @joins, @{$self->_compile_array_rowsets($domain, $query, \@params)};
     push @joins, @{$options{extra_joins} // []};
     my $sql = 'SELECT ' . join(', ', @selection_sql) .
-        ' FROM ' . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier($self->_root_alias);
+        ' FROM ' . (defined($domain->{_read_prefix}) ? $self->quote_identifier($domain->{_read_prefix}) . '.' : '')
+            . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier($self->_root_alias);
     $sql .= ' ' . join(' ', @joins) if @joins;
     my @predicates;
     push @predicates, $self->_compile_expression($domain, $predicate, \@params) if $predicate;
@@ -414,6 +434,14 @@ sub _compile_single {
 # type calls for, or undef. The base adapter keeps nothing.
 sub _note_projection { return; }
 sub _canonical_kind { return undef; }
+sub _emulates_rollup { return 0; }
+
+# Dialects that emulate grouping sets may change projections without changing
+# the expressions used by WHERE, joins, or GROUP BY in an ordinary branch.
+sub _compile_selection_expression {
+    my ($self, $domain, $expression, $params, $compiled_selections) = @_;
+    return $self->_compile_expression($domain, $expression, $params, $compiled_selections);
+}
 
 # A retargeted query compiles on a domain rooted at the target relation. Its
 # context is an ordinary query on the original domain, under the original
@@ -453,30 +481,45 @@ sub _compile_retargeted {
 
 sub _association_source_sql {
     my ($self, $association) = @_;
-    return $self->quote_identifier($association->table);
+    return defined($association->values) ? $self->quote_identifier($association->table)
+        : $self->_physical_source_sql($association->table);
+}
+sub _physical_source_sql {
+    my ($self, $table) = @_;
+    return (defined($self->{_read_prefix}) ? $self->quote_identifier($self->{_read_prefix}) . '.' : '')
+        . $self->quote_identifier($table);
 }
 
 sub _append_values_ctes {
-    my ($self, $with_sql, $params, $domain, $sources, @paths) = @_;
+    my ($self, $with_sql, $params, $domain, $sources, $physical, $cte_names, @paths) = @_;
     my (@entries, %seen);
     for my $path (@paths) {
         my $association = $domain->resolve_association($path)->{association};
         my $rows = $association->values;
         next unless defined $rows;
         my $table = $association->table;
-        next if $seen{$table}++;
+        my $fields = $association->value_fields;
+        my $field_types = $association->fields;
+        my $payload = {rows => $rows, fields => $fields, types => $field_types};
+        my $signature = Selecto::ConfiguredDomain->digest($payload, {});
+        if (exists $seen{lc $table}) {
+            Selecto::Error->throw('invalid_query', 'inline VALUES sources with the same SQL identity must have identical declarations')
+                unless $seen{lc $table} eq $signature;
+            next;
+        }
+        $seen{lc $table} = $signature;
+        $self->{_source_budget}->check_tree($payload, label => 'inline VALUES source');
         Selecto::Error->throw(
             'invalid_query',
             "query source $table conflicts with an inline values relation",
-        ) if exists $sources->{$table};
+        ) if $physical->{lc $table} || $cte_names->{lc $table}
+            || grep { lc($_) eq lc($table) } keys %$sources;
         Selecto::Error->throw('unsupported_feature', 'adapter does not support values relations')
             unless $self->supports('cte');
-        my $fields = $association->value_fields;
         Selecto::Error->throw('invalid_domain', 'values relation has no fields')
             unless ref($fields) eq 'ARRAY' && @$fields;
         # Bound cells have no type of their own; without a cast the database
         # infers one (PostgreSQL: text), so integers would sort as strings.
-        my $field_types = $association->fields;
         my %casts = map {
             my $field = $_;
             my $cast = $self->_values_column_type_sql(
@@ -564,47 +607,125 @@ sub _renumber_dollar_placeholders {
     return $sql;
 }
 
+sub _expand_query {
+    my ($self, $domain, $query) = @_;
+    require Selecto::QueryBinding;
+    if (my $owner = Selecto::QueryBinding->owner($query)) {
+        Selecto::QueryBinding->validate($owner, $query);
+    }
+    return $query unless @{$query->members};
+    my $key = refaddr($domain) . ':' . refaddr($query);
+    return $self->{_source_expansions}{$key} if exists $self->{_source_expansions}{$key};
+    $self->{_source_budget}->consume_count('max_expression_nodes', 1, label => 'named source expansions');
+    require Selecto::QueryMember;
+    my $engine = Selecto::QueryBinding->owner($query) // $self->{_selecto_compile_engine};
+    my $has_set = @{$query->set_operations};
+    my $expanded = Selecto::QueryMember->expand($domain, $has_set ? $query->_set_base_query : $query, $engine);
+    $expanded = $expanded->_copy(set_operations => $query->set_operations, orders => $query->orders,
+        limit_value => $query->limit_value, offset_value => $query->offset_value) if $has_set;
+    $self->{_source_budget}->check_tree($expanded, label => 'expanded source query',
+        allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
+        allowed_base_classes => ['Selecto::Query']);
+    return $self->{_source_expansions}{$key} = $expanded;
+}
+
+sub _physical_relations {
+    my ($self, $domain, $query) = @_;
+    my (%physical, %visited);
+    my @pending = ([$domain, $query, {}, 0]);
+    while (my $entry = shift @pending) {
+        my ($current, $intent, $dependencies, $depth) = @$entry;
+        $self->{_source_budget}->consume_count('max_expression_nodes', 1, label => 'source proof work');
+        $self->{_source_budget}->limits->check_count('max_expression_depth', $depth, 'invalid_query', 'source proof depth');
+        my $key = refaddr($current) . ':' . refaddr($intent) . ':' . join(',', sort keys %$dependencies);
+        next if $visited{$key}++;
+        $intent = $self->_expand_query($current, $intent);
+        $physical{lc $current->table} = 1 unless $dependencies->{lc $current->table};
+        my @edges = values %{$current->associations};
+        while (my $edge = shift @edges) {
+            $self->{_source_budget}->consume_count('max_expression_nodes', 1, label => 'association proof work');
+            $physical{lc $edge->table} = 1 unless defined $edge->values;
+            my $bridge = $edge->through;
+            $physical{lc $bridge->{table}} = 1 if $bridge;
+            push @edges, values %{$edge->associations};
+        }
+        my %available;
+        for my $spec (@{$intent->ctes}) {
+            my $dependencies = $spec->{dependencies} // [];
+            Selecto::Error->throw('invalid_query', 'CTE dependencies must name earlier CTEs')
+                unless ref($dependencies) eq 'ARRAY' && !grep { ref($_) || !exists($available{lc $_}) } @$dependencies;
+            my %authorized = map { (lc($_) => 1) } @$dependencies;
+            if ($authorized{lc $spec->{domain}->table}) {
+                my @expected = sort @{$available{lc $spec->{domain}->table}};
+                my @actual = sort keys %{$spec->{domain}->fields};
+                Selecto::Error->throw('invalid_query', 'dependent CTE domain must match the earlier projection')
+                    unless join("\0", @expected) eq join("\0", @actual);
+            }
+            push @pending, map { [$spec->{domain}, $_, \%authorized, $depth + 1] }
+                grep { defined } @{$spec}{qw(query anchor recursive_query)};
+            $available{lc $spec->{name}} = $spec->{columns};
+        }
+        push @pending, map { [$_->{domain}, $_->{query}, {}, $depth + 1] }
+            (@{$intent->lateral_joins}, @{$intent->subqueries});
+        push @pending, map { [$current, $_->{query}, $dependencies, $depth + 1] } @{$intent->set_operations};
+    }
+    return \%physical;
+}
+
 sub _query_sources {
     my ($self, $domain, $query) = @_;
     my %sources;
     my $domain_associations = $domain->associations;
-    for my $spec (@{$query->ctes}, @{$query->lateral_joins}) {
+    my $register = sub {
+        my ($name, $fields) = @_;
+        Selecto::Error->throw('invalid_query', "duplicate query source $name")
+            if grep { lc($_) eq lc($name) } keys %sources;
+        Selecto::Error->throw('invalid_query', "query source $name conflicts with a domain relationship")
+            if grep { lc($_) eq lc($name) } keys %$domain_associations;
+        $sources{$name} = $fields;
+    };
+    for my $spec (grep { defined($_->{join}) } @{$query->ctes}) {
         Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
             if exists $domain_associations->{$spec->{name}};
-        $sources{$spec->{name}} = {map { $_ => 1 } @{$spec->{columns}}};
+        $register->($spec->{name}, {map { $_ => 1 } @{$spec->{columns}}});
+    }
+    for my $spec (@{$query->lateral_joins}, @{$query->values_sources}, @{$query->subqueries}, @{$query->function_laterals}) {
+        Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
+            if exists $domain_associations->{$spec->{name}};
+        $register->($spec->{name}, {map { $_ => 1 } @{$spec->{columns}}});
     }
     for my $spec (@{$query->json_rowsets}) {
         Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
             if exists $domain_associations->{$spec->{name}};
-        $sources{$spec->{name}} = {map { $_ => 1 } keys %{$spec->{columns}}};
+        $register->($spec->{name}, {map { $_ => 1 } keys %{$spec->{columns}}});
     }
     for my $spec (@{$query->array_rowsets}) {
         Selecto::Error->throw('invalid_query', "query source $spec->{name} conflicts with a domain relationship")
             if exists $domain_associations->{$spec->{name}};
-        $sources{$spec->{name}} = {value => 1, (defined($spec->{ordinality}) ? ($spec->{ordinality} => 1) : ())};
+        $register->($spec->{name}, {value => 1, (defined($spec->{ordinality}) ? ($spec->{ordinality} => 1) : ())});
     }
     return \%sources;
 }
 
 sub _validate_query_aliases {
     my ($self, $sources, @association_paths) = @_;
-    my %internal = ($self->_root_alias => 1);
+    my %internal = (lc($self->_root_alias) => 1);
     for my $path (@association_paths) {
-        $internal{$self->_join_alias($path)} = 1;
-        $internal{$self->_through_alias($path)} = 1;
+        $internal{lc $self->_join_alias($path)} = 1;
+        $internal{lc $self->_through_alias($path)} = 1;
     }
     for my $name (sort keys %$sources) {
         Selecto::Error->throw(
             'invalid_query',
             "query source $name conflicts with an internal relation alias",
-        ) if $internal{$name};
+        ) if $internal{lc $name};
     }
 }
 
 sub _compile_cte_prefix {
     my ($self, $query) = @_;
     my $ctes = $query->ctes;
-    return ('', []) unless @$ctes;
+    return ('', []) unless @$ctes || @{$query->values_sources};
     Selecto::Error->throw('unsupported_feature', 'adapter does not support CTEs')
         unless $self->supports('cte');
     my (@entries, @params);
@@ -663,6 +784,24 @@ sub _compile_cte_prefix {
             join(', ', map { $self->quote_identifier($_) } @$columns) .
             ") AS ($body)";
     }
+    for my $spec (@{$query->values_sources}) {
+        my @rows;
+        for my $row (@{$spec->{rows}}) {
+            my @cells;
+            for my $value (@$row) {
+                push @params, $value;
+                my $sql = $self->placeholder(scalar @params);
+                my $type = _numeric_scalar_type($value);
+                $sql = 'CAST(' . $sql . ' AS ' . ($type eq 'INTEGER' ? 'BIGINT' : 'DOUBLE PRECISION') . ')' if defined $type;
+                push @cells, $sql;
+            }
+            push @rows, 'SELECT ' . join(', ', @cells);
+        }
+        push @rows, 'SELECT ' . join(', ', map { 'NULL' } @{$spec->{columns}}) . ' WHERE 1 = 0' unless @rows;
+        push @entries, $self->quote_identifier($spec->{name}) . ' ('
+            . join(', ', map { $self->quote_identifier($_) } @{$spec->{columns}}) . ') AS ('
+            . join(' UNION ALL ', @rows) . ')';
+    }
     return (
         'WITH ' . ($recursive ? 'RECURSIVE ' : '') . join(', ', @entries) . ' ',
         \@params,
@@ -699,6 +838,7 @@ sub _compile_cte_joins {
     my @joins;
     for my $spec (@{$query->ctes}) {
         my $join = $spec->{join};
+        next unless defined $join;
         my $owner = $domain->resolve($join->{owner_key});
         Selecto::Error->throw('invalid_query', 'CTE owner key must be a root field')
             if $owner->{association};
@@ -712,6 +852,61 @@ sub _compile_cte_joins {
     return \@joins;
 }
 
+sub _compile_values_joins {
+    my ($self, $domain, $query) = @_;
+    my @joins;
+    for my $spec (@{$query->values_sources}) {
+        my $join = $spec->{join};
+        my $sql = (defined($join) ? uc($join->{type}) . ' JOIN ' : 'CROSS JOIN ')
+            . $self->quote_identifier($spec->{name}) . ' AS ' . $self->quote_identifier($spec->{name});
+        if ($join) {
+            my $owner = $domain->resolve($join->{owner_key});
+            Selecto::Error->throw('invalid_query', 'VALUES owner key must be a root field') if $owner->{association};
+            $sql .= ' ON ' . $self->_qualified($self->_root_alias, $join->{owner_key}) . ' = '
+                . $self->_qualified($spec->{name}, $join->{related_key});
+        }
+        push @joins, $sql;
+    }
+    return \@joins;
+}
+sub _compile_subquery_joins {
+    my ($self, $domain, $query, $params) = @_;
+    my @joins;
+    for my $spec (@{$query->subqueries}) {
+        my $statement = $self->compile($spec->{domain}, $spec->{query});
+        Selecto::Error->throw('invalid_query', 'subquery projection must match declared columns')
+            unless @{$statement->columns} == @{$spec->{columns}}
+                && join("\0", @{$statement->columns}) eq join("\0", @{$spec->{columns}});
+        my $body = $self->_shift_placeholders($statement->sql, scalar @$params);
+        push @$params, @{$statement->params};
+        my @on;
+        for my $condition (@{$spec->{on}}) {
+            my $owner = $domain->resolve($condition->{left});
+            Selecto::Error->throw('invalid_query', 'subquery owner key must be a root field') if $owner->{association};
+            push @on, $self->_qualified($self->_root_alias, $condition->{left}) . ' = '
+                . $self->_qualified($spec->{name}, $condition->{right});
+        }
+        push @joins, uc($spec->{type}) . ' JOIN (' . $body . ') AS ' . $self->quote_identifier($spec->{name})
+            . ' ON ' . join(' AND ', @on);
+    }
+    return \@joins;
+}
+sub _compile_function_laterals {
+    my ($self, $query, $params) = @_;
+    my $plans = $query->function_laterals;
+    return [] unless @$plans;
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support function lateral sources')
+        unless $self->supports('lateral_join');
+    my @joins;
+    for my $spec (@$plans) {
+        my @arguments = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$spec->{arguments}};
+        push @joins, uc($spec->{type}) . ' JOIN LATERAL ' . $self->quote_identifier($spec->{function})
+            . '(' . join(', ', @arguments) . ') AS ' . $self->quote_identifier($spec->{name})
+            . ' (' . join(', ', map { $self->quote_identifier($_) } @{$spec->{columns}}) . ')'
+            . ($spec->{type} eq 'cross' ? '' : ' ON TRUE');
+    }
+    return \@joins;
+}
 sub _compile_lateral_joins {
     my ($self, $domain, $query, $params) = @_;
     my $laterals = $query->lateral_joins;
@@ -907,9 +1102,13 @@ sub _statement_cache_enabled { return 0; }
 
 sub preview_write {
     my ($self, $command) = @_;
+    Selecto::Write::Capabilities->preflight($self, $command);
+    $self->_validate_write_cardinality($command);
     my $statement = $self->_compile_write($command);
     return { sql => $statement->{sql}, params => [@{$statement->{params}}] };
 }
+
+sub _admit_plan_storage { return; }
 
 # Execution requires the engine's authorization for the exact object; see
 # Selecto::Write::Authorization. The *_unsafe variants skip domain governance
@@ -932,17 +1131,35 @@ sub execute_graph {
     return $self->execute_graph_unsafe($graph);
 }
 
+sub execute_transaction {
+    my ($self, $request, $authorization) = @_;
+    Selecto::Write::Authorization->require_for($request, $authorization);
+    Selecto::Error->throw('invalid_write', 'transaction work requires engine authority')
+        unless blessed($request) && $request->isa('Selecto::Write::Transaction') && ref($request->{work}) eq 'CODE';
+    if ($self->transaction_mode eq 'external') {
+        Selecto::Error->throw('invalid_adapter', 'protected rules require an open host transaction')
+            unless $self->_transaction_open;
+        return $self->_savepoint_transaction($request->{work});
+    }
+    return $self->_transaction($request->{work});
+}
+
 sub execute_write_unsafe {
     my ($self, $command) = @_;
+    Selecto::Write::Capabilities->preflight($self, $command);
+    $self->_validate_write_cardinality($command);
     my $compiled = $self->_compile_write($command);
     return $self->_transaction(sub { return $self->_execute_compiled_write_in_transaction($command, $compiled); });
 }
 
 sub execute_batch_unsafe {
     my ($self, $batch) = @_;
+    Selecto::Write::Capabilities->preflight($self, $batch);
     my @commands = @{$batch->commands};
+    $self->_validate_write_cardinality($_) for @commands;
     my @compiled = map { $self->_compile_write($_) } @commands;
     return $self->_transaction(sub {
+        $self->_admit_plan_storage(\@commands);
         my @results = map { $self->_execute_compiled_write_in_transaction($commands[$_], $compiled[$_]) } 0 .. $#commands;
         return \@results;
     });
@@ -950,12 +1167,18 @@ sub execute_batch_unsafe {
 
 sub execute_graph_unsafe {
     my ($self, $graph) = @_;
+    Selecto::Write::Capabilities->preflight($self, $graph);
+    $self->_validate_write_cardinality($_->{command}) for @{$graph->nodes};
+    $self->_validate_write_cardinality($_->{cleanup}) for @{$graph->{_governed_owned_sets} // []};
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
         unless blessed($graph) && $graph->isa('Selecto::Write::Graph');
     Selecto::Error->throw('write_capability_missing', 'adapter does not support write graphs')
         unless $self->write_capabilities->{write_graph};
 
-    return $self->_transaction(sub {
+    my $work = sub {
+        $self->_admit_plan_storage([map { $_->{command} } grep { !$_->{reference_only} } @{$graph->nodes}],
+            [map { $_->{cleanup} } @{$graph->{_governed_owned_sets} // []}]);
+        $self->_admit_graph_storage($graph) if $self->can('_admit_graph_storage');
         my %results;
         for my $node (@{$graph->nodes}) {
             my $operation = $node->{command}->operation;
@@ -1013,6 +1236,21 @@ sub execute_graph_unsafe {
             $command = $command->with_scope_predicate(
                 @scopes == 1 ? $scopes[0] : Selecto::Expression->all(@scopes)
             ) if @scopes;
+            if ($node->{reference_only}) {
+                my $domain = $graph->{_reference_domains}{$node->{id}};
+                Selecto::Error->throw('ungoverned_write', 'read anchor requires its governing domain') unless $domain;
+                my @fields = @{$command->metadata->{returning} // [$domain->primary_key]};
+                @fields = ($domain->primary_key) unless @fields;
+                my $predicate = Selecto::QueryEnforcement::combine($command->predicate,
+                    $command->scope_predicate, $command->query_enforcement ? $command->query_enforcement->predicate : undef);
+                my $query = Selecto::Query->new->select(@fields)->limit(2);
+                $query = $query->where($predicate) if defined $predicate;
+                my $rows = $self->execute_query($self->compile($domain, $query))->{rows};
+                Selecto::Error->throw('cardinality_mismatch', 'read anchor must resolve exactly one governed row') unless @$rows == 1;
+                $results{$node->{id}} = Selecto::Write::Result->new(operation => 'update', affected_rows => 0,
+                    values => {map { ($fields[$_] => $rows->[0][$_]) } 0 .. $#fields});
+                next;
+            }
             my $compiled = $self->_compile_write($command);
             my ($result, $ok);
             $ok = eval {
@@ -1024,9 +1262,66 @@ sub execute_graph_unsafe {
             die _graph_node_error($self, $@, $node->{id}) unless $ok;
             $results{$node->{id}} = $result;
         }
+        my @cleanup;
+        if (@{$graph->owned_sets}) {
+            Selecto::Error->throw('invalid_write_graph', 'owned sets require engine-derived cleanup')
+                unless $self->write_capabilities->{owned_set_sync}
+                    && ref($graph->{_governed_owned_sets}) eq 'ARRAY'
+                    && @{$graph->{_governed_owned_sets}} == @{$graph->owned_sets};
+            my %nodes = map { ($_->{id} => $_) } @{$graph->nodes};
+            for my $set (reverse @{$graph->{_governed_owned_sets}}) {
+                my $parent = $results{$set->{parent}}->values->{$set->{parent_key}};
+                Selecto::Error->throw('generated_value_missing', 'owned sync parent did not return its exact key')
+                    unless defined($parent) && !ref($parent);
+                my (%seen, @kept);
+                for my $id (@{$set->{nodes}}) {
+                    next if $nodes{$id}{command}->operation eq 'delete';
+                    my $values = $results{$id}->values;
+                    Selecto::Error->throw('generated_value_missing', 'owned sync row identity is incomplete')
+                        if grep { !exists($values->{$_}) || !defined($values->{$_}) || ref($values->{$_}) }
+                            @{$set->{identity_fields}};
+                    my @identity = map {
+                        my $type = $nodes{$id}{command}->metadata->{__selecto_insert_types}{$_};
+                        Selecto::InsertAdmission::_value(lc($type // ''), $values->{$_}, $_)
+                    } @{$set->{identity_fields}};
+                    my $key = JSON::PP->new->canonical->encode([map { "$_" } @identity]);
+                    Selecto::Error->throw('invalid_write_graph', 'owned sync contains duplicate returned identities')
+                        if $seen{$key}++;
+                    push @kept, Selecto::Expression->all(map {
+                        Selecto::Expression->eq($set->{identity_fields}[$_], $identity[$_])
+                    } 0 .. $#identity);
+                }
+                my $predicate = Selecto::Expression->eq($set->{child_key}, $parent);
+                $predicate = Selecto::Expression->all($predicate,
+                    Selecto::Expression->not(Selecto::Expression->any(@kept))) if @kept;
+                my $command = $set->{cleanup}->_with(predicate => $predicate);
+                push @cleanup, $self->_execute_compiled_write_in_transaction($command, $self->_compile_write($command));
+            }
+        }
         my $root = $graph->nodes->[0]{id};
-        return Selecto::Write::Graph::Result->new(nodes => \%results, root => $results{$root});
-    });
+        # Generated keys remain available until every binding and owned-set
+        # cleanup has finished. Only then apply the separately governed public
+        # projection; graph metadata never controls result visibility.
+        for my $node (@{$graph->nodes}) {
+            my $returning=$graph->public_returning($node->{id});
+            next unless defined $returning; # Preserve legacy absent intent.
+            my $result=$results{$node->{id}};
+            my $values=$result->values;
+            $results{$node->{id}}=Selecto::Write::Result->new(
+                operation=>$result->operation,affected_rows=>$result->affected_rows,
+                values=>{map { exists($values->{$_}) ? ($_=>$values->{$_}) : () } @$returning},
+                metadata=>$result->metadata);
+        }
+        return Selecto::Write::Graph::Result->new(nodes => \%results, root => $results{$root},
+            metadata => {owned_sync => scalar(@cleanup), cleanup_affected_rows =>
+                [map { $_->affected_rows } @cleanup]});
+    };
+    if (@{$graph->owned_sets} && $self->transaction_mode eq 'external') {
+        Selecto::Error->throw('invalid_adapter', 'owned sync requires an open host transaction')
+            unless $self->_transaction_open;
+        return $self->_savepoint_transaction($work);
+    }
+    return $self->_transaction($work);
 }
 
 sub _graph_node_error {
@@ -1104,8 +1399,25 @@ sub _value_key {
         if ref($value) eq 'ARRAY';
     return 'h:{' . join(',', map { _value_key($_) . '=' . _value_key($value->{$_}) } sort keys %$value) . '}'
         if ref($value) eq 'HASH';
-    return 's:' . length("$value") . ':' . "$value" unless ref($value);
+    unless (ref($value)) {
+        my $type = _numeric_scalar_type($value);
+        return (defined($type) ? 'n:' . $type . ':' : 's:') . length("$value") . ':' . "$value";
+    }
     return 'r:' . ref($value);
+}
+
+# Match JSON's scalar distinction. A numeric-looking authored string keeps its
+# string identity, including when Perl has cached a numeric interpretation.
+sub _numeric_scalar_type {
+    my ($value) = @_;
+    return undef unless defined $value;
+    return 'INTEGER' if JSON::PP::is_bool($value);
+    return undef if ref($value);
+    my $flags = B::svref_2object(\$value)->FLAGS;
+    return undef if $flags & B::SVp_POK();
+    return 'INTEGER' if $flags & B::SVf_IOK();
+    return 'REAL' if $flags & (B::SVp_NOK() | B::SVp_IOK());
+    return undef;
 }
 
 sub _selection_name {
@@ -1136,6 +1448,8 @@ sub _compile_expression {
     }
     my $kind = $expression->kind;
     my $arguments = $expression->arguments;
+    Selecto::Error->throw('raw_sql_forbidden', 'raw SQL is outside governed expressions', {path => []})
+        if $kind eq 'raw_sql';
     return $self->_field_sql($domain, $arguments->[0], $params) if $kind eq 'field';
     if ($kind eq 'recursion_depth') {
         # Internal level counter of a depth-bounded recursive CTE.
@@ -1207,7 +1521,7 @@ sub _compile_expression {
             unless blessed($operand) && $operand->kind eq 'field'
                 && ($domain->resolve($operand->arguments->[0])->{type} // '') =~ /\Ajsonb?\z/i;
         my $operand_sql = $self->_compile_expression($domain, $operand, $params);
-        push @$params, JSON::PP->new->canonical(1)->encode($arguments->[1]);
+        push @$params, JSON::PP->new->canonical(1)->allow_nonref(1)->encode($arguments->[1]);
         return $self->_compile_json_contains(
             $operand_sql, $self->placeholder(scalar @$params),
         );
@@ -1452,6 +1766,7 @@ sub _compile_related_collection_at {
         if ($field->{expression}->kind eq 'related_collection') {
             push @collection_fields, {
                 key => "$field->{key}",
+                type => 'json',
                 sql => $self->_compile_related_collection_at(
                     $domain,
                     $field->{expression},
@@ -1476,12 +1791,13 @@ sub _compile_related_collection_at {
         push @collection_fields, {
             key => "$field->{key}",
             sql => $self->_compile_expression($domain, $field->{expression}, $params),
+            ($field->{expression}->kind eq 'field' ? (type => $resolved->{type}) : ()),
             (exists($field->{stringify}) ? (stringify => $field->{stringify}) : ()),
         };
     }
 
     my $quoted_alias = $self->quote_identifier($alias);
-    my $table = $self->quote_identifier($association->table);
+    my $table = $self->_association_source_sql($association);
     my $related_key = $quoted_alias . '.' . $self->quote_identifier($association->related_key);
     my $owner_key = $self->quote_identifier($parent_alias) . '.' .
         $self->quote_identifier($association->owner_key);
@@ -1495,7 +1811,7 @@ sub _compile_related_collection_at {
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
         my $quoted_bridge_alias = $self->quote_identifier($bridge_alias);
-        my $bridge_table = $self->quote_identifier($through->{table});
+        my $bridge_table = $self->_physical_source_sql($through->{table});
         my @target_on = (
             $quoted_bridge_alias . '.' . $self->quote_identifier($through->{related_key}) .
             ' = ' . $self->_join_target_key($related_key, $through->{target_key_cast}),
@@ -1564,7 +1880,7 @@ sub _compile_related_collection_at {
         unless ref($orders) eq 'ARRAY';
     Selecto::Error->throw(
         'unsupported_feature', 'ordered related collections require a certified dialect',
-    ) if @$orders && $self->name ne 'postgresql';
+    ) if @$orders && $self->name ne 'postgresql' && !$self->supports('ordered_related_collections');
     my @order_sql;
     for my $spec (@$orders) {
         my ($field, $direction) = ref($spec) eq 'ARRAY' ? @$spec : ();
@@ -1574,7 +1890,7 @@ sub _compile_related_collection_at {
             && exists($association_fields->{$field})
             && defined($direction) && !ref($direction)
             && "$direction" =~ /\A(?:asc|desc)\z/i;
-        push @order_sql, $self->_qualified($alias, $field) . ' ' . uc($direction);
+        push @order_sql, $self->_related_collection_order_term($alias, $field, $direction);
     }
     my $order = @order_sql ? join(', ', @order_sql)
         : defined($association->target_primary_key)
@@ -1587,15 +1903,15 @@ sub _compile_related_collection_at {
         Selecto::Error->throw('invalid_query', 'per-parent collection limit is invalid')
             unless !ref($limit) && "$limit" =~ /\A[1-9][0-9]*\z/ && @order_sql;
         Selecto::Error->throw(
-            'unsupported_feature', 'per-parent collection limits require PostgreSQL',
-        ) unless $self->name eq 'postgresql';
+            'unsupported_feature', 'per-parent collection limits require a certified dialect',
+        ) unless $self->name eq 'postgresql' || $self->supports('bounded_related_collections');
         my $primary_key = $association->target_primary_key;
         Selecto::Error->throw(
             'invalid_query', 'per-parent collection limit requires a target primary key',
         ) unless defined($primary_key) && exists($association_fields->{$primary_key});
         my @stable_orders = map { [$_->[0], lc($_->[1])] } @$orders;
         if (!grep { $_->[0] eq $primary_key } @$orders) {
-            push @order_sql, $self->_qualified($alias, $primary_key) . ' ASC';
+            push @order_sql, $self->_related_collection_order_term($alias, $primary_key, 'asc');
             push @stable_orders, [$primary_key, 'asc'];
             $order = join(', ', @order_sql);
         }
@@ -1623,6 +1939,11 @@ sub _compile_related_collection_at {
         where => $where,
         order => $order,
     });
+}
+
+sub _related_collection_order_term {
+    my ($self, $alias, $field, $direction) = @_;
+    return $self->_qualified($alias, $field) . ' ' . uc($direction);
 }
 
 sub _related_collection_cursor_predicate {
@@ -1681,6 +2002,7 @@ sub _related_collection_json_pairs {
         my $sql = $self->_related_collection_value_sql($_);
         $sql = "($sql)::text"
             if $exact_decimals_as_text
+                && !$_->{stringify}
                 && defined($_->{type})
                 && $_->{type} =~ /\A(?:decimal|numeric|number)\z/;
         "'$key', $sql"
@@ -1856,7 +2178,7 @@ sub _compile_computed_field {
     push @predicates, $self->_constant_join_predicates(
         $alias, $association->where, $params
     );
-    return 'EXISTS (SELECT 1 FROM ' . $self->quote_identifier($association->table) .
+    return 'EXISTS (SELECT 1 FROM ' . $self->_association_source_sql($association) .
         ' AS ' . $self->quote_identifier($alias) . ' WHERE ' .
         join(' AND ', @predicates) . ')';
 }
@@ -2082,6 +2404,7 @@ sub _qualified {
 
 sub _compile_write {
     my ($self, $command) = @_;
+    $self->_validate_write_cardinality($command);
     my $relation = Selecto::Identifier::checked($command->relation);
     my $operation = $command->operation;
     my $assignments = $command->assignments;
@@ -2133,8 +2456,8 @@ sub _compile_write {
             my $updates = $metadata->{upsert_update_fields};
             Selecto::Error->throw('invalid_write', 'upsert conflict target must be a non-empty string array')
                 unless ref($conflict) eq 'ARRAY' && @$conflict && !grep { ref($_) } @$conflict;
-            Selecto::Error->throw('invalid_write', 'upsert update fields must be a non-empty string array')
-                unless ref($updates) eq 'ARRAY' && @$updates && !grep { ref($_) } @$updates;
+            Selecto::Error->throw('invalid_write', 'upsert update fields must be a string array')
+                unless ref($updates) eq 'ARRAY' && !grep { ref($_) } @$updates;
             $sql .= $self->_compile_upsert_clause($conflict, $updates);
         }
         return $self->_append_returning($sql, \@params, $command);
@@ -2185,18 +2508,19 @@ sub _compile_foreign_key_guards {
     my $alias = $self->quote_identifier('selecto_fk_parent');
     return join ' AND ', map {
         my $guard = $_;
-        Selecto::Error->throw('invalid_write', 'foreign-key guard must name its parent and tenants')
+        Selecto::Error->throw('invalid_write', 'foreign-key guard must name its parent and literal value')
             unless ref($guard) eq 'HASH' && defined($guard->{value}) && !ref($guard->{value})
-                && ref($guard->{tenants}) eq 'ARRAY' && @{$guard->{tenants}}
-                && !grep { !defined($_) || ref($_) } @{$guard->{tenants}};
+                && (!exists($guard->{tenant_field}) && !exists($guard->{tenants})
+                    || defined($guard->{tenant_field}) && ref($guard->{tenants}) eq 'ARRAY'
+                        && @{$guard->{tenants}} && !grep { !defined($_) || ref($_) } @{$guard->{tenants}});
         push @$params, $guard->{value};
         my $value = $self->placeholder(scalar @$params);
-        my @tenants = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$guard->{tenants}};
+        my @tenants = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$guard->{tenants}//[]};
         $self->_foreign_key_exists_sql(
             'SELECT 1 FROM ' . $self->quote_identifier(Selecto::Identifier::checked($guard->{relation})) . " AS $alias"
             . " WHERE $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{target_field})) . " = $value"
-            . " AND $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{tenant_field}))
-            . (@tenants == 1 ? " = $tenants[0]" : ' IN (' . join(', ', @tenants) . ')'),
+            . (@tenants ? " AND $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{tenant_field}))
+                . (@tenants == 1 ? " = $tenants[0]" : ' IN (' . join(', ', @tenants) . ')') : ''),
         );
     } @guards;
 }
@@ -2434,8 +2758,52 @@ sub _typed_insert_admission_probe {
         {truth_value => 'false_or_unknown'}) unless defined($row[0]) && "$row[0]" eq '1';
 }
 
+# Resolve declared cardinality independently of SQL rendering. A caller's
+# legacy exact count remains an additional constraint; trusted engine ceilings
+# bound both probes and the final effect, even for an otherwise unbounded range.
+sub _validate_write_cardinality {
+    my ($self, $command) = @_;
+    my $metadata = $command->metadata;
+    my $declared = exists $metadata->{expected_cardinality};
+    my $expected = $command->expected_count;
+    my ($minimum, $maximum) = (0, undef);
+    if ($declared) {
+        ($minimum, $maximum) = @{Selecto::Write::Policy->cardinality_bounds($metadata->{expected_cardinality})};
+        Selecto::Error->throw('invalid_expected_cardinality', 'legacy count conflicts with declared write cardinality')
+            if defined($expected) && (ref($expected) || "$expected" !~ /\A\d{1,9}\z/
+                || $expected < $minimum || defined($maximum) && $expected > $maximum);
+    }
+    if (exists $metadata->{__selecto_primary_key}) {
+        my $ceiling = $metadata->{__selecto_write_limit} // 1000;
+        Selecto::Error->throw('invalid_write', 'write row ceiling must be a positive integer')
+            if ref($ceiling) || "$ceiling" !~ /\A[1-9]\d{0,8}\z/;
+        Selecto::Error->throw('invalid_write', 'write cardinality requires a finite nonnegative integer')
+            if defined($expected) && (ref($expected) || "$expected" !~ /\A\d{1,9}\z/);
+        Selecto::Error->throw('invalid_write', 'write cardinality exceeds the trusted row ceiling')
+            if defined($expected) && $expected > $ceiling || $minimum > $ceiling;
+        $maximum = 0 + $ceiling if !defined($maximum) || $maximum > $ceiling;
+    }
+    if (defined $expected) {
+        $minimum = 0 + $expected;
+        $maximum = 0 + $expected;
+    }
+    return { minimum => $minimum, maximum => $maximum, declared => $declared,
+        expected => $declared ? $metadata->{expected_cardinality} : $expected };
+}
+
+sub _check_write_cardinality {
+    my ($self, $command, $affected, $bounds) = @_;
+    $bounds //= $self->_validate_write_cardinality($command);
+    Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
+        { expected => $bounds->{expected} })
+        if $affected < $bounds->{minimum} || defined($bounds->{maximum}) && $affected > $bounds->{maximum};
+    return 1;
+}
+
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
+    my $bounds = $self->_validate_write_cardinality($command);
+    $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
     my $bounded = $self->_bounded_write_command($command);
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
@@ -2456,25 +2824,24 @@ sub _execute_compiled_write_in_transaction {
                 if !@row && eval { $sth->err };
             # A guarded write that yields no row was refused by its guard.
             _guarded_cardinality($command, 0) if !@row && @{$command->foreign_key_guards};
-            Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
-            @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row);
+            $self->_check_write_cardinality($command, 0, $bounds) unless @row;
+            Selecto::Error->throw('write_returning_missing', 'write did not return the requested row')
+                if !@row && !$bounds->{declared};
+            @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row) if @row;
             # RETURNING emits one row per affected row. Some DBI drivers report
             # provisional counts until the result is exhausted. Drain before
-             # checking cardinality or committing, retaining only the first row.
-             my $returned = 1;
-             while (my @remaining = $sth->fetchrow_array) { ++$returned; }
-             $affected = $self->_logical_affected_rows($command->operation, $returned);
-         } else {
-             $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
+            # checking cardinality or committing, retaining only the first row.
+            my $returned = @row ? 1 : 0;
+            while (my @remaining = $sth->fetchrow_array) { ++$returned; }
+            die _dbi_error($sth, 'database returning fetch failed') if eval { $sth->err };
+            $affected = $self->_logical_affected_rows($command->operation, $returned);
+        } else {
+            $affected = $self->_logical_affected_rows($command->operation, 0 + $sth->rows);
         }
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    if (defined($command->expected_count) && $affected != $command->expected_count) {
-        Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows', {
-            expected => $command->expected_count,
-        });
-    }
+    $self->_check_write_cardinality($command, $affected, $bounds);
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
@@ -2489,15 +2856,8 @@ sub _bounded_write_command {
     # authorization. Explicit *_unsafe calls remain a trusted adapter escape.
     return $command unless exists $metadata->{__selecto_primary_key};
     my $key = Selecto::Identifier::checked($metadata->{__selecto_primary_key});
-    my $maximum = $metadata->{__selecto_write_limit} // 1000;
-    my $expected = $command->expected_count;
-    Selecto::Error->throw('invalid_write', 'write cardinality requires a finite nonnegative integer')
-        if defined($expected) && (ref($expected) || "$expected" !~ /\A\d{1,9}\z/);
-    Selecto::Error->throw('invalid_write', 'write row ceiling must be a positive integer')
-        if ref($maximum) || "$maximum" !~ /\A[1-9]\d{0,8}\z/;
-    Selecto::Error->throw('invalid_write', 'write cardinality exceeds the trusted row ceiling')
-        if defined($expected) && $expected > $maximum;
-    my $limit = defined($expected) ? 0 + $expected : 0 + $maximum;
+    my $bounds = $self->_validate_write_cardinality($command);
+    my $limit = $bounds->{maximum};
     my $predicate = Selecto::QueryEnforcement::combine(
         $command->predicate, $command->scope_predicate,
         defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
@@ -2552,13 +2912,11 @@ sub _bounded_write_command {
         Selecto::Error->throw('query_budget_restore_failed', 'bounded write could not restore its execution scope');
     }
     die $error unless $ok;
-    Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
-        {defined($expected) ? (expected => $expected) : ()})
-        if @keys > $limit || (defined($expected) && @keys != $expected);
+    $self->_check_write_cardinality($command, scalar(@keys), $bounds);
     # Keep every original scope and precondition, then constrain DML to the
     # exact locked keys. New matching rows can never join this mutation.
     my $keys = @keys ? Selecto::Expression->in($key, \@keys)
-        : Selecto::Expression->and(Selecto::Expression->is_null($key), Selecto::Expression->not_null($key));
+        : Selecto::Expression->all(Selecto::Expression->is_null($key), Selecto::Expression->not_null($key));
     return $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $keys));
 }
@@ -2820,8 +3178,9 @@ sub _compile_timezone_sql {
 
 sub _compile_upsert_clause {
     my ($self, $conflict, $updates) = @_;
-    return ' ON CONFLICT (' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$conflict) .
-        ') DO UPDATE SET ' . join(', ', map {
+    my $target = ' ON CONFLICT (' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$conflict) . ')';
+    return $target . ' DO NOTHING' unless @$updates;
+    return $target . ' DO UPDATE SET ' . join(', ', map {
             my $field = Selecto::Identifier::checked($_);
             $self->quote_identifier($field) . ' = EXCLUDED.' . $self->quote_identifier($field)
         } @$updates);

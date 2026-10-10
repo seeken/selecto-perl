@@ -9,15 +9,31 @@ use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Limits ();
 use Selecto::OperationBudget ();
+use Hash::Util::FieldHash qw(fieldhash);
+use Selecto::ConfiguredDomain ();
+
+fieldhash my %PREPARED_POLICY;
+sub _assert_prepared_policy {
+    my ($engine, $prepared) = @_;
+    $engine->_ensure_read_scope;
+    my $record = ref($prepared) eq 'HASH' && $PREPARED_POLICY{$prepared};
+    return unless $engine->_has_read_tenant_policy || $record && $record->{tenant_policy};
+    Selecto::Error->throw('domain_modified_after_configuration', 'prepared read policy is absent or changed', {path => []})
+        unless $record && $record->{policy} eq $engine->_read_policy_identity
+            && $record->{statement} eq Selecto::ConfiguredDomain->prepared_digest($prepared);
+}
 
 # HTTP-neutral finite result consumption. Dialects own transfer guards; a host
 # adapter must explicitly implement that capability, bounded streaming and a
 # real database deadline. A post-fetch byte check is not a buffering capability.
 sub prepare {
     my ($class, $engine, $query, %args) = @_;
+    $engine->assert_domain_identity;
     my $limits = _limits($engine, $args{limits});
     my $adapter = $engine->adapter;
     _capabilities($adapter);
+    require Selecto::QueryPolicy;
+    $query = Selecto::QueryPolicy->apply($engine->read_domain, $query, $limits);
     Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query')->check_tree($query,
         allowed_classes => ['Selecto::Query', 'Selecto::Expression'], label => 'Bounded query');
     my %top = map { refaddr($_) => 1 } @{$query->selections};
@@ -43,8 +59,8 @@ sub prepare {
             my ($path, $fields, $options) = @{$expression->arguments};
             $options //= {};
             if (!defined($options->{aggregate})) {
-                Selecto::Error->throw('unsupported_feature', 'bounded child collections require PostgreSQL')
-                    unless $adapter->name eq 'postgresql';
+                Selecto::Error->throw('unsupported_feature', 'bounded child collections require a certified dialect')
+                    unless $adapter->name eq 'postgresql' || $adapter->supports('bounded_related_collections');
                 Selecto::Error->throw('unsupported_feature', 'bounded child collections require scalar or formatted child fields')
                     if grep { ref($_) && !_formatted_child($_) } @$fields;
                 my $association = $engine->domain->resolve_association($path)->{association};
@@ -65,7 +81,10 @@ sub prepare {
         push @select, $expression;
     }
     my $bounded = $query->_copy(selections => \@select);
-    return {statement => $engine->compile($bounded), query => $bounded, collections => \@collections, limits => $limits};
+    my $prepared = {statement => $engine->compile($bounded), query => $bounded, collections => \@collections, limits => $limits};
+    $PREPARED_POLICY{$prepared} = {policy => $engine->_read_policy_identity, tenant_policy => $engine->_has_read_tenant_policy ? 1 : 0,
+        statement => Selecto::ConfiguredDomain->prepared_digest($prepared)};
+    return $prepared;
 }
 
 # A formatted child date is still one value per child row. Any other child
@@ -79,6 +98,27 @@ sub _formatted_child {
     return blessed($operand) && $operand->kind eq 'field' ? 1 : 0;
 }
 
+# A prepared bundle whose rows carry one more column holding the single value
+# of another prepared bundle's statement (the adapter's scalar_column_statement,
+# such as a canned page's total). Both bundles must carry this engine's read
+# policy evidence; the combined bundle then carries it too, so explicit read
+# tenant policy still admits it at execution.
+sub prepare_scalar_column {
+    my ($class, $engine, $prepared, $scalar, $alias) = @_;
+    $engine->assert_domain_identity;
+    Selecto::Error->throw('invalid_query', 'scalar columns join two prepared bounded queries')
+        unless ref($prepared) eq 'HASH' && ref($scalar) eq 'HASH';
+    _assert_prepared_policy($engine, $_) for $prepared, $scalar;
+    my $adapter = $engine->adapter;
+    Selecto::Error->throw('unsupported_feature', 'configured adapter does not support scalar columns')
+        unless $adapter->can('scalar_column_statement');
+    my $combined = {%$prepared,
+        statement => $adapter->scalar_column_statement($prepared->{statement}, $scalar->{statement}, $alias)};
+    $PREPARED_POLICY{$combined} = {policy => $engine->_read_policy_identity, tenant_policy => $engine->_has_read_tenant_policy ? 1 : 0,
+        statement => Selecto::ConfiguredDomain->prepared_digest($combined)};
+    return $combined;
+}
+
 sub all {
     my ($class, $engine, $query, %args) = @_;
     return $class->execute($engine, $class->prepare($engine, $query, %args), %args);
@@ -86,6 +126,9 @@ sub all {
 
 sub execute {
     my ($class, $engine, $prepared, %args) = @_;
+    $engine->assert_domain_identity;
+    _assert_prepared_policy($engine, $prepared);
+    $engine->_check_read_execution_options(\%args);
     my $statement = ref($prepared) eq 'HASH' ? $prepared->{statement} : $prepared;
     my $collections = ref($prepared) eq 'HASH' ? $prepared->{collections} : [];
     my $limits = _limits($engine, $args{limits} // (ref($prepared) eq 'HASH' ? $prepared->{limits} : undef));
@@ -135,11 +178,15 @@ sub execute {
     my $ok = eval {
         if ($direct) {
             $deadline = $adapter->begin_query_budget(timeout_ms => $timeout, savepoint => 1);
+            $engine->assert_domain_identity;
+            _assert_prepared_policy($engine, $prepared);
             $deadline->check(defer_rearm => 1);
             $admit->($_) for @{$adapter->execute_query($guarded, @canonical)->{rows}};
         } else {
             $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
-            $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows), @canonical);
+            $engine->assert_domain_identity;
+            _assert_prepared_policy($engine, $prepared);
+            $stream =$adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows), @canonical);
             while (my $row = $stream->next) {
                 $admit->($row);
             }
@@ -278,5 +325,14 @@ scalar-result statement. Never accept compiled SQL or execution options from
 request data. C<validate_result> admits cached result structures using the
 same trusted result limits; cache authorization namespacing belongs to the
 host, independently of this module.
+
+For engines with explicit read tenant policy, execution requires the actual
+prepared bundle and private evidence tying its statement, transfer metadata
+and configured read policy together. Changed bundles, another tenant context,
+or an unbound scalar statement fail before SQL. Approved C<with_limits> copies
+retain read authority while still intersecting execution resource limits.
+C<prepare_scalar_column($engine, $prepared, $scalar, $alias)> joins two such
+bundles through the adapter's C<scalar_column_statement> and carries the same
+evidence, after checking both.
 
 =cut

@@ -85,7 +85,8 @@ sub _class_atom {
     my $c = $self->_take;
     _invalid('pattern character class is malformed') unless length $c;
     return $self->_escape if $c eq '\\';
-    _invalid('POSIX and intersected classes are outside ascii_v1') if $c eq '[' || ($c eq '&' && $self->_peek eq '&');
+    _invalid('POSIX and intersected classes are outside ascii_v1')
+        if ($c eq '[' && $self->_peek eq ':') || ($c eq '&' && $self->_peek eq '&');
     return ['char', $c];
 }
 sub _atom {

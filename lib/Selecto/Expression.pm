@@ -10,6 +10,8 @@ our $_CONSTRUCTION_LIMITS;
 
 sub new {
     my ($class, $kind, @arguments) = @_;
+    Selecto::Error->throw('raw_sql_forbidden', 'raw SQL is outside governed expressions', {path => []})
+        if defined($kind) && !ref($kind) && $kind eq 'raw_sql';
     my $budget = Selecto::OperationBudget->new(
         (defined($_CONSTRUCTION_LIMITS) ? (limits => $_CONSTRUCTION_LIMITS) : ()), code => 'invalid_query');
     $budget->check_tree(\@arguments, label => 'expression arguments', allowed_classes => ['Selecto::Expression']);
@@ -361,8 +363,9 @@ sub _array_predicate {
 # JSON containment: the field's document contains the bound document.
 sub json_contains {
     my ($class, $field, $document) = @_;
-    Selecto::Error->throw('invalid_query', 'json_contains requires an object or array document')
-        unless ref($document) eq 'HASH' || ref($document) eq 'ARRAY';
+    require JSON::PP;
+    Selecto::Error->throw('invalid_query', 'json_contains requires a JSON value')
+        unless !ref($document) || ref($document) eq 'HASH' || ref($document) eq 'ARRAY' || JSON::PP::is_bool($document);
     return $class->new('json_contains', $class->_operand($field), $document);
 }
 
@@ -431,7 +434,7 @@ sub _from_filter_ast {
         # The whole document was admitted before cloning; charge its exact JSON
         # parameter now, after a bounded traversal made encoding safe.
         require JSON::PP;
-        $budget->consume_value(JSON::PP->new->canonical->utf8->encode($value), label => 'JSON containment value');
+        $budget->consume_value(JSON::PP->new->canonical->allow_nonref(1)->utf8->encode($value), label => 'JSON containment value');
         return $class->json_contains(_filter_field($field), $value);
     }
     Selecto::Error->throw('invalid_query', 'filter field must be a governed field name')
@@ -833,9 +836,10 @@ search text is bound.
 Array predicates over a column declared with an C<items> type. Each value is
 bound and the list is cast to the element type. Null arrays never match.
 
-=item C<json_contains($field, \%document)>
+=item C<json_contains($field, $document)>
 
-JSON containment with the document bound as canonical JSON.
+JSON containment with an object, array, string, number, Boolean or JSON null
+(C<undef>) bound as canonical JSON. Structural comparison preserves JSON types.
 
 =back
 

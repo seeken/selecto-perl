@@ -219,8 +219,9 @@ is(Selecto::Domain->parse($domain->contract)->fingerprint, $domain->fingerprint,
 my $sqlite = Selecto::Engine->new(
     domain => $domain, adapter => Selecto::SQLite->new(dbh => TestSelecto::DBH->new),
 );
-eval { $sqlite->compile($sqlite->query->select('effective_location')) };
-is($@->code, 'unsupported_feature', 'adapters without value expressions fail closed');
+my $sqlite_value = $sqlite->compile($sqlite->query->select('effective_location'));
+like($sqlite_value->sql, qr/COALESCE\(.*CAST\(\? AS TEXT\)\)/,
+    'SQLite compiles portable value expressions with bound literals');
 
 my $duckdb = Selecto::Engine->new(
     domain => $domain, adapter => Selecto::DuckDB->new(dbh => TestSelecto::DBH->new),

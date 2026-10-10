@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 Unreleased
+    - Selecto::BoundedQuery->prepare_scalar_column joins two prepared bundles
+      through the adapter's scalar_column_statement and carries their read
+      policy evidence, so a canned page that carries its total on its rows
+      still runs on an engine with explicit read tenant policy.
     - Date shortcuts are measured from the database's current date: without
       an explicit today, Selecto::DateShortcut->expression returns the new
       date_shortcut expression, which PostgreSQL and DuckDB compile against
@@ -102,6 +106,81 @@ Unreleased
       error details may now carry parameter). Documented in the OpenAPI
       document (an enum), Selecto::API and Selecto::API::EngineHandler;
       EngineHandler->resource_date_formats lists the values.
+    - Govern individual protected SQLite UPSERTs against their actual native
+      conflict branch, exact update mask, literal defaults and transaction-bound
+      private receipts. Compile empty masks as DO NOTHING while retaining caller
+      cardinality. Resolve choices from the final canonical persisted candidate.
+      Refuse UPSERTs whose TRANSACTION or EVIDENCE normalizers would change a
+      persisted value, since their rules would test a value that is never stored.
+    - Add bounded value.compare_path rules with absolute root dependencies,
+      exact related-value comparisons and unconditional resource preflight.
+    - Preserve native integer, unsigned integer, floating and authored text
+      identity through bounded rule/policy copies, including canonical domain
+      parsing and returned subjects. Admit literal opening brackets in bounded
+      ASCII character classes while refusing POSIX/intersection syntax.
+    - Preserve rule, validator and action scalar identity through domain
+      composition, overlay DSL construction and action planning/serialization,
+      including submitted JSON and declared action literals/defaults.
+    - Compile sealed portable operations through trusted tenant/context fills,
+      native foreign-key guards, required/captured query predicates and SQLite
+      typed insert admission. Preserve nested generated-key ownership and named
+      atomic batches across explicitly configured domains. Keep internal graph
+      identity keys separate from public returning ceilings. Refuse authored
+      document action policies until their full native mutation path exists.
+    - Verify the complete six portable write models through production APIs,
+      and expose genuine private planned-operation authorization/execution.
+    - Validate the complete bounded portable write contract and expose sealed
+      authored operation snapshots. Keep declarations separate from grants.
+    - Preflight versioned native write capabilities before dispatch, preserving
+      requested returning, generated bindings, transactions and atomic graphs.
+      Exercise the complete 30-state capability safety model.
+    - Enforce explicit returning/cardinality limits, required insert fields,
+      protected upsert fields and atomic write-once guards. Check cardinality
+      ranges before commit and retain caller-owned transaction/savepoint work.
+    - Add complete bounded choice-source metadata validation and public choice
+      binding/request/options APIs with explicit trusted host providers and
+      sealed native membership/options results. Preserve actual join target
+      authority, full aliases and unique established nested shorthand.
+    - Add bounded plain-domain schema validation for relation metadata, query
+      libraries, event payload schemas and consumer registry envelopes. Cover
+      imported native required filters when caller queries add disjunctions.
+    - Add public metadata domain identity APIs and native identity observations.
+    - Publish stable provider contract snapshots and verify consumer fields,
+      filters, query members, versions, fingerprints, and required scopes.
+      Snapshot diffs distinguish additive surfaces from breaking removals,
+      result type changes, and added required scopes. A public exhaustive
+      32-state compatibility model checks two independent invariants.
+    - Implement the complete 27-operator DataRules v1 AST and six text
+      normalizers with exact arithmetic, bounded ASCII patterns, shared
+      resource budgets and unconditional advisory/condition resource errors.
+    - Preserve submitted INPUT values separately from physical SQLite
+      candidates; consumed generated fields remain pending across logical
+      branches and conditions. Batch inserts preflight all rules before DML.
+    - Prove native graph/owned-set ownership with actual key affinities,
+      collations, complete single-key uniqueness and every present FK group.
+      Protected candidate storage refuses generated columns and automatic
+      foreign-key updates outside the admitted plan.
+    - Govern native SQLite stored candidates and complete child collections inside
+      their write transaction, applying required rules and normalizers before writes.
+    - Execute owned one-root action collection patches with policy-scoped read
+      anchors, exact returned client identities, plan revalidation, and atomic rollback.
+    - SQLite write graphs support explicitly declared owned-set reconciliation.
+      Cleanup uses actual RETURNING identities, whole composite keys and
+      independently derived parent, child tenant and required scopes. Empty
+      sets, exact generated identities, duplicate refusal and late rollback
+      are verified with native in-memory SQLite. Canonical required_filters
+      now guard both reads and writes, including nested domains.
+    - SQLite supports typed values, JSON extraction and recursive typed JSON
+      containment, JSON/array rowsets, array predicates, UTC calendar formats
+      and buckets, FTS5 predicates/ranking, schema metadata and query plans.
+      Version gates compare full tuples; CTEs require 3.8.3, windows 3.28.0,
+      and bounded materialization/RETURNING 3.35.0. Offset-only paging uses
+      LIMIT -1. Governed query/stream execution rejects writes and preserves
+      caller-owned query_only and raw/DBI transactions; trusted tooling has
+      an explicit execute_query_unsafe escape.
+    - SQLite ordered/bounded related collections retain boolean/JSON types,
+      child/bridge policies and tenant guards. Limits/cursors and API subtables
+      execute with stable ordering and whole-response overflow refusal.
     - Canonical direct associations infer tenant equality from both declared
       relation tenant fields, including nested edges, correlated collections,
       computed EXISTS and PostgreSQL lateral lookups. Explicit complete pairs
