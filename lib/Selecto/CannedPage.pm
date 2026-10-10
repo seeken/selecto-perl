@@ -417,10 +417,9 @@ sub run {
         # uncorrelated subquery, evaluated once), then is taken off again.
         my %options = (%$execution_options, canonical_values => 1);
         my $prepared = Selecto::BoundedQuery->prepare($engine, $plan->{query}, %options);
-        my $total_statement = Selecto::BoundedQuery->prepare($engine, $plan->{total_query}, %options)->{statement};
-        $rows = Selecto::BoundedQuery->execute($engine, {%$prepared,
-            statement => $adapter->scalar_column_statement($prepared->{statement}, $total_statement, 'selecto_total'),
-        }, %options);
+        my $total_prepared = Selecto::BoundedQuery->prepare($engine, $plan->{total_query}, %options);
+        $rows = Selecto::BoundedQuery->execute($engine,
+            Selecto::BoundedQuery->prepare_scalar_column($engine, $prepared, $total_prepared, 'selecto_total'), %options);
         pop @{$rows->{columns}};
         my @totals = map { pop @$_ } @{$rows->{rows}};
         # A page past the end has no rows to carry the total.

@@ -14,6 +14,7 @@ use strict;
 use warnings;
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
+use JSON::PP ();
 
 my %OPERATIONS = map { $_ => 1 } qw(insert update upsert delete);
 
@@ -133,16 +134,26 @@ package Selecto::Write::Graph;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed reftype);
+use Hash::Util::FieldHash qw(fieldhash);
 use Selecto::Error ();
+
+# Original caller result intent is kept outside mutable graph metadata. Generated
+# binding keys may be added to native commands, but governance rechecks this
+# original intent and result projection never grants execution authority.
+fieldhash my %PUBLIC_RETURNING;
 
 sub new {
     my ($class, %args) = @_;
+    require Selecto::Domain::QueryContract;
+    my $metadata = Selecto::Domain::QueryContract->copy_declaration({value => $args{metadata} // {}})->{value};
+    Selecto::Error->throw('invalid_write_graph', 'graph metadata must be bounded plain informational data')
+        unless ref($metadata) eq 'HASH';
     my $nodes = $args{nodes};
     Selecto::Error->throw('invalid_write_graph', 'graph nodes must be a non-empty array')
-        unless ref($nodes) eq 'ARRAY' && @$nodes;
+        unless ref($nodes) eq 'ARRAY' && @$nodes && @$nodes <= 1000;
 
-    my (%seen, %required_returning, %required_returning_seen);
+    my (%seen, %required_returning, %required_returning_seen, %public_returning);
     my @normalized;
     for my $index (0 .. $#$nodes) {
         my $node_spec = $nodes->[$index];
@@ -153,13 +164,20 @@ sub new {
             unless $id ne '' && !$seen{$id}++;
         Selecto::Error->throw('invalid_write_graph', "graph node $id must contain a write command")
             unless blessed($node_spec->{command}) && $node_spec->{command}->isa('Selecto::Write::Command');
+        my $reference = $node_spec->{reference_only} // 0;
+        Selecto::Error->throw('invalid_write_graph', 'reference_only must be an explicit boolean')
+            unless (!ref($reference) || JSON::PP::is_bool($reference)) && "$reference" =~ /\A[01]\z/;
+        Selecto::Error->throw('invalid_write_graph', 'read anchors require one empty update')
+            if $reference && ($node_spec->{command}->operation ne 'update'
+                || keys %{$node_spec->{command}->assignments}
+                || ($node_spec->{command}->expected_count // 0) != 1);
         my $bindings = $node_spec->{bindings} // [];
         Selecto::Error->throw('invalid_write_graph', "graph node $id bindings must be an array")
             unless ref($bindings) eq 'ARRAY';
         Selecto::Error->throw('invalid_write_graph', 'graph root must not contain bindings')
             if $index == 0 && @$bindings;
-        Selecto::Error->throw('invalid_write_graph', "graph child $id must bind to an earlier node")
-            if $index > 0 && !@$bindings;
+        # A graph may contain independent writes. Bindings, when present, still
+        # have to point to an earlier node and may never overwrite assignments.
         my $assignments = $node_spec->{command}->assignments;
         my %bound_fields;
         my @normalized_bindings = map {
@@ -188,10 +206,15 @@ sub new {
             }
             { field => $field, from => $from, key => $key, (defined($scope_field) ? (scope_field => $scope_field) : ()) };
         } @$bindings;
+        my $original_returning = $node_spec->{command}->metadata;
+        $public_returning{$id} = exists($original_returning->{returning})
+            ? Selecto::Domain::QueryContract->copy_declaration({value => $original_returning->{returning}})->{value}
+            : undef;
         push @normalized, {
             id => $id,
             command => $node_spec->{command},
             bindings => \@normalized_bindings,
+            reference_only => $reference ? 1 : 0,
         };
     }
 
@@ -212,7 +235,66 @@ sub new {
         ];
         $node->{command} = $node->{command}->with_metadata($metadata);
     }
-    return bless { nodes => \@normalized }, $class;
+    my $sets = $args{owned_sets} // [];
+    Selecto::Error->throw('invalid_write_graph', 'owned_sets must be a bounded array')
+        unless ref($sets) eq 'ARRAY' && @$sets <= 1000;
+    my (%set_seen, @sets);
+    for my $set (@$sets) {
+        Selecto::Error->throw('invalid_write_graph', 'owned set must declare parent, relationship, nodes and delete_missing')
+            unless ref($set) eq 'HASH'
+                && !grep { !/\A(?:parent|relationship|nodes|delete_missing)\z/ } keys %$set;
+        my ($parent, $relationship) = @{$set}{qw(parent relationship)};
+        Selecto::Error->throw('invalid_write_graph', 'owned set parent and relationship must be declared names')
+            unless defined($parent) && !ref($parent) && $seen{$parent}
+                && defined($relationship) && !ref($relationship)
+                && $relationship =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/
+                && !$set_seen{"$parent/$relationship"}++;
+        Selecto::Error->throw('invalid_write_graph', 'owned set nodes must be distinct existing child ids')
+            unless ref($set->{nodes}) eq 'ARRAY' && @{$set->{nodes}} <= 1000;
+        my %members;
+        Selecto::Error->throw('invalid_write_graph', 'owned set nodes must be distinct existing child ids')
+            if grep { !defined($_) || ref($_) || !$seen{$_} || $_ eq $parent || $members{$_}++ }
+                @{$set->{nodes}};
+        Selecto::Error->throw('invalid_write_graph', 'owned set requires explicit delete_missing')
+            unless defined($set->{delete_missing}) && (!ref($set->{delete_missing})
+                || JSON::PP::is_bool($set->{delete_missing}))
+                && "$set->{delete_missing}" eq '1';
+        push @sets, {parent => "$parent", relationship => "$relationship",
+            nodes => [@{$set->{nodes}}], delete_missing => 1};
+    }
+    my $self = bless { nodes => \@normalized, owned_sets => \@sets, metadata => $metadata }, $class;
+    $PUBLIC_RETURNING{$self} = \%public_returning;
+    return $self;
+}
+
+sub public_returning {
+    my ($self, $id) = @_;
+    Selecto::Error->throw('invalid_write_graph', 'public returning requires a constructed graph and declared node')
+        unless exists($PUBLIC_RETURNING{$self}) && defined($id) && !defined(reftype($id))
+            && exists($PUBLIC_RETURNING{$self}{$id});
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->copy_declaration({value => $PUBLIC_RETURNING{$self}{$id}})->{value};
+}
+
+sub metadata {
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->copy_declaration({value => $_[0]->{metadata} // {}})->{value};
+}
+sub validate {
+    my ($self) = @_;
+    my $nodes = $self->nodes;
+    for my $node (@$nodes) {
+        my $metadata = $node->{command}->metadata;
+        my $returning = $self->public_returning($node->{id});
+        if (defined($returning)) { $metadata->{returning} = $returning }
+        else { delete $metadata->{returning} }
+        $node->{command} = $node->{command}->with_metadata($metadata);
+    }
+    return __PACKAGE__->new(nodes => $nodes, owned_sets => $self->owned_sets, metadata => $self->metadata);
+}
+
+sub owned_sets {
+    return [map {{%$_, nodes => [@{$_->{nodes}}]}} @{$_[0]->{owned_sets} // []}];
 }
 
 sub nodes {
@@ -231,6 +313,7 @@ use warnings;
 sub new { my ($class, %args) = @_; return bless { %args }, $class; }
 sub nodes { return { %{$_[0]->{nodes} // {}} }; }
 sub root  { return $_[0]->{root}; }
+sub metadata { return {%{$_[0]->{metadata} // {}}}; }
 
 package Selecto::Write::Result;
 
@@ -238,7 +321,17 @@ use 5.034;
 use strict;
 use warnings;
 
-sub new { my ($class, %args) = @_; return bless { %args }, $class; }
+sub new {
+    my ($class, %args) = @_;
+    require Selecto::Domain::QueryContract;
+    my $metadata = Selecto::Domain::QueryContract->copy_declaration({value => $args{metadata} // {}})->{value};
+    Selecto::Error->throw('invalid_write', 'result metadata must be a bounded plain object') unless ref($metadata) eq 'HASH';
+    return bless { %args, metadata => $metadata }, $class;
+}
+sub metadata {
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->copy_declaration({value => $_[0]->{metadata} // {}})->{value};
+}
 sub operation { return $_[0]->{operation}; }
 sub affected_rows { return $_[0]->{affected_rows}; }
 sub values { return { %{$_[0]->{values} // {}} }; }
@@ -246,6 +339,7 @@ sub to_hash {
     my ($self) = @_;
     my $value = { operation => $self->{operation}, affected_rows => $self->{affected_rows} };
     $value->{values} = $self->values if keys %{$self->{values} // {}};
+    $value->{metadata} = $self->metadata if keys %{$self->{metadata} // {}};
     return $value;
 }
 

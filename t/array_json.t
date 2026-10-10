@@ -70,7 +70,11 @@ is_deeply($from_ast->params, ['a', '{"k":1}'], 'filter AST accepts array and JSO
 
 is(code_of(sub { $x->array_contains('tags', []) }), 'invalid_query', 'an empty value list is rejected');
 is(code_of(sub { $x->array_contains('tags', [['nested']]) }), 'invalid_query', 'values must be scalars');
-is(code_of(sub { $x->json_contains('metadata', 'text') }), 'invalid_query', 'documents are objects or arrays');
+is_deeply($engine->compile($engine->query->select('id')->where($x->json_contains('metadata', 'text')))->params,
+    ['"text"'], 'primitive JSON strings are bound with their JSON type');
+is_deeply($engine->compile($engine->query->select('id')->where($x->from_filter_ast(['json_contains', 'metadata', undef])))->params,
+    ['null'], 'filter AST supports explicit JSON null');
+is(code_of(sub { $x->json_contains('metadata', \1) }), 'invalid_query', 'documents reject non-JSON references');
 is(code_of(sub { $engine->compile($engine->query->select('id')->where($x->array_overlap('name', ['a']))) }),
     'invalid_query', 'array predicates require an array field');
 is(code_of(sub { $engine->compile($engine->query->select('id')->where($x->array_overlap('untyped', ['a']))) }),

@@ -1,0 +1,71 @@
+#!/usr/bin/env perl
+use 5.034;
+use strict;
+use warnings;
+use Test::More;
+use JSON::PP ();
+use Selecto;
+use Selecto::DataRules;
+use Selecto::SQLite;
+use Selecto::Write;
+use Selecto::Expression;
+use DBI;
+use DBD::SQLite;
+
+my $prefix = shift // die 'installed prefix required';
+like $INC{'Selecto.pm'}, qr/\A\Q$prefix\E\//, 'public module loads from extracted installed package';
+like $INC{'Selecto/RuleTest.pm'}, qr/\A\Q$prefix\E\//, 'closed AST helper is installed';
+like $INC{'Selecto/SQLite/Ownership.pm'}, qr/\A\Q$prefix\E\//, 'native ownership helper is installed';
+my $db = DBI->connect('dbi:SQLite:dbname=:memory:', undef, undef, {RaiseError => 1, PrintError => 0});
+$db->do('CREATE TABLE parents(id INTEGER PRIMARY KEY,label TEXT)');
+$db->do('CREATE TABLE children(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES parents(id),quantity INTEGER)');
+my $child = {name => 'Children', source => {source_table => 'children', primary_key => 'id', fields => [qw(id parent_id quantity)],
+    columns => {id => {type => 'integer'}, parent_id => {type => 'integer'}, quantity => {type => 'integer'}}, associations => {}}, schemas => {}, joins => {},
+    writes => {fields => {quantity => {insertable => 1}}}};
+my $raw = {name => 'Parents', source => {source_table => 'parents', primary_key => 'id', fields => [qw(id label)],
+    columns => {id => {type => 'integer'}, label => {type => 'string'}}, associations => {}}, schemas => {}, joins => {},
+    writes => {operations => {insert => {enabled => 1}}, fields => {label => {insertable => 1}}, relationships => {children => {
+        writable => 1, ownership => 'owned', parent_key => 'id', child_key => 'parent_id', allowed_ops => ['insert'], domain => $child}}},
+    rules => {schema => 'selecto.data_rules.v1', definitions => {
+        nullable => {version => 1, test => {op => 'value.eq', value => undef}},
+        children => {version => 1, test => {op => 'all', rules => [
+            {op => 'collection.count', exact => 2}, {op => 'collection.sum', path => ['quantity'], exact => '3'},
+            {op => 'collection.unique_by', paths => [['quantity']]}, {op => 'not', rule => {op => 'collection.count', exact => 0}}]}},
+    }, normalizers => {normalize => {version => 1, steps => [
+        {op => 'text.nfc', profile => 'unicode_nfc_v1'}, {op => 'text.line_endings'},
+        {op => 'text.trim', profile => 'ascii_v1'}, {op => 'text.uppercase', profile => 'ascii_v1'},
+        {op => 'text.lowercase', profile => 'ascii_v1'}, {op => 'text.empty_to_null'}]}}, bindings => {
+        nullable => {subject => {scope => 'candidate', path => ['label']}, rule => {id => 'nullable', version => 1}, normalizer => {id => 'normalize', version => 1}},
+        children => {subject => {scope => 'candidate', path => ['children']}, rule => {id => 'children', version => 1}},
+    }}};
+sub graph {
+    return Selecto::Write::Graph->new(nodes => [
+        {id => 'root', command => Selecto::Write::Command->new(operation => 'insert', relation => 'parents', assignments => {label => " \r\n "})},
+        map { {id => "child$_", command => Selecto::Write::Command->new(operation => 'insert', relation => 'children', assignments => {quantity => $_}),
+            bindings => [{from => 'root', key => 'id', field => 'parent_id'}]} } 1,2]);
+}
+my $adapter = Selecto::SQLite->new(dbh => $db);
+my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse($raw), adapter => $adapter);
+my $result = $engine->execute_graph(graph());
+ok $result->root->values->{id}, 'installed public graph returns actual generated identity';
+is $db->selectrow_array('SELECT label IS NULL FROM parents'), 1, 'all six normalizers store actual NULL once';
+is_deeply $db->selectall_arrayref('SELECT parent_id,quantity FROM children ORDER BY quantity'), [[1,1],[1,2]], 'native final children store their exact owner and values';
+my $mutations = 0;
+$db->sqlite_trace(sub {$mutations++ if $_[0] =~ /\A\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+["`\[]?(?:parents|children)\b/i});
+$raw->{rules}{definitions}{children}{test} = {op => 'any', rules => [{op => 'collection.count', exact => 2}, {op => 'collection.sum', path => ['id'], min => 0}]};
+eval {Selecto::Engine->new(domain => Selecto::Domain->parse($raw), adapter => $adapter)->execute_graph(graph())};
+is ref($@) && $@->can('code') ? $@->code : "$@", 'required_data_rule_pending', 'installed logical rule cannot consume unknown generated children';
+is $mutations, 0, 'unknown generated dependencies cause no business DML';
+is $db->selectrow_array('SELECT count(*) FROM parents'), 1, 'previous actual rows retained';
+$db->do('DROP TABLE children');
+$db->do('CREATE TABLE other(id INTEGER PRIMARY KEY)');
+$db->do('CREATE TABLE children(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES parents(id) REFERENCES other(id),quantity INTEGER)');
+$raw->{rules}{definitions}{children}{test} = {op => 'collection.count', exact => 2};
+$mutations = 0;
+eval {Selecto::Engine->new(domain => Selecto::Domain->parse($raw), adapter => $adapter)->execute_graph(graph())};
+is ref($@) && $@->can('code') ? $@->code : "$@", 'ownership_storage_not_evaluable', 'installed physical proof checks every contradictory FK group';
+is $mutations, 0, 'installed whole-plan ownership refusal precedes business DML';
+is $db->selectrow_array('SELECT count(*) FROM parents'), 1, 'ownership refusal retains previously stored parent';
+is_deeply [grep {length($_->[2])} @{$db->selectall_arrayref('PRAGMA database_list')}], [], 'all native candidate work remains memory only';
+$db->disconnect;
+done_testing;

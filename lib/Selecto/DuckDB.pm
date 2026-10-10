@@ -70,7 +70,7 @@ sub _values_cast_types {
 }
 
 sub write_capabilities {
-    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, write_graph => 1 };
+    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, generated_keys => 1, write_graph => 1 };
 }
 
 sub _query_transport_sql {

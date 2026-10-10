@@ -12,6 +12,56 @@ sub plan {
     return Selecto::Action::Planner->plan($domain, $intent, %options);
 }
 
+# An opaque handle for a genuine planned action is deliberately not a portable
+# authored Operation. Execute an accepted plan through the native action path.
+sub planned_operation {
+    my ($class, $domain, $intent, %options) = @_;
+    require Scalar::Util;
+    require Selecto::Domain::QueryContract;
+    require Selecto::ConfiguredDomain;
+    require Selecto::OperationBudget;
+    my $plain_intent = Selecto::Domain::QueryContract->copy_declaration($intent);
+    if ((Scalar::Util::blessed($domain) // '') eq 'Selecto::Domain') {
+        Selecto::ConfiguredDomain->digest($domain, {});
+    } else {
+        $domain = Selecto::Domain::QueryContract->copy_declaration($domain);
+    }
+    Selecto::Error->throw('invalid_argument', 'unknown planned operation option')
+        if grep { $_ ne 'limits' } keys %options;
+    Selecto::Action::Planner->_admit_provenance_tree(\%options, 1);
+    my $plan = $class->plan($domain, $plain_intent, %options);
+    require Selecto::Write::PlannedOperation;
+    return Selecto::Write::PlannedOperation->_from_plan($plan);
+}
+
+sub validate_provenance {
+    my ($class, $plan) = @_;
+    return Selecto::Action::Planner->validate_provenance($plan);
+}
+
+sub authorize_and_issue {
+    my ($class, $plan, $phase, %options) = @_;
+    # Provenance comes before resolver lookup or invocation, including for an
+    # unregistered plan whose authored fields otherwise look legitimate.
+    $class->validate_provenance($plan);
+    my $engine = delete $options{engine};
+    my $resolver = delete $options{resolver};
+    require Scalar::Util;
+    Selecto::Error->throw('invalid_action_engine', 'issuing an action grant requires a configured native engine')
+        unless (Scalar::Util::blessed($engine) // '') eq 'Selecto::Engine';
+    Selecto::Error->throw('invalid_argument', 'unknown planned action authorization option')
+        if grep { $_ ne 'context' && $_ ne 'expires_in' } keys %options;
+    require Selecto::Domain::QueryContract;
+    my $plain = Selecto::Domain::QueryContract->copy_declaration({phase => $phase, options => \%options});
+    Selecto::Error->throw('invalid_action_phase', 'action phase must be preview or execute')
+        unless defined($plain->{phase}) && !ref($plain->{phase})
+            && $plain->{phase} =~ /\A(?:preview|execute)\z/;
+    Selecto::Error->throw('invalid_capability_decision', 'capability resolver must be explicit host code')
+        if defined($resolver) && ref($resolver) ne 'CODE';
+    return $engine->grant_action($plan, phase => $plain->{phase},
+        resolver => $resolver, %{$plain->{options}});
+}
+
 # Resolve conditional input specifications without requiring a write executor
 # or a complete submission. Hosts use this for forms and lookup discovery;
 # execution must still go through plan/authorize/execute.
@@ -159,6 +209,16 @@ C<can_E<lt>actionE<gt>> columns from these (see
 L<Selecto::Domain/Action prerequisite columns>). C<plan> still checks the
 operation and the full transition. Throws C<invalid_action_intent> for an
 unknown action and the precondition errors of C<plan> for malformed guards.
+
+=head2 planned_operation / validate_provenance / authorize_and_issue
+
+C<planned_operation($domain, $intent)> creates an opaque handle by actual public
+planning. It cannot be passed to the portable authored-operation compiler.
+C<validate_provenance($plan)> requires the exact accepted planning object and
+unchanged content. C<authorize_and_issue($plan, $phase, engine =E<gt> $engine,
+resolver =E<gt> $resolver, context =E<gt> $context)> validates that provenance
+before delegating to the engine's native, context-bound, expiring single-use
+action grant. Serialized or caller-constructed lookalikes are refused.
 
 =head2 input_form
 

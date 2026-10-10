@@ -37,6 +37,17 @@ sub write_capabilities {
     return {%{$self->SUPER::write_capabilities}, upsert => 0};
 }
 
+sub _validate_write_intent {
+    my ($self, $write) = @_;
+    my @commands = ref($write) eq 'Selecto::Write::Command' ? ($write)
+        : ref($write) eq 'Selecto::Write::Batch' ? @{$write->commands}
+        : map { $_->{command} } @{$write->nodes};
+    Selecto::Error->throw('unsupported_upsert_conflict_target',
+        'MySQL-family adapters cannot guarantee the declared upsert conflict target')
+        if grep { $_->operation eq 'upsert' } @commands;
+    return 1;
+}
+
 # ON DUPLICATE KEY UPDATE fires on every unique key, not the declared
 # conflict target. Refuse every upsert: an unscoped table may have another
 # unique index too, and a domain allowlist is not a physical index inventory.

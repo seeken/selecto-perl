@@ -22,9 +22,12 @@ WriteMakefile(
         'Hash::Util::FieldHash' => 0,
         'JSON::PP'    => '4.06',
         'Math::BigInt' => 0,
+        'Math::BigRat' => 0,
+        'Math::BigFloat' => 0,
         'Mojolicious' => '9.49',
         'Scalar::Util'=> 0,
         'Storable'    => 0,
+        'Unicode::Normalize' => 0,
         'Text::CSV'   => '2.04',
     },
     CONFIGURE_REQUIRES => {

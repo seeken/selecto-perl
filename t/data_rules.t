@@ -72,12 +72,86 @@ my $large_version_result = Selecto::DataRules->parse($large_versions)->evaluate(
 );
 is $large_version_result->{state}, 'passed', 'numeric-string rule versions remain exact through references';
 
+my $mismatched_version = dclone($large_versions);
+$mismatched_version->{bindings}{positive_quantity}{rule}{version} = '900719925474099312346';
+eval { Selecto::DataRules->parse($mismatched_version) };
+is $@->code, 'unresolved_rule_reference', 'adjacent wide versions never resolve through floating-point equality';
+
+my $conditional = {
+    schema => 'selecto.data_rules.v1',
+    definitions => {'positive-number' => {version => 1, test => {op => 'number.gt', bound => '0'}}},
+    normalizers => {},
+    bindings => {'quantity-check' => {
+        subject => {scope => 'candidate', path => ['quantity']},
+        rule => {id => 'positive-number', version => 1},
+        condition => {op => 'value.eq', value => 0},
+    }},
+};
+my $conditional_rules = Selecto::DataRules->parse($conditional);
+is $conditional_rules->evaluate(stage => 'candidate', subject => {quantity => 0})->{code},
+    'numeric_bound', 'a true condition evaluates the referenced rule';
+is $conditional_rules->evaluate(stage => 'candidate', subject => {quantity => -1})->{state},
+    'passed', 'a false condition skips the referenced rule';
+
+my $action_condition = dclone($conditional);
+$action_condition->{bindings}{'quantity-check'}{subject} = {
+    scope => 'action_input', path => ['quantity'], action => 'approve-order',
+};
+my $action_condition_result = Selecto::DataRules->parse($action_condition)->evaluate(
+    stage => 'action_input', action => 'approve-order', subject => {quantity => 0},
+);
+is $action_condition_result->{code}, 'numeric_bound', 'standalone action identifiers allow nonempty hyphenated names';
+
+my $normalized_condition = {
+    schema => 'selecto.data_rules.v1',
+    definitions => {must_be_other => {version => 1, test => {op => 'value.eq', value => 'OTHER'}}},
+    normalizers => {uppercase => {version => 1, steps => [
+        {op => 'text.trim', profile => 'ascii_whitespace_v1'},
+        {op => 'text.uppercase', profile => 'ascii_v1'},
+    ]}},
+    bindings => {reference => {
+        subject => {scope => 'candidate', path => ['reference']},
+        rule => {id => 'must_be_other', version => 1},
+        normalizer => {id => 'uppercase', version => 1},
+        condition => {op => 'value.eq', value => 'VIN'},
+    }},
+};
+my $normalized_result = Selecto::DataRules->parse($normalized_condition)->evaluate(
+    stage => 'candidate', subject => {reference => '  vin  '},
+);
+is $normalized_result->{code}, 'not_equal', 'a condition observes the normalized subject before its rule';
+is_deeply $normalized_result->{normalized}, {reference => 'VIN'}, 'normalization is retained for a conditioned failure';
+
+my $unsupported_condition = dclone($conditional);
+$unsupported_condition->{bindings}{'quantity-check'}{condition} = {op => 'host.call'};
+eval { Selecto::DataRules->parse($unsupported_condition) };
+is $@->code, 'unsupported_rule_operator', 'unknown condition operators still refuse at parse time';
+
+my $empty_id = dclone($conditional);
+$empty_id->{bindings}{''} = delete $empty_id->{bindings}{'quantity-check'};
+eval { Selecto::DataRules->parse($empty_id) };
+is $@->code, 'invalid_data_rules_contract', 'empty registry identifiers still refuse';
+
+my $limited_condition = dclone($conditional);
+$limited_condition->{bindings}{'quantity-check'}{condition} = {op => 'number.gt', bound => '0'};
+my $numeric_condition = Selecto::DataRules->parse($limited_condition,
+    limits => Selecto::Limits->new(max_rule_numeric_digits => 4));
+my $numeric_condition_result = $numeric_condition->evaluate(
+    stage => 'candidate', subject => {quantity => '12345'},
+);
+is $numeric_condition_result->{code}, 'evaluation_limit', 'condition digit exhaustion remains nonpass';
+is_deeply $numeric_condition_result->{normalized}, {}, 'condition numeric admission precedes subject cloning';
+my $work_condition_result = $conditional_rules->evaluate(
+    stage => 'candidate', subject => {quantity => 0},
+    limits => Selecto::Limits->new(max_rule_work => 1),
+);
+is $work_condition_result->{code}, 'evaluation_limit', 'condition and referenced rule share one work budget';
+
 my @strict_probes = (
     ['scientific_bound', {definitions => {positive => {test => {bound => '1e3'}}}}, 'invalid_data_rules_contract'],
     ['conflicting_count', {definitions => {exactly_three => {test => {min => 1}}}}, 'invalid_data_rules_contract'],
     ['unknown_normalizer_profile', {normalizers => {reference => {steps => [{op => 'text.trim', profile => 'unicode_v1'}]}}}, 'invalid_data_rules_contract'],
     ['duplicate_operations', {bindings => {positive_quantity => {operations => ['insert', 'insert']}}}, 'invalid_data_rules_contract'],
-    ['binding_condition', {bindings => {positive_quantity => {condition => {op => 'value.eq', value => 1}}}}, 'unsupported_rule_operator'],
     ['missing_normalizer', {bindings => {reference_shape => {normalizer => {id => 'missing', version => 1}}}}, 'unresolved_rule_reference'],
     ['unknown_test_option', {definitions => {positive => {test => {remote_url => 'invalid'}}}}, 'unknown_rule_option'],
 );

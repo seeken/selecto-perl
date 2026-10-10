@@ -1,0 +1,32 @@
+[
+  {
+    "backend_requires": {},
+    "id": "D045",
+    "kind": "domain",
+    "profile": "choice_sources",
+    "required?": true,
+    "requires": [],
+    "tags": [],
+    "title": "choice bindings produce tenant-constrained membership requests"
+  },
+  {
+    "backend_requires": {},
+    "id": "D046",
+    "kind": "domain",
+    "profile": "choice_sources",
+    "required?": true,
+    "requires": [],
+    "tags": [],
+    "title": "choice option requests preserve search paging ordering and constraints"
+  },
+  {
+    "backend_requires": {},
+    "id": "D047",
+    "kind": "domain",
+    "profile": "choice_sources",
+    "required?": true,
+    "requires": [],
+    "tags": [],
+    "title": "choice membership fails closed without a resolver and preserves explicit decisions"
+  }
+]

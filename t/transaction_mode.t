@@ -194,6 +194,14 @@ package RecordingSTH {
 
 package main;
 
+{
+    package RecordingSQLite;
+    use Mojo::Base 'Selecto::SQLite';
+    # This DBH double observes generic transaction control, without a SQLite catalog.
+    sub _admit_plan_storage { return; }
+    sub write_capabilities { return Selecto::SQL::write_capabilities($_[0]); }
+}
+
 my $write = sub {
     my ($adapter, $id) = @_;
     return error_of(sub { engine_for($adapter)->execute_write(insert_command($id // 2)) });
@@ -229,7 +237,7 @@ subtest 'savepoints inside an open DBI transaction' => sub {
         'AutoCommit off means a savepoint, never commit');
 
     my $failing = RecordingDBH->new(AutoCommit => 0, affected => [0]);
-    is($write->(Selecto->adapter(sqlite => (dbh => $failing)))->code, 'cardinality_mismatch',
+    is($write->(RecordingSQLite->new(dbh => $failing))->code, 'cardinality_mismatch',
         'a failed write inside the host transaction keeps its error');
     is_deeply($failing->events, [
         'SELECT 1', 'SAVEPOINT selecto_write_1', 'write',

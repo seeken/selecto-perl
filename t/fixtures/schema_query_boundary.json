@@ -1,0 +1,3008 @@
+{
+  "DQ001": {
+    "domain": {
+      "joins": {},
+      "name": "Governed imported people",
+      "required_filters": [
+        [
+          "active",
+          true
+        ]
+      ],
+      "schema_version": 1,
+      "schemas": {},
+      "source": {
+        "associations": {},
+        "columns": {
+          "active": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "fields": [
+          "id",
+          "name",
+          "active"
+        ],
+        "primary_key": "id",
+        "source_table": "selecto_cert_people"
+      }
+    },
+    "queries": {
+      "baseline": {
+        "order_by": [
+          {
+            "direction": "asc",
+            "field": "id"
+          }
+        ],
+        "select": [
+          "id"
+        ]
+      },
+      "narrowed": {
+        "filter": {
+          "args": [
+            {
+              "field": "id",
+              "op": "eq",
+              "value": 1
+            },
+            {
+              "field": "id",
+              "op": "eq",
+              "value": 3
+            }
+          ],
+          "op": "or"
+        },
+        "order_by": [
+          {
+            "direction": "asc",
+            "field": "id"
+          }
+        ],
+        "select": [
+          "id"
+        ]
+      }
+    }
+  },
+  "DS001": {
+    "cases": [
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "baseline"
+      },
+      {
+        "domain": {
+          "components": {},
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "empty_components"
+      },
+      {
+        "domain": {
+          "domain_data": {},
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "empty_domain_data"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "json_schemas": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "empty_json_schemas"
+      },
+      {
+        "domain": {
+          "events": {},
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "empty_events"
+      },
+      {
+        "domain": {
+          "components": {
+            "query_params": false
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "components_policy"
+      },
+      {
+        "domain": {
+          "domain_data": "host metadata",
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "opaque_domain_data"
+      },
+      {
+        "domain": {
+          "domain_data": {
+            "display": {
+              "title": "Items"
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "domain_data_payload"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "json_schemas": {
+            "payload": {
+              "type": "object"
+            }
+          },
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "json_schemas_payload"
+      },
+      {
+        "domain": {
+          "events": "invalid",
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_events_shape"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": "invalid",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_query_library_shape"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": false,
+              "data": {
+                "id": {
+                  "required": true,
+                  "type": "integer"
+                },
+                "state": {
+                  "type": "enum",
+                  "values": [
+                    "open",
+                    "closed"
+                  ]
+                },
+                "tags": {
+                  "item": "string",
+                  "type": "list"
+                }
+              },
+              "schema_version": 1
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "event_contract"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": false,
+              "data": {
+                "id": {
+                  "required": true,
+                  "type": "integer"
+                },
+                "state": {
+                  "type": "enum",
+                  "values": [
+                    "open",
+                    "closed"
+                  ]
+                },
+                "tags": {
+                  "item": "string",
+                  "type": "list"
+                }
+              },
+              "schema_version": 0
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_event_version"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": false,
+              "data": [],
+              "schema_version": 1
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_event_data"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": "false",
+              "data": {
+                "id": {
+                  "required": true,
+                  "type": "integer"
+                },
+                "state": {
+                  "type": "enum",
+                  "values": [
+                    "open",
+                    "closed"
+                  ]
+                },
+                "tags": {
+                  "item": "string",
+                  "type": "list"
+                }
+              },
+              "schema_version": 1
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_event_additional_fields"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": false,
+              "data": {
+                "id": {
+                  "type": "bogus"
+                }
+              },
+              "schema_version": 1
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_event_type"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": false,
+              "data": {
+                "state": {
+                  "type": "enum"
+                }
+              },
+              "schema_version": 1
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_event_enum"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": false,
+              "data": {
+                "ids": {
+                  "item": "bogus",
+                  "type": "list"
+                }
+              },
+              "schema_version": 1
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_event_list_item"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": false,
+              "data": {
+                "id": {
+                  "item": "string",
+                  "type": "integer"
+                }
+              },
+              "schema_version": 1
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_event_non_list_item"
+      },
+      {
+        "domain": {
+          "events": {
+            "changed": {
+              "additional_fields": false,
+              "data": {
+                "id": {
+                  "required": 1,
+                  "type": "integer"
+                }
+              },
+              "schema_version": 1
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_event_boolean"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "operations": {
+            "inspect": {
+              "metadata": {
+                "value": 42
+              },
+              "version": "1"
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "operations_envelope"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "operations": {
+            "inspect": 1
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_operations_entry"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "operations": {
+            "": {}
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_operations_id"
+      },
+      {
+        "domain": {
+          "experiences": {
+            "inspect": {
+              "metadata": {
+                "value": 42
+              },
+              "version": "1"
+            }
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "experiences_envelope"
+      },
+      {
+        "domain": {
+          "experiences": {
+            "inspect": 1
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_experiences_entry"
+      },
+      {
+        "domain": {
+          "experiences": {
+            "": {}
+          },
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_experiences_id"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "query_library_contract"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": [],
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_registry"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": 1,
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_definition"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": "id"
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_fields"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "missing"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_field"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "missing"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_reference"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ],
+                "projections": [
+                  "summary"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_projection_cycle"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                },
+                "segments": [
+                  "composed"
+                ]
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_segment_cycle"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "not",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_group_not"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "active"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_group_xor"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "limit": {}
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_parameter"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "missing"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "summary",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_ordering"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "query_library": {
+            "orderings": {
+              "by_id": {
+                "order_by": [
+                  "id"
+                ]
+              }
+            },
+            "projections": {
+              "identity": {
+                "fields": [
+                  "id"
+                ]
+              },
+              "summary": {
+                "fields": [
+                  "name"
+                ],
+                "projections": [
+                  "identity"
+                ]
+              }
+            },
+            "segments": {
+              "active": {
+                "filters": [
+                  [
+                    "eq",
+                    "id",
+                    1
+                  ]
+                ],
+                "parameters": {
+                  "minimum": {
+                    "default": 1,
+                    "type": "integer"
+                  }
+                }
+              },
+              "composed": {
+                "segment_groups": [
+                  {
+                    "operator": "xor",
+                    "segments": [
+                      "active",
+                      "other"
+                    ]
+                  }
+                ],
+                "segments": [
+                  "active"
+                ]
+              },
+              "other": {}
+            },
+            "views": {
+              "list": {
+                "ordering": "by_id",
+                "projection": "missing",
+                "segments": [
+                  "composed"
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_library_view"
+      },
+      {
+        "domain": {
+          "joins": {
+            "child": {}
+          },
+          "name": "SchemaConformance",
+          "query_library": {
+            "projections": {
+              "tree": {
+                "associations": [
+                  {
+                    "fields": [
+                      "id"
+                    ],
+                    "name": "child"
+                  }
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {
+            "children": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                }
+              },
+              "fields": [
+                "id"
+              ],
+              "primary_key": "id",
+              "source_table": "children"
+            }
+          },
+          "source": {
+            "associations": {
+              "child": {
+                "owner_key": "id",
+                "queryable": "children",
+                "related_key": "id"
+              }
+            },
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "nested_projection"
+      },
+      {
+        "domain": {
+          "joins": {
+            "child": {}
+          },
+          "name": "SchemaConformance",
+          "query_library": {
+            "projections": {
+              "tree": {
+                "associations": [
+                  {
+                    "fields": [
+                      "missing"
+                    ],
+                    "name": "child"
+                  }
+                ]
+              }
+            }
+          },
+          "schema_version": 1,
+          "schemas": {
+            "children": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                }
+              },
+              "fields": [
+                "id"
+              ],
+              "primary_key": "id",
+              "source_table": "children"
+            }
+          },
+          "source": {
+            "associations": {
+              "child": {
+                "owner_key": "id",
+                "queryable": "children",
+                "related_key": "id"
+              }
+            },
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "invalid_nested_field"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": null,
+            "fields": null,
+            "primary_key": null,
+            "source_table": null
+          }
+        },
+        "id": "source_null_relation_members"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": null,
+              "fields": null,
+              "primary_key": null,
+              "source_table": null
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_null_relation_members"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": null,
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "source_null_fields"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "fields": null,
+              "primary_key": "id",
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_null_fields"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": null,
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "source_null_columns"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": null,
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_null_columns"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": 42,
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "source_scalar_column_spec"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": {
+                "id": 42,
+                "name": {
+                  "type": "string"
+                }
+              },
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_scalar_column_spec"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_kind": "alien",
+            "source_table": "items"
+          }
+        },
+        "id": "source_invalid_source_kind"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "source_kind": "alien",
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_invalid_source_kind"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_kind": null,
+            "source_table": "items"
+          }
+        },
+        "id": "source_null_source_kind"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "source_kind": null,
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_null_source_kind"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "readonly": "yes",
+            "source_table": "items"
+          }
+        },
+        "id": "source_invalid_readonly"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "readonly": "yes",
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_invalid_readonly"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "readonly": null,
+            "source_table": "items"
+          }
+        },
+        "id": "source_null_readonly"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": {
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "readonly": null,
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_null_readonly"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "readonly": true,
+            "source_kind": "table",
+            "source_table": "items"
+          }
+        },
+        "id": "source_valid_table_metadata"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "readonly": true,
+            "source_kind": "view",
+            "source_table": "items"
+          }
+        },
+        "id": "source_valid_view_metadata"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "readonly": true,
+            "source_kind": "materialized_view",
+            "source_table": "items"
+          }
+        },
+        "id": "source_valid_materialized_view_metadata"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": 42,
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "source_scalar_columns"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": 42,
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_scalar_columns"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": "invalid",
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "source_string_columns"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": "invalid",
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_string_columns"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {},
+          "source": {
+            "associations": {},
+            "columns": [
+              1
+            ],
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "source_list_columns"
+      },
+      {
+        "domain": {
+          "joins": {},
+          "name": "SchemaConformance",
+          "schema_version": 1,
+          "schemas": {
+            "other": {
+              "associations": {},
+              "columns": [
+                1
+              ],
+              "fields": [
+                "id",
+                "name"
+              ],
+              "primary_key": "id",
+              "source_table": "items"
+            }
+          },
+          "source": {
+            "associations": {},
+            "columns": {
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "fields": [
+              "id",
+              "name"
+            ],
+            "primary_key": "id",
+            "source_table": "items"
+          }
+        },
+        "id": "schema_list_columns"
+      }
+    ]
+  }
+}
