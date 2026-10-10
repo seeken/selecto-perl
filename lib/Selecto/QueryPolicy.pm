@@ -25,20 +25,55 @@ sub apply {
         @selected = map { _field($domain, $_) } @{_list($contract, 'default_selected')};
     }
     my @required = map { _field($domain, $_) } @{_list($contract, 'required_selected')};
-    my %seen;
-    @selected = grep { !$seen{_key($_)}++ } (@required, @selected);
     my @orders;
     for my $raw (@{_list($contract, 'required_order_by')}) {
         Selecto::Error->throw('invalid_domain', 'required ordering must contain a field and direction')
             unless ref($raw) eq 'ARRAY' && @$raw == 2 && defined($raw->[1]) && !ref($raw->[1]) && $raw->[1] =~ /\A(?:asc|desc)\z/;
         push @orders, [_field($domain, $raw->[0]), $raw->[1]];
     }
+    my @groups = map { _field($domain, $_) } @{_list($contract, 'required_group_by')};
+    my %seen;
+    @groups = grep { !$seen{_key($_)}++ } (@groups, @{$query->groups});
+    # Required selected fields and orderings are per-row obligations. An
+    # aggregate result has no single row value for an ungrouped field, so
+    # adding one would be invalid SQL on PostgreSQL (and an arbitrary value on
+    # SQLite). In an aggregate query they apply only to grouping keys.
+    if (@groups || grep { _aggregates($_) } @selected) {
+        my %grouped = map { (_field_path($_) // '') => 1 } @groups;
+        delete $grouped{''};
+        @required = grep { $grouped{_field_path($_)} } @required;
+        @orders = grep { $grouped{_field_path($_->[0])} } @orders;
+    }
+    %seen = ();
+    @selected = grep { !$seen{_key($_)}++ } (@required, @selected);
     %seen = ();
     @orders = grep { !$seen{_key($_->[0]) . '\0' . $_->[1]}++ } (@orders, @{$query->orders});
-    my @groups = map { _field($domain, $_) } @{_list($contract, 'required_group_by')};
-    %seen = ();
-    @groups = grep { !$seen{_key($_)}++ } (@groups, @{$query->groups});
     return $query->_copy(selections => \@selected, orders => \@orders, groups => \@groups);
+}
+
+my %AGGREGATE = map { $_ => 1 } qw(
+    count count_field count_distinct sum sum_zero avg min max
+    true_count false_count true_percentage count_bucket grouping dimension_display
+);
+# True when an expression aggregates rows outside a window or correlated
+# collection (whose aggregation is local to that expression).
+sub _aggregates {
+    my ($node) = @_;
+    if (blessed($node) && $node->isa('Selecto::Expression')) {
+        my $kind = $node->kind;
+        return 1 if $AGGREGATE{$kind};
+        return 0 if $kind eq 'window' || $kind eq 'related_collection';
+        return _aggregates($node->arguments);
+    }
+    return scalar grep { _aggregates($_) } @$node if ref($node) eq 'ARRAY';
+    return scalar grep { _aggregates($_) } values %$node if ref($node) eq 'HASH';
+    return 0;
+}
+sub _field_path {
+    my ($expression) = @_;
+    return undef unless blessed($expression) && $expression->isa('Selecto::Expression') && $expression->kind eq 'field';
+    my $path = $expression->arguments->[0];
+    return defined($path) && !ref($path) ? "$path" : undef;
 }
 
 sub filters {
