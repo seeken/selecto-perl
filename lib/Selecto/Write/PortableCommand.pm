@@ -28,6 +28,11 @@ use Selecto::Write::QueryEnforcement ();
 fieldhash my %ACCEPTED_INPUT;
 fieldhash my %ACCEPTED_GRAPHS;
 fieldhash my %INPUT_PROOFS;
+# Protected UPSERT choice decisions belong to the realized storage branch.
+# This separate origin receipt exists even when no INPUT rule or choice field
+# is assigned. Trusted callbacks never enter a Command or serialized metadata.
+fieldhash my %ACCEPTED_UPSERTS;
+fieldhash my %UPSERT_PROOFS;
 my $RECEIPT_LIMITS = Selecto::Limits->new;
 my %RECEIPT_CLASSES = map { $_ => 1 } qw(Selecto::Write::Command
     Selecto::Write::Graph Selecto::Expression Selecto::Write::Expression
@@ -160,6 +165,120 @@ sub _reuse_input {
         return Selecto::DataRules->_preflight_reused_input($record->{rules}, $command->operation,
             $record->{original}, $record->{normalized}, $engine->limits);
     }, accepted_work => $record->{work}, limits => $engine->limits);
+}
+
+sub _upsert_mismatch {
+    _fail('compiled_upsert_mismatch', 'compiled UPSERT origin differs from its original subject or host',
+        {reason => $_[0] // 'invalid_origin'});
+}
+my $issue_upsert = sub {
+    my ($command, $record) = @_;
+    my $token = bless \(my $identity = 0), 'Selecto::Write::PortableCommand::_UpsertProof';
+    $UPSERT_PROOFS{$token} = $record;
+    $ACCEPTED_UPSERTS{$command} = {digest => _receipt_digest($command), proof => $token};
+};
+sub _accepted_protected_upsert {
+    my ($class, $command) = @_;
+    my $record = defined(reftype($command)) ? $ACCEPTED_UPSERTS{$command} : undef;
+    return undef unless $record;
+    _upsert_mismatch('command_changed') unless $record->{digest} eq _receipt_digest($command);
+    return $record->{proof};
+}
+sub _protected_upsert_record {
+    my ($proof, $engine) = @_;
+    return undef unless defined $proof;
+    my $record = defined(reftype($proof)) ? $UPSERT_PROOFS{$proof} : undef;
+    _upsert_mismatch('invalid_origin') unless $record;
+    $engine->assert_domain_identity;
+    require Selecto::Domain;
+    require Selecto::ConfiguredDomain;
+    my $expected = _copy($record->{domain});
+    $expected->{name} //= $expected->{source}{source_table} // $expected->{source}{table};
+    my $domain = Selecto::Domain->parse($expected);
+    _upsert_mismatch('domain_changed') unless Selecto::ConfiguredDomain->digest($domain, {})
+        eq Selecto::ConfiguredDomain->digest($engine->domain, {});
+    _upsert_mismatch('context_changed') unless _receipt_digest($record->{context})
+        eq _receipt_digest($engine->write_context);
+    return $record;
+}
+sub _protected_upsert_declaration {
+    my ($record, $engine) = @_;
+    return ($record->{domain}, $record->{contract}) if $record;
+    my $domain = $engine->domain->as_contract;
+    # A native Domain may use the older native write shape. Its Engine has
+    # already governed that policy; reading choice bindings must not require
+    # importing it through the separate portable authoring contract.
+    return ($domain, {source => $domain->{source}, rules => $domain->{rules} // {},
+        fields => $engine->domain->writes->{fields} // {}});
+}
+sub _choice_fields {
+    my ($contract, $values) = @_;
+    return [grep {
+        my $spec = $contract->{source}{columns}{$_} // {};
+        defined($spec->{choice_source}) || ref($spec->{reference}) eq 'HASH' && defined($spec->{reference}{choice_source});
+    } sort keys %$values];
+}
+sub _candidate_normalizer {
+    my ($contract) = @_;
+    return scalar(grep {
+        my $binding = $_;
+        ref($binding) eq 'HASH' && defined($binding->{normalizer})
+            && ($binding->{subject}{scope} // '') eq 'candidate'
+            && (!@{$binding->{operations} // []} || grep { $_ eq 'upsert' } @{$binding->{operations}})
+    } values %{$contract->{rules}{bindings} // {}});
+}
+sub _protected_upsert_dependencies {
+    my ($class, $proof, $engine, $state) = @_;
+    my $record = _protected_upsert_record($proof, $engine);
+    my ($domain, $contract) = _protected_upsert_declaration($record, $engine);
+    my $fields = _fields($contract);
+    return [] unless @{_choice_fields($contract, $fields)};
+    return [] if ($state->{effect} // '') eq 'nothing' && !_candidate_normalizer($contract);
+    return [sort keys %$fields];
+}
+sub _regovern_protected_upsert {
+    my ($class, $proof, $engine, $original, $realized, $state) = @_;
+    my $record = _protected_upsert_record($proof, $engine);
+    _receipt_digest([$original, $realized]);
+    _upsert_mismatch('operation_changed') unless $original->operation eq 'upsert'
+        && $realized->operation eq 'upsert' && $original->relation eq $realized->relation;
+    my $metadata = $original->metadata;
+    my $assignments = $realized->assignments;
+    if ($record) {
+        my %updates = map { $_ => 1 } @{$metadata->{upsert_update_fields} // []};
+        my $before = $original->assignments;
+        for my $field (sort keys %$assignments) {
+            next if exists $before->{$field};
+            my $spec = $record->{contract}{fields}{$field} // {};
+            $updates{$field} = 1 if _true($spec->{updatable})
+                && !grep { _true($spec->{$_}) } qw(immutable write_once server_managed);
+        }
+        $metadata->{upsert_update_fields} = [sort keys %updates];
+    }
+    # Fresh host governance owns types, scope, field grants and FK guards.
+    # Original executable intent is retained; only realized assignments and
+    # a genuine portable origin's newly assigned eligible mask can change.
+    return $engine->governed_write($original->with_assignments($assignments)->with_metadata($metadata));
+}
+sub _validate_protected_upsert_choices {
+    my ($class, $proof, $engine, $command, $state) = @_;
+    my $record = _protected_upsert_record($proof, $engine);
+    return 1 if ($state->{effect} // '') eq 'nothing';
+    my ($domain, $contract) = _protected_upsert_declaration($record, $engine);
+    my $values = _copy($state->{values});
+    _upsert_mismatch('candidate_changed') unless ref($values) eq 'HASH';
+    my @persisted = ($state->{branch} // '') eq 'conflict'
+        ? @{$command->metadata->{upsert_update_fields} // []} : keys %{$command->assignments};
+    my %persisted = map { $_ => 1 } @persisted;
+    my %attrs;
+    for my $field (@{_choice_fields($contract, \%persisted)}) {
+        _fail('required_data_rule_pending', 'realized choice assignment lacks a canonical storage value', {field => $field})
+            unless exists $values->{$field};
+        $attrs{$field} = $values->{$field};
+    }
+    _choices_now($domain, $contract, \%attrs, $record ? $record->{context} : $engine->write_context,
+        $record ? $record->{resolver} : undef, 'upsert', $record ? $record->{filters} : [], $values);
+    return 1;
 }
 
 # Nested lowering records original compiler-owned child identities, then seals
@@ -401,18 +520,15 @@ sub _choices {
     return _choices_now(@arguments);
 }
 sub _choices_now {
-    my ($domain, $contract, $values, $context, $resolver, $type, $filters) = @_;
-    my @fields = grep {
-        my $spec = $contract->{source}{columns}{$_} // {};
-        defined($spec->{choice_source}) || ref($spec->{reference}) eq 'HASH' && defined($spec->{reference}{choice_source});
-    } sort keys %$values;
+    my ($domain, $contract, $values, $context, $resolver, $type, $filters, $record) = @_;
+    my @fields = @{_choice_fields($contract, $values)};
     return unless @fields;
     _fail('choice_membership_resolver_required', 'choice-backed write fields require a trusted membership resolver', {fields => \@fields})
         unless $resolver;
     require Selecto::Domain::Choices;
     for my $field (@fields) {
         my $result = Selecto::Domain::Choices->validate_choice($domain, $field, $values->{$field},
-            {actor => $context->{actor}, tenant => $context->{tenant_id}, record => $values,
+            {actor => $context->{actor}, tenant => $context->{tenant_id}, record => $record // $values,
                 filters => [map { $_->[1] eq 'eq' ? [$_->[0], $_->[2]] : [@$_] } @$filters],
                 context => $context->{choice_source_context} // {}, metadata => {surface => 'portable_write', operation => $type}}, $resolver);
         _fail('choice_membership_invalid', 'write value is not admitted by its choice source', {field => $field, reason_code => $result->reason_code})
@@ -494,7 +610,8 @@ sub _compile_flat {
     # The helper compiles the complete effective assigned bundle before any
     # evaluation. Its shared scope also spans every nested/batch member.
     $values = Selecto::Write::FieldValidators->validate_values($contract->{fields}, $values);
-    _choices($state->{domain}, $contract, $values, $context, $resolver, $type, $filters);
+    my $protected_upsert = $type eq 'upsert' && $class->requires_storage_candidate($operation);
+    _choices($state->{domain}, $contract, $values, $context, $resolver, $type, $filters) unless $protected_upsert;
     my $guards = Selecto::Write::Context->foreign_key_guards($state->{domain}, $contract, $values, $type, $context);
     my $relation = $contract->{source}{source_table} // $contract->{source}{table};
     _fail('invalid_domain', 'write domain must declare a source relation') unless defined($relation) && !ref($relation) && $relation =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
@@ -553,6 +670,8 @@ sub _compile_flat {
         {operations => $contract->{operations}, fields => $contract->{fields}}, $fields,
         trusted_field => $tenant_field);
     $issue_input->($command, $accepted_input) if $accepted_input;
+    $issue_upsert->($command, {domain => _copy($state->{domain}), contract => _copy($contract),
+        context => _copy($context), resolver => $resolver, filters => _copy($filters)}) if $protected_upsert;
     return {command => $command, context => _copy($context)};
 }
 
@@ -576,5 +695,10 @@ Input accepts only constructed Operation values and complete bounded plain
 metadata. Native objects, callbacks and resources are not write values.
 C<choice_membership_resolver> is a separate explicit trusted host callback;
 its results must come through the public choice-result API.
+Protected UPSERTs defer membership to native execution, after SQLite proves
+the actual branch and canonical candidate. Only the fields actually persisted
+are checked; a conflict with an empty update mask performs C<DO NOTHING> and
+retains the caller's cardinality requirement. Reconstructed commands do not
+inherit the compiler's private trusted resolver or portable normalization origin.
 
 =cut

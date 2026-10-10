@@ -216,6 +216,12 @@ sub _recheck {
     my ($self, %request) = @_;
     return $self->_evaluate_request(\%request, 1);
 }
+sub _with_native_upsert_values {
+    _fail('required_data_rule_pending', 'native decimal scope requires protected rule authority')
+        unless caller eq 'Selecto::WriteRules';
+    my ($class, $values, $types, $context, $receipt, $limits, $work) = @_;
+    return Selecto::RuleTest->_with_native_upsert_values($values, $types, $context, $receipt, $limits, $work);
+}
 # Resource admission is shared with native replay of compiler-owned INPUT
 # evidence. It inspects every applicable binding, including advisory and false
 # conditions, without running a normalizer, condition or rule test.
@@ -227,8 +233,8 @@ sub _preflight_subject {
         next unless _applies($binding, $request);
         my ($value, $present) = _at($subject, $binding->{subject}{path});
         Selecto::RuleTest::check_value($value, $limits, $work);
-        Selecto::RuleTest->preflight($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits);
-        Selecto::RuleTest->preflight($binding->{prepared_condition}, $value, $present, $limits)
+        Selecto::RuleTest->preflight($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits, $subject, $work);
+        Selecto::RuleTest->preflight($binding->{prepared_condition}, $value, $present, $limits, $subject, $work)
             if $binding->{prepared_condition};
     }
     return 1;
@@ -292,11 +298,11 @@ sub _evaluate_request {
             unless ($failed) {
                 my $applies = 1;
                 if ($binding->{prepared_condition}) {
-                    ($applies) = Selecto::RuleTest->evaluate($binding->{prepared_condition}, $value, $present, $limits, $work);
+                    ($applies) = Selecto::RuleTest->evaluate($binding->{prepared_condition}, $value, $present, $limits, $work, $normalized, $path);
                 }
                 if ($applies) {
                     my $passed;
-                    ($passed, $code) = Selecto::RuleTest->evaluate($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits, $work);
+                    ($passed, $code) = Selecto::RuleTest->evaluate($self->{definitions}{$binding->{rule}{id}}{prepared}, $value, $present, $limits, $work, $normalized, $path);
                     $failed = !$passed;
                 }
             }
@@ -327,7 +333,10 @@ sub consumed_paths {
         my $root = $binding->{subject}{path};
         push @paths, [@$root];
         for my $prepared ($self->{definitions}{$binding->{rule}{id}}{prepared}, $binding->{prepared_condition} // ()) {
-            push @paths, [@$root, @$_] for @{Selecto::RuleTest->dependencies($prepared)};
+            for my $path (@{Selecto::RuleTest->dependencies($prepared)}) {
+                push @paths, ref($path->[0]) eq 'HASH' && $path->[0]{root}
+                    ? [@$path[1 .. $#$path]] : [@$root, @$path];
+            }
         }
     }
     return \@paths;

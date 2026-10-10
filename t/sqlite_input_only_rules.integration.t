@@ -14,6 +14,7 @@ BEGIN { eval { require DBI; require DBD::SQLite; 1 } or plan skip_all => 'DBD::S
     sub write_capabilities { ++$_[0]{providers}; shift->SUPER::write_capabilities(@_) }
     sub execute_query { ++$_[0]{hydrations}; shift->SUPER::execute_query(@_) }
     sub rule_project_subject { ++$_[0]{projections}; shift->SUPER::rule_project_subject(@_) }
+    sub rule_upsert_candidate { ++$_[0]{upsert_projections}; shift->SUPER::rule_upsert_candidate(@_) }
     sub _execute_compiled_write_in_transaction {
         my ($self, $command, @rest) = @_;
         my $metadata = $command->metadata;
@@ -90,12 +91,13 @@ sub memory {
     my $observe = sub {
         my ($run) = @_;
         @sql = (); @prepare = (); @hooks = (); @db_errors = ();
-        @$adapter{qw(providers hydrations projections)} = (0, 0, 0); $adapter->{dispatched} = [];
+        @$adapter{qw(providers hydrations projections upsert_projections)} = (0, 0, 0, 0); $adapter->{dispatched} = [];
         my ($result, $error); my $ok = eval { $result = $run->(); 1 }; $error = $@ unless $ok;
         die "untyped native failure: $error" if !$ok && ref($error) ne 'Selecto::Error';
         return {code => $ok ? 'ok' : $error->code, result => $result, error => $error,
             sql => [@sql], prepare => [@prepare], hooks => [@hooks], db_errors => [@db_errors],
             providers => $adapter->{providers}, hydrations => $adapter->{hydrations}, projections => $adapter->{projections},
+            upsert_projections => $adapter->{upsert_projections},
             dispatched => copy($adapter->{dispatched})};
     };
     my $zero = sub {
@@ -155,10 +157,21 @@ subtest 'stored-stage dependencies remain protected and operation-filtered' => s
             my $raw = stored_binding(document(), $stage, enforcement => $enforcement);
             my $e = $engine->($raw); my $before = $snapshot->();
             my $seen = $observe->(sub { $e->execute_write(upsert(1, 'mixed')) });
-            is($seen->{code}, 'required_data_rule_pending', "$enforcement $stage upsert retains provider-selected branch obligation");
-            is(scalar @{$seen->{hooks}}, 0, 'protected pending upsert performs no mutation');
-            is(scalar @{$seen->{dispatched}}, 0, 'protected pending upsert dispatches no business statement');
-            is_deeply($snapshot->(), $before, 'protected pending upsert preserves complete rows');
+            my $expected_code = $stage eq 'evidence' && $enforcement eq 'required'
+                ? 'required_data_rule_pending' : 'ok';
+            my $allowed = $expected_code eq 'ok';
+            is($seen->{code}, $expected_code, "$enforcement $stage upsert respects actual native stage authority");
+            is(scalar(grep {$_->[1] eq 'main'} @{$seen->{hooks}}), $allowed ? 1 : 0,
+                'protected branch has exactly the admitted MAIN mutation count');
+            is(scalar @{$seen->{dispatched}}, $allowed ? 1 : 0,
+                'only admitted branch dispatches its business statement');
+            my $expected = copy($before);
+            $expected->{items}[0][2] = 'mixed' if $allowed;
+            is_deeply($snapshot->(), $expected, 'full rows change only the admitted conflict name');
+            is($db->selectrow_array('SELECT name FROM items WHERE id=1'),
+                $allowed ? 'mixed' : $before->{items}[0][2], 'actual stored name agrees with stage outcome');
+            cmp_ok($seen->{upsert_projections}, '>=', 2,
+                'active stored binding uses native initial and final candidate proof');
         }
         my $filtered = stored_binding(document(), $stage, operations => ['delete']);
         my $seen = $observe->(sub { $engine->($filtered)->execute_write(upsert(1, 'filtered')) });
@@ -166,6 +179,7 @@ subtest 'stored-stage dependencies remain protected and operation-filtered' => s
         is($db->selectrow_array('SELECT name FROM items WHERE id=1'), 'filtered', 'filtered positive actually stores');
         is($seen->{hydrations}, 0, 'filtered stored binding performs no candidate hydration');
         is($seen->{projections}, 0, 'filtered stored binding performs no candidate projection');
+        is($seen->{upsert_projections}, 0, 'filtered binding performs no protected UPSERT candidate proof');
     }
 }) };
 

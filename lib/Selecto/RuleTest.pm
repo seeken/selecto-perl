@@ -8,12 +8,42 @@ use Math::BigFloat ();
 use Scalar::Util qw(blessed reftype);
 use B ();
 use bytes ();
+use POSIX ();
 use Selecto::Error ();
 use Selecto::Pattern ();
 
 # Closed, driver-free portable AST. Work is shared by every binding, logical
 # branch, normalizer and exact arithmetic operation in one evaluation.
 sub _fail { Selecto::Error->throw(@_) }
+my $NATIVE_DECIMALS;
+
+# Native SQLite NUMERIC values are delivered as NVs, whereas the highest
+# adapter returns Decimal values. Only an actual protected candidate may lend
+# its proved decimal operands this interpretation; raw requests cannot opt in.
+sub _with_native_upsert_values {
+    my ($class, $values, $types, $context, $receipt, $limits, $work) = @_;
+    _fail('required_data_rule_pending', 'native decimal scope requires protected rule authority')
+        unless caller eq 'Selecto::DataRules' && ref($receipt) && ref($work) eq 'CODE';
+    require Selecto::Write::PortableCommand;
+    my %fields;
+    for my $field (keys %$values) {
+        next unless ($types->{$field} // '') =~ /\A(?:decimal|numeric)\z/;
+        my $value = $values->{$field};
+        next if !defined($value) || defined(reftype($value)) || JSON::PP::is_bool($value);
+        my $flags = B::svref_2object(\$value)->FLAGS;
+        next unless ($flags & B::SVf_NOK()) && !($flags & B::SVf_POK());
+        _fail('required_data_rule_pending', 'native decimal candidate is nonfinite') unless POSIX::isfinite($value);
+        $fields{$field} = pack('F', $value);
+    }
+    my $previous = $NATIVE_DECIMALS;
+    $NATIVE_DECIMALS = {fields => \%fields, origin => $receipt,
+        subject => Selecto::Write::PortableCommand::_receipt_digest($values),
+        context => Selecto::Write::PortableCommand::_receipt_digest($context)};
+    my $guard = bless {restore => sub {$NATIVE_DECIMALS = $previous}}, 'Selecto::RuleTest::_NativeDecimalScope';
+    my $want = wantarray;
+    return $work->() unless defined $want;
+    return $want ? $work->() : scalar $work->();
+}
 sub spend {
     my ($limits, $work, $amount) = @_;
     $$work += $amount // 1;
@@ -171,6 +201,12 @@ sub compile {
     } elsif ($op eq 'value.eq' || $op eq 'value.neq') {
         _keys($test, qw(op value)); _fail('invalid_data_rules_contract', 'equality requires a literal') unless exists $test->{value};
         _literal($test->{value}, $limits, $work, 0);
+    } elsif ($op eq 'value.compare_path') {
+        _keys($test, qw(op comparison path));
+        _fail('invalid_related_value_rule', 'related comparison requires gt/gte/lt/lte/eq/neq and a semantic path')
+            unless defined($test->{comparison}) && !ref($test->{comparison})
+                && $test->{comparison} =~ /\A(?:gt|gte|lt|lte|eq|neq)\z/;
+        $prepared->{path} = _path($test->{path});
     } elsif ($op eq 'collection.unique_by') {
         _keys($test, qw(op paths));
         _fail('invalid_data_rules_contract', 'unique_by requires bounded paths') unless ref($test->{paths}) eq 'ARRAY'
@@ -193,7 +229,7 @@ sub at {
     return ($value, 1);
 }
 sub preflight {
-    my ($class, $prepared, $value, $present, $limits) = @_;
+    my ($class, $prepared, $value, $present, $limits, $root, $work) = @_;
     my $op = $prepared->{op};
     if ($op =~ /\Anumber\./ && $present && defined($value) && !ref($value)) {
         _fail('evaluation_limit', 'rule number exceeds its digit limit')
@@ -204,7 +240,15 @@ sub preflight {
         for (@$value) { my ($part, $found) = at($_, $prepared->{path});
             $class->preflight({op => 'number.gt'}, $part, $found, $limits) }
     }
-    $class->preflight($_, $value, $present, $limits) for @{$prepared->{children} // []};
+    if ($op eq 'value.compare_path') {
+        my ($related, $found) = at($root // {}, $prepared->{path});
+        check_value($related, $limits, $work) if $work;
+        if ($prepared->{test}{comparison} !~ /\A(?:eq|neq)\z/) {
+            $class->preflight({op => 'number.gt'}, $value, $present, $limits);
+            $class->preflight({op => 'number.gt'}, $related, $found, $limits);
+        }
+    }
+    $class->preflight($_, $value, $present, $limits, $root, $work) for @{$prepared->{children} // []};
 }
 sub equal {
     my ($left, $right, $limits, $work) = @_;
@@ -228,21 +272,39 @@ sub _within {
         && (!exists($bounds->{max}) || $value->bcmp($bounds->{max}) <= 0);
 }
 sub evaluate {
-    my ($class, $prepared, $value, $present, $limits, $work) = @_;
+    my ($class, $prepared, $value, $present, $limits, $work, $root, $subject_path) = @_;
     spend($limits, $work);
     my ($op, $test) = @{$prepared}{qw(op test)};
     if ($op eq 'all' || $op eq 'any') {
         my ($passed, $failure) = (0, undef);
-        for my $child (@{$prepared->{children}}) { my ($ok, $code) = $class->evaluate($child, $value, $present, $limits, $work);
+        for my $child (@{$prepared->{children}}) { my ($ok, $code) = $class->evaluate($child, $value, $present, $limits, $work, $root, $subject_path);
             $passed ||= $ok; $failure //= $code unless $ok }
         return $op eq 'all' ? (!defined($failure), $failure) : ($passed, $passed ? undef : 'no_rule_matched');
     }
-    if ($op eq 'not') { my ($ok) = $class->evaluate($prepared->{children}[0], $value, $present, $limits, $work);
+    if ($op eq 'not') { my ($ok) = $class->evaluate($prepared->{children}[0], $value, $present, $limits, $work, $root, $subject_path);
         return (!$ok, $ok ? 'negated_rule_matched' : undef) }
     return ($present, $present ? undef : 'required') if $op eq 'presence.required';
     return ($present && defined($value), $present && defined($value) ? undef : 'null') if $op eq 'presence.non_null';
     return (!$present, $present ? 'forbidden' : undef) if $op eq 'presence.absent';
     return (0, 'invalid_type') unless $present;
+    if ($op eq 'value.compare_path') {
+        my ($related, $found) = _related_at($root // {}, $prepared->{path}, $limits, $work);
+        return (0, 'missing_related_value') unless $found;
+        my $comparison = $test->{comparison};
+        my $ok;
+        if ($comparison eq 'eq' || $comparison eq 'neq') {
+            my $same = equal($value, $related, $limits, $work);
+            $ok = $comparison eq 'eq' ? $same : !$same;
+        } else {
+            my $left = _related_number($value, $limits, $work, $subject_path, $root);
+            my $right = _related_number($related, $limits, $work, $prepared->{path}, $root);
+            return (0, 'invalid_related_value_type') unless defined($left) && defined($right);
+            my $order = $left->bcmp($right);
+            $ok = $comparison eq 'gt' ? $order > 0 : $comparison eq 'gte' ? $order >= 0
+                : $comparison eq 'lt' ? $order < 0 : $order <= 0;
+        }
+        return ($ok ? 1 : 0, $ok ? undef : 'related_value_comparison');
+    }
     if ($op eq 'value.eq' || $op eq 'value.neq') { my $same = equal($value, $test->{value}, $limits, $work);
         return $op eq 'value.eq' ? ($same, $same ? undef : 'not_equal') : (!$same, $same ? 'equal_to_excluded' : undef) }
     if ($op eq 'membership.in' || $op eq 'membership.not_in') { my $same = 0;
@@ -313,8 +375,48 @@ sub dependencies {
     my @paths;
     if ($op eq 'collection.sum') { push @paths, [{each => 1}, @{$prepared->{path}}] }
     elsif ($op eq 'collection.unique_by') { push @paths, [{each => 1}, @$_] for @{$prepared->{test}{paths}} }
+    elsif ($op eq 'value.compare_path') { push @paths, [{root => 1}, @{$prepared->{path}}] }
     elsif ($op =~ /\A(?:value\.|membership\.)/) { push @paths, [{complete => 1}] }
     push @paths, @{$class->dependencies($_)} for @{$prepared->{children} // []};
     return \@paths;
 }
+
+sub _related_at {
+    my ($root, $path, $limits, $work) = @_;
+    my $value = $root;
+    for my $segment (@$path) {
+        spend($limits, $work, ref($value) eq 'HASH' ? scalar(keys %$value) + 1 : 1);
+        return (undef, 0) unless ref($value) eq 'HASH' && exists($value->{$segment});
+        $value = $value->{$segment};
+    }
+    return ($value, 1);
+}
+sub _related_number {
+    my ($value, $limits, $work, $path, $root) = @_;
+    return undef if !defined($value) || defined(reftype($value)) || JSON::PP::is_bool($value);
+    my $flags = B::svref_2object(\$value)->FLAGS;
+    unless (($flags & B::SVf_POK()) || ($flags & B::SVf_IOK())) {
+        return undef unless $NATIVE_DECIMALS && ref($path) eq 'ARRAY' && @$path == 1
+            && exists($NATIVE_DECIMALS->{fields}{$path->[0]}) && ref($root) eq 'HASH'
+            && exists($root->{$path->[0]}) && !defined(reftype($root->{$path->[0]}))
+            && pack('F', $value) eq $NATIVE_DECIMALS->{fields}{$path->[0]}
+            && pack('F', $root->{$path->[0]}) eq $NATIVE_DECIMALS->{fields}{$path->[0]};
+        my $decimal;
+        for my $precision (1 .. 17) {
+            spend($limits, $work);
+            my $text = sprintf('%.*g', $precision, $value);
+            if (pack('F', 0 + $text) eq pack('F', $value)) { $decimal = $text; last }
+        }
+        return undef unless defined $decimal;
+        spend($limits, $work, bytes::length($decimal) + 1);
+        _fail('evaluation_limit', 'native decimal exponent exceeds its digit limit')
+            if $decimal =~ /[eE]([+-]?[0-9]+)\z/ && abs($1) > $limits->get('max_rule_numeric_digits');
+        $decimal = Math::BigFloat->new($decimal)->bstr if $decimal =~ /[eE]/;
+        return number($decimal, $limits, $work, 0);
+    }
+    return number($value, $limits, $work, 0);
+}
+
+package Selecto::RuleTest::_NativeDecimalScope;
+sub DESTROY { $_[0]{restore}->() }
 1;
