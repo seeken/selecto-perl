@@ -126,10 +126,41 @@ sub _execution {
                     $ancestor->assert_domain_identity;
                     return 1 if refaddr($ancestor) == refaddr($owner);
                 }
+                # Engines scoped from one configured family to different
+                # trusted tenants (base->with_scope(tenant => A) and
+                # base->with_scope(tenant => B)) may share flat intent: the
+                # target compiles it under its own trusted tenant and every
+                # other read obligation is identical, so nothing is dropped.
+                return 1 if _trusted_tenant_siblings($engine, $owner);
             }
         }
     }
     return $class->compatible($engine, $owner);
+}
+sub _flat_ancestors {
+    my ($engine) = @_;
+    my @chain;
+    while ($engine = $INPUT_PARENT{$engine}) {
+        $engine->assert_domain_identity;
+        push @chain, $engine;
+    }
+    return @chain;
+}
+sub _trusted_tenant_siblings {
+    my ($engine, $owner) = @_;
+    my %owner_ancestors = map { (refaddr($_) => 1) } _flat_ancestors($owner);
+    # A shared proper ancestor of both; an ancestor/descendant pair is either
+    # the approved forward transition above or a refused reverse transfer.
+    return 0 if $owner_ancestors{refaddr($engine)};
+    return 0 unless grep { $owner_ancestors{refaddr($_)} } _flat_ancestors($engine);
+    my ($target, $origin) = map { $_->scope->{tenant} } ($engine, $owner);
+    return 0 unless defined($target) && defined($origin);
+    my ($a, $b) = map {
+        my $scope = $_->scope;
+        delete $scope->{tenant};
+        Selecto::ConfiguredDomain->digest({}, [$scope, $_->tenant_context, $_->{tenant_required_filters} // []]);
+    } ($engine, $owner);
+    return $a eq $b ? 1 : 0;
 }
 sub validate {
     my ($class, $engine, $query) = @_;

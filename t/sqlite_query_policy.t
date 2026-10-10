@@ -29,6 +29,9 @@ for my$route(qw(select filter group order)){
 }
 is_deeply($engine->all($engine->query)->{rows},[[3,'Last'],[1,'First']],'native defaults, required selected/filter/order clauses execute');
 is_deeply($engine->all($engine->query->select('title')->replace_orders([[Selecto::Expression->field('priority'),'asc']]))->{rows},[[3,'Last'],[1,'First']],'replacing optional intent cannot erase required native ordering');
+is_deeply($engine->all($engine->query->select(Selecto::Expression->count->as('total')))->{rows},[[2]],'ungrouped aggregate gains no per-row required field or ordering');
+is_deeply($engine->all($engine->query->select('state',Selecto::Expression->count->as('total'))->group_by('state')->order_by('state'))->{rows},[['done',1],['open',1]],'grouped aggregate gains no ungrouped required field or ordering');
+like($engine->compile($engine->query->select(Selecto::Expression->count->as('total'))->group_by('id'))->sql,qr/\ASELECT\s+"?[a-z0-9]+"?\."id"/i,'required field that is a grouping key is still selected');
 my$q=$engine->query->select('title')->where(Selecto::Expression->eq('tenant_id',8));
 is_deeply($engine->all($q)->{rows},[],'optional contradictory tenant filter cannot erase required tenant predicate');
 my$updated=Selecto::Domain->parse(dclone($base));my$e=Selecto::Engine->new(domain=>$updated,adapter=>$adapter);

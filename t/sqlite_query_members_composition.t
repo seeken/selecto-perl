@@ -135,6 +135,17 @@ refusal('scoped flat intent cannot be downgraded to ancestor', 'mixed_tenant_sco
 refusal('independent scope cannot consume a different configured flat query', 'mixed_tenant_scopes', sub {
     configured('permissive', 'row', 'tenant-b')->all($tightened->query->select('id'));
 });
+my $sibling = $unscoped->with_scope(tenant => 'tenant-b');
+is_deeply($sibling->all($tightened->query->select('id')->order_by('id'))->{rows}, [[3]],
+    'a sibling trusted tenant of the same configured engine runs flat intent under its own tenant only');
+is($sibling->compile($tightened->query->select('id'))->sql, $tightened->compile($tightened->query->select('id'))->sql,
+    'sibling tenants compile shared flat intent to the same SQL text');
+refusal('sibling trusted tenant cannot transfer a configured source graph', 'mixed_tenant_scopes', sub {
+    $sibling->all($tightened->query->with_cte('scoped')->select('id'));
+});
+refusal('sibling with an extra read context cannot consume flat intent', 'mixed_tenant_scopes', sub {
+    $tightened->all($sibling->with_tenant({tenant_id => 'tenant-b'})->apply_tenant_scope->query->select('id'));
+});
 refusal('scope transition cannot transfer a configured source graph', 'mixed_tenant_scopes', sub {
     $tightened->all($unscoped->query->with_cte('scoped')->select('id'));
 });
