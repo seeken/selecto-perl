@@ -2688,7 +2688,7 @@ sub _check_typed_insert_admission {
     my $candidate = Selecto::InsertAdmission->prepare($predicate, $command->assignments, $types);
     Selecto::Error->throw('query_rule_not_evaluable', 'adapter cannot establish typed insert storage semantics')
         unless $self->name =~ /\A(?:sqlite|postgresql)\z/ && $self->query_budget_supported;
-    my $savepoint = $self->name eq 'postgresql' ? 'selecto_insert_admission' : undef;
+    my $savepoint = $self->name eq 'postgresql' ? _savepoint_name('selecto_insert_admission') : undef;
     $self->_savepoint_command(create => $savepoint) if $savepoint;
     my ($budget, $error);
     my $ok = eval {
@@ -2878,7 +2878,7 @@ sub _bounded_write_command {
     $sql .= ' FOR UPDATE' if $name eq 'postgresql';
     # Recover a timed-out PostgreSQL statement before restoring session
     # settings. The outer write transaction still owns all selected row locks.
-    my $savepoint = $name eq 'postgresql' ? 'selecto_bounded_probe' : undef;
+    my $savepoint = $name eq 'postgresql' ? _savepoint_name('selecto_bounded_probe') : undef;
     if ($savepoint) {
         eval { $self->_savepoint_command(create => $savepoint); 1 }
             or die $self->_transaction_control_error($@);
@@ -3001,9 +3001,7 @@ sub _own_transaction {
 # rolls back with the host, and a failure undoes only its savepoint.
 sub _savepoint_transaction {
     my ($self, $operation) = @_;
-    my $depth = ($self->{_selecto_savepoint_depth} // 0) + 1;
-    local $self->{_selecto_savepoint_depth} = $depth;
-    my $name = "selecto_write_$depth";
+    my $name = _savepoint_name('selecto_write');
     eval { $self->_savepoint_command(create => $name); 1 }
         or die $self->_transaction_control_error($@);
     my ($value, $error);
@@ -3036,6 +3034,15 @@ sub _handler_transaction {
     Selecto::Error->throw('invalid_adapter', 'transaction handler did not run the write')
         unless $ran;
     return $value;
+}
+
+# A savepoint name no other savepoint in this process shares, so a cleanup
+# can only ever roll back to its own savepoint, never to one an earlier or
+# outer operation left behind. Short enough for SQL Server's 32 characters.
+my $SAVEPOINT_SERIAL = 0;
+sub _savepoint_name {
+    my ($prefix) = @_;
+    return $prefix . '_' . $$ . '_' . ++$SAVEPOINT_SERIAL;
 }
 
 # Whether the handle is inside a transaction the host opened: AutoCommit is
@@ -3259,8 +3266,10 @@ its own transaction: C<begin_work>, then C<commit>, or C<rollback> on
 failure. On a handle that is already inside a transaction (C<AutoCommit>
 off after C<begin_work>, an C<< AutoCommit => 0 >> handle, or a transaction
 the server reports although C<AutoCommit> is on) the write runs inside a
-savepoint instead: C<SAVEPOINT selecto_write_1> ... C<RELEASE SAVEPOINT>,
-and C<ROLLBACK TO SAVEPOINT> then C<RELEASE> on failure. The write then
+savepoint instead: C<SAVEPOINT selecto_write_E<lt>pidE<gt>_E<lt>nE<gt>> ...
+C<RELEASE SAVEPOINT>, and C<ROLLBACK TO SAVEPOINT> then C<RELEASE> on
+failure. Each savepoint has a name no other savepoint in the process
+shares, so a cleanup can only roll back to its own. The write then
 commits or rolls back with the host's transaction, a failed write undoes
 only itself, and on PostgreSQL the host's transaction stays usable. The
 host still commits; a managed write never commits an C<< AutoCommit => 0 >>
