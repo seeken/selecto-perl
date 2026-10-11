@@ -616,7 +616,12 @@ sub _admit_graph {
                 my $maximum = $edge->{max_rows} // 1000;
                 _pending('candidate collection limit must be bounded') unless !ref($maximum) && "$maximum" =~ /\A[1-9][0-9]*\z/ && $maximum <= 1000;
                 my $predicate = Selecto::Expression->eq($child_key, $owner_value);
-                if (my $scope = $domain->write_tenant_scope) {
+                if (defined $root->scope->{tenant}) {
+                    # Lesson 47a: the engine value binds only the child's
+                    # tenant column; a pinned site column takes its pin.
+                    my @conditions = $child_engine->_write_tenant_conditions;
+                    $predicate = Selecto::Expression->all($predicate, @conditions) if @conditions;
+                } elsif (my $scope = $domain->write_tenant_scope) {
                     my $tenants = $root->_trusted_write_tenants($root->domain->required_predicate);
                     _pending('stored child candidate requires trusted tenant scope') unless $tenants && @$tenants;
                     $predicate = Selecto::Expression->all($predicate,

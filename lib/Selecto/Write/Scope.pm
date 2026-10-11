@@ -18,7 +18,12 @@ use Selecto::Expression ();
 #
 # The declaration is enforced data. When a domain declares it, every governed
 # mutation of that domain requires a trusted tenant supplied by the host
-# (Selecto::Engine->new(scope => {tenant => ...})), never by the caller:
+# (Selecto::Engine->new(scope => {tenant => ...})), never by the caller.
+# When the field is the domain's source.tenant_field (or the domain has
+# none) the engine applies the rules below with apply. On a two-column
+# domain (lesson 47a) the engine tenant binds source.tenant_field instead
+# (Selecto::Engine::_apply_write_tenant) and this field is pinned only by
+# host or required conjuncts, never bound to the trusted tenant:
 #
 # - update and delete gain `field = trusted` in their scope predicate;
 # - insert and upsert are assigned the trusted tenant;

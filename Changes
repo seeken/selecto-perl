@@ -1,6 +1,25 @@
 Revision history for Selecto
 
 Unreleased
+    - BEHAVIOUR, BREAKING: on a two-column domain (source.tenant_field
+      tenant_id, writes.scope.tenant site_id) the engine tenant means
+      tenant_id on writes too, as on reads (lesson 47a, reversing the
+      write half of 41a that 41c kept). Before, every write bound
+      site_id = engine value: with tenant 7 at sites 70 and 71 and tenant 8
+      at site 7, an engine tenant 7 update, delete, API write or graph root
+      changed tenant 8's site 7 row and could not reach tenant 7's own
+      rows, inserts were assigned site_id = 7, and a graph child tenanted
+      on site_id was bound site_id = 7. Now writes bind tenant_id = engine
+      tenant (lesson 47's rules), and site_id is never bound to the engine
+      value: a host trusted-scope (write_context required_filters) or
+      required predicate conjunct on site_id pins it, and a caller filter
+      on it only narrows. A writes.scope.tenant on site_id still requires
+      a trusted tenant. Reference guards pairing with site_id take the
+      pinned set (refused with missing_tenant_scope without one), stored
+      child candidates of data rules are read under the same binding, and
+      the portable foreign-key guard description pairs the context tenant
+      with tenant_id. Host-visible: an engine tenant's writes on such a
+      domain now touch the rows of that tenant_id at any site.
     - SECURITY, BREAKING: a trusted engine tenant limits every write of a
       domain that declares source.tenant_field, with or without
       writes.scope.tenant (lesson 47). Before, such a domain without
@@ -111,7 +130,8 @@ Unreleased
       parsed: the write scope is now known before members are validated,
       where it had paired positionally). By-name pairing and the
       invalid_domain refusal of a target tenant column matching neither
-      root column are kept, and writes still bind the write-scope column.
+      root column are kept. Writes still bound the write-scope column
+      until lesson 47a, which binds tenant_id on writes too.
     - SECURITY: the engine tenant survives domain rebuilds (lesson 42a).
       Multi-hop joins and retargets from a shared root through a shared
       middle hop (products -> categories -> notes), engine copies and

@@ -127,15 +127,17 @@ for my $backend (@backends) {
         is_deeply($by_tenant->all($by_tenant->query->with_member('named')->select('id', 'named.name')->order_by('id')->order_by('named.name'))->{rows},
             [[1, 'site 5'], [1, 'site 6'], [2, 'site 5'], [2, 'site 6']], 'a member over a tenant_id relation carries the engine tenant');
 
-        # Writes are unchanged: the engine tenant binds the write-scope column.
+        # Writes bind tenant_id too (lesson 47a): the engine value means
+        # tenant_id on writes as on reads, never site_id.
         my $assign = sub {
             my ($id) = @_;
             return code_of(sub { $root->execute_write(Selecto::Write::Command->new(operation => 'update',
                 relation => $t{orders}, assignments => {account_id => 1},
                 predicate => Selecto::Expression->eq('id', $id), expected_count => 1)) });
         };
-        is($assign->(4), 'ok', 'a write binds site_id to the engine tenant');
-        is($assign->(1), 'cardinality_mismatch', 'and never reaches a row outside that site');
+        is($assign->(1), 'ok', 'a write binds tenant_id to the engine tenant');
+        is($assign->(4), 'cardinality_mismatch', 'and never reaches tenant 8\'s row whose site_id is the engine value');
+        is($assign->(3), 'cardinality_mismatch', 'nor tenant 8\'s row at a site tenant 7 also uses');
 
         my $error = error_of(sub { $domain->('org_id') });
         is($error && blessed($error) && $error->code, 'invalid_domain', 'a target tenant column matching neither root column is refused');
