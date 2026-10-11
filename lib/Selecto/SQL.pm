@@ -3442,6 +3442,12 @@ write, must call it exactly once inside a transaction it controls, and
 should return its value and let its exceptions propagate. A handler that
 never calls the work fails with C<invalid_adapter>, as do a handler that is
 not a code reference and a handler combined with C<external> mode.
+On SQLite, writes governed by stored-stage data rules additionally require
+the handler's transaction to be open on the adapter's own connection; a
+handler that runs the work in autocommit is refused with
+C<required_data_rule_pending> before any business statement. The handler may
+be called again for the write inside its own transaction, so it should run
+nested work directly.
 
 =head1 METHODS
 
