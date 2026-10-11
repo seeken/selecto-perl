@@ -18,6 +18,7 @@ use Selecto::Identifier ();
 use Selecto::Write::Capabilities ();
 use Selecto::Write::PortableCommand ();
 use Selecto::SQLite::Ownership ();
+use Selecto::SQLite::UpsertIndependence ();
 
 fieldhash my %SCOPES;
 fieldhash my %RECEIPTS;
@@ -263,16 +264,9 @@ sub validate_plan {
         _pending('ambiguous_candidate_identity') if $subjects{refaddr($entry->{subject})}++;
         push @entries, [$command, $entry];
     }
-    for my $pair (@entries) {
-        my ($command, $entry) = @$pair;
-        # A final independence proof will admit disjoint same-table plans.
-        # Until then no plan ordering or symbolic cleanup can claim exclusion.
-        for my $other (@$commands, @{$cleanup // []}) {
-            next if refaddr($other) == refaddr($command);
-            _pending('plan_independence_unavailable') if _same($other->relation, $entry->{table});
-        }
-    }
-    return 1;
+    # Each candidate must be independent of every other command on its table,
+    # in either order; symbolic same-table cleanup cannot claim exclusion.
+    return Selecto::SQLite::UpsertIndependence->validate($adapter, \@entries, $commands, $cleanup);
 }
 
 # Read native catalog rows directly. Host SQL collations and SQL table-valued

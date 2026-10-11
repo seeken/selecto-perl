@@ -146,7 +146,17 @@ subtest 'real conflict mask, insert defaults, no-op and lexical receipt lifetime
             my $state = $a->rule_upsert_candidate($noop, request([], dependencies => 'all'));
             is($state->{effect}, 'nothing', 'existing row plus empty mask is actual DO NOTHING');
             is_deeply($state->{values}, {id => 2, name => 'sentinel', secret => 'private'}, 'DO NOTHING candidate ignores insertion values');
-            pending('same-table multi-command plan', sub { $a->rule_upsert_validate_plan([$next, $other]) }, 'plan_independence_unavailable');
+            ok($a->rule_upsert_validate_plan([$next, $other]), 'disjoint same-table protected plan is independent');
+            my $touch = Selecto::Write::Command->new(operation => 'update', relation => 'items', assignments => {secret => 'x'},
+                predicate => Selecto::Expression->eq('id', 1), expected_count => 1);
+            pending('same-table update of the protected row', sub { $a->rule_upsert_validate_plan([$next, $touch]) },
+                'plan_independence_unavailable');
+            my $cleanup = Selecto::Write::Command->new(operation => 'delete', relation => 'items',
+                predicate => Selecto::Expression->eq('id', 9), expected_count => undef);
+            pending('same-table owned cleanup', sub { $a->rule_upsert_validate_plan([$next], [$cleanup]) },
+                'plan_independence_unavailable');
+            ok($a->rule_upsert_validate_plan([$next], [$cleanup->_with(relation => 'caller')]),
+                'other-table cleanup needs no candidate proof');
             $scope_token = $final->{receipt};
         });
         pending('expired receipt cannot reopen', sub { $a->rule_upsert_scope(sub {

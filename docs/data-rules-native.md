@@ -144,8 +144,9 @@ known stored-rule failures are retained while later available stages and graph
 or INSERT-batch candidates finish their resource checks. The first ordinary
 failure then refuses the plan if no later resource error occurs. Refused INPUT,
 unknown prospective values and unavailable storage still stop admission. Protected
-stored batch deltas require a prospective whole-plan provider and remain pending
-here. Individual SQLite upserts with stored rules use the native unique arbiter
+stored UPDATE and DELETE batch deltas require a prospective whole-plan provider
+and remain pending here, as does a protected INSERT beside an ordinary
+non-INSERT command. Individual SQLite upserts with stored rules use the native unique arbiter
 inside the actual transaction to select the insert or conflict branch. Conflict
 candidates overlay only the command's exact update mask on the physical stored
 row; an empty mask compiles to `DO NOTHING` and retains the command's declared
@@ -193,8 +194,34 @@ Every dispatch path (write, preview, batch and graph) refuses a genuine
 protected portable origin with `compiled_upsert_mismatch` on a host whose
 domain, trusted context or stored UPSERT rules differ from the compiler's,
 including a host with no stored rules, so deferred membership is never skipped.
-Protected same-table multi-command plans still require a whole-plan independence
-proof and remain pending.
+
+A SQLite batch may combine protected UPSERTs with ordinary inserts, updates,
+deletes and upserts, and with protected inserts, only when each protected
+candidate is proved independent of every other command on its table. Every
+candidate was projected before any of the plan's DML, so the proof covers both
+orders, and two protected candidates are checked in both directions:
+
+- Another protected candidate's final row must not carry this candidate's
+  arbiter key, and the two must not select the same stored row.
+- An INSERT's row, with consumed literal defaults, must not carry the key.
+- An ordinary UPSERT is projected through its own arbiter and stored branch. It
+  must not select the candidate's stored row, its insertion row and its final
+  row must not carry the candidate's key, and the candidate's final row must
+  not carry the other UPSERT's key (the different-unique-key hazard).
+- An UPDATE or DELETE predicate must select neither the stored row the
+  candidate chose nor the row it will leave behind; an UPDATE must not write
+  every arbiter field to the candidate's key.
+
+Keys and predicates are compared by SQLite, through each column's affinity and
+collation; NULL keys never collide. An unknown generated rowid on the protected
+arbiter refuses any other same-table command, and an omitted rowid or volatile
+default that a comparison needs is unknown. Owned-set cleanup on the same
+table, unsupported predicates and operations, and plans beyond 4,096 pair
+checks remain pending (`required_data_rule_pending`, reasons
+`plan_independence_unavailable`, `ambiguous_candidate_identity` or
+`generated_identity_unavailable`) before business DML. Unique constraints other
+than the arbiters compared here keep their native errors, which roll back the
+whole batch. Protected UPSERTs in write graphs still refuse as pending.
 External evidence requires its exact
 authoritative stage. Unknown defaults or generated fields consumed by a rule,
 database-computed assignments and unmaterialized normalizer changes remain

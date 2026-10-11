@@ -198,10 +198,15 @@ subtest 'atomic native batch validates all INPUT before any prefix' => sub { mem
         $e->execute_batch(Selecto::Write::Batch->new(upsert(1, ' mixed '), upsert(5, 'wrong')));
     });
     my $protected = $engine->(stored_binding(document(), 'candidate'));
-    my $before = $snapshot->(); my $blocked = $observe->(sub { $protected->execute_batch($good) });
-    is($blocked->{code}, 'required_data_rule_pending', 'active stored-stage batch retains whole-plan refusal');
-    is(scalar @{$blocked->{hooks}}, 0, 'protected batch has no native mutation prefix');
+    my $before = $snapshot->();
+    my $blocked = $observe->(sub { $protected->execute_batch(Selecto::Write::Batch->new(upsert(5, 'first'), upsert(5, 'second'))) });
+    is($blocked->{code}, 'required_data_rule_pending', 'dependent stored-stage batch retains whole-plan refusal');
+    is(scalar(grep { $_->[1] eq 'main' } @{$blocked->{hooks}}), 0, 'protected batch has no native mutation prefix');
     is_deeply($snapshot->(), $before, 'protected batch leaves all rows intact');
+    my $disjoint = $observe->(sub { $protected->execute_batch(Selecto::Write::Batch->new(upsert(1, 'kept'), upsert(6, 'added'))) });
+    is($disjoint->{code}, 'ok', 'independent stored-stage upserts are admitted as one batch');
+    is_deeply($db->selectall_arrayref('SELECT id,name FROM items WHERE id IN (1,6) ORDER BY id'), [[1, 'kept'], [6, 'added']],
+        'both independent branches store');
 }) };
 
 subtest 'native graph prepares parent and child once before dispatch' => sub { memory(sub {
