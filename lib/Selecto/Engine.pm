@@ -136,6 +136,7 @@ sub new {
     if (my $references = eval { _domain_references($args{domain}) }) {
         _assert_reference_agreement($references);
     }
+    _assert_unique_parent_keys($args{domain}, $scope);
     my $mode = $args{mode} // 'permissive';
     Selecto::Error->throw('invalid_query_policy', 'mode must be strict or permissive')
         unless !defined(reftype($mode)) && ($mode eq 'strict' || $mode eq 'permissive');
@@ -1395,6 +1396,53 @@ sub _tenant_pairs {
         unless $root{$guard};
     $add->($guard, $guard);
     return @pairs;
+}
+
+# Lesson 36: under a tenant-bounded root, a graph or sync relationship's
+# parent_key must identify one parent row: the parent's primary key, or
+# exactly a single-column upsert conflict target the parent declares. A
+# non-unique key (a code two tenants' items share) would bind a child, and
+# its children, under every parent with that value, another tenant's
+# included. A composite conflict target (tenant_id, code) or a sync identity
+# (unique only per owner) does not count. Checked for every hop of nested
+# relationship domains, when the engine is built.
+sub _assert_unique_parent_keys {
+    my ($domain, $scope) = @_;
+    my $bounded = defined($scope->{tenant}) || defined($domain->tenant_field)
+        || $domain->write_tenant_scope || defined($domain->required_predicate);
+    return unless $bounded;
+    my $writes = $domain->writes;
+    return unless ref($writes) eq 'HASH';
+    my $work = Selecto::OperationBudget->new(code => 'invalid_domain');
+    my @pending = ([$domain->table, $domain->primary_key, $writes, []]);
+    while (my $entry = shift @pending) {
+        my ($table, $primary_key, $parent_writes, $path) = @$entry;
+        my $relationships = ref($parent_writes) eq 'HASH' ? $parent_writes->{relationships} : undef;
+        next unless ref($relationships) eq 'HASH';
+        my $upsert = ref($parent_writes->{operations}) eq 'HASH' ? $parent_writes->{operations}{upsert} : undef;
+        my $targets = ref($upsert) eq 'HASH' ? $upsert->{conflict_targets} : undef;
+        my %unique = map { ("$_->[0]" => 1) }
+            grep { ref($_) eq 'ARRAY' && @$_ == 1 && defined($_->[0]) && !ref($_->[0]) }
+            (ref($targets) eq 'ARRAY' ? @$targets : ());
+        for my $name (sort keys %$relationships) {
+            $work->consume_count('max_expression_nodes', 1, label => 'relationship work');
+            my $spec = $relationships->{$name};
+            next unless ref($spec) eq 'HASH';
+            my $parent_key = $spec->{parent_key};
+            Selecto::Error->throw('invalid_domain',
+                'a relationship\'s parent_key must be its parent\'s primary key or a single-column upsert conflict target',
+                {code => 'foreign_key_tenant_scope_undeclared', relationship => join('.', @$path, $name),
+                    relation => $table, parent_key => "$parent_key"},
+            ) if defined($parent_key) && !ref($parent_key)
+                && "$parent_key" ne ($primary_key // '') && !$unique{"$parent_key"};
+            my $child = $spec->{domain};
+            next unless ref($child) eq 'HASH';
+            my $source = ref($child->{source}) eq 'HASH' ? $child->{source} : {};
+            push @pending, [$source->{source_table} // $spec->{table}, $source->{primary_key} // 'id',
+                $child->{writes}, [@$path, $name]];
+        }
+    }
+    return;
 }
 
 # A declared foreign key and the associations on the same owner key must
@@ -3010,6 +3058,14 @@ root columns, and a tenant column pairing with no root column are refused
 with C<invalid_domain> (C<foreign_key_tenant_scope_undeclared>) when the
 engine is built. A reference whose paired root column no set bounds fails
 with C<missing_tenant_scope>.
+
+Under a tenant-bounded root (an engine tenant, a C<tenant_field>,
+C<writes.scope.tenant> or a required predicate) every graph or sync
+relationship's C<parent_key>, at every hop, must be its parent's primary key
+or exactly a single-column upsert conflict target the parent declares;
+otherwise the engine is refused with C<invalid_domain>
+(C<foreign_key_tenant_scope_undeclared>). A non-unique key would bind
+children under every parent sharing the value, another tenant's included.
 
 =head1 REQUIRED PREDICATES
 
