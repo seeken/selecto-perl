@@ -1,6 +1,27 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY, BREAKING: on a two-column domain under an engine tenant,
+      every write that sets site_id needs a host or required site pin
+      (lesson 47b). Once writes bind tenant_id only (47a), tenant 7 could
+      relabel its own row to tenant 8's site 7 and then read tenant 8's
+      site 7 rows through by-name site pairing (41c); at 47a this worked
+      through Engine writes, the public write route, batches, graph roots
+      and children. Now an insert, update, upsert, batch member, graph
+      root or child, owned-sync row, API write or action that sets site_id
+      is refused with missing_tenant_scope unless a positive top-level
+      eq/IN conjunct of the required predicate or a trusted write_context
+      required filter pins the allowed sites (host and required pins count
+      alike and are intersected; a pin set they leave empty is
+      tenant_mismatch); the value must be a literal inside the pin
+      (tenant_mismatch), also on update. An insert omitting site_id is
+      assigned the pin when exactly one site is pinned and refused
+      otherwise. A graph child tenanted on site_id is checked against the
+      root's pin intersected with its own, is never given site_id = engine
+      value, and its updates, deletes and owned-sync cleanup match only
+      rows inside a pin. Writes that do not set site_id are unaffected.
+      Previews refuse exactly what execution refuses. Host-visible: such
+      inserts now require a site pin.
     - BEHAVIOUR, BREAKING: on a two-column domain (source.tenant_field
       tenant_id, writes.scope.tenant site_id) the engine tenant means
       tenant_id on writes too, as on reads (lesson 47a, reversing the
