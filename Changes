@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: context-sourced foreign keys (source ['context', k]) are
+      paired like input foreign keys (item 34). A foreign key that records
+      no tenancy of its own no longer drops the tenancy an association on
+      the same owner key records: before, its context-owned existence-only
+      exemption let a context person_id reference another tenant's person
+      although the association paired person.tenant_id with the root's
+      tenant_id. The exemption now applies only when nothing declares the
+      target's tenancy. On a two-column root the guard takes the set of the
+      root column it pairs with (lesson 29e), so the site value never guards
+      a tenant_id column, and the portable description from
+      Selecto::Write::Context no longer pairs the trusted context tenant
+      (the write-scope column's) with another tenant column.
     - SECURITY: graph children and owned-sync rows are confined to the root's
       admitted tenants exactly as the root is (lesson 33). Under a root
       bounded only by its required predicate (no engine tenant), a child
