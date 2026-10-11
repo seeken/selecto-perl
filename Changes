@@ -1,6 +1,20 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: on a two-column root a shared hop that merely stores the
+      write-scope column is not a by-name pairing source (lesson 41e).
+      customers (tenant 7, site 5) -> shared bins (a bin at site 7) ->
+      lines tenanted on site_id returned tenant 8's site 7 line through the
+      join path (Engine reads and the public query handler), a filter on
+      bin.lines.code, retarget('bin.lines'), retarget('bin') plus
+      lines.code or a lines filter, and a collection after
+      retarget('bin'): under an engine tenant the line was bound
+      lines.site_id = 7 (the engine value), and under a required tenant_id
+      predicate alone it was unbounded, also when the shared hop authored
+      a site_id scope pair. A site_id relation now pairs only with a hop
+      chained back to the root's tenant-bound rows, or is refused with
+      missing_tenant_scope (the lesson 41b change); this pins every access
+      form. Site rows paired with the root itself are unchanged.
     - SECURITY: every hop of a two-column domain pairs tenant columns by
       name, and an untenanted retarget hop carries the root's admitted
       tenant set (lesson 41b). On a two-column root (source.tenant_field
