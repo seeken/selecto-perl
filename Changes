@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: a portable-compiled protected UPSERT, whose choice
+      membership is deferred to native branch projection, is refused with
+      compiled_upsert_mismatch when the executing engine's domain, trusted
+      context or stored UPSERT rules differ from the compiler's. Previously
+      an engine with no stored UPSERT rules returned before governance, so
+      the deferred membership was never checked (reproduced: a resolver
+      that rejected "forbidden" was never called and the row was stored
+      through execute_write, preview_write and execute_batch). The check
+      runs in governed_write, before any provider or DML.
     - SECURITY: INPUT and ACTION_INPUT bindings whose rule or condition
       reads another root path (value.compare_path) are re-tested, without
       normalizers, against the fully normalized submission. Bindings run in

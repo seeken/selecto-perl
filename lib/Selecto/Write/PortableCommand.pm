@@ -184,6 +184,20 @@ sub _accepted_protected_upsert {
     _upsert_mismatch('command_changed') unless $record->{digest} eq _receipt_digest($command);
     return $record->{proof};
 }
+# A genuine protected origin defers choice membership and mask semantics to
+# the executing host's stored-rule governance. A host whose domain, context or
+# rules differ would skip that governance entirely, so refuse the origin on
+# every dispatch path before any provider or DML.
+sub _require_protected_upsert_host {
+    my ($class, $command, $engine) = @_;
+    my $proof = $class->_accepted_protected_upsert($command);
+    return 1 unless defined $proof;
+    _protected_upsert_record($proof, $engine);
+    require Selecto::WriteRules;
+    _upsert_mismatch('host_rules_unavailable')
+        unless Selecto::WriteRules->has_stored_rules($engine->domain, 'upsert');
+    return 1;
+}
 sub _protected_upsert_record {
     my ($proof, $engine) = @_;
     return undef unless defined $proof;
