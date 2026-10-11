@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: an association source_scope_key that is not a root tenant
+      column (for example region_id -> region_id) no longer becomes the
+      reference's tenant guard. It was guarded as
+      target.region_id IN <tenant set>, which admitted another tenant's row
+      in the same region. On a single-column root such a reference is now
+      guarded by the target schema's tenant_field and refused with
+      invalid_domain (foreign_key_tenant_scope_undeclared) when the target
+      declares none; on a two-column root it is refused outright. Both
+      refusals happen at engine construction, before any query or write.
     - SECURITY: a declared foreign key and the associations on the same
       owner key must describe one reference. When they name different
       relations, or pair a target tenant column with a different tenant

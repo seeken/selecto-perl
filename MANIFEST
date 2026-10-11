@@ -182,6 +182,7 @@ t/write_graph_child_scope.t
 xt/changes.t
 xt/pod.t
 lib/Selecto/Limits.pm
+t/scope_key_tenant_guard.t
 t/security_boundaries.t
 t/security_action_integrity.t
 lib/Selecto/QueryBudget.pm
