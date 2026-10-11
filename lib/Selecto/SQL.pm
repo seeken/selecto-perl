@@ -176,7 +176,7 @@ sub _compile_single {
     }
     my $sources = $self->_query_sources($domain, $query);
     local $self->{_query_sources} = $sources;
-    my ($with_sql, $cte_params) = $self->_compile_cte_prefix($query);
+    my ($with_sql, $cte_params) = $self->_compile_cte_prefix($query, $domain);
     my @params = @$cte_params;
     my @joins;
     my $predicate = Selecto::QueryEnforcement::combine(
@@ -457,7 +457,9 @@ sub _compile_retargeted {
     require Selecto::Retarget;
     my $spec = $query->retarget_spec;
     my $target = Selecto::Retarget->target($domain, $spec->{path});
-    my $target_domain = Selecto::Retarget->target_domain($domain, $target);
+    my $engine = $self->{_selecto_compile_engine};
+    my $target_domain = Selecto::Retarget->target_domain($domain, $target,
+        tenant => ($engine ? $engine->scope->{tenant} : undef));
     my $key = Selecto::Expression->field("$target->{path}.$target->{primary_key}");
     my $context = Selecto::Query->new(
         selections => [$key],
@@ -727,7 +729,7 @@ sub _validate_query_aliases {
 }
 
 sub _compile_cte_prefix {
-    my ($self, $query) = @_;
+    my ($self, $query, $root) = @_;
     my $ctes = $query->ctes;
     return ('', []) unless @$ctes || @{$query->values_sources};
     Selecto::Error->throw('unsupported_feature', 'adapter does not support CTEs')
@@ -735,6 +737,7 @@ sub _compile_cte_prefix {
     my (@entries, @params);
     my $recursive = 0;
     for my $spec (@$ctes) {
+        $spec->{domain} = $self->_bounded_source_domain($root, $spec->{domain}, "CTE $spec->{name}");
         my $columns = $spec->{columns};
         my @statements;
         if ($spec->{recursive}) {
@@ -873,10 +876,22 @@ sub _compile_values_joins {
     }
     return \@joins;
 }
+# Every CTE, lateral and subquery source reads its own relation, so the root's
+# trusted tenant boundary is carried onto a tenant-scoped source relation, or
+# the source is refused with missing_tenant_scope (lesson 39). Declared members
+# arrive already bounded; inline sources are bounded here.
+sub _bounded_source_domain {
+    my ($self, $root, $source, $label) = @_;
+    require Selecto::QueryMember;
+    my $engine = $self->{_selecto_compile_engine};
+    return Selecto::QueryMember->bound_source_domain($root, $source, label => $label,
+        tenant => ($engine ? $engine->scope->{tenant} : undef), allow_prefix => 1);
+}
 sub _compile_subquery_joins {
     my ($self, $domain, $query, $params) = @_;
     my @joins;
     for my $spec (@{$query->subqueries}) {
+        $spec->{domain} = $self->_bounded_source_domain($domain, $spec->{domain}, "subquery $spec->{name}");
         my $statement = $self->compile($spec->{domain}, $spec->{query});
         Selecto::Error->throw('invalid_query', 'subquery projection must match declared columns')
             unless @{$statement->columns} == @{$spec->{columns}}
@@ -919,6 +934,7 @@ sub _compile_lateral_joins {
         unless $self->supports('lateral_join');
     my @joins;
     for my $spec (@$laterals) {
+        $spec->{domain} = $self->_bounded_source_domain($domain, $spec->{domain}, "lateral $spec->{name}");
         my $child_alias = 'l_' . $spec->{name};
         my @correlations;
         for my $child (sort keys %{$spec->{correlations}}) {

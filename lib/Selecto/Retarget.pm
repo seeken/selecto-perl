@@ -83,18 +83,17 @@ sub target {
 }
 
 # A domain rooted at the target relation, for compiling. Its required
-# predicate carries the root's tenant conditions onto the target's
-# tenant_field, failing closed when a scoped root's condition cannot be
-# carried.
+# predicate carries the root's trusted tenant boundary (its tenant conditions,
+# and the trusted engine tenant when given) onto the target's tenant_field,
+# failing closed when a scoped root's boundary cannot be carried.
 sub target_domain {
-    my ($class, $domain, $target) = @_;
+    my ($class, $domain, $target, %options) = @_;
     my $relation_domain = $class->relation_domain($domain, $target);
     my $relation = _contract_relation($domain, $target);
     return $relation_domain unless $relation;
     require Selecto::QueryMember;
-    return Selecto::QueryMember::_scoped_member_domain(
-        $domain, $relation_domain, $relation, "retarget to $target->{path}",
-    );
+    return Selecto::QueryMember->bound_source_domain($domain, $relation_domain,
+        label => "retarget to $target->{path}", tenant => $options{tenant});
 }
 
 # The target relation as an unscoped domain: its fields, associations, and

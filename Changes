@@ -1,6 +1,21 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: every query source over a tenant-scoped relation carries the
+      root's trusted tenant boundary or is refused with missing_tenant_scope
+      (lesson 39). Inline sources built with with_cte, with_recursive_cte,
+      subquery_join and lateral_join over a domain declaring tenant_field
+      ran unbounded under a root bounded by the engine tenant or only by its
+      required predicate (required_filters or with_required_predicate): a
+      tenant 7 read summed tenant 8's orders through an inline CTE, subquery
+      or lateral. They now receive the root's tenant conditions re-expressed
+      on their tenant field, as declared query members already did, and a
+      scoped root whose predicate has no tenant condition refuses them. A
+      root relation without a tenant field of its own now applies the
+      trusted engine tenant to every tenant-scoped declared member, inline
+      source and retarget target; before, those read every tenant's rows.
+      Sources already bounded by a same-tenant configured engine are
+      unchanged, and roots with no boundary keep reading every tenant.
     - SECURITY: under a trusted engine tenant, a read from a shared root
       (one that declares no tenant_field) binds every joined or through
       relation that declares tenant_field to the engine tenant, in the join

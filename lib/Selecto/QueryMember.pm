@@ -70,6 +70,9 @@ sub expand {
     # Expand only after the original intent and configured authority have been
     # validated. Transient plans are never exposed as declaration authority.
     my $expanded = Selecto::Query->new(%{$query->without_members});
+    # The trusted engine tenant bounds every member over a tenant-scoped
+    # relation, whether or not the root relation is itself tenant-scoped.
+    my $tenant = $engine ? $engine->scope->{tenant} : undef;
     for my $activation (@{$query->members}) {
         my ($requested, $name) = $activation =~ /\A([^:]+):(.+)\z/ ? ($1, $2) : (undef, $activation);
         my @found = grep { (!defined($requested) || $_ eq $requested) && ref($members->{$_}) eq 'HASH' && exists $members->{$_}{$name} } sort keys %$members;
@@ -96,7 +99,7 @@ sub expand {
                     (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()));
             }
         } else {
-            $expanded = $class->_source($domain, $group, $name, $spec, $expanded);
+            $expanded = $class->_source($domain, $group, $name, $spec, $expanded, $tenant);
         }
     }
     return $expanded;
@@ -125,7 +128,7 @@ sub _members {
 
 # Builds (and so validates) a member. With $query, adds it as a source.
 sub _source {
-    my ($class, $domain, $group, $name, $spec, $query) = @_;
+    my ($class, $domain, $group, $name, $spec, $query, $tenant) = @_;
     my $label = "query member $name";
     _fail("$label must be an object") unless ref($spec) eq 'HASH';
     if ($group eq 'values') {
@@ -157,7 +160,7 @@ sub _source {
         return $query->array_rowset($field, $as,
             (defined($spec->{ordinality}) ? (ordinality => $spec->{ordinality}) : ()));
     }
-    my $member_domain = _source_domain($domain, $spec->{source}, $label);
+    my $member_domain = _source_domain($domain, $spec->{source}, $label, $tenant);
     if ($group eq 'subqueries') {
         _keys($spec, [qw(source query columns on type join_id kind capability)], $label);
         my $child = build_query($member_domain, $spec->{query}, "$label query");
@@ -224,7 +227,7 @@ sub _source {
 
 # A member's root relation: a relation in the domain's own schemas section.
 sub _source_domain {
-    my ($domain, $source, $label) = @_;
+    my ($domain, $source, $label, $tenant) = @_;
     _fail("$label requires a source naming a domain schema")
         unless defined($source) && !ref($source) && "$source" =~ $IDENTIFIER;
     my $schemas = ($domain->contract // {})->{schemas} // {};
@@ -240,34 +243,60 @@ sub _source_domain {
         joins => {},
     });
     $member = bless {%$member, _read_prefix => $domain->{_read_prefix}}, ref($member) if defined $domain->{_read_prefix};
-    return _scoped_member_domain($domain, $member, $relation, $label);
+    return __PACKAGE__->bound_source_domain($domain, $member, label => $label, tenant => $tenant);
 }
 
 # A member reads its own relation, so the root's request scope does not reach
 # it through any join. When the member relation declares a tenant_field, the
-# root's tenant conditions are re-expressed on that field and required of the
-# member too. A scoped root whose tenant condition cannot be carried over
-# fails closed rather than reading every tenant's rows.
-sub _scoped_member_domain {
-    my ($domain, $member, $relation, $label) = @_;
-    my $required = $domain->required_predicate;
-    my $member_tenant = $relation->{tenant_field};
-    return $member unless defined($required) && defined($member_tenant);
-    my $root_tenant = $domain->tenant_field;
-    my @conjuncts = $required->kind eq 'and' ? @{$required->arguments->[0]} : ($required);
+# root's trusted tenant boundary is required of the member too: the root's
+# tenant conditions re-expressed on the member's tenant field and, when the
+# root relation has no tenant field of its own, the trusted engine tenant. A
+# scoped root whose boundary cannot be carried over fails closed with
+# missing_tenant_scope rather than reading every tenant's rows (lesson 39).
+# The same rule bounds inline CTE, lateral and subquery sources at compile;
+# there an inline source already confined to the root's attached tenant
+# prefix (schema-per-tenant) is admitted as it is (allow_prefix).
+sub bound_source_domain {
+    my ($class, $root, $source, %options) = @_;
+    my $member_tenant = $source->tenant_field;
+    return $source unless defined $member_tenant;
+    my $required = $root->required_predicate;
+    my $root_tenant = $root->tenant_field;
+    my $tenant = $options{tenant};
+    my $prefix = $options{allow_prefix} ? $root->{_read_prefix} : undef;
+    return $source unless defined($required) || defined($tenant) || defined($prefix);
     my @carried;
-    if (defined $root_tenant) {
+    if (defined($required) && defined($root_tenant)) {
+        my @conjuncts = $required->kind eq 'and' ? @{$required->arguments->[0]} : ($required);
         for my $conjunct (@conjuncts) {
             my $rewritten = eval { _rename_fields($conjunct, {"$root_tenant" => "$member_tenant"}) };
             push @carried, $rewritten if $rewritten;
         }
     }
-    Selecto::Error->throw(
-        'missing_tenant_scope',
-        "$label reads a tenant-scoped relation but the root tenant scope cannot be applied to it",
-        {tenant_field => "$member_tenant"},
-    ) unless @carried;
-    return $member->with_required_predicate(@carried == 1 ? $carried[0] : Selecto::Expression->all(@carried));
+    # A tenant-scoped root already carries the engine tenant in its required
+    # predicate (Selecto::Engine::read_domain); a root without a tenant field
+    # does not, so the trusted tenant is applied to the member directly.
+    push @carried, Selecto::Expression->eq("$member_tenant", $tenant)
+        if defined($tenant) && !defined($root_tenant);
+    unless (@carried) {
+        return $source if defined($prefix) && defined($source->{_read_prefix})
+            && "$source->{_read_prefix}" eq "$prefix";
+        Selecto::Error->throw(
+            'missing_tenant_scope',
+            ($options{label} // 'query source') . ' reads a tenant-scoped relation but the root tenant scope cannot be applied to it',
+            {tenant_field => "$member_tenant"},
+        );
+    }
+    # Conditions the source already requires (an owned query's own engine
+    # boundary, or an earlier expansion) are not repeated.
+    require Selecto::SQL;
+    my $existing = $source->required_predicate;
+    my %present = map { (Selecto::SQL::_value_key($_) => 1) }
+        defined($existing) ? ($existing->kind eq 'and' ? @{$existing->arguments->[0]} : $existing) : ();
+    @carried = grep { !$present{Selecto::SQL::_value_key($_)}++ } @carried;
+    return $source unless @carried;
+    my $carried = @carried == 1 ? $carried[0] : Selecto::Expression->all(@carried);
+    return $source->with_required_predicate(defined($existing) ? Selecto::Expression->all($existing, $carried) : $carried);
 }
 
 # Copies an expression tree, renaming field references by $map. Dies when the
@@ -459,12 +488,16 @@ most 10,000) and adds a trailing C<selecto_depth> column, which a member may
 not declare itself.
 
 A member reads its own relation, so the root's request scope does not reach
-it through a join. When the root domain carries a required predicate and the
-member's source schema declares C<tenant_field>, the root's tenant
-conditions are re-expressed on the member's tenant field. A scoped root
-whose predicate has no tenant condition fails with C<missing_tenant_scope>
-for such a member, so declare C<tenant_field> on every schema holding tenant
-data.
+it through a join. When the member's source schema declares C<tenant_field>,
+the root's trusted tenant boundary is required of the member too: the root's
+tenant conditions (its required predicate, which carries the engine tenant on
+a tenant-scoped root) are re-expressed on the member's tenant field, and on a
+root relation without a tenant field the trusted engine tenant is applied to
+it directly. A scoped root whose boundary cannot be carried fails with
+C<missing_tenant_scope> for such a member, so declare C<tenant_field> on every
+schema holding tenant data. The same rule bounds inline CTE, recursive CTE,
+lateral and subquery sources (L<Selecto::Query/with_cte> and friends) over a
+domain that declares C<tenant_field>.
 
 Members are validated when the domain is parsed and are part of its
 fingerprint. Naming an undeclared member fails with C<unknown_query_member>.
