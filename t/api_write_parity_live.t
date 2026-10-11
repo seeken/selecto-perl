@@ -25,9 +25,10 @@ my $domain = Selecto::Domain->parse({
             tenant_id => {type => 'integer'}, secret => {type => 'string', internal => 1}},
         associations => {}}, schemas => {}, joins => {},
     writes => {operations => {
-        insert => {enabled => 1}, update => {enabled => 1, bulk => 1},
-        delete => {enabled => 1, bulk => 1},
-        upsert => {enabled => 1, conflict_targets => [['id']]}},
+        insert => {enabled => 1, returning => ['id','name']},
+        update => {enabled => 1, bulk => 1, expected_cardinality => 'many', returning => ['id','name']},
+        delete => {enabled => 1, bulk => 1, expected_cardinality => 'many', returning => ['name']},
+        upsert => {enabled => 1, conflict_targets => [['id']], returning => ['name']}},
         fields => {id => {insertable => 1}, name => {insertable => 1, updatable => 1},
             tenant_id => {insertable => 1}}},
 });

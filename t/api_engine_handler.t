@@ -83,7 +83,10 @@ my $domain = Selecto::Domain->parse({
         operations => {
             insert => {enabled => JSON::PP::true},
             upsert => {enabled => JSON::PP::true},
-            update => {enabled => JSON::PP::true, bulk => JSON::PP::true},
+            update => {
+                enabled => JSON::PP::true, bulk => JSON::PP::true,
+                expected_cardinality => 'many', returning => ['id'],
+            },
             delete => {enabled => JSON::PP::true},
         },
         fields => {

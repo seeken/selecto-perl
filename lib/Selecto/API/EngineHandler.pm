@@ -19,6 +19,7 @@ use Selecto::Identifier ();
 use Selecto::QueryLibrary ();
 use Selecto::Limits ();
 use Selecto::Write ();
+use Selecto::Write::Policy ();
 
 has max_fields        => 100;
 has max_filters       => 20;
@@ -176,6 +177,13 @@ sub write_command ($self, $engine, $body) {
     Selecto::Error->throw(
         'invalid_api_write', 'insert and upsert expect exactly one affected row',
     ) if ($operation eq 'insert' || $operation eq 'upsert') && $expected_count != 1;
+    # The operation's authored expected_cardinality grant bounds every public
+    # request count. An omitted grant permits exactly one row: bulk is a
+    # separate prerequisite for counts above one and never widens the grant.
+    Selecto::Error->throw(
+        'invalid_api_write', 'expected_count exceeds the operation cardinality grant',
+        {expected_count => $expected_count},
+    ) unless _api_count_granted($operation_spec, $expected_count);
 
     my %metadata;
     for my $key (qw(returning conflict_target upsert_update_fields)) {
@@ -192,6 +200,14 @@ sub write_command ($self, $engine, $body) {
             _public_field_definition($domain, $field);
         }
         $metadata{$key} = \@fields;
+    }
+    # Returning is granted only by the operation's authored returning policy;
+    # an omitted grant returns no fields, whatever the field publication says.
+    if (my @ungranted = _api_returning_ungranted($operation_spec, $metadata{returning} // [])) {
+        Selecto::Error->throw(
+            'invalid_api_write', 'returning fields exceed the operation returning grant',
+            {fields => \@ungranted},
+        );
     }
     if ($operation eq 'upsert') {
         Selecto::Error->throw(
@@ -1027,6 +1043,29 @@ sub _write_bounded_integer ($value, $label, $minimum, $maximum) {
     return $integer;
 }
 
+# Public API write grants. Both fail closed: a missing grant is the strict
+# default (one row, no returning) and a malformed grant admits nothing.
+sub _api_count_granted ($spec, $count) {
+    return $count == 1 unless defined $spec->{expected_cardinality};
+    my $bounds = eval {
+        Selecto::Write::Policy->cardinality_bounds($spec->{expected_cardinality});
+    };
+    Selecto::Error->throw('invalid_api_write', 'operation expected_cardinality grant is invalid')
+        unless ref($bounds) eq 'ARRAY';
+    my ($minimum, $maximum) = @$bounds;
+    return $count >= $minimum && (!defined($maximum) || $count <= $maximum);
+}
+
+sub _api_returning_ungranted ($spec, $fields) {
+    return () unless @$fields;
+    my $grant = eval { Selecto::Write::Policy->normalize_returning($spec->{returning}) };
+    Selecto::Error->throw('invalid_api_write', 'operation returning grant is invalid')
+        unless defined $grant;
+    return () if !ref($grant) && $grant eq 'all';
+    my %granted = ref($grant) eq 'ARRAY' ? map { ($_ => 1) } @$grant : ();
+    return grep { !$granted{$_} } @$fields;
+}
+
 sub _filters ($self, $domain, $filters) {
     Selecto::Error->throw('invalid_api_query', 'filters must be an array')
         unless ref($filters) eq 'ARRAY';
@@ -1679,11 +1718,26 @@ the returned command does not carry it, so it is never applied twice.
 
 =item C<expected_count>
 
-Default 1; values above 1 need C<bulk> on the operation.
+Default 1, bounded by C<max_write_count>. The count must fall within the
+operation's authored C<expected_cardinality> grant (C<"many">,
+C<["exactly", n]>, C<["at_most", n]>, C<["at_least", n]> or
+C<["between", min, max]>). An operation without that grant permits exactly
+one row: C<bulk> is still required for counts above 1 on updates and
+deletes, but C<bulk> alone never admits them. Inserts and upserts always
+expect one row. A count outside the grant is refused with
+C<invalid_api_write> before anything executes.
 
-=item C<returning>, C<conflict_target>, C<upsert_update_fields>
+=item C<returning>
 
-Root field lists. Upserts require the last two and are refused on domains
+Root field list, permitted only within the operation's authored
+C<returning> grant: a field list, or C<true>/C<"all"> for every field.
+Without a grant (or with C<false>, C<"none"> or an empty list) no fields may
+be returned, and any requested field is refused with C<invalid_api_write>
+before anything executes. An empty list requests nothing.
+
+=item C<conflict_target>, C<upsert_update_fields>
+
+Root field lists. Upserts require both and are refused on domains
 with a required predicate (C<query_enforcement_unsupported_operation>).
 
 =back
