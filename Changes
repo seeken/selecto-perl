@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: a plain join path past an untenanted hop keeps the root's
+      admitted tenant set (lesson 41f). root (tenant_id) -> shared bin ->
+      tenant notes, with the root bounded only by a required predicate
+      (tenant_id IN (7, 8) or = 7, no engine tenant), paired tenants per
+      adjacent edge only, so the notes went unbounded: bin.notes.body,
+      a through join's labels, a filter on bin.notes.body, the public
+      query handler and API route (200), and a retarget to the bin
+      returned tenant 9's notes. The lesson 41b change binds such a
+      relation to the root's admitted set (IN (7, 8)) as well as to any
+      engine tenant, and refuses it with missing_tenant_scope when the
+      root is bounded by a predicate without a tenant set; this pins the
+      join, through-join, filter, handler, API and retarget forms. A root
+      with no boundary still reads every tenant.
     - SECURITY: on a two-column root a shared hop that merely stores the
       write-scope column is not a by-name pairing source (lesson 41e).
       customers (tenant 7, site 5) -> shared bins (a bin at site 7) ->
