@@ -675,11 +675,14 @@ sub _canonical_associations {
             ) unless exists($source_fields->{$source_key}) && exists($target_fields->{$target_key});
             %scope_keys = (source_scope_key => $source_key, target_scope_key => $target_key);
         }
-        # Lesson 41: when both relations declare tenant_field, the join also
+        # Lessons 41 and 42: every joined relation that declares tenant_field
+        # is tenant-bounded. When both relations declare one, the join also
         # pairs those tenant fields, even when its authored scope keys pair
         # another column (region_id -> region_id) or it runs through a bridge
         # (authored pairs are kept as well); otherwise a tenant 7 row reaches
-        # tenant 8's row sharing that column or bridge (Selecto::SQL).
+        # tenant 8's row sharing that column or bridge. When only the target
+        # declares one (a shared parent), compilation binds the target's
+        # tenant field to the trusted engine tenant (Selecto::SQL).
         my %tenant_keys;
         if (defined $target->{tenant_field}) {
             my $target_key = _identifier($target->{tenant_field}, 'tenant field');
