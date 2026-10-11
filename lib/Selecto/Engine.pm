@@ -137,6 +137,7 @@ sub new {
         _assert_reference_agreement($references);
     }
     _assert_unique_parent_keys($args{domain}, $scope);
+    _assert_lookups_public($args{domain});
     my $mode = $args{mode} // 'permissive';
     Selecto::Error->throw('invalid_query_policy', 'mode must be strict or permissive')
         unless !defined(reftype($mode)) && ($mode eq 'strict' || $mode eq 'permissive');
@@ -1446,6 +1447,98 @@ sub _tenant_pairs {
         unless $root{$guard};
     $add->($guard, $guard);
     return @pairs;
+}
+
+# Lesson 37: a choice source or co-domain lookup hands back the value, label
+# and description fields its declaration names. A declaration that would
+# expose a redacted (or internal or hidden) field is refused when the engine
+# is built, with invalid_domain: details code choice_source_redacted_field
+# or co_domain_redacted_field. Fields of another domain are checked where
+# this contract describes it (a schema backed by that relation, or this
+# domain itself); a co-domain lookup also refuses non-public fields of its
+# target engine's domain at lookup time.
+sub _assert_lookups_public {
+    my ($domain) = @_;
+    my $contract = $domain->_contract_view;
+    return unless ref($contract) eq 'HASH';
+    my $schemas = ref($contract->{schemas}) eq 'HASH' ? $contract->{schemas} : {};
+    my $work = Selecto::OperationBudget->new(code => 'invalid_domain');
+    # True when $path names a field this contract withholds.
+    my $withheld = sub {
+        my ($path) = @_;
+        return 0 unless defined($path) && !ref($path) && length("$path");
+        return 1 unless $domain->field_is_public("$path");
+        my ($schema, $field) = "$path" =~ /\A([^.]+)\.([^.]+)\z/ or return 0;
+        my $spec = $schemas->{$schema};
+        return 0 unless ref($spec) eq 'HASH';
+        return 1 if Selecto::Domain::_redacted($spec, $field);
+        my $column = ref($spec->{columns}) eq 'HASH' ? $spec->{columns}{$field} : undef;
+        return ref($column) eq 'HASH' && ($column->{internal} || $column->{hidden}) ? 1 : 0;
+    };
+    # The relations this contract describes as another domain: this domain
+    # itself, or schemas keyed or backed by that name.
+    my $targets = sub {
+        my ($name) = @_;
+        return () unless defined($name) && !ref($name);
+        return ('') if defined($contract->{name}) && "$name" eq "$contract->{name}";
+        return map { "$_." } grep { ref($schemas->{$_}) eq 'HASH'
+            && ($_ eq "$name" || ($schemas->{$_}{source_table} // '') eq "$name") } sort keys %$schemas;
+    };
+    my $refuse = sub {
+        my ($code, %details) = @_;
+        Selecto::Error->throw('invalid_domain', 'a lookup declaration exposes a redacted field',
+            {code => $code, %details});
+    };
+    my $sources = ref($contract->{choice_sources}) eq 'HASH' ? $contract->{choice_sources} : {};
+    for my $id (sort keys %$sources) {
+        my $spec = $sources->{$id};
+        next unless ref($spec) eq 'HASH';
+        for my $key (qw(value_source caption_source description_source)) {
+            $work->consume_count('max_expression_nodes', 1, label => 'lookup redaction work');
+            $refuse->('choice_source_redacted_field', choice_source => $id, key => $key, field => "$spec->{$key}")
+                if $withheld->($spec->{$key});
+        }
+        for my $prefix ($targets->($spec->{domain})) {
+            for my $key (qw(value_field label_field description_field)) {
+                $work->consume_count('max_expression_nodes', 1, label => 'lookup redaction work');
+                my $field = $spec->{$key};
+                next unless defined($field) && !ref($field);
+                $refuse->('choice_source_redacted_field', choice_source => $id, key => $key, field => "$field")
+                    if $withheld->($prefix . $field);
+            }
+        }
+    }
+    my @columns = ([ref($contract->{source}) eq 'HASH' ? $contract->{source}{columns} : undef, '']);
+    push @columns, map { [$schemas->{$_}{columns}, "$_."] } grep { ref($schemas->{$_}) eq 'HASH' } sort keys %$schemas;
+    for my $group (@columns) {
+        my ($columns, $prefix) = @$group;
+        next unless ref($columns) eq 'HASH';
+        for my $name (sort keys %$columns) {
+            my $reference = ref($columns->{$name}) eq 'HASH' ? $columns->{$name}{reference} : undef;
+            next unless ref($reference) eq 'HASH';
+            for my $key (qw(value_source caption_source caption_field)) {
+                $work->consume_count('max_expression_nodes', 1, label => 'lookup redaction work');
+                $refuse->('choice_source_redacted_field', field => "$prefix$name", key => "reference.$key",
+                    source => "$reference->{$key}") if $withheld->($reference->{$key});
+            }
+        }
+    }
+    my $co_domains = $domain->co_domains;
+    for my $id (sort keys %$co_domains) {
+        my $definition = $co_domains->{$id};
+        next unless ref($definition) eq 'HASH';
+        my $result = ref($definition->{result}) eq 'HASH' ? $definition->{result} : {};
+        my $search = ref($definition->{search}) eq 'HASH' ? $definition->{search} : {};
+        for my $prefix ($targets->($definition->{domain})) {
+            for my $field ($result->{value_field}, $result->{label_field}, @{$result->{description_fields} // []},
+                @{$search->{fields} // []}) {
+                $work->consume_count('max_expression_nodes', 1, label => 'lookup redaction work');
+                $refuse->('co_domain_redacted_field', co_domain => $id, field => "$field")
+                    if defined($field) && !ref($field) && $withheld->($prefix . $field);
+            }
+        }
+    }
+    return;
 }
 
 # Lesson 36: under a tenant-bounded root, a graph or sync relationship's
