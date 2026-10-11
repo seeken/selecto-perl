@@ -191,6 +191,7 @@ t/query_budget.t
 t/read_guard_transaction_state.t
 t/graph_child_foreign_tenant.t
 t/graph_unique_parent_key.t
+t/graph_child_tenant_confinement.t
 t/bounded_write.t
 t/security_sql_boundaries.t
 docs/security-boundaries.md
