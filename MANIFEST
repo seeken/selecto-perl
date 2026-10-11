@@ -188,6 +188,7 @@ t/security_action_integrity.t
 lib/Selecto/QueryBudget.pm
 t/query_budget.t
 t/read_guard_transaction_state.t
+t/graph_child_foreign_tenant.t
 t/bounded_write.t
 t/security_sql_boundaries.t
 docs/security-boundaries.md
