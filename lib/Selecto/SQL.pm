@@ -2506,21 +2506,33 @@ sub _compile_foreign_key_guards {
     my @guards = @{$command->foreign_key_guards};
     return undef unless @guards;
     my $alias = $self->quote_identifier('selecto_fk_parent');
+    my $valid_tenants = sub {
+        my ($condition) = @_;
+        return ref($condition) eq 'HASH' && defined($condition->{tenant_field}) && ref($condition->{tenants}) eq 'ARRAY'
+            && @{$condition->{tenants}} && !grep { !defined($_) || ref($_) } @{$condition->{tenants}};
+    };
     return join ' AND ', map {
         my $guard = $_;
         Selecto::Error->throw('invalid_write', 'foreign-key guard must name its parent and literal value')
             unless ref($guard) eq 'HASH' && defined($guard->{value}) && !ref($guard->{value})
-                && (!exists($guard->{tenant_field}) && !exists($guard->{tenants})
-                    || defined($guard->{tenant_field}) && ref($guard->{tenants}) eq 'ARRAY'
-                        && @{$guard->{tenants}} && !grep { !defined($_) || ref($_) } @{$guard->{tenants}});
+                && (!exists($guard->{tenant_field}) && !exists($guard->{tenants}) && !exists($guard->{more_tenant_fields})
+                    || $valid_tenants->($guard) && (!exists($guard->{more_tenant_fields})
+                        || ref($guard->{more_tenant_fields}) eq 'ARRAY'
+                            && !grep { !$valid_tenants->($_) } @{$guard->{more_tenant_fields}}));
         push @$params, $guard->{value};
         my $value = $self->placeholder(scalar @$params);
-        my @tenants = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$guard->{tenants}//[]};
+        # On a two-column root one referenced row can be guarded on each root
+        # tenant column, each with its own set, in the same EXISTS.
+        my $tenant_sql = join '', map {
+            my $condition = $_;
+            my @tenants = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$condition->{tenants}};
+            " AND $alias." . $self->quote_identifier(Selecto::Identifier::checked($condition->{tenant_field}))
+                . (@tenants == 1 ? " = $tenants[0]" : ' IN (' . join(', ', @tenants) . ')');
+        } (exists($guard->{tenant_field}) ? ($guard) : ()), @{$guard->{more_tenant_fields} // []};
         $self->_foreign_key_exists_sql(
             'SELECT 1 FROM ' . $self->quote_identifier(Selecto::Identifier::checked($guard->{relation})) . " AS $alias"
             . " WHERE $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{target_field})) . " = $value"
-            . (@tenants ? " AND $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{tenant_field}))
-                . (@tenants == 1 ? " = $tenants[0]" : ' IN (' . join(', ', @tenants) . ')') : ''),
+            . $tenant_sql,
         );
     } @guards;
 }

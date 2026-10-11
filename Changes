@@ -1,6 +1,26 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: on a two-column root (writes.scope.tenant on one column,
+      source.tenant_field on another) reference guards took the write-scope
+      tenant set whatever root column they paired with. An association
+      authored as source_scope_key tenant_id -> target_scope_key site_id was
+      guarded as warehouses.site_id IN <site set>, accepting another
+      tenant's row and refusing the right one; a target column named after
+      no root column (tenant_id -> org_id) accepted a row tagged with the
+      site value. Each root column now has its own admitted set (the engine
+      tenant for the write-scope column, the required predicate's eq/in
+      conjuncts for the tenant_field column) and a guard takes the set of
+      the column it pairs with (lesson 29e): an authored pair takes its
+      source_scope_key's set, a target storing both root columns is guarded
+      on each by name with its own set, and any other tenant column pairs
+      by name. Scope keys that disagree with the target's tenant_field, a
+      column two pairings would give different sets (29j), an authored pair
+      crossing names on a both-columns target, and a tenant column pairing
+      with no root column are refused with invalid_domain
+      (foreign_key_tenant_scope_undeclared) when the engine is built; a
+      reference whose paired column no set bounds fails with
+      missing_tenant_scope.
     - SECURITY/correctness (PostgreSQL): read guards (bounded streams,
       savepoint query budgets, direct bounded reads) and managed writes no
       longer start on a connection whose transaction they cannot account
