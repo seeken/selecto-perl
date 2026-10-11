@@ -35,6 +35,13 @@ sub rule_upsert_validate_plan {
     my ($self, $commands, $cleanup) = @_;
     return Selecto::SQLite::UpsertCandidate->validate_plan($self, $commands, $cleanup);
 }
+# Engine governance adds this capability only on the protected path, and
+# dispatch then requires the command's private candidate receipt.
+sub _admits_empty_upsert_mask {
+    my ($self, $command) = @_;
+    return scalar grep { !ref($_) && $_ eq 'protected_upsert_candidates' }
+        @{$command->metadata->{required_capabilities} // []};
+}
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
     $self->rule_upsert_validate_command($command);

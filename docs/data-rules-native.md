@@ -142,7 +142,11 @@ here. Individual SQLite upserts with stored rules use the native unique arbiter
 inside the actual transaction to select the insert or conflict branch. Conflict
 candidates overlay only the command's exact update mask on the physical stored
 row; an empty mask compiles to `DO NOTHING` and retains the command's declared
-cardinality. A zero-row no-op still fails an exact-one request.
+cardinality. A zero-row no-op still fails an exact-one request. Only this
+protected SQLite path admits an empty mask. Other adapters, SQLite engines
+without stored UPSERT rules and upsert actions there still refuse it
+(`invalid_write`, or `invalid_action_plan` for actions), and the HTTP write
+API keeps requiring a non-empty `upsert_update_fields`.
 
 Protected upsert receipts are private and expire when the transaction callback
 exits. They bind the actual adapter, connection, command, context, arbiter,

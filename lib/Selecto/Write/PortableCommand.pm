@@ -712,7 +712,8 @@ its results must come through the public choice-result API.
 Protected UPSERTs defer membership to native execution, after SQLite proves
 the actual branch and canonical candidate. Only the fields actually persisted
 are checked; a conflict with an empty update mask performs C<DO NOTHING> and
-retains the caller's cardinality requirement. Reconstructed commands do not
+retains the caller's cardinality requirement. Other adapters and unprotected
+engines refuse an empty update mask. Reconstructed commands do not
 inherit the compiler's private trusted resolver or portable normalization origin.
 
 =cut
