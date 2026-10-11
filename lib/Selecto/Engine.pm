@@ -771,7 +771,7 @@ sub _prepare_graph {
         operation     => $nodes[0]{command}->operation,
     });
     my $root_scope = $self->{domain}->write_tenant_scope;
-    my $tenants = $self->_trusted_write_tenants($self->{domain}->required_predicate);
+    my $tenants = $self->_trusted_tenant_sets($self->{domain}->required_predicate);
     for my $node (@nodes[1 .. $#nodes]) {
         ($contexts{$node->{id}}, $node->{command}) =
             $self->_validate_graph_node($node, \%contexts, $root_scope, $tenants,$graph->owned_sets,$relationship_work);
@@ -953,7 +953,7 @@ sub governed_write {
         __selecto_write_limit => $self->{limits}->get('max_action_targets')});
     # Set on every governed command, replacing any a caller supplied.
     $command = $command->with_foreign_key_guards(_foreign_key_guards(
-        _domain_references($self->{domain}), $command, $self->_trusted_write_tenants($required), %details,
+        _domain_references($self->{domain}), $command, $self->_trusted_tenant_sets($required), %details,
     ));
     return $self->_retain_command_work($command, $accepted_work);
 }
@@ -1045,7 +1045,13 @@ sub _check_required_tenant_assignment {
 sub _trusted_write_tenants {
     my ($self, $required) = @_;
     return [$self->{scope}{tenant}] if defined $self->{scope}{tenant};
-    my $field = $self->{domain}->tenant_field;
+    return _required_tenants($required, $self->{domain}->tenant_field);
+}
+
+# The tenants a required predicate's top-level eq/in conjuncts on $field
+# admit, intersected; undef when none bounds the field.
+sub _required_tenants {
+    my ($required, $field) = @_;
     return undef unless defined($field) && defined($required);
     my $values;
     for my $conjunct ($required->kind eq 'and' ? @{$required->arguments->[0] // []} : ($required)) {
@@ -1057,6 +1063,30 @@ sub _trusted_write_tenants {
         $values = $values ? [grep { $allowed{"$_"} } @$values] : [@allowed];
     }
     return $values && @$values ? $values : undef;
+}
+
+# Lesson 29e: the admitted tenants of each root tenant column, for reference
+# guards. On a root with at most one tenant column every guard keeps the one
+# trusted set (_trusted_write_tenants). On a two-column root
+# (writes.scope.tenant on one column, source.tenant_field on another) each
+# column has its own set: the engine tenant bounds only the write-scope
+# column, and the tenant_field column is bounded only by the required
+# predicate's conjuncts on it. A guard then takes the set of the root column
+# it pairs with (see _tenant_pairs), never the write-scope set by default.
+sub _trusted_tenant_sets {
+    my ($self, $required) = @_;
+    my $tenants = $self->_trusted_write_tenants($required);
+    my $scope = $self->{domain}->write_tenant_scope;
+    my $field = $self->{domain}->tenant_field;
+    return $tenants unless $scope && defined($field) && $scope->{field} ne $field;
+    return {
+        any => $tenants,
+        columns => {
+            $scope->{field} => defined($self->{scope}{tenant}) ? [$self->{scope}{tenant}]
+                : _required_tenants($required, $scope->{field}),
+            $field => _required_tenants($required, $field),
+        },
+    };
 }
 
 # The references a relation declares, for the foreign-key tenant guard:
@@ -1157,6 +1187,9 @@ sub _schema_tenancy {
             table => $schema->{source_table} // $_,
             tenant_field => $schema->{tenant_field},
             static => defined($schema->{values}) ? 1 : 0,
+            stores => {map { (defined($_) && !ref($_) ? ("$_" => 1) : ()) }
+                (ref($schema->{fields}) eq 'ARRAY' ? @{$schema->{fields}} : ()),
+                (ref($schema->{columns}) eq 'HASH' ? keys %{$schema->{columns}} : ())},
         } : ()
     } sort keys %$schemas];
 }
@@ -1171,9 +1204,12 @@ sub _schema_tenancy {
 # assigns a reference whose tenancy the domain does not record fails closed,
 # as in the Elixir core (foreign_key_tenant_scope_undeclared).
 sub _foreign_key_guards {
-    my ($references, $command, $tenants, %details) = @_;
+    my ($references, $command, $sets, %details) = @_;
     _assert_reference_agreement($references, %details);
     return [] if $command->operation eq 'delete';
+    # One trusted set, or (on a two-column root) a set per root tenant column.
+    my $columns = ref($sets) eq 'HASH' ? $sets->{columns} : undef;
+    my $tenants = ref($sets) eq 'HASH' ? $sets->{any} : $sets;
     my $assignments = $command->assignments;
     my $tenant_scoped = $tenants && $references->{tenant_data};
     my $relation = $command->relation;
@@ -1205,7 +1241,7 @@ sub _foreign_key_guards {
         next if $declared{$field} || !exists($assignments->{$field});
         push @candidates, {
             field => $field, relation => $association->{table}, target_field => $association->{related_key},
-            tenancy => _association_tenancy($references, $association),
+            tenancy => _association_tenancy($references, $association), association => $association,
         };
     }
     my (%seen, @guards);
@@ -1240,12 +1276,26 @@ sub _foreign_key_guards {
         Selecto::Error->throw('invalid_write', 'a reference on a tenant-scoped write must be a literal value',
             \%where,
         ) if ref($value);
-        my $key = join "\0", @{$candidate}{qw(field relation target_field)}, $tenant_field//'';
+        # Each guarded column of the referenced row and the set it must lie
+        # in: the one trusted set, or on a two-column root the set of the root
+        # column it pairs with (lesson 29e). A column whose root column no
+        # set bounds is left unguarded; a reference none can confine fails.
+        my @conditions = $kind ne 'tenant' ? ()
+            : !$columns ? ([$tenant_field, $tenants])
+            : map { my $set = $columns->{$_->[1]}; $set ? ([$_->[0], $set]) : () }
+                _tenant_pairs($references, $candidate, [sort keys %$columns], %where);
+        Selecto::Error->throw('missing_tenant_scope',
+            'no trusted tenant set bounds the root tenant column this reference pairs with',
+            {%where, referenced => $candidate->{relation}, tenant_field => $tenant_field},
+        ) if $kind eq 'tenant' && !@conditions;
+        my $key = join "\0", @{$candidate}{qw(field relation target_field)}, map { $_->[0] } @conditions;
         next if $seen{$key}++;
+        my ($first, @more) = @conditions;
         my $guard={
             field => $candidate->{field}, relation => $candidate->{relation},
             target_field => $candidate->{target_field}, value => $value,
-            ($kind eq 'tenant' ? (tenant_field => $tenant_field,tenants => [@$tenants]) : ()),
+            ($first ? (tenant_field => $first->[0], tenants => [@{$first->[1]}]) : ()),
+            (@more ? (more_tenant_fields => [map { {tenant_field => $_->[0], tenants => [@{$_->[1]}]} } @more]) : ()),
         };
         $output->check_tree($guard,label=>'foreign-key guards');push @guards,$guard;
     }
@@ -1290,6 +1340,63 @@ sub _association_tenancy {
         : ['undeclared'];
 }
 
+# Lesson 29e: on a two-column root, the root tenant column each guarded
+# column of a referenced row pairs with, as [guard column, root column].
+#  - A target that is the root's own table or stores both root columns is
+#    guarded on each root column by name, each with its own set.
+#  - An association whose source_scope_key is a root tenant column pairs its
+#    target_scope_key with that column, whatever the target column is named
+#    (tenant_id -> warehouse.site_id guards site_id with the tenant_id set).
+#  - Any other tenant column (a declared tenant_field, references.tenant_field)
+#    pairs with the root column of its own name.
+# Anything else is refused with invalid_domain rather than guessed: scope
+# keys that disagree with the target's declared tenant_field, an authored
+# pair crossing names on a target storing both root columns, a column two
+# pairings would give different sets, and a column pairing with no root
+# column.
+sub _tenant_pairs {
+    my ($references, $candidate, $roots, %where) = @_;
+    my $refuse = sub {
+        Selecto::Error->throw('invalid_domain', $_[0], {%where, code => 'foreign_key_tenant_scope_undeclared',
+            reason => $_[1], referenced => $candidate->{relation}});
+    };
+    my %root = map { ($_ => 1) } @$roots;
+    my $guard = $candidate->{tenancy}[1];
+    my $both = $candidate->{relation} eq $references->{table}
+        || grep { $_->{table} eq $candidate->{relation} && !grep { !$_ } @{$_->{stores}}{@$roots} }
+            @{$references->{schemas}};
+    my (%pairs, @pairs);
+    my $add = sub {
+        my ($column, $root) = @_;
+        $refuse->('a referenced tenant column pairs with two root tenant columns', 'conflicting_tenant_pairings')
+            if exists($pairs{$column}) && $pairs{$column} ne $root;
+        push @pairs, [$column, $root] unless exists $pairs{$column};
+        $pairs{$column} = $root;
+    };
+    if ($both) { $add->($_, $_) for @$roots; }
+    my $association = $candidate->{association} // {};
+    my ($source, $target) = @{$association}{qw(source_scope_key target_scope_key)};
+    if (defined($source) && $root{$source}) {
+        my $declared = $association->{target_tenant_field};
+        if ($both) {
+            $refuse->('an authored scope pair crosses root tenant column names on a target storing both',
+                'crossed_scope_pair') if $root{$target} && $target ne $source;
+        } else {
+            $refuse->('a reference\'s scope keys disagree with the referenced tenant field', 'scope_keys_disagree')
+                if defined($declared) && $declared ne $target;
+            $refuse->('a referenced tenant column pairs with two root tenant columns', 'conflicting_tenant_pairings')
+                if defined($declared) && $root{$target} && $target ne $source;
+        }
+        $add->($target, $source);
+        return @pairs;
+    }
+    return @pairs if $both && $root{$guard};
+    $refuse->('a referenced tenant column pairs with no root tenant column', 'unpaired_tenant_column')
+        unless $root{$guard};
+    $add->($guard, $guard);
+    return @pairs;
+}
+
 # A declared foreign key and the associations on the same owner key must
 # describe one reference: the same relation, and the same target tenant
 # column paired with the same root tenant column. Otherwise whichever
@@ -1316,7 +1423,21 @@ sub _assert_reference_agreement {
                 association => $association->{name}, reason => $tenancy->[1], relation => $references->{table},
                 referenced => $association->{table}, required => ['schemas', 'tenant_field'], %details},
         ) if $tenancy->[0] eq 'refuse';
-        push @{$by_key{$association->{owner_key}}}, {relation => $association->{table}, tenancy => $tenancy};
+        push @{$by_key{$association->{owner_key}}}, {relation => $association->{table}, tenancy => $tenancy,
+            association => $association};
+    }
+    # Lesson 29e: on a two-column root every tenant-guarded reference must
+    # pair each guarded column with one root tenant column, at admission.
+    my @roots = @{$references->{root_tenant_fields} // []};
+    if (@roots > 1) {
+        for my $field (sort keys %by_key) {
+            for my $declared (@{$by_key{$field}}) {
+                next unless $declared->{tenancy}[0] eq 'tenant';
+                _tenant_pairs($references, {relation => $declared->{relation}, tenancy => $declared->{tenancy},
+                    association => $declared->{association}}, \@roots,
+                    field => $field, relation => $references->{table}, %details);
+            }
+        }
     }
     for my $field (sort keys %by_key) {
         my @declared = @{$by_key{$field}};
@@ -2871,6 +2992,24 @@ C<references.tenant_field>, a C<tenant_field> on the target schema, or
 association scope keys. A declared foreign key to tenant data without
 trusted tenants fails with C<missing_tenant_scope>, and a computed reference
 value cannot be guarded (C<invalid_write>).
+
+On a two-column root (C<writes.scope.tenant> on one column,
+C<source.tenant_field> on another) each root column has its own admitted
+set: the engine tenant bounds the write-scope column, and the required
+predicate's C<eq>/C<in> conjuncts bound the C<tenant_field> column. A
+reference guard takes the set of the root column it pairs with. An
+association whose C<source_scope_key> is a root tenant column pairs its
+C<target_scope_key> with that column, whatever the target column is named
+(C<tenant_id -E<gt> warehouses.site_id> guards C<site_id> with the
+C<tenant_id> set); a target that is the root's table or stores both root
+columns is guarded on each of them by name, in one C<EXISTS>; any other
+tenant column pairs with the root column of its own name. Scope keys that
+disagree with the target's C<tenant_field>, a column two pairings would give
+different sets, an authored pair crossing names on a target storing both
+root columns, and a tenant column pairing with no root column are refused
+with C<invalid_domain> (C<foreign_key_tenant_scope_undeclared>) when the
+engine is built. A reference whose paired root column no set bounds fails
+with C<missing_tenant_scope>.
 
 =head1 REQUIRED PREDICATES
 

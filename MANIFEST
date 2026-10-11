@@ -183,6 +183,7 @@ xt/changes.t
 xt/pod.t
 lib/Selecto/Limits.pm
 t/scope_key_tenant_guard.t
+t/two_column_scope_pairing.t
 t/security_boundaries.t
 t/security_action_integrity.t
 lib/Selecto/QueryBudget.pm
