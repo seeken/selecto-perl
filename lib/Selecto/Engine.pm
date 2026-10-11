@@ -732,10 +732,23 @@ sub _execute_batch {
     return $self->_execute_governed(execute_batch => $prepared)
         unless grep { Selecto::WriteRules->has_stored_rules($engines->[$_]->domain, $commands[$_]->operation) } 0..$#commands;
     return $self->_rules_transaction(sub {
-        # Stored batch deltas may overlap or depend on earlier mutations. They
-        # need a prospective whole-plan provider; do not dispatch a prefix.
+        # Stored UPDATE/DELETE deltas may overlap or depend on earlier
+        # mutations; they need a prospective whole-plan provider. Protected
+        # UPSERTs project their own native branch and the adapter proves each
+        # one independent of every other command before the first DML.
+        # Protected INSERTs keep their insert-only batches.
+        my $upserts = $self->{adapter}->can('rule_upsert_validate_plan');
+        my ($protected_insert, $other_delta);
+        for my $index (0 .. $#commands) {
+            my $operation = $commands[$index]->operation;
+            my $stored = Selecto::WriteRules->has_stored_rules($engines->[$index]->domain, $operation);
+            Selecto::Error->throw('required_data_rule_pending', 'protected stored batch deltas require a whole-plan candidate provider')
+                if $operation ne 'insert' && ($stored ? $operation ne 'upsert' || !$upserts : !$upserts);
+            $protected_insert ||= $stored && $operation eq 'insert';
+            $other_delta ||= !$stored && $operation ne 'insert';
+        }
         Selecto::Error->throw('required_data_rule_pending', 'protected stored batch deltas require a whole-plan candidate provider')
-            if grep { $_->operation ne 'insert' } @commands;
+            if $protected_insert && $other_delta;
         my $admitted = Selecto::WriteRules->_with_stored_failure_deferral(sub {
             my @admitted = map { Selecto::WriteRules->govern($engines->[$_], $commands[$_], input_prepared => 1) } 0 .. $#commands;
             return Selecto::Write::Batch->new(@admitted);

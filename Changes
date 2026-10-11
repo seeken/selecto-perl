@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - SQLite batches may combine protected UPSERTs with ordinary inserts,
+      updates, deletes and upserts (and protected inserts) when each
+      protected candidate is proved independent of every other command on
+      its table, ported from the Elixir reference. The proof compares
+      arbiter keys, stored and final candidate rows, other UPSERTs' own
+      arbiters (the different-unique-key hazard), UPDATE/DELETE predicates
+      and key-moving updates through SQLite affinity and collation, in
+      both orders and both directions between protected candidates. Unknown
+      generated rowids, volatile defaults, same-table cleanup and anything
+      else unprovable refuse as required_data_rule_pending before DML.
+      Previously every such batch refused; stored UPDATE/DELETE deltas, a
+      protected insert beside an ordinary delta, and protected UPSERTs in
+      graphs still do.
     - Document and pin that on a native DBD::SQLite handle every write
       governed by stored-stage rules (insert, update and upsert, since the
       protected UPSERT port) requires an open native transaction on the
