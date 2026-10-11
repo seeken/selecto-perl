@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: under a tenant-bounded root (an engine tenant, a
+      tenant_field, writes.scope.tenant or a required predicate) a graph or
+      sync relationship's parent_key must be the parent's primary key or
+      exactly a single-column upsert conflict target the parent declares
+      (lesson 36), at every hop of nested relationship domains. Otherwise
+      the engine is refused when it is built with invalid_domain (details
+      code foreign_key_tenant_scope_undeclared, relationship, parent_key).
+      A composite conflict target or a sync identity does not count.
+      Previously, on PostgreSQL, parts bound to their item by a code two
+      tenants' items shared were reachable through tenant 7's item: a
+      two-hop graph updated tenant 8's part. (SQLite already refused it
+      through its native ownership storage proof.)
     - SECURITY: on a two-column root (writes.scope.tenant on one column,
       source.tenant_field on another) reference guards took the write-scope
       tenant set whatever root column they paired with. An association
