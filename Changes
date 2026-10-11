@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: graph children and owned-sync rows are confined to the root's
+      admitted tenants exactly as the root is (lesson 33). Under a root
+      bounded only by its required predicate (no engine tenant), a child
+      that stores the root's tenant column could be inserted or re-tagged
+      with another tenant's tenant_id, update or delete a tenant 8 row
+      under tenant 7's parent, and owned-sync cleanup deleted such rows.
+      Now, unless the child declares its own writes.scope.tenant, each root
+      tenant column it stores is ANDed into its UPDATE and DELETE scope (and
+      into owned-sync cleanup), an insert must land inside the set (the
+      adapter admits insert candidates against the scope), an assignment to
+      the column must be one of the set's literal values (tenant_mismatch,
+      before any DML), and an upsert is refused
+      (query_enforcement_unsupported_operation), as on the root.
     - SECURITY: under a tenant-bounded root (an engine tenant, a
       tenant_field, writes.scope.tenant or a required predicate) a graph or
       sync relationship's parent_key must be the parent's primary key or

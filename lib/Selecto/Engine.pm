@@ -784,7 +784,7 @@ sub _prepare_graph {
         $node->{command}=Selecto::WriteRules->prepare_submitted($engine,$node->{command},input=>$rule_inputs{$node->{id}},accepted_input=>$accepted_inputs->{$node->{id}});
     }
     my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets,metadata=>$graph->metadata);
-    my $sets = $self->_govern_owned_sets($graph->owned_sets, $prepared->{nodes}, \%contexts,$relationship_work);
+    my $sets = $self->_govern_owned_sets($graph->owned_sets, $prepared->{nodes}, \%contexts,$relationship_work,$tenants);
     $prepared->{_governed_owned_sets} = $sets;
     $prepared->{_reference_domains} = {map { ($_ => $contexts{$_}{domain}) } keys %contexts};
     $prepared->{_requires_rules} = scalar(grep {
@@ -798,7 +798,7 @@ sub _prepare_graph {
 }
 
 sub _govern_owned_sets {
-    my ($self, $sets, $nodes, $contexts,$relationship_work) = @_;
+    my ($self, $sets, $nodes, $contexts,$relationship_work,$tenants) = @_;
     return [] unless @$sets;
     my %nodes = map { ($_->{id} => $_) } @$nodes;
     my %position = map { ($nodes->[$_]{id} => $_) } 0 .. $#$nodes;
@@ -864,6 +864,9 @@ sub _govern_owned_sets {
         my $cleanup = $child_engine->governed_write(Selecto::Write::Command->new(
             operation => 'delete', relation => $child->table, expected_count => undef,
             scope_predicate => $ownership_scope));
+        # Cleanup deletes only rows the root's tenant boundary admits.
+        $cleanup = $self->_confine_child_tenants($cleanup, $tenants, $child->fields,
+            owned_set => $set->{relationship}) unless $child_scope;
         push @prepared, {%$set, parent_key => $parent_key, child_key => $child_key,
             identity_fields => [@$identity], cleanup => $cleanup};
     }
@@ -1064,6 +1067,42 @@ sub _required_tenants {
         $values = $values ? [grep { $allowed{"$_"} } @$values] : [@allowed];
     }
     return $values && @$values ? $values : undef;
+}
+
+# Lesson 33: a graph child or owned-sync row that stores a root tenant column
+# is confined to that column's admitted set exactly as the root is, whether
+# the set comes from the engine tenant or only from the root's required
+# predicate: an update or delete matches only rows inside the set, an insert
+# must land inside it (the adapter admits insert candidates against the
+# scope), an assignment to the column must be one of the set's literal
+# values (tenant_mismatch), and an upsert is refused, as on a root with a
+# required predicate. $sets is _trusted_tenant_sets' answer for the root. A
+# child that declares its own writes.scope.tenant is governed by that scope
+# instead, and is not passed here.
+sub _confine_child_tenants {
+    my ($self, $command, $sets, $fields, %details) = @_;
+    return $command unless $sets && ref($fields) eq 'HASH';
+    my %columns = ref($sets) eq 'HASH' ? %{$sets->{columns}}
+        : map { ($_ => $sets) } @{_root_tenant_fields($self->{domain}->tenant_field, $self->{domain}->write_tenant_scope)};
+    my @scopes;
+    for my $column (sort keys %columns) {
+        my $set = $columns{$column};
+        next unless $set && exists $fields->{$column};
+        my %where = (relation => $command->relation, field => $column, %details);
+        Selecto::Error->throw('query_enforcement_unsupported_operation',
+            'upsert is not supported on a graph child confined to a tenant set', \%where)
+            if $command->operation eq 'upsert';
+        if ($command->operation ne 'delete' && exists $command->assignments->{$column}) {
+            my $value = $command->assignments->{$column};
+            $value = $value->kind eq 'literal' ? $value->arguments->[0] : undef
+                if blessed($value) && $value->isa('Selecto::Write::Expression');
+            Selecto::Error->throw('tenant_mismatch', 'tenant value must match the trusted tenant scope', \%where)
+                if !defined($value) || ref($value) || !grep { "$_" eq "$value" } @$set;
+        }
+        push @scopes, @$set == 1 ? Selecto::Expression->eq($column, $set->[0]) : Selecto::Expression->in($column, [@$set]);
+    }
+    return $command unless @scopes;
+    return $command->with_scope_predicate(Selecto::QueryEnforcement::combine($command->scope_predicate, @scopes));
 }
 
 # Lesson 29e: the admitted tenants of each root tenant column, for reference
@@ -2305,6 +2344,8 @@ sub _validate_graph_node {
     my $required = $nested_engine->required_write_guard($command->operation, graph_node => $node->{id});
     $command = $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $required)) if defined $required;
+    $command = $self->_confine_child_tenants($command, $tenants, $edge->{fields}, graph_node => $node->{id})
+        unless $scope;
     my %nested_fields = %{$edge->{fields} // {}};
     $command = Selecto::Write::Policy->apply($command, $edge->{writes}, \%nested_fields,
         trusted_field => $scope ? $scope->{field} : undef);
@@ -3058,6 +3099,13 @@ root columns, and a tenant column pairing with no root column are refused
 with C<invalid_domain> (C<foreign_key_tenant_scope_undeclared>) when the
 engine is built. A reference whose paired root column no set bounds fails
 with C<missing_tenant_scope>.
+
+A graph child or owned-sync row that stores a root tenant column, and
+declares no C<writes.scope.tenant> of its own, is confined to that column's
+admitted tenants as the root is, also when only the root's required
+predicate bounds them: its updates, deletes and sync cleanup match only rows
+inside the set, its inserts must land inside it, an assignment to the column
+outside it fails with C<tenant_mismatch>, and an upsert is refused.
 
 Under a tenant-bounded root (an engine tenant, a C<tenant_field>,
 C<writes.scope.tenant> or a required predicate) every graph or sync
