@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY (low): a choice source or co-domain declaration that would
+      return a redacted (or internal or hidden) field is refused when the
+      engine is built (lesson 37), with invalid_domain and details code
+      choice_source_redacted_field (a choice source's value_source,
+      caption_source or description_source, a field reference's
+      value_source, caption_source or caption_field, or value/label fields of
+      a choice domain this contract describes) or co_domain_redacted_field (a
+      co-domain targeting this domain). Before, a host resolver was handed a
+      choice source naming a redacted field such as owners.ssn as its
+      caption or description. Co-domain lookups into another domain already
+      refused its non-public fields at lookup time (invalid_co_domain); that
+      is now pinned by a test.
     - SECURITY: context-sourced foreign keys (source ['context', k]) are
       paired like input foreign keys (item 34). A foreign key that records
       no tenancy of its own no longer drops the tenancy an association on
