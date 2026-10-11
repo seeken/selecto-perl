@@ -364,8 +364,11 @@ sub _parse_canonical {
     my $joins = $raw->{joins} // {};
     _object($schemas, 'schemas');
     _object($joins, 'joins');
+    my $scope_tenant = ref($raw->{writes}) eq 'HASH' && ref($raw->{writes}{scope}) eq 'HASH'
+        && ref($raw->{writes}{scope}{tenant}) eq 'HASH'
+        ? ($raw->{writes}{scope}{tenant}{field} // $raw->{writes}{scope}{tenant}{tenant_field}) : undef;
     my $associations = _canonical_associations(
-        $source, $schemas, $joins, $strict, '',
+        $source, $schemas, $joins, $strict, '', $scope_tenant,
     );
     _apply_values_foreign_key_metadata(
         $source, $associations, $raw->{writes},
@@ -562,7 +565,23 @@ sub _apply_values_foreign_key_metadata {
 }
 
 sub _canonical_associations {
-    my ($relation, $schemas, $joins, $strict, $prefix) = @_;
+    my ($relation, $schemas, $joins, $strict, $prefix, $root_scope_field) = @_;
+    # Lesson 41a: on a two-column root (writes.scope.tenant on one column,
+    # source.tenant_field on another) a target's tenant column pairs with the
+    # root column of its own name, never with tenant_field by position, and a
+    # target tenant column matching neither root column is refused.
+    my $two_column = defined($root_scope_field) && !ref($root_scope_field) && defined($relation->{tenant_field})
+        && "$root_scope_field" ne "$relation->{tenant_field}";
+    my $paired_source = sub {
+        my ($target_key, $path) = @_;
+        my $source_key = _identifier($relation->{tenant_field}, 'tenant field');
+        return $source_key unless $two_column;
+        return $target_key if $target_key eq $source_key || $target_key eq "$root_scope_field";
+        Selecto::Error->throw(
+            'invalid_domain', 'a tenant column on a two-column root must pair with the root column of its own name',
+            {association => $path, code => 'foreign_key_tenant_scope_undeclared', tenant_field => $target_key},
+        );
+    };
     my $source_associations = $relation->{associations} // {};
     _object($source_associations, $prefix eq '' ? 'source associations' : "schema $prefix associations");
     my %associations;
@@ -666,8 +685,8 @@ sub _canonical_associations {
         # partial pairs, which the association validator must reject).
         if (!keys(%scope_keys) && !exists($association->{through})
             && defined($relation->{tenant_field}) && defined($target->{tenant_field})) {
-            my $source_key = _identifier($relation->{tenant_field}, 'tenant field');
             my $target_key = _identifier($target->{tenant_field}, 'tenant field');
+            my $source_key = $paired_source->($target_key, $path);
             my $source_fields = _canonical_fields($relation);
             Selecto::Error->throw(
                 'invalid_domain', 'tenant field must be a relation field',
@@ -686,8 +705,7 @@ sub _canonical_associations {
         my %tenant_keys;
         if (defined $target->{tenant_field}) {
             my $target_key = _identifier($target->{tenant_field}, 'tenant field');
-            my $source_key = defined($relation->{tenant_field})
-                ? _identifier($relation->{tenant_field}, 'tenant field') : undef;
+            my $source_key = defined($relation->{tenant_field}) ? $paired_source->($target_key, $path) : undef;
             my $source_fields = _canonical_fields($relation);
             Selecto::Error->throw(
                 'invalid_domain', 'an association to a tenant-scoped relation must be able to bound its tenant field',
