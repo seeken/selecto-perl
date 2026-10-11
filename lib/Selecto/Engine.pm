@@ -803,7 +803,7 @@ sub _prepare_graph {
         operation     => $nodes[0]{command}->operation,
     });
     my $root_scope = $self->{domain}->write_tenant_scope;
-    my $tenants = $self->_trusted_tenant_sets($self->{domain}->required_predicate);
+    my $tenants = $self->_trusted_tenant_sets($self->_host_required_predicate);
     for my $node (@nodes[1 .. $#nodes]) {
         ($contexts{$node->{id}}, $node->{command}) =
             $self->_validate_graph_node($node, \%contexts, $root_scope, $tenants,$graph->owned_sets,$relationship_work);
@@ -1107,16 +1107,78 @@ sub _apply_write_tenant {
         # trusted tenant, but the engine value never binds its column.
         Selecto::Write::Scope->require_trusted($scope, $tenant, label => $command->relation, details => \%details);
     }
-    return ($command, \@trusted) unless defined($tenant) && defined($column);
-    my %where = (relation => $command->relation, field => "$column", %details);
-    for my $expression (grep { defined } $required, $command->predicate, $command->scope_predicate,
-        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef) {
-        Selecto::Error->throw('tenant_mismatch', 'tenant value must match the trusted tenant scope', \%where)
-            if _excludes_tenant($expression, $column, $tenant);
+    return ($command, \@trusted) unless defined $tenant;
+    if (defined $column) {
+        my %where = (relation => $command->relation, field => "$column", %details);
+        for my $expression (grep { defined } $required, $command->predicate, $command->scope_predicate,
+            defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef) {
+            Selecto::Error->throw('tenant_mismatch', 'tenant value must match the trusted tenant scope', \%where)
+                if _excludes_tenant($expression, $column, $tenant);
+        }
+        unless ($rules->{legacy}) {
+            push @trusted, $column;
+            $command = _bind_write_tenant($command, $column, $tenant, %where);
+        }
     }
-    return ($command, \@trusted) if $rules->{legacy};
-    push @trusted, $column;
-    return (_bind_write_tenant($command, $column, $tenant, %where), \@trusted);
+    for my $pinned (@{$rules->{pinned}}) {
+        my $set;
+        ($command, $set) = $self->_pin_write_tenant($command, $pinned, %details);
+        push @trusted, $pinned if $set;
+    }
+    return ($command, \@trusted);
+}
+
+# Lesson 47b: under an engine tenant, a write that sets a pinned column
+# (the site_id of a two-column domain, or a graph child column the root
+# pins) is refused with missing_tenant_scope unless a host trusted-scope or
+# required predicate pins the allowed values (a positive top-level eq/IN
+# conjunct; host and required pins, and a child's and its root's, are
+# intersected). The value must be a literal inside the pin
+# (tenant_mismatch). An insert or upsert omitting the column is assigned
+# the pin when exactly one value is pinned and refused otherwise. Without
+# this, once writes bind tenant_id only (47a), tenant 7 could relabel its
+# own row to tenant 8's site and then read tenant 8's site rows through
+# by-name site pairing (41c). Updates and deletes keep matching only rows
+# inside a pin; a write that does not set the column is otherwise
+# unaffected. Returns the command and whether the column was set.
+sub _pin_write_tenant {
+    my ($self, $command, $column, %details) = @_;
+    my $operation = $command->operation;
+    my %where = (relation => $command->relation, field => "$column", %details);
+    my $assignments = $command->assignments;
+    my $sets = $operation ne 'delete' && exists $assignments->{$column};
+    my $inserts = $operation eq 'insert' || $operation eq 'upsert';
+    my $pins = $self->_tenant_pins($column);
+    Selecto::Error->throw('tenant_mismatch', 'host and required pins admit no value', \%where)
+        if $pins && !@$pins;
+    if ($sets || $inserts) {
+        Selecto::Error->throw('missing_tenant_scope',
+            'a write setting a pinned tenant column requires a host or required pin', \%where) unless $pins;
+        if ($sets) {
+            my $value = _literal_value($assignments->{$column});
+            Selecto::Error->throw('tenant_mismatch', 'tenant value must match the trusted tenant scope', \%where)
+                unless defined($value) && !ref($value) && grep { "$_" eq "$value" } @$pins;
+        } else {
+            Selecto::Error->throw('missing_tenant_scope',
+                'an insert omitting a pinned tenant column requires exactly one pinned value', \%where)
+                unless @$pins == 1;
+            $command = $command->with_assignments({%$assignments, $column => $pins->[0]});
+        }
+    }
+    if ($pins && ($operation eq 'update' || $operation eq 'delete')) {
+        my $guard = @$pins == 1 ? Selecto::Expression->eq($column, $pins->[0]) : Selecto::Expression->in($column, [@$pins]);
+        $command = $command->with_scope_predicate(Selecto::QueryEnforcement::combine($command->scope_predicate, $guard))
+            unless grep { $_->kind eq $guard->kind && _is_tenant_comparison($_, $column)
+                && JSON::PP->new->canonical->encode([_comparison_values($_)])
+                    eq JSON::PP->new->canonical->encode([_comparison_values($guard)]) } _conjuncts($command->scope_predicate);
+    }
+    return ($command, $sets || $inserts);
+}
+
+sub _comparison_values {
+    my ($expression) = @_;
+    my $argument = $expression->arguments->[1];
+    return map { "$_" } $expression->kind eq 'eq' ? ($argument->arguments->[0]) : @$argument;
 }
 
 sub _bind_write_tenant {
@@ -1279,9 +1341,8 @@ sub _required_tenants {
     my ($required, $field) = @_;
     return undef unless defined($field) && defined($required);
     my $values;
-    for my $conjunct ($required->kind eq 'and' ? @{$required->arguments->[0] // []} : ($required)) {
-        next unless blessed($conjunct) && $conjunct->isa('Selecto::Expression')
-            && ($conjunct->kind eq 'eq' || $conjunct->kind eq 'in') && _is_tenant_comparison($conjunct, $field);
+    for my $conjunct (_conjuncts($required)) {
+        next unless ($conjunct->kind eq 'eq' || $conjunct->kind eq 'in') && _is_tenant_comparison($conjunct, $field);
         my $argument = $conjunct->arguments->[1];
         my @allowed = $conjunct->kind eq 'eq' ? ($argument->arguments->[0]) : @$argument;
         my %allowed = map { ("$_" => 1) } @allowed;
@@ -3394,6 +3455,16 @@ by a positive top-level C<eq>/C<in> conjunct of the required predicate or a
 trusted C<write_context> filter. The C<writes.scope.tenant> declaration still
 requires a trusted tenant. A graph child never binds the engine value onto
 a column the root pins, such as a child tenanted on C<site_id>.
+
+Under an engine tenant, a write that sets the pinned C<site_id> (insert,
+update, upsert, batch member, graph root or child, owned-sync row) is
+refused with C<missing_tenant_scope> unless such a pin exists (lesson 47b).
+Host and required pins count alike and are intersected (with the root's
+pin for a graph child); a set they leave empty is C<tenant_mismatch>. The
+value must be a literal inside the pin (C<tenant_mismatch>). An insert
+omitting C<site_id> is assigned the pin when exactly one site is pinned,
+and refused otherwise. Updates and deletes of a graph child match only
+rows inside a pin. Writes that do not set C<site_id> are unaffected.
 
 Reads of a domain with a C<tenant_field> are always restricted to the
 engine's tenant. Domains that rely on a required predicate as their tenant
