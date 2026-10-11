@@ -1,6 +1,20 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: every Engine read honours the trusted engine tenant
+      (lesson 43). Probed under engine tenant 7 with tenant 8 rows present,
+      on SQLite and PostgreSQL: all, compile, stream, projection_sum,
+      export scalars, BoundedQuery, canned pages, the public query handler,
+      joined fields and filters, retargets (IN and EXISTS), related
+      collections, query members, inline subqueries and laterals, lateral
+      lookups, query library segments and with_limits copies all bound the
+      root of a tenant_field domain to the engine tenant already, and a
+      required predicate agreeing with it or wider (tenant_id IN (7, 8))
+      returned only tenant 7's rows. A required tenant condition that
+      excludes the engine tenant (required_filters, a required predicate
+      or require_tenant_filter) was refused only as tenant_scope_ambiguous;
+      it is now refused with tenant_mismatch before any read path runs,
+      and require_tenant_filter refuses it when it is attached.
     - BEHAVIOUR: on a two-column root (source.tenant_field tenant_id,
       writes.scope.tenant site_id) the engine tenant bounds reads on the
       tenant_field column only (lesson 41c, reversing that part of 41a).
