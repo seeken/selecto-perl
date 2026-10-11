@@ -1026,20 +1026,56 @@ sub _host_required_predicate {
         Selecto::Write::Context->required_predicate({source=>$source},$self->{write_context}));
 }
 
-# Lesson 47: the column a trusted engine tenant binds on writes of this
-# engine's domain: the writes.scope.tenant field, else source.tenant_field.
-# A graph child (an engine made by _graph_engine) binds its own column only
-# when it pairs by name with the root's bound column, or when the root has
-# none; a child's own writes.scope.tenant field is always bound by Scope.
-sub _write_tenant_column {
+# Lesson 47/47a: how a trusted engine tenant governs writes of this engine's
+# domain. bind is the column it binds: source.tenant_field, else the
+# writes.scope.tenant field (legacy when writes.scope.tenant names it, and
+# Selecto::Write::Scope applies it). On a two-column domain (writes.scope.tenant
+# on another column than tenant_field) the engine value means tenant_field on
+# writes as on reads (41c), and the scope column is pinned: never bound to
+# the engine value. A graph child (an engine made by _graph_engine) never
+# binds a column the root pins, and binds its own tenant_field only when it
+# pairs by name with the root's bound column or the root has none; a
+# child's own writes.scope.tenant on another column keeps binding it.
+sub _write_tenant_rules {
     my ($self) = @_;
     my $domain = $self->{domain};
     my $scope = $domain->write_tenant_scope;
-    my $column = $scope ? $scope->{field} : $domain->tenant_field;
-    my $root = $self->{_graph_root};
-    return $column unless $root && defined $column;
-    return $column if !defined($root->{bind}) || $column eq $root->{bind};
-    return $scope && $scope->{field} eq $column ? $column : undef;
+    my $field = $domain->tenant_field;
+    my (%rules, @pinned);
+    my $column = $scope ? $scope->{field} : $field;
+    if ($scope && defined($field) && $scope->{field} ne $field) {
+        ($column, @pinned) = ($field, $scope->{field});
+    } elsif ($scope) {
+        $rules{legacy} = 1;
+    }
+    if ((my $root = $self->{_graph_root}) && defined $column) {
+        if (exists $root->{pinned}{$column}) {
+            unshift @pinned, $column;
+            ($column, $rules{legacy}) = (undef, 0);
+        } elsif (!$rules{legacy} && defined($root->{bind}) && $column ne $root->{bind}) {
+            $column = undef;
+        }
+    }
+    return {%rules, bind => $column, pinned => \@pinned};
+}
+sub _write_tenant_column { return $_[0]->_write_tenant_rules->{bind}; }
+
+# The tenant conditions a stored row of this engine's domain must meet to be
+# one this engine's writes may reach: the bound column equal to the engine
+# tenant, and each pinned column inside its pin. Empty without an engine
+# tenant.
+sub _write_tenant_conditions {
+    my ($self) = @_;
+    my $tenant = $self->{scope}{tenant};
+    return () unless defined $tenant;
+    my $rules = $self->_write_tenant_rules;
+    my @conditions = defined($rules->{bind}) ? (Selecto::Expression->eq($rules->{bind}, $tenant)) : ();
+    for my $column (@{$rules->{pinned}}) {
+        my $pins = $self->_tenant_pins($column) or next;
+        push @conditions, @$pins == 1 ? Selecto::Expression->eq($column, $pins->[0])
+            : Selecto::Expression->in($column, [@$pins]);
+    }
+    return @conditions;
 }
 
 # Lesson 47: a trusted engine tenant limits every write of a domain with a
@@ -1058,13 +1094,18 @@ sub _apply_write_tenant {
     my ($self, $command, $required, %details) = @_;
     my $tenant = $self->{scope}{tenant};
     my $scope = $self->{domain}->write_tenant_scope;
-    my $column = $self->_write_tenant_column;
+    my $rules = $self->_write_tenant_rules;
+    my $column = $rules->{bind};
     my @trusted;
-    if ($scope) {
+    if ($rules->{legacy}) {
         $command = Selecto::Write::Scope->apply(
             $command, $scope, $tenant, label => $command->relation, details => \%details,
         );
         push @trusted, $scope->{field};
+    } elsif ($scope) {
+        # A two-column (or root-pinned) writes.scope.tenant still requires a
+        # trusted tenant, but the engine value never binds its column.
+        Selecto::Write::Scope->require_trusted($scope, $tenant, label => $command->relation, details => \%details);
     }
     return ($command, \@trusted) unless defined($tenant) && defined($column);
     my %where = (relation => $command->relation, field => "$column", %details);
@@ -1073,7 +1114,7 @@ sub _apply_write_tenant {
         Selecto::Error->throw('tenant_mismatch', 'tenant value must match the trusted tenant scope', \%where)
             if _excludes_tenant($expression, $column, $tenant);
     }
-    return ($command, \@trusted) if $scope && $scope->{field} eq $column;
+    return ($command, \@trusted) if $rules->{legacy};
     push @trusted, $column;
     return (_bind_write_tenant($command, $column, $tenant, %where), \@trusted);
 }
@@ -1133,8 +1174,42 @@ sub _graph_engine {
     my ($self, $domain) = @_;
     my $engine = ref($self)->new(domain => $domain, adapter => $self->{adapter},
         scope => $self->{scope}, write_context => $self->{write_context}, limits => $self->{limits});
-    $engine->{_graph_root} = $self->{_graph_root} // {bind => $self->_write_tenant_column};
+    $engine->{_graph_root} = $self->{_graph_root} // do {
+        my $rules = $self->_write_tenant_rules;
+        my $required = @{$rules->{pinned}} ? $self->_host_required_predicate : undef;
+        {bind => $rules->{bind}, pinned => {map { ($_ => _pin_set($required, $_)) } @{$rules->{pinned}}}};
+    };
     return $engine;
+}
+
+# The values a predicate's top-level eq/in conjuncts on $column admit,
+# intersected (possibly none); undef when no conjunct names the column.
+sub _pin_set {
+    my ($predicate, $column) = @_;
+    my $values;
+    for my $conjunct (_conjuncts($predicate)) {
+        next unless ($conjunct->kind eq 'eq' || $conjunct->kind eq 'in') && _is_tenant_comparison($conjunct, $column);
+        my $argument = $conjunct->arguments->[1];
+        my @allowed = $conjunct->kind eq 'eq' ? ($argument->arguments->[0]) : @$argument;
+        my %allowed = map { ("$_" => 1) } @allowed;
+        $values = $values ? [grep { $allowed{"$_"} } @$values] : [@allowed];
+    }
+    return $values;
+}
+
+# The site values a write of this engine's domain may store in a pinned
+# column: the host's required and trusted-context conjuncts on it,
+# intersected with the root's pin when this is a graph child. Undef when
+# nothing pins it.
+sub _tenant_pins {
+    my ($self, $column) = @_;
+    my $own = _pin_set($self->_host_required_predicate, $column);
+    my $root = $self->{_graph_root};
+    my $inherited = $root && exists($root->{pinned}{$column}) ? $root->{pinned}{$column} : undef;
+    return $own unless $inherited;
+    return $inherited unless $own;
+    my %own = map { ("$_" => 1) } @$own;
+    return [grep { $own{"$_"} } @$inherited];
 }
 
 # Context-owned fields are checked as authored literal values before native
@@ -1260,10 +1335,11 @@ sub _confine_child_tenants {
 # guards. On a root with at most one tenant column every guard keeps the one
 # trusted set (_trusted_write_tenants). On a two-column root
 # (writes.scope.tenant on one column, source.tenant_field on another) each
-# column has its own set: the engine tenant bounds only the write-scope
-# column, and the tenant_field column is bounded only by the required
-# predicate's conjuncts on it. A guard then takes the set of the root column
-# it pairs with (see _tenant_pairs), never the write-scope set by default.
+# column has its own set: the engine tenant bounds only the tenant_field
+# column (lesson 47a, as on reads), and the write-scope column is bounded
+# only by the required predicate's conjuncts on it (host trusted-context
+# filters included), never by the engine value. A guard then takes the set
+# of the root column it pairs with (see _tenant_pairs).
 sub _trusted_tenant_sets {
     my ($self, $required) = @_;
     my $tenants = $self->_trusted_write_tenants($required);
@@ -1273,9 +1349,9 @@ sub _trusted_tenant_sets {
     return {
         any => $tenants,
         columns => {
-            $scope->{field} => defined($self->{scope}{tenant}) ? [$self->{scope}{tenant}]
-                : _required_tenants($required, $scope->{field}),
-            $field => _required_tenants($required, $field),
+            $scope->{field} => _required_tenants($required, $scope->{field}),
+            $field => defined($self->{scope}{tenant}) ? [$self->{scope}{tenant}]
+                : _required_tenants($required, $field),
         },
     };
 }
@@ -3310,6 +3386,15 @@ binds the engine tenant only onto a column that pairs by name with the
 root's. Every update of a root tenant column must keep a value the required
 and host conjuncts on it admit.
 
+On a two-column domain (C<source.tenant_field> C<tenant_id>,
+C<writes.scope.tenant> C<site_id>) the engine tenant means C<tenant_id> on
+writes as on reads (lesson 47a): writes bind C<tenant_id> by the rules
+above, and C<site_id> is never bound to the engine value. It is pinned only
+by a positive top-level C<eq>/C<in> conjunct of the required predicate or a
+trusted C<write_context> filter. The C<writes.scope.tenant> declaration still
+requires a trusted tenant. A graph child never binds the engine value onto
+a column the root pins, such as a child tenanted on C<site_id>.
+
 Reads of a domain with a C<tenant_field> are always restricted to the
 engine's tenant. Domains that rely on a required predicate as their tenant
 boundary are described under L<Selecto::Domain/with_required_predicate>.
@@ -3354,8 +3439,9 @@ value cannot be guarded (C<invalid_write>).
 
 On a two-column root (C<writes.scope.tenant> on one column,
 C<source.tenant_field> on another) each root column has its own admitted
-set: the engine tenant bounds the write-scope column, and the required
-predicate's C<eq>/C<in> conjuncts bound the C<tenant_field> column. A
+set: the engine tenant bounds the C<tenant_field> column (lesson 47a), and
+the required predicate's and trusted C<write_context> filters' C<eq>/C<in>
+conjuncts bound (pin) the write-scope column; the engine value never does. A
 reference guard takes the set of the root column it pairs with. An
 association whose C<source_scope_key> is a root tenant column pairs its
 C<target_scope_key> with that column, whatever the target column is named

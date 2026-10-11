@@ -13,9 +13,10 @@ use Selecto::Write::Context ();
 
 # Item 34: a context-sourced foreign key (source ['context', k]) is paired
 # like an input foreign key. On a two-column root (writes.scope.tenant on
-# site_id, bound to engine tenant 7; source.tenant_field tenant_id, bounded
-# to 1 by the required predicate) a reference to people, which store
-# tenant_id, is guarded with the tenant_id set, never the site value. The
+# site_id, pinned to 7 by the required predicate; source.tenant_field
+# tenant_id, bound to engine tenant 1 since lesson 47a) a reference to
+# people, which store tenant_id, is guarded with the tenant_id set, never
+# the site value. The
 # context-owned existence-only exemption applies only when nothing declares
 # the target's tenancy, and crossed or contradictory pairings are refused
 # with invalid_domain (foreign_key_tenant_scope_undeclared).
@@ -74,8 +75,8 @@ sub contract {
 }
 sub engine_for {
     my ($adapter, $t, $person, %o) = @_;
-    my $domain = Selecto::Domain->parse(contract($t, %o))->with_required_predicate(Selecto::Expression->eq('tenant_id', 1));
-    return Selecto::Engine->new(domain => $domain, adapter => $adapter, scope => {tenant => 7},
+    my $domain = Selecto::Domain->parse(contract($t, %o))->with_required_predicate(Selecto::Expression->eq('site_id', 7));
+    return Selecto::Engine->new(domain => $domain, adapter => $adapter, scope => {tenant => 1},
         write_context => {person_id => $person});
 }
 
@@ -95,7 +96,7 @@ for my $backend (@backends) {
             my ($person, %o) = @_;
             my $engine = engine_for($adapter, \%t, $person, %o);
             return code_of(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'insert',
-                relation => $t{orders}, assignments => {id => ++$id, tenant_id => 1}, expected_count => 1)) });
+                relation => $t{orders}, assignments => {id => ++$id, tenant_id => 1, site_id => 7}, expected_count => 1)) });
         };
         my $stored = sub { [map { $_->[0] } @{$dbh->selectall_arrayref("SELECT person_id FROM $t{orders} ORDER BY id")}] };
 
@@ -127,21 +128,21 @@ for my $backend (@backends) {
         ) {
             my ($label, %o) = @$case;
             my $direct = error_of(sub { engine_for($adapter, \%t, 51, %o)->execute_write(Selecto::Write::Command->new(
-                operation => 'insert', relation => $t{orders}, assignments => {id => ++$id, tenant_id => 1}, expected_count => 1)) });
+                operation => 'insert', relation => $t{orders}, assignments => {id => ++$id, tenant_id => 1, site_id => 7}, expected_count => 1)) });
             is($direct && blessed($direct) && $direct->code, 'invalid_domain', "$label: invalid_domain");
             is($direct && blessed($direct) && $direct->details->{code}, 'foreign_key_tenant_scope_undeclared',
                 "$label: foreign_key_tenant_scope_undeclared");
         }
 
         # The portable guard description pairs the same way: the context
-        # tenant (the site value) never guards a tenant_id column.
+        # tenant is the tenant_id value (lesson 47a) and guards tenant_id.
         my $portable = contract(\%t, references => {tenant_field => 'tenant_id'});
         my $guards = Selecto::Write::Context->foreign_key_guards({schemas => $portable->{schemas}},
             {source => $portable->{source}, scope => $portable->{writes}{scope}, constraints => $portable->{writes}{constraints}},
-            {person_id => 51}, 'insert', {tenant_id => 7, person_id => 51});
+            {person_id => 51}, 'insert', {tenant_id => 1, person_id => 51});
         is(scalar(@$guards), 1, 'the portable path describes one guard');
-        ok(!grep({ ($_->{tenant_field} // '') eq 'tenant_id' && grep { $_ == 7 } @{$_->{tenants} // []} } @$guards),
-            'the portable guard never pairs the site value with tenant_id');
+        is_deeply([map { [$_->{tenant_field}, $_->{tenants}] } @$guards], [['tenant_id', [1]]],
+            'the portable guard pairs the context tenant with tenant_id');
         $dbh->do("DROP TABLE $t{$_}") for qw(orders people);
     };
 }

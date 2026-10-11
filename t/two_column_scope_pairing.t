@@ -9,10 +9,11 @@ use Selecto::Engine ();
 use Selecto::Expression ();
 use Selecto::Write ();
 
-# Lesson 29e: on a two-column root (writes.scope.tenant on site_id, bound to
-# engine tenant 7; source.tenant_field tenant_id, bounded to 1 by the
-# required predicate) a reference guard takes the admitted set of the root
-# column it pairs with. An authored scope pair (source_scope_key ->
+# Lesson 29e: on a two-column root (writes.scope.tenant on site_id,
+# source.tenant_field tenant_id) a reference guard takes the admitted set of
+# the root column it pairs with. Since lesson 47a the engine tenant (1)
+# bounds tenant_id on writes as on reads, and site_id is bounded only by a
+# host or required pin (site_id = 7 here), never by the engine value. An authored scope pair (source_scope_key ->
 # target_scope_key) pairs the target column with its source column whatever
 # the target column is called; a target storing both root columns is guarded
 # on each by name. Pairings that disagree are refused with invalid_domain
@@ -67,8 +68,8 @@ sub engine_for {
             scope => {tenant => {field => 'site_id', satisfied_by => ['trusted_context']}},
         },
     });
-    $domain = $domain->with_required_predicate(Selecto::Expression->eq('tenant_id', 1)) unless $o{unbounded};
-    return Selecto::Engine->new(domain => $domain, adapter => $adapter, scope => {tenant => 7});
+    $domain = $domain->with_required_predicate(Selecto::Expression->eq('site_id', 7)) unless $o{unbounded};
+    return Selecto::Engine->new(domain => $domain, adapter => $adapter, scope => {tenant => 1});
 }
 
 for my $backend (@backends) {
@@ -127,11 +128,12 @@ for my $backend (@backends) {
         is($stored->('site_ref'), undef, 'both columns: nothing was written');
         is($assign->($both, 'site_ref', 31), 'ok', 'both columns: the row in both sets is accepted');
 
-        # Without a required predicate nothing bounds tenant_id: a reference
-        # paired with it is refused rather than guarded with the site set.
-        my $unbounded = engine_for($dbh, $adapter, \%t, owner => 'wh_id', table => 'warehouses', columns => ['site_id'],
-            source => 'tenant_id', target => 'site_id', unbounded => 1);
-        is($assign->($unbounded, 'wh_id', 71), 'missing_tenant_scope', 'an unbounded paired column refuses the reference');
+        # Without a site pin nothing bounds site_id: a reference paired with
+        # it is refused rather than guarded with the engine value.
+        my $unbounded = engine_for($dbh, $adapter, \%t, owner => 'depot_id', table => 'depots', columns => ['tenant_id'],
+            source => 'site_id', target => 'tenant_id', unbounded => 1);
+        is($assign->($unbounded, 'depot_id', 19), 'missing_tenant_scope', 'an unbounded paired column refuses the reference');
+        is($assign->($unbounded, 'depot_id', 17), 'missing_tenant_scope', 'even the engine value\'s row');
 
         # Refusals, all when the engine is built.
         for my $case (

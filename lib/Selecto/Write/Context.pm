@@ -247,15 +247,17 @@ sub foreign_key_guards {
         my $guard={field=>$field,relation=>$relation,target_field=>$target_field,value=>$value};
         if (defined $tenant_field) {
             _fail('missing_tenant_scope','tenant-scoped foreign key requires trusted tenant context',{field=>$field}) unless defined $context->{tenant_id};
-            # The trusted context tenant is the write-scope column's. On a
-            # two-column root (writes.scope.tenant and source.tenant_field on
-            # different columns) it never guards another tenant column: the
-            # governing engine pairs that column with its own set (item 34),
-            # and this description carries no set, so it cannot be executed
-            # as it stands.
+            # The trusted context tenant is the column the engine tenant
+            # binds. On a two-column root (writes.scope.tenant and
+            # source.tenant_field on different columns) that is the
+            # tenant_field column (lesson 47a); it never guards another
+            # tenant column, such as the pinned site column: the governing
+            # engine pairs that column with its own set (item 34), and this
+            # description carries no set, so it cannot be executed as it
+            # stands.
             my $scope_field=ref($scope) eq 'HASH' && defined($scope->{field}) ? $class->identifier($scope->{field}) : undef;
             my $root_field=ref($root) eq 'HASH' && defined($root->{tenant_field}) ? $class->identifier($root->{tenant_field}) : undef;
-            my $other_column=defined($scope_field) && defined($root_field) && $scope_field ne $root_field && $tenant_field ne $scope_field;
+            my $other_column=defined($scope_field) && defined($root_field) && $scope_field ne $root_field && $tenant_field ne $root_field;
             @{$guard}{qw(tenant_field tenants)}=($tenant_field,$other_column ? [] : [$context->{tenant_id}]);
         }
         $output->check_tree($guard,label=>'foreign-key guards');push @guards,$guard;
