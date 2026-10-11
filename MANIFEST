@@ -333,3 +333,4 @@ t/shared_root_join_tenant_bound.t
 t/query_member_tenant_boundary.t
 t/co_domain_lookup_tenant_boundary.t
 t/two_column_join_pairing.t
+t/rebuild_tenant_bound.t
