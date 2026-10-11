@@ -1,6 +1,17 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: a declared foreign key and the associations on the same
+      owner key must describe one reference. When they name different
+      relations, or pair a target tenant column with a different tenant
+      column (or a different root tenant column), the domain is refused with
+      invalid_domain (code foreign_key_tenant_scope_undeclared) when the
+      engine is built and on every write, before any query or DML.
+      Previously the declared foreign key silently won and the
+      association's tenant guard was skipped, so a write could reference
+      another tenant's row. An agreeing foreign key and association are
+      guarded once, and an explicit shared foreign key
+      (references.tenant_field false) remains usable.
     - BREAKING: public API writes (Selecto::API::EngineHandler) are confined
       to each operation's authored grants. Without an expected_cardinality
       grant an operation permits exactly one row: bulk => 1 is still

@@ -131,6 +131,11 @@ sub new {
         unless blessed($limits) && $limits->isa('Selecto::Limits');
     $args{adapter}->assert_contract;
     $args{domain}->validate_query_library($limits);
+    # Contradictory reference declarations are refused at admission, before
+    # any query or write. A malformed foreign-key section stays a write error.
+    if (my $references = eval { _domain_references($args{domain}) }) {
+        _assert_reference_agreement($references);
+    }
     my $mode = $args{mode} // 'permissive';
     Selecto::Error->throw('invalid_query_policy', 'mode must be strict or permissive')
         unless !defined(reftype($mode)) && ($mode eq 'strict' || $mode eq 'permissive');
@@ -1070,6 +1075,7 @@ sub _domain_references {
         primary_key => $domain->primary_key,
         tenant_field => $scope ? $scope->{field} : $domain->tenant_field,
         tenant_data => $scope || defined($domain->tenant_field) ? 1 : 0,
+        root_tenant_fields => _root_tenant_fields($domain->tenant_field, $scope),
         foreign_keys => _declared_foreign_keys($contract->{writes}),
         schemas => _schema_tenancy($schemas),
         associations => [map {
@@ -1083,6 +1089,7 @@ sub _domain_references {
                 table => $association->table,
                 static => defined($association->values) || (ref($target) eq 'HASH' && defined($target->{values})) ? 1 : 0,
                 through => defined($association->through) ? 1 : 0,
+                source_scope_key => $association->source_scope_key,
                 target_scope_key => $association->target_scope_key,
                 target_tenant_field => ref($target) eq 'HASH' ? $target->{tenant_field} : undef,
             }
@@ -1103,6 +1110,7 @@ sub _contract_references {
         primary_key => $source->{primary_key} // 'id',
         tenant_field => $scope ? $scope->{field} : $source->{tenant_field},
         tenant_data => $scope || defined($source->{tenant_field}) ? 1 : 0,
+        root_tenant_fields => _root_tenant_fields($source->{tenant_field}, $scope),
         foreign_keys => _declared_foreign_keys($contract->{writes}),
         schemas => _schema_tenancy($schemas),
         associations => [map {
@@ -1116,11 +1124,20 @@ sub _contract_references {
                 table => ref($target) eq 'HASH' ? $target->{source_table} : $spec->{table},
                 static => ref($target) eq 'HASH' && defined($target->{values}) ? 1 : 0,
                 through => defined($spec->{through}) ? 1 : 0,
+                source_scope_key => $spec->{source_scope_key},
                 target_scope_key => $spec->{target_scope_key},
                 target_tenant_field => ref($target) eq 'HASH' ? $target->{tenant_field} : undef,
             } : ()
         } sort keys %$associations],
     };
+}
+
+# The root's tenant columns: source.tenant_field and writes.scope.tenant.field.
+# Two distinct columns make a two-column root.
+sub _root_tenant_fields {
+    my ($tenant_field, $scope) = @_;
+    my %fields = map { (defined($_) && !ref($_) ? ("$_" => 1) : ()) } $tenant_field, $scope ? $scope->{field} : undef;
+    return [sort keys %fields];
 }
 
 sub _declared_foreign_keys {
@@ -1155,6 +1172,7 @@ sub _schema_tenancy {
 # as in the Elixir core (foreign_key_tenant_scope_undeclared).
 sub _foreign_key_guards {
     my ($references, $command, $tenants, %details) = @_;
+    _assert_reference_agreement($references, %details);
     return [] if $command->operation eq 'delete';
     my $assignments = $command->assignments;
     my $tenant_scoped = $tenants && $references->{tenant_data};
@@ -1181,22 +1199,13 @@ sub _foreign_key_guards {
             context_owned => ref($spec->{source}) ? 1 : 0,
         };
     }
-    for my $association (@{$references->{associations}}) {
+    for my $association (_guarded_associations($references)) {
         $work->consume_count('max_expression_nodes',1,label=>'foreign-key work');
         my $field = $association->{owner_key};
-        next if !defined($field) || $declared{$field} || !exists($assignments->{$field});
-        # Only a reference from this row to another: not the row's own key, a
-        # to-many or bridged association, or a static value list.
-        next if $field eq ($references->{primary_key} // '') || $association->{cardinality} ne 'one'
-            || $association->{through} || $association->{static} || !defined($association->{table});
-        my $tenancy = defined($association->{target_scope_key}) ? ['tenant', $association->{target_scope_key}]
-            : defined($association->{target_tenant_field}) ? ['tenant', $association->{target_tenant_field}]
-            : $association->{table} eq $references->{table} && defined($references->{tenant_field})
-                ? ['tenant', $references->{tenant_field}]
-            : ['undeclared'];
+        next if $declared{$field} || !exists($assignments->{$field});
         push @candidates, {
             field => $field, relation => $association->{table}, target_field => $association->{related_key},
-            tenancy => $tenancy,
+            tenancy => _association_tenancy($references, $association),
         };
     }
     my (%seen, @guards);
@@ -1241,6 +1250,72 @@ sub _foreign_key_guards {
         $output->check_tree($guard,label=>'foreign-key guards');push @guards,$guard;
     }
     return \@guards;
+}
+
+# Direct to-one associations whose owner key references another row: not the
+# row's own key, a to-many or bridged association, or a static value list.
+sub _guarded_associations {
+    my ($references) = @_;
+    return grep {
+        my $field = $_->{owner_key};
+        defined($field) && $field ne ($references->{primary_key} // '') && $_->{cardinality} eq 'one'
+            && !$_->{through} && !$_->{static} && defined($_->{table})
+    } @{$references->{associations}};
+}
+
+# The tenant column an association guards on its target, and the root tenant
+# column it pairs that column with.
+sub _association_tenancy {
+    my ($references, $association) = @_;
+    my $source = $association->{source_scope_key};
+    my $root = defined($source) && grep({ $_ eq $source } @{$references->{root_tenant_fields} // []})
+        ? $source : $references->{tenant_field};
+    return defined($association->{target_scope_key}) ? ['tenant', $association->{target_scope_key}, $root]
+        : defined($association->{target_tenant_field}) ? ['tenant', $association->{target_tenant_field}, $root]
+        : $association->{table} eq $references->{table} && defined($references->{tenant_field})
+            ? ['tenant', $references->{tenant_field}, $root]
+        : ['undeclared'];
+}
+
+# A declared foreign key and the associations on the same owner key must
+# describe one reference: the same relation, and the same target tenant
+# column paired with the same root tenant column. Otherwise whichever
+# declaration won would silently drop the other's tenant guard, so the
+# contradictory domain is refused before any query or write. An explicit
+# shared foreign key (references.tenant_field false) is authoritative and
+# agrees with any tenancy the association records for the same relation.
+sub _assert_reference_agreement {
+    my ($references, %details) = @_;
+    my %by_key;
+    my $foreign_keys = $references->{foreign_keys} // {};
+    for my $field (sort keys %$foreign_keys) {
+        my $target = ref($foreign_keys->{$field}) eq 'HASH' ? $foreign_keys->{$field}{references} : undef;
+        next unless ref($target) eq 'HASH' && defined($target->{relation}) && !ref($target->{relation});
+        my $tenancy = _declared_tenancy($references, $target);
+        push @{$by_key{$field}}, {relation => "$target->{relation}",
+            tenancy => $tenancy->[0] eq 'tenant' ? [@$tenancy, $references->{tenant_field}] : $tenancy};
+    }
+    push @{$by_key{$_->{owner_key}}}, {relation => $_->{table}, tenancy => _association_tenancy($references, $_)}
+        for _guarded_associations($references);
+    for my $field (sort keys %by_key) {
+        my @declared = @{$by_key{$field}};
+        for my $i (0 .. $#declared - 1) {
+            for my $other (@declared[$i + 1 .. $#declared]) {
+                my ($one, $two) = ($declared[$i]{tenancy}, $other->{tenancy});
+                my $reason = $declared[$i]{relation} ne $other->{relation} ? 'different_relations'
+                    : $one->[0] eq 'tenant' && $two->[0] eq 'tenant'
+                        && ($one->[1] ne $two->[1] || ($one->[2] // '') ne ($two->[2] // ''))
+                        ? 'different_tenant_columns' : undef;
+                next unless defined $reason;
+                Selecto::Error->throw('invalid_domain',
+                    'declarations of one reference disagree on its relation or tenant columns',
+                    {code => 'foreign_key_tenant_scope_undeclared', field => $field, reason => $reason,
+                        relation => $references->{table},
+                        referenced => [sort($declared[$i]{relation}, $other->{relation})], %details});
+            }
+        }
+    }
+    return;
 }
 
 # references.tenant_field when declared (a field, or false/null for a shared
