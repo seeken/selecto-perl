@@ -1,6 +1,46 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY/correctness (PostgreSQL): read guards (bounded streams,
+      savepoint query budgets, direct bounded reads) and managed writes no
+      longer start on a connection whose transaction they cannot account
+      for. A pending asynchronous host result (pg_async before pg_result),
+      a busy connection, an already aborted host transaction or an unknown
+      state is refused with the new typed error transaction_state_unsafe
+      (details state: active, inerror or unknown) before any statement is
+      sent. Previously, with a pending async INSERT inside a raw BEGIN, a
+      bounded stream or managed write treated the connection as idle and its
+      rollback discarded the host's transaction (its earlier INSERT and the
+      pending one), so the host's next INSERT autocommitted; inside an
+      aborted transaction a savepoint budget failed with
+      query_budget_unavailable and poisoned the handle for later budgets.
+    - SECURITY/correctness (PostgreSQL): a bounded stream rolls back only
+      what it can prove is its own. When the host aborted the transaction
+      while a stream was open inside it (a failing statement, or a failing
+      async query), the stream's next FETCH or close rolled back to its
+      savepoint and so silently un-aborted the host's transaction: the
+      host's later INSERT and COMMIT went through. When the host took the
+      connection over during a stream in its own transaction (ROLLBACK,
+      BEGIN, INSERT), the stream's close rolled back the host's new
+      transaction. The stream now marks its own transaction
+      (SET LOCAL selecto.guard) and checks the marker before rolling back,
+      rolls back its savepoint only after its own statement failed, and
+      otherwise fails with transaction_state_unsafe, leaving the connection
+      untouched for the host. Healthy streams, and a stream's own failures
+      (a timeout, a decode error), behave as before.
+    - SECURITY/correctness: ending a stream or budget never hides a cleanup
+      that left the host's transaction aborted (PostgreSQL's COMMIT of an
+      aborted transaction silently rolls back). When a stream's own failure
+      cannot be undone, next raises stream_cleanup_failed instead of the
+      original error, close raises as before, and an abandoned stream or
+      budget whose cleanup failed or was left to the host now warns from
+      DESTROY; the aborted transaction, the poisoned handle and the refusal
+      of every later guard keep the state detectable.
+    - Every Selecto savepoint (writes, bounded write probes, typed insert
+      admission, budgets, streams) now has a process-unique name
+      (selecto_write_<pid>_<n> instead of selecto_write_<depth>), so a
+      cleanup can only ever roll back to its own savepoint. A savepoint
+      budget counts as begun only once its savepoint exists.
     - SECURITY: an association source_scope_key that is not a root tenant
       column (for example region_id -> region_id) no longer becomes the
       reference's tenant guard. It was guarded as

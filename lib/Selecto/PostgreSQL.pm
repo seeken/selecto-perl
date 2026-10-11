@@ -1071,12 +1071,69 @@ sub _cached_execute {
 
 # A raw BEGIN leaves AutoCommit on, but the server still reports the
 # transaction: pg_ping answers 3 (idle in a transaction) or 4 (in a failed
-# one). Asked only when AutoCommit is on.
+# one). Asked only when AutoCommit is on. A connection busy with the host's
+# own statement (2) is refused: Selecto never begins, rolls back or creates a
+# savepoint around a result it does not own.
 sub _server_transaction_open {
     my ($self) = @_;
     my $status = eval { $self->{dbh}->pg_ping };
     return undef unless defined($status) && $status > 0;
+    _refuse_connection_state('active') if $status == 2;
     return $status >= 3 ? 1 : 0;
+}
+
+# DBD::Pg holds the host's asynchronous query (pg_async) until the host takes
+# its result. Its rollback would silently discard that result and the host's
+# transaction with it, so nothing Selecto runs may start while one is pending.
+sub _transaction_open {
+    my ($self) = @_;
+    $self->_refuse_pending_result;
+    return $self->SUPER::_transaction_open;
+}
+
+sub _refuse_pending_result {
+    my ($self) = @_;
+    _refuse_connection_state('active') if eval { $self->{dbh}{pg_async_status} };
+    return;
+}
+
+# The connection state, as libpq reports it, before a read guard (a bounded
+# stream or a savepoint query budget) sends anything: 'idle', 'intrans',
+# 'active', 'inerror' or 'unknown'. A pending asynchronous result is
+# 'active' whatever pg_ping says.
+sub _connection_state {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return 'active' if eval { $dbh->{pg_async_status} };
+    my $status = eval { $dbh->pg_ping };
+    return 'unknown' unless defined $status;
+    return {1 => 'idle', 2 => 'active', 3 => 'intrans', 4 => 'inerror'}->{$status} // 'unknown';
+}
+
+# Where a read guard may run: 'own' (an idle handle: the guard begins and
+# rolls back its own transaction) or 'host' (the host's healthy transaction,
+# or an AutoCommit => 0 handle DBD::Pg has not begun yet: a savepoint).
+# Anything else (a pending result, an aborted transaction, an unknown or
+# broken connection) is refused before a single statement is sent.
+sub _read_guard_scope {
+    my ($self) = @_;
+    my $state = $self->_connection_state;
+    my $auto_commit = eval { $self->{dbh}{AutoCommit} };
+    return $auto_commit ? 'own' : 'host' if $state eq 'idle' && defined $auto_commit;
+    return 'host' if $state eq 'intrans';
+    _refuse_connection_state($state);
+}
+
+sub _refuse_connection_state {
+    my ($state) = @_;
+    my %reason = (
+        active => 'the database connection is busy with another statement or a pending result',
+        inerror => 'the host transaction has already failed',
+    );
+    Selecto::Error->throw('transaction_state_unsafe',
+        ($reason{$state} // 'the database connection state is unknown')
+            . '; Selecto will not open a transaction or savepoint on it',
+        {state => exists($reason{$state}) ? $state : 'unknown'});
 }
 
 1;
@@ -1319,6 +1376,23 @@ driver's message: C<database_not_null_violation> (with the field when
 known), C<database_unique_violation> (with the key fields),
 C<database_foreign_key_violation> and C<database_check_violation>. Other
 failures become C<query_error>.
+
+=head1 TRANSACTION STATE
+
+Selecto opens a transaction or savepoint (a bounded stream, a savepoint
+query budget, a direct bounded read, a managed write) only on a connection
+whose state it can account for: idle (it then owns the transaction), or
+inside the host's healthy transaction (it then owns a uniquely named
+savepoint). A connection with the host's pending asynchronous result
+(C<pg_async>, before C<pg_result>), busy with another statement, inside an
+already aborted transaction, or in an unknown state is refused with
+C<transaction_state_unsafe> (details C<state>: C<active>, C<inerror> or
+C<unknown>) before anything is sent. Otherwise a rollback could discard the
+host's pending result and its transaction, and the host's next statement
+would autocommit. Checking costs one C<pg_ping> round trip where none was
+made before (a stream or a savepoint budget on an C<< AutoCommit => 0 >>
+handle). A bounded stream also refuses, after it opened, to roll back
+anything it cannot prove is its own; see L<Selecto::PostgreSQL::Stream>.
 
 =head1 SEE ALSO
 

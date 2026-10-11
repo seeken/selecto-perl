@@ -140,7 +140,15 @@ package RecordingDBH {
         my ($class, %options) = @_;
         return bless { AutoCommit => 1, events => [], answers => {}, %options }, $class;
     }
-    sub events { return [@{$_[0]{events}}]; }
+    # Savepoint names are unique per process; number them per handle in the
+    # order they appear, so a pair still has to name the same savepoint.
+    sub events {
+        my (%seen, $count);
+        return [map {
+            (my $event = $_) =~ s{\bselecto_write_\d+_\d+\b}{$seen{$&} //= 'selecto_write_' . ++$count}ge;
+            $event;
+        } @{$_[0]{events}}];
+    }
     sub begin_work {
         my ($self) = @_;
         push @{$self->{events}}, 'begin_work';

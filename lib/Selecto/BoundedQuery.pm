@@ -170,9 +170,10 @@ sub execute {
     # A result whose guard keeps it within one fetch batch buffers no more as a
     # plain statement than a cursor would: run it directly inside the host's
     # transaction, under a savepoint opened with its timeout and rolled back
-    # afterwards, so neither the timeout nor an error outlives it. Three round
-    # trips instead of a cursor's savepoint, declare, fetches, close and timeout
-    # restore.
+    # afterwards, so neither the timeout nor an error outlives it. Four round
+    # trips (the connection state check, savepoint with timeout, query,
+    # rollback) instead of a cursor's savepoint, declare, fetches, close and
+    # timeout restore.
     my $direct = $max_rows + 1 <= DIRECT_ROWS()
         && $adapter->can('bounded_direct_supported') && $adapter->bounded_direct_supported;
     my $ok = eval {

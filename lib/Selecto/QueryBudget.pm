@@ -3,7 +3,7 @@ package Selecto::QueryBudget;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(refaddr weaken);
+use Scalar::Util qw(blessed refaddr weaken);
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
 use Selecto::Error ();
 
@@ -52,6 +52,16 @@ sub begin {
         if $ACTIVE{$identity};
     Selecto::Error->throw('query_budget_unavailable', 'database handle requires recovery after a budget restore failure')
         if $dbh->{private_selecto_query_budget_poisoned};
+    # A savepoint budget is a read guard: it starts only on the host's healthy
+    # transaction, never on an aborted one or beside a pending result, and it
+    # refuses before it sends anything. Other PostgreSQL budgets still refuse
+    # a pending asynchronous result, which their statements would disturb.
+    if ($options{savepoint}) {
+        Selecto::Error->throw('invalid_query_budget', 'savepoint query budgets need an open transaction')
+            unless $adapter->_read_guard_scope eq 'host';
+    } elsif ($adapter->name eq 'postgresql' && $adapter->can('_refuse_pending_result')) {
+        $adapter->_refuse_pending_result;
+    }
     my $self = bless {dbh => $dbh, identity => $identity, deadline => _now() + $ms / 1000,
         closed => 0, restore => sub {}}, $class;
     $ACTIVE{$identity} = $self;
@@ -83,13 +93,26 @@ sub begin {
             # it in one more, which undoes the timeout and keeps an error (a timeout among
             # them) from aborting the host's transaction. Rolling back also undoes anything
             # run under the budget and frees its locks, so this is for reads only.
+            # The name is unique, so a cleanup can only ever roll back to this
+            # budget's own savepoint, and the budget counts as begun (its close
+            # rolls back) only once that savepoint exists.
             my $savepoint = 'selecto_budget_' . $$ . '_' . ++$SERIAL;
-            $self->{restore} = sub {
-                defined($dbh->do("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint"))
-                    or die 'query timeout restoration failed';
+            my $rollback = "ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint";
+            my $opened = eval {
+                defined($dbh->do("SAVEPOINT $savepoint; " . _transaction_timeout_sql(0 + $ms))) or die;
+                1;
             };
-            defined($dbh->do("SAVEPOINT $savepoint; " . _transaction_timeout_sql(0 + $ms)))
-                or die 'query timeout configuration failed';
+            if (!$opened) {
+                # The savepoint may exist with the timeout statement failed after
+                # it. Rolling back to it undoes only that; when it was never
+                # created the unique name matches nothing and the transaction
+                # stays as the failure left it.
+                eval { $dbh->do($rollback) };
+                die 'query timeout configuration failed';
+            }
+            $self->{restore} = sub {
+                defined($dbh->do($rollback)) or die 'query timeout restoration failed';
+            };
             $self->{rearm} = _transaction_rearm($dbh);
         } elsif ($name eq 'postgresql' && !$dbh->{AutoCommit}) {
             # Inside the host's transaction: SET LOCAL semantics, never the session
@@ -218,7 +241,17 @@ sub close {
     return;
 }
 
-sub DESTROY { my ($self) = @_; local $@; eval { $self->close } unless $self->{closed}; }
+# Destruction cannot raise: a failed restore is reported as a warning and
+# poisons the handle for later budgets, so it never looks clean.
+sub DESTROY {
+    my ($self) = @_;
+    return if $self->{closed};
+    local $@;
+    return if eval { $self->close; 1 };
+    my $error = $@;
+    warn 'Selecto query budget abandoned: '
+        . (blessed($error) && $error->can('message') ? $error->message : 'restore failed') . "\n";
+}
 1;
 
 __END__
@@ -242,7 +275,13 @@ a transaction, for reads only) opens a savepoint in the same round trip as the
 timeout, and C<close> rolls back to it and releases it in one more. That undoes
 the timeout and keeps an error, a timeout among them, from aborting the host's
 transaction. It also undoes anything run under the budget and frees its locks,
-so never use it around writes or locking reads.
+so never use it around writes or locking reads. Its savepoint name is
+unique, and it starts only inside the host's healthy transaction: an
+aborted transaction, a pending asynchronous result or an unknown connection
+state is refused with C<transaction_state_unsafe> before anything is sent
+(see L<Selecto::PostgreSQL/TRANSACTION STATE>), and outside a transaction
+with C<invalid_query_budget>. Other PostgreSQL budgets refuse a pending
+asynchronous result the same way.
 Keep it alive through execution and fetch, call C<check> between application
 operations, and call C<close> after closing result streams. Between rows of a
 bounded stream, C<< check(defer_rearm => 1) >> checks the wall deadline but
