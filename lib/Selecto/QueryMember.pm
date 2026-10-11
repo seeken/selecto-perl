@@ -264,16 +264,23 @@ sub bound_source_domain {
     my $root_tenant = $root->tenant_field;
     my $tenant = $options{tenant};
     my $prefix = $options{allow_prefix} ? $root->{_read_prefix} : undef;
-    return $source unless defined($required) || defined($tenant) || defined($prefix);
-    # On a two-column root (lesson 41a) the member's tenant column carries the
-    # conditions of the root column of its own name, never tenant_field's by
-    # position; matching neither root column, nothing is carried.
+    my $carry = $root->{_tenant_carry};
+    return $source unless defined($required) || defined($tenant) || defined($prefix) || $carry;
+    # In a tenant family (lessons 41a, 41b) the member's tenant column carries
+    # the conditions of the root column of its own name, never tenant_field's
+    # by position; matching no anchor of the root, nothing is carried.
+    my $family = $root->tenant_family;
     my $paired = $root_tenant;
-    my $scope = defined($root_tenant) ? $root->write_tenant_scope : undef;
-    if ($scope && defined($scope->{field}) && "$scope->{field}" ne "$root_tenant") {
-        $paired = grep({ $_ eq "$member_tenant" } "$root_tenant", "$scope->{field}") ? "$member_tenant" : undef;
+    if ($family) {
+        $paired = grep({ $_ eq "$member_tenant" } @{$root->tenant_anchors}) ? "$member_tenant" : undef;
     }
     my @carried;
+    # A root rebuilt at an untenanted retarget hop carries the original root's
+    # admitted tenant sets (lesson 41b) onto the member's tenant column.
+    if ($carry && (!$family || defined($carry->{field}) && $carry->{field} eq "$member_tenant")) {
+        push @carried, map { @$_ == 1 ? Selecto::Expression->eq("$member_tenant", $_->[0])
+            : Selecto::Expression->in("$member_tenant", [@$_]) } @{$carry->{sets}};
+    }
     if (defined($required) && defined($paired)) {
         my @conjuncts = $required->kind eq 'and' ? @{$required->arguments->[0]} : ($required);
         for my $conjunct (@conjuncts) {
@@ -289,6 +296,11 @@ sub bound_source_domain {
     unless (@carried) {
         return $source if defined($prefix) && defined($source->{_read_prefix})
             && "$source->{_read_prefix}" eq "$prefix";
+        # A retarget target tenanted on the family's site column is reached
+        # only through the context's by-name chain from the tenant-bound
+        # root (Selecto::SQL refuses an unchained one), so it is admitted.
+        return $source if $options{chained_site} && $family && $family->{root}
+            && "$member_tenant" eq $family->{site};
         Selecto::Error->throw(
             'missing_tenant_scope',
             ($options{label} // 'query source') . ' reads a tenant-scoped relation but the root tenant scope cannot be applied to it',
@@ -305,6 +317,34 @@ sub bound_source_domain {
     return $source unless @carried;
     my $carried = @carried == 1 ? $carried[0] : Selecto::Expression->all(@carried);
     return $source->with_required_predicate(defined($existing) ? Selecto::Expression->all($existing, $carried) : $carried);
+}
+
+# The tenant sets a read domain admits (lessons 41b, 41f): each top-level
+# positive conjunct (eq or IN over literals) of its required predicate on its
+# own tenant_field, and the sets a root rebuilt at an untenanted retarget hop
+# carries, as [[field, [values]], ...]. The flag says whether the domain is
+# bounded at all (a required predicate, or a carried boundary).
+sub admitted_tenant_sets {
+    my ($class, $domain) = @_;
+    my @sets;
+    my $required = $domain->required_predicate;
+    if (defined(my $field = $domain->tenant_field)) {
+        require Selecto::Engine;
+        my @conjuncts = defined($required) ? ($required) : ();
+        while (my $conjunct = shift @conjuncts) {
+            next unless Scalar::Util::blessed($conjunct) && $conjunct->isa('Selecto::Expression');
+            if ($conjunct->kind eq 'and') { push @conjuncts, @{$conjunct->arguments->[0] // []}; next }
+            next unless ($conjunct->kind eq 'eq' || $conjunct->kind eq 'in')
+                && Selecto::Engine::_is_tenant_comparison($conjunct, "$field");
+            my $value = $conjunct->arguments->[1];
+            push @sets, ["$field", $conjunct->kind eq 'eq' ? [$value->arguments->[0]] : [@$value]];
+        }
+    }
+    my $carry = $domain->{_tenant_carry};
+    push @sets, map { [$carry->{field}, [@$_]] } @{$carry->{sets}} if $carry;
+    # A root without a tenant field of its own (a shared root) has no tenant
+    # boundary to carry, whatever else its required predicate bounds.
+    return (\@sets, defined($domain->tenant_field) && defined($required) || $carry ? 1 : 0);
 }
 
 # Copies an expression tree, renaming field references by $map. Dies when the
