@@ -17,6 +17,11 @@ even when a generated identity remains unavailable to stored rules. ACTION_INPUT
 declared action defaults; an authored system expression is unknown until the
 host can establish its actual value. Graph INPUT applies to each node's own
 submitted assignments. The prospective child collection belongs to CANDIDATE.
+INPUT and ACTION_INPUT bindings run in sorted-id order. A binding whose rule
+or condition reads another root path (`value.compare_path`) is tested again,
+without normalizers, against the fully normalized submission, so a
+confirmation cannot pass against a value that a later binding normalizes. A
+binding that reads only its own path keeps the value it saw at its position.
 
 Applicable INPUT rules do not require a stored candidate. Once submitted
 validation succeeds, ordinary writes, batches, graphs and both native SQLite

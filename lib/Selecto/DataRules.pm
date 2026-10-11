@@ -216,6 +216,22 @@ sub _recheck {
     my ($self, %request) = @_;
     return $self->_evaluate_request(\%request, 1);
 }
+# Submitted bindings run in sorted-id order, so a test reading another root
+# path (value.compare_path) may have seen that field before its own
+# normalizer ran. Re-test only those bindings, without normalizers, against the
+# final normalized subject. A binding reading only its own path keeps the
+# value it saw at its position in the order.
+sub _recheck_related {
+    my ($self, %request) = @_;
+    return $self->_evaluate_request(\%request, 1, 1);
+}
+sub _reads_related {
+    my ($self, $binding) = @_;
+    for my $prepared ($self->{definitions}{$binding->{rule}{id}}{prepared}, $binding->{prepared_condition} // ()) {
+        return 1 if grep { ref($_->[0]) eq 'HASH' && $_->[0]{root} } @{Selecto::RuleTest->dependencies($prepared)};
+    }
+    return 0;
+}
 sub _with_native_upsert_values {
     _fail('required_data_rule_pending', 'native decimal scope requires protected rule authority')
         unless caller eq 'Selecto::WriteRules';
@@ -254,7 +270,7 @@ sub _preflight_reused_input {
     }, limits => $limits);
 }
 sub _evaluate_request {
-    my ($self, $request, $test_only) = @_;
+    my ($self, $request, $test_only, $related_only) = @_;
     my %request = %$request;
     my $stage = $request{stage} // '';
     _fail('invalid_data_rules_request', 'invalid rule evaluation stage or operation')
@@ -283,6 +299,7 @@ sub _evaluate_request {
     for my $id (sort keys %{$self->{bindings}}) {
         my $binding = $self->{bindings}{$id};
         next unless _applies($binding, \%request);
+        next if $related_only && !$self->_reads_related($binding);
         my $required = $binding->{enforcement} ne 'advisory';
         my $path = $binding->{subject}{path};
         my $unavailable = ($stage eq 'transaction' || $stage eq 'evidence')

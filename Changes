@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: INPUT and ACTION_INPUT bindings whose rule or condition
+      reads another root path (value.compare_path) are re-tested, without
+      normalizers, against the fully normalized submission. Bindings run in
+      sorted-id order, so a confirmation binding could pass against a
+      related field before that field's own normalizer ran (reproduced:
+      confirm "A@X" passed eq ['email'] and email was stored as "a@x").
+      The recheck covers native writes, previews, portable compilation and
+      action plans, and refuses with data_rule_failed before DML. Bindings
+      reading only their own path keep their ordered semantics.
     - SECURITY: a protected SQLite UPSERT refuses a connection with
       PRAGMA read_uncommitted on (required_data_rule_pending, reason
       read_uncommitted_isolation). On a shared cache such a connection
