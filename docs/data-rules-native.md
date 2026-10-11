@@ -174,6 +174,10 @@ update mask; an explicit native mask cannot widen. Choice membership uses only
 actual persisted fields and the complete final canonical root row. Compilation
 defers these callbacks until native branch projection. A no-op consumes no
 unused choice provider, and required stored failures prevent external callbacks.
+Every dispatch path (write, preview, batch and graph) refuses a genuine
+protected portable origin with `compiled_upsert_mismatch` on a host whose
+domain, trusted context or stored UPSERT rules differ from the compiler's,
+including a host with no stored rules, so deferred membership is never skipped.
 Protected same-table multi-command plans still require a whole-plan independence
 proof and remain pending.
 External evidence requires its exact

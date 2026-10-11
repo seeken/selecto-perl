@@ -955,6 +955,7 @@ sub governed_write {
         'write relation must be the domain table',
         { relation => $command->relation, expected => $self->{domain}->table },
     ) unless $command->relation eq $self->{domain}->table;
+    Selecto::Write::PortableCommand->_require_protected_upsert_host($command, $self);
     $command = $self->_materialize_write_context($command);
     $command = $self->_normalize_write_command($command);
     my $required = $self->required_write_guard($command->operation, %details);

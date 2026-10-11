@@ -180,4 +180,40 @@ subtest 'native DO NOTHING retains caller cardinality and transaction state' => 
     $db->disconnect;
 };
 
+subtest 'a host without the stored rules cannot skip deferred choices' => sub {
+    plan skip_all => 'DBD::SQLite is optional' unless eval { require DBI; require DBD::SQLite; 1 };
+    my $db = DBI->connect('dbi:SQLite:dbname=:memory:', '', '', {RaiseError => 1, PrintError => 0});
+    $db->do('PRAGMA temp_store=MEMORY');
+    $db->do(q{CREATE TABLE items(id INTEGER PRIMARY KEY,name TEXT,code TEXT,added TEXT,secret TEXT)});
+    my @hooks; $db->sqlite_update_hook(sub { push @hooks, [@_] });
+    my $calls = 0; my $verdict = 'invalid';
+    my $resolver = sub { ++$calls; $verdict eq 'valid' ? Selecto::Domain::Choices->valid('ok')
+        : Selecto::Domain::Choices->invalid('forbidden') };
+    my $origin = choices();
+    my $plain = choices(); delete $plain->{rules};
+    my $advisory = choices(); $advisory->{rules}{bindings}{name}{subject}{scope} = 'input';
+    my $build = sub { Selecto::Engine->new(domain => Selecto::Domain->parse($_[0]), adapter => Selecto::SQLite->new(dbh => $db)) };
+    my $fresh = sub { compile($origin, {id => $_[0], name => 'forbidden'}, choice_membership_resolver => $resolver) };
+    for my $case (['no rules', $plain], ['INPUT-only rules', $advisory]) {
+        my ($label, $raw) = @$case; my $host = $build->($raw);
+        is(error(sub { $host->execute_write($fresh->(1)) }), 'compiled_upsert_mismatch', "$label: execution refuses the origin");
+        is(error(sub { $host->preview_write($fresh->(1)) }), 'compiled_upsert_mismatch', "$label: preview refuses the origin");
+        is(error(sub { $host->execute_batch(Selecto::Write::Batch->new($fresh->(1))) }), 'compiled_upsert_mismatch',
+            "$label: batch refuses the origin");
+    }
+    is($calls, 0, 'refused hosts never consult the deferred resolver');
+    is_deeply(\@hooks, [], 'refused hosts mutate no row');
+    is_deeply($db->selectall_arrayref('SELECT * FROM items'), [], 'no forbidden choice was stored');
+    my $host = $build->($origin);
+    is(error(sub { $host->execute_write($fresh->(2)) }), 'choice_membership_invalid', 'the originating host still checks membership');
+    $verdict = 'valid';
+    is(error(sub { $host->execute_write($fresh->(2)) }), undef, 'the originating host admits a valid choice');
+    is_deeply($db->selectall_arrayref('SELECT id,name FROM items'), [[2, 'forbidden']], 'positive control stores its row');
+    my $ordinary = Selecto::Write::Command->new(operation => 'upsert', relation => 'items', assignments => {id => 3, added => 'a'},
+        metadata => {conflict_target => ['id'], upsert_update_fields => ['added']});
+    my $ordinary_error = error(sub { $build->($plain)->execute_write($ordinary) });
+    is($ordinary_error, undef, 'native commands without an origin are unaffected') or diag($ordinary_error);
+    $db->disconnect;
+};
+
 done_testing;
