@@ -528,7 +528,9 @@ responses.
 Declare C<< writes.scope.tenant => {field => ..., satisfied_by => ['trusted_context']} >>
 and construct the engine with C<< scope => {tenant => $tenant} >>. The
 tenant is then added to every update and delete predicate and assigned on
-every insert, and commands naming another tenant fail. The full rules are in
+every insert, and commands naming another tenant fail. An engine tenant
+bounds the writes of a domain with a C<source.tenant_field> the same way
+even without C<writes.scope.tenant>. The full rules are in
 L<Selecto::Engine/TENANT SCOPE>.
 
 =head1 REQUIRED PREDICATES

@@ -191,7 +191,7 @@ sub apply {
         for my $field (sort keys %$assignments) {
             my $field_spec = $field_specs->{$field};
             next unless ref($field_spec) eq 'HASH';
-            next if defined($options{trusted_field}) && $field eq $options{trusted_field};
+            next if grep { $field eq $_ } _trusted_fields($options{trusted_field});
             _fail('write_field_not_writable', 'server-managed fields cannot be assigned', field => $field, reason => 'server_managed')
                 if _true($field_spec->{server_managed});
             if ($operation eq 'update' && _true($field_spec->{immutable})) {
@@ -209,6 +209,12 @@ sub apply {
             unless defined($command->predicate) || defined($command->scope_predicate) || defined($command->query_enforcement);
     }
     return $command->with_metadata($metadata);
+}
+
+# The fields the engine assigns from trusted scope: one name or a list.
+sub _trusted_fields {
+    my ($trusted) = @_;
+    return grep { defined } (ref($trusted) eq 'ARRAY' ? @$trusted : ($trusted));
 }
 
 1;

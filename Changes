@@ -1,6 +1,34 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY, BREAKING: a trusted engine tenant limits every write of a
+      domain that declares source.tenant_field, with or without
+      writes.scope.tenant (lesson 47). Before, such a domain without
+      writes.scope.tenant was written unbounded: under engine tenant 7 an
+      update or delete with a required or host (write_context
+      required_filters) tenant_id = 8, a tenant_id IN (7, 8), or only a
+      caller filter id = 2 changed tenant 8's rows, through Engine writes,
+      the public API write route and graph roots. Now updates, deletes,
+      upserts, batch members, graph roots and children, owned-sync
+      cleanup, actions and query-enforced writes AND tenant_id = 7 into
+      their scope; inserts and upserts carry it (filled when absent,
+      tenant_mismatch when another value is given or an update re-tags a
+      row); an upsert must resolve conflicts on a target including
+      tenant_id (tenant_scope_conflict_target). A required, host, caller
+      or query-evidence predicate whose top-level tenant_id conjunct
+      excludes the engine tenant is refused with tenant_mismatch before
+      any DML, also on a domain whose writes.scope.tenant names that column
+      (it matched no row before); an IN list admitting it is intersected.
+      Host-visible: the public write handler accepts an engine tenant as
+      the write boundary of such a domain (it was missing_tenant_scope),
+      and an engine-tenant write that used to reach other tenants' rows
+      now affects only its own. Every update of a root tenant column,
+      the writes.scope.tenant column included, must keep a value its
+      required and host conjuncts admit. A graph child binds the engine
+      tenant only onto a column pairing with the root's. A domain whose
+      writes.scope.tenant names the tenant column is otherwise unchanged,
+      and a public write with no tenant boundary is still refused with
+      missing_tenant_scope.
     - SECURITY: a plain join path past an untenanted hop keeps the root's
       admitted tenant set (lesson 41f). root (tenant_id) -> shared bin ->
       tenant notes, with the root bounded only by a required predicate

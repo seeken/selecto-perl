@@ -555,9 +555,7 @@ sub _admit_graph {
     local $HYDRATION = $HYDRATION // {loaded => 0};
     my @nodes = @{$graph->nodes};
     my %nodes = map { ($_->{id} => $_) } @nodes;
-    my %engines = map { ($_ => ref($root)->new(domain => $contexts->{$_}{domain},
-        adapter => $root->adapter, scope => $root->scope, write_context => $root->write_context,
-        limits => $root->limits)) } keys %$contexts;
+    my %engines = map { ($_ => $root->_graph_engine($contexts->{$_}{domain})) } keys %$contexts;
     my (%children, %edges, %sets, %values);
     for my $node (@nodes[1 .. $#nodes]) {
         _pending('protected graph candidates require one ownership binding') unless @{$node->{bindings}} == 1;
@@ -604,8 +602,7 @@ sub _admit_graph {
             my $edge = $relationships->{$name};
             _pending('collection rules require an authored child domain') unless ref($edge->{domain}) eq 'HASH';
             my $domain = _relationship_domain($edge->{domain});
-            my $child_engine = ref($root)->new(domain => $domain, adapter => $root->adapter,
-                scope => $root->scope, write_context => $root->write_context, limits => $root->limits);
+            my $child_engine = $root->_graph_engine($domain);
             my $parent_key = $edge->{parent_key} // $engine->domain->primary_key;
             my $child_key = $edge->{child_key} // $edge->{foreign_key};
             _pending('stored collection ownership key cannot be reassigned')
