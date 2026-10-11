@@ -151,6 +151,10 @@ API keeps requiring a non-empty `upsert_update_fields`.
 Protected upsert receipts are private and expire when the transaction callback
 exits. They bind the actual adapter, connection, command, context, arbiter,
 schema and prior physical row, and are rechecked immediately before dispatch.
+The engine opens the candidate scope with its live trusted write context. A
+receipt is minted only when its request context matches that live context, and
+the dispatch recheck compares the receipt with the context of the scope that is
+running then, so a nested scope with another context cannot dispatch it.
 The strategy reports serializable snapshot protection. It does not claim a
 write lock for caller-owned deferred transactions. Native stale-snapshot write
 upgrades retain SQLite's failure behavior. That claim needs SQLite's locking

@@ -69,6 +69,32 @@ sub memory {
 my @ordinary = ('CREATE TABLE items(id INTEGER PRIMARY KEY,name TEXT,secret TEXT DEFAULT \'default secret\')',
     q{INSERT INTO items VALUES(1,'before','stored secret'),(2,'sentinel','private')});
 
+subtest 'receipts are rechecked against the live scope context at dispatch' => sub {
+    memory(\@ordinary, sub {
+        my ($a, $db, $hooks) = @_;
+        my $tenant = {tenant_id => 7}; my $other = {tenant_id => 8};
+        my $cmd = command({id => 1, name => 'after'});
+        $a->rule_upsert_scope(sub {
+            pending('projection under another context', sub {
+                $a->rule_upsert_candidate($cmd, request([], context => $other)) }, 'receipt_context_mismatch');
+            my $state = $a->rule_upsert_candidate($cmd, request([], context => $tenant));
+            ok($a->rule_upsert_validate_command($cmd), 'receipt validates under its own live context');
+            $a->rule_upsert_scope(sub {
+                pending('nested scope with another context', sub { $a->rule_upsert_validate_command($cmd) },
+                    'receipt_context_mismatch');
+                pending('nested dispatch with another context', sub { $a->execute_write_unsafe($cmd) },
+                    'receipt_context_mismatch');
+            }, context => $other);
+            ok($a->rule_upsert_validate_command($cmd), 'leaving the nested scope restores the live context');
+            $a->rule_upsert_scope(sub {
+                ok($a->rule_upsert_validate_command($cmd), 'a nested scope with the same context keeps the receipt');
+            }, context => {tenant_id => 7});
+        }, context => $tenant);
+        pending('untrusted scope option', sub { $a->rule_upsert_scope(sub { 1 }, actor => 'x') });
+        is(scalar @$hooks, 0, 'refused dispatch performed no business DML');
+    });
+};
+
 subtest 'capability report requires authentic native DBI support' => sub {
     {
         package UpsertForgedNativeHandle;

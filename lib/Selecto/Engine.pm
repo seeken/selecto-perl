@@ -667,7 +667,7 @@ sub _rules_transaction {
     Selecto::Error->throw('required_data_rule_pending', 'adapter cannot protect stored candidates')
         unless $self->{adapter}->can('execute_transaction');
     my $protected_work = sub {
-        return $self->{adapter}->rule_upsert_scope($work)
+        return $self->{adapter}->rule_upsert_scope($work, context => $self->write_context)
             if $self->{adapter}->can('rule_upsert_scope');
         return $work->();
     };

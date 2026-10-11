@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Protected SQLite UPSERT receipts are rechecked against the live
+      trusted write context at dispatch. The engine now opens the candidate
+      scope with its write context; projection refuses a request under a
+      different context and the dispatch recheck compares the receipt with
+      the running scope's context (a nested scope swaps it in and restores
+      it), refusing with required_data_rule_pending, reason
+      receipt_context_mismatch. Previously dispatch compared the receipt's
+      recorded context with itself, contrary to the docs.
     - An empty UPSERT update mask compiles to DO NOTHING only on the
       protected SQLite path (a SQLite engine whose domain has stored UPSERT
       rules, dispatched with its private candidate receipt). Since the
