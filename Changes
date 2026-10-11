@@ -1,6 +1,20 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: on a two-column root (writes.scope.tenant on one column,
+      source.tenant_field on another) reads pair tenant columns by name,
+      never by position (lesson 41a). A join to a target whose tenant_field
+      names the write-scope column (site_id) inferred
+      s0.tenant_id = target.site_id and the lesson 41 pairing repeated it;
+      it now pairs s0.site_id = target.site_id, and a target tenant column
+      matching neither root column is refused with invalid_domain (details
+      code foreign_key_tenant_scope_undeclared). The engine tenant bounds
+      only the write-scope column on reads too, as on writes: before, a
+      read bound tenant_field to the engine tenant, so a site 7 engine read
+      the rows whose tenant_id was 7 (or refused with
+      tenant_scope_ambiguous beside a required tenant_id predicate). Query
+      members, inline sources and retarget targets carry the root column
+      of their own tenant column's name.
     - SECURITY: every query source over a tenant-scoped relation carries the
       root's trusted tenant boundary or is refused with missing_tenant_scope
       (lesson 39). Inline sources built with with_cte, with_recursive_cte,

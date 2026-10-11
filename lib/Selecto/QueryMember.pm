@@ -265,11 +265,19 @@ sub bound_source_domain {
     my $tenant = $options{tenant};
     my $prefix = $options{allow_prefix} ? $root->{_read_prefix} : undef;
     return $source unless defined($required) || defined($tenant) || defined($prefix);
+    # On a two-column root (lesson 41a) the member's tenant column carries the
+    # conditions of the root column of its own name, never tenant_field's by
+    # position; matching neither root column, nothing is carried.
+    my $paired = $root_tenant;
+    my $scope = defined($root_tenant) ? $root->write_tenant_scope : undef;
+    if ($scope && defined($scope->{field}) && "$scope->{field}" ne "$root_tenant") {
+        $paired = grep({ $_ eq "$member_tenant" } "$root_tenant", "$scope->{field}") ? "$member_tenant" : undef;
+    }
     my @carried;
-    if (defined($required) && defined($root_tenant)) {
+    if (defined($required) && defined($paired)) {
         my @conjuncts = $required->kind eq 'and' ? @{$required->arguments->[0]} : ($required);
         for my $conjunct (@conjuncts) {
-            my $rewritten = eval { _rename_fields($conjunct, {"$root_tenant" => "$member_tenant"}) };
+            my $rewritten = eval { _rename_fields($conjunct, {"$paired" => "$member_tenant"}) };
             push @carried, $rewritten if $rewritten;
         }
     }
