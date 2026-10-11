@@ -104,9 +104,9 @@ for my $backend (@backends) {
             'a required predicate agreeing with the engine tenant');
         is_deeply($rows->($engine->('site_id', required => [['tenant_id', ['in', [7, 8]]]]), 'id'), [[1], [2]],
             'a wider required predicate is intersected with the engine tenant');
-        like(code_of(sub { my $e = Selecto::Engine->new(domain => $domain->('site_id')->with_required_predicate(
+        is(code_of(sub { my $e = Selecto::Engine->new(domain => $domain->('site_id')->with_required_predicate(
                 Selecto::Expression->eq('tenant_id', 8)), adapter => $adapter, scope => {tenant => 7}); $rows->($e, 'id') }),
-            qr/\Atenant_(?:mismatch|scope_ambiguous)\z/, 'a required predicate excluding the engine tenant is refused');
+            'tenant_mismatch', 'a required predicate excluding the engine tenant is refused');
         is_deeply($rows->($engine->('site_id', required => [['site_id', 6]]), 'id', 'account.name'), [[2, 'site 6']],
             'a required site_id predicate narrows the tenant-bound rows');
 

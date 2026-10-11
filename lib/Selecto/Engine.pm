@@ -242,6 +242,7 @@ sub require_tenant_filter {
     $self->{domain}->resolve($filter->[0]);
     my $filters = Selecto::Tenant::Context->unique_filters([@{$self->{tenant_required_filters} // []}, $filter]);
     my $copy = bless {%$self, tenant_required_filters => $filters}, ref($self);
+    $copy->_assert_engine_tenant_agrees;
     delete $copy->{_read_domain};
     return $seal_domain->(Selecto::QueryBinding->inherit_engine($self, $copy, flat_input => 1));
 }
@@ -309,8 +310,25 @@ sub _ensure_write_context {
 }
 sub _ensure_read_scope {
     my ($self) = @_;
+    $self->_assert_engine_tenant_agrees;
     my $report = $self->validate_tenant_scope;
     Selecto::Error->throw($report->{error}{code}, 'required read tenant scope is missing or inconsistent', $report->{error}) unless $report->{valid};
+    return;
+}
+# Lesson 43: every read of a tenant_field domain under a trusted engine
+# tenant is bound to it, intersected with the required predicate and any
+# required tenant filter. One whose tenant condition excludes the engine
+# tenant is refused with tenant_mismatch before any read path runs, rather
+# than reported as an ambiguous scope or read as an empty result.
+sub _assert_engine_tenant_agrees {
+    my ($self) = @_;
+    my $tenant = $self->{scope}{tenant};
+    my $field = $self->{domain}->tenant_field;
+    return unless defined($tenant) && defined($field);
+    Selecto::Error->throw('tenant_mismatch', 'required predicate excludes the engine tenant', {tenant_field => "$field"})
+        if _excludes_tenant($self->{domain}->required_predicate, $field, $tenant)
+            || grep { $_->[0] eq "$field" && _excludes_tenant(Selecto::Expression->eq(@$_), $field, $tenant) }
+                @{$self->{tenant_required_filters} // []};
     return;
 }
 sub _has_read_tenant_policy {
