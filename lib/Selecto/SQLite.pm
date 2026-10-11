@@ -11,14 +11,16 @@ use Selecto::SQLite::UpsertCandidate ();
 
 sub rule_upsert_scope {
     Selecto::SQLite::UpsertCandidate::_check_args(@_);
-    my ($self, $work) = @_;
+    my ($self, $work, %options) = @_;
     Selecto::Error->throw('required_data_rule_pending', 'SQLite candidate scope requires a callback')
         unless ref($work) eq 'CODE';
+    Selecto::Error->throw('required_data_rule_pending', 'SQLite candidate scope accepts only a trusted context')
+        if grep { $_ ne 'context' } keys %options;
     # Existing compiler/test providers can still serve ordinary stored-rule
     # requests. Native UPSERT projection separately requires the real scope.
     my $native = Selecto::SQLite::UpsertCandidate::_native_handle($self->dbh);
     return $work->() unless $native;
-    return Selecto::SQLite::UpsertCandidate->scope($self, $work);
+    return Selecto::SQLite::UpsertCandidate->scope($self, $work, $options{context});
 }
 sub rule_upsert_candidate {
     Selecto::SQLite::UpsertCandidate::_check_args(@_);

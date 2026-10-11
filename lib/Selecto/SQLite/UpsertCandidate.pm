@@ -94,18 +94,34 @@ sub _isolated {
 # The engine opens the real adapter transaction before entering this scope.
 # Registry lifetime is lexical: raw BEGIN/COMMIT state or serialized metadata
 # cannot recreate an expired receipt. Nested adapter calls reuse the registry.
+# The scope also carries the live trusted write context of the engine whose
+# transaction is running. Receipts are minted only under a matching context
+# and every dispatch recheck compares the receipt with the live one, so a
+# receipt cannot be dispatched by a nested engine with another context.
 sub scope {
     &_check_args;
-    my ($class, $adapter, $work) = @_;
+    my ($class, $adapter, $work, $context) = @_;
     _pending('invalid_scope_callback') unless ref($work) eq 'CODE';
+    _pending('invalid_scope_context') unless !defined($context) || ref($context) eq 'HASH' && !defined(tied(%$context));
+    $context = _plain($context // {});
     my $dbh = _dbh($adapter);
-    return $work->() if $SCOPES{$adapter} && _scope($adapter);
+    if ($SCOPES{$adapter} && _scope($adapter)) {
+        my $active = $SCOPES{$adapter};
+        my @previous = @{$active}{qw(context context_identity)};
+        @{$active}{qw(context context_identity)} = ($context, _identity($context));
+        my $restore = bless {finish => sub { @{$active}{qw(context context_identity)} = @previous }},
+            'Selecto::SQLite::UpsertCandidate::_Scope';
+        my $want = wantarray;
+        return $work->() unless defined $want;
+        return $want ? $work->() : scalar $work->();
+    }
     # DBI AutoCommit=>0 transactions begin lazily, before a plain statement.
     _rows($adapter, 'SELECT 1', [], 1);
     _pending('native_transaction_required') if $dbh->sqlite_get_autocommit;
     _isolated($adapter);
     my ($outer, $inner) = DBI::_handles($dbh);
-    my $scope = {dbh => $dbh, inner => $inner, active => 1, subjects => {}, rows => {}};
+    my $scope = {dbh => $dbh, inner => $inner, active => 1, subjects => {}, rows => {},
+        context => $context, context_identity => _identity($context)};
     $SCOPES{$adapter} = $scope;
     my $guard = bless {finish => sub {
         $scope->{active} = 0;
@@ -137,6 +153,7 @@ sub project {
         && keys(%{$data->{field_types}}) && keys(%{$data->{field_types}}) <= 512
         && ref($data->{context}) eq 'HASH';
     my $scope = _scope($adapter);
+    _pending('receipt_context_mismatch') unless _identity($data->{context}) eq $scope->{context_identity};
     my $previous = _prior($scope, $subject, $request->{prior}, $data->{context});
     my ($facts, $inserted, $selection, $values, $prior_values, $effect);
     my $ok = eval {
@@ -212,7 +229,9 @@ my $command_entry = sub {
     my $entry = $RECEIPTS{$receipt};
     _pending('receipt_mismatch') unless $entry && refaddr($entry->{scope}) == refaddr($scope)
         && refaddr($entry->{adapter}) == refaddr($adapter) && $entry->{command} eq _identity($command);
-    _prior($scope, $entry->{subject}, $receipt, $entry->{context});
+    # Compare the receipt with the live context of the running scope, not
+    # with the context the receipt itself recorded.
+    _prior($scope, $entry->{subject}, $receipt, $scope->{context});
     my $facts = _schema($adapter, $command, $entry->{request});
     _pending('schema_changed') unless $facts->{schema_identity} eq $entry->{schema_identity}
         && $facts->{schema_version} == $entry->{schema_version};
