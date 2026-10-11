@@ -272,6 +272,7 @@ sub _compile_single {
                     $self->_qualified($bridge_alias, $through->{through_scope_key}) . ' = ' .
                     $self->_qualified($target_alias, $through->{target_scope_key});
             }
+            push @bridge_on, $self->_tenant_pair_sql($association, $parent_alias, $target_alias);
             push @joins,
                 $keyword . ' (' . $self->_physical_source_sql($through->{table}) .
                 ' AS ' . $self->quote_identifier($bridge_alias) .
@@ -311,6 +312,7 @@ sub _compile_single {
                     $self->_qualified($parent_alias, $association->source_scope_key) . ' = ' .
                     $self->_qualified($lookup_alias, $association->target_scope_key);
             }
+            push @target_on, $self->_tenant_pair_sql($association, $parent_alias, $lookup_alias);
             if ($lateral_lookup) {
                 # OFFSET 0 keeps PostgreSQL from flattening this correlated
                 # lookup into a join plan that repeatedly scans the relation.
@@ -1836,12 +1838,14 @@ sub _compile_related_collection_at {
         push @predicates, $self->_constant_join_predicates(
             $bridge_alias, $through->{where}, $params
         );
+        push @predicates, $self->_tenant_pair_sql($association, $parent_alias, $alias);
         $from = "$bridge_table AS $quoted_bridge_alias INNER JOIN $table AS $quoted_alias ON " .
             join(' AND ', @target_on);
     } else {
         push @predicates, $self->_constant_join_predicates(
             $alias, $association->where, $params
         );
+        push @predicates, $self->_tenant_pair_sql($association, $parent_alias, $alias);
     }
     my $filters = $options->{filters} // [];
     Selecto::Error->throw('invalid_query', 'related collection filters are invalid')
@@ -2178,6 +2182,7 @@ sub _compile_computed_field {
     push @predicates, $self->_constant_join_predicates(
         $alias, $association->where, $params
     );
+    push @predicates, $self->_tenant_pair_sql($association, $self->_root_alias, $alias);
     return 'EXISTS (SELECT 1 FROM ' . $self->_association_source_sql($association) .
         ' AS ' . $self->quote_identifier($alias) . ' WHERE ' .
         join(' AND ', @predicates) . ')';
@@ -2382,6 +2387,21 @@ sub _join_target_key {
         unless $cast eq 'string';
     return "CAST($sql AS VARCHAR)";
 }
+# Lesson 41: a join between two relations that both declare tenant_field
+# pairs their tenant fields, even when authored scope keys pair another
+# column or the join runs through a bridge. An authored pair that already is
+# that tenant pair is not repeated.
+sub _tenant_pair_sql {
+    my ($self, $association, $parent_alias, $target_alias) = @_;
+    my ($source, $target) = ($association->source_tenant_field, $association->target_tenant_field);
+    return () unless defined($source) && defined($target);
+    my $authored = $association->through
+        // {source_scope_key => $association->source_scope_key, target_scope_key => $association->target_scope_key};
+    return () if defined($authored->{source_scope_key}) && defined($authored->{target_scope_key})
+        && $authored->{source_scope_key} eq $source && $authored->{target_scope_key} eq $target;
+    return $self->_qualified($parent_alias, $source) . ' = ' . $self->_qualified($target_alias, $target);
+}
+
 sub _constant_join_predicates {
     my ($self, $alias, $where, $params) = @_;
     return () unless ref($where) eq 'HASH' && keys %$where;
