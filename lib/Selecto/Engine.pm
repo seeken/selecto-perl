@@ -1269,11 +1269,22 @@ sub _foreign_key_guards {
         ) unless ref($target) eq 'HASH'
             && grep({ defined($target->{$_}) && !ref($target->{$_}) && "$target->{$_}" =~ /\A[A-Za-z_][A-Za-z0-9_.]*\z/ }
                 qw(relation field)) == 2;
-        push @candidates, {
+        my $candidate = {
             field => $field, relation => "$target->{relation}", target_field => "$target->{field}", declared => 1,
             tenancy => _declared_tenancy($references, $target),
             context_owned => ref($spec->{source}) ? 1 : 0,
         };
+        # A foreign key that records no tenancy of its own does not drop the
+        # tenancy an association on the same owner key records (item 34):
+        # its context-owned existence-only exemption applies only when
+        # nothing declares the target's tenancy.
+        if ($candidate->{tenancy}[0] eq 'undeclared') {
+            my ($association) = grep { $_->{owner_key} eq $field && $_->{table} eq $candidate->{relation} }
+                _guarded_associations($references);
+            my $tenancy = $association ? _association_tenancy($references, $association) : undef;
+            @{$candidate}{qw(tenancy association)} = ($tenancy, $association) if $tenancy && $tenancy->[0] eq 'tenant';
+        }
+        push @candidates, $candidate;
     }
     for my $association (_guarded_associations($references)) {
         $work->consume_count('max_expression_nodes',1,label=>'foreign-key work');
