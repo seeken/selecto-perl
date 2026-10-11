@@ -1,6 +1,25 @@
 Revision history for Selecto
 
 Unreleased
+    - BEHAVIOUR: on a two-column root (source.tenant_field tenant_id,
+      writes.scope.tenant site_id) the engine tenant bounds reads on the
+      tenant_field column only (lesson 41c, reversing that part of 41a).
+      The root binds tenant_id to the engine tenant, a relation whose tenant
+      column is tenant_id pairs s0.tenant_id and so carries that bound, and
+      a relation whose tenant column is site_id is never bound to the
+      engine value: it pairs s0.site_id by name with the tenant-bound root
+      rows, returning the caller's own site rows. Before (since 41a) a
+      site 7 engine read bound site_id = 7 on reads and ignored tenant_id,
+      so a tenant 7 engine read returned another tenant's rows whose
+      site_id was 7. A required predicate on tenant_id is intersected with
+      the engine tenant, and one excluding it is refused. A query member,
+      inline source or retarget target over a site_id relation carries
+      only a site_id bound of the root's required predicate, so with none
+      it is refused with missing_tenant_scope (also when the domain is
+      parsed: the write scope is now known before members are validated,
+      where it had paired positionally). By-name pairing and the
+      invalid_domain refusal of a target tenant column matching neither
+      root column are kept, and writes still bind the write-scope column.
     - SECURITY: the engine tenant survives domain rebuilds (lesson 42a).
       Multi-hop joins and retargets from a shared root through a shared
       middle hop (products -> categories -> notes), engine copies and
