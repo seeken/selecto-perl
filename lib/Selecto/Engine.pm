@@ -518,9 +518,8 @@ sub read_domain {
 
 # The tenant boundary public surfaces (the API write and query handlers,
 # canned pages, co-domain lookups) require on a tenant_field domain. Either the
-# engine holds a trusted tenant (for writes, on the field writes.scope.tenant
-# declares, since execution applies it there), or the trusted host scope has a
-# positive tenant conjunct: the required predicate ANDed with any host
+# engine holds a trusted tenant (which every write binds on tenant_field,
+# lesson 47), or the trusted host scope has a positive tenant conjunct: the required predicate ANDed with any host
 # predicate the surface accepts. Any other host predicate, such as a status
 # filter, is not a boundary. Engine::all itself stays available for trusted
 # host reads that deliberately span tenants.
@@ -532,6 +531,15 @@ sub assert_tenant_boundary {
         unless $access eq 'read' || $access eq 'write';
     my $field = $self->{domain}->tenant_field;
     return $self unless defined $field;
+    my $column = $self->_write_tenant_column;
+    if ($access eq 'write' && defined($self->{scope}{tenant}) && defined($column)) {
+        # Lesson 47: an engine tenant bounds every write; a host boundary
+        # that excludes it is a host error, refused before any write.
+        Selecto::Error->throw('tenant_mismatch', 'required predicate excludes the engine tenant',
+            {tenant_field => "$column"})
+            if grep { _excludes_tenant($_, $column, $self->{scope}{tenant}) }
+                grep { defined } $self->_host_required_predicate, $args{host_predicate};
+    }
     return $self if $access eq 'write' ? $self->_scopes_tenant_field($field) : defined($self->{scope}{tenant});
     return $self if grep { _has_tenant_conjunct($_, $field) }
         grep { defined } $self->{domain}->required_predicate, $args{host_predicate};
@@ -802,8 +810,7 @@ sub _prepare_graph {
         $contexts{$node->{id}}{rule_input} = $rule_inputs{$node->{id}};
     }
     for my $node ($options{submitted_prepared} ? () : @nodes) {
-        my $engine=ref($self)->new(domain=>$contexts{$node->{id}}{domain},adapter=>$self->{adapter},
-            scope=>$self->{scope},write_context=>$self->{write_context},limits=>$self->{limits});
+        my $engine=$self->_graph_engine($contexts{$node->{id}}{domain});
         $node->{command}=Selecto::WriteRules->prepare_submitted($engine,$node->{command},input=>$rule_inputs{$node->{id}},accepted_input=>$accepted_inputs->{$node->{id}});
     }
     my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets,metadata=>$graph->metadata);
@@ -875,8 +882,7 @@ sub _govern_owned_sets {
         my %returned;
         $root_metadata->{returning} = [grep { !$returned{$_}++ } @{$root_metadata->{returning}}];
         $nodes{$set->{parent}}{command} = $nodes{$set->{parent}}{command}->with_metadata($root_metadata);
-        my $child_engine = ref($self)->new(domain => $child, adapter => $self->{adapter},
-            scope => $self->{scope}, write_context=>$self->{write_context}, limits => $self->{limits});
+        my $child_engine = $self->_graph_engine($child);
         # Cleanup is limited to owned rows. Its exact parent key is supplied
         # from the root's actual RETURNING result during graph execution; this
         # necessary ownership condition survives alongside that later binding.
@@ -888,7 +894,7 @@ sub _govern_owned_sets {
             operation => 'delete', relation => $child->table, expected_count => undef,
             scope_predicate => $ownership_scope));
         # Cleanup deletes only rows the root's tenant boundary admits.
-        $cleanup = $self->_confine_child_tenants($cleanup, $tenants, $child->fields,
+        ($cleanup) = $self->_confine_child_tenants($cleanup, $tenants, $child->fields,
             owned_set => $set->{relationship}) unless $child_scope;
         push @prepared, {%$set, parent_key => $parent_key, child_key => $child_key,
             identity_fields => [@$identity], cleanup => $cleanup};
@@ -952,10 +958,8 @@ sub governed_write {
     $command = $self->_materialize_write_context($command);
     $command = $self->_normalize_write_command($command);
     my $required = $self->required_write_guard($command->operation, %details);
-    my $scope = $self->{domain}->write_tenant_scope;
-    $command = Selecto::Write::Scope->apply(
-        $command, $scope, $self->{scope}{tenant}, label => $command->relation, details => \%details,
-    );
+    my $trusted;
+    ($command, $trusted) = $self->_apply_write_tenant($command, $required, %details);
     # The required predicate is host-authored, so it joins the scope after
     # writes.scope.tenant has checked the caller's own tenant references;
     # both boundaries then hold in the same statement.
@@ -968,8 +972,8 @@ sub governed_write {
                 && _has_conjunct($command->query_enforcement->predicate, $required));
     }
     $command = Selecto::Write::Policy->apply($command, $self->{domain}->writes, $self->{domain}->fields,
-        trusted_field => $scope ? $scope->{field} : undef);
-    $self->_validate_write_command($command, trusted_field => $scope ? $scope->{field} : undef);
+        trusted_field => $trusted);
+    $self->_validate_write_command($command, trusted_field => $trusted);
     $self->_check_required_tenant_assignment($command, $required, %details);
     # Adapter bounded-write preflight must use the governing domain identity,
     # never a key supplied by the caller's command metadata.
@@ -995,10 +999,7 @@ sub governed_write {
 # insert candidates against it before the transaction opens.
 sub required_write_guard {
     my ($self, $operation, %details) = @_;
-    my $contract=$self->{domain}->_contract_view // {};
-    my $source=$contract->{source} // {fields=>[sort keys %{$self->{domain}->fields}]};
-    my $required = Selecto::QueryEnforcement::combine($self->{domain}->required_predicate,
-        Selecto::Write::Context->required_predicate({source=>$source},$self->{write_context}));
+    my $required = $self->_host_required_predicate;
     return undef unless defined $required;
     my $relation = $self->{domain}->table;
     my @paths = _association_paths($required);
@@ -1013,6 +1014,127 @@ sub required_write_guard {
         { relation => $relation, %details },
     ) if ($operation // '') eq 'upsert';
     return $required;
+}
+
+# The host-authored write boundary: the domain's required predicate ANDed
+# with the trusted write context's required filters.
+sub _host_required_predicate {
+    my ($self) = @_;
+    my $contract=$self->{domain}->_contract_view // {};
+    my $source=$contract->{source} // {fields=>[sort keys %{$self->{domain}->fields}]};
+    return Selecto::QueryEnforcement::combine($self->{domain}->required_predicate,
+        Selecto::Write::Context->required_predicate({source=>$source},$self->{write_context}));
+}
+
+# Lesson 47: the column a trusted engine tenant binds on writes of this
+# engine's domain: the writes.scope.tenant field, else source.tenant_field.
+# A graph child (an engine made by _graph_engine) binds its own column only
+# when it pairs by name with the root's bound column, or when the root has
+# none; a child's own writes.scope.tenant field is always bound by Scope.
+sub _write_tenant_column {
+    my ($self) = @_;
+    my $domain = $self->{domain};
+    my $scope = $domain->write_tenant_scope;
+    my $column = $scope ? $scope->{field} : $domain->tenant_field;
+    my $root = $self->{_graph_root};
+    return $column unless $root && defined $column;
+    return $column if !defined($root->{bind}) || $column eq $root->{bind};
+    return $scope && $scope->{field} eq $column ? $column : undef;
+}
+
+# Lesson 47: a trusted engine tenant limits every write of a domain with a
+# tenant column, with or without writes.scope.tenant. Any top-level eq/in
+# conjunct on that column, in the host's required predicate or trusted
+# context filters, the caller's predicate or scope, or query evidence, must
+# admit the tenant (an IN list is intersected with it) or the write is
+# refused with tenant_mismatch before any DML. A writes.scope.tenant on that
+# column is applied by Selecto::Write::Scope as before; otherwise updates and
+# deletes match only rows of the tenant, inserts and upserts carry it
+# (filled when absent, tenant_mismatch when another value is given), an
+# upsert must resolve conflicts on a target including the column
+# (tenant_scope_conflict_target). Returns the command and the fields the
+# engine assigns from trusted scope.
+sub _apply_write_tenant {
+    my ($self, $command, $required, %details) = @_;
+    my $tenant = $self->{scope}{tenant};
+    my $scope = $self->{domain}->write_tenant_scope;
+    my $column = $self->_write_tenant_column;
+    my @trusted;
+    if ($scope) {
+        $command = Selecto::Write::Scope->apply(
+            $command, $scope, $tenant, label => $command->relation, details => \%details,
+        );
+        push @trusted, $scope->{field};
+    }
+    return ($command, \@trusted) unless defined($tenant) && defined($column);
+    my %where = (relation => $command->relation, field => "$column", %details);
+    for my $expression (grep { defined } $required, $command->predicate, $command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef) {
+        Selecto::Error->throw('tenant_mismatch', 'tenant value must match the trusted tenant scope', \%where)
+            if _excludes_tenant($expression, $column, $tenant);
+    }
+    return ($command, \@trusted) if $scope && $scope->{field} eq $column;
+    push @trusted, $column;
+    return (_bind_write_tenant($command, $column, $tenant, %where), \@trusted);
+}
+
+sub _bind_write_tenant {
+    my ($command, $column, $tenant, %where) = @_;
+    my $operation = $command->operation;
+    return _scope_tenant($command, $column, $tenant) if $operation eq 'delete';
+    my $assignments = $command->assignments;
+    if (exists $assignments->{$column}) {
+        my $value = _literal_value($assignments->{$column});
+        Selecto::Error->throw('tenant_mismatch', 'tenant value must match the trusted tenant scope', \%where)
+            unless defined($value) && !ref($value) && "$value" eq "$tenant";
+    } elsif ($operation eq 'insert' || $operation eq 'upsert') {
+        $assignments->{$column} = $tenant;
+    }
+    if ($operation eq 'upsert') {
+        my $target = $command->metadata->{conflict_target};
+        Selecto::Error->throw(
+            'tenant_scope_conflict_target',
+            'tenant-scoped upsert must resolve conflicts on a target that includes the tenant field',
+            \%where,
+        ) unless ref($target) eq 'ARRAY' && grep { defined($_) && !ref($_) && "$_" eq $column } @$target;
+    }
+    return _scope_tenant($command->with_assignments($assignments), $column, $tenant);
+}
+
+# ANDs column = tenant into the command's scope once.
+sub _scope_tenant {
+    my ($command, $column, $tenant) = @_;
+    my $existing = $command->scope_predicate;
+    return $command if grep {
+        $_->kind eq 'eq' && _is_tenant_comparison($_, $column) && "${\$_->arguments->[1]->arguments->[0]}" eq "$tenant"
+    } _conjuncts($existing);
+    my $guard = Selecto::Expression->eq($column, $tenant);
+    return $command->with_scope_predicate(defined($existing) ? Selecto::Expression->all($existing, $guard) : $guard);
+}
+
+# The top-level conjuncts of an expression, through nested ANDs.
+sub _conjuncts {
+    my ($expression) = @_;
+    return () unless blessed($expression) && $expression->isa('Selecto::Expression');
+    return ($expression) unless $expression->kind eq 'and';
+    return map { _conjuncts($_) } @{$expression->arguments->[0] // []};
+}
+
+sub _literal_value {
+    my ($value) = @_;
+    return $value unless blessed($value) && $value->isa('Selecto::Write::Expression');
+    return $value->kind eq 'literal' ? $value->arguments->[0] : undef;
+}
+
+# An engine for a graph child or owned-sync relation of this engine's graph,
+# carrying the root's tenant columns so the child binds only the columns
+# that pair with them.
+sub _graph_engine {
+    my ($self, $domain) = @_;
+    my $engine = ref($self)->new(domain => $domain, adapter => $self->{adapter},
+        scope => $self->{scope}, write_context => $self->{write_context}, limits => $self->{limits});
+    $engine->{_graph_root} = $self->{_graph_root} // {bind => $self->_write_tenant_column};
+    return $engine;
 }
 
 # Context-owned fields are checked as authored literal values before native
@@ -1054,16 +1176,17 @@ sub _materialize_write_context {
 # to another tenant. Inserts are checked as candidates against the predicate.
 sub _check_required_tenant_assignment {
     my ($self, $command, $required, %details) = @_;
-    my $field = $self->{domain}->tenant_field;
-    return unless defined($required) && defined($field) && $command->operation eq 'update'
-        && exists($command->assignments->{$field}) && _has_tenant_conjunct($required, $field);
-    my $value = $command->assignments->{$field};
-    $value = $value->kind eq 'literal' ? $value->arguments->[0] : undef
-        if blessed($value) && $value->isa('Selecto::Write::Expression');
-    Selecto::Error->throw(
-        'tenant_mismatch', 'tenant value must match the trusted tenant scope',
-        {relation => $command->relation, field => "$field", %details},
-    ) if !defined($value) || ref($value) || _excludes_tenant($required, $field, $value);
+    return unless defined($required) && $command->operation eq 'update';
+    my $domain = $self->{domain};
+    # Every root tenant column, the writes.scope.tenant column included.
+    for my $field (@{_root_tenant_fields($domain->tenant_field, $domain->write_tenant_scope)}) {
+        next unless exists($command->assignments->{$field}) && _has_tenant_conjunct($required, $field);
+        my $value = _literal_value($command->assignments->{$field});
+        Selecto::Error->throw(
+            'tenant_mismatch', 'tenant value must match the trusted tenant scope',
+            {relation => $command->relation, field => "$field", %details},
+        ) if !defined($value) || ref($value) || _excludes_tenant($required, $field, $value);
+    }
 }
 
 # TW-05: the trusted tenants a write is confined to: the engine tenant, or
@@ -1104,10 +1227,14 @@ sub _required_tenants {
 # instead, and is not passed here.
 sub _confine_child_tenants {
     my ($self, $command, $sets, $fields, %details) = @_;
-    return $command unless $sets && ref($fields) eq 'HASH';
+    return ($command, []) unless $sets && ref($fields) eq 'HASH';
     my %columns = ref($sets) eq 'HASH' ? %{$sets->{columns}}
         : map { ($_ => $sets) } @{_root_tenant_fields($self->{domain}->tenant_field, $self->{domain}->write_tenant_scope)};
-    my @scopes;
+    # Lesson 47: a child insert omitting the column the engine tenant binds
+    # on the root carries the tenant, as a root insert does.
+    my $tenant = $self->{scope}{tenant};
+    my $bound = defined($tenant) ? $self->_write_tenant_column : undef;
+    my (@scopes, @filled);
     for my $column (sort keys %columns) {
         my $set = $columns{$column};
         next unless $set && exists $fields->{$column};
@@ -1116,16 +1243,17 @@ sub _confine_child_tenants {
             'upsert is not supported on a graph child confined to a tenant set', \%where)
             if $command->operation eq 'upsert';
         if ($command->operation ne 'delete' && exists $command->assignments->{$column}) {
-            my $value = $command->assignments->{$column};
-            $value = $value->kind eq 'literal' ? $value->arguments->[0] : undef
-                if blessed($value) && $value->isa('Selecto::Write::Expression');
+            my $value = _literal_value($command->assignments->{$column});
             Selecto::Error->throw('tenant_mismatch', 'tenant value must match the trusted tenant scope', \%where)
                 if !defined($value) || ref($value) || !grep { "$_" eq "$value" } @$set;
+        } elsif ($command->operation eq 'insert' && defined($bound) && $column eq $bound) {
+            $command = $command->with_assignments({%{$command->assignments}, $column => $tenant});
+            push @filled, $column;
         }
         push @scopes, @$set == 1 ? Selecto::Expression->eq($column, $set->[0]) : Selecto::Expression->in($column, [@$set]);
     }
-    return $command unless @scopes;
-    return $command->with_scope_predicate(Selecto::QueryEnforcement::combine($command->scope_predicate, @scopes));
+    return ($command, \@filled) unless @scopes;
+    return ($command->with_scope_predicate(Selecto::QueryEnforcement::combine($command->scope_predicate, @scopes)), \@filled);
 }
 
 # Lesson 29e: the admitted tenants of each root tenant column, for reference
@@ -2084,8 +2212,8 @@ sub enforce_query_evidence {
 # True when execution will add the trusted tenant for this field itself.
 sub _scopes_tenant_field {
     my ($self, $field) = @_;
-    my $scope = $self->{domain}->write_tenant_scope;
-    return $scope && $scope->{field} eq $field && defined($self->{scope}{tenant});
+    my $column = $self->_write_tenant_column;
+    return defined($self->{scope}{tenant}) && defined($column) && $column eq $field;
 }
 
 # A scope counts as tenant-scoped only when a positive conjunct (eq or in over
@@ -2231,8 +2359,8 @@ sub _validate_command_against_contract {
                 unless exists $domain_fields->{$field};
             next unless defined($fields_spec);
             # The trusted tenant is assigned by scope, not granted to callers.
-            next if $permission eq 'insertable' && defined($context{trusted_field})
-                && $field eq $context{trusted_field};
+            next if $permission eq 'insertable'
+                && grep { $field eq $_ } Selecto::Write::Policy::_trusted_fields($context{trusted_field});
             my $spec = $fields_spec->{$field};
             Selecto::Error->throw(
                 'write_field_not_writable',
@@ -2446,8 +2574,7 @@ sub _validate_graph_node {
     }
     my $scope = $edge->{tenant_scope};
     my $nested_domain = _native_relationship_domain($edge->{contract});
-    my $nested_engine = ref($self)->new(domain => $nested_domain, adapter => $self->{adapter},
-        scope => $self->{scope}, write_context=>$self->{write_context}, limits => $self->{limits});
+    my $nested_engine = $self->_graph_engine($nested_domain);
     $command=$nested_engine->_materialize_write_context($command);
     $command = $command->with_assignments($nested_domain->normalize_write_assignments($command->assignments));
     if (!$scope && $root_scope) {
@@ -2463,24 +2590,23 @@ sub _validate_graph_node {
             {relation => $command->relation, graph_node => $node->{id}, field => $root_scope->{field}},
         ) if exists $edge->{fields}{$root_scope->{field}};
     }
-    $command = Selecto::Write::Scope->apply(
-        $command, $scope, $self->{scope}{tenant},
-        label => $command->relation, details => {graph_node => $node->{id}},
-    );
     my $required = $nested_engine->required_write_guard($command->operation, graph_node => $node->{id});
+    my ($trusted, $filled);
+    ($command, $trusted) = $nested_engine->_apply_write_tenant($command, $required, graph_node => $node->{id});
     $command = $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $required)) if defined $required;
-    $command = $self->_confine_child_tenants($command, $tenants, $edge->{fields}, graph_node => $node->{id})
+    ($command, $filled) = $self->_confine_child_tenants($command, $tenants, $edge->{fields}, graph_node => $node->{id})
         unless $scope;
+    $trusted = [@$trusted, @{$filled // []}];
     my %nested_fields = %{$edge->{fields} // {}};
     $command = Selecto::Write::Policy->apply($command, $edge->{writes}, \%nested_fields,
-        trusted_field => $scope ? $scope->{field} : undef);
+        trusted_field => $trusted);
     $self->_validate_command_against_contract($command,
         ($edge->{fields_known} ? (fields => \%nested_fields) : (fields => undef)),
         writes      => $edge->{writes},
         allowed_ops => $edge->{allowed_ops},
         label       => $command->relation,
-        trusted_field => $scope ? $scope->{field} : undef,
+        trusted_field => $trusted,
     );
     # A bound field takes its value from the parent this graph wrote, so only
     # the child's own assignments are guarded.
@@ -2944,8 +3070,10 @@ domain's own required predicate excludes the engine's tenant.
 Throws C<missing_tenant_scope> unless a domain with a C<tenant_field> has a
 tenant boundary: a trusted engine tenant, or a positive C<eq>/C<in> conjunct
 on the tenant field in the required predicate or in C<host_predicate>. With
-C<< access => 'write' >> only a trusted tenant on the field
-C<writes.scope.tenant> names counts. Returns the engine.
+C<< access => 'write' >> a trusted tenant counts when every write binds it
+to the tenant field (lesson 47), and a required predicate, trusted
+C<write_context> filter or C<host_predicate> excluding it is refused with
+C<tenant_mismatch>. Returns the engine.
 
 =head1 WRITING
 
@@ -3165,6 +3293,22 @@ graph whose nested domain stores the tenant field without declaring its own
 C<writes.scope.tenant>.
 
 =back
+
+A trusted engine tenant limits every write of a domain with a
+C<source.tenant_field> whether or not it declares C<writes.scope.tenant>
+(lesson 47): updates, deletes, upserts, batch members, graph roots,
+owned-sync cleanup, actions and query-enforced writes add
+C<< tenant_field = tenant >> to their scope; inserts and upserts carry the
+tenant (filled when absent, C<tenant_mismatch> for another value); an
+update may not re-tag a row; upserts must resolve conflicts on a target
+including the tenant field (C<tenant_scope_conflict_target>). A required
+predicate, trusted C<write_context> C<required_filters>, caller predicate or
+query evidence whose top-level C<eq>/C<in> conjunct on the tenant field
+excludes the engine tenant is refused with C<tenant_mismatch> before any
+DML; one that admits it (C<IN (7, 8)>) is intersected with it. A graph child
+binds the engine tenant only onto a column that pairs by name with the
+root's. Every update of a root tenant column must keep a value the required
+and host conjuncts on it admit.
 
 Reads of a domain with a C<tenant_field> are always restricted to the
 engine's tenant. Domains that rely on a required predicate as their tenant

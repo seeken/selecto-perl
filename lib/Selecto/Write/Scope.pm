@@ -93,16 +93,7 @@ sub apply {
     return $command unless $scope;
     my $field = $scope->{field};
     my $label = {relation => $args{label} // $command->relation, %{$args{details} // {}}};
-    Selecto::Error->throw(
-        'unsupported_tenant_scope_source',
-        'this runtime satisfies tenant scope from trusted context only',
-        {%$label, satisfied_by => [@{$scope->{satisfied_by}}]},
-    ) unless grep { $_ eq 'trusted_context' } @{$scope->{satisfied_by}};
-    Selecto::Error->throw(
-        'missing_tenant_scope',
-        'tenant-scoped writes require a trusted tenant from the host',
-        {%$label, field => $field},
-    ) unless defined $trusted;
+    $class->require_trusted($scope, $trusted, %args, label => $label->{relation});
 
     for my $expression (grep { defined } $command->predicate, $command->scope_predicate) {
         _check_references($expression, $field, $trusted, $label);
@@ -130,6 +121,25 @@ sub apply {
     return $command
         ->with_assignments($assignments)
         ->with_scope_predicate(defined($existing) ? Selecto::Expression->all($existing, $guard) : $guard);
+}
+
+# A declared writes.scope.tenant can be written only with a trusted tenant
+# from the host, whichever column the engine tenant binds.
+sub require_trusted {
+    my ($class, $scope, $trusted, %args) = @_;
+    return unless $scope;
+    my $label = {relation => $args{label}, %{$args{details} // {}}};
+    Selecto::Error->throw(
+        'unsupported_tenant_scope_source',
+        'this runtime satisfies tenant scope from trusted context only',
+        {%$label, satisfied_by => [@{$scope->{satisfied_by}}]},
+    ) unless grep { $_ eq 'trusted_context' } @{$scope->{satisfied_by}};
+    Selecto::Error->throw(
+        'missing_tenant_scope',
+        'tenant-scoped writes require a trusted tenant from the host',
+        {%$label, field => $scope->{field}},
+    ) unless defined $trusted;
+    return;
 }
 
 # A caller may restate the trusted tenant, but may not name another tenant or
