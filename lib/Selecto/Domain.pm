@@ -402,11 +402,13 @@ sub _parse_canonical {
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
     _validate_value_expressions($domain, $source, $raw->{writes});
-    require Selecto::QueryMember;
-    Selecto::QueryMember->validate($domain);
+    # The write scope is known before members are validated: on a two-column
+    # root a member's tenant column pairs with the root column of its name.
     $domain->{write_tenant_scope} = Selecto::Write::Scope->parse_tenant(
         $raw->{writes}, fields => $domain->fields, tenant_field => $source->{tenant_field},
     );
+    require Selecto::QueryMember;
+    Selecto::QueryMember->validate($domain);
     _validate_conditional_filter_choices($domain);
     _validate_picker_visible_id_paths($domain);
     require Selecto::Retarget;

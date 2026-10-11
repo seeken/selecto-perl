@@ -259,7 +259,7 @@ sub required_filters {
     require Selecto::QueryPolicy;
     my $filters = Selecto::QueryPolicy->filters($self->{domain}, $self->query, $self->{limits});
     push @$filters, @{$self->{tenant_required_filters} // []};
-    my $read_field = _read_tenant_field($self->{domain});
+    my $read_field = $self->{domain}->tenant_field;
     push @$filters, [$read_field, $self->{scope}{tenant}]
         if defined($read_field) && defined($self->{scope}{tenant});
     require Selecto::Domain::QueryContract;
@@ -457,7 +457,10 @@ sub all {
 # writes, so a read path that forgets with_required_predicate cannot see other
 # tenants' rows. Query members inherit the added condition through the
 # required predicate. A required predicate whose tenant condition excludes the
-# trusted tenant is a host error rather than an empty result.
+# trusted tenant is a host error rather than an empty result. On a two-column
+# root (writes.scope.tenant on another column) reads bind tenant_field only
+# (lesson 41c); relations tenanted on the write-scope column pair with the
+# root by name and are never bound to the engine value.
 sub read_domain {
     my ($self) = @_;
     $self->assert_domain_identity;
@@ -466,7 +469,7 @@ sub read_domain {
     my $read = do {
         my $domain = $self->{domain};
         my $tenant = $self->{scope}{tenant};
-        my $field = _read_tenant_field($domain);
+        my $field = $domain->tenant_field;
         if (defined($tenant) && defined($field)) {
             my $required = $domain->required_predicate;
             Selecto::Error->throw(
@@ -493,17 +496,6 @@ sub read_domain {
     $self->{_read_domain} = $read;
     $CONFIGURED_DOMAIN{$self}{read} = Selecto::ConfiguredDomain->digest($read, $self->_read_authority);
     return $read;
-}
-
-# The root column the engine tenant bounds on reads: tenant_field, or on a
-# two-column root (lesson 41a) the writes.scope.tenant column, as on writes;
-# the required predicate bounds tenant_field there.
-sub _read_tenant_field {
-    my ($domain) = @_;
-    my $field = $domain->tenant_field;
-    return $field unless defined $field;
-    my $scope = $domain->write_tenant_scope;
-    return $scope && defined($scope->{field}) ? $scope->{field} : $field;
 }
 
 # The tenant boundary public surfaces (the API write and query handlers,
