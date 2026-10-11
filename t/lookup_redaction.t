@@ -64,6 +64,10 @@ for my $backend (@backends) {
             ['a field reference caption', reference => {caption_source => 'owners.ssn'}],
             ['a self-targeted co-domain label', co_domains => {self => {domain => 'Tickets', projection => 'all',
                 search => {fields => ['title']}, result => {value_field => 'id', label_field => 'secret'}}}],
+            # A search over a redacted column is a match oracle even when
+            # every returned field is public.
+            ['a self-targeted co-domain search field', co_domains => {self => {domain => 'Tickets', projection => 'all',
+                search => {fields => ['secret']}, result => {value_field => 'id', label_field => 'title'}}}],
         ) {
             my ($label, %o) = @$case;
             my $raw = contract(%o);
@@ -94,6 +98,13 @@ for my $backend (@backends) {
             engine => $users, query => 'a') });
         ok($error && blessed($error) && $error->code =~ /\Ainvalid_co_domain|invalid_domain|invalid_query/,
             'a co-domain lookup returning a redacted target field is refused (' . ($error && blessed($error) ? $error->code : 'none') . ')');
+
+        my $searching = Selecto::Domain->parse(contract(co_domains => {owners => {domain => 'Users', projection => 'all',
+            search => {fields => ['ssn']}, result => {value_field => 'id', label_field => 'name'}}}));
+        $error = error_of(sub { Selecto::CoDomain->lookup(source_domain => $searching, co_domain => 'owners',
+            engine => $users, query => 'a') });
+        ok($error && blessed($error) && $error->code =~ /\Ainvalid_co_domain|invalid_domain|invalid_query/,
+            'a co-domain lookup searching a redacted target field is refused (' . ($error && blessed($error) ? $error->code : 'none') . ')');
     };
 }
 
