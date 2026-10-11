@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - Document and pin that on a native DBD::SQLite handle every write
+      governed by stored-stage rules (insert, update and upsert, since the
+      protected UPSERT port) requires an open native transaction on the
+      adapter's connection. A host transaction_handler that runs the work
+      in autocommit, contrary to its documented contract, is refused with
+      required_data_rule_pending (native_transaction_required) before DML;
+      before the port such inserts and updates ran their candidate proof
+      and write non-atomically. Writes without stored rules and handlers
+      that open a transaction are unaffected.
     - Protected SQLite UPSERT receipts are rechecked against the live
       trusted write context at dispatch. The engine now opens the candidate
       scope with its write context; projection refuses a request under a

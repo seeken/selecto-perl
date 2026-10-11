@@ -96,7 +96,14 @@ Trusted `Selecto::Limits` can tighten these bounds. The ASCII pattern evaluator
 uses a finite Thompson NFA rather than native backtracking expressions.
 
 SQLite admission uses an actual memory or host connection and the enclosing
-write transaction. Native NUMERIC affinity is evaluated before rules; for
+write transaction. Every stored-stage write on a native DBD::SQLite handle
+(insert, update and upsert, not only UPSERT) requires that transaction to be
+open on the adapter's connection when governance starts. A host
+`transaction_handler` must open it, as its contract states; a handler that runs
+the work in autocommit is refused with `required_data_rule_pending` (reason
+`native_transaction_required`) before business DML, because the candidate
+proof and the write would not be atomic. Writes without stored-stage rules are
+unaffected. Native NUMERIC affinity is evaluated before rules; for
 example `1e-400` becomes zero and fails required positivity. Protected storage
 refuses temporary shadows, virtual/view/shadow tables, triggers, generated
 columns and unsupported scalar types. Every mutating ordinary write, preview,
