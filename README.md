@@ -415,6 +415,20 @@ print "$response->{status} $response->{headers}{'content-type'}\n";
 print $response->{body}, "\n";   # UTF-8 encoded canonical JSON bytes
 ```
 
+API writes are confined to each operation's authored grants in
+`writes.operations`. Without `expected_cardinality` an operation permits exactly
+one row; `bulk => 1` is still needed for larger update/delete counts but never
+admits them alone. Without `returning` (a field list, true or `"all"`) no fields
+may be returned. Refusals are `invalid_api_write`, before any statement runs:
+
+```perl
+writes => {operations => {
+    update => {enabled => 1, bulk => 1, expected_cardinality => 'many',
+               returning => ['id', 'stock']},
+    delete => {enabled => 1, bulk => 1, expected_cardinality => ['between', 1, 50]},
+}},
+```
+
 `GET .../domain` defaults to 403: the complete contract can contain internal
 expressions and policy metadata. A trusted host can set `publish_domain => 1`
 for an intentionally public contract, or supply a callback that returns exactly

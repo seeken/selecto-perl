@@ -87,6 +87,8 @@ Successful `subtables` metadata contains the existing `columns`, plus `limit` an
 
 Public non-bulk UPDATE/DELETE requires a concrete primary-key equality filter. Other tenant, required and precondition filters remain in effect. Engine and adapter write guards also validate execution; this API restriction does not replace them.
 
+Public API write counts and returning fields are confined to the operation's authored grants. Without an `expected_cardinality` grant an operation permits exactly one row; `bulk: true` is still required for counts above one on UPDATE/DELETE but never widens the grant by itself. Without a `returning` grant (a field list, `true` or `"all"`) no fields may be returned. Either refusal is `invalid_api_write`, raised during request admission before anything executes. Request limits and tenant/scope checks still apply to granted requests.
+
 ## CSV inspection memory
 
 The inspector checks input bytes before encoding or parsing, counts all cells and decoded bytes including the header, and creates only the final row representation. It no longer retains a second array of all raw records. Existing per-row, column and cell limits still apply. The sample limit controls the returned sample only.

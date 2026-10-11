@@ -3360,7 +3360,8 @@ L</without_action_prerequisites>.
   writes => {
       operations => {
           insert => {enabled => 1},
-          update => {enabled => 1, bulk => 1, require_filter => 1},
+          update => {enabled => 1, bulk => 1, require_filter => 1,
+                     expected_cardinality => 'many', returning => ['id', 'status']},
           upsert => {enabled => 1, conflict_targets => [['sku']]},
           delete => {enabled => 1},
       },
@@ -3376,6 +3377,10 @@ L</without_action_prerequisites>.
 An engine with the default strict policy writes only what this section
 grants. C<required> fields must be supplied by inserts and upserts
 (C<missing_required_write_fields>). A count greater than one needs C<bulk>.
+Public API writes (L<Selecto::API::EngineHandler>) are also confined to each
+operation's authored grants: without C<expected_cardinality> an operation
+permits exactly one row, even with C<bulk>, and without C<returning> no
+fields may be returned.
 See L<Selecto::Write> and L<Selecto::Engine>.
 
 =head2 Other sections

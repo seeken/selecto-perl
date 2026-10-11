@@ -98,6 +98,7 @@ t/api_resources.t
 t/api_response_json_bytes.t
 t/api_result_formatter.t
 t/api_through_association_parity_live.t
+t/api_write_grants.t
 t/api_write_parity_live.t
 t/array_json.t
 t/canned_page.integration.t

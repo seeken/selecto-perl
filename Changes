@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - BREAKING: public API writes (Selecto::API::EngineHandler) are confined
+      to each operation's authored grants. Without an expected_cardinality
+      grant an operation permits exactly one row: bulk => 1 is still
+      required for update/delete counts above one but no longer admits them
+      by itself. Without a returning grant (a field list, true or "all") no
+      fields may be returned. Either request is refused with
+      invalid_api_write during admission, before any statement runs. Domain
+      documents that relied on bulk alone, or on ungranted returning, must
+      add expected_cardinality (for example "many" or ["between", 1, 50])
+      and returning grants to their writes.operations. Request limits,
+      tenant and scope checks, and native/portable write policy are
+      unchanged.
     - Selecto::BoundedQuery->prepare_scalar_column joins two prepared bundles
       through the adapter's scalar_column_statement and carries their read
       policy evidence, so a canned page that carries its total on its rows
