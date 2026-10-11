@@ -164,6 +164,7 @@ sub _compile_single {
     return $self->_compile_rollup($domain, $query, %options)
         if $query->grouping_mode eq 'rollup' && $self->_emulates_rollup;
     local $self->{_root_alias} = $options{root_alias} // 's0';
+    local $self->{_tenant_root} = $domain;
     local $self->{_timezone} = $query->timezone;
     local $self->{_read_prefix} = $domain->{_read_prefix};
     my $selections = $query->selections;
@@ -2429,15 +2430,49 @@ sub _tenant_pair_sql {
 # without exposing another tenant's. A tenant-scoped parent is itself bounded
 # (the root by Selecto::Engine::read_domain, a joined parent by this rule or
 # its tenant pair), so its pair carries the bound.
+#
+# Lessons 41b, 41e and 41f: such an unpaired relation is also bound to the
+# admitted tenant sets of the compile root (its required tenant conjuncts, or
+# those a retarget carried past an untenanted hop) as IN, so a root bounded
+# only by a required predicate keeps its boundary past a shared hop. In a
+# two-column tenant family only the tenant_field column takes those bounds:
+# a relation tenanted on the write-scope (site) column pairs by name with a
+# hop chained to the root or is refused, since a shared hop that merely
+# stores that column is no pairing source. A bounded root with nothing to
+# carry refuses the relation with missing_tenant_scope; a root with no
+# boundary at all keeps reading every tenant.
 sub _tenant_bound_sql {
     my ($self, $association, $target_alias, $params) = @_;
     my $field = $association->target_tenant_field;
     return () unless defined($field) && !defined($association->source_tenant_field);
     my $engine = $self->{_selecto_compile_engine};
     my $tenant = $engine ? $engine->scope->{tenant} : undef;
-    return () unless defined $tenant;
-    push @$params, $tenant;
-    return $self->_qualified($target_alias, $field) . ' = ' . $self->placeholder(scalar @$params);
+    my $root = $self->{_tenant_root};
+    my $family = $root ? $root->tenant_family : undef;
+    require Selecto::QueryMember;
+    my ($sets, $bounded) = $root ? Selecto::QueryMember->admitted_tenant_sets($root) : ([], 0);
+    $bounded ||= defined $tenant;
+    my $refuse = sub {
+        Selecto::Error->throw('missing_tenant_scope', $_[0], {tenant_field => "$field", association => $association->name});
+    };
+    if ($family && "$field" ne $family->{tenant}) {
+        return () unless $bounded;
+        $refuse->('a relation tenanted on the write-scope column must pair by name with a hop chained to the tenant-bound root');
+    }
+    my @predicates;
+    if (defined $tenant) {
+        push @$params, $tenant;
+        push @predicates, $self->_qualified($target_alias, $field) . ' = ' . $self->placeholder(scalar @$params);
+    }
+    for my $set (@$sets) {
+        my ($from, $values) = @$set;
+        next if $family && $from ne "$field";
+        my @placeholders = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
+        push @predicates, $self->_qualified($target_alias, $field)
+            . (@placeholders == 1 ? " = $placeholders[0]" : ' IN (' . join(', ', @placeholders) . ')');
+    }
+    return @predicates if @predicates || !$bounded;
+    $refuse->('a tenant-scoped relation past an untenanted hop has no tenant boundary of the root to carry');
 }
 
 sub _constant_join_predicates {

@@ -367,8 +367,13 @@ sub _parse_canonical {
     my $scope_tenant = ref($raw->{writes}) eq 'HASH' && ref($raw->{writes}{scope}) eq 'HASH'
         && ref($raw->{writes}{scope}{tenant}) eq 'HASH'
         ? ($raw->{writes}{scope}{tenant}{field} // $raw->{writes}{scope}{tenant}{tenant_field}) : undef;
+    # Lessons 41a and 41b: a two-column root (writes.scope.tenant on one
+    # column, source.tenant_field on another) makes a tenant family. Every
+    # hop of its domain, and of the domains a retarget rebuilds from it
+    # ($DERIVED_TENANT_FAMILY), pairs tenant columns by name.
+    my ($family, $anchors) = _tenant_family($source, $scope_tenant);
     my $associations = _canonical_associations(
-        $source, $schemas, $joins, $strict, '', $scope_tenant,
+        $source, $schemas, $joins, $strict, '', $family, $anchors,
     );
     _apply_values_foreign_key_metadata(
         $source, $associations, $raw->{writes},
@@ -397,6 +402,7 @@ sub _parse_canonical {
         experiences => $raw->{experiences},
         rules => $raw->{rules},
     );
+    $domain->{_tenant_family} = $family if $family;
     _apply_required_filters($domain, $raw->{required_filters});
     $domain->{contract} = _clone_with_rules($raw);
     $domain->{canonical_schemas} = dclone($schemas);
@@ -566,23 +572,42 @@ sub _apply_values_foreign_key_metadata {
     }
 }
 
+# The tenant family of a root relation: on a two-column root (lesson 41a)
+# {tenant => tenant_field, site => the writes.scope.tenant column}, with both
+# columns as the root's pairing anchors. A domain a retarget rebuilds from it
+# is parsed under $DERIVED_TENANT_FAMILY and anchors only its own tenant
+# column. Elsewhere there is no family and tenant columns pair by position.
+our $DERIVED_TENANT_FAMILY;
+sub _tenant_family {
+    my ($source, $scope_tenant) = @_;
+    my $tenant = $source->{tenant_field};
+    if (defined($scope_tenant) && !ref($scope_tenant) && defined($tenant) && !ref($tenant) && "$scope_tenant" ne "$tenant") {
+        return ({tenant => "$tenant", site => "$scope_tenant", root => 1}, ["$tenant", "$scope_tenant"]);
+    }
+    return (undef, undef) unless $DERIVED_TENANT_FAMILY;
+    return ({%$DERIVED_TENANT_FAMILY, root => 0}, [defined($tenant) ? ("$tenant") : ()]);
+}
+
 sub _canonical_associations {
-    my ($relation, $schemas, $joins, $strict, $prefix, $root_scope_field) = @_;
-    # Lesson 41a: on a two-column root (writes.scope.tenant on one column,
-    # source.tenant_field on another) a target's tenant column pairs with the
-    # root column of its own name, never with tenant_field by position, and a
-    # target tenant column matching neither root column is refused.
-    my $two_column = defined($root_scope_field) && !ref($root_scope_field) && defined($relation->{tenant_field})
-        && "$root_scope_field" ne "$relation->{tenant_field}";
+    my ($relation, $schemas, $joins, $strict, $prefix, $family, $anchors) = @_;
+    # Lessons 41a and 41b: in a tenant family every hop pairs a target's
+    # tenant column only with a column of its own name that anchors the
+    # parent (the root's two columns; a nested or rebuilt hop's own tenant
+    # column), never with the parent's tenant_field by position. A target
+    # tenant column naming neither family column is refused; one with no
+    # anchor of its name is left unpaired (Selecto::SQL binds or refuses it).
     my $paired_source = sub {
         my ($target_key, $path) = @_;
-        my $source_key = _identifier($relation->{tenant_field}, 'tenant field');
-        return $source_key unless $two_column;
-        return $target_key if $target_key eq $source_key || $target_key eq "$root_scope_field";
+        return _identifier($relation->{tenant_field}, 'tenant field') unless $family;
+        return (grep { $_ eq $target_key } @{$anchors // []}) ? $target_key : undef;
+    };
+    my $family_column = sub {
+        my ($target_key, $path) = @_;
+        return unless $family;
         Selecto::Error->throw(
             'invalid_domain', 'a tenant column on a two-column root must pair with the root column of its own name',
             {association => $path, code => 'foreign_key_tenant_scope_undeclared', tenant_field => $target_key},
-        );
+        ) unless $target_key eq $family->{tenant} || $target_key eq $family->{site};
     };
     my $source_associations = $relation->{associations} // {};
     _object($source_associations, $prefix eq '' ? 'source associations' : "schema $prefix associations");
@@ -688,13 +713,16 @@ sub _canonical_associations {
         if (!keys(%scope_keys) && !exists($association->{through})
             && defined($relation->{tenant_field}) && defined($target->{tenant_field})) {
             my $target_key = _identifier($target->{tenant_field}, 'tenant field');
+            $family_column->($target_key, $path);
             my $source_key = $paired_source->($target_key, $path);
-            my $source_fields = _canonical_fields($relation);
-            Selecto::Error->throw(
-                'invalid_domain', 'tenant field must be a relation field',
-                {association => $path},
-            ) unless exists($source_fields->{$source_key}) && exists($target_fields->{$target_key});
-            %scope_keys = (source_scope_key => $source_key, target_scope_key => $target_key);
+            if (defined $source_key) {
+                my $source_fields = _canonical_fields($relation);
+                Selecto::Error->throw(
+                    'invalid_domain', 'tenant field must be a relation field',
+                    {association => $path},
+                ) unless exists($source_fields->{$source_key}) && exists($target_fields->{$target_key});
+                %scope_keys = (source_scope_key => $source_key, target_scope_key => $target_key);
+            }
         }
         # Lessons 41 and 42: every joined relation that declares tenant_field
         # is tenant-bounded. When both relations declare one, the join also
@@ -707,6 +735,7 @@ sub _canonical_associations {
         my %tenant_keys;
         if (defined $target->{tenant_field}) {
             my $target_key = _identifier($target->{tenant_field}, 'tenant field');
+            $family_column->($target_key, $path);
             my $source_key = defined($relation->{tenant_field}) ? $paired_source->($target_key, $path) : undef;
             my $source_fields = _canonical_fields($relation);
             Selecto::Error->throw(
@@ -1253,6 +1282,8 @@ sub resolve_association {
                 $self->{canonical_joins} // {},
                 1,
                 $prefix,
+                $self->{_tenant_family},
+                [defined($relation->{tenant_field}) ? ("$relation->{tenant_field}") : ()],
             );
         } else {
             $associations = $association->associations;
@@ -2459,6 +2490,15 @@ sub associations { return { %{$_[0]->{associations}} }; }
 sub fingerprint  { return $_[0]->{fingerprint}; }
 sub primary_key  { return $_[0]->{primary_key}; }
 sub required_predicate { return $_[0]->{required_predicate}; }
+# The tenant family of a two-column domain ({tenant, site}; see
+# _tenant_family), or undef, and the root columns its hops pair with by name.
+sub tenant_family { return $_[0]->{_tenant_family} ? {%{$_[0]->{_tenant_family}}} : undef; }
+sub tenant_anchors {
+    my ($self) = @_;
+    my $family = $self->{_tenant_family};
+    return [$family->{tenant}, $family->{site}] if $family && $family->{root};
+    return [defined($self->{tenant_field}) ? ("$self->{tenant_field}") : ()];
+}
 sub tenant_field { return $_[0]->{tenant_field}; }
 sub tenant_required { return $_[0]->{tenant_required} // 0; }
 sub contract     { return defined($_[0]->{contract}) ? _clone_with_rules($_[0]->{contract}) : undef; }

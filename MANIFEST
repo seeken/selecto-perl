@@ -335,3 +335,4 @@ t/co_domain_lookup_tenant_boundary.t
 t/two_column_join_pairing.t
 t/rebuild_tenant_bound.t
 t/engine_read_tenant_boundary.t
+t/retarget_hop_pairing.t

@@ -86,14 +86,29 @@ sub target {
 # predicate carries the root's trusted tenant boundary (its tenant conditions,
 # and the trusted engine tenant when given) onto the target's tenant_field,
 # failing closed when a scoped root's boundary cannot be carried.
+#
+# The rebuilt domain also carries the root's admitted tenant sets (lesson
+# 41b): its own hops are compiled apart from the context, so an untenanted
+# target (a shared bin) or a site_id target would otherwise lose the root's
+# boundary for later tenant joins, collections and inline sources.
 sub target_domain {
     my ($class, $domain, $target, %options) = @_;
     my $relation_domain = $class->relation_domain($domain, $target);
     my $relation = _contract_relation($domain, $target);
     return $relation_domain unless $relation;
     require Selecto::QueryMember;
+    my ($sets, $bounded) = Selecto::QueryMember->admitted_tenant_sets($domain);
+    if ($bounded || defined $options{tenant}) {
+        my $field = $domain->tenant_field // ($domain->{_tenant_carry} // {})->{field};
+        my $family = $domain->tenant_family;
+        $field = $family->{tenant} if $family;
+        $relation_domain = bless {%$relation_domain, _tenant_carry => {
+            field => defined($field) ? "$field" : undef,
+            sets => [map { [@{$_->[1]}] } grep { !$family || $_->[0] eq $family->{tenant} } @$sets],
+        }}, ref($relation_domain);
+    }
     return Selecto::QueryMember->bound_source_domain($domain, $relation_domain,
-        label => "retarget to $target->{path}", tenant => $options{tenant});
+        label => "retarget to $target->{path}", tenant => $options{tenant}, chained_site => 1);
 }
 
 # The target relation as an unscoped domain: its fields, associations, and
@@ -117,6 +132,8 @@ sub relation_domain {
             grep { defined($_) && !ref($_) && index($_, "$path.") == 0 }
             @{ref($contract->{redact_fields}) eq 'ARRAY' ? $contract->{redact_fields} : []};
         $document{redact_fields} = \@redacted if @redacted;
+        # The target's hops pair by name in the root's tenant family.
+        local $Selecto::Domain::DERIVED_TENANT_FAMILY = $domain->tenant_family;
         return Selecto::Domain->parse(\%document);
     }
     # Directly constructed domains carry their relationships as nested

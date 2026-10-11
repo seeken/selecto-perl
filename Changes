@@ -1,6 +1,29 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: every hop of a two-column domain pairs tenant columns by
+      name, and an untenanted retarget hop carries the root's admitted
+      tenant set (lesson 41b). On a two-column root (source.tenant_field
+      tenant_id, writes.scope.tenant site_id) only root hops paired by
+      name: nested hops and the domain a retarget rebuilds at its target
+      lost the root's write scope and paired positionally, so once reads
+      bind tenant_id (41c) an accounts hop paired accounts.tenant_id =
+      lines.site_id (a tenant 7 read of account.lines.code, or of
+      retarget('account') + lines.code, returned site 7's line) and a lines
+      hop paired lines.site_id = notes.tenant_id (lines.notes.body
+      returned tenant 5's note at site 5). Every hop
+      now pairs a tenant column only with a same-named tenant column of a
+      hop chained to the root; a tenant_id relation reached otherwise is
+      bound to the engine tenant or the root's admitted set, and a site_id
+      relation reached otherwise is refused with missing_tenant_scope. A
+      retarget target carries each root conjunct only onto its same-named
+      column; a site_id target chained to the root by name is admitted on
+      the retarget context's bound. And under a required predicate such
+      as tenant_id IN (7, 8) with no engine tenant, a retarget to a shared
+      hop (retarget('bin')) let later tenant joins, filters, collections
+      and inline sources read every tenant's notes; the rebuilt domain now
+      carries the root's admitted set onto them (as IN), and refuses them
+      with missing_tenant_scope when the root's boundary has no tenant set.
     - SECURITY: every Engine read honours the trusted engine tenant
       (lesson 43). Probed under engine tenant 7 with tenant 8 rows present,
       on SQLite and PostgreSQL: all, compile, stream, projection_sum,
