@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: the engine tenant survives domain rebuilds (lesson 42a).
+      Multi-hop joins and retargets from a shared root through a shared
+      middle hop (products -> categories -> notes), engine copies and
+      parsed-domain rebuilds were already bounded and are now pinned by
+      tests. A directly constructed domain whose association records its
+      target's tenant field lost it through as_contract, so the rebuilt
+      domain joined every tenant's rows; the portable projection now keeps
+      the target schema's tenant_field.
     - SECURITY: on a two-column root (writes.scope.tenant on one column,
       source.tenant_field on another) reads pair tenant columns by name,
       never by position (lesson 41a). A join to a target whose tenant_field

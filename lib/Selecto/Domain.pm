@@ -1336,6 +1336,10 @@ sub _portable_associations {
             primary_key => $target_primary_key,
             fields => [sort keys %$fields],
             columns => \%target_columns,
+            # Lesson 42a: a rebuilt domain keeps the target's tenant field, so
+            # its joins stay bounded by the engine tenant.
+            (defined($association->target_tenant_field)
+                ? (tenant_field => $association->target_tenant_field) : ()),
             associations => _portable_associations(
                 $association->associations, \@path, $schemas, $joins,
             ),
