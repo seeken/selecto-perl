@@ -261,6 +261,7 @@ sub _compile_single {
             push @target_on, $self->_constant_join_predicates(
                 $target_alias, $association->where, \@params
             );
+            push @target_on, $self->_tenant_bound_sql($association, $target_alias, \@params);
             push @bridge_on, $self->_constant_join_predicates(
                 $bridge_alias, $through->{where}, \@params
             );
@@ -312,7 +313,8 @@ sub _compile_single {
                     $self->_qualified($parent_alias, $association->source_scope_key) . ' = ' .
                     $self->_qualified($lookup_alias, $association->target_scope_key);
             }
-            push @target_on, $self->_tenant_pair_sql($association, $parent_alias, $lookup_alias);
+            push @target_on, $self->_tenant_pair_sql($association, $parent_alias, $lookup_alias),
+                $self->_tenant_bound_sql($association, $lookup_alias, \@params);
             if ($lateral_lookup) {
                 # OFFSET 0 keeps PostgreSQL from flattening this correlated
                 # lookup into a join plan that repeatedly scans the relation.
@@ -1835,6 +1837,7 @@ sub _compile_related_collection_at {
         push @target_on, $self->_constant_join_predicates(
             $alias, $association->where, $params
         );
+        push @target_on, $self->_tenant_bound_sql($association, $alias, $params);
         push @predicates, $self->_constant_join_predicates(
             $bridge_alias, $through->{where}, $params
         );
@@ -1845,7 +1848,8 @@ sub _compile_related_collection_at {
         push @predicates, $self->_constant_join_predicates(
             $alias, $association->where, $params
         );
-        push @predicates, $self->_tenant_pair_sql($association, $parent_alias, $alias);
+        push @predicates, $self->_tenant_pair_sql($association, $parent_alias, $alias),
+            $self->_tenant_bound_sql($association, $alias, $params);
     }
     my $filters = $options->{filters} // [];
     Selecto::Error->throw('invalid_query', 'related collection filters are invalid')
@@ -2182,7 +2186,8 @@ sub _compile_computed_field {
     push @predicates, $self->_constant_join_predicates(
         $alias, $association->where, $params
     );
-    push @predicates, $self->_tenant_pair_sql($association, $self->_root_alias, $alias);
+    push @predicates, $self->_tenant_pair_sql($association, $self->_root_alias, $alias),
+        $self->_tenant_bound_sql($association, $alias, $params);
     return 'EXISTS (SELECT 1 FROM ' . $self->_association_source_sql($association) .
         ' AS ' . $self->quote_identifier($alias) . ' WHERE ' .
         join(' AND ', @predicates) . ')';
@@ -2400,6 +2405,23 @@ sub _tenant_pair_sql {
     return () if defined($authored->{source_scope_key}) && defined($authored->{target_scope_key})
         && $authored->{source_scope_key} eq $source && $authored->{target_scope_key} eq $target;
     return $self->_qualified($parent_alias, $source) . ' = ' . $self->_qualified($target_alias, $target);
+}
+
+# Lesson 42: a tenant-scoped relation joined from a shared parent (one that
+# declares no tenant_field, such as a shared root) is bound to the trusted
+# engine tenant in its join condition, so a left join keeps the parent row
+# without exposing another tenant's. A tenant-scoped parent is itself bounded
+# (the root by Selecto::Engine::read_domain, a joined parent by this rule or
+# its tenant pair), so its pair carries the bound.
+sub _tenant_bound_sql {
+    my ($self, $association, $target_alias, $params) = @_;
+    my $field = $association->target_tenant_field;
+    return () unless defined($field) && !defined($association->source_tenant_field);
+    my $engine = $self->{_selecto_compile_engine};
+    my $tenant = $engine ? $engine->scope->{tenant} : undef;
+    return () unless defined $tenant;
+    push @$params, $tenant;
+    return $self->_qualified($target_alias, $field) . ' = ' . $self->placeholder(scalar @$params);
 }
 
 sub _constant_join_predicates {

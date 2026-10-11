@@ -329,3 +329,4 @@ t/sqlite_rollback_policy.integration.t
 t/data_rules_scalar_admission.t
 t/sqlite_rule_scalar_admission.integration.t
 t/join_tenant_pairing.t
+t/shared_root_join_tenant_bound.t
