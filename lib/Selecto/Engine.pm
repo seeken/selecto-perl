@@ -1264,16 +1264,29 @@ sub _guarded_associations {
 }
 
 # The tenant column an association guards on its target, and the root tenant
-# column it pairs that column with.
+# column it pairs that column with. A source_scope_key that is not a root
+# tenant column (such as region_id) relates rows within a tenant; it never
+# makes its target_scope_key a guard column for the tenant set. On a
+# single-column root such an association is guarded by the target's declared
+# tenancy, and refused when the target declares none; on a two-column root
+# it is refused outright ('refuse' tenancies fail domain admission).
 sub _association_tenancy {
     my ($references, $association) = @_;
+    my @roots = @{$references->{root_tenant_fields} // []};
     my $source = $association->{source_scope_key};
-    my $root = defined($source) && grep({ $_ eq $source } @{$references->{root_tenant_fields} // []})
-        ? $source : $references->{tenant_field};
+    my $self = $association->{table} eq $references->{table} && defined($references->{tenant_field});
+    if (defined($source) && !grep { $_ eq $source } @roots) {
+        return ['refuse', 'non_tenant_scope_key_on_two_column_root'] if @roots > 1;
+        my $declared = $association->{target_tenant_field};
+        return ['tenant', "$declared", $references->{tenant_field}]
+            if defined($declared) && !ref($declared) && "$declared" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+        return ['tenant', $references->{tenant_field}, $references->{tenant_field}] if $self;
+        return @roots ? ['refuse', 'non_tenant_scope_key_target_undeclared'] : ['undeclared'];
+    }
+    my $root = defined($source) ? $source : $references->{tenant_field};
     return defined($association->{target_scope_key}) ? ['tenant', $association->{target_scope_key}, $root]
         : defined($association->{target_tenant_field}) ? ['tenant', $association->{target_tenant_field}, $root]
-        : $association->{table} eq $references->{table} && defined($references->{tenant_field})
-            ? ['tenant', $references->{tenant_field}, $root]
+        : $self ? ['tenant', $references->{tenant_field}, $root]
         : ['undeclared'];
 }
 
@@ -1295,8 +1308,16 @@ sub _assert_reference_agreement {
         push @{$by_key{$field}}, {relation => "$target->{relation}",
             tenancy => $tenancy->[0] eq 'tenant' ? [@$tenancy, $references->{tenant_field}] : $tenancy};
     }
-    push @{$by_key{$_->{owner_key}}}, {relation => $_->{table}, tenancy => _association_tenancy($references, $_)}
-        for _guarded_associations($references);
+    for my $association (_guarded_associations($references)) {
+        my $tenancy = _association_tenancy($references, $association);
+        Selecto::Error->throw('invalid_domain',
+            'an association scope key that is not a root tenant column cannot guard its target',
+            {code => 'foreign_key_tenant_scope_undeclared', field => $association->{owner_key},
+                association => $association->{name}, reason => $tenancy->[1], relation => $references->{table},
+                referenced => $association->{table}, required => ['schemas', 'tenant_field'], %details},
+        ) if $tenancy->[0] eq 'refuse';
+        push @{$by_key{$association->{owner_key}}}, {relation => $association->{table}, tenancy => $tenancy};
+    }
     for my $field (sort keys %by_key) {
         my @declared = @{$by_key{$field}};
         for my $i (0 .. $#declared - 1) {
