@@ -72,7 +72,23 @@ sub _scope {
     _pending('transaction_connection_changed') unless refaddr($scope->{dbh}) == refaddr($dbh)
         && refaddr($scope->{inner}) == refaddr($inner);
     _pending('transaction_scope_required') if $dbh->sqlite_get_autocommit;
+    _isolated($adapter);
     return $scope;
+}
+
+# Snapshot protection rests on SQLite's own read isolation. A shared-cache
+# connection with PRAGMA read_uncommitted takes no table read locks: it can
+# read another connection's uncommitted rows, and that connection can commit
+# or roll back between the candidate proof and the business DML. The adapter
+# cannot observe whether the cache is shared (another connection may join it
+# later), so the pragma alone refuses, on every check, before business DML.
+sub _isolated {
+    my ($adapter) = @_;
+    my $rows = _rows($adapter, 'PRAGMA read_uncommitted', [], 1);
+    _pending('read_isolation_unverifiable') unless @$rows == 1 && @{$rows->[0]} == 1
+        && defined($rows->[0][0]) && $rows->[0][0] =~ /\A[01]\z/;
+    _pending('read_uncommitted_isolation') if $rows->[0][0];
+    return 1;
 }
 
 # The engine opens the real adapter transaction before entering this scope.
@@ -87,6 +103,7 @@ sub scope {
     # DBI AutoCommit=>0 transactions begin lazily, before a plain statement.
     _rows($adapter, 'SELECT 1', [], 1);
     _pending('native_transaction_required') if $dbh->sqlite_get_autocommit;
+    _isolated($adapter);
     my ($outer, $inner) = DBI::_handles($dbh);
     my $scope = {dbh => $dbh, inner => $inner, active => 1, subjects => {}, rows => {}};
     $SCOPES{$adapter} = $scope;

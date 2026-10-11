@@ -144,7 +144,17 @@ exits. They bind the actual adapter, connection, command, context, arbiter,
 schema and prior physical row, and are rechecked immediately before dispatch.
 The strategy reports serializable snapshot protection. It does not claim a
 write lock for caller-owned deferred transactions. Native stale-snapshot write
-upgrades retain SQLite's failure behavior. Ordinary UNIQUE NULLs select the
+upgrades retain SQLite's failure behavior. That claim needs SQLite's locking
+reads: with `PRAGMA read_uncommitted` a shared-cache connection takes no table
+read locks, so a peer on the same cache could roll back a row the proof read,
+or commit one it did not see, before the business DML. The scope, every
+projection and the dispatch recheck therefore refuse a connection whose
+`read_uncommitted` is on as `required_data_rule_pending` (reason
+`read_uncommitted_isolation`) before business DML, leaving the caller's
+transaction, savepoints and pragma unchanged. The adapter cannot observe
+whether a cache is or will become shared, so a private connection with the
+pragma on refuses too. Shared-cache connections with the default locking reads
+keep their table read locks until the transaction ends and remain admitted. Ordinary UNIQUE NULLs select the
 insert branch; builtin BINARY, NOCASE and RTRIM arbiters and complete ordinary
 unique indexes are supported. Partial/expression arbiters and ambiguous matching
 index collations remain pending. Consumed literal defaults are projected through

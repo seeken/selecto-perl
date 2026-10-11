@@ -1,6 +1,22 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: a protected SQLite UPSERT refuses a connection with
+      PRAGMA read_uncommitted on (required_data_rule_pending, reason
+      read_uncommitted_isolation). On a shared cache such a connection
+      takes no table read locks: in a deferred transaction (caller-owned
+      BEGIN DEFERRED, or adapter-owned with
+      sqlite_use_immediate_transaction off) the candidate proof could read
+      a peer's uncommitted conflict row, validate the conflict branch
+      against it, and then, after the peer rolled back between the
+      dispatch recheck and the business DML, insert a row whose rules were
+      never checked (reproduced: a nonblank-extra rule admitted a NULL
+      extra). A peer committing in the same window turned a proved insert
+      into an unproved update. The scope, each projection and the dispatch
+      recheck read the pragma; the caller's transaction, savepoints and
+      pragma are left unchanged. A private connection with the pragma on
+      refuses too, as the adapter cannot tell a shared cache apart.
+      Default locking reads, shared or not, are unaffected.
     - SECURITY, BREAKING: on a two-column domain under an engine tenant,
       every write that sets site_id needs a host or required site pin
       (lesson 47b). Once writes bind tenant_id only (47a), tenant 7 could
