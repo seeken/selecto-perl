@@ -113,6 +113,11 @@ sub _construct {
             unless exists $fields->{$self->{tenant_field}};
     }
     for my $association (values %associations) {
+        Selecto::Error->throw(
+            'invalid_domain', 'association tenant fields must be relation fields',
+            {association => $association->name, code => 'foreign_key_tenant_scope_undeclared'},
+        ) if defined($association->source_tenant_field) && !exists($fields->{$association->source_tenant_field})
+            || defined($association->target_tenant_field) && !exists($association->fields->{$association->target_tenant_field});
         if (defined $association->source_scope_key) {
             Selecto::Error->throw(
                 'invalid_domain',
@@ -670,6 +675,25 @@ sub _canonical_associations {
             ) unless exists($source_fields->{$source_key}) && exists($target_fields->{$target_key});
             %scope_keys = (source_scope_key => $source_key, target_scope_key => $target_key);
         }
+        # Lesson 41: when both relations declare tenant_field, the join also
+        # pairs those tenant fields, even when its authored scope keys pair
+        # another column (region_id -> region_id) or it runs through a bridge
+        # (authored pairs are kept as well); otherwise a tenant 7 row reaches
+        # tenant 8's row sharing that column or bridge (Selecto::SQL).
+        my %tenant_keys;
+        if (defined $target->{tenant_field}) {
+            my $target_key = _identifier($target->{tenant_field}, 'tenant field');
+            my $source_key = defined($relation->{tenant_field})
+                ? _identifier($relation->{tenant_field}, 'tenant field') : undef;
+            my $source_fields = _canonical_fields($relation);
+            Selecto::Error->throw(
+                'invalid_domain', 'an association to a tenant-scoped relation must be able to bound its tenant field',
+                {association => $path, code => 'foreign_key_tenant_scope_undeclared'},
+            ) unless exists($target_fields->{$target_key})
+                && (!defined($source_key) || exists($source_fields->{$source_key}));
+            %tenant_keys = (target_tenant_field => $target_key,
+                (defined($source_key) ? (source_tenant_field => $source_key) : ()));
+        }
         $associations{$name} = Selecto::Domain::Association->new(
             name => $name,
             value => {
@@ -687,6 +711,7 @@ sub _canonical_associations {
                 join_mode => $join_mode,
                 queryable => "$queryable",
                 %scope_keys,
+                %tenant_keys,
                 (exists($association->{through}) ? (through => $association->{through}) : ()),
                 (exists($association->{where}) ? (where => $association->{where}) : ()),
                 (exists($association->{join_strategy}) ? (
@@ -2727,6 +2752,8 @@ sub new {
         join_type => $join_type,
         join_mode => $join_mode,
         (defined($join_strategy) ? (join_strategy => $join_strategy) : ()),
+        (map { defined($value->{$_}) ? ($_ => Selecto::Domain::_identifier($value->{$_}, $_ =~ tr/_/ /r)) : () }
+            qw(source_tenant_field target_tenant_field)),
         (defined($source_scope_key) ? (
             source_scope_key => $source_scope_key,
             target_scope_key => $target_scope_key,
@@ -2770,6 +2797,7 @@ sub fingerprint_value {
             ? (target_primary_key => $self->{target_primary_key}) : ()),
         (defined($self->{through}) ? (through => {%{$self->{through}}}) : ()),
         (defined($self->{where}) ? (where => {%{$self->{where}}}) : ()),
+        (map { defined($self->{$_}) ? ($_ => $self->{$_}) : () } qw(source_tenant_field target_tenant_field)),
         (defined($self->{source_scope_key}) ? (
             source_scope_key => $self->{source_scope_key},
             target_scope_key => $self->{target_scope_key},
@@ -2807,6 +2835,8 @@ sub through { return defined($_[0]->{through}) ? {%{$_[0]->{through}}} : undef; 
 sub where { return defined($_[0]->{where}) ? {%{$_[0]->{where}}} : {}; }
 sub source_scope_key { return $_[0]->{source_scope_key}; }
 sub target_scope_key { return $_[0]->{target_scope_key}; }
+sub source_tenant_field { return $_[0]->{source_tenant_field}; }
+sub target_tenant_field { return $_[0]->{target_tenant_field}; }
 
 1;
 

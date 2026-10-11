@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - SECURITY: a join between two relations that both declare tenant_field
+      pairs their tenant fields even when the association authors scope
+      keys on another column (lesson 41). Before, an authored pair such as
+      region_id -> region_id replaced the inferred tenant pair, and through
+      associations never paired tenants, so under a root bounded by the
+      engine tenant or only by its required predicate a tenant 7 read of
+      `select id, account.name` (or a through association's field) returned
+      tenant 8's row sharing tenant 7's region or bridge row, through Engine
+      reads, lateral lookups and the public query route (200), and such a
+      field was a filter oracle. Authored pairs are kept as well. A target
+      whose declared tenant_field is not one of its fields is refused with
+      invalid_domain (details code foreign_key_tenant_scope_undeclared).
     - SECURITY (low): a choice source or co-domain declaration that would
       return a redacted (or internal or hidden) field is refused when the
       engine is built (lesson 37), with invalid_domain and details code
