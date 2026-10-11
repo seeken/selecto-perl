@@ -136,6 +136,17 @@ sub evaluate {
     Selecto::Error->throw('evaluation_limit', 'rule evaluation exceeds its finite resource budget')
         if ($result->{code} // '') eq 'evaluation_limit';
     _pending('consumed input or prospective candidate is unknown') if $unknown;
+    # Submitted bindings normalize in sorted-id order, so a related-path test
+    # (value.compare_path) can read a field before that field's own normalizer
+    # runs. Re-test those bindings once against the fully normalized
+    # submission, without normalizers, as the candidate stage rechecks after
+    # native reprojection.
+    if ($result->{state} eq 'passed' && !$options{test_only} && ($stage eq 'input' || $stage eq 'action_input')) {
+        $result = $rules->_recheck_related(stage => $stage, operation => $operation, subject => $result->{normalized},
+            (defined($options{action}) ? (action => $options{action}) : ()));
+        Selecto::Error->throw('evaluation_limit', 'rule evaluation exceeds its finite resource budget')
+            if ($result->{code} // '') eq 'evaluation_limit';
+    }
     if ($result->{state} ne 'passed') {
         _pending() if $result->{state} eq 'pending' || $result->{state} eq 'error';
         my $error = Selecto::Error->new(code => 'data_rule_failed', message => 'required domain data rule failed',
