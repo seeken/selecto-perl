@@ -2549,8 +2549,9 @@ sub _compile_write {
             my $updates = $metadata->{upsert_update_fields};
             Selecto::Error->throw('invalid_write', 'upsert conflict target must be a non-empty string array')
                 unless ref($conflict) eq 'ARRAY' && @$conflict && !grep { ref($_) } @$conflict;
-            Selecto::Error->throw('invalid_write', 'upsert update fields must be a string array')
-                unless ref($updates) eq 'ARRAY' && !grep { ref($_) } @$updates;
+            Selecto::Error->throw('invalid_write', 'upsert update fields must be a non-empty string array')
+                unless ref($updates) eq 'ARRAY' && !(grep { ref($_) } @$updates)
+                    && (@$updates || $self->_admits_empty_upsert_mask($command));
             $sql .= $self->_compile_upsert_clause($conflict, $updates);
         }
         return $self->_append_returning($sql, \@params, $command);
@@ -3287,6 +3288,10 @@ sub _compile_timezone_sql {
         'unsupported_feature', 'adapter does not support explicit query timezones',
     );
 }
+
+# Only an adapter that proves the native conflict branch may compile an empty
+# update mask as DO NOTHING.
+sub _admits_empty_upsert_mask { return 0 }
 
 sub _compile_upsert_clause {
     my ($self, $conflict, $updates) = @_;

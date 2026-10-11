@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - An empty UPSERT update mask compiles to DO NOTHING only on the
+      protected SQLite path (a SQLite engine whose domain has stored UPSERT
+      rules, dispatched with its private candidate receipt). Since the
+      protected UPSERT port every adapter accepted an empty mask; PostgreSQL,
+      DuckDB, MSSQL and unprotected SQLite engines refuse it again with
+      invalid_write, and their upsert actions with no updatable change with
+      invalid_action_plan. The HTTP API still requires a non-empty mask.
     - SECURITY: a portable-compiled protected UPSERT, whose choice
       membership is deferred to native branch projection, is refused with
       compiled_upsert_mismatch when the executing engine's domain, trusted

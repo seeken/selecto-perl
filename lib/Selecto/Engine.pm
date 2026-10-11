@@ -2099,7 +2099,18 @@ sub _action_upsert_metadata {
     my @updates = sort grep {
         !$key{$_} && ref($fields->{$_}) eq 'HASH' && $fields->{$_}{updatable}
     } keys %{$plan->changes // {}};
+    Selecto::Error->throw('invalid_action_plan', 'upsert actions need at least one updatable change',
+        {action => $plan->action}) unless @updates || $self->_admits_empty_upsert_mask;
     return (conflict_target => [map { "$_" } @$target], upsert_update_fields => \@updates);
+}
+# An empty update mask compiles to DO NOTHING only where the native branch is
+# proved: a SQLite engine whose domain has stored UPSERT rules, so the command
+# is governed through the protected candidate and its receipt. Every other
+# adapter and unprotected path keeps requiring a non-empty mask.
+sub _admits_empty_upsert_mask {
+    my ($self) = @_;
+    return $self->{adapter}->name eq 'sqlite' && $self->{adapter}->can('rule_upsert_candidate')
+        && Selecto::WriteRules->has_stored_rules($self->{domain}, 'upsert') ? 1 : 0;
 }
 
 sub preview_action {
@@ -2426,6 +2437,7 @@ sub _validate_write_command {
         allowed_ops => undef,
         label       => $command->relation,
         trusted_field => $options{trusted_field},
+        empty_upsert_mask => $self->_admits_empty_upsert_mask,
         computed    => sub { ref($self->{domain}->_field_metadata_view($_[0])->{computed}) eq 'HASH' },
     );
 }
@@ -2551,7 +2563,7 @@ sub _validate_command_against_contract {
             $writes, $metadata->{conflict_target}, $domain_fields);
         my $updates = $metadata->{upsert_update_fields};
         Selecto::Error->throw('invalid_write', 'upsert requires declared update fields')
-            unless ref($updates) eq 'ARRAY';
+            unless ref($updates) eq 'ARRAY' && (@$updates || $context{empty_upsert_mask});
         for my $field (@$updates) {
             Selecto::Error->throw('invalid_write', 'upsert update fields must be field names') if ref($field);
             Selecto::Error->throw('unknown_field', "upsert update field is not declared by $label", { field => "$field" })
