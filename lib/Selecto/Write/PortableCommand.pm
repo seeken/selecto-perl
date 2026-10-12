@@ -12,6 +12,7 @@ use bytes ();
 use POSIX ();
 use Encode qw(encode_utf8);
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Selecto::Error ();
 use Selecto::Limits ();
 use Selecto::Domain::QueryContract ();
@@ -333,7 +334,7 @@ sub _accepted_graph_inputs {
 sub _fail { Selecto::Error->throw($_[0], $_[1], {code => $_[0], %{$_[2] // {}}}); }
 sub _copy { Selecto::Domain::QueryContract->copy_declaration({value => $_[0]})->{value} }
 sub _true { JSON::PP::is_bool($_[0]) ? ${$_[0]} == 1 : defined($_[0]) && !ref($_[0]) && $_[0] eq '1' }
-sub _same { JSON::PP->new->canonical->encode([$_[0]]) eq JSON::PP->new->canonical->encode([$_[1]]) }
+sub _same { Cpanel::JSON::XS->new->canonical->encode([$_[0]]) eq Cpanel::JSON::XS->new->canonical->encode([$_[1]]) }
 
 # The optional atom marker preserves distinct authored identifier spellings in
 # languages with atoms. Plain Perl strings remain ordinary identifiers.

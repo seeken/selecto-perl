@@ -2,6 +2,7 @@ package Selecto::SQL;
 
 use Mojo::Base 'Selecto::Adapter';
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use B ();
 use Digest::SHA qw(sha1_hex);
 use Scalar::Util qw(blessed refaddr);
@@ -1311,7 +1312,7 @@ sub execute_graph_unsafe {
                         my $type = $nodes{$id}{command}->metadata->{__selecto_insert_types}{$_};
                         Selecto::InsertAdmission::_value(lc($type // ''), $values->{$_}, $_)
                     } @{$set->{identity_fields}};
-                    my $key = JSON::PP->new->canonical->encode([map { "$_" } @identity]);
+                    my $key = Cpanel::JSON::XS->new->canonical->encode([map { "$_" } @identity]);
                     Selecto::Error->throw('invalid_write_graph', 'owned sync contains duplicate returned identities')
                         if $seen{$key}++;
                     push @kept, Selecto::Expression->all(map {
@@ -1548,7 +1549,7 @@ sub _compile_expression {
             unless blessed($operand) && $operand->kind eq 'field'
                 && ($domain->resolve($operand->arguments->[0])->{type} // '') =~ /\Ajsonb?\z/i;
         my $operand_sql = $self->_compile_expression($domain, $operand, $params);
-        push @$params, JSON::PP->new->canonical(1)->allow_nonref(1)->encode($arguments->[1]);
+        push @$params, Cpanel::JSON::XS->new->canonical(1)->allow_nonref(1)->encode($arguments->[1]);
         return $self->_compile_json_contains(
             $operand_sql, $self->placeholder(scalar @$params),
         );

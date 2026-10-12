@@ -5,6 +5,7 @@ use strict;
 use warnings;
 use B ();
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
 
@@ -224,7 +225,7 @@ sub _merge {
             ((@next == 1 && ($key eq 'redact_fields' || $key eq 'extensions')) ||
              (@next == 2 && $next[0] eq 'source' && $key eq 'redact_fields'))) {
             my %seen;
-            my $json = JSON::PP->new->canonical;
+            my $json = Cpanel::JSON::XS->new->canonical;
             $result->{$key} = [map { _clone($_) } grep {
                 my $id = $json->encode(_key($_));
                 !$seen{$id}++

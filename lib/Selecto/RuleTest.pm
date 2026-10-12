@@ -3,6 +3,7 @@ use 5.034;
 use strict;
 use warnings;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Math::BigRat ();
 use Math::BigFloat ();
 use Scalar::Util qw(blessed reftype);
@@ -57,7 +58,7 @@ sub kind {
     return 'collection' if ref($value) eq 'ARRAY';
     return 'object' if ref($value) eq 'HASH';
     return 'unsupported' if ref $value;
-    my $wire = JSON::PP->new->allow_nonref->encode($value);
+    my $wire = Cpanel::JSON::XS->new->allow_nonref->encode($value);
     return substr($wire, 0, 1) eq '"' ? 'text' : 'number';
 }
 sub text {
@@ -212,7 +213,7 @@ sub compile {
         _fail('invalid_data_rules_contract', 'unique_by requires bounded paths') unless ref($test->{paths}) eq 'ARRAY'
             && @{$test->{paths}} && @{$test->{paths}} <= 1000;
         my %seen;
-        for (@{$test->{paths}}) { my $path = _path($_); my $key = JSON::PP->new->encode($path);
+        for (@{$test->{paths}}) { my $path = _path($_); my $key = Cpanel::JSON::XS->new->encode($path);
             _fail('invalid_data_rules_contract', 'duplicate unique_by path') if $seen{$key}++ }
     } elsif ($op eq 'all' || $op eq 'any') {
         _keys($test, qw(op rules));

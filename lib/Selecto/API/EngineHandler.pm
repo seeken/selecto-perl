@@ -6,6 +6,7 @@ use warnings;
 
 use Mojo::Base -base, -signatures;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed);
 use Selecto::API::ResultFormatter ();
 use Selecto::API::ResponsePolicy ();
@@ -1400,7 +1401,7 @@ sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
             my $decoded = $row->[$index];
             my $ok = ref($decoded) eq 'ARRAY';
             $ok = defined($decoded) && !ref($decoded)
-                && eval { $decoded = JSON::PP->new->max_depth($limits->get('max_response_depth'))->decode($decoded); 1 }
+                && eval { $decoded = Cpanel::JSON::XS->new->max_depth($limits->get('max_response_depth'))->decode($decoded); 1 }
                 unless $ok;
             Selecto::Error->throw(
                 'invalid_api_host', 'Selecto adapter returned an invalid related collection',
@@ -1468,7 +1469,7 @@ sub _collection_json_value ($value) {
     return $value unless defined($value) && !ref($value);
     # Preserve strings and safe numeric JSON types. Comparing decimal digits
     # avoids routing exact 64-bit IDs through floating-point arithmetic.
-    my $wire = JSON::PP->new->allow_nonref(1)->encode($value);
+    my $wire = Cpanel::JSON::XS->new->allow_nonref(1)->encode($value);
     if ($wire =~ /\A-?([0-9]+)\z/) {
         my $digits = $1;
         return substr($wire, 0) if length($digits) > 16

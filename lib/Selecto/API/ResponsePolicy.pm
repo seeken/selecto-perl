@@ -6,6 +6,7 @@ use warnings;
 use Hash::Util::FieldHash qw(fieldhash);
 use Scalar::Util qw(blessed isdual);
 use JSON::PP ();
+use Selecto::CanonicalJSON ();
 use B ();
 use bytes ();
 use Selecto::Limits ();
@@ -286,7 +287,7 @@ sub _scalar_json_bytes {
     if (!$key && ($flags & (B::SVp_IOK() | B::SVp_NOK())) && !($flags & B::SVp_POK())) {
         # Native numeric scalars have bounded textual representations. Canonical
         # JSON's ordinary validator still rejects non-integral numeric values.
-        return length(JSON::PP->new->allow_nonref->encode($value));
+        return length(Selecto::CanonicalJSON->encode($value));
     }
     my $bytes = 2 + bytes::length($value);
     # Raw eight-bit Perl strings encode their high bytes as Unicode code points.

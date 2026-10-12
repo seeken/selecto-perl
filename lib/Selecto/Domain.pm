@@ -6,6 +6,8 @@ use warnings;
 use Digest::SHA qw(sha256_hex);
 use Encode qw(encode_utf8);
 use JSON::PP ();
+use Cpanel::JSON::XS ();
+use Selecto::CanonicalJSON ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Error ();
@@ -204,7 +206,7 @@ sub _refresh_fingerprint {
             $fingerprint_value->{$key} = $contract->{$key} if defined $contract->{$key};
         }
     }
-    my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
+    my $json = Selecto::CanonicalJSON->encode($fingerprint_value);
     $self->{fingerprint} = 'sha256:' . sha256_hex(encode_utf8($json));
     return $self;
 }
@@ -283,7 +285,7 @@ sub parse {
     if (ref($document)) {
         $raw = $document;
     } else {
-        my $ok = eval { $raw = JSON::PP->new->allow_nonref(0)->decode($document); 1 };
+        my $ok = eval { $raw = Cpanel::JSON::XS->new->allow_nonref(0)->decode($document); 1 };
         Selecto::Error->throw('invalid_domain', 'domain JSON is malformed', { parser => 'JSON::PP' })
             unless $ok;
     }
@@ -431,7 +433,7 @@ sub _parse_canonical {
     my $fingerprint_document = _clone_with_rules($raw);
     delete $fingerprint_document->{domain_fingerprint};
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
-        encode_utf8(JSON::PP->new->canonical(1)->encode($fingerprint_document))
+        encode_utf8(Selecto::CanonicalJSON->encode($fingerprint_document))
     );
     return $domain;
 }

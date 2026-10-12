@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed looks_like_number reftype);
 use Storable qw(dclone);
 use POSIX qw(isfinite);
@@ -721,7 +722,7 @@ sub _different_parameters {
 sub _canonical {
     my ($value) = @_;
     require JSON::PP;
-    return JSON::PP->new->canonical(1)->encode($value);
+    return Cpanel::JSON::XS->new->canonical(1)->encode($value);
 }
 
 1;

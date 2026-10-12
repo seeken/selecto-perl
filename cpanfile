@@ -9,6 +9,7 @@ requires 'Encode';
 requires 'Excel::Writer::XLSX', '1.10';
 requires 'File::Temp';
 requires 'JSON::PP', '4.06';
+requires 'Cpanel::JSON::XS', '4.38';
 requires 'Unicode::Normalize';
 requires 'Math::BigInt';
 requires 'Math::BigRat';

@@ -8,6 +8,7 @@ use Mojo::Base -base, -signatures;
 use Digest::SHA qw(sha256_hex);
 use Encode qw(decode encode FB_CROAK LEAVE_SRC);
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed);
 use Text::CSV ();
 use Selecto::DateShortcut ();
@@ -349,7 +350,7 @@ sub preview_rows ($self, $inspection, $configuration, %options) {
     my $limits = $self->limits->tightened(max_import_preview_bytes => $self->limits->get('max_response_bytes'));
     my $output_budget = Selecto::OperationBudget->new(limits => $limits, code => 'import_preview_limit_exceeded');
     $output_budget->check_tree($normalized, label => 'preview configuration', bytes_limit => 'max_import_preview_bytes');
-    my $encoded_bytes = bytes::length(JSON::PP->new->canonical->utf8->encode($normalized));
+    my $encoded_bytes = bytes::length(Cpanel::JSON::XS->new->canonical->utf8->encode($normalized));
     $limits->check_count('max_import_preview_bytes', $encoded_bytes, 'import_preview_limit_exceeded', 'preview bytes');
     my $selected = 0;
     for my $row (@{$inspection->{rows} // []}) {
@@ -370,7 +371,7 @@ sub preview_rows ($self, $inspection, $configuration, %options) {
         _charge_value($value_budget, $value);
         my $transformed = _apply_transforms($value, $mapping->{transforms});
         _charge_value(Selecto::OperationBudget->new(limits => $self->limits, code => 'import_preview_limit_exceeded'), $transformed);
-        $constant_bytes += bytes::length(JSON::PP->new->allow_nonref->utf8->encode($transformed));
+        $constant_bytes += bytes::length(Cpanel::JSON::XS->new->allow_nonref->utf8->encode($transformed));
     }
     $limits->check_count('max_import_preview_bytes', $encoded_bytes + $constant_bytes * $selected,
         'import_preview_limit_exceeded', 'static preview expansion');
@@ -382,12 +383,12 @@ sub preview_rows ($self, $inspection, $configuration, %options) {
         last if defined($normalized->{rows}{end}) && $row->{row_number} > $normalized->{rows}{end};
         my $preview = $self->_preview_row($row, $normalized, $key_set, $trusted, $resolver);
         $output_budget->check_tree($preview, label => 'preview rows', bytes_limit => 'max_import_preview_bytes');
-        $encoded_bytes += bytes::length(JSON::PP->new->canonical->utf8->encode($preview));
+        $encoded_bytes += bytes::length(Cpanel::JSON::XS->new->canonical->utf8->encode($preview));
         $limits->check_count('max_import_preview_bytes', $encoded_bytes, 'import_preview_limit_exceeded', 'preview bytes');
         push @rows, $preview;
     }
     my $result = {configuration => $normalized, rows => \@rows, returned => scalar(@rows)};
-    $limits->check_bytes('max_import_preview_bytes', JSON::PP->new->canonical->utf8->encode($result),
+    $limits->check_bytes('max_import_preview_bytes', Cpanel::JSON::XS->new->canonical->utf8->encode($result),
         'import_preview_limit_exceeded', 'encoded preview bytes');
     return $result;
 }
@@ -779,7 +780,7 @@ sub _resolve_value ($mapping, $values, $parameters, $trusted) {
 sub _charge_value ($budget, $value) {
     if (ref($value) && !JSON::PP::is_bool($value)) {
         $budget->check_tree($value, label => 'import value');
-        $budget->consume_value(JSON::PP->new->allow_nonref->utf8->encode($value), label => 'import value');
+        $budget->consume_value(Cpanel::JSON::XS->new->allow_nonref->utf8->encode($value), label => 'import value');
     } else {
         $budget->consume_value($value, label => 'import value');
     }
@@ -869,7 +870,7 @@ sub _reject_unknown ($value, $allowed, $label) {
     my @unknown = sort grep { !$allowed{$_} } keys %$value;
     Selecto::Error->throw('invalid_import_configuration', "$label has unknown properties", {properties => \@unknown}) if @unknown;
 }
-sub _clone ($value) { return JSON::PP->new->allow_nonref(1)->decode(JSON::PP->new->canonical(1)->encode($value)); }
+sub _clone ($value) { return Cpanel::JSON::XS->new->allow_nonref(1)->decode(Cpanel::JSON::XS->new->canonical(1)->encode($value)); }
 sub _error_hash ($error, $field) {
     return {code => $error->code, message => $error->message, defined($field) ? (field => $field) : (), details => $error->details}
         if blessed($error) && $error->isa('Selecto::Error');

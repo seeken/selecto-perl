@@ -8,6 +8,8 @@ use POSIX qw(isfinite);
 use DBI qw(SQL_INTEGER SQL_DOUBLE SQL_VARCHAR);
 use Selecto::SQLite::Ownership ();
 use Selecto::SQLite::UpsertCandidate ();
+use Cpanel::JSON::XS ();
+use JSON::PP ();
 
 sub rule_upsert_scope {
     Selecto::SQLite::UpsertCandidate::_check_args(@_);
@@ -635,7 +637,7 @@ sub _json_available {
             my ($source, $needle) = @_;
             return undef unless defined($source) && defined($needle);
             my ($left, $right);
-            my $json = JSON::PP->new->allow_nonref(1)->allow_bignum(1);
+            my $json = Cpanel::JSON::XS->new->allow_nonref(1)->allow_bignum(1);
             return 0 unless eval { $left = $json->decode($source); $right = $json->decode($needle); 1 };
             return _json_contains_value($left, $right) ? 1 : 0;
         });
@@ -677,7 +679,7 @@ sub _json_contains_value {
             && ($source ? 1 : 0) == ($needle ? 1 : 0) ? 1 : 0;
     }
     return 0 if ref($source) eq 'HASH' || ref($source) eq 'ARRAY';
-    my $json = JSON::PP->new->allow_nonref(1)->allow_bignum(1);
+    my $json = Cpanel::JSON::XS->new->allow_nonref(1)->allow_bignum(1);
     my $left = $json->encode($source);
     my $right = $json->encode($needle);
     my $left_string = $left =~ /\A"/;
@@ -720,7 +722,7 @@ sub _compile_array_predicate {
         $type eq 'integer' ? 0 + $_ : $type eq 'boolean' ? ($_ ? JSON::PP::true : JSON::PP::false)
             : $type eq 'decimal' ? 0 + $_ : "$_"
     } @$values;
-    push @$params, JSON::PP->new->canonical(1)->encode(\@typed);
+    push @$params, Cpanel::JSON::XS->new->canonical(1)->encode(\@typed);
     my $marker = $self->placeholder(scalar @$params);
     return 'selecto_json_contains(' . ($kind eq 'array_contained' ? "$marker, $source" : "$source, $marker") . ')'
         if $kind ne 'array_overlap';

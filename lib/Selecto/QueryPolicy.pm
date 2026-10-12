@@ -3,7 +3,7 @@ package Selecto::QueryPolicy;
 use 5.034;
 use strict;
 use warnings;
-use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::Expression ();
@@ -121,7 +121,7 @@ sub _field {
 }
 sub _key {
     my ($expression) = @_;
-    return $expression->kind . '\0' . ($expression->alias_name // '') . '\0' . JSON::PP->new->canonical->encode($expression->arguments)
+    return $expression->kind . '\0' . ($expression->alias_name // '') . '\0' . Cpanel::JSON::XS->new->canonical->encode($expression->arguments)
         if $expression->kind eq 'field';
     # Other expressions remain separate optional selections. Required policy
     # currently accepts governed field paths only, so it cannot erase them.

@@ -5,6 +5,7 @@ use strict;
 use warnings;
 no overloading;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(reftype);
 use Selecto::Domain::QueryContract ();
 use Selecto::Error ();
@@ -32,7 +33,7 @@ sub _entries {
     } @$value;
 }
 sub _same {
-    return JSON::PP->new->canonical->encode($_[0]) eq JSON::PP->new->canonical->encode($_[1]);
+    return Cpanel::JSON::XS->new->canonical->encode($_[0]) eq Cpanel::JSON::XS->new->canonical->encode($_[1]);
 }
 sub _true {
     return ${$_[0]} == 1 if ref($_[0]) eq 'JSON::PP::Boolean';
@@ -115,7 +116,7 @@ sub resolve {
     my %context=(%{$state->{values}},%{$state->{identity}});
     $context{tenant_field}//='tenant_id' if defined $context{tenant_id};
     $context{required}=JSON::PP::true if $state->{required};
-    my %seen;my @filters=grep{!$seen{JSON::PP->new->canonical->encode($_)}++}@{$state->{filters}};
+    my %seen;my @filters=grep{!$seen{Cpanel::JSON::XS->new->canonical->encode($_)}++}@{$state->{filters}};
     $context{required_filters}=\@filters if @filters;
     return _copy(\%context);
 }
@@ -319,7 +320,7 @@ sub apply_tenant_scope {
             && _same($_->[1],$context->{tenant_id})} @filters;
         push @filters,[$field,$context->{tenant_id}] unless $present;
     }
-    my %seen;$snapshot->{filters}=[grep{!$seen{JSON::PP->new->canonical->encode($_)}++}@filters];
+    my %seen;$snapshot->{filters}=[grep{!$seen{Cpanel::JSON::XS->new->canonical->encode($_)}++}@filters];
     return _copy($snapshot);
 }
 sub apply_execution_scope {
@@ -335,7 +336,7 @@ sub apply_execution_scope {
     else {
         _fail('invalid_write_context','operation filters must be an array') unless ref($snapshot->{filters}//[]) eq 'ARRAY';
         my @filters=(@{$snapshot->{filters}//[]},@{$context->{required_filters}//[]});
-        my %seen;$snapshot->{filters}=[grep{!$seen{JSON::PP->new->canonical->encode($_)}++}@filters];
+        my %seen;$snapshot->{filters}=[grep{!$seen{Cpanel::JSON::XS->new->canonical->encode($_)}++}@filters];
     }
     if ($trusted && defined $context->{tenant_id}) {
         my $field=$class->identifier($scope->{field});

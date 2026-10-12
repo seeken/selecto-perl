@@ -3,7 +3,7 @@ package Selecto::Domain::DSL;
 use 5.034;
 use strict;
 use warnings;
-use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Storable qw(dclone);
 use Selecto::Domain ();
 use Selecto::DataRules ();
@@ -224,7 +224,7 @@ sub _clone {
 
 sub _value_key {
     my ($value) = @_;
-    my $key = eval { JSON::PP->new->canonical(1)->allow_nonref(1)->encode($value) };
+    my $key = eval { Cpanel::JSON::XS->new->canonical(1)->allow_nonref(1)->encode($value) };
     return defined($key) ? $key : (ref($value) || 'scalar') . ':' . "$value";
 }
 

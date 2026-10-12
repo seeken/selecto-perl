@@ -19,6 +19,7 @@ lib/Selecto/API.pm
 lib/Selecto/API/EngineHandler.pm
 t/api_field_roles_adversarial.t
 lib/Selecto/API/ResultFormatter.pm
+lib/Selecto/CanonicalJSON.pm
 lib/Selecto/CannedPage.pm
 lib/Selecto/CoDomain.pm
 lib/Selecto/ConfiguredDomain.pm
@@ -108,6 +109,7 @@ t/api_write_grants.t
 t/api_write_parity_live.t
 t/array_json.t
 t/canned_page.integration.t
+t/canonical_json.t
 t/canonical_values.t
 t/canonical_values.integration.t
 t/canned_page_case_insensitive.t

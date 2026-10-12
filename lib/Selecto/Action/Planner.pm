@@ -5,6 +5,7 @@ use strict;
 use warnings;
 use bytes ();
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed);
 use Selecto::Action::Plan ();
 use Selecto::Domain ();
@@ -61,7 +62,7 @@ sub plan {
         return $class->_plan($input, $intent, %options);
     }, limits => _limits($options{limits}));
     $ACCEPTED_PLANS{$plan} = {
-        contract => JSON::PP->new->canonical->encode(_contract($input)),
+        contract => Cpanel::JSON::XS->new->canonical->encode(_contract($input)),
         digest => Selecto::Action::Grant->plan_digest($plan),
         work => $work,
     };
@@ -73,7 +74,7 @@ sub _accepted_plan {
     my $record = $ACCEPTED_PLANS{$plan};
     return 0 unless $record;
     Selecto::Error->throw('action_plan_mismatch', 'plan differs from accepted planning evidence')
-        unless $record->{contract} eq JSON::PP->new->canonical->encode(_contract($domain))
+        unless $record->{contract} eq Cpanel::JSON::XS->new->canonical->encode(_contract($domain))
             && $record->{digest} eq Selecto::Action::Grant->plan_digest($plan);
     return 1;
 }
@@ -612,8 +613,8 @@ sub _condition_matches {
 
 sub _same_value {
     my ($left, $right) = @_;
-    return JSON::PP->new->canonical(1)->allow_nonref(1)->encode($left)
-        eq JSON::PP->new->canonical(1)->allow_nonref(1)->encode($right);
+    return Cpanel::JSON::XS->new->canonical(1)->allow_nonref(1)->encode($left)
+        eq Cpanel::JSON::XS->new->canonical(1)->allow_nonref(1)->encode($right);
 }
 
 sub _resolve_template {

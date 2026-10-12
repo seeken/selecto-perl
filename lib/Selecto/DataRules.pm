@@ -5,6 +5,7 @@ use warnings;
 no overloading;
 use B ();
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Math::BigRat ();
 use Selecto::Error ();
 use Selecto::OperationBudget ();
@@ -402,7 +403,7 @@ sub _normalize {
     }
     return ($current, undef);
 }
-sub _hash { my($v,$code,$label)=@_;_fail($code,"$label must be an object")unless ref$v eq'HASH';return$v } sub _keys {my($v,$a,$l)=@_;my%a=map{$_=>1}@$a;_fail('unknown_rule_option',"unknown member in $l")if grep{!$a{$_}}keys%$v} sub _id{defined($_[0])&&!ref($_[0])&&length($_[0])>0} sub _positive{_fail('invalid_rule_version','version must be a positive integer')unless defined($_[0])&&!ref($_[0])&&$_[0]=~/\A[1-9][0-9]*\z/;$_[0]} sub _nonneg{defined($_[0])&&!ref($_[0])&&$_[0]=~/\A(?:0|[1-9][0-9]*)\z/?$_[0]:undef} sub _ref{my$v=_hash($_[0],'invalid_data_rules_contract','reference');_keys($v,[qw(id version)],'reference');_fail('invalid_data_rules_contract','reference id is invalid')unless _id($v->{id});{id=>$v->{id},version=>_positive($v->{version})}} sub _path{my$v=$_[0];_fail('invalid_data_rules_contract','path is invalid')unless ref$v eq'ARRAY'&&@$v&&!grep{!defined($_)||ref($_)||$_ eq''}@$v;[@$v]} sub _at{my($r,$p)=@_;my$c=$r;for(@$p){return(undef,0)unless ref$c eq'HASH'&&exists$c->{$_};$c=$c->{$_}}($c,1)}sub _set{my($r,$p,$v)=@_;my$c=$r;for my$k(@$p[0..$#$p-1]){$c->{$k}={}unless ref$c->{$k}eq'HASH';$c=$c->{$k}}$c->{$p->[-1]}=$v}sub _decimal{my$v=$_[0];return undef unless defined$v&&!ref$v&&"$v"=~/\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/;Math::BigRat->new("$v")}sub _stable{JSON::PP->new->canonical(1)->encode($_[0])}sub _result{my($s,$n,$c,$p)=@_;{state=>$s,normalized=>$n,(defined$c?(code=>$c):()),(defined$p?(path=>[@$p]):())}}sub _fail{Selecto::Error->throw(@_)}
+sub _hash { my($v,$code,$label)=@_;_fail($code,"$label must be an object")unless ref$v eq'HASH';return$v } sub _keys {my($v,$a,$l)=@_;my%a=map{$_=>1}@$a;_fail('unknown_rule_option',"unknown member in $l")if grep{!$a{$_}}keys%$v} sub _id{defined($_[0])&&!ref($_[0])&&length($_[0])>0} sub _positive{_fail('invalid_rule_version','version must be a positive integer')unless defined($_[0])&&!ref($_[0])&&$_[0]=~/\A[1-9][0-9]*\z/;$_[0]} sub _nonneg{defined($_[0])&&!ref($_[0])&&$_[0]=~/\A(?:0|[1-9][0-9]*)\z/?$_[0]:undef} sub _ref{my$v=_hash($_[0],'invalid_data_rules_contract','reference');_keys($v,[qw(id version)],'reference');_fail('invalid_data_rules_contract','reference id is invalid')unless _id($v->{id});{id=>$v->{id},version=>_positive($v->{version})}} sub _path{my$v=$_[0];_fail('invalid_data_rules_contract','path is invalid')unless ref$v eq'ARRAY'&&@$v&&!grep{!defined($_)||ref($_)||$_ eq''}@$v;[@$v]} sub _at{my($r,$p)=@_;my$c=$r;for(@$p){return(undef,0)unless ref$c eq'HASH'&&exists$c->{$_};$c=$c->{$_}}($c,1)}sub _set{my($r,$p,$v)=@_;my$c=$r;for my$k(@$p[0..$#$p-1]){$c->{$k}={}unless ref$c->{$k}eq'HASH';$c=$c->{$k}}$c->{$p->[-1]}=$v}sub _decimal{my$v=$_[0];return undef unless defined$v&&!ref$v&&"$v"=~/\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/;Math::BigRat->new("$v")}sub _stable{Cpanel::JSON::XS->new->canonical(1)->encode($_[0])}sub _result{my($s,$n,$c,$p)=@_;{state=>$s,normalized=>$n,(defined$c?(code=>$c):()),(defined$p?(path=>[@$p]):())}}sub _fail{Selecto::Error->throw(@_)}
 {
     package Selecto::DataRules::_BudgetScope;
     sub DESTROY { $_[0]{restore}->() }
