@@ -246,6 +246,7 @@ docs/contract-compatibility.md
 t/sqlite_numeric_parameters.t
 lib/Selecto/Domain/Identity.pm
 t/domain_identity.t
+t/domain_identity_verification.t
 t/fixtures/domain_identity.json
 lib/Selecto/QueryLibrary/Contract.pm
 lib/Selecto/QueryPolicy.pm
