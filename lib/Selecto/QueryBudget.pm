@@ -150,13 +150,18 @@ sub begin {
         } elsif ($name eq 'mysql' || $name eq 'mariadb') {
             my $setting = $name eq 'mysql' ? 'max_execution_time' : 'max_statement_time';
             my ($prior) = $dbh->selectrow_array('SELECT @@SESSION.' . $setting);
+            # Literal numbers: DBD::MariaDB binds placeholders client-side as
+            # quoted strings, which these system variables reject.
+            die 'query timeout configuration failed'
+                unless defined($prior) && "$prior" =~ /\A\d{1,12}(?:\.\d{1,6})?\z/;
             my $value = $name eq 'mysql' ? 0 + $ms : $ms / 1000;
-            $value = $prior if $prior && $prior < $value;
+            $value = 0 + $prior if $prior > 0 && $prior < $value;
+            my $literal = sub { return $name eq 'mysql' ? sprintf('%d', $_[0]) : sprintf('%.6f', $_[0]); };
             $self->{restore} = sub {
-                defined($dbh->do('SET SESSION ' . $setting . ' = ?', undef, $prior))
+                defined($dbh->do('SET SESSION ' . $setting . ' = ' . $literal->($prior)))
                     or die 'query timeout restoration failed';
             };
-            defined($dbh->do('SET SESSION ' . $setting . ' = ?', undef, $value))
+            defined($dbh->do('SET SESSION ' . $setting . ' = ' . $literal->($value)))
                 or die 'query timeout configuration failed';
         } elsif ($name eq 'mssql') {
             my $prior = $dbh->{odbc_query_timeout};

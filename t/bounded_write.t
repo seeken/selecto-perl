@@ -108,7 +108,10 @@ subtest 'unproven broad-write dialects refuse, bounded key writes remain support
         my $adapter=Selecto->adapter($name=>(dbh=>TestSelecto::DBH->new));
         my $cmd=command(1)->with_metadata({__selecto_primary_key=>'id',__selecto_write_limit=>1000});
         eval{$adapter->_bounded_write_command($cmd)};
-        is $@->code,'write_capability_missing',"$name broad predicate refused";
+        # MySQL and MariaDB bound broad writes with a locking key probe under
+        # a server deadline, which a handle without DBI cannot provide.
+        is $@->code, $name =~ /\Amysql|mariadb\z/ ? 'query_budget_unsupported' : 'write_capability_missing',
+            "$name broad predicate refused";
         my $key=command(1,'update',Selecto::Expression->eq('id',1))->with_metadata($cmd->metadata);
         is $adapter->_bounded_write_command($key),$key,"$name unique-key write needs no preflight";
     }

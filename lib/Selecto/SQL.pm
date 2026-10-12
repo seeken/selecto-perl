@@ -227,7 +227,6 @@ sub _compile_single {
     }
     my %compiled_selections;
     my %selection_positions;
-    my %selection_aliases;
     my $selection_position = 0;
     my @projection;
     my @selection_sql = map {
@@ -244,7 +243,6 @@ sub _compile_single {
         my $item = $needs_result_alias
             ? $expression_sql . ' AS ' . $self->quote_identifier($columns[$selection_position - 1])
             : $expression_sql;
-        $selection_aliases{_expression_key($_)} //= $columns[$selection_position - 1] if $needs_result_alias;
         push @projection, [length($expression_sql), length($item), $self->_canonical_kind($domain, $_)];
         $item
     } @$selections;
@@ -408,25 +406,30 @@ sub _compile_single {
         $sql = $self->_rollup_sort_fix_enabled
             ? 'SELECT * FROM (' . $sql . ') AS rollupfix ORDER BY ' . $order_sql
             : $sql . ' ORDER BY ' . $order_sql;
+    } elsif (@$orders && $self->_null_ordered_terms && @$groups
+        && !grep { !exists $selection_positions{_expression_key($_->[0])} } @$orders) {
+        # A grouped query's NULL-placement key on a computed group expression
+        # is not functionally dependent under ONLY_FULL_GROUP_BY, and an output
+        # alias inside it may resolve to a shadowed source column. Order the
+        # grouped rows as a derived table by their qualified output columns.
+        my $ordered = $self->quote_identifier('__selecto_ordered');
+        $sql = 'SELECT * FROM (' . $sql . ") AS $ordered ORDER BY " . join(', ', map {
+            $self->_null_ordered_term("$ordered."
+                . $self->quote_identifier($columns[$selection_positions{_expression_key($_->[0])} - 1]), uc($_->[1]))
+        } @$orders);
     } elsif (@$orders) {
         $sql .= ' ORDER BY ' . join(', ', map {
             my $key = _expression_key($_->[0]);
             my $direction = uc($_->[1]);
-            if ($self->_null_ordered_terms && @$groups && exists($selection_aliases{$key})) {
-                # A grouped query orders a selected computed expression by its
-                # alias, which ONLY_FULL_GROUP_BY accepts inside the NULL key.
-                $self->_null_ordered_term($self->quote_identifier($selection_aliases{$key}), $direction);
-            } else {
-                my $expression_sql = @$groups && $self->_reuses_parameter_identity && exists($compiled_selections{$key})
-                    ? $compiled_selections{$key}
-                    : $self->_compile_expression($domain, $_->[0], \@params);
-                # Anonymous parameters bind by occurrence: the NULL-placement
-                # key compiles the expression again rather than repeating it.
-                $self->_null_ordered_terms
-                    ? "($expression_sql IS NULL) $direction, "
-                        . $self->_compile_expression($domain, $_->[0], \@params) . " $direction"
-                    : "$expression_sql $direction";
-            }
+            my $expression_sql = @$groups && $self->_reuses_parameter_identity && exists($compiled_selections{$key})
+                ? $compiled_selections{$key}
+                : $self->_compile_expression($domain, $_->[0], \@params);
+            # Anonymous parameters bind by occurrence: the NULL-placement key
+            # compiles the expression again rather than repeating its SQL.
+            $self->_null_ordered_terms
+                ? "($expression_sql IS NULL) $direction, "
+                    . $self->_compile_expression($domain, $_->[0], \@params) . " $direction"
+                : "$expression_sql $direction";
         } @$orders);
     }
     $sql .= $self->_compile_pagination(
@@ -1692,10 +1695,14 @@ sub _compile_window {
     Selecto::Error->throw('invalid_query', 'window order_by must be an array')
         unless ref($orders) eq 'ARRAY';
     if (@$orders) {
-        # A RANGE frame with an offset needs its single ORDER BY key.
-        my $null_keys = $self->_null_ordered_terms && !(ref($over->{frame}) eq 'HASH'
-            && uc($over->{frame}{type} // 'rows') eq 'RANGE'
-            && grep { ref($_) eq 'HASH' } @{$over->{frame}}{qw(start end)});
+        # A RANGE frame with an offset needs its single ORDER BY key, which
+        # cannot then carry the NULL-placement key.
+        my $null_keys = $self->_null_ordered_terms;
+        Selecto::Error->throw('unsupported_feature',
+            'RANGE offset frames cannot order NULLs as PostgreSQL on this adapter')
+            if $null_keys && ref($over->{frame}) eq 'HASH'
+                && uc($over->{frame}{type} // 'rows') eq 'RANGE'
+                && grep { ref($_) eq 'HASH' } @{$over->{frame}}{qw(start end)};
         push @clauses, 'ORDER BY ' . join(', ', map {
             Selecto::Error->throw('invalid_query', 'window order entry is invalid')
                 unless ref($_) eq 'ARRAY' && @$_ == 2
@@ -2852,7 +2859,7 @@ sub _check_typed_insert_admission {
     return unless $predicate;
     my $candidate = Selecto::InsertAdmission->prepare($predicate, $command->assignments, $types);
     Selecto::Error->throw('query_rule_not_evaluable', 'adapter cannot establish typed insert storage semantics')
-        unless $self->name =~ /\A(?:sqlite|postgresql)\z/ && $self->query_budget_supported;
+        unless $self->name =~ /\A(?:sqlite|postgresql|mysql|mariadb)\z/ && $self->query_budget_supported;
     my $savepoint = $self->name eq 'postgresql' ? _savepoint_name('selecto_insert_admission') : undef;
     $self->_savepoint_command(create => $savepoint) if $savepoint;
     my ($budget, $error);
@@ -3043,14 +3050,15 @@ sub _bounded_write_command {
     return $command if defined($identity_bound) && $identity_bound <= $limit;
     my $name = $self->name;
     Selecto::Error->throw('write_capability_missing', 'adapter cannot safely bound a broad write')
-        unless $name =~ /\A(?:postgresql|sqlite)\z/;
+        unless $name =~ /\A(?:postgresql|sqlite|mysql|mariadb)\z/;
     my @params;
     my $where = $self->_compile_write_predicate($predicate, \@params);
     my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
     my $columns = join(', ', map { $self->quote_identifier($_) } @keys);
     my $probe_limit = $limit + 1;
     my $sql = "SELECT $columns FROM $table WHERE $where ORDER BY $columns LIMIT $probe_limit";
-    $sql .= ' FOR UPDATE' if $name eq 'postgresql';
+    # InnoDB locking reads hold the selected keys until the write commits.
+    $sql .= ' FOR UPDATE' if $name =~ /\A(?:postgresql|mysql|mariadb)\z/;
     # Recover a timed-out PostgreSQL statement before restoring session
     # settings. The outer write transaction still owns all selected row locks.
     my $savepoint = $name eq 'postgresql' ? _savepoint_name('selecto_bounded_probe') : undef;

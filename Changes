@@ -48,6 +48,27 @@ Unreleased
       refuse. Caught child failures still roll back the callback. Errors
       after callback completion preserve unknown commit state and prohibit
       automatic retry. See docs/fluent-writes.md for capability limits.
+    - MySQL and MariaDB writes: unscoped upserts follow PostgreSQL ON
+      CONFLICT semantics without ON DUPLICATE KEY UPDATE (which resolves on
+      the primary key before the declared target and has no WHERE). In the
+      write transaction the declared target must be exactly a real unique
+      index (under the table's metadata lock); the row holding the target
+      values is locked (FOR UPDATE) and updated, or the row is inserted, so
+      any other unique collision fails as in PostgreSQL. Upserts carrying a
+      write scope (tenant, caller or required predicate) and bound graph
+      child upserts are refused with unsupported_scope_predicate.
+      RETURNING, generated keys and write graphs are emulated: update and
+      delete lock the keys their full condition selects (FOR UPDATE), the
+      write is confined to them, and rows are re-read by those keys and the
+      tenant conjuncts only (or by the inserted key / conflict target);
+      captured, written and re-read counts must agree or the write rolls
+      back. Broad writes are bounded with locking key probes, guarded
+      inserts are admitted against the column storage contract (strict
+      sql_mode, no triggers, column type and collation) and the stored row
+      is re-checked against the enforced predicate before commit. Updates
+      and upserts refuse a handle whose DSN disables
+      mariadb_client_found_rows. Query budgets set max_execution_time /
+      max_statement_time as literals (DBD::MariaDB quotes bound values).
     - MySQL and MariaDB adapters gain the advanced read features, each gated
       on the connected server version: CTEs and recursive CTEs, window
       functions (rows and range frames), INTERSECT/EXCEPT, rollups (as
