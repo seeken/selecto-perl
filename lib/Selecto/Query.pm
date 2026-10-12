@@ -83,8 +83,8 @@ sub _build {
         unless ref($members) eq 'ARRAY' && !grep { !defined($_) || ref($_) } @$members;
     my $timezone = $args{timezone};
     my $row_lock = $args{row_lock};
-    Selecto::Error->throw('invalid_query', 'row lock must be share')
-        if defined($row_lock) && (ref($row_lock) || $row_lock ne 'share');
+    Selecto::Error->throw('invalid_query', 'row lock must be share or update')
+        if defined($row_lock) && (ref($row_lock) || $row_lock !~ /\A(?:share|update)\z/);
     Selecto::Error->throw('invalid_query', 'timezone must be a valid IANA timezone name')
         if defined($timezone) && (
             ref($timezone) || !DateTime::TimeZone->is_valid_name("$timezone")
@@ -725,6 +725,18 @@ sub for_share {
     my ($self) = @_;
     $self->_ensure_pre_set_mutation('for_share');
     return $self->_copy(row_lock => 'share');
+}
+sub filter {
+    my ($self, $expression) = @_;
+    Selecto::Error->throw('invalid_query', 'filter expects an expression')
+        unless blessed($expression) && $expression->isa('Selecto::Expression');
+    return $self->where(defined($self->predicate)
+        ? Selecto::Expression->all($self->predicate, $expression) : $expression);
+}
+sub select_for_update {
+    my ($self, @fields) = @_;
+    require Selecto::Write::LockedQuery;
+    return Selecto::Write::LockedQuery->new($self, @fields);
 }
 
 sub _nonnegative {

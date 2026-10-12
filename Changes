@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - Add native fluent write and domain-action helpers through
+      Selecto::Write->new($engine), with trusted omitted-tenant fills,
+      bound SQL previews, exact-count defaults and single-use execution.
+      Existing immutable Operation builders remain compatible; upsert masks
+      may narrow their assigned writable conflict fields.
+    - Add engine transaction callbacks and PostgreSQL opaque editable-row
+      results through return_for_update and select_for_update. Follow-up
+      exact-key updates and owned one-to-many inserts share the caller's
+      transaction; expired/forged references and unsupported result modes
+      refuse. Caught child failures still roll back the callback. Errors
+      after callback completion preserve unknown commit state and prohibit
+      automatic retry. See docs/fluent-writes.md for capability limits.
     - SQLite batches may combine protected UPSERTs with ordinary inserts,
       updates, deletes and upserts (and protected inserts) when each
       protected candidate is proved independent of every other command on

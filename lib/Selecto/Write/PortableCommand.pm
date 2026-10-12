@@ -677,6 +677,18 @@ sub _compile_flat {
             my $grant = $contract->{fields}{$_} // {};
             _true($grant->{updatable}) && !grep { _true($grant->{$_}) } qw(immutable write_once server_managed)
         } sort keys %$values];
+        if (exists $state->{upsert_update_fields}) {
+            my $requested = $state->{upsert_update_fields};
+            _fail('invalid_write', 'upsert update fields must be an array') unless ref($requested) eq 'ARRAY';
+            my %allowed = map { $_ => 1 } @{$metadata{upsert_update_fields}};
+            my %seen;
+            $metadata{upsert_update_fields} = [map {
+                my $field = $class->identifier($_);
+                _fail('write_field_not_writable', 'upsert update field must be an assigned writable field', {field => $field})
+                    unless $allowed{$field} && !$seen{$field}++;
+                $field;
+            } @$requested];
+        }
     }
     my $command = Selecto::Write::Command->new(operation => $type, relation => $relation, assignments => $values,
         predicate => $predicate, scope_predicate => $required, expected_count => undef, metadata => \%metadata, foreign_key_guards => $guards);

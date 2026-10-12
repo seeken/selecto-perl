@@ -4,7 +4,7 @@ use Mojo::Base 'Selecto::SQL';
 use Hash::Util::FieldHash ();
 use JSON::PP ();
 use Mojo::JSON ();
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
@@ -32,6 +32,20 @@ has statement_cache_size => 256;
 
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
+sub edit_transaction_identity {
+    my ($self) = @_;
+    my $dbh = $self->dbh;
+    Selecto::Error->throw('write_capability_missing', 'editable rows require a native PostgreSQL connection')
+        unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' };
+    Selecto::Error->throw('edit_handle_expired', 'editable rows require an active PostgreSQL transaction')
+        unless $dbh->{Active} && (!$dbh->{AutoCommit} || $dbh->pg_ping == 3);
+    my $identity = eval { $dbh->selectrow_array("SELECT pg_backend_pid()::text || ':' || txid_current()::text") };
+    die $self->normalize_error($@) if $@;
+    Selecto::Error->throw('edit_handle_expired', 'transaction identity is unavailable') unless defined $identity;
+    Selecto::Error->throw('edit_handle_expired', 'editable rows require a pinned PostgreSQL transaction')
+        unless $dbh->pg_ping == 3;
+    return refaddr($dbh) . ':' . $identity;
+}
 sub _reuses_parameter_identity { return 1; }
 
 sub bounded_stream_supported {
@@ -520,8 +534,8 @@ sub _compile_json_text {
 sub _compile_row_lock {
     my ($self, $mode) = @_;
     Selecto::Error->throw('invalid_query', 'unsupported row lock mode')
-        unless $mode eq 'share';
-    return ' FOR SHARE OF ' . $self->quote_identifier($self->_root_alias);
+        unless $mode eq 'share' || $mode eq 'update';
+    return ($mode eq 'update' ? ' FOR UPDATE OF ' : ' FOR SHARE OF ') . $self->quote_identifier($self->_root_alias);
 }
 
 sub projection_sum_statement {
@@ -559,7 +573,8 @@ sub _rollup_sort_fix_enabled {
 }
 
 sub write_capabilities {
-    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, generated_keys => 1, write_graph => 1 };
+    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, generated_keys => 1, write_graph => 1,
+        transaction_edit_handles => 1 };
 }
 
 sub _renumber_placeholders {

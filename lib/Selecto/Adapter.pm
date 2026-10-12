@@ -42,6 +42,9 @@ sub assert_contract ($self) {
 
 sub feature_inventory ($self) { return []; }
 sub write_capabilities ($self) { return {}; }
+sub edit_transaction_identity ($self) {
+    Selecto::Error->throw('write_capability_missing', 'adapter does not support transaction-scoped editable rows');
+}
 sub supports ($self, $feature) { return 0; }
 sub text_search_rank_direction ($self) { return 'desc'; }
 sub capability ($self, $feature) { return { supported => $self->supports($feature) ? 1 : 0 }; }

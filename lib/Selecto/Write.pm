@@ -5,6 +5,12 @@ use strict;
 use warnings;
 use Selecto::Write::Expression ();
 
+sub new {
+    my ($class, @args) = @_;
+    require Selecto::Write::Builder;
+    return Selecto::Write::Builder->new(@args);
+}
+
 1;
 
 package Selecto::Write::Command;
