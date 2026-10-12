@@ -1,5 +1,6 @@
 use 5.034;use strict;use warnings;
 use Test::More;use Scalar::Util qw(blessed);use JSON::PP ();
+$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use Selecto::Action ();use Selecto::Action::Plan ();use Selecto::Write::Operation ();use Selecto::Write::PortableCommand ();
 use Selecto::Verification::WriteModel ();
 sub caught {my($fn)=@_;my$e;{local$@;my$ok=eval{$fn->();1};$e=$@ unless$ok;}return$e;}

@@ -45,24 +45,54 @@ sub _read_authority {
     return [$self->{scope}, $self->{write_context}, $self->{tenant_context}, $self->{tenant_required_filters}, $self->{query_mode}];
 }
 
+# Whether engines re-verify their domain's identity (a digest of the whole domain) when
+# used, refusing a domain modified after configuration. Off by default: hosts that build
+# their domains in code and never modify them don't need it, and on a large domain it
+# was most of the time a query took. An engine turns it on with verify_domain_identity
+# => 1, or a host for all engines with $Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1.
+our $VERIFY_DOMAIN_IDENTITY //= 0;
+
+sub _verifies_identity { return $_[0]->{verify_domain_identity} // $VERIFY_DOMAIN_IDENTITY }
+
+# Without verification the configured digest is computed only when something asks for
+# the engine's read policy identity (_read_policy_identity), then kept.
 my $seal_domain = sub {
     my ($self) = @_;
-    $CONFIGURED_DOMAIN{$self} = {
-        domain => Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority),
-    };
+    $CONFIGURED_DOMAIN{$self} = $self->_verifies_identity
+        ? {domain => Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority)}
+        : {};
     return $self;
 };
+
+# Engines (by refaddr) inside an outermost method call: {verified => 0|1}. Every engine
+# method asserts the domain's identity, and one call reaches many of them; walking a large
+# domain each time made identity checks most of the time a query took (Load: 27 walks,
+# about 1 s, per Explorer query). So the first assertion in an outermost call verifies and
+# the nested ones within it reuse that; the scope ends when the call returns or dies, and
+# the next call verifies again, so a domain changed between calls is still refused.
+# Nothing outside the engine runs between a call's nested assertions.
+my %IDENTITY_SCOPE;
 
 sub assert_domain_identity {
     my ($self) = @_;
     my $record = $CONFIGURED_DOMAIN{$self};
+    unless ($self->_verifies_identity) {
+        # Still only a genuinely configured engine.
+        Selecto::Error->throw('domain_modified_after_configuration',
+            'configured domain identity has changed', {path => []}) unless $record;
+        return $self;
+    }
+    my $scope = $IDENTITY_SCOPE{refaddr($self)};
+    return $self if $scope && $scope->{verified};
     Selecto::Error->throw('domain_modified_after_configuration',
         'configured domain identity has changed', {path => []})
         unless $record
+            && defined($record->{domain})
             && $record->{domain} eq Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority)
             && (exists($record->{read}) == exists($self->{_read_domain}))
             && (!exists($record->{read}) || $record->{read} eq
                 Selecto::ConfiguredDomain->digest($self->{_read_domain}, $self->_read_authority));
+    $scope->{verified} = 1 if $scope;
     return $self;
 }
 
@@ -150,6 +180,7 @@ sub new {
         write_context=>$write_context,
         write_policy => _write_policy($args{write_policy}),
         limits => $limits,
+        (defined($args{verify_domain_identity}) ? (verify_domain_identity => $args{verify_domain_identity} ? 1 : 0) : ()),
     }, $class;
     Selecto::QueryBinding->configure_engine($self, $args{member_builders});
     return $seal_domain->($self);
@@ -356,10 +387,13 @@ sub _has_read_tenant_policy {
     $self->assert_domain_identity;
     return $self->{domain}->tenant_required || keys(%{$self->{tenant_context} // {}}) || @{$self->{tenant_required_filters} // []};
 }
+# The configured digest: verified unchanged just now when verification is on (so the
+# sealed value is the current one), else computed on first use and kept.
 sub _read_policy_identity {
     my ($self) = @_;
     $self->assert_domain_identity;
-    return Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority);
+    return $CONFIGURED_DOMAIN{$self}{domain}
+        //= Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority);
 }
 
 # Trusted hosts may tighten a request's budget without reconfiguring its
@@ -552,7 +586,8 @@ sub read_domain {
         $domain;
     };
     $self->{_read_domain} = $read;
-    $CONFIGURED_DOMAIN{$self}{read} = Selecto::ConfiguredDomain->digest($read, $self->_read_authority);
+    $CONFIGURED_DOMAIN{$self}{read} = Selecto::ConfiguredDomain->digest($read, $self->_read_authority)
+        if $self->_verifies_identity;
     return $read;
 }
 
@@ -3019,6 +3054,28 @@ sub _relationship_policy {
     return {modern=>1,writable=>(_relationship_flag($spec->{writable})||_relationship_flag($spec->{enabled})||%modes)?1:0,
         allowed_ops=>[sort keys%physical],semantic=>\%semantic,ownership=>$ownership,modes=>[sort keys%modes],owned_sync=>$owned_sync?1:0,
         requires_owned_set=>($owned_sync && keys(%modes)==1 && $modes{full_set})?1:0};
+}
+
+# Each engine method opens the identity scope above when it is the outermost call on its
+# engine (subclass overrides that call SUPER:: are covered by the method they reach).
+# Class-method calls and the identity machinery itself are left as they are.
+{
+    no strict 'refs';
+    no warnings 'redefine';
+    my %unscoped = map { $_ => 1 } qw(new assert_domain_identity _read_authority _verifies_identity DESTROY import can isa VERSION);
+    for my $name (sort keys %Selecto::Engine::) {
+        next if $unscoped{$name} || $name =~ /\A[A-Z_]+\z/;
+        my $code = defined(&{"Selecto::Engine::$name"}) ? \&{"Selecto::Engine::$name"} : next;
+        my $cv = B::svref_2object($code);
+        my $stash = $cv->can('STASH') ? $cv->STASH : undef;
+        next unless $stash && $stash->can('NAME') && $stash->NAME eq 'Selecto::Engine' && !$cv->XSUB;
+        *{"Selecto::Engine::$name"} = sub {
+            my $id = blessed($_[0]) ? refaddr($_[0]) : undef;
+            return $code->(@_) if !defined($id) || $IDENTITY_SCOPE{$id};
+            local $IDENTITY_SCOPE{$id} = {verified => 0};
+            return $code->(@_);
+        };
+    }
 }
 
 1;
