@@ -3,6 +3,8 @@ package Selecto::MySQLFamily;
 use Mojo::Base 'Selecto::SQL';
 use Selecto::Error ();
 use Selecto::Identifier ();
+use Selecto::QueryEnforcement ();
+use Selecto::Write ();
 use JSON::PP ();
 use Selecto::Expression ();
 use Selecto::InsertAdmission ();
@@ -59,7 +61,7 @@ my %FEATURE_VERSIONS = (
 
 sub supports {
     my ($self, $feature) = @_;
-    return 1 if "$feature" eq 'transactions' || "$feature" eq 'stream';
+    return 1 if "$feature" eq 'transactions' || "$feature" eq 'stream' || "$feature" eq 'export_scalars';
     my $versions = $FEATURE_VERSIONS{"$feature"} or return 0;
     my $minimum = $versions->[$self->name eq 'mariadb' ? 1 : 0] or return 0;
     return $self->_server_version_at_least(@$minimum);
@@ -109,7 +111,8 @@ sub _compile_rollup {
     my ($self, $domain, $query, %options) = @_;
     return Selecto::SQL::RollupEmulation::compile($self, $domain, $query, sub {
         my ($position, $column, $direction, $nulls) = @_;
-        my $quoted = $self->quote_identifier($column);
+        # Qualified by the derived table, never a caller-named FROM column.
+        my $quoted = $self->quote_identifier('__selecto_rollup') . '.' . $self->quote_identifier($column);
         return "$position $direction" unless defined $nulls;
         # Both servers sort NULL first ascending and last descending.
         return ($quoted . ' IS NULL ' . ($nulls eq 'first' ? 'DESC' : 'ASC')) . ", $position $direction";
@@ -538,9 +541,12 @@ sub _value_type_sql {
     return $self->SUPER::_value_type_sql($type);
 }
 
+# RETURNING (and the generated keys and graphs built on it) is emulated by a
+# re-read in the write's own transaction; see _execute_compiled_write_in_transaction.
 sub write_capabilities {
     my ($self) = @_;
-    return {%{$self->SUPER::write_capabilities}, upsert => 0};
+    return {%{$self->SUPER::write_capabilities}, upsert => 1, returning => 1, generated_keys => 1,
+        write_graph => 1, typed_insert_admission => 1};
 }
 
 sub _validate_write_intent {
@@ -548,21 +554,34 @@ sub _validate_write_intent {
     my @commands = ref($write) eq 'Selecto::Write::Command' ? ($write)
         : ref($write) eq 'Selecto::Write::Batch' ? @{$write->commands}
         : map { $_->{command} } @{$write->nodes};
-    Selecto::Error->throw('unsupported_upsert_conflict_target',
-        'MySQL-family adapters cannot guarantee the declared upsert conflict target')
-        if grep { $_->operation eq 'upsert' } @commands;
+    _refuse_scoped_upsert($_) for grep { $_->operation eq 'upsert' } @commands;
+    # A graph child's parent binding becomes an assignment; ON DUPLICATE KEY
+    # UPDATE could then resolve on any unique key of another parent's row.
+    if (ref($write) eq 'Selecto::Write::Graph') {
+        Selecto::Error->throw('unsupported_scope_predicate',
+            'MySQL-family adapters cannot confine a bound graph child upsert to its parent',
+            {upsert_strategy => 'on_duplicate_key'})
+            if grep { $_->{command}->operation eq 'upsert' && @{$_->{bindings} // []} } @{$write->nodes};
+    }
     return 1;
 }
 
-# ON DUPLICATE KEY UPDATE fires on every unique key, not the declared
-# conflict target. Refuse every upsert: an unscoped table may have another
-# unique index too, and a domain allowlist is not a physical index inventory.
+# ON DUPLICATE KEY UPDATE has no WHERE: it updates whichever row holds the
+# conflicting key, so it cannot keep a write scope (tenant, caller or
+# required predicate). Such upserts are refused, as by the Elixir and Go
+# MySQL-family adapters. Query-enforced upserts keep the shared refusal.
+sub _refuse_scoped_upsert {
+    my ($command) = @_;
+    return if defined $command->query_enforcement;
+    Selecto::Error->throw('unsupported_scope_predicate',
+        'MySQL-family adapters cannot apply write scope predicates to upserts',
+        {upsert_strategy => 'on_duplicate_key'})
+        if defined($command->predicate) || defined($command->scope_predicate);
+}
+
 sub _compile_write {
     my ($self, $command) = @_;
-    Selecto::Error->throw(
-        'unsupported_upsert_conflict_target',
-        'MySQL-family adapters cannot guarantee the declared upsert conflict target',
-    ) if $command->operation eq 'upsert';
+    _refuse_scoped_upsert($command) if $command->operation eq 'upsert';
     return $self->SUPER::_compile_write($command);
 }
 
@@ -578,9 +597,371 @@ sub _foreign_key_exists_sql {
     return 'EXISTS (SELECT 1 FROM (' . $select . ' LIMIT 1) AS ' . $self->quote_identifier('selecto_fk_check') . ')';
 }
 
+# Upserts never use ON DUPLICATE KEY UPDATE, which resolves on whichever
+# unique key collides first (the primary key before the declared target) and
+# has no WHERE. They are emulated with PostgreSQL ON CONFLICT semantics; see
+# _execute_upsert. A preview shows the INSERT branch.
 sub _compile_upsert_clause {
-    Selecto::Error->throw('unsupported_upsert_conflict_target',
-        'MySQL-family adapters cannot guarantee the declared upsert conflict target');
+    my ($self, $conflict, $updates) = @_;
+    Selecto::Error->throw('invalid_write', 'MySQL-family upserts require update fields') unless @$updates;
+    return '';
+}
+
+# The declared conflict target must be exactly the columns of a real unique
+# index (no prefix or functional part), so at most one row can hold its
+# values. The table is read first: its shared metadata lock keeps the index
+# set unchanged until the write transaction ends.
+sub _admit_upsert_conflict {
+    my ($self, $command) = @_;
+    my $refuse = sub {
+        Selecto::Error->throw('unsupported_upsert_conflict_target',
+            'MySQL-family adapters cannot guarantee the declared upsert conflict target', {reason => $_[0]});
+    };
+    my $table = Selecto::Identifier::checked($command->relation);
+    my $conflict = $command->metadata->{conflict_target};
+    $refuse->('conflict_target_invalid') unless ref($conflict) eq 'ARRAY' && @$conflict;
+    my %target = map { (Selecto::Identifier::checked($_) => 1) } @$conflict;
+    my $dbh = $self->dbh;
+    my $indexes;
+    my $ok = eval {
+        $dbh->do('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0');
+        $indexes = $dbh->selectall_arrayref(q{SELECT INDEX_NAME, COLUMN_NAME, SUB_PART FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND NON_UNIQUE = 0 ORDER BY INDEX_NAME, SEQ_IN_INDEX},
+            undef, $table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my %index;
+    for my $row (@$indexes) {
+        my ($name, $column, $prefix) = @$row;
+        my $entry = $index{$name} //= {columns => {}, usable => 1};
+        $entry->{usable} = 0 if !defined($column) || defined($prefix);
+        $entry->{columns}{$column} = 1 if defined $column;
+    }
+    $refuse->('no_matching_unique_index') unless grep {
+        my $entry = $_;
+        $entry->{usable} && keys(%{$entry->{columns}}) == keys(%target)
+            && !grep { !$entry->{columns}{$_} } keys %target
+    } values %index;
+    return 1;
+}
+
+# PostgreSQL ON CONFLICT (target) DO UPDATE, in the write's transaction: a
+# locking read of the one row holding the target values (FOR UPDATE, which
+# under REPEATABLE READ also locks the gap so no concurrent insert can take
+# the key), then an UPDATE of that row confined to the target values, or a
+# plain INSERT that any other unique collision fails as it would in
+# PostgreSQL. A NULL target value never conflicts.
+sub _execute_upsert {
+    my ($self, $command) = @_;
+    $self->_admit_upsert_conflict($command);
+    my $metadata = $command->metadata;
+    my $assignments = $command->assignments;
+    my (@terms, $null);
+    for my $field (@{$metadata->{conflict_target}}) {
+        my $value = $assignments->{$field};
+        $value = $value->arguments->[0]
+            if blessed($value) && $value->isa('Selecto::Write::Expression') && $value->kind eq 'literal';
+        Selecto::Error->throw('unsupported_upsert_conflict_target',
+            'MySQL-family upsert conflict target values must be literals', {field => $field})
+            if !exists($assignments->{$field}) || ref($value);
+        $null = 1 unless defined $value;
+        push @terms, Selecto::Expression->eq($field, $value);
+    }
+    my $target = Selecto::QueryEnforcement::combine(@terms);
+    my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
+    my $found = 0;
+    unless ($null) {
+        my @params;
+        my $where = $self->_compile_write_predicate($target, \@params);
+        my $rows;
+        my $ok = eval { $rows = $self->dbh->selectall_arrayref("SELECT 1 FROM $table WHERE $where FOR UPDATE", undef, @params); 1 };
+        die $self->normalize_error($@) unless $ok;
+        $found = @$rows;
+    }
+    my %branch_metadata = %$metadata;
+    delete @branch_metadata{qw(conflict_target upsert_update_fields returning)};
+    my %shared = (relation => $command->relation, expected_count => $command->expected_count,
+        metadata => \%branch_metadata, foreign_key_guards => $command->foreign_key_guards);
+    my $branch = $found
+        ? Selecto::Write::Command->new(%shared, operation => 'update', predicate => $target,
+            assignments => {map { ($_ => $assignments->{$_}) } @{$metadata->{upsert_update_fields}}})
+        : Selecto::Write::Command->new(%shared, operation => 'insert', assignments => $assignments);
+    my $result = $self->SUPER::_execute_compiled_write_in_transaction($branch, $self->SUPER::_compile_write($branch));
+    return Selecto::Write::Result->new(operation => 'upsert', affected_rows => $result->affected_rows, values => {});
+}
+
+# RETURNING fields are validated as usual but compiled into no SQL; the
+# executor re-reads them.
+sub _append_returning {
+    my ($self, $sql, $params, $command) = @_;
+    my $returning = $command->metadata->{returning} // [];
+    return $self->SUPER::_append_returning($sql, $params, $command)
+        unless ref($returning) eq 'ARRAY' && @$returning;
+    my $compiled = $self->SUPER::_append_returning($sql, $params,
+        $command->with_metadata({%{$command->metadata}, returning => []}));
+    Selecto::Error->throw('invalid_write', 'returning must be an array of declared identifiers')
+        if grep { ref($_) || !defined($_) || !Selecto::Identifier::checked($_) } @$returning;
+    return {%$compiled, returning => [], returning_emulated => [@$returning]};
+}
+
+# Neither server has UPDATE ... RETURNING (MySQL has no RETURNING at all), so
+# a returning write re-reads its rows inside its own transaction, by primary
+# key and under the write's scope predicate:
+# - update/delete first lock the keys the write's full predicate and guards
+#   select (FOR UPDATE), the DML then changes exactly those locked rows, and
+#   an update re-reads them while a delete returns what it read before;
+# - insert reads the row by its assigned key or AUTO_INCREMENT id, and an
+#   upsert by its conflict target, which the index proof makes unique.
+# A re-read that disagrees with the affected count fails the write.
+sub _execute_compiled_write_in_transaction {
+    my ($self, $command, $compiled) = @_;
+    my $operation = $command->operation;
+    # Affected-row counts are matched rows only with CLIENT_FOUND_ROWS, the
+    # DBD::MariaDB default; a handle that names it off in its DSN is refused.
+    # (A connect-attribute override is not readable back; hosts must keep it.)
+    Selecto::Error->throw('write_capability_missing',
+        'MySQL-family writes require mariadb_client_found_rows (matched-row counts)')
+        if ($operation eq 'update' || $operation eq 'upsert')
+            && (eval { $self->dbh->{Name} } // '') =~ /(?:\A|;)\s*mariadb_client_found_rows\s*=\s*0\b/;
+    my @returning = @{$compiled->{returning_emulated} // []};
+    unless (@returning) {
+        return $self->_execute_upsert($command) if $operation eq 'upsert';
+        my $result = $self->SUPER::_execute_compiled_write_in_transaction($command, $compiled);
+        $self->_verify_inserted_row($command, $result) if $operation eq 'insert';
+        return $result;
+    }
+    my $metadata = $command->metadata;
+    Selecto::Error->throw('write_capability_missing', 'MySQL-family RETURNING requires the governing primary key')
+        unless defined($metadata->{__selecto_primary_key}) && !ref($metadata->{__selecto_primary_key});
+    my $key = Selecto::Identifier::checked($metadata->{__selecto_primary_key});
+    Selecto::Error->throw('write_capability_missing', 'MySQL-family RETURNING requires the governing tenant columns')
+        unless ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY';
+    # The re-read finds rows by their captured keys; a key change would lose them.
+    Selecto::Error->throw('write_capability_missing',
+        'MySQL-family RETURNING cannot follow an update of the primary key', {field => $key})
+        if $operation eq 'update' && exists $command->assignments->{$key};
+    my ($keys, $before);
+    if ($operation eq 'update' || $operation eq 'delete') {
+        $keys = $self->_locked_write_keys($command, $key);
+        $before = $self->_returning_rows($command, \@returning, Selecto::Expression->in($key, $keys))
+            if $operation eq 'delete' && @$keys;
+    }
+    my $result = $operation eq 'upsert' ? $self->_execute_upsert($command)
+        : $self->SUPER::_execute_compiled_write_in_transaction($command, {%$compiled, returning => []});
+    my $affected = $result->affected_rows;
+    my $rows = [];
+    if ($operation eq 'update') {
+        $rows = $self->_returning_rows($command, \@returning, Selecto::Expression->in($key, $keys)) if @$keys;
+    } elsif ($operation eq 'delete') {
+        $rows = $before // [];
+    } elsif ($affected) {
+        $rows = $self->_returning_rows($command, \@returning, $self->_inserted_identity($command, $key));
+    }
+    # Captured, written and re-read counts must agree: a row the update moved
+    # out of its tenant scope is not re-read, and the write rolls back.
+    my $expected = $operation eq 'insert' || $operation eq 'upsert' ? ($affected ? 1 : 0) : $affected;
+    Selecto::Error->throw('write_returning_missing', 'write returning re-read disagrees with the affected rows')
+        unless @$rows == $expected && (!$keys || @$keys == $affected);
+    Selecto::Error->throw('write_returning_missing', 'write did not return the requested row')
+        if !@$rows && !exists($metadata->{expected_cardinality});
+    $self->_verify_inserted_row($command, $result, $rows) if $operation eq 'insert';
+    my %values;
+    @values{@returning} = @{$rows->[0]} if @$rows;
+    return Selecto::Write::Result->new(operation => $operation, affected_rows => $affected, values => \%values);
+}
+
+# A guarded insert was admitted by casting its candidate to the column
+# storage (type, scale, collation). The stored row is checked again in the
+# write transaction: it must still satisfy the enforced predicate when read
+# back by its key, or the write fails with query_rule_violation and rolls
+# back. This covers storage effects the candidate cast cannot see.
+sub _verify_inserted_row {
+    my ($self, $command, $result) = @_;
+    return unless $result->affected_rows;
+    my $predicate = _write_predicate_expression($command);
+    return unless defined($predicate) && exists $command->metadata->{__selecto_insert_types};
+    my $key = $command->metadata->{__selecto_primary_key};
+    Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires the primary key')
+        unless defined($key) && !ref($key);
+    $key = Selecto::Identifier::checked($key);
+    my @params;
+    my $where = $self->_compile_write_predicate(
+        Selecto::QueryEnforcement::combine($self->_inserted_identity($command, $key), $predicate), \@params);
+    my $sql = 'SELECT COUNT(*) FROM ' . $self->quote_identifier(Selecto::Identifier::checked($command->relation))
+        . " WHERE $where";
+    my ($count);
+    my $ok = eval { ($count) = $self->dbh->selectrow_array($sql, undef, @params); 1 };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_violation', 'stored row does not satisfy the enforced query',
+        {truth_value => 'false_or_unknown'}) unless defined($count) && $count == $result->affected_rows;
+    return 1;
+}
+
+sub _write_predicate_expression {
+    my ($command) = @_;
+    return Selecto::QueryEnforcement::combine($command->predicate, $command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef);
+}
+
+sub _locked_write_keys {
+    my ($self, $command, $key) = @_;
+    my @params;
+    my $where = $self->_compile_write_predicate(_write_predicate_expression($command), \@params);
+    if ($command->operation eq 'update') {
+        my $guard = $self->_compile_foreign_key_guards($command, \@params);
+        $where .= " AND $guard" if defined $guard;
+    }
+    my $bounds = $self->_validate_write_cardinality($command);
+    my $column = $self->quote_identifier($key);
+    my $sql = "SELECT $column FROM " . $self->quote_identifier(Selecto::Identifier::checked($command->relation))
+        . " WHERE $where ORDER BY $column"
+        . (defined($bounds->{maximum}) ? ' LIMIT ' . ($bounds->{maximum} + 1) : '') . ' FOR UPDATE';
+    my $keys;
+    my $ok = eval { $keys = $self->dbh->selectcol_arrayref($sql, undef, @params); 1 };
+    die $self->normalize_error($@) unless $ok;
+    return $keys;
+}
+
+# The inserted row's identity. LAST_INSERT_ID is used only when the server
+# generated the key: the key column is AUTO_INCREMENT and the insert omitted
+# it or assigned NULL/DEFAULT. Any other assigned key must be a literal.
+sub _inserted_identity {
+    my ($self, $command, $key) = @_;
+    my $assignments = $command->assignments;
+    my $literal = sub {
+        my ($field) = @_;
+        my $value = $assignments->{$field};
+        $value = $value->arguments->[0]
+            if blessed($value) && $value->isa('Selecto::Write::Expression') && $value->kind eq 'literal';
+        Selecto::Error->throw('write_capability_missing',
+            'MySQL-family RETURNING requires a literal identity value', {field => $field})
+            if !defined($value) || ref($value);
+        return $value;
+    };
+    if ($command->operation eq 'upsert') {
+        my @terms = map { Selecto::Expression->eq($_, $literal->($_)) } @{$command->metadata->{conflict_target}};
+        return @terms == 1 ? $terms[0] : Selecto::Expression->all(@terms);
+    }
+    if (exists $assignments->{$key}) {
+        my $value = $assignments->{$key};
+        my $generated = !defined($value)
+            || (blessed($value) && $value->isa('Selecto::Write::Expression')
+                && ($value->kind eq 'default' || ($value->kind eq 'literal' && !defined($value->arguments->[0]))));
+        return Selecto::Expression->eq($key, $literal->($key)) unless $generated;
+    }
+    my $table = Selecto::Identifier::checked($command->relation);
+    my ($extra, $id);
+    my $ok = eval {
+        ($extra) = $self->dbh->selectrow_array(q{SELECT EXTRA FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?}, undef, $table, $key);
+        $id = $self->dbh->{mariadb_insertid};
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('write_capability_missing',
+        'MySQL-family RETURNING requires an assigned or AUTO_INCREMENT primary key')
+        unless defined($extra) && $extra =~ /\bauto_increment\b/i && defined($id) && "$id" =~ /\A[1-9]\d*\z/;
+    return Selecto::Expression->eq($key, "$id");
+}
+
+# The top-level eq/IN conjuncts of the write scope on its tenant columns
+# (engine tenant, writes.scope.tenant, pins). Non-tenant required predicates
+# are left out: an update may legitimately change what they read, and the
+# rows were already captured under the write's full condition.
+sub _tenant_conjuncts {
+    my ($command) = @_;
+    my %tenant = map { ($_ => 1) } @{$command->metadata->{__selecto_tenant_fields} // []};
+    my @pending = grep { defined } ($command->scope_predicate);
+    my @kept;
+    while (my $expression = shift @pending) {
+        next unless blessed($expression) && $expression->isa('Selecto::Expression');
+        if ($expression->kind eq 'and') {
+            push @pending, @{$expression->arguments->[0]};
+            next;
+        }
+        my $field = $expression->arguments->[0];
+        push @kept, $expression if ($expression->kind eq 'eq' || $expression->kind eq 'in')
+            && blessed($field) && $field->kind eq 'field' && $tenant{$field->arguments->[0]};
+    }
+    return @kept;
+}
+
+sub _returning_rows {
+    my ($self, $command, $fields, $identity) = @_;
+    my @params;
+    my $where = $self->_compile_write_predicate(
+        Selecto::QueryEnforcement::combine($identity, _tenant_conjuncts($command)), \@params);
+    my $key = $self->quote_identifier(Selecto::Identifier::checked($command->metadata->{__selecto_primary_key}));
+    my $sql = 'SELECT ' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$fields)
+        . ' FROM ' . $self->quote_identifier(Selecto::Identifier::checked($command->relation))
+        . " WHERE $where ORDER BY $key";
+    my ($sth, $rows);
+    my $ok = eval {
+        $sth = $self->dbh->prepare($sql);
+        $self->_execute_statement($sth, \@params);
+        my @types = $self->_column_types($sth);
+        $rows = $sth->fetchall_arrayref;
+        $self->_decode_rows($rows, \@types);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return $rows;
+}
+
+my %INTEGER_TYPES = map { $_ => 1 } qw(tinyint smallint mediumint int bigint);
+my %TEXT_TYPES = map { $_ => 1 } qw(char varchar tinytext text mediumtext longtext);
+
+# The storage contract for a guarded insert's candidate check, read in the
+# write transaction after a read of the table: its shared metadata lock keeps
+# the column definitions and triggers (CREATE TRIGGER needs an exclusive
+# lock) unchanged until commit. Strict SQL mode is required, so a value the
+# column cannot hold fails the INSERT instead of being stored altered.
+sub insert_admission_storage {
+    my ($self, $command, $types) = @_;
+    my $fail = sub { Selecto::Error->throw('query_rule_not_evaluable',
+        'MySQL-family adapter cannot establish the guarded insert storage contract'); };
+    my $dbh = $self->dbh;
+    $fail->() unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'MariaDB' };
+    my $table = Selecto::Identifier::checked($command->relation);
+    my ($mode, $kind, $triggers, $rows);
+    my $ok = eval {
+        $dbh->do('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0');
+        ($mode) = $dbh->selectrow_array('SELECT @@SESSION.sql_mode');
+        ($kind) = $dbh->selectrow_array(q{SELECT TABLE_TYPE FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}, undef, $table);
+        ($triggers) = $dbh->selectrow_array(q{SELECT COUNT(*) FROM information_schema.TRIGGERS
+            WHERE EVENT_OBJECT_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = ?}, undef, $table);
+        $rows = $dbh->selectall_arrayref(q{SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, EXTRA,
+            CHARACTER_SET_NAME, COLLATION_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}, {Slice => {}}, $table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    $fail->() unless defined($mode) && $mode =~ /\bSTRICT_(?:TRANS|ALL)_TABLES\b/
+        && defined($kind) && $kind eq 'BASE TABLE' && !$triggers;
+    my %columns = map { ($_->{COLUMN_NAME} => $_) } @$rows;
+    my %storage;
+    for my $field (keys %$types) {
+        my $column = $columns{$field};
+        $fail->() unless $column && ($column->{EXTRA} // '') !~ /GENERATED/i;
+        my ($name, $declaration) = (lc($column->{DATA_TYPE} // ''), lc($column->{COLUMN_TYPE} // ''));
+        my $type = $types->{$field};
+        if ($type eq 'integer' || $type eq 'boolean') {
+            $fail->() unless $INTEGER_TYPES{$name} && ($type eq 'integer' || $declaration =~ /\Atinyint\(1\)/);
+            $storage{$field} = {cast => $declaration =~ /\bunsigned\b/ ? 'UNSIGNED' : 'SIGNED'};
+        } elsif ($type eq 'decimal') {
+            $fail->() unless $name eq 'decimal' && $declaration =~ /\Adecimal\((\d+),(\d+)\)\z/;
+            $storage{$field} = {cast => "DECIMAL($1, $2)"};
+        } else {
+            $fail->() unless $TEXT_TYPES{$name} && defined($column->{CHARACTER_SET_NAME})
+                && defined($column->{COLLATION_NAME})
+                && $column->{CHARACTER_SET_NAME} =~ /\A\w+\z/ && $column->{COLLATION_NAME} =~ /\A\w+\z/;
+            $storage{$field} = {cast => "CHAR CHARACTER SET $column->{CHARACTER_SET_NAME}",
+                collation => $column->{COLLATION_NAME}};
+        }
+    }
+    return \%storage;
 }
 
 sub _logical_affected_rows {
@@ -589,15 +970,36 @@ sub _logical_affected_rows {
     return $physical;
 }
 
+# A TINYINT(1) column is how both servers store BOOLEAN; it is named
+# 'boolean' so export scalars can emit JSON booleans.
 sub _column_types {
     my ($self, $sth) = @_;
-    return eval { @{$sth->{mariadb_type_name} // []} };
+    my @names = eval { @{$sth->{mariadb_type_name} // []} };
+    my @precision = eval { @{$sth->{PRECISION} // []} };
+    return map {
+        lc($names[$_] // '') eq 'tinyint' && defined($precision[$_]) && $precision[$_] == 1 ? 'boolean' : $names[$_]
+    } 0 .. $#names;
+}
+
+# Canonical export scalars: exact decimals keep the scale the server writes,
+# booleans are JSON booleans and JSON columns are decoded; other values are
+# canonical as usual.
+sub execute_query {
+    my ($self, $statement, %options) = @_;
+    local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
+    return $self->SUPER::execute_query($statement);
 }
 
 sub _decode {
     my ($self, $value, $type) = @_;
     return undef unless defined $value;
     $type = uc($type // '');
+    if ($self->{_selecto_export_scalars}) {
+        return "$value" if $type =~ /\A(?:DECIMAL|NUMERIC)\z/;
+        return "$value" ? JSON::PP::true : JSON::PP::false if $type eq 'BOOLEAN';
+        return JSON::PP->new->allow_nonref(1)->decode("$value") if $type eq 'JSON';
+    }
+    return int($value) if $type eq 'BOOLEAN' && "$value" =~ /\A-?\d+\z/;
     return int($value) if $type =~ /\A(?:BIGINT|INT|INTEGER|SMALLINT|TINYINT)\z/ && "$value" =~ /\A-?\d+\z/;
     if ($type =~ /\A(?:DECIMAL|DOUBLE|FLOAT|NUMERIC|REAL)\z/) {
         my $normalized = "$value";

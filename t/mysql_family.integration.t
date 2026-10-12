@@ -58,13 +58,21 @@ for my $specification (
             assignments => { id => 9, name => 'Renée 東京', amount => 20.25 },
             metadata => { conflict_target => ['name'], upsert_update_fields => ['amount'] },
         );
-        for my $target (['name'], ['id']) {
-            my $command = $upsert->with_metadata({conflict_target => $target, upsert_update_fields => ['amount']});
-            eval { $engine->execute_write($command) };
-            is($@->code, 'unsupported_upsert_conflict_target', "$backend refuses target-specific upsert");
-            is($dbh->selectrow_array('SELECT amount FROM selecto_perl_mysql_products WHERE id = 1'),
-                '10.50', "$backend never changes the row selected by another unique key");
-        }
+        # PostgreSQL ON CONFLICT semantics: the declared target's row is
+        # updated; a collision on another unique key fails the insert.
+        my $by_name = $engine->execute_write($upsert);
+        is($by_name->affected_rows, 1, "$backend upserts on the declared target");
+        is_deeply($dbh->selectall_arrayref('SELECT id, amount FROM selecto_perl_mysql_products ORDER BY id'),
+            [[1, '20.25']], "$backend updates the target's row, never inserting or moving its key");
+        my $by_id = eval {
+            $engine->execute_write($upsert->with_metadata({conflict_target => ['id'], upsert_update_fields => ['amount']}));
+            1;
+        };
+        ok(!$by_id && $@->code eq 'query_error', "$backend fails an insert that collides on another unique key");
+        is($dbh->selectrow_array('SELECT amount FROM selecto_perl_mysql_products WHERE id = 1'),
+            '20.25', "$backend never changes the row selected by another unique key");
+        eval { $engine->execute_write($upsert->with_scope_predicate(Selecto::Expression->eq('id', 1))) };
+        is($@->code, 'unsupported_scope_predicate', "$backend refuses a scoped upsert");
 
         my $first = Selecto::Write::Command->new(
             operation => 'insert', relation => 'selecto_perl_mysql_products',

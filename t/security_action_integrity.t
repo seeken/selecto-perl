@@ -78,15 +78,23 @@ subtest 'R10 every governed upsert uses the declared exact identity' => sub {
         'conflict_target_not_declared', 'batch shares the validator');
 };
 
-subtest 'R09 MySQL and MariaDB refuse unsupported identity semantics before DB work' => sub {
+subtest 'R09 MySQL and MariaDB prove the upsert identity before any mutation' => sub {
+    # The recorder has no catalog rows, so the physical unique-index proof
+    # cannot show that ON DUPLICATE KEY UPDATE resolves only on the target.
+    {
+        package Local::NoCatalogDBH;
+        our @ISA = ('TestSelecto::DBH');
+        sub selectall_arrayref { return []; }
+    }
     for my $backend (qw(mysql mariadb)) {
-        my $engine = engine(undef, $backend);
-        ok(!$engine->adapter->write_capabilities->{upsert}, "$backend does not advertise upsert");
-        for my $method (qw(preview_write execute_write)) {
-            is(error_code(sub {$engine->$method(upsert(['id']))}), 'unsupported_upsert_conflict_target',
-                "$backend $method refuses target-specific upsert");
-        }
-        is_deeply($engine->adapter->dbh->prepared, [], "$backend prepares no mutation");
+        my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse(contract(), strict => 1),
+            adapter => Selecto->adapter($backend => (dbh => Local::NoCatalogDBH->new)));
+        ok($engine->adapter->write_capabilities->{upsert}, "$backend advertises proved upserts");
+        unlike($engine->preview_write(upsert(['id']))->{sql}, qr/ON DUPLICATE KEY/,
+            "$backend never previews ON DUPLICATE KEY UPDATE");
+        is(error_code(sub {$engine->execute_write(upsert(['id']))}), 'unsupported_upsert_conflict_target',
+            "$backend execute_write refuses an upsert its catalog cannot prove");
+        is_deeply([grep { $_->{sql} =~ /\AINSERT/ } @{$engine->adapter->dbh->prepared}], [], "$backend prepares no mutation");
     }
 };
 
