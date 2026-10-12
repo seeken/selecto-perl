@@ -39,7 +39,7 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
     my ($name, $version) = @$case;
     my $adapter = Selecto->adapter($name => (dbh => bless({%{TestSelecto::DBH->new}, version => $version}, 'VersionedDBH')));
     ok($adapter->supports($_), "$name supports $_") for qw(cte recursive_cte window_functions set_operations rollup json_rowset);
-    is($adapter->supports('lateral_join') ? 1 : 0, $name eq 'mysql' ? 1 : 0, "$name LATERAL support follows the server");
+    ok($adapter->supports('lateral_join'), "$name supports lateral joins (lowered on MariaDB)");
     my $old = Selecto->adapter($name => (dbh => bless({%{TestSelecto::DBH->new},
         version => $name eq 'mysql' ? '5.7.44' : '10.1.48-MariaDB'}, 'VersionedDBH')));
     ok(!$old->supports('cte'), "$name refuses CTEs on an old server");
@@ -81,6 +81,21 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
     like($rollup->sql, qr/UNION ALL/, "$name rolls up with grouped UNION ALL branches");
     unlike($rollup->sql, qr/GROUPING\(|WITH ROLLUP|NULLS (?:FIRST|LAST)/, "$name rollup avoids GROUPING() and NULLS clauses");
     like($rollup->sql, qr/MIN\(CASE WHEN 1 = 0 THEN `s0`\.`state` END\)/, "$name rolled-up dimensions keep their type");
+
+    my $lateral = compile_for($name, $version, sub {
+        my $child = $_[0]->select('id')->where($x->eq('state', 'open'))->order_by('id', 'desc')->limit(1);
+        $_[0]->lateral_join('latest', $domain, $child, columns => ['order_id'], correlations => {person_id => 'id'})
+            ->select('id', $x->field('latest.order_id')->as('latest_id'))->where($x->gt('id', 0))
+    });
+    if ($name eq 'mariadb') {
+        unlike($lateral->sql, qr/LATERAL/, 'mariadb lowers a lateral join');
+        like($lateral->sql, qr/ROW_NUMBER\(\) OVER \(PARTITION BY `l_latest`\.`person_id` ORDER BY \(`l_latest`\.`id` IS NULL\) DESC, `l_latest`\.`id` DESC\)/,
+            'mariadb ranks lowered lateral rows per parent in the child order');
+        like($lateral->sql, qr/`__selecto_lateral_row` > 0 AND `latest`\.`__selecto_lateral_row` <= 1/, 'mariadb keeps the child limit');
+    } else {
+        like($lateral->sql, qr/LEFT JOIN LATERAL/, 'mysql keeps native LATERAL');
+    }
+    is_deeply($lateral->params, ['open', 0], "$name binds lateral parameters in text order");
 
     # Lesson 48: anonymous parameters bind in SQL text order.
     my $ordered = compile_for($name, $version, sub {

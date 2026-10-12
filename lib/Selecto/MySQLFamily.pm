@@ -44,7 +44,8 @@ my %FEATURE_VERSIONS = (
     set_operations => [[8, 0, 31], [10, 3, 0]],
     rollup => [[8, 0, 1], [10, 2, 2]],
     value_expressions => [[8, 0, 17], [10, 4, 0]],
-    lateral_join => [[8, 0, 14], undef],
+    # MariaDB has no LATERAL; its lateral joins are lowered (window functions).
+    lateral_join => [[8, 0, 14], [10, 2, 0]],
     # JSON_TABLE, also used for array elements and exact containment.
     json_rowset => [[8, 0, 4], [10, 6, 0]],
     array_rowset => [[8, 0, 4], [10, 6, 0]],
@@ -121,9 +122,107 @@ sub _compile_rollup {
 
 sub _compile_selection_expression {
     my ($self, $domain, $expression, $params, $compiled_selections, $options) = @_;
+    my $formats = $self->{_selecto_formats_active};
+    my $position = $formats ? $self->{_selecto_selection_index}++ : undef;
+    local $self->{_selecto_format_slot} = $formats && blessed($expression)
+        && $expression->kind eq 'datetime_format' ? $position : undef;
     return Selecto::SQL::RollupEmulation::selection_expression($self, $options, sub {
         return $self->_compile_expression($domain, $expression, $params, $compiled_selections);
     });
+}
+
+# Date and time formats are applied in Perl with DateTime::TimeZone: the
+# servers' CONVERT_TZ silently leaves pre-1970 (and, on MariaDB, post-2038)
+# values unconverted and stops DST after 2037. A format is therefore allowed
+# only as a selection of the outermost statement, which selects the stored
+# value with a marker and has its column formatted after execution; anywhere
+# else (filters, grouping, ordering, nested sources, set operands, rollups)
+# it is refused with unsupported_feature.
+sub compile {
+    my ($self, $domain, $query) = @_;
+    my $top = !$self->{_selecto_in_compile};
+    local $self->{_selecto_in_compile} = 1;
+    my $scope = $top && blessed($query) && !@{$query->set_operations} && $query->grouping_mode ne 'rollup'
+        ? {pending => 1, formatters => {}} : undef;
+    local $self->{_selecto_format_scope} = $scope;
+    local $self->{_selecto_formats_active};
+    my $statement = $self->SUPER::compile($domain, $query);
+    $statement->{_selecto_formatters} = $scope->{formatters} if $scope && %{$scope->{formatters}};
+    return $statement;
+}
+
+sub _compile_single {
+    my ($self, $domain, $query, %options) = @_;
+    my $scope = $self->{_selecto_format_scope};
+    # A retargeted query compiles its selections in the inner call.
+    return $self->SUPER::_compile_single($domain, $query, %options)
+        if $scope && $scope->{pending} && defined $query->retarget_spec;
+    if ($scope && $scope->{pending} && !$options{rollup_projection}) {
+        local $scope->{pending} = 0;
+        local $self->{_selecto_formats_active} = $scope;
+        local $self->{_selecto_selection_index} = 0;
+        return $self->SUPER::_compile_single($domain, $query, %options);
+    }
+    local $self->{_selecto_formats_active};
+    return $self->SUPER::_compile_single($domain, $query, %options);
+}
+
+my $FORMAT_MARKER = 'selecto-format:';
+
+sub _compile_datetime_format {
+    my ($self, $domain, $expression, $params) = @_;
+    my ($field, $format, $timezone) = @{$expression->arguments};
+    require Selecto::DateFormat;
+    Selecto::Error->throw('invalid_query', 'datetime format is not available')
+        unless Selecto::DateFormat::valid($format);
+    Selecto::Error->throw('invalid_query', 'datetime format field must be a governed temporal field')
+        unless blessed($field) && $field->isa('Selecto::Expression')
+            && ($field->kind eq 'field' || $field->kind eq 'epoch_datetime');
+    my $source = $field->kind eq 'epoch_datetime' ? $field->arguments->[0] : $field;
+    Selecto::Error->throw('invalid_query', 'datetime format field must be a governed field')
+        unless blessed($source) && $source->isa('Selecto::Expression') && $source->kind eq 'field';
+    my $type = $domain->resolve($source->arguments->[0])->{type} // '';
+    Selecto::Error->throw('invalid_query', 'datetime format requires a date or time field')
+        unless $type =~ /\A(?:date|naive_datetime|datetime|utc_datetime|epoch_datetime)\z/;
+    my $position = $self->{_selecto_format_slot};
+    Selecto::Error->throw('unsupported_feature',
+        'MySQL-family date formats are available only as selected values of the outermost query')
+        unless defined($position) && $self->{_selecto_formats_active};
+    local $self->{_selecto_format_slot};
+    $timezone //= $self->{_timezone};
+    $self->{_selecto_formats_active}{formatters}{$position} = {
+        format => "$format", type => $type, (defined($timezone) ? (timezone => "$timezone") : ()),
+    };
+    local $self->{_suppress_field_timezone} = 1;
+    local $self->{_timezone};
+    my $sql = $self->_compile_expression($domain, $source, $params);
+    my $raw = $type eq 'date' ? "DATE_FORMAT($sql, '%Y-%m-%d')"
+        : $type eq 'epoch_datetime' ? "CAST($sql AS CHAR)"
+        : "DATE_FORMAT($sql, '%Y-%m-%d %H:%i:%s.%f')";
+    return "CONCAT('$FORMAT_MARKER', $raw)";
+}
+
+sub _apply_formatters {
+    my ($self, $statement, $result) = @_;
+    my $formatters = $statement->{_selecto_formatters} or return $result;
+    require Selecto::MySQLFamily::DateFormat;
+    for my $row (@{$result->{rows}}) {
+        for my $index (keys %$formatters) {
+            next unless defined $row->[$index];
+            my $value = "$row->[$index]";
+            Selecto::Error->throw('query_error', 'date format value is not marked')
+                unless $value =~ s/\A\Q$FORMAT_MARKER\E//;
+            $row->[$index] = Selecto::MySQLFamily::DateFormat::format_value($formatters->{$index}, $value);
+        }
+    }
+    return $result;
+}
+
+sub stream_query {
+    my ($self, $statement, %options) = @_;
+    Selecto::Error->throw('unsupported_feature', 'MySQL-family date formats cannot be streamed')
+        if blessed($statement) && $statement->{_selecto_formatters};
+    return $self->SUPER::stream_query($statement, %options);
 }
 
 # DBD::MariaDB binds client-side, quoting every value, and both servers need
@@ -469,6 +568,7 @@ sub _compile_dialect_expression {
     my $kind = $expression->kind;
     return $self->_compile_text_search($domain, $expression, $params)
         if $kind eq 'text_search' || $kind eq 'text_rank';
+    return $self->_compile_datetime_format($domain, $expression, $params) if $kind eq 'datetime_format';
     return $self->SUPER::_compile_dialect_expression($domain, $expression, $params);
 }
 
@@ -518,6 +618,77 @@ sub _compile_text_search {
         Selecto::Error->throw('unsupported_feature', "MySQL-family text search mode $mode is unavailable");
     }
     return 'MATCH (' . join(', ', @columns) . ") AGAINST ($against IN BOOLEAN MODE)";
+}
+
+my %AGGREGATE_KINDS = map { $_ => 1 } qw(
+    count count_field count_distinct sum sum_zero avg min max true_count false_count true_percentage
+    count_bucket grouping dimension_display
+);
+
+# MariaDB has no LATERAL (nor derived tables that read the outer row). A
+# lateral join lowers to a derived table of the bounded child relation that
+# also selects its correlation keys and, for a limit or offset, a per-parent
+# ROW_NUMBER over the child's order (with PostgreSQL NULL placement), joined
+# on those keys and row numbers. Children whose per-parent semantics would
+# change (grouping, aggregates, set operations, retargets) are refused.
+sub _compile_lateral_joins {
+    my ($self, $domain, $query, $params) = @_;
+    my $laterals = $query->lateral_joins;
+    return $self->SUPER::_compile_lateral_joins($domain, $query, $params)
+        unless @$laterals && $self->name eq 'mariadb';
+    Selecto::Error->throw('unsupported_feature', 'adapter does not support lateral joins')
+        unless $self->supports('lateral_join');
+    my @joins;
+    for my $spec (@$laterals) {
+        $spec->{domain} = $self->_bounded_source_domain($domain, $spec->{domain}, "lateral $spec->{name}");
+        my $child = $spec->{query};
+        Selecto::Error->throw('unsupported_feature', 'MariaDB lowers only ungrouped, non-aggregate lateral children')
+            if @{$child->groups} || $child->grouping_mode ne 'plain' || @{$child->set_operations}
+                || defined($child->retarget_spec) || @{$child->lateral_joins}
+                || grep { $AGGREGATE_KINDS{$_->kind} } @{$child->selections};
+        my @columns = @{$spec->{columns}};
+        Selecto::Error->throw('invalid_query', 'lateral projection width does not match declared columns')
+            unless @columns == @{$child->selections};
+        my @keys = sort keys %{$spec->{correlations}};
+        for my $key (@keys) {
+            Selecto::Error->throw('invalid_query', 'lateral correlations require root fields')
+                if $spec->{domain}->resolve($key)->{association}
+                    || $domain->resolve($spec->{correlations}{$key})->{association};
+        }
+        my @selections = map { $child->selections->[$_]->as($columns[$_]) } 0 .. $#columns;
+        push @selections, map { Selecto::Expression->field($keys[$_])->as("__selecto_lateral_key$_") } 0 .. $#keys;
+        my ($limit, $offset) = ($child->limit_value, $child->offset_value);
+        my $ranked = defined($limit) || defined($offset);
+        push @selections, Selecto::Expression->row_number(
+            partition_by => [map { Selecto::Expression->field($_) } @keys],
+            order_by => [map { [$_->[0], $_->[1]] } @{$child->orders}],
+        )->as('__selecto_lateral_row') if $ranked;
+        my $lowered = $child->_copy(selections => \@selections, orders => [],
+            limit_value => undef, offset_value => undef);
+        my $statement = $self->_compile_single($spec->{domain}, $lowered, root_alias => 'l_' . $spec->{name});
+        my $sql = $self->_shift_placeholders($statement->sql, scalar @$params);
+        push @$params, @{$statement->params};
+        my $name = $self->quote_identifier($spec->{name});
+        my @on = map {
+            "$name." . $self->quote_identifier("__selecto_lateral_key$_") . ' = '
+                . $self->_qualified($self->_root_alias, $spec->{correlations}{$keys[$_]})
+        } 0 .. $#keys;
+        if ($ranked) {
+            my $row = "$name." . $self->quote_identifier('__selecto_lateral_row');
+            my $start = int($offset // 0);
+            push @on, "$row > $start";
+            push @on, "$row <= " . ($start + int($limit)) if defined $limit;
+        }
+        push @joins, ($spec->{type} eq 'left' ? 'LEFT JOIN' : 'INNER JOIN') . " ($sql) AS $name ON " . join(' AND ', @on);
+    }
+    return \@joins;
+}
+
+sub _compile_function_laterals {
+    my ($self, $query, $params) = @_;
+    Selecto::Error->throw('unsupported_feature', 'MariaDB has no lateral function sources')
+        if @{$query->function_laterals} && $self->name eq 'mariadb';
+    return $self->SUPER::_compile_function_laterals($query, $params);
 }
 
 sub _values_source_cast_sql { return $_[1] eq 'INTEGER' ? 'SIGNED' : 'DOUBLE'; }
@@ -987,7 +1158,7 @@ sub _column_types {
 sub execute_query {
     my ($self, $statement, %options) = @_;
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
-    return $self->SUPER::execute_query($statement);
+    return $self->_apply_formatters($statement, $self->SUPER::execute_query($statement));
 }
 
 sub _decode {

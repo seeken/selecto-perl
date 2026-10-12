@@ -48,6 +48,15 @@ Unreleased
       refuse. Caught child failures still roll back the callback. Errors
       after callback completion preserve unknown commit state and prohibit
       automatic retry. See docs/fluent-writes.md for capability limits.
+    - MySQL and MariaDB support datetime_format as a selected value of the
+      outermost query. The stored value is selected with a marker and
+      formatted in Perl with DateTime::TimeZone (PostgreSQL gap/fold rules)
+      because CONVERT_TZ leaves pre-1970 and (MariaDB) post-2038 values
+      unconverted and drops DST after 2037. Formats in filters, grouping,
+      ordering, nested sources, set operands or rollups, and streamed
+      formatted statements, are refused with unsupported_feature.
+      utc_datetime columns must hold UTC in DATETIME (a TIMESTAMP column is
+      read through the session time zone).
     - MySQL and MariaDB writes: unscoped upserts follow PostgreSQL ON
       CONFLICT semantics without ON DUPLICATE KEY UPDATE (which resolves on
       the primary key before the declared target and has no WHERE). In the
@@ -74,7 +83,9 @@ Unreleased
       functions (rows and range frames), INTERSECT/EXCEPT, rollups (as
       grouped UNION ALL branches with typed NULL dimensions, since MariaDB
       has no GROUPING() and neither server has NULLS FIRST/LAST), LATERAL
-      joins (MySQL 8.0.14+ only), JSON_TABLE JSON and array rowsets, exact
+      joins (native on MySQL 8.0.14+; on MariaDB lowered to a derived table
+      with per-parent ROW_NUMBER, refusing grouped or aggregate children),
+      JSON_TABLE JSON and array rowsets, exact
       jsonb-style JSON containment and typed array predicates (JSON_CONTAINS
       also matches scalars inside nested arrays, so it is not used), JSON
       text extraction, value expressions, ordered and per-parent bounded
