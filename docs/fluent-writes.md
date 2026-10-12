@@ -165,10 +165,9 @@ my $created = $engine->transaction(sub {
 ```
 
 `return_for_update` is mutually exclusive with `returning`. It requires exactly
-one inserted/updated/upserted row and an explicitly granted primary key in the
-requested projection. Delete and bulk handles refuse. The current native domain
-contract has a scalar primary key; compound-key handles and hidden identity
-retrieval are not advertised. Unsupported adapters refuse explicitly.
+one inserted/updated/upserted row and every explicitly granted primary-key field
+in the requested projection. Delete and bulk handles refuse. Hidden identity
+retrieval is not implemented. Unsupported adapters refuse explicitly.
 
 The callback pins one connection and transaction. Native writes use savepoints
 and never commit it independently. Nested callbacks use their own savepoint and
@@ -241,6 +240,29 @@ supports owned one-to-many insert edges bound to the parent's primary key;
 shared references, synchronization, arbitrary joined updates, and child edit
 handles remain explicit unsupported capabilities.
 
+## Compound identities
+
+Compound root identities use a nonempty, distinct field list in the domain:
+`source => {primary_key => ['tenant_id', 'id'], ...}`. Both
+`return_for_update(qw(tenant_id id name))` and locked reads must explicitly
+select every key field. Locked reads also require an equality for each part:
+
+```perl
+my $editable = $tx->query->where(Selecto::Expression->all(
+    Selecto::Expression->eq('tenant_id', 8),
+    Selecto::Expression->eq('id', $id),
+))->select_for_update(qw(tenant_id id name))->execute;
+$editable->row->write->update->assignments(name => 'Changed')->execute;
+```
+
+The handle retains all actual returned components; a follow-up cannot assign
+any identity field. Missing/null components refuse. Native compound row actions
+accept `target({tenant_id => 8, id => $id})`; missing or extra fields refuse.
+Compound bulk-action targets and relationship bindings across multiple columns
+are not implemented. Existing scalar relationship bindings still require the
+declared globally unique parent field; a compound component alone does not
+acquire that guarantee.
+
 ## Verification
 
 `t/fluent_write_builder.t` exercises real SQLite writes, action authorization,
@@ -252,7 +274,7 @@ child rollback also run through the helper in
 
 With `SELECTO_PERL_TEST_POSTGRES_URL` pointing to a disposable database,
 `t/fluent_edit_handles.integration.t` verifies generated/exact identities,
-both upsert branches, actual two-connection lock contention, preview behavior,
+both upsert branches, scalar/compound identities, actual two-connection lock contention, preview behavior,
 owned-child atomicity, nested/host transaction ownership, and handle expiry.
 It creates uniquely named synthetic tables and removes only its own tables.
 

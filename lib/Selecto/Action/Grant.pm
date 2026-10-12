@@ -19,7 +19,7 @@ use Selecto::Error ();
 # issued, so a blessed lookalike authorizes nothing.
 
 my %GRANTS;
-my $JSON = JSON::PP->new->canonical(1)->allow_blessed(1)->convert_blessed(0);
+my $JSON = JSON::PP->new->canonical(1)->utf8(1)->allow_blessed(1)->convert_blessed(0);
 
 sub _issue {
     my ($class, %binding) = @_;

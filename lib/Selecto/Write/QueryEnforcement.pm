@@ -209,7 +209,10 @@ sub compile {
             relation=>$contract->{source}{source_table}//$contract->{source}{table},
             primary_key=>$contract->{source}{primary_key}//$state->{domain}{primary_key}//'id',
             fingerprint=>$contract->{fingerprint});
-        my @mismatch = grep { defined($source->{$_}) && defined($actual{$_}) && $source->{$_} ne $actual{$_}
+        my @mismatch = grep { defined($source->{$_}) && defined($actual{$_}) &&
+            (ref($source->{$_}) || ref($actual{$_})
+                ? JSON::PP->new->canonical->allow_nonref->encode($source->{$_}) ne JSON::PP->new->canonical->allow_nonref->encode($actual{$_})
+                : $source->{$_} ne $actual{$_})
             || ($_ eq 'relation' || $_ eq 'primary_key') && (!defined($source->{$_}) || !defined($actual{$_})) } sort keys %actual;
         _fail('query_source_mismatch', 'enforced query and write source identities differ', {fields=>\@mismatch}) if @mismatch;
         _fail('query_enforcement_requires_filter', 'an enforced query must contain an effective predicate') unless ref($evidence->{filters}) eq 'ARRAY' && @{$evidence->{filters}};

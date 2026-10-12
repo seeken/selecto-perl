@@ -68,7 +68,9 @@ C<bulk>).
 
 =item C<target>
 
-The normalized target: a primary-key value, or C<< {ids => [...]} >>.
+The normalized target: a scalar primary-key value, a compound row identity
+object naming every primary-key field, or C<< {ids => [...]} >> for a scalar
+bulk target.
 
 =item C<filters>
 

@@ -62,6 +62,30 @@ subtest 'SQLite preflight refuses before triggers' => sub {
     exercise('sqlite',$dbh,sub{$dbh->selectrow_array('SELECT total_changes()')-$before});
 };
 
+subtest 'compound probe retains exact tuples rather than a Cartesian selection' => sub {
+    plan skip_all=>'SQLite unavailable' unless eval{require DBI;require DBD::SQLite;1};
+    my $dbh=DBI->connect('dbi:SQLite:dbname=:memory:','','',{RaiseError=>1,PrintError=>0});
+    $dbh->do('CREATE TABLE bounded_items(a INTEGER NOT NULL,b INTEGER NOT NULL,name TEXT,PRIMARY KEY(a,b))');
+    $dbh->do(q{INSERT INTO bounded_items VALUES(1,1,'picked'),(2,2,'picked'),(1,2,'leave'),(2,1,'leave')});
+    my $adapter=Selecto->adapter(sqlite=>(dbh=>$dbh));
+    my $cmd=Selecto::Write::Command->new(operation=>'update',relation=>'bounded_items',
+        assignments=>{name=>'changed'},predicate=>Selecto::Expression->eq('name','picked'),expected_count=>2,
+        metadata=>{__selecto_primary_key=>['a','b'],__selecto_write_limit=>1000});
+    $dbh->begin_work;
+    my $bounded=$adapter->_bounded_write_command($cmd);
+    # Simulate newly matching crossed rows after the probe. They must never
+    # join the already selected tuple set, even though both components match.
+    $dbh->do(q{UPDATE bounded_items SET name='picked' WHERE name='leave'});
+    my $compiled=$adapter->_compile_write($bounded);
+    my $sth=$dbh->prepare($compiled->{sql});
+    $sth->execute(@{$compiled->{params}});
+    is($sth->rows,2,'only complete probed tuples mutate');
+    is_deeply($dbh->selectall_arrayref('SELECT a,b,name FROM bounded_items ORDER BY a,b'),
+        [[1,1,'changed'],[1,2,'picked'],[2,1,'picked'],[2,2,'changed']], 'crossed component values are excluded');
+    $dbh->rollback;
+    $dbh->disconnect;
+};
+
 subtest 'PostgreSQL preflight refuses before nontransactional trigger effects' => sub {
     my $database=$ENV{SELECTO_API_TEST_DATABASE};
     plan skip_all=>'disposable PostgreSQL unavailable' unless $database && eval{require DBI;require DBD::Pg;1};

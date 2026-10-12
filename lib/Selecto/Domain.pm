@@ -101,12 +101,14 @@ sub _construct {
         tenant_field => $args{tenant_field},
         tenant_required => $tenant_required,
     }, $class;
-    $self->{primary_key} = _identifier(
-        $args{primary_key} // (exists($fields->{id}) ? 'id' : (sort keys %$fields)[0]),
-        'primary key',
-    );
+    my $primary = $args{primary_key} // (exists($fields->{id}) ? 'id' : (sort keys %$fields)[0]);
+    my @primary = ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    my %primary;
+    Selecto::Error->throw('invalid_domain', 'primary key must contain distinct root fields')
+        unless @primary && !grep { $primary{_identifier($_, 'primary key')}++ } @primary;
     Selecto::Error->throw('invalid_domain', 'primary key must be a root field')
-        unless exists $fields->{$self->{primary_key}};
+        if grep { !exists $fields->{$_} } @primary;
+    $self->{primary_key} = ref($primary) eq 'ARRAY' ? [@primary] : $primary;
     if (defined($self->{tenant_field})) {
         $self->{tenant_field} = _identifier($self->{tenant_field}, 'tenant field');
         Selecto::Error->throw('invalid_domain', 'tenant field must be a root field')
@@ -1324,7 +1326,7 @@ sub as_contract {
         name => $self->{name},
         source => {
             source_table => $self->{table},
-            primary_key => $self->{primary_key},
+            primary_key => $self->primary_key,
             fields => [sort keys %{$self->{fields}}],
             columns => \%columns,
             associations => $source_associations,
@@ -2488,7 +2490,8 @@ sub _normalize_fts5_index {
 sub fields       { return { %{$_[0]->{fields}} }; }
 sub associations { return { %{$_[0]->{associations}} }; }
 sub fingerprint  { return $_[0]->{fingerprint}; }
-sub primary_key  { return $_[0]->{primary_key}; }
+sub primary_key  { my $key = $_[0]->{primary_key}; return ref($key) eq 'ARRAY' ? [@$key] : $key; }
+sub primary_keys { my $key = $_[0]->{primary_key}; return ref($key) eq 'ARRAY' ? [@$key] : [$key]; }
 sub required_predicate { return $_[0]->{required_predicate}; }
 # The tenant family of a two-column domain ({tenant, site}; see
 # _tenant_family), or undef, and the root columns its hops pair with by name.
@@ -3255,7 +3258,10 @@ root C<source> must use C<source_table>.
 
 =item C<primary_key>
 
-Defaults to C<id>.
+Defaults to C<id>. A scalar names one root field; an array reference names
+distinct root fields making up a compound identity. C<primary_keys> always
+returns a fresh array reference, while C<primary_key> preserves the authored
+scalar or array shape and copies arrays.
 
 =item C<fields> and C<columns>
 

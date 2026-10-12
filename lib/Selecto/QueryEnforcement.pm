@@ -139,7 +139,7 @@ sub evaluate {
 
 sub predicate_fingerprint_value {
     my ($expression) = @_;
-    my $json = JSON::PP->new->canonical(1)->encode(_predicate_value($expression));
+    my $json = JSON::PP->new->canonical(1)->utf8(1)->encode(_predicate_value($expression));
     return 'sha256:' . sha256_hex($json);
 }
 

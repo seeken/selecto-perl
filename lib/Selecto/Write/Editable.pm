@@ -27,12 +27,12 @@ sub _row {
 my $issue = sub {
     my ($engine, $result, $values) = @_;
     Selecto::Write::Session->require_live($engine);
-    my $key = $engine->domain->primary_key;
-    _fail('editable result requires one complete scalar root identity')
-        unless defined($key) && !ref($key) && defined($values->{$key}) && !ref($values->{$key});
+    my $keys = $engine->domain->primary_keys;
+    _fail('editable result requires a complete non-null root identity')
+        if grep { !defined($values->{$_}) || ref($values->{$_}) } @$keys;
     my ($rt, $ht) = (0, 0);
     my $row = bless \$ht, 'Selecto::Write::Editable::Row';
-    $ROWS{$row} = {engine => $engine, key => $key, id => $values->{$key}};
+    $ROWS{$row} = {engine => $engine, keys => $keys, identity => {map { ($_ => $values->{$_}) } @$keys}};
     my $res = bless \$rt, 'Selecto::Write::Editable::Result';
     $RESULTS{$res} = {row => $row, result => $result, values => _copy($values)};
     return $res;
@@ -46,12 +46,13 @@ sub dispatch {
     _fail('edit handles require exactly one affected row')
         unless ref($cardinality) eq 'ARRAY' && @$cardinality == 2
             && $cardinality->[0] eq 'exactly' && $cardinality->[1] == 1;
-    my $key = $engine->domain->primary_key;
+    my $keys = $engine->domain->primary_keys;
     my $returning = $command->metadata->{returning} // [];
     # This pilot requires an explicitly granted identity in the requested
     # projection. No hidden identity read or implicit returning grant.
-    _fail('return_for_update must include the granted primary key')
-        unless ref($returning) eq 'ARRAY' && grep { $_ eq $key } @$returning;
+    my %returning = map { ($_ => 1) } @$returning;
+    _fail('return_for_update must include every granted primary-key field')
+        if grep { !$returning{$_} } @$keys;
     return $engine->preview_write($command) if $phase eq 'preview';
     my ($res, $error);
     my $ok = eval {
@@ -70,8 +71,9 @@ sub validate_read {
         if $query->retarget_spec || @{$query->groups} || $query->grouping_mode ne 'plain' || $query->offset_value
             || defined($query->limit_value) && $query->limit_value == 0
             || grep { @{$query->{$_} // []} } qw(set_operations ctes lateral_joins json_rowsets array_rowsets members values_sources subqueries function_laterals);
-    my $key = $engine->domain->primary_key;
-    my $identity;
+    my $keys = $engine->domain->primary_keys;
+    my %keys = map { ($_ => 1) } @$keys;
+    my %identity;
     my $find;
     $find = sub {
         my ($expr) = @_;
@@ -80,14 +82,15 @@ sub validate_read {
         return unless $expr->kind eq 'eq';
         my ($left, $right) = @{$expr->arguments};
         return unless blessed($left) && blessed($right) && $left->kind eq 'field' && $right->kind eq 'literal'
-            && $left->arguments->[0] eq $key;
+            && $keys{$left->arguments->[0]};
+        my $key = $left->arguments->[0];
         my $value = $right->arguments->[0];
         _fail('root identity must be a non-null scalar') unless defined($value) && !ref($value);
-        _fail('conflicting root identities') if defined($identity) && "$identity" ne "$value";
-        $identity = $value;
+        _fail('conflicting root identities') if exists($identity{$key}) && "$identity{$key}" ne "$value";
+        $identity{$key} = $value;
     };
     $find->($query->predicate);
-    _fail('select_for_update requires an exact root primary-key filter') unless defined $identity;
+    _fail('select_for_update requires every exact root primary-key filter') if grep { !exists $identity{$_} } @$keys;
     my @fields;
     for my $expr (@{$query->selections}) {
         _fail('editable reads select declared public root fields only')
@@ -97,7 +100,8 @@ sub validate_read {
             unless exists($engine->domain->fields->{$field}) && $engine->domain->field_is_public($field);
         push @fields, $field;
     }
-    _fail('editable read projection must include primary key') unless grep { $_ eq $key } @fields;
+    my %fields = map { ($_ => 1) } @fields;
+    _fail('editable read projection must include every primary-key field') if grep { !$fields{$_} } @$keys;
     return 1;
 }
 sub locked_read {
@@ -120,19 +124,20 @@ sub bound_command {
     my ($class, $row, $edge_name, $type, $values, $metadata) = @_;
     my $s = _row($row);
     my $engine = $s->{engine};
-    my $predicate = Selecto::Expression->eq($s->{key}, $s->{id});
+    my $predicate = Selecto::Expression->all(map { Selecto::Expression->eq($_, $s->{identity}{$_}) } @{$s->{keys}});
     _fail('related write pilot supports owned one-to-many inserts only') unless $type eq 'insert';
     my $edge = $engine->domain->writes->{relationships}{$edge_name};
     _fail('related write requires a declared owned one-to-many edge')
         unless ref($edge) eq 'HASH' && ($edge->{ownership} // '') =~ /\A(?:owned|composition)\z/
             && ($edge->{cardinality} // '') eq 'many' && ref($edge->{domain}) eq 'HASH';
-    my $parent_key = $edge->{parent_key} // $s->{key};
+    my $parent_key = $edge->{parent_key} // (@{$s->{keys}} == 1 ? $s->{keys}[0] : undef);
     my $child_key = $edge->{child_key} // $edge->{foreign_key};
-    _fail('related insert requires the exact bound parent key') unless $parent_key eq $s->{key} && defined($child_key);
+    _fail('related insert requires a declared bound parent key')
+        unless defined($parent_key) && !ref($parent_key) && exists($s->{identity}{$parent_key}) && defined($child_key);
     _fail('related assignments cannot override the parent binding') if exists($values->{$child_key});
     my $child = Selecto::Engine::_native_relationship_domain($edge->{domain});
     my $anchor = Selecto::Write::Command->new(operation => 'update', relation => $engine->domain->table,
-        assignments => {}, predicate => $predicate, expected_count => 1, metadata => {returning => [$s->{key}]});
+        assignments => {}, predicate => $predicate, expected_count => 1, metadata => {returning => $s->{keys}});
     my $command = Selecto::Write::Command->new(operation => 'insert', relation => $child->table,
         assignments => $values, expected_count => 1, metadata => $metadata);
     return Selecto::Write::Graph->new(nodes => [
@@ -143,7 +148,7 @@ sub bound_command {
 sub identity_filter {
     my ($class, $row) = @_;
     my $s = _row($row);
-    return [$s->{key}, $s->{id}];
+    return [map { [$_, $s->{identity}{$_}] } @{$s->{keys}}];
 }
 sub assert_live { _row($_[1]); return 1 }
 

@@ -17,11 +17,13 @@ my $db = $connect->();
 my $observer = $connect->();
 my $parents = 'selecto_helper_parents_' . $$;
 my $children = 'selecto_helper_children_' . $$;
+my $compound = 'selecto_helper_compound_' . $$;
 $db->do("CREATE TABLE $parents(id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, name TEXT UNIQUE NOT NULL, UNIQUE(tenant_id,id))");
 $db->do("CREATE TABLE $children(id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, parent_id BIGINT NOT NULL REFERENCES $parents(id), name TEXT UNIQUE NOT NULL)");
+$db->do("CREATE TABLE $compound(tenant_id INTEGER NOT NULL, id BIGINT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(tenant_id,id))");
 END {
     if ($db) {
-        eval { $db->rollback unless $db->{AutoCommit}; $db->do("DROP TABLE IF EXISTS $children"); $db->do("DROP TABLE IF EXISTS $parents") };
+        eval { $db->rollback unless $db->{AutoCommit}; $db->do("DROP TABLE IF EXISTS $compound"); $db->do("DROP TABLE IF EXISTS $children"); $db->do("DROP TABLE IF EXISTS $parents") };
     }
 }
 sub domain {
@@ -195,5 +197,57 @@ subtest 'changing the connection lease expires issued row handles' => sub {
     });
     $replacement->rollback;
     $replacement->disconnect;
+};
+subtest 'compound identities bind every component for writes and locked reads' => sub {
+    my $contract = domain($compound, qw(tenant_id id name));
+    $contract->{source}{primary_key} = [qw(tenant_id id)];
+    $contract->{writes}{fields}{id} = {insertable => JSON::PP::true, immutable => JSON::PP::true};
+    $contract->{writes}{operations}{upsert} = {enabled => JSON::PP::true, returning => 'all', conflict_targets => [[qw(tenant_id id)]]};
+    my $host = Selecto::Engine->new(domain => Selecto::Domain->parse($contract), adapter => $engine->adapter,
+        write_context => {tenant_id => 8});
+    my $key = $host->domain->primary_key;
+    $key->[0] = 'name';
+    is_deeply($host->domain->primary_keys, [qw(tenant_id id)], 'primary-key accessor cannot mutate configured identity');
+    my $large = '9007199254740993';
+    $db->do("INSERT INTO $compound VALUES(9, ?, 'other tenant')", undef, $large);
+    my $saved = $host->transaction(sub {
+        my ($tx) = @_;
+        isa_ok(error(sub { Selecto::Write->new($tx)->insert->assignments(id => 1, name => 'incomplete')
+            ->return_for_update(qw(id name))->execute }), 'Selecto::Error', 'missing returned component refuses before insert');
+        my $created = Selecto::Write->new($tx)->insert->with_tenant(8)->assignments(id => $large, name => 'compound')
+            ->return_for_update(qw(tenant_id id name))->execute;
+        is_deeply([map { "" . $created->values->{$_} } qw(tenant_id id)], ['8', $large], 'complete native large identity retained');
+        for my $field (qw(tenant_id id)) {
+            isa_ok(error(sub { $created->row->write->update->assignments($field => 10) }), 'Selecto::Error', 'each identity component is immutable');
+        }
+        my $change = $created->row->write->update->assignments(name => 'changed');
+        like($change->preview->{sql}, qr/"tenant_id".*"id"/s, 'follow-up preview contains compound identity');
+        $change->execute;
+        is($observer->selectrow_array("SELECT count(*) FROM $compound WHERE tenant_id = 8"), 0, 'compound insert and follow-up share transaction');
+        return $created;
+    });
+    is($db->selectrow_array("SELECT name FROM $compound WHERE tenant_id = 8 AND id = ?", undef, $large), 'changed', 'exact compound write committed');
+    is($db->selectrow_array("SELECT name FROM $compound WHERE tenant_id = 9 AND id = ?", undef, $large), 'other tenant', 'same second key in other tenant unchanged');
+    is(error(sub { $saved->row })->code, 'edit_handle_expired', 'compound handle expires after callback');
+    $host->transaction(sub {
+        my ($tx) = @_;
+        isa_ok(error(sub { $tx->query->filter(Selecto::Expression->eq('id', $large))->select_for_update(qw(tenant_id id name)) }),
+            'Selecto::Error', 'partial compound read filter refuses');
+        my $query = $tx->query->where(Selecto::Expression->all(
+            Selecto::Expression->eq('tenant_id', 8), Selecto::Expression->eq('id', $large)));
+        isa_ok(error(sub { $query->select_for_update(qw(id name)) }), 'Selecto::Error', 'partial compound projection refuses');
+        my $editable = $query->select_for_update(qw(tenant_id id name))->execute;
+        my $locked = error(sub { $observer->do("UPDATE $compound SET name = 'blocked' WHERE tenant_id = 8 AND id = ?", undef, $large) });
+        ok($locked, 'second connection contends on compound row lock');
+        is($observer->state, '55P03', 'actual compound lock timeout');
+        $editable->row->write->update->assignments(name => 'read follow-up')->execute;
+    });
+    $host->transaction(sub {
+        my ($tx) = @_;
+        my $editable = Selecto::Write->new($tx)->upsert->assignments(id => $large, name => 'upserted')
+            ->conflict_target(qw(tenant_id id))->upsert_update_fields('name')->return_for_update(qw(tenant_id id name))->execute;
+        $editable->row->write->update->assignments(name => 'upsert follow-up')->execute;
+    });
+    is($db->selectrow_array("SELECT name FROM $compound WHERE tenant_id = 8 AND id = ?", undef, $large), 'upsert follow-up', 'compound upsert retains exact identity');
 };
 done_testing;

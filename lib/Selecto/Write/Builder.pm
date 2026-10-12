@@ -97,7 +97,7 @@ sub assignments {
     my $values = _pairs(@args);
     if ($s->{row} && !defined($s->{edge})) {
         my $identity = Selecto::Write::Editable->identity_filter($s->{row});
-        _fail('row-bound update cannot change primary identity') if exists $values->{$identity->[0]};
+        _fail('row-bound update cannot change primary identity') if grep { exists $values->{$_->[0]} } @$identity;
     }
     $s->{assignments} = $values;
     return $self;
@@ -213,7 +213,9 @@ sub _command {
     my $op = Selecto::Write::Operation->new($engine->domain->as_contract)
         ->operation($s->{type}, $s->{assignments})->filters($s->{filters})
         ->expected_cardinality($s->{expected_cardinality} // ['exactly', 1]);
-    $op = $op->filter(Selecto::Write::Editable->identity_filter($s->{row})) if $s->{row};
+    if ($s->{row}) {
+        $op = $op->filter($_) for @{Selecto::Write::Editable->identity_filter($s->{row})};
+    }
     $op = $op->enforce_query($engine->query->where(Selecto::Expression->all(@{$s->{predicates}})))
         if @{$s->{predicates} // []};
     for my $key (qw(returning conflict_target upsert_update_fields)) {

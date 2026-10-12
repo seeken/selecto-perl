@@ -151,4 +151,52 @@ subtest 'native returning preserves Unicode, null and exact large identity' => s
     is($res->values->{name}, 'Tokyo 東京', 'native literal Unicode preserved');
     ok(exists($res->values->{state}) && !defined($res->values->{state}), 'explicit null retained');
 };
+subtest 'compound root identities retain exact write scope and action targets' => sub {
+    $db->do('CREATE TABLE compound_tasks(org_id INTEGER NOT NULL, id TEXT NOT NULL, name TEXT, state TEXT, reason TEXT, PRIMARY KEY(org_id,id))');
+    my $contract = Selecto::Domain::QueryContract->copy_declaration($raw);
+    $contract->{name} = 'Compound tasks';
+    $contract->{source}{source_table} = 'compound_tasks';
+    $contract->{source}{primary_key} = [qw(org_id id)];
+    $contract->{source}{columns}{id}{type} = 'string';
+    $contract->{writes}{operations}{upsert}{conflict_targets} = [[qw(org_id id)]];
+    my $native = Selecto::Domain->new(name => 'Compound', table => 'compound_tasks',
+        fields => {org_id => 'integer', id => 'string'}, primary_key => [qw(org_id id)]);
+    my $exported = $native->as_contract;
+    $exported->{source}{primary_key}[0] = 'id';
+    is_deeply($native->primary_keys, [qw(org_id id)], 'native contract export owns its compound key copy');
+    my $host = Selecto::Engine->new(domain => Selecto::Domain->parse($contract), adapter => $engine->adapter,
+        write_context => {tenant_id => 8});
+    my $new = sub { Selecto::Write->new($host) };
+    for my $id ('東京', 'other') {
+        $new->()->insert->assignments(id => $id, name => 'Test', state => 'done')->execute;
+    }
+    $db->do(q{INSERT INTO compound_tasks VALUES(9,'東京','other tenant','done',NULL)});
+    my $changed = $new->()->update->assignments(name => 'exact')->filter(Selecto::Expression->all(
+        Selecto::Expression->eq('org_id', 8), Selecto::Expression->eq('id', '東京')))->execute;
+    is($changed->affected_rows, 1, 'captured native predicate preserves compound source identity');
+    my $before = $db->selectrow_array('SELECT total_changes()');
+    my $failure = error(sub { $new->()->update->assignments(name => 'too broad')->execute });
+    is($failure->code, 'cardinality_mismatch', 'partial identity cannot bypass bounded probe');
+    is($db->selectrow_array('SELECT total_changes()'), $before, 'broad refusal occurs before target DML');
+    $new->()->update->assignments(name => 'bounded set')->expected_cardinality(['exactly',2])->execute;
+    is_deeply($db->selectall_arrayref('SELECT org_id,id,name FROM compound_tasks ORDER BY org_id,id'),
+        [[8,'other','bounded set'],[8,'東京','bounded set'],[9,'東京','other tenant']], 'probe binds full tuples without cross-tenant effects');
+    my $action = $new->()->action('archive')->target({org_id => 8, id => '東京'})->inputs(reason => 'complete');
+    my $policy = sub { 'enabled' };
+    my $preview = $action->preview(resolver => $policy);
+    like($preview->{statement}{sql}, qr/"org_id".*"id"/s, 'action preview includes every target component');
+    $action->execute(resolver => $policy);
+    is($db->selectrow_array(q{SELECT state FROM compound_tasks WHERE org_id=8 AND id='東京'}), 'archived', 'named row action targets native compound identity');
+    for my $target ({id => '東京'}, {org_id => undef, id => '東京'}, {org_id => 8,id => '東京',name => 'extra'}, '東京') {
+        isa_ok(error(sub { $new->()->action('archive')->target($target)->inputs(reason => 'bad')->execute(resolver => $policy) }),
+            'Selecto::Error', 'incomplete or ambiguous action identity refuses');
+    }
+    isa_ok(error(sub { $new->()->action('bulk_archive')->target({ids => [{org_id => 8, id => 'other'}]})->execute(resolver => $policy) }),
+        'Selecto::Error', 'unimplemented compound bulk target refuses explicitly');
+    for my $key ([], ['id','id'], ['id','missing'], ['id',{}]) {
+        my $bad = Selecto::Domain::QueryContract->copy_declaration($contract);
+        $bad->{source}{primary_key} = $key;
+        isa_ok(error(sub { Selecto::Domain->parse($bad) }), 'Selecto::Error', 'invalid native primary-key declaration refuses');
+    }
+};
 done_testing;
