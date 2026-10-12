@@ -10,6 +10,7 @@ use Selecto::SQLite::Ownership ();
 use Selecto::SQLite::UpsertCandidate ();
 use Cpanel::JSON::XS ();
 use JSON::PP ();
+use Selecto::SQL::RollupEmulation ();
 
 sub rule_upsert_scope {
     Selecto::SQLite::UpsertCandidate::_check_args(@_);
@@ -240,154 +241,35 @@ sub supports {
         || "$feature" eq 'rollup' ? 1 : 0;
 }
 
-my %ROLLUP_AGGREGATES = map { $_ => 1 } qw(
-    count count_field count_distinct sum sum_zero avg min max
-    true_count false_count true_percentage count_bucket
-);
-
 sub _emulates_rollup { return 1; }
 
 sub _validate_rollup_projection {
     my ($self, $expression, $dimensions) = @_;
-    my $key = Selecto::SQL::_expression_key($expression);
-    return if exists($dimensions->{$key}) || $expression->kind eq 'literal'
-        || $ROLLUP_AGGREGATES{$expression->kind};
-    my ($kind, $args) = ($expression->kind, $expression->arguments);
-    if ($kind eq 'grouping') {
-        Selecto::Error->throw('invalid_query', 'GROUPING must reference at most 31 rollup dimensions')
-            unless ref($args->[0]) eq 'ARRAY' && @{$args->[0]} && @{$args->[0]} <= 31
-                && !grep { !exists $dimensions->{Selecto::SQL::_expression_key($_)} } @{$args->[0]};
-        return;
-    }
-    if ($kind eq 'dimension_display') {
-        Selecto::Error->throw('invalid_query', 'dimension display requires a rollup dimension')
-            unless @$args == 2 && blessed($args->[1]) && $args->[1]->isa('Selecto::Expression')
-                && exists $dimensions->{Selecto::SQL::_expression_key($args->[1])};
-        return;
-    }
-    # Scalar compositions may use dimensions, constants, and closed measures.
-    # A free field, window, subquery, or unrelated value AST is not a measure.
-    Selecto::Error->throw('invalid_query', 'rollup projections require dimensions or closed aggregates')
-        if $kind =~ /\A(?:field|value|window|related_collection|recursion_depth)\z/;
-    my @children = _rollup_expression_children($args);
-    Selecto::Error->throw('invalid_query', 'rollup projections require dimensions or closed aggregates')
-        unless @children;
-    $self->_validate_rollup_projection($_, $dimensions) for @children;
-}
-
-sub _rollup_expression_children {
-    my ($value) = @_;
-    return ($value) if blessed($value) && $value->isa('Selecto::Expression');
-    return map { _rollup_expression_children($_) } @$value if ref($value) eq 'ARRAY';
-    return map { _rollup_expression_children($value->{$_}) } sort keys %$value if ref($value) eq 'HASH';
-    return ();
+    return Selecto::SQL::RollupEmulation::validate_projection($self, $expression, $dimensions);
 }
 
 sub _compile_rollup {
     my ($self, $domain, $query, %options) = @_;
-    my $groups = $query->groups;
-    my %dimensions;
-    for my $index (0 .. $#$groups) {
-        my $key = Selecto::SQL::_expression_key($groups->[$index]);
-        Selecto::Error->throw('invalid_query', 'rollup requires at most 31 distinct dimensions')
-            if @$groups > 31 || exists $dimensions{$key};
-        $dimensions{$key} = $index;
-    }
-    Selecto::Error->throw('invalid_query', 'rollup requires at least one dimension') unless @$groups;
-    Selecto::Error->throw('unsupported_feature', 'adapter does not support row locks')
-        if defined $query->row_lock;
-    my $selections = $query->selections;
-    Selecto::Error->throw('invalid_query', 'query must select at least one expression') unless @$selections;
-    $self->_validate_rollup_projection($_, \%dimensions) for @$selections;
-    my @columns = map { $self->_selection_name($_) } @$selections;
-    my @aliased = map { $selections->[$_]->as($columns[$_]) } 0 .. $#$selections;
-    my (@branches, @params);
-    for (my $level = @$groups; $level >= 0; $level--) {
-        my $branch = $query->_copy(
-            selections => \@aliased,
-            grouping_mode => 'plain', groups => $level ? [@$groups[0 .. $level - 1]] : [],
-            orders => [], limit_value => undef, offset_value => undef,
-        );
-        my $statement = $self->_compile_single($domain, $branch, %options,
-            rollup_projection => {dimensions => \%dimensions, level => $level});
-        # A derived table also keeps branch-local WITH clauses legal in a union.
-        push @branches, 'SELECT * FROM (' . $statement->sql . ') AS '
-            . $self->quote_identifier('__selecto_rollup_branch' . $level);
-        push @params, @{$statement->params};
-    }
-    my $sql = 'SELECT * FROM (' . join(' UNION ALL ', @branches) . ') AS '
-        . $self->quote_identifier('__selecto_rollup');
-    my @orders;
-    for my $order (@{$query->orders}) {
-        my $key = Selecto::SQL::_expression_key($order->[0]);
-        my ($position) = grep {
-            Selecto::SQL::_expression_key($selections->[$_]) eq $key
-                || ($order->[0]->kind eq 'field' && $order->[0]->arguments->[0] eq $columns[$_])
-        } 0 .. $#$selections;
-        Selecto::Error->throw('invalid_query', 'rollup ordering must reference a selected output column')
-            unless defined $position;
-        push @orders, ($position + 1) . ' ' . uc($order->[1]);
-    }
-    my ($marker) = grep {
-        $selections->[$_]->kind eq 'grouping'
-            && Selecto::SQL::_value_key($selections->[$_]->arguments->[0]) eq Selecto::SQL::_value_key($groups)
-    } 0 .. $#$selections;
-    if (@orders) {
-        $_ .= @$groups == 1 && defined($marker) ? ' NULLS LAST' : ' NULLS FIRST' for @orders;
-        if (defined $marker) {
-            @$groups == 1 ? unshift(@orders, ($marker + 1) . ' DESC')
-                : push(@orders, ($marker + 1) . ' DESC');
-        }
-        $sql .= ' ORDER BY ' . join(', ', @orders);
-    }
-    $sql .= $self->_compile_pagination($query->limit_value, $query->offset_value, @orders ? 1 : 0);
-    return Selecto::Statement->new(sql => $sql, params => \@params,
-        columns => \@columns, adapter_name => $self->name);
+    return Selecto::SQL::RollupEmulation::compile($self, $domain, $query, sub {
+        my ($position, $column, $direction, $nulls) = @_;
+        return "$position $direction" . (defined($nulls) ? ' NULLS ' . uc($nulls) : '');
+    }, %options);
 }
 
 sub _compile_selection_expression {
     my ($self, $domain, $expression, $params, $compiled_selections, $options) = @_;
-    local $self->{_rollup_branch} = $options->{rollup_projection};
-    local $self->{_rollup_projection} = defined $self->{_rollup_branch};
-    my $sql = $self->_compile_expression($domain, $expression, $params, $compiled_selections);
-    # COUNT forces the empty grouping set to yield one row even with no measure.
-    return $self->{_rollup_branch} && $self->{_rollup_branch}{level} == 0
-        ? 'CASE WHEN COUNT(*) >= 0 THEN ' . $sql . ' END' : $sql;
+    return Selecto::SQL::RollupEmulation::selection_expression($self, $options, sub {
+        return $self->_compile_expression($domain, $expression, $params, $compiled_selections);
+    });
 }
 
 sub _compile_expression {
     my ($self, $domain, $expression, $params, $compiled_selections) = @_;
-    my $branch = $self->{_rollup_branch};
-    if ($branch && blessed($expression) && $expression->isa('Selecto::Expression')) {
-        my $key = Selecto::SQL::_expression_key($expression);
-        if ($self->{_rollup_projection} && exists $branch->{dimensions}{$key}) {
-            return 'NULL' if $branch->{dimensions}{$key} >= $branch->{level};
-            local $self->{_rollup_projection} = 0;
-            return $self->SUPER::_compile_expression($domain, $expression, $params, $compiled_selections);
-        }
-        if ($expression->kind eq 'grouping') {
-            $self->_validate_rollup_projection($expression, $branch->{dimensions});
-            my $marker = 0;
-            for my $dimension (@{$expression->arguments->[0]}) {
-                my $index = $branch->{dimensions}{Selecto::SQL::_expression_key($dimension)};
-                Selecto::Error->throw('invalid_query', 'GROUPING must reference rollup dimensions') unless defined $index;
-                $marker = ($marker << 1) | ($index >= $branch->{level} ? 1 : 0);
-            }
-            return "$marker";
-        }
-        if ($expression->kind eq 'dimension_display') {
-            my ($display, $dimension) = @{$expression->arguments};
-            my $index = $branch->{dimensions}{Selecto::SQL::_expression_key($dimension)};
-            Selecto::Error->throw('invalid_query', 'dimension display requires a rollup dimension') unless defined $index;
-            return 'NULL' if $index >= $branch->{level};
-            local $self->{_rollup_projection} = 0;
-            return 'MIN(' . $self->_compile_expression($domain, $display, $params) . ')';
-        }
-        if ($ROLLUP_AGGREGATES{$expression->kind}) {
-            local $self->{_rollup_projection} = 0;
-            return $self->SUPER::_compile_expression($domain, $expression, $params, $compiled_selections);
-        }
-    }
+    my $sql = Selecto::SQL::RollupEmulation::branch_expression(
+        $self, $domain, $expression, $params, $compiled_selections,
+        sub { return $self->SUPER::_compile_expression(@_); },
+    );
+    return $sql if defined $sql;
     Selecto::Error->throw('unsupported_feature', 'SQLite grouping markers require a rollup projection')
         if blessed($expression) && $expression->isa('Selecto::Expression')
             && ($expression->kind eq 'grouping' || $expression->kind eq 'dimension_display');
