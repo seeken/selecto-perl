@@ -45,13 +45,13 @@ $raw->{writes}{relationships}{items} = {writable => JSON::PP::true, ownership =>
     write => {modes => ['append_only'], create => JSON::PP::true},
     domain => domain($children, qw(id tenant_id parent_id name))};
 my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse($raw),
-    adapter => Selecto->adapter(postgresql => (dbh => $db)), write_context => {tenant_id => 8});
+    adapter => Selecto->adapter(postgresql => (dbh => $db)))->with_tenant(8);
 sub error { my ($work) = @_; return eval { $work->(); 1 } ? undef : $@ }
 my ($result, $row, $delayed, $id);
 subtest 'generated identity, owned child and one transaction' => sub {
     $result = $engine->transaction(sub {
         my ($tx) = @_;
-        my $w = Selecto::Write->new($tx)->insert->with_tenant(8)->assignments(name => 'parent')->return_for_update(qw(id name));
+        my $w = $tx->write->insert->assignments(name => 'parent')->return_for_update(qw(id name));
         my $preview = $w->preview;
         like($preview->{sql}, qr/RETURNING/, 'preview exposes SQL without an edit handle');
         my $created = $w->execute;
@@ -214,7 +214,7 @@ subtest 'compound identities bind every component for writes and locked reads' =
         my ($tx) = @_;
         isa_ok(error(sub { Selecto::Write->new($tx)->insert->assignments(id => 1, name => 'incomplete')
             ->return_for_update(qw(id name))->execute }), 'Selecto::Error', 'missing returned component refuses before insert');
-        my $created = Selecto::Write->new($tx)->insert->with_tenant(8)->assignments(id => $large, name => 'compound')
+        my $created = $tx->write->insert->assignments(id => $large, name => 'compound')
             ->return_for_update(qw(tenant_id id name))->execute;
         is_deeply([map { "" . $created->values->{$_} } qw(tenant_id id)], ['8', $large], 'complete native large identity retained');
         for my $field (qw(tenant_id id)) {

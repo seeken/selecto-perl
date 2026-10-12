@@ -151,7 +151,8 @@ The remaining examples in this README continue from this program.
 ## Core concepts
 
 Native fluent writes and named domain actions are available through
-`Selecto::Write->new($engine)`. Setters return the same local builder;
+`$engine->write()` and `$engine->action($name)`. Bind the trusted tenant once
+with `$engine = $engine->with_tenant(8)`; the domain declares its tenant field. Setters return the same local builder;
 `execute` consumes it once. Trusted `with_tenant` fills omitted tenant
 assignments. PostgreSQL additionally supports transaction-scoped
 `return_for_update`, owned related inserts, and read-side `select_for_update`.
@@ -294,8 +295,7 @@ my $notes = Selecto::Domain->parse({
 my $shop7 = Selecto::Engine->new(
     domain  => $notes,
     adapter => Selecto->adapter(sqlite => (dbh => $dbh)),
-    scope   => {tenant => 7},
-);
+)->with_tenant(7);
 
 my $rows = $shop7->all($shop7->query->select('id', 'body'))->{rows};
 print scalar(@$rows), " visible note(s)\n";                   # 1 visible note(s)
