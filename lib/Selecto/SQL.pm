@@ -1266,8 +1266,8 @@ sub execute_graph_unsafe {
             if ($node->{reference_only}) {
                 my $domain = $graph->{_reference_domains}{$node->{id}};
                 Selecto::Error->throw('ungoverned_write', 'read anchor requires its governing domain') unless $domain;
-                my @fields = @{$command->metadata->{returning} // [$domain->primary_key]};
-                @fields = ($domain->primary_key) unless @fields;
+                my @fields = @{$command->metadata->{returning} // $domain->primary_keys};
+                @fields = @{$domain->primary_keys} unless @fields;
                 my $predicate = Selecto::QueryEnforcement::combine($command->predicate,
                     $command->scope_predicate, $command->query_enforcement ? $command->query_enforcement->predicate : undef);
                 my $query = Selecto::Query->new->select(@fields)->limit(2);
@@ -2967,14 +2967,24 @@ sub _bounded_write_command {
     # Only the engine supplies this key before sealing the exact command in its
     # authorization. Explicit *_unsafe calls remain a trusted adapter escape.
     return $command unless exists $metadata->{__selecto_primary_key};
-    my $key = Selecto::Identifier::checked($metadata->{__selecto_primary_key});
+    my $primary = $metadata->{__selecto_primary_key};
+    my @keys = map { Selecto::Identifier::checked($_) } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    Selecto::Error->throw('invalid_write', 'bounded write requires primary-key fields') unless @keys;
     my $bounds = $self->_validate_write_cardinality($command);
     my $limit = $bounds->{maximum};
     my $predicate = Selecto::QueryEnforcement::combine(
         $command->predicate, $command->scope_predicate,
         defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
     );
-    my $identity_bound = _write_identity_bound($predicate, $key);
+    my @identity_bounds = map { _write_identity_bound($predicate, $_) } @keys;
+    # The conjunction must bound every component. Multiply component bounds
+    # conservatively; an equality on just one part is never a row identity.
+    my $identity_bound = 1;
+    for my $bound (@identity_bounds) {
+        if (!defined $bound) { $identity_bound = undef; last }
+        $identity_bound *= $bound;
+        if ($identity_bound > $limit) { $identity_bound = undef; last }
+    }
     # A predicate selecting at most N distinct primary keys already bounds
     # mutation work without a second query or a check/use interval.
     return $command if defined($identity_bound) && $identity_bound <= $limit;
@@ -2984,9 +2994,9 @@ sub _bounded_write_command {
     my @params;
     my $where = $self->_compile_write_predicate($predicate, \@params);
     my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
-    my $column = $self->quote_identifier($key);
+    my $columns = join(', ', map { $self->quote_identifier($_) } @keys);
     my $probe_limit = $limit + 1;
-    my $sql = "SELECT $column FROM $table WHERE $where ORDER BY $column LIMIT $probe_limit";
+    my $sql = "SELECT $columns FROM $table WHERE $where ORDER BY $columns LIMIT $probe_limit";
     $sql .= ' FOR UPDATE' if $name eq 'postgresql';
     # Recover a timed-out PostgreSQL statement before restoring session
     # settings. The outer write transaction still owns all selected row locks.
@@ -2995,7 +3005,7 @@ sub _bounded_write_command {
         eval { $self->_savepoint_command(create => $savepoint); 1 }
             or die $self->_transaction_control_error($@);
     }
-    my ($budget, $sth, @keys, $error);
+    my ($budget, $sth, @identities, $error);
     my $ok = eval {
         $budget = $self->begin_query_budget(timeout_ms => 5000);
         $sth = $self->dbh->prepare($sql);
@@ -3004,8 +3014,8 @@ sub _bounded_write_command {
             or die _dbi_error($sth, 'bounded write selection failed');
         while (my @row = $sth->fetchrow_array) {
             $budget->check;
-            push @keys, $row[0];
-            last if @keys > $limit;
+            push @identities, [@row];
+            last if @identities > $limit;
         }
         die _dbi_error($sth, 'bounded write fetch failed') if eval { $sth->err };
         1;
@@ -3024,11 +3034,16 @@ sub _bounded_write_command {
         Selecto::Error->throw('query_budget_restore_failed', 'bounded write could not restore its execution scope');
     }
     die $error unless $ok;
-    $self->_check_write_cardinality($command, scalar(@keys), $bounds);
+    $self->_check_write_cardinality($command, scalar(@identities), $bounds);
     # Keep every original scope and precondition, then constrain DML to the
     # exact locked keys. New matching rows can never join this mutation.
-    my $keys = @keys ? Selecto::Expression->in($key, \@keys)
-        : Selecto::Expression->all(Selecto::Expression->is_null($key), Selecto::Expression->not_null($key));
+    my $keys = !@identities
+        ? Selecto::Expression->all(Selecto::Expression->is_null($keys[0]), Selecto::Expression->not_null($keys[0]))
+        : @keys == 1 ? Selecto::Expression->in($keys[0], [map { $_->[0] } @identities])
+        : Selecto::Expression->any(map {
+            my $identity = $_;
+            Selecto::Expression->all(map { Selecto::Expression->eq($keys[$_], $identity->[$_]) } 0 .. $#keys)
+        } @identities);
     return $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $keys));
 }

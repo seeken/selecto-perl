@@ -324,8 +324,12 @@ sub validate_plan_limits {
         unless ref($action) eq 'HASH';
     my $limits = _limits($options{limits});
     my $target = $plan->target;
-    Selecto::Error->throw('invalid_action_plan', 'plan bulk target must contain only an ids list')
-        if ref($target) eq 'HASH' && (keys(%$target) != 1 || ref($target->{ids}) ne 'ARRAY');
+    if (ref($contract->{source}{primary_key}) eq 'ARRAY' && defined($target)) {
+        _target($contract, $action, {}, $target, $limits);
+    } else {
+        Selecto::Error->throw('invalid_action_plan', 'plan bulk target must contain only an ids list')
+            if ref($target) eq 'HASH' && (keys(%$target) != 1 || ref($target->{ids}) ne 'ARRAY');
+    }
     my $maximum = _check_target_limit($action, $target, $limits);
     $limits->check_bytes('max_value_bytes', $target, 'invalid_action_target', 'target ID')
         if defined($target) && !ref($target);
@@ -690,7 +694,20 @@ sub _create_target {
 
 sub _target {
     my ($contract, $action, $operation_spec, $target, $limits) = @_;
-    my $primary_key = "$contract->{source}{primary_key}";
+    my $primary_key = $contract->{source}{primary_key} // 'id';
+    if (ref($primary_key) eq 'ARRAY') {
+        Selecto::Error->throw('action_scope_mismatch', 'compound-key row action requires an exact identity object')
+            unless ref($target) eq 'HASH';
+        Selecto::Error->throw('action_scope_mismatch', 'compound bulk action targets are not supported')
+            if _id($action->{scope}) eq 'bulk' || _id($action->{type}) eq 'bulk_action';
+        my %keys = map { ($_ => 1) } @$primary_key;
+        Selecto::Error->throw('invalid_action_target', 'compound target must contain every primary-key field and no other fields')
+            if keys(%$target) != @$primary_key || grep { !$keys{$_} } keys %$target;
+        Selecto::Error->throw('invalid_action_target', 'compound identity values must be non-null scalars')
+            if grep { !defined($target->{$_}) || ref($target->{$_}) || !length("$target->{$_}") } @$primary_key;
+        $limits->check_bytes('max_value_bytes', $target->{$_}, 'invalid_action_target', 'target ID') for @$primary_key;
+        return ('row', [map { [$_, $target->{$_}] } @$primary_key], ['exactly', 1], {%$target});
+    }
     $primary_key = 'id' if $primary_key eq '';
     my $declared_scope = _id($action->{scope}) || (_id($action->{type}) eq 'bulk_action' ? 'bulk' : 'row');
 
