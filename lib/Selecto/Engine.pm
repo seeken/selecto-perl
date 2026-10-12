@@ -996,7 +996,8 @@ sub governed_write {
             || (defined($command->query_enforcement)
                 && _has_conjunct($command->query_enforcement->predicate, $required));
     }
-    $command = Selecto::Write::Policy->apply($command, $self->{domain}->writes, $self->{domain}->fields,
+    my %returning_fields = map { ($_ => $self->{domain}->_field_metadata_view($_)) } keys %{$self->{domain}->fields};
+    $command = Selecto::Write::Policy->apply($command, $self->{domain}->writes, \%returning_fields,
         trusted_field => $trusted);
     $self->_validate_write_command($command, trusted_field => $trusted);
     $self->_check_required_tenant_assignment($command, $required, %details);
@@ -2773,7 +2774,8 @@ sub _validate_graph_node {
         unless $scope;
     $trusted = [@$trusted, @{$filled // []}];
     my %nested_fields = %{$edge->{fields} // {}};
-    $command = Selecto::Write::Policy->apply($command, $edge->{writes}, \%nested_fields,
+    my %returning_fields = map { ($_ => $nested_domain->_field_metadata_view($_)) } keys %nested_fields;
+    $command = Selecto::Write::Policy->apply($command, $edge->{writes}, \%returning_fields,
         trusted_field => $trusted);
     $self->_validate_command_against_contract($command,
         ($edge->{fields_known} ? (fields => \%nested_fields) : (fields => undef)),
