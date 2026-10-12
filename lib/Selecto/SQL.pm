@@ -410,6 +410,12 @@ sub _compile_single {
         @$orders ? 1 : 0,
     );
     if (defined($query->row_lock)) {
+        if ($query->row_lock eq 'update') {
+            Selecto::Error->throw('invalid_transaction', 'update locks require a configured engine transaction')
+                unless $self->{_selecto_compile_engine};
+            require Selecto::Write::Session;
+            Selecto::Write::Session->require_live($self->{_selecto_compile_engine});
+        }
         Selecto::Error->throw('unsupported_feature', 'adapter does not support row locks')
             unless $self->supports('row_locks');
         Selecto::Error->throw('invalid_query', 'row locks require an ungrouped row query')

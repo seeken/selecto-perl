@@ -201,6 +201,8 @@ sub with_write_context {
     my $copy=bless {%$self,write_context=>$next,scope=>{%{$self->{scope}}}},ref($self);
     $copy->{scope}{tenant}=$next->{tenant_id} if defined $next->{tenant_id};
     delete $copy->{_read_domain};
+    require Selecto::Write::Session;
+    Selecto::Write::Session->inherit($self, $copy);
     return $seal_domain->(Selecto::QueryBinding->inherit_engine($self,$copy,flat_input=>1));
 }
 
@@ -417,6 +419,11 @@ sub adapter { return $_[0]->{adapter}; }
 sub domain_ref { return $_[0]->{domain_ref}; }
 sub query_mode { $_[0]->assert_domain_identity; return $_[0]->{query_mode}; }
 sub query   { $_[0]->assert_domain_identity; return Selecto::QueryBinding->bind($_[0], Selecto::Query->new); }
+sub transaction {
+    my ($self, @args) = @_;
+    require Selecto::Write::Session;
+    return Selecto::Write::Session->run($self, @args);
+}
 sub validate_query {
     my ($self, $query) = @_;
     $self->assert_domain_identity;
@@ -440,6 +447,10 @@ sub compile {
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
         allowed_base_classes => ['Selecto::Query']);
     Selecto::QueryBinding->validate($self, $query);
+    if (($query->row_lock // '') eq 'update') {
+        require Selecto::Write::Session;
+        Selecto::Write::Session->require_live($self);
+    }
     if (defined(($self->{tenant_context} // {})->{prefix})) {
         Selecto::Error->throw('unsupported_feature', 'prefix read contexts do not support retargeted queries')
             if $query->retarget_spec;

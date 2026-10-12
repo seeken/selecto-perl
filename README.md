@@ -150,6 +150,14 @@ The remaining examples in this README continue from this program.
 
 ## Core concepts
 
+Native fluent writes and named domain actions are available through
+`Selecto::Write->new($engine)`. Setters return the same local builder;
+`execute` consumes it once. Trusted `with_tenant` fills omitted tenant
+assignments. PostgreSQL additionally supports transaction-scoped
+`return_for_update`, owned related inserts, and read-side `select_for_update`.
+See [fluent writes and editable rows](docs/fluent-writes.md) for complete
+domain configuration, SQL previews, permission checks, and transaction lifetime.
+
 ### Domains
 
 A `Selecto::Domain` is the contract for one root table: its columns and

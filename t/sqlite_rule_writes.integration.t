@@ -58,8 +58,9 @@ subtest 'collection actions use read anchors, exact generated identities and act
     $db->do('INSERT INTO rule_write_items VALUES(9007199254740993,99,1,1)');
     my$e=engine(patch_domain(),$a);
     my$p=$e->plan_action({action=>'patch',target=>42,inputs=>{items=>[{op=>'update',id=>11,quantity=>4},{op=>'remove',id=>13},{op=>'add',product_id=>8,quantity=>3,client_id=>'temp'}]}});
-    my$preview=$e->preview_action($p)->{statement};like $preview->{statements}[0]{sql},qr/\ASELECT /,'preview selects its read anchor';
-    my$r=$e->execute_action($p)->{result};is $r->root->affected_rows,0,'no synthetic root write';
+    my$helper=Selecto::Write->new($e)->action('patch')->target(42)->inputs($p->inputs);
+    my$preview=$helper->preview->{statement};like $preview->{statements}[0]{sql},qr/\ASELECT /,'fluent action preview selects its read anchor';
+    my$r=$helper->execute->{result};is $r->root->affected_rows,0,'fluent action retains native graph result and no synthetic root write';
     is "".$r->metadata->{identity_mapping}[0]{identity}{id},'9007199254740994','actual generated client identity remains exact';
     is $db->selectrow_array('SELECT reference FROM rule_write_orders WHERE id=42'),'prior','read anchor did not change stored root';
     is $db->selectrow_array('SELECT quantity FROM rule_write_items WHERE id=11'),4,'child update applied';
@@ -71,8 +72,9 @@ subtest 'late child constraints roll back action patches while preserving host w
     my($db,$a)=@_;seed($db);my$d=patch_domain();delete$d->{rules};delete$d->{writes}{relationships}{items}{domain}{rules};
     $db->do("CREATE TRIGGER reject_quantity BEFORE INSERT ON rule_write_items WHEN NEW.quantity=99 BEGIN SELECT RAISE(ABORT,'late child');END");
     $db->begin_work;$db->do("UPDATE rule_write_orders SET reference='host' WHERE id=42");
-    my$e=engine($d,$a);my$p=$e->plan_action({action=>'patch',target=>42,inputs=>{items=>[{op=>'update',id=>11,quantity=>4},{op=>'add',product_id=>8,quantity=>99}]}});
-    eval {$e->execute_action($p)};ok $@,'actual late failure raised';
+    my$e=engine($d,$a);my$helper=Selecto::Write->new($e)->action('patch')->target(42)
+        ->inputs(items=>[{op=>'update',id=>11,quantity=>4},{op=>'add',product_id=>8,quantity=>99}]);
+    eval {$helper->execute};ok $@,'actual late failure through fluent action helper raised';
     is $db->selectrow_array('SELECT quantity FROM rule_write_items WHERE id=11'),1,'earlier patch rolled back';
     is $db->selectrow_array('SELECT reference FROM rule_write_orders WHERE id=42'),'host','host transaction work preserved';ok !$db->{AutoCommit},'host transaction stays open';$db->rollback;
 })};

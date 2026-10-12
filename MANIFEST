@@ -347,3 +347,11 @@ t/engine_write_tenant_boundary.t
 t/retarget_hop_pairing.t
 t/shared_hop_site_pairing.t
 t/untenanted_hop_admitted_set.t
+lib/Selecto/Write/Builder.pm
+lib/Selecto/Write/Editable.pm
+lib/Selecto/Write/LockedQuery.pm
+lib/Selecto/Write/Session.pm
+t/fluent_edit_handles.integration.t
+t/fluent_write_builder.t
+docs/fluent-writes.md
+t/fluent_transaction.t
