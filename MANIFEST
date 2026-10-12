@@ -86,6 +86,7 @@ MANIFEST
 MANIFEST.SKIP
 README.md
 t/00-load.t
+t/common_native_api.t
 t/action.t
 t/action_prerequisite_columns.t
 t/action_forms.t

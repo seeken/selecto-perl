@@ -206,9 +206,27 @@ sub with_write_context {
     return $seal_domain->(Selecto::QueryBinding->inherit_engine($self,$copy,flat_input=>1));
 }
 
-# Read context is attached independently of the existing trusted write scope.
-# A row context must be explicitly applied as required query obligations.
 sub with_tenant {
+    my ($self, @args) = @_;
+    $self->assert_domain_identity;
+    Selecto::Error->throw('invalid_tenant_context', 'with_tenant requires one tenant identity') unless @args == 1;
+    my $value = Selecto::Domain::QueryContract->copy_declaration({tenant => $args[0]})->{tenant};
+    # Preserve the existing structured read-context API without promoting its
+    # identity/prefix/filters into trusted write authority.
+    return $self->with_read_context($value) if ref($value) eq 'HASH' || ref($value) eq 'ARRAY';
+    Selecto::Error->throw('invalid_tenant_context', 'trusted tenant must be a nonblank scalar')
+        unless defined($value) && !ref($value) && $value =~ /\S/;
+    Selecto::Error->throw('tenant_not_declared', 'with_tenant requires a domain-declared tenant field')
+        unless defined $self->{domain}->tenant_field;
+    $self->_ensure_write_context;
+    my $copy = $self->with_write_context({tenant_id => $value});
+    $copy->_assert_engine_tenant_agrees;
+    return $copy;
+}
+
+# Explicit legacy read context. Attaching it never grants write authority;
+# applying row obligations remains a separate operation.
+sub with_read_context {
     my ($self, $given) = @_;
     $self->assert_domain_identity;
     my $context = Selecto::Tenant::Context->normalize($given);
@@ -419,6 +437,17 @@ sub adapter { return $_[0]->{adapter}; }
 sub domain_ref { return $_[0]->{domain_ref}; }
 sub query_mode { $_[0]->assert_domain_identity; return $_[0]->{query_mode}; }
 sub query   { $_[0]->assert_domain_identity; return Selecto::QueryBinding->bind($_[0], Selecto::Query->new); }
+sub write {
+    my ($self, @args) = @_;
+    $self->assert_domain_identity;
+    Selecto::Error->throw('invalid_write_builder', 'write takes no arguments; select an operation on its builder') if @args;
+    require Selecto::Write::Builder;
+    return Selecto::Write::Builder->new($self);
+}
+sub action {
+    my ($self, @args) = @_;
+    return $self->write->action(@args);
+}
 sub transaction {
     my ($self, @args) = @_;
     require Selecto::Write::Session;
@@ -3157,9 +3186,29 @@ an explicit C<tenant_required> domain or attached read context also requires
 valid read scope. Hosts that omit read tenant policy retain ordinary trusted
 cross-tenant reads. Public surfaces also call L</assert_tenant_boundary>.
 
-=head2 with_tenant, apply_tenant_scope, validate_tenant_scope
+=head2 with_tenant, write, action
 
-  my $attached = $engine->with_tenant({tenant_id => 'tenant-a'});
+  my $bound = $engine->with_tenant(7);
+  my $result = $bound->write->insert->assignments(name => 'Test')->execute;
+  my $action = $bound->action('archive')->target(42)->inputs(reason => 'Closed');
+
+The scalar tenant call returns a trusted engine copy. The domain must declare
+C<source.tenant_field>; no field name or matching required predicate is needed.
+Reads, writes, actions and transaction callback engines inherit the binding.
+Missing insert tenant assignments are supplied before validation. Conflicting
+identities or required predicates refuse; the original engine is unchanged.
+C<write()> returns a fresh L<Selecto::Write::Builder>; C<action($name)> selects
+its named action mode. Existing explicit constructors remain supported.
+
+Migration: scalar C<with_tenant> now binds trusted read/write context. Use
+C<with_read_context> for the old scalar read-only attachment. Structured
+C<with_tenant({...})> remains a compatibility alias for read-only context and
+never grants write authority. An attached read context cannot be promoted by
+calling scalar C<with_tenant>.
+
+=head2 with_read_context, apply_tenant_scope, validate_tenant_scope
+
+  my $attached = $engine->with_read_context({tenant_id => 'tenant-a'});
   my $scoped = $attached->apply_tenant_scope;
   my $report = $scoped->validate_tenant_scope; # {valid => JSON boolean, ...}
 

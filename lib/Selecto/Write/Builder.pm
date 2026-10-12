@@ -206,9 +206,32 @@ sub upsert_update_fields {
 sub _command {
     my ($s) = @_;
     my $engine = $s->{engine};
+    $engine->_ensure_write_context;
     if (defined $s->{edge}) {
         return Selecto::Write::Editable->bound_command($s->{row}, $s->{edge}, $s->{type},
             $s->{assignments}, {returning => $s->{returning} // []});
+    }
+    my $domain = $engine->domain;
+    my $scope = $domain->write_tenant_scope;
+    if (defined($domain->tenant_field) && (!$scope || $scope->{field} ne $domain->tenant_field)) {
+        # Portable operations currently bind their single scope field. Native
+        # engine governance also binds a source-only tenant, and knows that a
+        # two-column domain independently pins the write-scope column. Keep
+        # declarations intact and use that governed native command path.
+        require Selecto::Write::PortableCommand;
+        my $contract = Selecto::Domain::WriteContract->compile($domain->as_contract);
+        my $fields = Selecto::Write::PortableCommand::_fields($contract);
+        my $filters = Selecto::Write::PortableCommand->_filters($s->{filters}, $fields);
+        my @predicates = @{$s->{predicates} // []};
+        push @predicates, Selecto::Write::PortableCommand->filters_predicate($filters) if @$filters;
+        push @predicates, Selecto::Expression->eq(@$_) for $s->{row}
+            ? @{Selecto::Write::Editable->identity_filter($s->{row})} : ();
+        my %metadata = (expected_cardinality => $s->{expected_cardinality} // ['exactly', 1]);
+        $metadata{$_} = $s->{$_} for grep { exists $s->{$_} } qw(returning conflict_target upsert_update_fields);
+        return $engine->write_command(operation => $s->{type},
+            assignments => $s->{type} eq 'delete' ? {} : Selecto::Write::PortableCommand->_values($s->{assignments}, $fields),
+            (@predicates ? (predicate => Selecto::Expression->all(@predicates)) : ()),
+            expected_count => undef, metadata => \%metadata);
     }
     my $op = Selecto::Write::Operation->new($engine->domain->as_contract)
         ->operation($s->{type}, $s->{assignments})->filters($s->{filters})

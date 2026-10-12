@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - Add scalar engine with_tenant(value), write(), and action(name) as the
+      common native facade. Domain-owned tenant columns and trusted context
+      are inherited by reads, writes, actions, and transaction engines;
+      omitted insert tenant values remain bound SQL data. Two-column native
+      fluent writes preserve independent write scope through engine governance.
+      Scalar engine with_tenant now binds trusted read/write scope: migrate
+      read-only scalar attachment to with_read_context. Structured legacy
+      with_tenant contexts stay read-only and cannot be promoted into writes.
+      Existing scope/write_context constructors and Write->new stay supported.
     - Keep computed query fields, including derived action-prerequisite columns,
       out of write RETURNING all. Explicit computed projections refuse before
       execution instead of targeting nonexistent physical columns.

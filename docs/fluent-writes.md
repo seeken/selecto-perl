@@ -1,9 +1,24 @@
 # Fluent writes, domain actions, and editable rows
 
-`Selecto::Write->new($engine)` binds a local builder to a genuine configured
+`$engine->write()` binds a local builder to a genuine configured
 engine. It uses native portable compilation and fresh engine governance for
 scalar writes, and native action planning/authorization for named actions.
 Existing immutable `Selecto::Write::Operation` builders keep their behavior.
+
+The domain declares `source.tenant_field` once. `$engine->with_tenant(8)`
+returns a separately bound engine whose reads, writes, domain actions, and
+transaction engines inherit that trusted identity. Do not repeat a matching
+required predicate, tenant-field option, write-level tenant binding, or tenant
+assignment. Rebinding to a different value refuses, and independent write-scope
+columns remain independent.
+
+Migration: the scalar engine call `with_tenant(8)` now establishes trusted
+read/write scope. Existing structured `with_tenant({...})` calls retain their
+read-only behavior; use `with_read_context({...})` explicitly for those contexts
+and `apply_tenant_scope` when applying row obligations. A read context is never
+promoted to write authority. Existing `scope`, `write_context`,
+`Selecto::Write->new($engine)`, and builder-level `with_tenant` remain available.
+
 
 ## Configure the domain and host context
 
@@ -59,8 +74,7 @@ my $domain = Selecto::Domain->parse({
 my $engine = Selecto::Engine->new(
     domain => $domain,
     adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
-    write_context => {tenant_id => 8}, # Host authenticates this value.
-);
+)->with_tenant(8); # The host authenticates this value once.
 ```
 
 The host creates a root table with a generated `id`, `tenant_id`, `name`, `state`,
@@ -70,7 +84,7 @@ and nullable `archive_reason`. Selecto does not open a connection or migrate it.
 
 ```perl
 my $result = eval {
-    my $w = Selecto::Write->new($engine)->insert->with_tenant(8);
+    my $w = $engine->write->insert;
     $w->assignments(name => 'Test', state => 'done');
     $w->returning(qw(id name));
     my $preview = $w->preview;
@@ -124,7 +138,7 @@ my $policy = sub {
     return $host_authorizer->($request, $context);
 };
 my $done = eval {
-    my $a = Selecto::Write->new($engine)->action('archive')->with_tenant(8);
+    my $a = $engine->action('archive');
     $a->target($id);
     $a->inputs(reason => 'completed');
     my $preview = $a->preview(resolver => $policy,
@@ -155,7 +169,7 @@ stale transitions, and wrong-tenant targets refuse through native governance.
 ```perl
 my $created = $engine->transaction(sub {
     my ($tx) = @_;
-    my $res = Selecto::Write->new($tx)->insert->with_tenant(8)
+    my $res = $tx->write->insert
         ->assignments(name => 'Editable', state => 'done')
         ->return_for_update(qw(id name))->execute;
     $res->row->write->update->assignments(name => 'Changed')->execute;
