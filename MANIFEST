@@ -61,6 +61,7 @@ lib/Selecto/QueryLibrary.pm
 lib/Selecto/QueryMember.pm
 lib/Selecto/Retarget.pm
 lib/Selecto/SQL.pm
+lib/Selecto/SQL/RollupEmulation.pm
 lib/Selecto/SQLite.pm
 lib/Selecto/SQLite/Ownership.pm
 lib/Selecto/SQLite/UpsertCandidate.pm

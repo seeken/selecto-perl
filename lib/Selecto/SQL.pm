@@ -134,15 +134,25 @@ sub _compile_query {
             $positions{_expression_key($selections->[$index])} //= $index + 1;
             $positions{$self->_selection_name($selections->[$index])} //= $index + 1;
         }
-        $sql .= ' ORDER BY ' . join(', ', map {
+        my @terms = map {
             my $position = $positions{_expression_key($_->[0])};
             $position //= $positions{$self->_selection_name($_->[0])};
             Selecto::Error->throw(
                 'invalid_query',
                 'set result ordering must reference a selected output column',
             ) unless defined $position;
-            $position . ' ' . uc($_->[1]);
-        } @$orders);
+            [$position, uc($_->[1])];
+        } @$orders;
+        if ($self->_null_ordered_terms) {
+            # Positions cannot carry the NULL-placement key; order the
+            # compound as a derived table by its output column names.
+            my $set = $self->quote_identifier('__selecto_set');
+            $sql = 'SELECT * FROM (' . $sql . ") AS $set ORDER BY " . join(', ', map {
+                $self->_null_ordered_term("$set." . $self->quote_identifier($columns->[$_->[0] - 1]), $_->[1])
+            } @terms);
+        } else {
+            $sql .= ' ORDER BY ' . join(', ', map { "$_->[0] $_->[1]" } @terms);
+        }
     }
     $sql .= $self->_compile_pagination(
         $query->limit_value,
@@ -217,6 +227,7 @@ sub _compile_single {
     }
     my %compiled_selections;
     my %selection_positions;
+    my %selection_aliases;
     my $selection_position = 0;
     my @projection;
     my @selection_sql = map {
@@ -233,6 +244,7 @@ sub _compile_single {
         my $item = $needs_result_alias
             ? $expression_sql . ' AS ' . $self->quote_identifier($columns[$selection_position - 1])
             : $expression_sql;
+        $selection_aliases{_expression_key($_)} //= $columns[$selection_position - 1] if $needs_result_alias;
         push @projection, [length($expression_sql), length($item), $self->_canonical_kind($domain, $_)];
         $item
     } @$selections;
@@ -399,10 +411,22 @@ sub _compile_single {
     } elsif (@$orders) {
         $sql .= ' ORDER BY ' . join(', ', map {
             my $key = _expression_key($_->[0]);
-            my $expression_sql = @$groups && $self->_reuses_parameter_identity && exists($compiled_selections{$key})
-                ? $compiled_selections{$key}
-                : $self->_compile_expression($domain, $_->[0], \@params);
-            $expression_sql . ' ' . uc($_->[1])
+            my $direction = uc($_->[1]);
+            if ($self->_null_ordered_terms && @$groups && exists($selection_aliases{$key})) {
+                # A grouped query orders a selected computed expression by its
+                # alias, which ONLY_FULL_GROUP_BY accepts inside the NULL key.
+                $self->_null_ordered_term($self->quote_identifier($selection_aliases{$key}), $direction);
+            } else {
+                my $expression_sql = @$groups && $self->_reuses_parameter_identity && exists($compiled_selections{$key})
+                    ? $compiled_selections{$key}
+                    : $self->_compile_expression($domain, $_->[0], \@params);
+                # Anonymous parameters bind by occurrence: the NULL-placement
+                # key compiles the expression again rather than repeating it.
+                $self->_null_ordered_terms
+                    ? "($expression_sql IS NULL) $direction, "
+                        . $self->_compile_expression($domain, $_->[0], \@params) . " $direction"
+                    : "$expression_sql $direction";
+            }
         } @$orders);
     }
     $sql .= $self->_compile_pagination(
@@ -445,6 +469,16 @@ sub _compile_single {
 # _canonical_kind names the canonical formatting a selection's declared domain
 # type calls for, or undef. The base adapter keeps nothing.
 sub _note_projection { return; }
+
+# Dialects whose NULL ordering differs from PostgreSQL's (NULLs last
+# ascending, first descending) and that have no NULLS FIRST/LAST order each
+# term after an (expression IS NULL) key.
+sub _null_ordered_terms { return 0; }
+
+sub _null_ordered_term {
+    my ($self, $sql, $direction) = @_;
+    return "($sql IS NULL) $direction, $sql $direction";
+}
 sub _canonical_kind { return undef; }
 sub _emulates_rollup { return 0; }
 
@@ -807,7 +841,7 @@ sub _compile_cte_prefix {
                 push @params, $value;
                 my $sql = $self->placeholder(scalar @params);
                 my $type = _numeric_scalar_type($value);
-                $sql = 'CAST(' . $sql . ' AS ' . ($type eq 'INTEGER' ? 'BIGINT' : 'DOUBLE PRECISION') . ')' if defined $type;
+                $sql = 'CAST(' . $sql . ' AS ' . $self->_values_source_cast_sql($type) . ')' if defined $type;
                 push @cells, $sql;
             }
             push @rows, 'SELECT ' . join(', ', @cells);
@@ -822,6 +856,9 @@ sub _compile_cte_prefix {
         \@params,
     );
 }
+
+# The cast target of a numeric cell in an inline VALUES source: INTEGER or REAL.
+sub _values_source_cast_sql { return $_[1] eq 'INTEGER' ? 'BIGINT' : 'DOUBLE PRECISION'; }
 
 # Declared or inferred types of a query's selections, keyed by column name.
 sub _selection_types {
@@ -1551,7 +1588,7 @@ sub _compile_expression {
         my $operand_sql = $self->_compile_expression($domain, $operand, $params);
         push @$params, Cpanel::JSON::XS->new->canonical(1)->allow_nonref(1)->encode($arguments->[1]);
         return $self->_compile_json_contains(
-            $operand_sql, $self->placeholder(scalar @$params),
+            $operand_sql, $self->placeholder(scalar @$params), $params,
         );
     }
     if ($kind eq 'in') {
@@ -1655,11 +1692,17 @@ sub _compile_window {
     Selecto::Error->throw('invalid_query', 'window order_by must be an array')
         unless ref($orders) eq 'ARRAY';
     if (@$orders) {
+        # A RANGE frame with an offset needs its single ORDER BY key.
+        my $null_keys = $self->_null_ordered_terms && !(ref($over->{frame}) eq 'HASH'
+            && uc($over->{frame}{type} // 'rows') eq 'RANGE'
+            && grep { ref($_) eq 'HASH' } @{$over->{frame}}{qw(start end)});
         push @clauses, 'ORDER BY ' . join(', ', map {
             Selecto::Error->throw('invalid_query', 'window order entry is invalid')
                 unless ref($_) eq 'ARRAY' && @$_ == 2
                     && ($_->[1] eq 'asc' || $_->[1] eq 'desc');
-            $self->_compile_expression($domain, $_->[0], $params) . ' ' . uc($_->[1]);
+            ($null_keys ? '(' . $self->_compile_expression($domain, $_->[0], $params) . ' IS NULL) '
+                . uc($_->[1]) . ', ' : '')
+            . $self->_compile_expression($domain, $_->[0], $params) . ' ' . uc($_->[1]);
         } @$orders);
     }
     push @clauses, $self->_compile_window_frame($over->{frame})
@@ -1959,10 +2002,8 @@ sub _compile_related_collection_at {
                 $params, $alias, $parent_identity, \@stable_orders, $options->{after}
             );
         }
-        $from = '(SELECT ' . $quoted_alias . '.* FROM ' . $from .
-            ' WHERE ' . $where . ' ORDER BY ' . $order .
-            ' LIMIT ' . int($limit) . ') AS ' . $quoted_alias;
-        $where = 'TRUE';
+        ($from, $where, $limit) = $self->_bounded_related_collection_source(
+            $from, $where, $order, int($limit), $quoted_alias);
     }
     return $self->_compile_related_collection_sql({
         fields => \@collection_fields,
@@ -1970,7 +2011,18 @@ sub _compile_related_collection_at {
         from => $from,
         where => $where,
         order => $order,
+        (defined($limit) ? (limit => $limit) : ()),
     });
+}
+
+# Bounds one parent's children to $limit rows in $order. Returns the new
+# source, predicate and a limit the aggregate itself must still apply (undef
+# when the source already applies it).
+sub _bounded_related_collection_source {
+    my ($self, $from, $where, $order, $limit, $quoted_alias) = @_;
+    return ('(SELECT ' . $quoted_alias . '.* FROM ' . $from .
+        ' WHERE ' . $where . ' ORDER BY ' . $order .
+        ' LIMIT ' . int($limit) . ') AS ' . $quoted_alias, 'TRUE', undef);
 }
 
 sub _related_collection_order_term {

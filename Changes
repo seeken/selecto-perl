@@ -48,6 +48,24 @@ Unreleased
       refuse. Caught child failures still roll back the callback. Errors
       after callback completion preserve unknown commit state and prohibit
       automatic retry. See docs/fluent-writes.md for capability limits.
+    - MySQL and MariaDB adapters gain the advanced read features, each gated
+      on the connected server version: CTEs and recursive CTEs, window
+      functions (rows and range frames), INTERSECT/EXCEPT, rollups (as
+      grouped UNION ALL branches with typed NULL dimensions, since MariaDB
+      has no GROUPING() and neither server has NULLS FIRST/LAST), LATERAL
+      joins (MySQL 8.0.14+ only), JSON_TABLE JSON and array rowsets, exact
+      jsonb-style JSON containment and typed array predicates (JSON_CONTAINS
+      also matches scalars inside nested arrays, so it is not used), JSON
+      text extraction, value expressions, ordered and per-parent bounded
+      related collections, and FULLTEXT boolean-mode text search for
+      co-domain lookups. The SQLite rollup emulation moved to
+      Selecto::SQL::RollupEmulation, shared with them.
+    - MySQL and MariaDB results order NULLs as PostgreSQL does: last
+      ascending and first descending. Every ORDER BY term (queries, set
+      operations, windows, rollups, related collections) gets a leading
+      (expression IS NULL) key, and related-collection cursors compare with
+      <=> so keyset pages stay consistent with that order. Previously both
+      servers sorted NULLs first ascending.
     - SQLite batches may combine protected UPSERTs with ordinary inserts,
       updates, deletes and upserts (and protected inserts) when each
       protected candidate is proved independent of every other command on

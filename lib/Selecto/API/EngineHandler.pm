@@ -467,7 +467,7 @@ sub _query ($self, $engine, $body, %options) {
 
     if ($has_select) {
         # Validate caller intent before composing host-mandated output fields.
-        _api_selections($domain, $body->{select}, $self->max_fields, $self->limits, $engine->adapter->name);
+        _api_selections($domain, $body->{select}, $self->max_fields, $self->limits, $engine->adapter);
         my @required = @{($domain->contract // {})->{required_selected} // []};
         my %required = map { $_ => 1 } @required;
         my $field_identity = sub {
@@ -486,7 +486,7 @@ sub _query ($self, $engine, $body, %options) {
             (grep { my $field = $field_identity->($_); !defined($field) || !$required{$field} } @{$body->{select}}),
         );
         my $selection_plan = _api_selections(
-            $domain, \@selections, $self->max_fields, $self->limits, $engine->adapter->name,
+            $domain, \@selections, $self->max_fields, $self->limits, $engine->adapter,
         );
         $query = $query->select($selection_plan->{expressions});
         @subtables = @{$selection_plan->{subtables}};
@@ -522,7 +522,7 @@ sub _query ($self, $engine, $body, %options) {
     if (!$has_select) {
         # Named library definitions are not permission to expose internal fields.
         my @fields = map { $_->arguments->[0] } @{$query->selections};
-        my $selection_plan = _api_selections($domain, \@fields, $self->max_fields, $self->limits, $engine->adapter->name);
+        my $selection_plan = _api_selections($domain, \@fields, $self->max_fields, $self->limits, $engine->adapter);
         $query = $query->replace_selections($selection_plan->{expressions});
     }
 
@@ -1243,7 +1243,8 @@ sub _required_string ($value, $label) {
     return "$value";
 }
 
-sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
+sub _api_selections ($domain, $value, $maximum, $limits, $adapter) {
+    my $adapter_name = $adapter->name;
     Selecto::Error->throw('invalid_api_query', 'select must be an array')
         unless ref($value) eq 'ARRAY';
     Selecto::Error->throw('invalid_api_query', 'select must not be empty')
@@ -1266,7 +1267,8 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
         Selecto::Error->throw('invalid_api_query', 'subtable selection must not be empty')
             unless @$entry;
         Selecto::Error->throw('unsupported_feature', 'bounded API collections require a certified dialect')
-            unless $adapter_name eq 'postgresql' || $adapter_name eq 'sqlite';
+            unless $adapter_name eq 'postgresql' || $adapter_name eq 'sqlite'
+                || $adapter->supports('bounded_related_collections');
         my (@fields, %nested_names, $association);
         for my $nested_entry (@$entry) {
             Selecto::Error->throw(
