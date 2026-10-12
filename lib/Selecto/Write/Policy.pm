@@ -95,12 +95,15 @@ sub resolve_returning {
     }
     _fail('returning_policy_violation', 'caller returning policy exceeds domain policy',
         domain_returning => $ceiling, requested_returning => $value) unless $subset;
-    my @returned = !ref($value) ? $value eq 'all' ? sort keys %$fields : () : @$value;
+    my $stored = sub { !((ref($fields->{$_[0]}) eq 'HASH') && ref($fields->{$_[0]}{computed}) eq 'HASH') };
+    my @returned = !ref($value) ? $value eq 'all' ? sort grep { $stored->($_) } keys %$fields : () : @$value;
     my %seen;
     for my $field (@returned) {
         _fail('duplicate_returning_identifier', 'returning identifiers must be distinct', field => $field) if $seen{$field}++;
         _fail('undeclared_write_identifier', 'returning field must be declared on the write source',
             field => $field, identifier_kind => 'returning') unless exists $fields->{$field};
+        _fail('write_capability_missing', 'write returning requires stored root fields', field => $field)
+            unless $stored->($field);
     }
     return \@returned;
 }

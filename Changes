@@ -1,6 +1,9 @@
 Revision history for Selecto
 
 Unreleased
+    - Keep computed query fields, including derived action-prerequisite columns,
+      out of write RETURNING all. Explicit computed projections refuse before
+      execution instead of targeting nonexistent physical columns.
     - Support compound root primary keys in native domains, bounded writes,
       PostgreSQL edit handles and exact row-action targets. Every component
       is required and retained without JSON round-tripping. Encode Unicode

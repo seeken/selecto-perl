@@ -400,8 +400,9 @@ sub _compile {
 }
 sub _fields {
     my ($contract) = @_;
-    my %fields = map { $_ => 1 } @{$contract->{source}{fields} // []};
-    $fields{$_} = 1 for keys %{$contract->{source}{columns} // {}};
+    my $columns = $contract->{source}{columns} // {};
+    my %fields = map { $_ => $columns->{$_} // {} } @{$contract->{source}{fields} // []};
+    $fields{$_} = $columns->{$_} for keys %$columns;
     return \%fields;
 }
 sub requires_storage_candidate {

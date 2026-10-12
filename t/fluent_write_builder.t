@@ -199,4 +199,28 @@ subtest 'compound root identities retain exact write scope and action targets' =
         isa_ok(error(sub { Selecto::Domain->parse($bad) }), 'Selecto::Error', 'invalid native primary-key declaration refuses');
     }
 };
+subtest 'computed query fields are never physical write returning columns' => sub {
+    my $contract = Selecto::Domain::QueryContract->copy_declaration($raw);
+    push @{$contract->{source}{fields}}, 'is_done';
+    $contract->{source}{columns}{is_done} = {type => 'boolean',
+        computed => {kind => 'predicate', expression => ['eq','state','done']}};
+    my $host = Selecto::Engine->new(domain => Selecto::Domain->parse($contract), adapter => $engine->adapter,
+        write_context => {tenant_id => 8});
+    my $w = Selecto::Write->new($host)->insert->assignments(id => 200, name => 'Computed domain', state => 'done');
+    unlike($w->preview->{sql}, qr/"is_done"/, 'portable all-returning preview contains only stored fields');
+    my $res = $w->execute;
+    is($res->values->{id},200,'default returning persists the real insert');
+    ok(!exists($res->values->{is_done}), 'computed field is not fabricated in write result');
+    my $direct = Selecto::Write::Command->new(operation => 'update', relation => 'tasks',
+        assignments => {name => 'Native governed'}, predicate => Selecto::Expression->eq('id',200),
+        expected_count => 1, metadata => {returning => ['is_done']});
+    is(error(sub { $host->preview_write($direct) })->code, 'write_capability_missing',
+        'native governed computed returning also refuses before execution');
+    for my $field ('is_done', grep { /^can_/ } keys %{$host->domain->fields}) {
+        my $failure = error(sub { Selecto::Write->new($host)->insert->assignments(id => 201, name => 'Refused', state => 'done')
+            ->returning($field)->execute });
+        is($failure->code,'write_capability_missing','explicit computed returning refuses before DML');
+    }
+    is($db->selectrow_array('SELECT count(*) FROM tasks WHERE id = 201'),0,'computed refusals leave storage unchanged');
+};
 done_testing;
