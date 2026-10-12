@@ -182,4 +182,18 @@ subtest 'edit-result modes preserve exact identity and refuse unavailable identi
     is($observer->selectrow_array("SELECT name FROM $parents WHERE id = ?", undef, $large), 'upsert changed follow-up', 'both upsert branches support exact-key follow-up');
     is($observer->selectrow_array("SELECT count(*) FROM $parents WHERE name IN ('missing identity','mixed modes','bulk handle')"), 0, 'all invalid result modes left no target mutation');
 };
+subtest 'changing the connection lease expires issued row handles' => sub {
+    my $replacement = $connect->();
+    $replacement->begin_work;
+    $engine->transaction(sub {
+        my ($tx) = @_;
+        my $editable = $tx->query->filter(Selecto::Expression->eq('id', $id))->select_for_update('id')->execute;
+        $tx->adapter->dbh($replacement);
+        my $expired = error(sub { $editable->row->write });
+        $tx->adapter->dbh($db);
+        is($expired->code, 'edit_handle_expired', 'another active connection cannot reuse the original row lease');
+    });
+    $replacement->rollback;
+    $replacement->disconnect;
+};
 done_testing;
