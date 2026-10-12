@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Selecto::QueryLibrary ();
 use Selecto::OperationBudget ();
 use Selecto::Limits ();
@@ -143,7 +144,7 @@ sub _validate {
         }
     }
     my %seen;
-    @errors = grep { !$seen{JSON::PP->new->canonical->encode($_)}++ } @errors;
+    @errors = grep { !$seen{Cpanel::JSON::XS->new->canonical->encode($_)}++ } @errors;
     return {valid => @errors ? JSON::PP::false : JSON::PP::true, errors => \@errors};
 }
 

@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Selecto ();
 use Selecto::QueryBinding ();
 use Selecto::Error ();
@@ -77,7 +78,7 @@ sub _branches {
     my ($query) = @_;
     return ($query, map { _branches($_->{query}) } @{$query->set_operations});
 }
-sub _same { JSON::PP->new->canonical->encode($_[0]) eq JSON::PP->new->canonical->encode($_[1]) }
+sub _same { Cpanel::JSON::XS->new->canonical->encode($_[0]) eq Cpanel::JSON::XS->new->canonical->encode($_[1]) }
 sub _invariants {
     return [
         ['tenant_scope_is_closed_under_supported_composition', sub {

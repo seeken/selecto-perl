@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Time::HiRes ();
 use B ();
 use Scalar::Util qw(blessed refaddr reftype);
@@ -127,7 +128,7 @@ sub _accepted_command_work {
     return undef unless $record;
     $domain //= $self->{domain};
     Selecto::Error->throw('action_plan_mismatch', 'action command differs from accepted planning evidence')
-        unless $record->{contract} eq JSON::PP->new->canonical->encode($domain->contract)
+        unless $record->{contract} eq Cpanel::JSON::XS->new->canonical->encode($domain->contract)
             && $record->{digest} eq $self->_action_command_digest($command);
     return $record->{work};
 }
@@ -135,7 +136,7 @@ sub _accepted_command_work {
 sub _retain_command_work {
     my ($self, $command, $work) = @_;
     $ACTION_COMMAND_WORK{$command} = {
-        contract => JSON::PP->new->canonical->encode($self->{domain}->contract),
+        contract => Cpanel::JSON::XS->new->canonical->encode($self->{domain}->contract),
         digest => $self->_action_command_digest($command), work => $work,
     } if defined $work;
     return $command;
@@ -777,7 +778,7 @@ sub _batch_engines {
         unless ref($engines) eq 'ARRAY' && !defined(tied(@$engines)) && @$engines==@{$batch->commands};
     Selecto::OperationBudget->new(limits=>$self->{limits},code=>'invalid_write')->consume_count(
         'max_expression_nodes',scalar(@$engines),label=>'configured batch engines');
-    my $context=JSON::PP->new->canonical->encode($self->{write_context});
+    my $context=Cpanel::JSON::XS->new->canonical->encode($self->{write_context});
     for my $index (0..$#$engines) {
         Selecto::Error->throw('invalid_write','batch engines cannot contain tied values') if defined(tied($engines->[$index]));
         my $engine=$engines->[$index];
@@ -788,7 +789,7 @@ sub _batch_engines {
         Selecto::Error->throw('invalid_write','batch engines must use the identical adapter')
             unless refaddr($engine->{adapter})==refaddr($self->{adapter});
         Selecto::Error->throw('tenant_mismatch','batch engines must agree on trusted write context')
-            unless JSON::PP->new->canonical->encode($engine->{write_context}) eq $context;
+            unless Cpanel::JSON::XS->new->canonical->encode($engine->{write_context}) eq $context;
     }
     return [@$engines];
 }
@@ -1259,8 +1260,8 @@ sub _pin_write_tenant {
         my $guard = @$pins == 1 ? Selecto::Expression->eq($column, $pins->[0]) : Selecto::Expression->in($column, [@$pins]);
         $command = $command->with_scope_predicate(Selecto::QueryEnforcement::combine($command->scope_predicate, $guard))
             unless grep { $_->kind eq $guard->kind && _is_tenant_comparison($_, $column)
-                && JSON::PP->new->canonical->encode([_comparison_values($_)])
-                    eq JSON::PP->new->canonical->encode([_comparison_values($guard)]) } _conjuncts($command->scope_predicate);
+                && Cpanel::JSON::XS->new->canonical->encode([_comparison_values($_)])
+                    eq Cpanel::JSON::XS->new->canonical->encode([_comparison_values($guard)]) } _conjuncts($command->scope_predicate);
     }
     return ($command, $sets || $inserts);
 }
@@ -2386,7 +2387,7 @@ sub _action_assignments {
         } elsif (ref($value) && !JSON::PP::is_bool($value)) {
             Selecto::Error->throw('invalid_action_changes', 'structured input requires a JSON field', {field => $field})
                 unless $type =~ /\A(?:json|jsonb|map)\z/;
-            my $encoded = eval {JSON::PP->new->canonical->encode($value)};
+            my $encoded = eval {Cpanel::JSON::XS->new->canonical->encode($value)};
             Selecto::Error->throw('invalid_action_changes', 'action JSON value is not portable', {field => $field}) if $@;
             $value = $encoded;
         }
@@ -2938,9 +2939,9 @@ sub _match_relationship {
 
 sub _same_contract {
     my ($a, $b) = @_;
-    return JSON::PP->new->canonical(1)->encode({
+    return Cpanel::JSON::XS->new->canonical(1)->encode({
         map { ($_ => $a->{$_}) } grep { $_ ne 'edge_id' } sort keys %$a
-    }) eq JSON::PP->new->canonical(1)->encode({
+    }) eq Cpanel::JSON::XS->new->canonical(1)->encode({
         map { ($_ => $b->{$_}) } grep { $_ ne 'edge_id' } sort keys %$b
     });
 }

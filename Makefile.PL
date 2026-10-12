@@ -21,6 +21,7 @@ WriteMakefile(
         'File::Find'  => 0,
         'Hash::Util::FieldHash' => 0,
         'JSON::PP'    => '4.06',
+        'Cpanel::JSON::XS' => '4.38',
         'Math::BigInt' => 0,
         'Math::BigRat' => 0,
         'Math::BigFloat' => 0,

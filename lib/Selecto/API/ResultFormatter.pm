@@ -7,6 +7,7 @@ use Encode qw(encode);
 use File::Temp qw(tempfile);
 use File::Find ();
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Mojo::Base -base, -signatures;
 use Scalar::Util qw(blessed looks_like_number);
 use Selecto::Error ();
@@ -22,7 +23,7 @@ my $QUOTE_TSV = qr/["\t\r\n]|[^\x00-\x7f]/;
 # Unicode White_Space starts with =, +, - or @, gets a leading "'" (before
 # the whitespace). Negative numbers and headers are neutralized too.
 # Canonical JSON text of a nested cell (sorted keys, characters unescaped).
-my $CELL_JSON = JSON::PP->new->canonical(1)->allow_nonref(1)->utf8(0);
+my $CELL_JSON = Cpanel::JSON::XS->new->canonical(1)->allow_nonref(1)->utf8(0);
 my $FORMULA_LEAD = qr/\A(?:[\t\r\n]|\p{White_Space}*[=+\-@])/;
 
 my %FORMAT = (
@@ -327,13 +328,13 @@ sub _flat_value ($value) {
 
 sub _native_number ($value) {
     return 0 if ref($value) || !looks_like_number($value);
-    my $encoded = JSON::PP->new->allow_nonref(1)->utf8(0)->encode($value);
+    my $encoded = Cpanel::JSON::XS->new->allow_nonref(1)->utf8(0)->encode($value);
     return $encoded !~ /\A"/ ? 1 : 0;
 }
 
 sub _safe_xlsx_number ($value) {
     return 0 unless _native_number($value);
-    my $encoded = JSON::PP->new->allow_nonref(1)->utf8(0)->encode($value);
+    my $encoded = Cpanel::JSON::XS->new->allow_nonref(1)->utf8(0)->encode($value);
     if ($encoded =~ /\A-?(?:0|[1-9][0-9]*)\z/) {
         my $digits = $encoded =~ s/\A-//r;
         my $limit = '9007199254740991';

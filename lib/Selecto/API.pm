@@ -4,6 +4,8 @@ use 5.034;
 use utf8;
 use Mojo::Base -base, -signatures;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
+use Selecto::CanonicalJSON ();
 use Scalar::Util qw(blessed looks_like_number);
 use Selecto::API::ResultFormatter ();
 use Selecto::API::ResponsePolicy ();
@@ -339,12 +341,7 @@ sub canonical_json ($value) {
     # (_canonical_values_ok) is not walked twice.
     _validate_canonical_value($value, '$')
         unless Selecto::API::ResponsePolicy::_canonical_values_ok($value);
-    return JSON::PP->new
-        ->allow_nonref(1)
-        ->ascii(0)
-        ->canonical(1)
-        ->utf8(1)
-        ->encode($value);
+    return Selecto::CanonicalJSON->encode_utf8($value);
 }
 
 sub _validate_canonical_value ($value, $path) {
@@ -378,7 +375,7 @@ sub _validate_canonical_value ($value, $path) {
     # intentional JSON string type (notably exact NUMERIC/DECIMAL values from
     # DBI adapters). Use JSON::PP's scalar typing decision before rejecting a
     # native non-integer number from Canonical JSON v1.
-    my $encoded_scalar = JSON::PP->new->allow_nonref(1)->encode($value);
+    my $encoded_scalar = Cpanel::JSON::XS->new->allow_nonref(1)->encode($value);
     if ($encoded_scalar !~ /\A"/
         && looks_like_number($value)
         && "$value" !~ /\A-?(?:0|[1-9][0-9]*)\z/) {

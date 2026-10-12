@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Encode JSON with Cpanel::JSON::XS (4.38 or later, now required) instead of
+      JSON::PP. Domain and predicate fingerprints and Canonical JSON v1 bodies
+      go through Selecto::CanonicalJSON and keep the bytes JSON::PP wrote,
+      including whole numbers held as floats (3, not 3.0). Integer-looking
+      floats of 1e16 and above, which JSON::PP wrote as strings, are now
+      refused by canonical_json as floats.
+    - Domain identity re-verification is opt-in (verify_domain_identity or
+      $Selecto::Engine::VERIFY_DOMAIN_IDENTITY) and runs once per outermost call.
     - Add scalar engine with_tenant(value), write(), and action(name) as the
       common native facade. Domain-owned tenant columns and trusted context
       are inherited by reads, writes, actions, and transaction engines;

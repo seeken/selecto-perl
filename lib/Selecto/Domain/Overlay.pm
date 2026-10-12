@@ -3,7 +3,7 @@ package Selecto::Domain::Overlay;
 use 5.034;
 use strict;
 use warnings;
-use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Domain ();
@@ -207,7 +207,7 @@ sub _unique_list {
     my @values = @_;
     my (%seen, @unique);
     for my $value (@values) {
-        my $key = eval { JSON::PP->new->canonical(1)->allow_nonref(1)->encode($value) };
+        my $key = eval { Cpanel::JSON::XS->new->canonical(1)->allow_nonref(1)->encode($value) };
         $key = defined($key) ? $key : _value_type($value) . ':' . "$value";
         next if $seen{$key}++;
         push @unique, _clone($value);

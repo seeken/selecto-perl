@@ -8,3 +8,4 @@ e35891f4575ffd32168aa415abe595bb52e011cfb00c49fa6522da4e539a601c https://cpan.me
 2c31163d8bdaaf8beaef9c97b8f260432d67a534bc7b69e7265c21cb841432b8 https://cpan.metacpan.org/authors/id/T/TU/TURNSTEP/DBD-Pg-3.16.0.tar.gz
 88efbe2e9a642dceaa186430fedfcf999aaf0e06f6cced28a714b8e56b514921 https://cpan.metacpan.org/authors/id/M/MI/MIYAGAWA/Module-CPANfile-1.1004.tar.gz
 5a8750ddd8ee743d7cc89bebdd542a9b78a34023164ebe19dea0c248e121c21e https://cpan.metacpan.org/authors/id/O/OA/OALDERS/URI-5.37.tar.gz
+32d7e099c9a71e5693f951b26114c89854de419f17ff7402ad5890fa41dbd819 https://cpan.metacpan.org/authors/id/R/RU/RURBAN/Cpanel-JSON-XS-4.53.tar.gz

@@ -6,6 +6,7 @@ use warnings;
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::OperationBudget ();
+use Cpanel::JSON::XS ();
 our $_CONSTRUCTION_LIMITS;
 
 sub new {
@@ -21,7 +22,7 @@ sub new {
         # admission must not replace that later type/authority decision.
         my $value = $arguments[0];
         if (ref($value) && !JSON::PP::is_bool($value)) {
-            $value = JSON::PP->new->canonical->utf8->encode($value);
+            $value = Cpanel::JSON::XS->new->canonical->utf8->encode($value);
         }
         $budget->consume_value($value, label => 'expression literal');
     } elsif ($kind =~ /\A(?:in|array_contains|array_contained|array_overlap)\z/ && ref($arguments[1]) eq 'ARRAY') {
@@ -433,8 +434,7 @@ sub _from_filter_ast {
             unless @arguments == 2;
         # The whole document was admitted before cloning; charge its exact JSON
         # parameter now, after a bounded traversal made encoding safe.
-        require JSON::PP;
-        $budget->consume_value(JSON::PP->new->canonical->allow_nonref(1)->utf8->encode($value), label => 'JSON containment value');
+        $budget->consume_value(Cpanel::JSON::XS->new->canonical->allow_nonref(1)->utf8->encode($value), label => 'JSON containment value');
         return $class->json_contains(_filter_field($field), $value);
     }
     Selecto::Error->throw('invalid_query', 'filter field must be a governed field name')

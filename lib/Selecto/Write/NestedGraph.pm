@@ -6,6 +6,7 @@ use warnings;
 no overloading;
 use Scalar::Util qw(blessed reftype);
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use B ();
 use bytes ();
 use Selecto::Error ();
@@ -21,7 +22,7 @@ sub _fail { Selecto::Error->throw($_[0] // 'invalid_graph', $_[1], {path=>$_[2] 
 sub _copy { Selecto::Domain::QueryContract->copy_declaration({value=>$_[0]})->{value} }
 sub _true { ref($_[0]) eq 'JSON::PP::Boolean' ? ${$_[0]} == 1 : defined($_[0]) && !defined(reftype($_[0])) && $_[0] =~ /\A(?:1|true)\z/ }
 sub _id { defined($_[0]) && !defined(reftype($_[0])) && (B::svref_2object(\$_[0])->FLAGS & B::SVp_POK()) && $_[0] =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/ }
-sub _json { JSON::PP->new->canonical->allow_nonref->encode($_[0]) }
+sub _json { Cpanel::JSON::XS->new->canonical->allow_nonref->encode($_[0]) }
 sub _object_values {
     my ($given,$path)=@_;
     return $given if ref($given) eq 'HASH';

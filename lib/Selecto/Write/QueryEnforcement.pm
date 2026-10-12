@@ -8,6 +8,7 @@ use Scalar::Util qw(blessed reftype refaddr);
 use bytes ();
 use Encode qw(encode_utf8);
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Selecto::Error ();
 use Selecto::Limits ();
 use Selecto::Expression ();
@@ -211,7 +212,7 @@ sub compile {
             fingerprint=>$contract->{fingerprint});
         my @mismatch = grep { defined($source->{$_}) && defined($actual{$_}) &&
             (ref($source->{$_}) || ref($actual{$_})
-                ? JSON::PP->new->canonical->allow_nonref->encode($source->{$_}) ne JSON::PP->new->canonical->allow_nonref->encode($actual{$_})
+                ? Cpanel::JSON::XS->new->canonical->allow_nonref->encode($source->{$_}) ne Cpanel::JSON::XS->new->canonical->allow_nonref->encode($actual{$_})
                 : $source->{$_} ne $actual{$_})
             || ($_ eq 'relation' || $_ eq 'primary_key') && (!defined($source->{$_}) || !defined($actual{$_})) } sort keys %actual;
         _fail('query_source_mismatch', 'enforced query and write source identities differ', {fields=>\@mismatch}) if @mismatch;
