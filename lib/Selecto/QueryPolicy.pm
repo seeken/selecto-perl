@@ -121,8 +121,15 @@ sub _field {
 }
 sub _key {
     my ($expression) = @_;
-    return $expression->kind . '\0' . ($expression->alias_name // '') . '\0' . Cpanel::JSON::XS->new->canonical->encode($expression->arguments)
-        if $expression->kind eq 'field';
+    if ($expression->kind eq 'field') {
+        my $arguments = $expression->arguments;
+        my $alias = $expression->alias_name // '';
+        # An explicit alias equal to the field's own name is the same output
+        # as the unaliased required field. Other aliases remain distinct.
+        $alias = '' if $alias eq $arguments->[0];
+        return $expression->kind . '\0' . $alias . '\0'
+            . Cpanel::JSON::XS->new->canonical->encode($arguments);
+    }
     # Other expressions remain separate optional selections. Required policy
     # currently accepts governed field paths only, so it cannot erase them.
     return 'optional:' . Scalar::Util::refaddr($expression);
