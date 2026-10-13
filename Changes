@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - A relationship whose child_key is the child's primary key and whose child
+      domain is tenant-bounded (tenant_field or writes.scope.tenant) may name
+      any parent_key under a tenant-bounded root: the parent holds its child's
+      id (as a truck holds its trailer's), so it binds at most one child, which
+      the child's tenant boundary keeps in reach. Without the child's tenant
+      boundary it is still refused (foreign_key_tenant_scope_undeclared).
     - Encode JSON with Cpanel::JSON::XS (4.38 or later, now required) instead of
       JSON::PP. Domain and predicate fingerprints and Canonical JSON v1 bodies
       go through Selecto::CanonicalJSON and keep the bytes JSON::PP wrote,
