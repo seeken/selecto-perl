@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 Unreleased
+    - A filtered association (one with where) is a lookup, not a reference:
+      it picks one of the rows matching its owner key (a customer's option in
+      one group) rather than the row the key identifies. It no longer counts
+      as a declaration of its owner key's reference, so it neither contradicts
+      that key's association or foreign key nor gets a write guard of its own.
     - A relationship whose child_key is the child's primary key and whose child
       domain is tenant-bounded (tenant_field or writes.scope.tenant) may name
       any parent_key under a tenant-bounded root: the parent holds its child's
