@@ -10,6 +10,7 @@ export HARNESS_VERBOSE=1 PYTHONDONTWRITEBYTECODE=1
 stage() { label=$1; shift; python3 -B ci/run.py "$label" -- "$@"; }
 stage checkout python3 -B ci/sources.py checkout
 stage dependencies ci/deps
+python3 -B ci/test_run.py
 trap "ci/postgres-vm stop" EXIT HUP INT TERM
 stage postgres-start ci/postgres-vm start
 stage distribution-configure script/with-local-deps perl Makefile.PL

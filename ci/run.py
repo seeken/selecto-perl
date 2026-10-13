@@ -15,6 +15,64 @@ SUMMARY = re.compile(r'Files=(\d+),\s*Tests=(\d+)')
 SKIP = re.compile(r'^.*(?:\b[0-9]+\.\.0\s+#\s*SKIP\b|^\s*(?:ok|not ok)\s+\d+.*#\s*skip\b)', re.I)
 FILE_SKIP = re.compile(r'^\s*[A-Za-z0-9_./-]+\.t\s+\.+\s+skipped:\s*(.*)$', re.I)
 
+FILE_FAILURE = re.compile(r'^\s*(t/[A-Za-z0-9_./-]{1,240}\.t)\s+\(Wstat:\s*([0-9]{1,10})(?:\s+\(exited\s+([0-9]{1,10})\))?\s+Tests:\s*([0-9]{1,10})\s+Failed:\s*([0-9]{1,10})\)\s*$')
+FAILED_INDEXES = re.compile(r'^\s*Failed tests?:\s*([0-9, \-]+)\s*$')
+CONTINUED_INDEXES = re.compile(r'^\s+([0-9, \-]+)\s*$')
+
+def failed_tap_files(output):
+    """Expose only bounded numeric Harness failure identities, never assertions."""
+    records = []
+    current = None
+    collecting_indexes = False
+    in_summary = False
+    index_count = 0
+    for line in output.splitlines():
+        if line.strip() == 'Test Summary Report':
+            in_summary = True
+            continue
+        if not in_summary:
+            continue
+        match = FILE_FAILURE.fullmatch(line)
+        if match:
+            path, wait_status, exit_status, tests, failed = match.groups()
+            current = None
+            collecting_indexes = False
+            if '..' in Path(path).parts or len(path) > 240 or len(records) >= 64:
+                continue
+            current = {'file': path, 'wait_status': int(wait_status),
+                       'exit_status': int(exit_status or 0), 'tests': int(tests),
+                       'failed': int(failed), 'failed_test_indexes': [],
+                       'index_parse_status': 'not_reported'}
+            records.append(current)
+            continue
+        match = FAILED_INDEXES.fullmatch(line)
+        if not match and collecting_indexes:
+            match = CONTINUED_INDEXES.fullmatch(line)
+        if not match or current is None:
+            collecting_indexes = False
+            continue
+        collecting_indexes = True
+        indexes = []
+        for token in match.group(1).replace(',', ' ').split():
+            parts = token.split('-')
+            if len(parts) not in (1, 2) or any(not part.isdigit() or len(part) > 10 for part in parts):
+                current['index_parse_status'] = 'malformed'
+                break
+            first, last = int(parts[0]), int(parts[-1])
+            if first < 1 or last < first or last > current['tests']:
+                current['index_parse_status'] = 'malformed'
+                break
+            if last - first + 1 + len(indexes) + index_count > 4096:
+                current['index_parse_status'] = 'bounded'
+                break
+            indexes.extend(range(first, last + 1))
+        else:
+            new_indexes = set(indexes) - set(current['failed_test_indexes'])
+            index_count += len(new_indexes)
+            current['failed_test_indexes'] = sorted(set(current['failed_test_indexes']) | new_indexes)
+            current['index_parse_status'] = 'reported'
+    return records
+
 def skip_reason(line):
     match = FILE_SKIP.match(line)
     if match:
@@ -83,6 +141,7 @@ def main():
               'harness_file_skips': sum(bool(FILE_SKIP.match(line)) for line in skip_lines),
               'skip_categories': skips,
               'required_skip_directives': required_skips,
+              'failed_tap_files': failed_tap_files(output),
               'minimum_tests': floor, 'require_no_skips': bool(rule.get('require_no_skips'))}
     (evidence / (stage.replace(':', '-') + '.json')).write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))

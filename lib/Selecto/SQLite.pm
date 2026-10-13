@@ -637,7 +637,7 @@ sub _json_available {
             my ($source, $needle) = @_;
             return undef unless defined($source) && defined($needle);
             my ($left, $right);
-            my $json = Cpanel::JSON::XS->new->allow_nonref(1)->allow_bignum(1);
+            my $json = Cpanel::JSON::XS->new->allow_nonref(1)->allow_bignum(1)->allow_dupkeys(1);
             return 0 unless eval { $left = $json->decode($source); $right = $json->decode($needle); 1 };
             return _json_contains_value($left, $right) ? 1 : 0;
         });
