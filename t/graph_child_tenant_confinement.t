@@ -80,8 +80,6 @@ for my $backend (@backends) {
             };
             my $children = sub { $dbh->selectall_arrayref("SELECT id, parent_id, tenant_id, note FROM $t{children} ORDER BY id") };
             my $engine = Selecto::Engine->new(domain => domain(\%t, $owned), adapter => Selecto->adapter($name => (dbh => $dbh)));
-            plan skip_all => "$name does not implement owned-set sync"
-                if $owned && !$engine->adapter->write_capabilities->{owned_set_sync};
             my $graph = sub {
                 my (@commands) = @_;
                 my @ids = map { "child$_" } 0 .. $#commands;
@@ -100,6 +98,19 @@ for my $backend (@backends) {
                     ($operation eq 'insert' ? () : (predicate => Selecto::Expression->eq('id', $id))), expected_count => 1);
             };
             my $keep = $command->('update', 10, note => 'kept');
+
+            if ($owned && !$engine->adapter->write_capabilities->{owned_set_sync}) {
+                $reset->();
+                is(code_of(sub { $engine->execute_graph($graph->($keep)) }),
+                    'write_capability_missing', 'unsupported owned-set sync is refused explicitly');
+                is_deeply($children->(), [[10, 1, 7, 'keep'], [13, 1, 8, 'foreign']],
+                    'an unsupported sync changes no child rows');
+                is($dbh->selectrow_array("SELECT label FROM $t{parents} WHERE id = 1"),
+                    'mine', 'an unsupported sync changes no parent rows');
+                $dbh->do("DROP TABLE $t{$_}") for qw(children parents);
+                $dbh->disconnect;
+                return;
+            }
 
             for my $attack (
                 ['insert with a foreign tenant_id', 'tenant_mismatch', $command->('insert', undef, id => 20, tenant_id => 8, note => 'x')],
