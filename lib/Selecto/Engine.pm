@@ -1925,8 +1925,13 @@ sub _assert_lookups_public {
 # non-unique key (a code two tenants' items share) would bind a child, and
 # its children, under every parent with that value, another tenant's
 # included. A composite conflict target (tenant_id, code) or a sync identity
-# (unique only per owner) does not count. Checked for every hop of nested
-# relationship domains, when the engine is built.
+# (unique only per owner) does not count. A reference the other way (the
+# parent row holds the child's id, as a truck holds its trailer's) binds at
+# most one child, so any parent_key may name it when child_key is the child's
+# primary key and the child domain is tenant-bounded itself (tenant_field or
+# writes.scope.tenant), which keeps another tenant's row out of reach.
+# Checked for every hop of nested relationship domains, when the engine is
+# built.
 sub _assert_unique_parent_keys {
     my ($domain, $scope) = @_;
     my $bounded = defined($scope->{tenant}) || defined($domain->tenant_field)
@@ -1950,13 +1955,14 @@ sub _assert_unique_parent_keys {
             my $spec = $relationships->{$name};
             next unless ref($spec) eq 'HASH';
             my $parent_key = $spec->{parent_key};
+            my $child = $spec->{domain};
             Selecto::Error->throw('invalid_domain',
                 'a relationship\'s parent_key must be its parent\'s primary key or a single-column upsert conflict target',
                 {code => 'foreign_key_tenant_scope_undeclared', relationship => join('.', @$path, $name),
                     relation => $table, parent_key => "$parent_key"},
             ) if defined($parent_key) && !ref($parent_key)
-                && "$parent_key" ne ($primary_key // '') && !$unique{"$parent_key"};
-            my $child = $spec->{domain};
+                && "$parent_key" ne ($primary_key // '') && !$unique{"$parent_key"}
+                && !_references_bounded_child($spec);
             next unless ref($child) eq 'HASH';
             my $source = ref($child->{source}) eq 'HASH' ? $child->{source} : {};
             push @pending, [$source->{source_table} // $spec->{table}, $source->{primary_key} // 'id',
@@ -1964,6 +1970,19 @@ sub _assert_unique_parent_keys {
         }
     }
     return;
+}
+
+# Whether relationship $spec binds its child by the child's own primary key
+# (child_key) and the child domain is tenant-bounded (see
+# _assert_unique_parent_keys).
+sub _references_bounded_child {
+    my ($spec) = @_;
+    my $child = $spec->{domain};
+    return 0 unless ref($child) eq 'HASH' && defined($spec->{child_key}) && !ref($spec->{child_key});
+    my $source = ref($child->{source}) eq 'HASH' ? $child->{source} : {};
+    return 0 unless "$spec->{child_key}" eq ($source->{primary_key} // 'id');
+    my $scope = ref($child->{writes}) eq 'HASH' && ref($child->{writes}{scope}) eq 'HASH' ? $child->{writes}{scope} : {};
+    return defined($source->{tenant_field}) || ref($scope->{tenant}) eq 'HASH' ? 1 : 0;
 }
 
 # A declared foreign key and the associations on the same owner key must

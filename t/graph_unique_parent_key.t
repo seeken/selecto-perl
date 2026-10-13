@@ -14,7 +14,9 @@ use Selecto::Write ();
 # upsert conflict target. Here parts bind to their item by a code that tenant
 # 7's and tenant 8's items share: through tenant 7's item, a two-hop graph
 # would reach tenant 8's part. Such a domain is refused when the engine is
-# built (invalid_domain, foreign_key_tenant_scope_undeclared).
+# built (invalid_domain, foreign_key_tenant_scope_undeclared). A parent
+# naming its child's primary key binds one child, and is accepted when the
+# child domain is tenant-bounded.
 
 plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
 
@@ -45,7 +47,9 @@ sub relation {
 sub domain {
     my ($t, %o) = @_;
     my $parts = {schema_version => 1, name => 'Parts',
-        source => relation($t->{parts}, {id => 'integer', item_code => 'string', note => 'string'}),
+        source => {%{relation($t->{parts}, {id => 'integer', item_code => 'string', note => 'string',
+            ($o{parts_tenant} ? (tenant_id => 'integer') : ())})},
+            ($o{parts_tenant} ? (tenant_field => 'tenant_id') : ())},
         schemas => {}, joins => {},
         writes => {operations => {update => {enabled => 1}}, fields => {note => {updatable => 1}}}};
     my $items = {schema_version => 1, name => 'Items',
@@ -56,7 +60,7 @@ sub domain {
                 (defined($o{conflict_targets}) ? (upsert => {enabled => 1, conflict_targets => $o{conflict_targets}}) : ())},
             fields => {status => {updatable => 1}},
             relationships => {parts => {writable => 1, table => $t->{parts}, parent_key => $o{parent_key} // 'code',
-                child_key => 'item_code', allowed_ops => ['update'], domain => $parts}},
+                child_key => $o{child_key} // 'item_code', allowed_ops => ['update'], domain => $parts}},
         }};
     return Selecto::Domain->parse({schema_version => 1, name => 'Orders',
         source => {%{relation($t->{orders}, {id => 'integer', tenant_id => 'integer', title => 'string'})},
@@ -115,6 +119,14 @@ for my $backend (@backends) {
             'a single-column conflict target on the parent key is accepted');
         is(error_of(sub { Selecto::Engine->new(domain => domain(\%t, parent_key => 'id'),
             adapter => $adapter, scope => {tenant => 7}) }), undef, 'the parent primary key is accepted');
+        # The parent holding its child's id (as a truck holds its trailer's) binds one child.
+        is(error_of(sub { Selecto::Engine->new(domain => domain(\%t, child_key => 'id', parts_tenant => 1),
+            adapter => $adapter, scope => {tenant => 7}) }), undef,
+            "a reference to a tenant-bounded child's primary key is accepted");
+        my $unbounded = error_of(sub { Selecto::Engine->new(domain => domain(\%t, child_key => 'id'),
+            adapter => $adapter, scope => {tenant => 7}) });
+        is($unbounded && blessed($unbounded) && $unbounded->details->{code}, 'foreign_key_tenant_scope_undeclared',
+            'a reference to the primary key of a child without a tenant boundary is refused');
         $dbh->do("DROP TABLE $t{$_}") for qw(parts items orders);
     };
 }
