@@ -14,7 +14,8 @@ use Selecto::Write ();
 # one reference. When they disagree on the referenced relation or on the
 # tenant columns they pair, one declaration would silently drop the other's
 # tenant guard, so the domain is refused (invalid_domain,
-# foreign_key_tenant_scope_undeclared) before any query or write.
+# foreign_key_tenant_scope_undeclared) before any query or write. A filtered
+# lookup (an association with where) is not a reference.
 
 plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
 
@@ -155,6 +156,17 @@ for my $backend (@backends) {
         is_deeply($orders->(), [], 'the refused reference wrote nothing');
         is($insert->($agreeing, 1, 51, tenant_id => 1), 'ok', "an agreeing reference admits the tenant's own customer");
         is_deeply($orders->(), [[1, 51]], 'the own-tenant order was written');
+        $dbh->do("DELETE FROM $t{orders}");
+
+        # A filtered lookup on the same owner key (one of the rows matching it,
+        # here a site customer at site 5) is not a reference: it neither
+        # contradicts the association nor drops the association's guard.
+        my $lookup = $engine->(association => [[customer => 'customer'],
+            [site_lookup => 'site_customer', cardinality => 'one', where => {site_id => 5}]]);
+        is($insert->($lookup, 1, 50, tenant_id => 1), 'cardinality_mismatch',
+            "beside a filtered lookup, the association still refuses another tenant's customer");
+        is($insert->($lookup, 1, 51, tenant_id => 1), 'ok', "and admits the tenant's own");
+        is_deeply($orders->(), [[1, 51]], 'only the own-tenant order was written');
         $dbh->do("DELETE FROM $t{orders}");
 
         # AWF003: an explicit shared FK (tenant_field false) is authoritative
