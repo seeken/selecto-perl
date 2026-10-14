@@ -1080,7 +1080,7 @@ sub governed_write {
                 && _has_conjunct($command->query_enforcement->predicate, $required));
     }
     my %returning_fields = map { ($_ => $self->{domain}->_field_metadata_view($_)) } keys %{$self->{domain}->fields};
-    $command = Selecto::Write::Policy->apply($command, $self->{domain}->writes, \%returning_fields,
+    $command = Selecto::Write::Policy->apply($command, $self->{domain}->writes_shared, \%returning_fields,
         trusted_field => $trusted);
     $self->_validate_write_command($command, trusted_field => $trusted);
     $self->_check_required_tenant_assignment($command, $required, %details);
@@ -1388,7 +1388,7 @@ sub _tenant_pins {
 # meaning; none can supply a context-owned identity.
 sub _materialize_write_context {
     my ($self,$command)=@_;
-    my $keys=_declared_foreign_keys($self->{domain}->writes);
+    my $keys=_declared_foreign_keys($self->{domain}->writes_shared);
     return $command unless keys %$keys;
     my $assignments=$command->assignments;my (%context_keys,%plain);
     for my $field (sort keys %$keys) {
@@ -2563,7 +2563,7 @@ sub _validate_write_command {
     return $self->_validate_command_against_contract(
         $command,
         fields      => $self->{domain}->fields,
-        writes      => _checked_writes($self->{domain}->writes),
+        writes      => _checked_writes($self->{domain}->writes_shared),
         values_foreign_keys => $self->{domain}->values_foreign_keys,
         allowed_ops => undef,
         label       => $command->relation,
