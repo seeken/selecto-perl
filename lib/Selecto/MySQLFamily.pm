@@ -273,7 +273,7 @@ sub _compile_expression {
 # Server errors by MySQL/MariaDB errno, typed like PostgreSQL's constraint
 # errors. A deadlock or lock-wait timeout is retryable (the host reruns the
 # whole transaction); neither is a client error. The violated key's name is
-# kept on the adapter for the upsert emulation, never in the public details.
+# kept on the adapter, never in the public details.
 sub normalize_error {
     my ($self, $error) = @_;
     return $error if blessed($error) && $error->isa('Selecto::Error');
@@ -894,7 +894,7 @@ sub _require_transactional_table {
 # PostgreSQL. A NULL target value never conflicts.
 sub _execute_upsert {
     my ($self, $command) = @_;
-    my $target_index = $self->_admit_upsert_conflict($command);
+    $self->_admit_upsert_conflict($command);
     my $metadata = $command->metadata;
     my $assignments = $command->assignments;
     my (@terms, $null);
@@ -929,14 +929,15 @@ sub _execute_upsert {
         $self->_savepoint_command(release => $savepoint);
         return Selecto::Write::Result->new(operation => 'upsert', affected_rows => $result->affected_rows, values => {});
     }
-    my $unique_key = $self->{_selecto_unique_key};
     $self->_savepoint_command(rollback => $savepoint);
     $self->_savepoint_command(release => $savepoint);
     die $error unless blessed($error) && $error->isa('Selecto::Error')
-        && $error->code eq 'database_unique_violation' && defined($unique_key) && $unique_key eq $target_index;
-    # The collision was on the declared target. Lock that row and update it;
-    # when it is gone (another unique key collided, or the row was removed
-    # meanwhile) the original unique violation stands.
+        && $error->code eq 'database_unique_violation';
+    # As PostgreSQL's arbiter index does, the declared target alone decides
+    # whether this is a conflict, whichever unique key the server reported
+    # first (the primary key is checked before the target). Lock the target's
+    # row and update it; when no such row exists the collision was only on
+    # another unique key and the original unique violation stands.
     my (@params, $rows);
     my $where = $self->_compile_write_predicate($target, \@params);
     my $ok = eval { $rows = $self->dbh->selectall_arrayref("SELECT 1 FROM $table WHERE $where FOR UPDATE", undef, @params); 1 };
