@@ -2524,6 +2524,11 @@ sub write_tenant_scope {
 # deep copy of the whole contract; the caller receives the same fresh copy.
 sub writes       { my $contract = $_[0]->{contract} // {}; return Selecto::DataRules::_copy_plain(
     $contract->{writes} // {}, Selecto::Limits->new, 'invalid_write_contract', 'writes contract'); }
+# The domain's own sealed write contract, not a copy. It was validated and copied when the
+# domain was parsed. Callers must treat it as read-only: use writes() for anything that is
+# kept or changed. It exists so the hot write path does not deep-copy the contract per
+# command.
+sub writes_shared { my $contract = $_[0]->{contract} // {}; return $contract->{writes} // {}; }
 sub actions      { my $contract = $_[0]->{contract} // {}; return Selecto::DataRules::_copy_plain(
     $contract->{actions} // {}, Selecto::Limits->new, 'invalid_action_contract', 'actions contract'); }
 sub imports      { my $contract = $_[0]->{contract} // {}; return dclone($contract->{imports} // {}); }
