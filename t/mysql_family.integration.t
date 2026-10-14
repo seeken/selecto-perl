@@ -68,7 +68,7 @@ for my $specification (
             $engine->execute_write($upsert->with_metadata({conflict_target => ['id'], upsert_update_fields => ['amount']}));
             1;
         };
-        ok(!$by_id && $@->code eq 'query_error', "$backend fails an insert that collides on another unique key");
+        ok(!$by_id && $@->code eq 'database_unique_violation', "$backend fails an insert that collides on another unique key");
         is($dbh->selectrow_array('SELECT amount FROM selecto_perl_mysql_products WHERE id = 1'),
             '20.25', "$backend never changes the row selected by another unique key");
         eval { $engine->execute_write($upsert->with_scope_predicate(Selecto::Expression->eq('id', 1))) };

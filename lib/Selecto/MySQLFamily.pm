@@ -234,6 +234,10 @@ sub _compile_window {
     my ($self, $domain, $expression, $params) = @_;
     my ($function, $arguments) = @{$expression->arguments};
     my %inline;
+    # MariaDB's LAG/LEAD take no default argument.
+    Selecto::Error->throw('unsupported_feature', 'MariaDB LAG and LEAD do not accept a default argument')
+        if $self->name eq 'mariadb' && defined($function) && !ref($function) && ($function eq 'lag' || $function eq 'lead')
+            && ref($arguments) eq 'ARRAY' && @$arguments > 2;
     if (defined($function) && !ref($function) && exists($WINDOW_INTEGER_ARGUMENT{$function})
         && ref($arguments) eq 'ARRAY') {
         my $argument = $arguments->[$WINDOW_INTEGER_ARGUMENT{$function}];
@@ -266,6 +270,57 @@ sub _compile_expression {
 }
 
 # OFFSET requires a LIMIT; the largest unsigned BIGINT means no limit.
+# Server errors by MySQL/MariaDB errno, typed like PostgreSQL's constraint
+# errors. A deadlock or lock-wait timeout is retryable (the host reruns the
+# whole transaction); neither is a client error. The violated key's name is
+# kept on the adapter for the upsert emulation, never in the public details.
+sub normalize_error {
+    my ($self, $error) = @_;
+    return $error if blessed($error) && $error->isa('Selecto::Error');
+    my $dbh = $self->{dbh};
+    my $errno = eval { blessed($dbh) && $dbh->can('err') ? $dbh->err : undef };
+    my $text = eval { "$error" } // '';
+    delete $self->{_selecto_unique_key};
+    return $self->SUPER::normalize_error($error) unless defined($errno) && "$errno" =~ /\A\d+\z/;
+    if ($errno == 1062) {
+        my ($key) = $text =~ /.*for key '([^']+)'(?: at |\s*\z)/s;
+        if (defined $key) {
+            $key =~ s/\A.*\.//s;
+            $self->{_selecto_unique_key} = lc $key;
+        }
+        return Selecto::Error->new(code => 'database_unique_violation',
+            message => 'A value conflicts with an existing record.', details => {constraint => 'unique'});
+    }
+    if ($errno == 1451 || $errno == 1452) {
+        return Selecto::Error->new(code => 'database_foreign_key_violation',
+            message => 'A referenced record does not exist or is not available.',
+            details => {constraint => 'foreign_key'});
+    }
+    if ($errno == 1048) {
+        my ($field) = $text =~ /Column '([A-Za-z_][A-Za-z0-9_]*)' cannot be null/;
+        return Selecto::Error->new(code => 'database_not_null_violation',
+            message => defined($field) ? "Required field $field was not provided." : 'A required database field was not provided.',
+            details => {constraint => 'not_null', defined($field) ? (field => $field) : ()});
+    }
+    if ($errno == 3819 || $errno == 4025) {
+        return Selecto::Error->new(code => 'database_check_violation',
+            message => 'A database validation constraint was not satisfied.', details => {constraint => 'check'});
+    }
+    if ($errno == 1213) {
+        return Selecto::Error->new(code => 'database_deadlock_detected',
+            message => 'The database rolled the transaction back to resolve a deadlock; retry it.',
+            details => {category => 'deadlock_detected', retryable => JSON::PP::true});
+    }
+    if ($errno == 1205) {
+        return Selecto::Error->new(code => 'database_lock_timeout',
+            message => 'The database timed out waiting for a lock; retry the transaction.',
+            details => {category => 'lock_timeout', retryable => JSON::PP::true});
+    }
+    return $self->SUPER::normalize_error($error);
+}
+
+sub _rereads_written_rows { return 1; }
+
 sub _compile_pagination {
     my ($self, $limit, $offset, @rest) = @_;
     return ' LIMIT 18446744073709551615 OFFSET ' . int($offset) if !defined($limit) && defined($offset);
@@ -796,6 +851,7 @@ sub _admit_upsert_conflict {
     my $indexes;
     my $ok = eval {
         $dbh->do('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0');
+        $self->_require_transactional_table($table);
         $indexes = $dbh->selectall_arrayref(q{SELECT INDEX_NAME, COLUMN_NAME, SUB_PART FROM information_schema.STATISTICS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND NON_UNIQUE = 0 ORDER BY INDEX_NAME, SEQ_IN_INDEX},
             undef, $table);
@@ -809,11 +865,24 @@ sub _admit_upsert_conflict {
         $entry->{usable} = 0 if !defined($column) || defined($prefix);
         $entry->{columns}{$column} = 1 if defined $column;
     }
-    $refuse->('no_matching_unique_index') unless grep {
-        my $entry = $_;
+    my ($matched) = grep {
+        my $entry = $index{$_};
         $entry->{usable} && keys(%{$entry->{columns}}) == keys(%target)
             && !grep { !$entry->{columns}{$_} } keys %target
-    } values %index;
+    } sort keys %index;
+    $refuse->('no_matching_unique_index') unless defined $matched;
+    return lc $matched;
+}
+
+# FOR UPDATE, savepoints and rollback need a transactional engine; a MyISAM
+# table would apply every statement immediately and ignore both.
+sub _require_transactional_table {
+    my ($self, $table) = @_;
+    my ($engine) = $self->dbh->selectrow_array(q{SELECT ENGINE FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}, undef, $table);
+    Selecto::Error->throw('write_capability_missing',
+        'MySQL-family writes require an InnoDB table', {reason => 'non_transactional_engine'})
+        unless defined($engine) && uc($engine) eq 'INNODB';
     return 1;
 }
 
@@ -825,7 +894,7 @@ sub _admit_upsert_conflict {
 # PostgreSQL. A NULL target value never conflicts.
 sub _execute_upsert {
     my ($self, $command) = @_;
-    $self->_admit_upsert_conflict($command);
+    my $target_index = $self->_admit_upsert_conflict($command);
     my $metadata = $command->metadata;
     my $assignments = $command->assignments;
     my (@terms, $null);
@@ -841,24 +910,41 @@ sub _execute_upsert {
     }
     my $target = Selecto::QueryEnforcement::combine(@terms);
     my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
-    my $found = 0;
-    unless ($null) {
-        my @params;
-        my $where = $self->_compile_write_predicate($target, \@params);
-        my $rows;
-        my $ok = eval { $rows = $self->dbh->selectall_arrayref("SELECT 1 FROM $table WHERE $where FOR UPDATE", undef, @params); 1 };
-        die $self->normalize_error($@) unless $ok;
-        $found = @$rows;
-    }
     my %branch_metadata = %$metadata;
     delete @branch_metadata{qw(conflict_target upsert_update_fields returning)};
     my %shared = (relation => $command->relation, expected_count => $command->expected_count,
         metadata => \%branch_metadata, foreign_key_guards => $command->foreign_key_guards);
-    my $branch = $found
-        ? Selecto::Write::Command->new(%shared, operation => 'update', predicate => $target,
-            assignments => {map { ($_ => $assignments->{$_}) } @{$metadata->{upsert_update_fields}}})
-        : Selecto::Write::Command->new(%shared, operation => 'insert', assignments => $assignments);
-    my $result = $self->SUPER::_execute_compiled_write_in_transaction($branch, $self->SUPER::_compile_write($branch));
+    my $insert = Selecto::Write::Command->new(%shared, operation => 'insert', assignments => $assignments);
+    my $run = sub { $self->SUPER::_execute_compiled_write_in_transaction($_[0], $self->SUPER::_compile_write($_[0])) };
+    my $result;
+    # INSERT first, in a savepoint. Locking an absent key first (SELECT ...
+    # FOR UPDATE) takes a gap lock that two sessions on the same new key hold
+    # together, and both then deadlock inserting. The insert takes the key's
+    # record lock directly; a loser waits for the winner and gets 1062.
+    my $savepoint = Selecto::SQL::_savepoint_name('selecto_upsert');
+    $self->_savepoint_command(create => $savepoint);
+    my $inserted = eval { $result = $run->($insert); 1 };
+    my $error = $@;
+    if ($inserted) {
+        $self->_savepoint_command(release => $savepoint);
+        return Selecto::Write::Result->new(operation => 'upsert', affected_rows => $result->affected_rows, values => {});
+    }
+    my $unique_key = $self->{_selecto_unique_key};
+    $self->_savepoint_command(rollback => $savepoint);
+    $self->_savepoint_command(release => $savepoint);
+    die $error unless blessed($error) && $error->isa('Selecto::Error')
+        && $error->code eq 'database_unique_violation' && defined($unique_key) && $unique_key eq $target_index;
+    # The collision was on the declared target. Lock that row and update it;
+    # when it is gone (another unique key collided, or the row was removed
+    # meanwhile) the original unique violation stands.
+    my (@params, $rows);
+    my $where = $self->_compile_write_predicate($target, \@params);
+    my $ok = eval { $rows = $self->dbh->selectall_arrayref("SELECT 1 FROM $table WHERE $where FOR UPDATE", undef, @params); 1 };
+    die $self->normalize_error($@) unless $ok;
+    die $error unless @$rows;
+    my $update = Selecto::Write::Command->new(%shared, operation => 'update', predicate => $target,
+        assignments => {map { ($_ => $assignments->{$_}) } @{$metadata->{upsert_update_fields}}});
+    $result = $run->($update);
     return Selecto::Write::Result->new(operation => 'upsert', affected_rows => $result->affected_rows, values => {});
 }
 
@@ -989,7 +1075,12 @@ sub _locked_write_keys {
         . " WHERE $where ORDER BY $column"
         . (defined($bounds->{maximum}) ? ' LIMIT ' . ($bounds->{maximum} + 1) : '') . ' FOR UPDATE';
     my $keys;
-    my $ok = eval { $keys = $self->dbh->selectcol_arrayref($sql, undef, @params); 1 };
+    my $ok = eval {
+        $self->_require_transactional_table(Selecto::Identifier::checked($command->relation));
+        $keys = $self->dbh->selectcol_arrayref($sql, undef, @params);
+        1;
+    };
+    die $@ if !$ok && blessed($@) && $@->isa('Selecto::Error');
     die $self->normalize_error($@) unless $ok;
     return $keys;
 }
@@ -1098,6 +1189,7 @@ sub insert_admission_storage {
     my ($mode, $kind, $triggers, $rows);
     my $ok = eval {
         $dbh->do('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0');
+        $self->_require_transactional_table($table);
         ($mode) = $dbh->selectrow_array('SELECT @@SESSION.sql_mode');
         ($kind) = $dbh->selectrow_array(q{SELECT TABLE_TYPE FROM information_schema.TABLES
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}, undef, $table);
@@ -1235,12 +1327,22 @@ sub _related_collection_order_term {
     return "($sql IS NULL) " . uc($direction) . ", $sql " . uc($direction);
 }
 
+# Rewrites the shared cursor predicate's (IS [NOT] DISTINCT FROM ?) into the
+# null-safe <=>. Only a quoted identifier (optionally qualified) is the left
+# operand, so the rewrite never swallows an opening parenthesis, and the
+# negation is parenthesized so it covers just the comparison.
+my $QUOTED_IDENTIFIER = qr/`(?:``|[^`])*`(?:\.`(?:``|[^`])*`)*/;
+
+sub _null_safe_cursor_sql {
+    my ($sql) = @_;
+    $sql =~ s/($QUOTED_IDENTIFIER) IS NOT DISTINCT FROM (\?)/($1 <=> $2)/g;
+    $sql =~ s/($QUOTED_IDENTIFIER) IS DISTINCT FROM (\?)/(NOT ($1 <=> $2))/g;
+    return $sql;
+}
+
 sub _related_collection_cursor_predicate {
     my ($self, @arguments) = @_;
-    my $sql = $self->SUPER::_related_collection_cursor_predicate(@arguments);
-    $sql =~ s/(\S+) IS NOT DISTINCT FROM (\?)/($1 <=> $2)/g;
-    $sql =~ s/(\S+) IS DISTINCT FROM (\?)/NOT ($1 <=> $2)/g;
-    return $sql;
+    return _null_safe_cursor_sql($self->SUPER::_related_collection_cursor_predicate(@arguments));
 }
 
 sub _related_collection_text_sql {
@@ -1274,10 +1376,23 @@ Selecto::MySQLFamily - shared DBD::MariaDB mechanics for the MySQL and MariaDB a
 
 Common base class of L<Selecto::MySQL> and L<Selecto::MariaDB>: placeholders,
 backtick quoting and value decoding. The two public adapters stay separate
-classes with separate identities. Their C<upsert> write capability is false:
-C<ON DUPLICATE KEY UPDATE> can match any unique index and cannot guarantee the
-declared conflict target. All upsert previews and executions therefore fail
-with C<unsupported_upsert_conflict_target> before database preparation.
+classes with separate identities.
+
+Unscoped upserts follow PostgreSQL C<ON CONFLICT> semantics and never use
+C<ON DUPLICATE KEY UPDATE>, which resolves on whichever unique key collides
+first: the declared target must be exactly a real unique index, the row is
+inserted inside a savepoint, and a duplicate on that index is answered by
+locking and updating the target row. A collision on any other unique key is a
+C<database_unique_violation>. An upsert carrying a write scope is refused with
+C<unsupported_scope_predicate> (HTTP 501). A deadlock or lock-wait timeout
+(possible when three or more sessions race on one new key) is the retryable
+C<database_deadlock_detected> or C<database_lock_timeout>; the host reruns its
+transaction.
+
+Writes need InnoDB tables and a connection with C<mariadb_client_found_rows>
+on (the DBD::MariaDB default, which this module cannot read back from a
+handle): a DSN that sets it to 0 is refused for updates and upserts, but one
+passed as a connect attribute is a host requirement.
 
 This module is an internal part of the L<Selecto> distribution. Its interface
 may change without notice; applications should use the public entry points

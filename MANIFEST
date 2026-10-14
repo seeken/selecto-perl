@@ -165,7 +165,9 @@ t/mssql_decimal_scale.t
 t/mutation_expression.t
 t/mysql_family.integration.t
 t/mysql_family.t
+t/mysql_family_cursor.t
 t/mysql_family_date_format.t
+t/mysql_family_live.t
 t/mysql_family_sql.t
 t/naive_utc_storage.t
 t/postgresql.integration.t
