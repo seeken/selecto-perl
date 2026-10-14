@@ -1088,7 +1088,7 @@ sub governed_write {
     # never a key supplied by the caller's command metadata.
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $self->{domain}->primary_key,
-        __selecto_tenant_fields => $self->_write_tenant_fields,
+        $self->_tenant_fields_metadata,
         __selecto_insert_types => $self->{domain}->fields,
         __selecto_limits => $self->{limits},
         __selecto_write_limit => $self->{limits}->get('max_action_targets')});
@@ -1174,6 +1174,16 @@ sub _write_tenant_column { return $_[0]->_write_tenant_rules->{bind}; }
 # tenant_field, its writes.scope.tenant field, pinned columns and any root
 # tenant columns a graph child stores. Adapters that re-read written rows
 # (MySQL-family RETURNING) keep exactly these conjuncts of the write scope.
+# The metadata pair for adapters that re-read written rows (MySQL family);
+# every other adapter gets none, so governed writes there pay nothing. A
+# caller-supplied copy never survives: the key is replaced or absent.
+sub _tenant_fields_metadata {
+    my ($self, @extra) = @_;
+    my $adapter = $self->{adapter};
+    return $adapter->can('_rereads_written_rows') && $adapter->_rereads_written_rows
+        ? (__selecto_tenant_fields => $self->_write_tenant_fields(@extra)) : ();
+}
+
 sub _write_tenant_fields {
     my ($self, @extra) = @_;
     my $domain = $self->{domain};
@@ -2912,7 +2922,7 @@ sub _validate_graph_node {
     ));
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $edge->{primary_key},
-        __selecto_tenant_fields => $nested_engine->_write_tenant_fields(grep { exists $edge->{fields}{$_} }
+        $nested_engine->_tenant_fields_metadata(grep { exists $edge->{fields}{$_} }
             @{_root_tenant_fields($self->{domain}->tenant_field, $self->{domain}->write_tenant_scope)}),
         __selecto_insert_types => $edge->{field_types},
         __selecto_limits => $self->{limits},

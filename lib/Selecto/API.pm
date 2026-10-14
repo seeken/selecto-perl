@@ -337,6 +337,8 @@ my %FORBIDDEN_CODES = map { $_ => 1 } qw(hidden_field missing_tenant_scope);
 sub error_status ($code) {
     return 404 if defined($code) && !ref($code) && $code eq 'resource_not_found';
     return 501 if defined($code) && !ref($code) && $code eq 'unsupported_scope_predicate';
+    # A deadlock victim or lock-wait timeout is retryable server state, not a bad request.
+    return 503 if defined($code) && !ref($code) && ($code eq 'database_deadlock_detected' || $code eq 'database_lock_timeout');
     return defined($code) && !ref($code) && $FORBIDDEN_CODES{$code} ? 403 : 422;
 }
 

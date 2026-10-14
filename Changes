@@ -1,6 +1,20 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL and MariaDB upserts insert first inside a savepoint, so two
+      sessions on one new key no longer deadlock on a shared gap lock; a
+      duplicate on the declared target locks and updates its row, a duplicate
+      on any other unique key is database_unique_violation. Server errors are
+      typed like PostgreSQL's (database_unique_violation,
+      database_foreign_key_violation, database_not_null_violation,
+      database_check_violation); a deadlock (1213) or lock-wait timeout (1205)
+      is the retryable database_deadlock_detected / database_lock_timeout,
+      answered with HTTP 503 by API::error_status. Writes refuse a
+      non-InnoDB table. MariaDB LAG/LEAD with a default argument is refused.
+      Related-collection keyset cursors no longer lose rows on MySQL/MariaDB
+      (the null-safe rewrite swallowed an opening parenthesis).
+    - A refused tenant-scoped MySQL/MariaDB upsert (unsupported_scope_predicate)
+      is HTTP 501 from API::error_status in every runtime, not a 422.
     - A filtered association (one with where) is a lookup, not a reference:
       it picks one of the rows matching its owner key (a customer's option in
       one group) rather than the row the key identifies. It no longer counts
