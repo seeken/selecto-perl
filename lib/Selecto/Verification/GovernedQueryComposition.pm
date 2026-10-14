@@ -78,7 +78,7 @@ sub _branches {
     my ($query) = @_;
     return ($query, map { _branches($_->{query}) } @{$query->set_operations});
 }
-sub _same { Cpanel::JSON::XS->new->canonical->encode($_[0]) eq Cpanel::JSON::XS->new->canonical->encode($_[1]) }
+sub _same { Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($_[0]) eq Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($_[1]) }
 sub _invariants {
     return [
         ['tenant_scope_is_closed_under_supported_composition', sub {

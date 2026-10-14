@@ -350,7 +350,7 @@ sub preview_rows ($self, $inspection, $configuration, %options) {
     my $limits = $self->limits->tightened(max_import_preview_bytes => $self->limits->get('max_response_bytes'));
     my $output_budget = Selecto::OperationBudget->new(limits => $limits, code => 'import_preview_limit_exceeded');
     $output_budget->check_tree($normalized, label => 'preview configuration', bytes_limit => 'max_import_preview_bytes');
-    my $encoded_bytes = bytes::length(Cpanel::JSON::XS->new->canonical->utf8->encode($normalized));
+    my $encoded_bytes = bytes::length(Cpanel::JSON::XS->new->allow_nonref(1)->canonical->utf8->encode($normalized));
     $limits->check_count('max_import_preview_bytes', $encoded_bytes, 'import_preview_limit_exceeded', 'preview bytes');
     my $selected = 0;
     for my $row (@{$inspection->{rows} // []}) {
@@ -383,12 +383,12 @@ sub preview_rows ($self, $inspection, $configuration, %options) {
         last if defined($normalized->{rows}{end}) && $row->{row_number} > $normalized->{rows}{end};
         my $preview = $self->_preview_row($row, $normalized, $key_set, $trusted, $resolver);
         $output_budget->check_tree($preview, label => 'preview rows', bytes_limit => 'max_import_preview_bytes');
-        $encoded_bytes += bytes::length(Cpanel::JSON::XS->new->canonical->utf8->encode($preview));
+        $encoded_bytes += bytes::length(Cpanel::JSON::XS->new->allow_nonref(1)->canonical->utf8->encode($preview));
         $limits->check_count('max_import_preview_bytes', $encoded_bytes, 'import_preview_limit_exceeded', 'preview bytes');
         push @rows, $preview;
     }
     my $result = {configuration => $normalized, rows => \@rows, returned => scalar(@rows)};
-    $limits->check_bytes('max_import_preview_bytes', Cpanel::JSON::XS->new->canonical->utf8->encode($result),
+    $limits->check_bytes('max_import_preview_bytes', Cpanel::JSON::XS->new->allow_nonref(1)->canonical->utf8->encode($result),
         'import_preview_limit_exceeded', 'encoded preview bytes');
     return $result;
 }
@@ -870,7 +870,7 @@ sub _reject_unknown ($value, $allowed, $label) {
     my @unknown = sort grep { !$allowed{$_} } keys %$value;
     Selecto::Error->throw('invalid_import_configuration', "$label has unknown properties", {properties => \@unknown}) if @unknown;
 }
-sub _clone ($value) { return Cpanel::JSON::XS->new->allow_nonref(1)->decode(Cpanel::JSON::XS->new->canonical(1)->encode($value)); }
+sub _clone ($value) { return Cpanel::JSON::XS->new->allow_nonref(1)->decode(Cpanel::JSON::XS->new->allow_nonref(1)->canonical(1)->encode($value)); }
 sub _error_hash ($error, $field) {
     return {code => $error->code, message => $error->message, defined($field) ? (field => $field) : (), details => $error->details}
         if blessed($error) && $error->isa('Selecto::Error');

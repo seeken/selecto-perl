@@ -362,7 +362,7 @@ sub _normalize {
     _check_storage($engine, $normalized) unless $normalized->operation eq 'update' && !keys %$assignments;
     return ($normalized, $values);
 }
-sub _changed { Cpanel::JSON::XS->new->canonical->encode([$_[0]]) ne Cpanel::JSON::XS->new->canonical->encode([$_[1]]) }
+sub _changed { Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode([$_[0]]) ne Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode([$_[1]]) }
 
 # Native UPSERT owns its branch and physical row. Submitted INSERT attributes
 # outside the conflict-update mask must not replace that protected candidate.
@@ -550,7 +550,7 @@ sub _govern {
 sub _key {
     my ($domain, $fields, $values) = @_;
     _pending('collection identity is incomplete') if grep { !exists($values->{$_}) || !defined($values->{$_}) || ref($values->{$_}) } @$fields;
-    return Cpanel::JSON::XS->new->canonical->encode([map {
+    return Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode([map {
         my $value = $values->{$_};
         if (($domain->fields->{$_} // '') eq 'integer') {
             _pending('collection identity must retain exact integers') unless "$value" =~ /\A[+-]?[0-9]+\z/;

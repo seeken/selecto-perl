@@ -225,7 +225,7 @@ sub _merge {
             ((@next == 1 && ($key eq 'redact_fields' || $key eq 'extensions')) ||
              (@next == 2 && $next[0] eq 'source' && $key eq 'redact_fields'))) {
             my %seen;
-            my $json = Cpanel::JSON::XS->new->canonical;
+            my $json = Cpanel::JSON::XS->new->allow_nonref(1)->canonical;
             $result->{$key} = [map { _clone($_) } grep {
                 my $id = $json->encode(_key($_));
                 !$seen{$id}++

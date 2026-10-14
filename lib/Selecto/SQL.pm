@@ -1312,7 +1312,7 @@ sub execute_graph_unsafe {
                         my $type = $nodes{$id}{command}->metadata->{__selecto_insert_types}{$_};
                         Selecto::InsertAdmission::_value(lc($type // ''), $values->{$_}, $_)
                     } @{$set->{identity_fields}};
-                    my $key = Cpanel::JSON::XS->new->canonical->encode([map { "$_" } @identity]);
+                    my $key = Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode([map { "$_" } @identity]);
                     Selecto::Error->throw('invalid_write_graph', 'owned sync contains duplicate returned identities')
                         if $seen{$key}++;
                     push @kept, Selecto::Expression->all(map {

@@ -343,7 +343,7 @@ sub for_record {
     my $service = $self->{service};
     Selecto::Files::_error('invalid_request')
         unless $owner->{domain_fingerprint} eq $service->{descriptor}{domain_fingerprint};
-    my $identity = Cpanel::JSON::XS->new->canonical->encode($owner->{key});
+    my $identity = Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($owner->{key});
     return bless {
         service => $service, scope => $self->{scope}, actor => $self->{actor},
         owner => $owner, owner_fingerprint => sha256_hex($identity),

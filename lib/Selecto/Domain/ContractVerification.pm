@@ -270,7 +270,7 @@ sub _compare { for my $i (0 .. 2) { my $order = $_[0][$i] <=> $_[1][$i]; return 
 sub _same {
     my ($left, $right) = @_;
     my $same;
-    my $ok = eval { $same = Cpanel::JSON::XS->new->canonical->encode($left) eq Cpanel::JSON::XS->new->canonical->encode($right); 1 };
+    my $ok = eval { $same = Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($left) eq Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($right); 1 };
     _fail('snapshot metadata must be JSON-compatible') unless $ok;
     return $same;
 }

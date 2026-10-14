@@ -53,7 +53,7 @@ sub _state {
     return {tenant_required => $required, context => $context, apply_scope => $apply, user_filter => $user,
         engine => $engine, query => $query};
 }
-sub _same { Cpanel::JSON::XS->new->canonical->encode($_[0]) eq Cpanel::JSON::XS->new->canonical->encode($_[1]); }
+sub _same { Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($_[0]) eq Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($_[1]); }
 sub _invariants {
     return [
         ['required_scope_fails_closed', sub {

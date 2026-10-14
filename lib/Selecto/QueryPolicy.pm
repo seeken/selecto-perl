@@ -128,7 +128,7 @@ sub _key {
         # as the unaliased required field. Other aliases remain distinct.
         $alias = '' if $alias eq $arguments->[0];
         return $expression->kind . '\0' . $alias . '\0'
-            . Cpanel::JSON::XS->new->canonical->encode($arguments);
+            . Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($arguments);
     }
     # Other expressions remain separate optional selections. Required policy
     # currently accepts governed field paths only, so it cannot erase them.

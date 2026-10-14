@@ -62,7 +62,7 @@ sub unique_filters {
     my ($class, $filters) = @_;
     my $copy = Selecto::Domain::QueryContract->copy_declaration({filters => $filters})->{filters};
     my %seen;
-    return [grep { !$seen{Cpanel::JSON::XS->new->canonical->encode($_)}++ } @$copy];
+    return [grep { !$seen{Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($_)}++ } @$copy];
 }
 sub report {
     my ($class, $required, $context, $filters) = @_;
@@ -71,14 +71,14 @@ sub report {
     for my $filter (@$filters) {
         next unless ref($filter) eq 'ARRAY' && @$filter == 2 && defined($filter->[0]) && !ref($filter->[0]) && $filter->[0] eq $field
             && defined($filter->[1]) && !ref($filter->[1]);
-        $values{Cpanel::JSON::XS->new->encode($filter->[1])} = $filter->[1];
+        $values{Cpanel::JSON::XS->new->allow_nonref(1)->encode($filter->[1])} = $filter->[1];
     }
     my @values = map { $values{$_} } sort keys %values;
     my $reason;
     if (!@values) {
         $reason = 'tenant_scope_missing' if defined($context->{tenant_id}) || ($required || $context->{required}) && !defined($context->{prefix});
     } elsif (@values > 1) { $reason = 'tenant_scope_ambiguous'; }
-    elsif (defined($context->{tenant_id}) && Cpanel::JSON::XS->new->encode($values[0]) ne Cpanel::JSON::XS->new->encode($context->{tenant_id})) { $reason = 'tenant_scope_mismatch'; }
+    elsif (defined($context->{tenant_id}) && Cpanel::JSON::XS->new->allow_nonref(1)->encode($values[0]) ne Cpanel::JSON::XS->new->allow_nonref(1)->encode($context->{tenant_id})) { $reason = 'tenant_scope_mismatch'; }
     my $valid = $reason ? 0 : 1;
     return {valid => bless(\$valid, 'JSON::PP::Boolean'),
         ($reason ? (error => {code => $reason, tenant_field => $field}) : ())};

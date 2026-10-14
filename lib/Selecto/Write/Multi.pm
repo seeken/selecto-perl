@@ -86,7 +86,7 @@ sub _merge_context {
     my ($left, $given) = @_;
     my $right = _copy($given);
     _error('invalid_operation', 'Compiled Multi context must be an object') unless ref($right) eq 'HASH';
-    my $json = Cpanel::JSON::XS->new->canonical;
+    my $json = Cpanel::JSON::XS->new->allow_nonref(1)->canonical;
     my @conflicts = sort grep { exists($right->{$_}) && $json->encode($left->{$_}) ne $json->encode($right->{$_}) } keys %$left;
     _error((grep { $_ eq 'tenant_id' || $_ eq 'tenant' } @conflicts) ? 'tenant_mismatch' : 'invalid_operation',
         'Atomic write batch has conflicting trusted context', {code=>'batch_context_conflict', keys=>\@conflicts}) if @conflicts;
