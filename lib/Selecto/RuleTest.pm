@@ -213,7 +213,7 @@ sub compile {
         _fail('invalid_data_rules_contract', 'unique_by requires bounded paths') unless ref($test->{paths}) eq 'ARRAY'
             && @{$test->{paths}} && @{$test->{paths}} <= 1000;
         my %seen;
-        for (@{$test->{paths}}) { my $path = _path($_); my $key = Cpanel::JSON::XS->new->encode($path);
+        for (@{$test->{paths}}) { my $path = _path($_); my $key = Cpanel::JSON::XS->new->allow_nonref(1)->encode($path);
             _fail('invalid_data_rules_contract', 'duplicate unique_by path') if $seen{$key}++ }
     } elsif ($op eq 'all' || $op eq 'any') {
         _keys($test, qw(op rules));

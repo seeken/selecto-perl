@@ -138,7 +138,7 @@ sub compatible {
 sub signature {
     my ($class, $unit) = @_;
     my $normalized = $class->normalize_unit($unit);
-    return Cpanel::JSON::XS->new->canonical(1)->encode($normalized);
+    return Cpanel::JSON::XS->new->allow_nonref(1)->canonical(1)->encode($normalized);
 }
 
 sub numeric_type {

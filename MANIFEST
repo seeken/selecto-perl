@@ -65,6 +65,7 @@ lib/Selecto/SQLite.pm
 lib/Selecto/SQLite/Ownership.pm
 lib/Selecto/SQLite/UpsertCandidate.pm
 lib/Selecto/SQLite/UpsertIndependence.pm
+t/json_encoders_nonref.t
 t/limits_lookup.t
 t/sqlite_upsert_candidate_native.t
 t/sqlite_rules_transaction_handler.t

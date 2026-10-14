@@ -144,7 +144,7 @@ sub _validate {
         }
     }
     my %seen;
-    @errors = grep { !$seen{Cpanel::JSON::XS->new->canonical->encode($_)}++ } @errors;
+    @errors = grep { !$seen{Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($_)}++ } @errors;
     return {valid => @errors ? JSON::PP::false : JSON::PP::true, errors => \@errors};
 }
 

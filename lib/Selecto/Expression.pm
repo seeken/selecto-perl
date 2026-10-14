@@ -22,7 +22,7 @@ sub new {
         # admission must not replace that later type/authority decision.
         my $value = $arguments[0];
         if (ref($value) && !JSON::PP::is_bool($value)) {
-            $value = Cpanel::JSON::XS->new->canonical->utf8->encode($value);
+            $value = Cpanel::JSON::XS->new->allow_nonref(1)->canonical->utf8->encode($value);
         }
         $budget->consume_value($value, label => 'expression literal');
     } elsif ($kind =~ /\A(?:in|array_contains|array_contained|array_overlap)\z/ && ref($arguments[1]) eq 'ARRAY') {

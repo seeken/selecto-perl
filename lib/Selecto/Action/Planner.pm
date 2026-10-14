@@ -62,7 +62,7 @@ sub plan {
         return $class->_plan($input, $intent, %options);
     }, limits => _limits($options{limits}));
     $ACCEPTED_PLANS{$plan} = {
-        contract => Cpanel::JSON::XS->new->canonical->encode(_contract($input)),
+        contract => Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode(_contract($input)),
         digest => Selecto::Action::Grant->plan_digest($plan),
         work => $work,
     };
@@ -74,7 +74,7 @@ sub _accepted_plan {
     my $record = $ACCEPTED_PLANS{$plan};
     return 0 unless $record;
     Selecto::Error->throw('action_plan_mismatch', 'plan differs from accepted planning evidence')
-        unless $record->{contract} eq Cpanel::JSON::XS->new->canonical->encode(_contract($domain))
+        unless $record->{contract} eq Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode(_contract($domain))
             && $record->{digest} eq Selecto::Action::Grant->plan_digest($plan);
     return 1;
 }

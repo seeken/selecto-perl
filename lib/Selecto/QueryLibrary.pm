@@ -722,7 +722,7 @@ sub _different_parameters {
 sub _canonical {
     my ($value) = @_;
     require JSON::PP;
-    return Cpanel::JSON::XS->new->canonical(1)->encode($value);
+    return Cpanel::JSON::XS->new->allow_nonref(1)->canonical(1)->encode($value);
 }
 
 1;

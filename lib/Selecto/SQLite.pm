@@ -722,7 +722,7 @@ sub _compile_array_predicate {
         $type eq 'integer' ? 0 + $_ : $type eq 'boolean' ? ($_ ? JSON::PP::true : JSON::PP::false)
             : $type eq 'decimal' ? 0 + $_ : "$_"
     } @$values;
-    push @$params, Cpanel::JSON::XS->new->canonical(1)->encode(\@typed);
+    push @$params, Cpanel::JSON::XS->new->allow_nonref(1)->canonical(1)->encode(\@typed);
     my $marker = $self->placeholder(scalar @$params);
     return 'selecto_json_contains(' . ($kind eq 'array_contained' ? "$marker, $source" : "$source, $marker") . ')'
         if $kind ne 'array_overlap';
