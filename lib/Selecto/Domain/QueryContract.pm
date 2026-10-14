@@ -29,8 +29,8 @@ sub _contract {
 sub _walk {
     my ($state, $value, $depth) = @_;
     _fail('query contract exceeds its metadata resource limit')
-        if ++$state->{nodes} > $LIMITS->get('max_expression_nodes')
-            || $depth > $LIMITS->get('max_expression_depth');
+        if ++$state->{nodes} > $LIMITS->{max_expression_nodes}
+            || $depth > $LIMITS->{max_expression_depth};
     my $type = reftype($value);
     unless (defined $type) {
         _bytes($state, defined($value) ? $value : '');
@@ -51,7 +51,7 @@ sub _walk {
     local $state->{active}{$address} = 1;
     my $count = $type eq 'HASH' ? scalar(keys %$value) : scalar(@$value);
     _fail('query contract exceeds its metadata node limit')
-        if $state->{nodes} + $count > $LIMITS->get('max_expression_nodes');
+        if $state->{nodes} + $count > $LIMITS->{max_expression_nodes};
     if ($type eq 'HASH') {
         for my $key (keys %$value) {
             _fail('query contract contains tied scalar metadata') if defined(tied($value->{$key}));
@@ -67,9 +67,9 @@ sub _walk {
 }
 sub _bytes {
     my ($state, $value) = @_;
-    $state->{bytes} += bytes::length(utf8::is_utf8($value) ? encode_utf8($value) : $value);
+    $state->{bytes} += length(utf8::is_utf8($value) ? encode_utf8($value) : $value);
     _fail('query contract exceeds its metadata byte limit')
-        if $state->{bytes} > $LIMITS->get('max_state_bytes');
+        if $state->{bytes} > $LIMITS->{max_state_bytes};
 }
 sub _copy {
     my ($value) = @_;
@@ -94,7 +94,7 @@ sub _field_key {
     my ($state, $prefix, $id) = @_;
     my $output = $state->{output};
     _fail('query contract exceeds its generated field limit')
-        if ++$output->{nodes} > $LIMITS->get('max_expression_nodes');
+        if ++$output->{nodes} > $LIMITS->{max_expression_nodes};
     # Check the concatenated UTF-8 size before allocating it. A compact schema
     # with a long name must not multiply that prefix across thousands of fields.
     _bytes($output, $prefix);
@@ -104,7 +104,7 @@ sub _field_key {
 sub _work {
     my ($state, $count) = @_;
     _fail('query contract exceeds its projection work limit')
-        if ($state->{work} += $count // 1) > $LIMITS->get('max_expression_nodes');
+        if ($state->{work} += $count // 1) > $LIMITS->{max_expression_nodes};
 }
 sub _object {
     my ($state, $value, $path) = @_;

@@ -40,10 +40,10 @@ sub new {
 }
 
 sub get {
-    my ($self, $name) = @_;
-    Selecto::Error->throw('invalid_limits', 'unknown resource limit')
-        unless exists $DEFAULTS{$name};
-    return $self->{$name};
+    # Every limit object holds every known name (new() and tightened() copy all of
+    # %DEFAULTS), so one hash lookup both validates the name and returns the value.
+    return $_[0]{$_[1]} if exists $_[0]{$_[1]};
+    Selecto::Error->throw('invalid_limits', 'unknown resource limit');
 }
 
 sub tightened {
@@ -81,7 +81,7 @@ sub check_bytes {
         ($label // $name) . ' must be a scalar') if ref($value);
     # Perl's byte length counts the UTF-8 representation of decoded strings
     # without allocating an encoded copy; raw byte strings retain their size.
-    return $self->check_count($name, defined($value) ? bytes::length($value) : 0,
+    return $self->check_count($name, defined($value) ? do { use bytes; length($value) } : 0,
         $code, $label);
 }
 

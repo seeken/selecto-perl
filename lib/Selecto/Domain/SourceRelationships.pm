@@ -38,16 +38,16 @@ sub _type {
 }
 sub _bytes {
     my ($state, $value) = @_;
-    $state->{bytes} += bytes::length(utf8::is_utf8($value) ? encode_utf8($value) : $value);
+    $state->{bytes} += length(utf8::is_utf8($value) ? encode_utf8($value) : $value);
     _fail('source relationships exceed the generated metadata byte limit')
-        if $state->{bytes} > $LIMITS->get('max_state_bytes');
+        if $state->{bytes} > $LIMITS->{max_state_bytes};
 }
 sub _charge {
     my ($state, $value, $depth) = @_;
     $depth //= 0;
     _fail('source relationships exceed the generated metadata node or depth limit')
-        if ++$state->{nodes} > $LIMITS->get('max_expression_nodes')
-            || $depth > $LIMITS->get('max_expression_depth');
+        if ++$state->{nodes} > $LIMITS->{max_expression_nodes}
+            || $depth > $LIMITS->{max_expression_depth};
     if (ref($value) eq 'HASH') {
         for my $key (keys %$value) { _bytes($state, $key); _charge($state, $value->{$key}, $depth + 1); }
     } elsif (ref($value) eq 'ARRAY') {
@@ -59,7 +59,7 @@ sub _charge {
 sub _work {
     my ($state) = @_;
     _fail('source relationships exceed the field resolution work limit')
-        if ++$state->{work} > $LIMITS->get('max_expression_nodes');
+        if ++$state->{work} > $LIMITS->{max_expression_nodes};
 }
 sub _error {
     my ($state, $code, $path, %attrs) = @_;

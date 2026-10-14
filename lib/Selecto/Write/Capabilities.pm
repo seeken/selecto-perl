@@ -36,7 +36,7 @@ sub _admit {
 sub _walk {
     my ($state, $value, $depth) = @_;
     _fail($state->{code}, 'write preflight input exceeds its resource limit')
-        if ++$state->{nodes} > $state->{nodes_limit} || $depth > $LIMITS->get('max_expression_depth');
+        if ++$state->{nodes} > $state->{nodes_limit} || $depth > $LIMITS->{max_expression_depth};
     my $type = reftype($value);
     unless (defined $type) { _bytes($state, defined($value) ? $value : ''); return }
     my $class = blessed($value) // '';
@@ -71,7 +71,7 @@ sub _walk {
 }
 sub _bytes {
     my ($state, $value) = @_;
-    $state->{bytes} += bytes::length($value);
+    $state->{bytes} += do { use bytes; length($value) };
     _fail($state->{code}, 'write preflight input exceeds its byte limit') if $state->{bytes} > $state->{bytes_limit};
 }
 sub _boolean {

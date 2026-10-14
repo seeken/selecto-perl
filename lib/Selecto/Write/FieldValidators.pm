@@ -107,7 +107,7 @@ sub _walk {
 }
 sub _bytes {
     my ($state, $value) = @_;
-    my $size = bytes::length($value);
+    my $size = do { use bytes; length($value) };
     _fail('evaluation_limit', 'field validator metadata exceeds its byte limit')
         if ($state->{bytes} += $size) > $BUDGET->{limits}->get('max_state_bytes');
     _spend($size);

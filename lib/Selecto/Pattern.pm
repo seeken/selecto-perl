@@ -13,8 +13,8 @@ sub compile {
     my ($class, $pattern, %options) = @_;
     my $limits = $options{limits} // Selecto::Limits->new;
     _invalid('pattern is outside ascii_v1')
-        unless defined($pattern) && !ref($pattern) && bytes::length($pattern) >= 1
-            && bytes::length($pattern) <= 256 && $pattern =~ /\A[\x00-\x7f]*\z/;
+        unless defined($pattern) && !ref($pattern) && do { use bytes; length($pattern) } >= 1
+            && do { use bytes; length($pattern) } <= 256 && $pattern =~ /\A[\x00-\x7f]*\z/;
     my $self = bless {pattern => $pattern, position => 0, limits => $limits, states => []}, $class;
     my $ast = $self->_alternation(0);
     _invalid('pattern is malformed') unless $self->{position} == length($pattern);
@@ -177,7 +177,7 @@ sub _matches_char {
 }
 sub matches {
     my ($self, $text, %options) = @_;
-    return (undef, 'evaluation_limit') if !defined($text) || ref($text) || bytes::length($text) > 4096;
+    return (undef, 'evaluation_limit') if !defined($text) || ref($text) || do { use bytes; length($text) } > 4096;
     my $limit = ($options{limits} // $self->{limits})->get('max_rule_work');
     my $local_work = 0;
     my $work = $options{work_ref} // \$local_work;

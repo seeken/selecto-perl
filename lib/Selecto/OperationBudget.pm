@@ -108,7 +108,7 @@ sub _consume_flat_array {
     $self->_check('max_value_bytes', $bytes, $label) if $bytes > $maximum;
     for my $value (@$values) {
         Selecto::Error->throw($self->{code}, 'array parameter elements must be scalars') if ref($value);
-        $bytes += defined($value) ? 2 * bytes::length($value) + 2 : 4;
+        $bytes += defined($value) ? 2 * do { use bytes; length($value) } + 2 : 4;
         $self->_check('max_value_bytes', $bytes, $label) if $bytes > $maximum;
     }
     $self->consume_count('max_parameter_bytes', $bytes, label => 'operation parameter bytes');
@@ -178,7 +178,7 @@ sub check_tree {
                 push @stack, $node->[$_], $depth + 1, 0 for reverse 0 .. $#$node;
             } else {
                 for my $key (keys %$node) {
-                    $bytes += bytes::length($key);
+                    $bytes += do { use bytes; length($key) };
                     $self->_check($byte_limit, $bytes_base + $bytes, "$label bytes")
                         if $bytes_base + $bytes > ($bytes_max //= $limits->get($byte_limit));
                     push @stack, $node->{$key}, $depth + 1, 0;

@@ -282,7 +282,7 @@ sub _rows {
         while ($sth->{NUM_OF_FIELDS} && (my $row = DBI::st::fetchrow_arrayref($sth))) {
             _pending('native_row_limit') if @rows >= $maximum;
             for my $value (@$row) {
-                $bytes += defined($value) ? bytes::length($value) : 0;
+                $bytes += defined($value) ? do { use bytes; length($value) } : 0;
                 _pending('native_byte_limit') if $bytes > 1_048_576;
             }
             push @rows, [@$row];
@@ -298,7 +298,7 @@ sub _rows {
 sub _q { return $_[0]->quote_identifier($_[1]) }
 sub _canonical_field {
     my ($field, $schema) = @_;
-    _pending('invalid_field') unless defined($field) && !ref($field) && bytes::length($field) <= 1024;
+    _pending('invalid_field') unless defined($field) && !ref($field) && do { use bytes; length($field) } <= 1024;
     my @matches = grep { _same($_, $field) } keys %$schema;
     _pending('invalid_field') unless @matches == 1;
     return $matches[0];
@@ -431,7 +431,7 @@ sub _submitted {
 sub _default {
     my ($adapter, $sql) = @_;
     _pending('unconsumed_default_unavailable') unless defined($sql) && !ref($sql)
-        && bytes::length($sql) <= 4096 && index($sql, "\0") < 0;
+        && do { use bytes; length($sql) } <= 4096 && index($sql, "\0") < 0;
     $sql =~ s/\A\s+|\s+\z//g;
     for my $depth (0 .. 16) {
         last unless substr($sql, 0, 1) eq '(';

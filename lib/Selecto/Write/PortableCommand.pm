@@ -52,8 +52,8 @@ sub _receipt_digest {
     my $part = sub {
         my ($tag, $text) = @_;
         my $wire = utf8::is_utf8($text) ? encode_utf8($text) : $text;
-        _input_mismatch() if ($bytes += bytes::length($wire)) > $RECEIPT_LIMITS->get('max_response_bytes');
-        $hash->add($tag, pack('N', bytes::length($wire)), $wire);
+        _input_mismatch() if ($bytes += do { use bytes; length($wire) }) > $RECEIPT_LIMITS->get('max_response_bytes');
+        $hash->add($tag, pack('N', do { use bytes; length($wire) }), $wire);
     };
     my $walk;
     $walk = sub {

@@ -64,7 +64,7 @@ sub inspect_csv ($self, $content, %options) {
     Selecto::Error->throw('invalid_import_file', 'CSV content must be a scalar')
         if !defined($content) || ref($content);
     Selecto::Error->throw('import_file_limit_exceeded', 'Import file exceeds its byte limit', {maximum_bytes => $self->max_file_bytes})
-        if bytes::length($content) > $self->max_file_bytes;
+        if do { use bytes; length($content) } > $self->max_file_bytes;
     my $bytes = eval { utf8::is_utf8($content) ? encode('UTF-8', "$content", FB_CROAK) : "$content" };
     Selecto::Error->throw('invalid_import_file', 'CSV content must be UTF-8')
         if $@ || !eval { decode('UTF-8', "$bytes", FB_CROAK); 1 };

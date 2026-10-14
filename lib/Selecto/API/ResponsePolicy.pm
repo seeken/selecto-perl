@@ -289,7 +289,7 @@ sub _scalar_json_bytes {
         # JSON's ordinary validator still rejects non-integral numeric values.
         return length(Selecto::CanonicalJSON->encode($value));
     }
-    my $bytes = 2 + bytes::length($value);
+    my $bytes = 2 + do { use bytes; length($value) };
     # Raw eight-bit Perl strings encode their high bytes as Unicode code points.
     $bytes += ($value =~ tr/\x80-\xff/\x80-\xff/) unless utf8::is_utf8($value);
     $limits->check_count('max_response_bytes', $used + $bytes,

@@ -90,7 +90,7 @@ sub _string {
 }
 sub _work {
     _limit('capability validation exceeds its work limit')
-        if ++$_[0]{work} > $LIMITS->get('max_expression_nodes');
+        if ++$_[0]{work} > $LIMITS->{max_expression_nodes};
 }
 sub _error {
     my ($state, $code, $path) = @_;
@@ -98,12 +98,12 @@ sub _error {
     # path before allocating another diagnostic rather than limiting input only.
     $state->{nodes} += 4 + @$path;
     _limit('capability validation exceeds its diagnostic node limit')
-        if $state->{nodes} > $LIMITS->get('max_expression_nodes');
+        if $state->{nodes} > $LIMITS->{max_expression_nodes};
     $state->{bytes} += length('code') + length('path');
     for my $value ($code, @$path) {
-        $state->{bytes} += bytes::length(utf8::is_utf8($value) ? encode_utf8($value) : $value);
+        $state->{bytes} += length(utf8::is_utf8($value) ? encode_utf8($value) : $value);
         _limit('capability validation exceeds its diagnostic byte limit')
-            if $state->{bytes} > $LIMITS->get('max_state_bytes');
+            if $state->{bytes} > $LIMITS->{max_state_bytes};
     }
     push @{$state->{errors}}, {code => $code, path => [@$path]};
 }

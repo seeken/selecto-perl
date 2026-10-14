@@ -41,7 +41,7 @@ sub _copy_plain {
         unless (defined $type) {
             my $boolean = defined($node) && JSON::PP::is_bool($node);
             my $flags = defined($node) ? B::svref_2object(\$node)->FLAGS : 0;
-            $budget->consume_count('max_state_bytes', defined($node) ? bytes::length($node) : 0,
+            $budget->consume_count('max_state_bytes', defined($node) ? do { use bytes; length($node) } : 0,
                 label => "$label bytes");
             if (!defined $node) { $$target = undef }
             elsif ($boolean) { my $bit = $node ? 1 : 0; $$target = bless \$bit, 'JSON::PP::Boolean' }
@@ -59,7 +59,7 @@ sub _copy_plain {
         if ($BOOLEAN{$class} && $type eq 'SCALAR') {
             _fail($code, "$label contains an invalid Boolean") if defined(tied($$node))
                 || !defined($$node) || defined(reftype($$node))
-                || bytes::length($$node) != 1 || "$$node" !~ /\A[01]\z/;
+                || do { use bytes; length($$node) } != 1 || "$$node" !~ /\A[01]\z/;
             my $bit = $$node ? 1 : 0;
             $budget->consume_count('max_state_bytes', 1, label => "$label bytes");
             $$target = bless \$bit, 'JSON::PP::Boolean';
@@ -78,7 +78,7 @@ sub _copy_plain {
         if ($type eq 'HASH') {
             my $result = {}; $$target = $result;
             for my $key (keys %$node) {
-                $budget->consume_count('max_state_bytes', bytes::length($key), label => "$label bytes");
+                $budget->consume_count('max_state_bytes', do { use bytes; length($key) }, label => "$label bytes");
                 _fail($code, "$label contains tied metadata") if defined(tied($node->{$key}));
                 push @stack, [\$node->{$key}, \$result->{$key}, $depth + 1];
             }
@@ -379,7 +379,7 @@ sub _decimal_limit {
     my ($value, $limits) = @_;
     return 0 if !defined($value) || ref($value);
     my $maximum = $limits->get('max_rule_numeric_digits');
-    return 1 if bytes::length($value) > $maximum + 2;
+    return 1 if do { use bytes; length($value) } > $maximum + 2;
     my $digits = $value =~ tr/0-9/0-9/;
     return $digits > $maximum;
 }
