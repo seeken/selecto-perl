@@ -17,6 +17,7 @@ lib/Selecto/Analytics/TransformRegistry.pm
 lib/Selecto/Analytics/UnitRegistry.pm
 lib/Selecto/API.pm
 lib/Selecto/API/EngineHandler.pm
+t/api_error_status_unsupported_scope.t
 t/api_field_roles_adversarial.t
 lib/Selecto/API/ResultFormatter.pm
 lib/Selecto/CanonicalJSON.pm

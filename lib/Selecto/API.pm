@@ -328,11 +328,15 @@ sub _download_filename ($name, $extension) {
 
 # The HTTP status for a handler error that names none: a query naming a hidden
 # (internal or redacted) field and a request without a trusted tenant scope
-# are forbidden, as in the other runtimes; every other refusal is 422.
+# are forbidden, as in the other runtimes; a tenant-scoped MySQL/MariaDB upsert
+# (unsupported_scope_predicate) is 501; every other refusal is 422.
 my %FORBIDDEN_CODES = map { $_ => 1 } qw(hidden_field missing_tenant_scope);
 
+# A tenant-scoped upsert on MySQL or MariaDB is refused (ON DUPLICATE KEY UPDATE matches any
+# unique key): the backend cannot do it, so it is 501 in every runtime, not a 422 request error.
 sub error_status ($code) {
     return 404 if defined($code) && !ref($code) && $code eq 'resource_not_found';
+    return 501 if defined($code) && !ref($code) && $code eq 'unsupported_scope_predicate';
     return defined($code) && !ref($code) && $FORBIDDEN_CODES{$code} ? 403 : 422;
 }
 
@@ -668,7 +672,8 @@ The body is UTF-8 encoded bytes; C<content-length> is exact.
 
 A handler returns C<['ok', $data]> or C<['error', \%error]>, where
 C<%error> may contain C<status> (default L</error_status> of the code: 403
-for C<hidden_field> and C<missing_tenant_scope>, otherwise 422), C<code>,
+for C<hidden_field> and C<missing_tenant_scope>, 404 for C<resource_not_found>, 501 for
+C<unsupported_scope_predicate> (a tenant-scoped MySQL/MariaDB upsert), otherwise 422), C<code>,
 C<message> and C<details>.
 If a handler dies, the response is a 500 C<handler_failed> without the
 exception text, so convert expected L<Selecto::Error>s into
