@@ -97,6 +97,24 @@ sub assert_domain_identity {
     return $self;
 }
 
+# The domain's write contract and this engine's limits are fixed once the engine exists,
+# and admitting the contract (a full validating copy and walk of every validator) took
+# most of a governed write. A successful admission is remembered for the exact domain
+# and limits objects it covered; a failure is never remembered, so an invalid contract is
+# refused on every command. With domain identity verification on, assert_domain_identity
+# has already refused a changed domain before this runs.
+sub _admit_write_contract {
+    my ($self) = @_;
+    # The memo holds the admitted objects themselves, so a freed object's address can
+    # never be mistaken for a new one.
+    my $memo = $self->{_admitted_write_contract};
+    return $self if $memo && refaddr($memo->[0]) == refaddr($self->{domain})
+        && refaddr($memo->[1]) == refaddr($self->{limits});
+    Selecto::Write::FieldValidators->admit_domain({writes=>$self->{domain}->writes},limits=>$self->{limits});
+    $self->{_admitted_write_contract} = [$self->{domain}, $self->{limits}];
+    return $self;
+}
+
 sub _action_command_digest {
     my ($self, $command) = @_;
     my $metadata = $command->{metadata};
@@ -1038,7 +1056,7 @@ sub governed_write {
         label => 'write', allowed_classes => [qw(Selecto::Expression Selecto::Write::Expression Selecto::QueryEnforcement)]);
     # Command admission owns write-shape errors. Inspect the sealed trusted
     # policy only after that boundary, before normalization or any provider.
-    Selecto::Write::FieldValidators->admit_domain({writes=>$self->{domain}->writes},limits=>$self->{limits});
+    $self->_admit_write_contract;
     Selecto::Error->throw(
         'write_relation_mismatch',
         'write relation must be the domain table',
