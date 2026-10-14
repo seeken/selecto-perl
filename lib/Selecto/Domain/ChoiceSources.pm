@@ -93,7 +93,7 @@ sub _bindings {
         for my$id(sort keys%$columns){
             my$column=$columns->{$id};next unless ref($column)eq'HASH';
             $state->{budget}->consume_count('max_expression_nodes',1,label=>'choice binding work');
-            $state->{budget}->consume_count('max_state_bytes',bytes::length($prefix)+bytes::length($id),label=>'generated binding identifiers');
+            $state->{budget}->consume_count('max_state_bytes',do { use bytes; length($prefix) }+do { use bytes; length($id) },label=>'generated binding identifiers');
             my$field=$prefix.$id;my$p=[@$path,$id];
             if(defined$column->{choice_source}){
                 if(!_string($column->{choice_source})){_error($state,'invalid_field_choice_source',[@$p,'choice_source'],field=>$field)}

@@ -76,14 +76,17 @@ sub _refuse {
 sub _part {
     my ($state, $tag, $value) = @_;
     my $bytes = utf8::is_utf8($value) ? encode_utf8($value) : $value;
-    $state->{bytes} += bytes::length($bytes) unless $state->{plain} && $tag =~ /\A(?:C|H|A|E)\z/;
-    _refuse($state) if $state->{bytes} > $state->{limits}->get($state->{byte_limit});
-    $state->{hash}->add($tag, pack('N', bytes::length($bytes)), $bytes);
+    # $bytes is an octet string here (encoded above, or never character-flagged), so
+    # length() is its byte length; the limit is read once per digest, not per part.
+    my $size = length($bytes);
+    $state->{bytes} += $size unless $state->{plain} && $tag =~ /\A(?:C|H|A|E)\z/;
+    _refuse($state) if $state->{bytes} > ($state->{byte_max} //= $state->{limits}->get($state->{byte_limit}));
+    $state->{hash}->add($tag, pack('N', $size), $bytes);
 }
 sub _walk {
     my ($state, $value, $depth, $compiled) = @_;
-    _refuse($state) if ++$state->{nodes} > $state->{limits}->get($state->{node_limit})
-        || $depth > $state->{limits}->get('max_expression_depth');
+    _refuse($state) if ++$state->{nodes} > ($state->{node_max} //= $state->{limits}->get($state->{node_limit}))
+        || $depth > ($state->{depth_max} //= $state->{limits}->get('max_expression_depth'));
     my $type = reftype($value);
     unless (defined $type) {
         return _part($state, 'U', '') unless defined $value;
@@ -112,7 +115,7 @@ sub _walk {
     _part($state, 'C', $class);
     my $count = $type eq 'HASH' ? scalar(keys %$value) : scalar(@$value);
     # Refuse breadth before sorting keys or traversing child occurrences.
-    _refuse($state) if $state->{nodes} + $count > $state->{limits}->get($state->{node_limit});
+    _refuse($state) if $state->{nodes} + $count > ($state->{node_max} //= $state->{limits}->get($state->{node_limit}));
     _part($state, $type eq 'HASH' ? 'H' : 'A', "$count");
     if ($type eq 'HASH') {
         for my $key (sort keys %$value) {

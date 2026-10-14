@@ -109,7 +109,7 @@ sub _prove {
         $index_tables[0][1]);
     _fail('unsupported_feature', 'SQLite external FTS5 declaration is missing or ambiguous')
         unless @$ddl_rows == 1 && defined($ddl_rows->[0][0])
-            && bytes::length($ddl_rows->[0][0]) <= 16384;
+            && do { use bytes; length($ddl_rows->[0][0]) } <= 16384;
     my ($indexed, $options) = _declaration($ddl_rows->[0][0]);
     _fail('unsupported_feature', 'SQLite external FTS5 options do not match the governed content')
         unless _identity($options->{content}, $root) && _identity($options->{content_rowid}, $key)
@@ -141,7 +141,7 @@ sub prove_root {
             q{SELECT sql FROM main.sqlite_schema WHERE CAST(name AS BLOB) = CAST(? AS BLOB) AND CAST(type AS BLOB) = CAST('table' AS BLOB) LIMIT 2},
             $matches[0][1]);
         _fail('unsupported_feature', 'SQLite root FTS5 declaration is unavailable')
-            unless @$ddl == 1 && defined($ddl->[0][0]) && bytes::length($ddl->[0][0]) <= 16384;
+            unless @$ddl == 1 && defined($ddl->[0][0]) && do { use bytes; length($ddl->[0][0]) } <= 16384;
         _fts5_arguments($ddl->[0][0]);
         my $columns = _rows($dbh, 'PRAGMA main.table_xinfo(' . $adapter->quote_identifier($root) . ')');
         for my $field (@$fields) {

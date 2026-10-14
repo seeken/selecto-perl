@@ -97,7 +97,7 @@ sub _admit_provenance_tree {
         $fail->() if $depth > 64 || $nodes > 10_000 || $bytes > 131_072;
         my $type = Scalar::Util::reftype($node);
         if (!defined $type) {
-            $bytes += defined($node) ? bytes::length($node) : 0;
+            $bytes += defined($node) ? do { use bytes; length($node) } : 0;
             $fail->() if $bytes > 131_072;
             next;
         }
@@ -126,7 +126,7 @@ sub _admit_provenance_tree {
         $fail->() if $nodes > 10_000;
         if ($type eq 'HASH') {
             for my $key (keys %$node) {
-                $bytes += bytes::length($key);
+                $bytes += do { use bytes; length($key) };
                 $fail->() if $bytes > 131_072 || defined(tied($node->{$key}));
                 push @stack, [$node->{$key}, $depth + 1, undef];
             }

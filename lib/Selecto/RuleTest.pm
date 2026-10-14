@@ -64,13 +64,13 @@ sub kind {
 sub text {
     my ($value, $limits, $work, $code) = @_;
     check_text($value, $code);
-    spend($limits, $work, bytes::length($value) + 1);
+    spend($limits, $work, do { use bytes; length($value) } + 1);
     return $value;
 }
 sub check_text {
     my ($value, $code) = @_;
     _fail($code // 'invalid_type', 'rule requires text') unless kind($value) eq 'text';
-    _fail('evaluation_limit', 'rule text exceeds its byte limit') if bytes::length($value) > 4096;
+    _fail('evaluation_limit', 'rule text exceeds its byte limit') if do { use bytes; length($value) } > 4096;
     _fail('invalid_data_rules_contract', 'invalid Unicode scalar text') if $value =~ /[\x{D800}-\x{DFFF}]/;
     return $value;
 }
@@ -85,13 +85,13 @@ sub number {
     my $maximum = $limits->get('max_rule_numeric_digits');
     if (!$literal && $kind eq 'number' && "$value" =~ /\A(-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?)[eE]([+-]?[0-9]+)\z/) {
         _fail('evaluation_limit', 'native number exponent exceeds its digit limit')
-            if bytes::length($value) > $maximum + 2 || length($2) > 5 || abs($2) > $maximum;
+            if do { use bytes; length($value) } > $maximum + 2 || length($2) > 5 || abs($2) > $maximum;
         $value = Math::BigFloat->new("$value")->bstr;
     }
     _fail($literal ? 'invalid_data_rules_contract' : 'evaluation_limit', 'rule number exceeds its digit limit')
-        if bytes::length($value) > $maximum + 2 || ($value =~ tr/0-9/0-9/) > $maximum;
+        if do { use bytes; length($value) } > $maximum + 2 || ($value =~ tr/0-9/0-9/) > $maximum;
     return undef unless "$value" =~ /\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/;
-    spend($limits, $work, bytes::length($value) + 1);
+    spend($limits, $work, do { use bytes; length($value) } + 1);
     my $number = Math::BigRat->new("$value");
     if ($literal && !($flags & B::SVp_POK())) {
         _fail('invalid_data_rules_contract', 'native numeric operands must be delivered integers')
@@ -108,7 +108,7 @@ sub check_value {
     if ($kind eq 'text') { text($value, $limits, $work) }
     elsif ($kind eq 'number') {
         _fail('evaluation_limit', 'rule number exceeds its digit limit')
-            if bytes::length($value) > $limits->get('max_rule_numeric_digits') + 2;
+            if do { use bytes; length($value) } > $limits->get('max_rule_numeric_digits') + 2;
     } elsif ($kind eq 'collection' || $kind eq 'object') {
         my $size = $kind eq 'collection' ? @$value : keys %$value;
         _fail('evaluation_limit', 'rule collection exceeds its bound') if $size > 1000;
@@ -234,7 +234,7 @@ sub preflight {
     my $op = $prepared->{op};
     if ($op =~ /\Anumber\./ && $present && defined($value) && !ref($value)) {
         _fail('evaluation_limit', 'rule number exceeds its digit limit')
-            if bytes::length($value) > $limits->get('max_rule_numeric_digits') + 2
+            if do { use bytes; length($value) } > $limits->get('max_rule_numeric_digits') + 2
                 || ($value =~ tr/0-9/0-9/) > $limits->get('max_rule_numeric_digits');
     }
     if ($op eq 'collection.sum' && ref($value) eq 'ARRAY') {
@@ -259,7 +259,7 @@ sub equal {
     return 1 if $a eq 'null';
     return ($left ? 1 : 0) == ($right ? 1 : 0) if $a eq 'boolean';
     if ($a eq 'number') { my ($x, $y) = map { number($_, $limits, $work, 0) } ($left, $right); return defined($x) && defined($y) && $x->bcmp($y) == 0 }
-    if ($a eq 'text') { spend($limits, $work, bytes::length($left) + bytes::length($right)); return $left eq $right }
+    if ($a eq 'text') { spend($limits, $work, do { use bytes; length($left) } + do { use bytes; length($right) }); return $left eq $right }
     if ($a eq 'collection') { return 0 unless @$left == @$right; my $same = 1;
         for (0 .. $#$left) { $same &= equal($left->[$_], $right->[$_], $limits, $work) } return $same }
     if ($a eq 'object') { return 0 unless keys(%$left) == keys(%$right); my $same = 1;
@@ -409,7 +409,7 @@ sub _related_number {
             if (pack('F', 0 + $text) eq pack('F', $value)) { $decimal = $text; last }
         }
         return undef unless defined $decimal;
-        spend($limits, $work, bytes::length($decimal) + 1);
+        spend($limits, $work, do { use bytes; length($decimal) } + 1);
         _fail('evaluation_limit', 'native decimal exponent exceeds its digit limit')
             if $decimal =~ /[eE]([+-]?[0-9]+)\z/ && abs($1) > $limits->get('max_rule_numeric_digits');
         $decimal = Math::BigFloat->new($decimal)->bstr if $decimal =~ /[eE]/;

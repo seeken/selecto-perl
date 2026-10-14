@@ -60,7 +60,7 @@ sub _comparison {
 sub _filter {
     my ($filter, $fields, $depth) = @_;
     _fail('query_rule_unsupported_predicate', 'query guards require bounded filter tuples')
-        unless ref($filter) eq 'ARRAY' && @$filter && $depth <= $LIMITS->get('max_expression_depth');
+        unless ref($filter) eq 'ARRAY' && @$filter && $depth <= $LIMITS->{max_expression_depth};
     my $first = _operator($filter->[0]);
     return _field_filter($filter->[0], $filter->[1], $fields)
         if @$filter == 2 && !defined(reftype($filter->[0])) && defined($filter->[0]) && $fields->{$filter->[0]};
@@ -112,11 +112,11 @@ sub _filters {
 sub _admit_native {
     my ($value, $state, $depth) = @_;
     _fail('invalid_query_enforcement', 'captured query contains unsupported or excessive native data')
-        if ++$state->{nodes} > $LIMITS->get('max_expression_nodes') || $depth > $LIMITS->get('max_expression_depth');
+        if ++$state->{nodes} > $LIMITS->{max_expression_nodes} || $depth > $LIMITS->{max_expression_depth};
     my $type = reftype($value);
     unless (defined $type) {
-        $state->{bytes} += defined($value) ? bytes::length(utf8::is_utf8($value) ? encode_utf8($value) : $value) : 0;
-        _fail('invalid_query_enforcement', 'captured query exceeds its metadata byte limit') if $state->{bytes} > $LIMITS->get('max_state_bytes');
+        $state->{bytes} += defined($value) ? length(utf8::is_utf8($value) ? encode_utf8($value) : $value) : 0;
+        _fail('invalid_query_enforcement', 'captured query exceeds its metadata byte limit') if $state->{bytes} > $LIMITS->{max_state_bytes};
         return;
     }
     my $class = blessed($value);
@@ -133,7 +133,7 @@ sub _admit_native {
     _fail('invalid_query_enforcement', 'captured query contains a cycle') if $state->{active}{$id};
     local $state->{active}{$id} = 1;
     my $count = $type eq 'HASH' ? scalar(keys %$value) : scalar(@$value);
-    _fail('invalid_query_enforcement', 'captured query exceeds its metadata node limit') if $state->{nodes} + $count > $LIMITS->get('max_expression_nodes');
+    _fail('invalid_query_enforcement', 'captured query exceeds its metadata node limit') if $state->{nodes} + $count > $LIMITS->{max_expression_nodes};
     if ($type eq 'HASH') {
         for my $key (keys %$value) {
             _fail('invalid_query_enforcement', 'captured query contains tied scalar metadata') if defined(tied($value->{$key}));

@@ -234,7 +234,7 @@ sub _relationships {
     my ($state,$contract,$nested,$parent_type,$parent_id,$parent_key,$parent_path,$depth)=@_;
     _fail('invalid_graph','nested write exceeds maximum relationship depth',$parent_path) if $depth>32;
     for my $relationship (sort keys %$nested) {
-        my $path_bytes=bytes::length($relationship);$path_bytes+=bytes::length($_) for @$parent_path;
+        my $path_bytes=do { use bytes; length($relationship) };$path_bytes+=do { use bytes; length($_) } for @$parent_path;
         $state->{generated}->consume_count('max_state_bytes',$path_bytes,label=>'generated nested path bytes');
         my $path=[@$parent_path,$relationship];my $spec=$contract->{relationships}{$relationship};
         _fail('invalid_graph','nested relationship has invalid cardinality',$path)
@@ -262,7 +262,7 @@ sub _relationships {
             my $entry=$entries->[$index];my $attrs=$entry->{attrs};
             _fail('invalid_graph','caller cannot supply generated relationship foreign key',$path,{field=>$child_key}) if exists $attrs->{$child_key};
             my $token=_token($entry,$fields);my $segment=!defined($token)?($entry->{stable_paths}?"index=$index":$index):$token->[0] eq 'client'?"client_id=$token->[1]":join(',',map {$_->[0].'='.$_->[1]} @{$token->[1]});
-            my $row_bytes=$path_bytes+bytes::length($segment);
+            my $row_bytes=$path_bytes+do { use bytes; length($segment) };
             $state->{generated}->consume_count('max_state_bytes',$row_bytes*3,label=>'generated nested row and metadata bytes');
             my $row_path=$spec->{cardinality} eq 'one'?$path:[@$path,$segment];
             my ($flat,$child_nested)=_split($attrs,$child_contract,$row_path);
@@ -290,7 +290,7 @@ sub _relationships {
                 ownership=>$spec->{ownership},mutation_mode=>$mode,identity_mapping=>_true($spec->{output}{identity_mapping} // defined($spec->{client_identity}))?1:0};
             $command=$command->with_metadata($metadata);
             # Native IDs encode structural components rather than interpolated path text.
-            $state->{generated}->consume_count('max_state_bytes',2*bytes::length($parent_id)+2*bytes::length($relationship)+32,label=>'generated native graph identities');
+            $state->{generated}->consume_count('max_state_bytes',2*do { use bytes; length($parent_id) }+2*do { use bytes; length($relationship) }+32,label=>'generated native graph identities');
             my $id='nested:'._json([$parent_id,$relationship,$index]);
             $state->{input_sources}{$id}=$input_source;
             my $node={id=>$id,command=>$command,bindings=>[{field=>$child_key,from=>$parent_id,key=>$parent_key}]};
