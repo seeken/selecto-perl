@@ -35,6 +35,7 @@ lib/Selecto/Document/ShapeRelease.pm
 lib/Selecto/Domain.pm
 lib/Selecto/Domain/Projection.pm
 t/domain_projection.t
+t/engine_write_admission_memo.t
 t/fixtures/domain_projection.json
 lib/Selecto/Domain/DSL.pm
 lib/Selecto/Domain/Overlay.pm
