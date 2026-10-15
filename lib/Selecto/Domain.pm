@@ -8,7 +8,8 @@ use Encode qw(encode_utf8);
 use JSON::PP ();
 use Cpanel::JSON::XS ();
 use Selecto::CanonicalJSON ();
-use Scalar::Util qw(blessed);
+use Hash::Util::FieldHash qw(fieldhash);
+use Scalar::Util qw(blessed refaddr);
 use Storable qw(dclone);
 use Selecto::Error ();
 use Selecto::ConfiguredDomain ();
@@ -1261,6 +1262,11 @@ sub resolve {
     };
 }
 
+# Canonical nested association maps, by the canonical schema graph they were
+# built from. Kept off the domain so its digest is unchanged; derived copies
+# share the graph, and so the cache, which is freed with it.
+fieldhash my %CANONICAL_ASSOCIATIONS;
+
 sub resolve_association {
     my ($self, $path) = @_;
     my @segments = split /\./, defined($path) ? "$path" : '', -1;
@@ -1280,7 +1286,12 @@ sub resolve_association {
         if (defined($queryable) && ref($self->{canonical_schemas}) eq 'HASH') {
             my $relation = $self->{canonical_schemas}{$queryable};
             Selecto::Error->throw('invalid_domain', "missing schema $queryable") unless $relation;
-            $associations = _canonical_associations(
+            # The map depends only on the schema graph, joins, tenant family
+            # and path, so it is built once rather than on every lookup.
+            my $cache_key = join "\0",
+                map({ defined($_) ? refaddr($_) : '' } @{$self}{qw(canonical_joins _tenant_family)}),
+                $queryable, $prefix;
+            $associations = $CANONICAL_ASSOCIATIONS{$self->{canonical_schemas}}{$cache_key} //= _canonical_associations(
                 $relation,
                 $self->{canonical_schemas},
                 $self->{canonical_joins} // {},
