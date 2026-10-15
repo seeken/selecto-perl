@@ -4,13 +4,18 @@ Unreleased
     - MySQL and MariaDB upserts insert first inside a savepoint, so two
       sessions on one new key no longer deadlock on a shared gap lock; a
       duplicate on the declared target locks and updates its row, a duplicate
-      on any other unique key is database_unique_violation. Server errors are
+      on any other unique key is database_unique_violation. An existing row
+      is found by a plain read first and locked directly, so racing updates
+      of one row do not deadlock. Server errors are
       typed like PostgreSQL's (database_unique_violation,
       database_foreign_key_violation, database_not_null_violation,
       database_check_violation); a deadlock (1213) or lock-wait timeout (1205)
       is the retryable database_deadlock_detected / database_lock_timeout,
-      answered with HTTP 503 by API::error_status. Writes refuse a
-      non-InnoDB table. MariaDB LAG/LEAD with a default argument is refused.
+      answered with HTTP 503 by API::error_status. Upsert
+      admission, guarded-insert admission and RETURNING key locking refuse a
+      table that is not InnoDB (views and TEMPORARY tables, invisible in
+      information_schema.TABLES, too); plain inserts and bulk updates run
+      regardless. MariaDB LAG/LEAD with a default argument is refused.
       Related-collection keyset cursors no longer lose rows on MySQL/MariaDB
       (the null-safe rewrite swallowed an opening parenthesis).
     - A refused tenant-scoped MySQL/MariaDB upsert (unsupported_scope_predicate)

@@ -278,8 +278,12 @@ sub normalize_error {
     my ($self, $error) = @_;
     return $error if blessed($error) && $error->isa('Selecto::Error');
     my $dbh = $self->{dbh};
-    my $errno = eval { blessed($dbh) && $dbh->can('err') ? $dbh->err : undef };
     my $text = eval { "$error" } // '';
+    # $dbh->err outlives its statement: it counts only when this error is the
+    # driver's current one (its text carries the handle's errstr).
+    my $errstr = eval { blessed($dbh) && $dbh->can('errstr') ? $dbh->errstr : undef };
+    my $errno = defined($errstr) && length($errstr) && index($text, $errstr) >= 0
+        ? eval { $dbh->err } : undef;
     delete $self->{_selecto_unique_key};
     return $self->SUPER::normalize_error($error) unless defined($errno) && "$errno" =~ /\A\d+\z/;
     if ($errno == 1062) {
@@ -917,36 +921,57 @@ sub _execute_upsert {
     my $insert = Selecto::Write::Command->new(%shared, operation => 'insert', assignments => $assignments);
     my $run = sub { $self->SUPER::_execute_compiled_write_in_transaction($_[0], $self->SUPER::_compile_write($_[0])) };
     my $result;
-    # INSERT first, in a savepoint. Locking an absent key first (SELECT ...
-    # FOR UPDATE) takes a gap lock that two sessions on the same new key hold
-    # together, and both then deadlock inserting. The insert takes the key's
-    # record lock directly; a loser waits for the winner and gets 1062.
+    my ($where, @params);
+    unless ($null) {
+        $where = $self->_compile_write_predicate($target, \@params);
+    }
+    # Locks and updates the target's row; false when no such row exists.
+    my $update_target = sub {
+        my $rows;
+        my $ok = eval { $rows = $self->dbh->selectall_arrayref("SELECT 1 FROM $table WHERE $where FOR UPDATE", undef, @params); 1 };
+        die $self->normalize_error($@) unless $ok;
+        return 0 unless @$rows;
+        my $update = Selecto::Write::Command->new(%shared, operation => 'update', predicate => $target,
+            assignments => {map { ($_ => $assignments->{$_}) } @{$metadata->{upsert_update_fields}}});
+        $result = $run->($update);
+        return 1;
+    };
+    my $done = sub { Selecto::Write::Result->new(operation => 'upsert', affected_rows => $result->affected_rows, values => {}) };
+    # An existing row is the common case: a plain snapshot read finds it and
+    # goes straight to a record lock. Inserting first would leave a shared
+    # lock on the duplicate record (a savepoint rollback does not release it),
+    # and sessions racing on one row would each hold it while asking for the
+    # exclusive lock: a deadlock.
+    if (!$null) {
+        my $present;
+        my $ok = eval { ($present) = $self->dbh->selectrow_array("SELECT 1 FROM $table WHERE $where LIMIT 1", undef, @params); 1 };
+        die $self->normalize_error($@) unless $ok;
+        return $done->() if $present && $update_target->();
+    }
+    # Absent: INSERT first, in a savepoint. Locking an absent key first
+    # (SELECT ... FOR UPDATE) takes a gap lock that two sessions on the same
+    # new key hold together, and both then deadlock inserting. The insert
+    # takes the key's record lock directly; a loser waits for the winner and
+    # gets 1062.
     my $savepoint = Selecto::SQL::_savepoint_name('selecto_upsert');
     $self->_savepoint_command(create => $savepoint);
     my $inserted = eval { $result = $run->($insert); 1 };
     my $error = $@;
     if ($inserted) {
         $self->_savepoint_command(release => $savepoint);
-        return Selecto::Write::Result->new(operation => 'upsert', affected_rows => $result->affected_rows, values => {});
+        return $done->();
     }
     $self->_savepoint_command(rollback => $savepoint);
     $self->_savepoint_command(release => $savepoint);
     die $error unless blessed($error) && $error->isa('Selecto::Error')
-        && $error->code eq 'database_unique_violation';
+        && $error->code eq 'database_unique_violation' && !$null;
     # As PostgreSQL's arbiter index does, the declared target alone decides
     # whether this is a conflict, whichever unique key the server reported
-    # first (the primary key is checked before the target). Lock the target's
-    # row and update it; when no such row exists the collision was only on
-    # another unique key and the original unique violation stands.
-    my (@params, $rows);
-    my $where = $self->_compile_write_predicate($target, \@params);
-    my $ok = eval { $rows = $self->dbh->selectall_arrayref("SELECT 1 FROM $table WHERE $where FOR UPDATE", undef, @params); 1 };
-    die $self->normalize_error($@) unless $ok;
-    die $error unless @$rows;
-    my $update = Selecto::Write::Command->new(%shared, operation => 'update', predicate => $target,
-        assignments => {map { ($_ => $assignments->{$_}) } @{$metadata->{upsert_update_fields}}});
-    $result = $run->($update);
-    return Selecto::Write::Result->new(operation => 'upsert', affected_rows => $result->affected_rows, values => {});
+    # first (the primary key is checked before the target). When no target
+    # row exists the collision was only on another unique key and the
+    # original unique violation stands.
+    die $error unless $update_target->();
+    return $done->();
 }
 
 # RETURNING fields are validated as usual but compiled into no SQL; the
