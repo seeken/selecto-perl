@@ -141,6 +141,49 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             $dbh->do('DROP TABLE selecto_live_conc');
         };
 
+        subtest 'upserts of pre-existing keys from two sessions never deadlock' => sub {
+            $dbh->do('DROP TABLE IF EXISTS selecto_live_conc');
+            $dbh->do('CREATE TABLE selecto_live_conc (id int primary key, code varchar(40) not null, hits int not null, unique key uc (code)) ENGINE=InnoDB');
+            my $rounds = 100;
+            $dbh->do('INSERT INTO selecto_live_conc VALUES (?, ?, 0)', undef, 5000 + $_, "k$_") for 1 .. $rounds;
+            my $start = time + 2;
+            my @pids;
+            for my $worker (1, 2) {
+                my $pid = fork;
+                die "fork failed\n" unless defined $pid;
+                if (!$pid) {
+                    my $connection = open_db($backend, $url);
+                    my $domain = TestSelecto::writable_domain(
+                        name => 'Conc', table => 'selecto_live_conc',
+                        fields => {id => 'integer', code => 'string', hits => 'integer'},
+                        conflict_targets => [['code']]);
+                    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($backend => (dbh => $connection)));
+                    my %outcome;
+                    for my $round (1 .. $rounds) {
+                        my $at = $start + $round * 0.04;
+                        my $wait = $at - time;
+                        sleep($wait) if $wait > 0;
+                        my $command = Selecto::Write::Command->new(operation => 'upsert', relation => 'selecto_live_conc',
+                            assignments => {id => $worker * 1000 + $round, code => "k$round", hits => $worker},
+                            metadata => {conflict_target => ['code'], upsert_update_fields => ['hits']});
+                        my $ok = eval { $engine->execute_write($command); 1 };
+                        $outcome{$ok ? 'ok' : (ref($@) && $@->can('code') ? $@->code : 'died')}++;
+                    }
+                    POSIX::_exit(($outcome{ok} // 0) == $rounds ? 0 : 1);
+                }
+                push @pids, $pid;
+            }
+            my @status = map { waitpid($_, 0); $? >> 8 } @pids;
+            is_deeply(\@status, [0, 0], 'every upsert of both sessions succeeded (no deadlock, no unique violation)');
+            my ($rows) = $dbh->selectrow_array('SELECT COUNT(*) FROM selecto_live_conc');
+            is($rows, $rounds, 'no row was added or lost');
+            my ($lost) = $dbh->selectrow_array('SELECT COUNT(*) FROM selecto_live_conc WHERE hits NOT IN (1, 2)');
+            is($lost, 0, 'every row holds one session\'s update');
+            my ($moved) = $dbh->selectrow_array('SELECT COUNT(*) FROM selecto_live_conc WHERE id < 5000');
+            is($moved, 0, 'updates never replaced a row\'s identity');
+            $dbh->do('DROP TABLE selecto_live_conc');
+        };
+
         subtest 'server errors are typed' => sub {
             $dbh->do('DROP TABLE IF EXISTS selecto_live_kid');
             $dbh->do('DROP TABLE IF EXISTS selecto_live_par');
@@ -155,6 +198,9 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             is($run->(q{INSERT INTO selecto_live_par VALUES (2, 'a')})->code, 'database_unique_violation', 'duplicate key');
             is($run->(q{INSERT INTO selecto_live_kid VALUES (1, 99)})->code, 'database_foreign_key_violation', 'missing parent');
             is($run->(q{INSERT INTO selecto_live_par (id, code) VALUES (3, NULL)})->code, 'database_not_null_violation', 'null in a required column');
+            # A stale driver errno must not type an unrelated error.
+            my $stale = $adapter->normalize_error('not a database error');
+            is($stale->code, 'query_error', 'a stale errno does not type a non-database error');
             $dbh->do('DROP TABLE selecto_live_kid');
             $dbh->do('DROP TABLE selecto_live_par');
         };
