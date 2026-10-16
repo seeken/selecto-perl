@@ -89,7 +89,7 @@ sub _server_version {
         if $self->{_selecto_server_version} && ($self->{_selecto_server_dbh} // 0) == ($dbh // 0);
     my ($text) = eval {
         local $dbh->{PrintError} = 0;
-        $dbh->selectrow_array('SELECT VERSION()');
+        $dbh->selectrow_array($self->_statement_sql('SELECT VERSION()'));
     };
     my @version = defined($text) && "$text" =~ /\A(\d+)\.(\d+)\.(\d+)/ ? ($1, $2, $3) : ();
     my $mariadb = defined($text) && "$text" =~ /mariadb/i ? 1 : 0;
@@ -303,17 +303,28 @@ sub _exact_identity_compare { return 1; }
 
 sub _identity_bytes_sql { return "CAST(CONVERT($_[1] USING utf8mb4) AS BINARY)"; }
 
+# An undeclared column ($exact == 2) compares its bytes only when it holds
+# text: COLLATION() is 'binary' for numbers, temporal values and binary
+# strings, which compare exactly (or as PostgreSQL does) without it.
+sub _identity_text_guard {
+    my ($self, $column, $exact, $bytes) = @_;
+    return $bytes unless ($exact // 0) == 2;
+    return "(COLLATION($column) = 'binary' OR $bytes)";
+}
+
 sub _identity_equal_sql {
     my ($self, $left, $right, $exact) = @_;
     return "$left = $right" unless $exact;
-    return "($left = $right AND " . $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right) . ')';
+    return "($left = $right AND " . $self->_identity_text_guard($left, $exact,
+        $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right)) . ')';
 }
 
 # NULL-safe (<=>), and byte-exact for text identity columns.
 sub _identity_correlation_sql {
     my ($self, $inner, $outer, $exact) = @_;
     return "$inner <=> $outer" unless $exact;
-    return "($inner <=> $outer AND " . $self->_identity_bytes_sql($inner) . ' <=> ' . $self->_identity_bytes_sql($outer) . ')';
+    return "($inner <=> $outer AND " . $self->_identity_text_guard($inner, $exact,
+        $self->_identity_bytes_sql($inner) . ' <=> ' . $self->_identity_bytes_sql($outer)) . ')';
 }
 
 sub _identity_values_sql {
@@ -327,8 +338,10 @@ sub _identity_values_sql {
         if ref($self->{_selecto_bind_copies}) eq 'ARRAY';
     my @binary = map { push @$params, $_; 'CAST(' . $self->placeholder(scalar @$params) . ' AS BINARY)' } @$values;
     my $bytes = $self->_identity_bytes_sql($column);
-    return "($column = $collated[0] AND $bytes = $binary[0])" if @$values == 1;
-    return "($column IN (" . join(', ', @collated) . ") AND $bytes IN (" . join(', ', @binary) . '))';
+    return "($column = $collated[0] AND " . $self->_identity_text_guard($column, $exact, "$bytes = $binary[0]") . ')'
+        if @$values == 1;
+    return "($column IN (" . join(', ', @collated) . ') AND '
+        . $self->_identity_text_guard($column, $exact, "$bytes IN (" . join(', ', @binary) . ')') . ')';
 }
 
 # True for a non-empty list of defined scalars: the only values a tenant
@@ -352,10 +365,11 @@ sub _identity_operand_field {
     my ($self, $domain, $operand) = @_;
     return 0 unless blessed($operand) && $operand->isa('Selecto::Expression') && $operand->kind eq 'field';
     my $path = $operand->arguments->[0];
-    return 1 if $self->_identity_field_exact($domain, $path);
+    my $exact = $self->_identity_field_exact($domain, $path);
+    return $exact if $exact;
     return 0 unless $self->{_selecto_host_identity};
     my $resolved = eval { $domain->resolve("$path") };
-    return ref($resolved) eq 'HASH' && Selecto::SQL::_identity_text_type($resolved->{type}) ? 1 : 0;
+    return ref($resolved) eq 'HASH' ? Selecto::SQL::_identity_text_type($resolved->{type}) : 0;
 }
 
 # A read predicate (eq or IN) on a text tenant or site column: the root's,
@@ -382,10 +396,10 @@ sub _identity_predicate_sql {
     my $host = $self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{refaddr($expression)};
     local $self->{_selecto_host_identity} = $host ? 1 : 0;
     if ($kind eq 'in') {
-        return undef unless $self->_identity_operand_field($domain, $left);
+        my $exact = $self->_identity_operand_field($domain, $left) or return undef;
         _refuse_inexact_identity() unless _identity_scalars($right);
         my $column = $self->_compile_expression($domain, $left, $params);
-        return $self->_identity_values_sql($column, [@$right], $params, 1);
+        return $self->_identity_values_sql($column, [@$right], $params, $exact);
     }
     my $left_exact = $self->_identity_operand_field($domain, $left);
     my $right_exact = $self->_identity_operand_field($domain, $right);
@@ -394,11 +408,12 @@ sub _identity_predicate_sql {
     my $is = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq $_[1] };
     if ($is->($other, 'field')) {
         my $left_sql = $self->_compile_expression($domain, $left, $params);
-        return $self->_identity_equal_sql($left_sql, $self->_compile_expression($domain, $right, $params), 1);
+        return $self->_identity_equal_sql($left_sql, $self->_compile_expression($domain, $right, $params),
+            $left_exact == 1 || $right_exact == 1 ? 1 : 2);
     }
     _refuse_inexact_identity() unless $is->($other, 'literal') && _identity_scalars([$other->arguments->[0]]);
     my $column = $self->_compile_expression($domain, $field, $params);
-    return $self->_identity_values_sql($column, [$other->arguments->[0]], $params, 1);
+    return $self->_identity_values_sql($column, [$other->arguments->[0]], $params, $left_exact || $right_exact);
 }
 
 # Write predicates, storage re-reads and guarded-insert probes of a governed
@@ -416,8 +431,8 @@ sub _write_identity_columns {
     my @host = blessed($command) && $command->can('scope_predicate')
         ? Selecto::SQL::_comparison_fields($command->scope_predicate,
             defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef) : ();
-    return {map { ($_ => 1) } grep { defined($_) && !ref($_) && Selecto::SQL::_identity_text_type($types->{$_}) }
-        @$fields, @host};
+    return {map { ($_ => Selecto::SQL::_identity_text_type($types->{$_})) }
+        grep { defined($_) && !ref($_) && Selecto::SQL::_identity_text_type($types->{$_}) } @$fields, @host};
 }
 
 sub _compile_write_predicate {
@@ -443,7 +458,7 @@ sub _compile_write_predicate {
                     ? [$right->arguments->[0]] : undef;
             _refuse_inexact_identity() unless _identity_scalars($values);
             return $self->_identity_values_sql($self->quote_identifier(Selecto::Identifier::checked($field)),
-                [@$values], $params, 1);
+                [@$values], $params, $columns->{$field});
         }
     }
     return $self->SUPER::_compile_write_predicate($expression, $params);
@@ -1018,7 +1033,13 @@ sub _compile_write {
     for my $entry (@{$self->{_selecto_bind_copies}}) {
         my ($owner, $start, $count) = @$entry;
         next unless ref($params) eq 'ARRAY' && $owner == refaddr($params);
-        $copy{$_} = 1 for $start .. $start + $count - 1;
+        for my $offset (0 .. $count - 1) {
+            # Each dropped byte-half value must equal its collated twin.
+            my ($twin, $copy) = ($params->[$start - $count + $offset], $params->[$start + $offset]);
+            Selecto::Error->throw('invalid_query', 'exact comparison parameters lost their pairing')
+                unless defined($twin) && defined($copy) && !ref($twin) && !ref($copy) && "$twin" eq "$copy";
+            $copy{$start + $offset} = 1;
+        }
     }
     # Without repeated values the compiled parameters are the logical ones.
     return $compiled unless %copy;

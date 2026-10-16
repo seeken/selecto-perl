@@ -163,6 +163,7 @@ t/mssql.integration.t
 t/mssql.t
 t/mssql_decimal_scale.t
 t/mutation_expression.t
+t/host_scope_identity_live.t
 t/mysql_family.integration.t
 t/mysql_family.t
 t/mysql_family_cursor.t

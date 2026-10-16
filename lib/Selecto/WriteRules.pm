@@ -63,6 +63,10 @@ sub rows {
     my $fields = _fields($engine->domain);
     my $query = Selecto::Query->new->select(@$fields)->limit($maximum + 1);
     $query = $query->where($predicate) if defined $predicate;
+    # Trusted parts of the predicate (a command's scope predicate and
+    # query-enforcement evidence, engine-derived tenant conditions) compile
+    # as host identity, not as a caller filter.
+    local $engine->adapter->{_selecto_trusted_predicates} = $options{trusted} if ref($options{trusted}) eq 'ARRAY';
     my $result = $engine->all($query);
     _pending('candidate provider did not establish a complete bounded snapshot')
         if exists($result->{complete}) && !$result->{complete};
@@ -97,7 +101,9 @@ sub candidate {
     my $values = {};
     if ($command->operation eq 'update' || $command->operation eq 'delete') {
         _pending('protected scalar candidates require exactly one row') unless ($command->expected_count // 0) == 1;
-        my $rows = $class->rows($engine, _predicate($command), 1, raw => 1);
+        my $rows = $class->rows($engine, _predicate($command), 1, raw => 1,
+            trusted => [grep { defined } $command->scope_predicate,
+                $command->query_enforcement ? $command->query_enforcement->predicate : undef]);
         Selecto::Error->throw('cardinality_mismatch', 'candidate must resolve exactly one governed row') unless @$rows == 1;
         $values = $rows->[0];
     } elsif ($command->operation eq 'upsert') {
@@ -640,7 +646,7 @@ sub _admit_graph {
                         @$tenants == 1 ? Selecto::Expression->eq($scope->{field}, $tenants->[0])
                             : Selecto::Expression->in($scope->{field}, $tenants));
                 }
-                $final = $class->rows($child_engine, $predicate, $maximum);
+                $final = $class->rows($child_engine, $predicate, $maximum, trusted => [$predicate]);
             }
             my $identity = $edge->{identity_fields} // [$domain->primary_key];
             _pending('collection identity must be ordered stored fields') unless ref($identity) eq 'ARRAY' && @$identity

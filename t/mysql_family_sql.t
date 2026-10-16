@@ -16,7 +16,7 @@ package VersionedDBH {
     our @ISA = ('TestSelecto::DBH');
     sub selectrow_array {
         my ($self, $sql) = @_;
-        return $self->{version} if $sql eq 'SELECT VERSION()';
+        return $self->{version} if $sql =~ /SELECT VERSION\(\)\z/;
         return;
     }
 }
@@ -147,7 +147,8 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
         my $preview = $adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'accounts',
             assignments => {name => 'z'}, predicate => $x->eq('id', 1),
             scope_predicate => $x->any($x->eq('org', 't7'), $x->not($x->ne('org', 'zz')))));
-        like($preview->{sql}, qr/NOT \(\(`org` = \? AND CAST\(CONVERT\(`org` USING utf8mb4\) AS BINARY\) = CAST\(\? AS BINARY\)\)\)/,
+        # Undeclared (no column types): bytes compare only while the column holds text.
+        like($preview->{sql}, qr/NOT \(\(`org` = \? AND \(COLLATION\(`org`\) = 'binary' OR CAST\(CONVERT\(`org` USING utf8mb4\) AS BINARY\) = CAST\(\? AS BINARY\)\)\)\)/,
             "$name renders a host <> as the negated exact equality");
         is_deeply($preview->{params}, ['z', 1, 't7', 't7', 'zz', 'zz'], "$name binds each exact value twice");
         is_deeply($preview->{logical_params}, ['z', 1, 't7', 'zz'], "$name reports the logical parameters");

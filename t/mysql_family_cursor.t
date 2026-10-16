@@ -23,7 +23,7 @@ is($rewrite->('(`we``ird`.`na``me` IS DISTINCT FROM ?)'), '((NOT (`we``ird`.`na`
 
 package VersionedDBH {
     our @ISA = ('TestSelecto::DBH');
-    sub selectrow_array { return $_[0]->{version} if $_[1] eq 'SELECT VERSION()'; return; }
+    sub selectrow_array { return $_[0]->{version} if $_[1] =~ /SELECT VERSION\(\)\z/; return; }
 }
 
 my $x = 'Selecto::Expression';

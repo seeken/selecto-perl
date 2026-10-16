@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB exact identity comparison applies only to columns
+      declared as text (string, text, char, varchar, citext, enum) and to
+      undeclared columns while they hold text (COLLATION() is not
+      'binary'). Declared temporal, json, decimal, uuid and binary columns
+      compare plainly again: a byte comparison widened host <> and NOT IN on
+      a TIMESTAMP(3) column and made the ISO 'T' form match nothing.
+    - Graph read anchors (reference-only roots), data-rule candidate reads
+      and action-plan anchor previews compile the command's scope predicate
+      and query-enforcement evidence as host identity, not as a caller
+      filter: on MySQL/MariaDB a child could bind to tenant 'T1''s root.
+    - Each logical-parameter drop is checked against its collated twin;
+      SELECT VERSION() and MariaDB's max_statement_time read carry the
+      subquery-cache prefix too.
     - Host-trusted scope on MySQL/MariaDB is exact at any depth: every =,
       <> and IN comparison of a required predicate, a command's scope
       predicate or query-enforcement evidence on a text or undeclared column
