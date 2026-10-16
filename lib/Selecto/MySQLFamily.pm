@@ -190,6 +190,9 @@ sub _compile_datetime_format {
         unless defined($position) && $self->{_selecto_formats_active};
     local $self->{_selecto_format_slot};
     $timezone //= $self->{_timezone};
+    require Selecto::MySQLFamily::DateFormat;
+    Selecto::Error->throw('invalid_query', 'timezone must be a valid IANA timezone name')
+        if defined($timezone) && !Selecto::MySQLFamily::DateFormat::valid_zone($timezone);
     $self->{_selecto_formats_active}{formatters}{$position} = {
         format => "$format", type => $type, (defined($timezone) ? (timezone => "$timezone") : ()),
     };
