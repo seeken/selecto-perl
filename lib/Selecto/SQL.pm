@@ -33,6 +33,17 @@ has transaction_mode => 'managed';
 has 'transaction_handler';
 has 'query_budget_progress_handler';
 
+# Mojo::Base copies every constructor argument into the object. Keys with the
+# _selecto_ prefix are the adapter's private per-call state (a verified
+# session, the compiling engine, the admitted query, a server version cache),
+# so a caller can never preset them.
+sub new {
+    my ($class, @args) = @_;
+    my %args = @args == 1 && ref($args[0]) eq 'HASH' ? %{$args[0]} : @args;
+    delete @args{grep { /\A_selecto_/ } keys %args};
+    return $class->SUPER::new(%args);
+}
+
 sub query_budget_supported {
     require Selecto::QueryBudget;
     return Selecto::QueryBudget->supported($_[0]);

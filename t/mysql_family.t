@@ -74,4 +74,19 @@ for my $case ([['SYSTEM', 'UTC'], 'ok'], [['SYSTEM', '+00:00'], 'ok'], [['Etc/UT
     }
 }
 
+# A caller cannot preset the adapter's private per-call state: a constructor
+# argument _selecto_session_verified does not skip the session check.
+for my $name (qw(mysql mariadb)) {
+    my $session = SessionDBH->new({rows => [[1]]});
+    $session->{zone} = ['+01:00', 'UTC'];
+    my $adapter = Selecto->adapter($name => (dbh => $session, _selecto_session_verified => 1,
+        _selecto_server_version => [99, 0, 0]));
+    ok(!exists $adapter->{_selecto_session_verified}, "$name drops a preset session flag");
+    my $outcome = eval {
+        $adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => [], columns => ['x']));
+        'ok';
+    } // (ref($@) ? $@->details->{reason} : "died: $@");
+    is($outcome, 'session_time_zone', "$name still checks the session");
+}
+
 done_testing;
