@@ -183,6 +183,45 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
                 $dbh->do("DROP TABLE IF EXISTS $t{$_}") for qw(lines orders customers);
             };
         }
+
+        # A reference guard compares the referenced parent's tenant column by
+        # the parent's own declared type: an integer tenant on the written
+        # table says nothing about a text tenant on the parent, which under a
+        # PAD SPACE or case-insensitive collation would admit '7 ' for '7'.
+        subtest 'a reference guard compares a text parent tenant exactly under an integer child tenant' => sub {
+            $dbh->do("DROP TABLE IF EXISTS $_") for qw(selecto_tc_mix_orders selecto_tc_mix_customers);
+            $dbh->do('CREATE TABLE selecto_tc_mix_customers (id int primary key, tenant_id varchar(16) NOT NULL, name varchar(20)) ENGINE=InnoDB');
+            $dbh->do('CREATE TABLE selecto_tc_mix_orders (id int primary key, tenant_id int NOT NULL, code varchar(20), customer_id int) ENGINE=InnoDB');
+            my @spellings = ('7', '07', '7 ', ' 7');
+            $dbh->do('INSERT INTO selecto_tc_mix_customers VALUES (?, ?, ?)', undef, $_ + 1, $spellings[$_], "c$_") for 0 .. $#spellings;
+            my $domain = Selecto::Domain->parse({
+                schema_version => 1, name => 'MixedOrders', domain_version => '1',
+                source => {%{relation('selecto_tc_mix_orders', id => 'integer', tenant_id => 'integer', code => 'string',
+                    customer_id => 'integer')}, tenant_field => 'tenant_id', associations => {
+                        customer => {queryable => 'customer', owner_key => 'customer_id', related_key => 'id'}}},
+                schemas => {customer => {%{relation('selecto_tc_mix_customers', id => 'integer', tenant_id => 'string',
+                    name => 'string')}, tenant_field => 'tenant_id'}},
+                joins => {},
+                writes => {operations => {insert => {enabled => 1}},
+                    fields => {map { ($_ => {insertable => 1}) } qw(id tenant_id code customer_id)}},
+            });
+            my $id = 100;
+            for my $case (['the number 7', 7], ['the text 7', '7']) {
+                my ($label, $tenant) = @$case;
+                my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($backend => (dbh => $dbh)),
+                    scope => {tenant => $tenant});
+                my @accepted;
+                for my $customer (1 .. @spellings) {
+                    my $insert = Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_tc_mix_orders',
+                        assignments => {id => ++$id, code => 'x', customer_id => $customer});
+                    push @accepted, $spellings[$customer - 1] if code_of(sub { $engine->execute_write($insert) }) eq 'ok';
+                }
+                is_deeply(\@accepted, ['7'], "tenant $label references only the parent whose tenant is exactly '7'");
+            }
+            is($dbh->selectrow_array('SELECT COUNT(*) FROM selecto_tc_mix_orders WHERE customer_id <> 1'), 0,
+                'no order references another tenant\'s parent');
+            $dbh->do("DROP TABLE IF EXISTS $_") for qw(selecto_tc_mix_orders selecto_tc_mix_customers);
+        };
         $dbh->disconnect;
     };
 }
