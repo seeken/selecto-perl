@@ -207,7 +207,8 @@ sub _compile_single {
     # The top-level eq/IN conjuncts of the host-trusted required predicate
     # decide tenant or scope identity even without a declared tenant_field.
     local $self->{_selecto_host_conjuncts} = $self->_exact_identity_compare
-        ? {map { (refaddr($_) => 1) } _comparison_nodes($domain->required_predicate)} : undef;
+        ? {map { (refaddr($_) => 1) } _comparison_nodes($domain->required_predicate,
+            @{$self->{_selecto_trusted_predicates} // []})} : undef;
     my @association_paths = $self->_referenced_associations($query, $predicate, $domain);
     my ($join_aliases, $through_aliases) = _association_alias_maps(@association_paths);
     local $self->{_join_aliases} = $join_aliases;
@@ -1360,6 +1361,11 @@ sub execute_graph_unsafe {
                     $command->scope_predicate, $command->query_enforcement ? $command->query_enforcement->predicate : undef);
                 my $query = Selecto::Query->new->select(@fields)->limit(2);
                 $query = $query->where($predicate) if defined $predicate;
+                # The command's scope predicate and query-enforcement evidence
+                # are host-trusted, not a caller filter: their comparisons
+                # decide identity (exact on dialects with folding collations).
+                local $self->{_selecto_trusted_predicates} = [grep { defined } $command->scope_predicate,
+                    $command->query_enforcement ? $command->query_enforcement->predicate : undef];
                 my $rows = $self->execute_query($self->compile($domain, $query))->{rows};
                 Selecto::Error->throw('cardinality_mismatch', 'read anchor must resolve exactly one governed row') unless @$rows == 1;
                 $results{$node->{id}} = Selecto::Write::Result->new(operation => 'update', affected_rows => 0,
@@ -2607,14 +2613,16 @@ sub _identity_values_sql {
     return $column . (@markers == 1 ? " = $markers[0]" : ' IN (' . join(', ', @markers) . ')');
 }
 
-# Whether a declared field type stores text; an undeclared type counts as
-# text, so the exact comparison is the fail-closed choice.
+# How a declared field type takes part in exact identity comparison: 1 for a
+# declared text type (string, text, char, varchar, citext, enum), 2 for an
+# undeclared type (compared exactly when it holds text, see the dialect),
+# 0 for every other declared type (numbers, booleans, temporal, json,
+# decimal, uuid, binary), which compares plainly.
 sub _identity_text_type {
     my ($type) = @_;
     $type = $type->{type} if ref($type) eq 'HASH';
-    return 1 unless defined($type) && !ref($type);
-    return lc("$type") =~ /\A(?:integer|int|bigint|smallint|tinyint|mediumint|decimal|numeric|number|float|double|real|boolean|bool)\z/
-        ? 0 : 1;
+    return 2 unless defined($type) && !ref($type) && length("$type") && lc("$type") ne 'unknown';
+    return lc("$type") =~ /\A(?:string|text|char|character|varchar|character varying|citext|enum)\z/ ? 1 : 0;
 }
 
 sub _association_identity_exact {

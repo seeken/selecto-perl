@@ -58,8 +58,11 @@ MySQL and MariaDB compare tenant and site identity exactly, as PostgreSQL
 does: a text tenant column is compared byte for byte as well as under its
 collation, so tenant `t1` never reads or writes the rows of `T1` or `t1 `
 whatever the column's (case-insensitive or PAD SPACE) collation is.
-A uuid tenant stored as `CHAR(36)` therefore compares case-sensitively:
-store it in one case (lowercase, as PostgreSQL's `uuid` type prints it).
+Exact comparison applies to columns declared as text (`string`, `text`,
+`char`, `varchar`) and to undeclared columns that hold text; a tenant uuid
+declared `string` and stored as `CHAR(36)` therefore compares case-sensitively
+(store it in one case). Columns declared temporal, decimal, json, uuid or
+binary compare as PostgreSQL compares them.
 Every MySQL/MariaDB read, stream and write first checks its session, per
 call: the time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`, or `SYSTEM`
 on a server whose system zone is UTC; never `GMT`), the client, connection

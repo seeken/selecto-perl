@@ -109,6 +109,9 @@ sub preview {
         if ($node->{reference_only}) {
             my $query = Selecto::Query->new->select(@{$command->metadata->{returning} // [$child->domain->primary_key]})
                 ->where(Selecto::WriteRules::_predicate($command))->limit(2);
+            # The command's scope predicate and evidence compile as host identity.
+            local $engine->adapter->{_selecto_trusted_predicates} = [grep { defined } $command->scope_predicate,
+                $command->query_enforcement ? $command->query_enforcement->predicate : undef];
             my $statement = $child->compile($query);
             push @statements, {sql => $statement->sql, params => $statement->params, reference_only => 1};
         } else { push @statements, $engine->adapter->preview_write($command) }
