@@ -172,6 +172,10 @@ package RecordingDBH {
     }
     sub selectrow_array {
         my ($self, $sql) = @_;
+        if (defined($self->{session}) && $sql =~ /\ASELECT \@\@SESSION\.time_zone\b/) {
+            push @{$self->{events}}, 'SESSION';
+            return @{$self->{session}}[0 .. ($sql =~ /\@\@in_transaction\z/ ? 8 : 7)];
+        }
         push @{$self->{events}}, $sql;
         return exists $self->{answers}{$sql} ? ($self->{answers}{$sql}) : die "no answer for $sql\n";
     }
@@ -273,28 +277,41 @@ subtest 'savepoints inside an open DBI transaction' => sub {
 };
 
 subtest 'MySQL and MariaDB' => sub {
+    # A UTC, utf8mb4, strict session that decodes exactly; the last value is
+    # MariaDB's @@in_transaction.
+    my @session = ('UTC', 'UTC', 'utf8mb4', 'utf8mb4', 'utf8mb4', 'STRICT_TRANS_TABLES', "\x{1F600}",
+        '2024-03-10 02:30:00.500000');
     for my $name (qw(mysql mariadb)) {
-        my $raw = RecordingDBH->new(answers => { 'SELECT @@in_transaction' => 1 });
-        ok(!$write->(Selecto->adapter($name => (dbh => $raw))), "$name write succeeds");
-        is_deeply($raw->events, [
-            'SELECT @@in_transaction', 'SAVEPOINT selecto_write_1', 'write',
-            'RELEASE SAVEPOINT selecto_write_1',
-        ], "$name detects a raw START TRANSACTION and uses a savepoint");
+        # Whether a host transaction is open is the driver's AutoCommit, never
+        # the server's @@in_transaction. A server transaction opened behind
+        # the driver's back is refused on MariaDB (it would be committed or
+        # discarded); MySQL cannot report one.
+        my $raw = RecordingDBH->new(session => [@session, 1]);
+        my $error = $write->(Selecto->adapter($name => (dbh => $raw)));
+        if ($name eq 'mariadb') {
+            is($error && $error->code, 'invalid_adapter', 'mariadb refuses a transaction opened outside the driver');
+            is_deeply($raw->events, ['SESSION'], 'before any transaction control');
+        } else {
+            ok(!$error, 'mysql write succeeds');
+            is_deeply($raw->events, ['SESSION', 'begin_work', 'write', 'commit'],
+                'mysql decides by AutoCommit alone');
+        }
 
-        my $idle = RecordingDBH->new(answers => { 'SELECT @@in_transaction' => 0 });
-        $write->(Selecto->adapter($name => (dbh => $idle)));
-        is_deeply($idle->events, ['SELECT @@in_transaction', 'begin_work', 'write', 'commit'],
+        my $idle = RecordingDBH->new(session => [@session, 0]);
+        ok(!$write->(Selecto->adapter($name => (dbh => $idle))), "$name write succeeds");
+        is_deeply($idle->events, ['SESSION', 'begin_work', 'write', 'commit'],
             "$name begins and commits on an idle connection");
 
-        my $unknown = RecordingDBH->new;
-        $write->(Selecto->adapter($name => (dbh => $unknown)));
-        is_deeply($unknown->events, ['SELECT @@in_transaction', 'begin_work', 'write', 'commit'],
-            "$name keeps begin and commit when the server cannot say");
+        my $manual = RecordingDBH->new(AutoCommit => 0, session => [@session, 1]);
+        ok(!$write->(Selecto->adapter($name => (dbh => $manual))), "$name write inside begin_work succeeds");
+        is_deeply($manual->events, ['SESSION', 'SAVEPOINT selecto_write_1', 'write', 'RELEASE SAVEPOINT selecto_write_1'],
+            "$name with AutoCommit off uses a savepoint");
 
-        my $manual = RecordingDBH->new(AutoCommit => 0);
-        $write->(Selecto->adapter($name => (dbh => $manual)));
-        is_deeply($manual->events, ['SAVEPOINT selecto_write_1', 'write', 'RELEASE SAVEPOINT selecto_write_1'],
-            "$name with AutoCommit off uses a savepoint without asking the server");
+        my $unknown = RecordingDBH->new;
+        is($write->(Selecto->adapter($name => (dbh => $unknown)))->code, 'query_error',
+            "$name refuses a connection whose session cannot be read");
+        is_deeply([grep { $_ eq 'begin_work' || $_ eq 'write' } @{$unknown->events}], [],
+            'before any transaction control');
     }
 };
 

@@ -1,6 +1,22 @@
 Revision history for Selecto
 
 Unreleased
+    - Every MySQL/MariaDB read, stream and write checks its session first, in
+      one round trip per call (a host can SET it at any time): a UTC time
+      zone ('UTC', '+00:00', 'Etc/UTC', or SYSTEM only when the server's
+      system zone is 'UTC' or '+00:00'; 'GMT' is refused, being also
+      Europe/London's winter abbreviation), utf8mb4 client, connection and
+      result character sets, a strict sql_mode, and a driver that returns
+      utf8mb4 text and DATETIME values unchanged. Otherwise the call is
+      refused with the new invalid_connection error (details.reason names
+      the setting) before anything runs.
+    - MySQL/MariaDB no longer infer an open host transaction from the
+      server's @@in_transaction: the driver's AutoCommit alone decides
+      between the write's own transaction and a savepoint. On MariaDB a write
+      on a server transaction opened outside the driver (a raw START
+      TRANSACTION with AutoCommit on) is refused with invalid_adapter
+      (reason transaction_outside_driver) instead of running in a savepoint;
+      MySQL cannot report one. Open host transactions with begin_work.
     - A MySQL/MariaDB upsert whose savepointed INSERT is the deadlock victim
       reports database_deadlock_detected (HTTP 503, retryable) again: the
       server had already rolled back the whole transaction, and the failed

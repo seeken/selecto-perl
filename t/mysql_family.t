@@ -45,4 +45,33 @@ for my $adapter ($mysql, $mariadb) {
     is_deeply($dbh->prepared, [], $adapter->name . ' refuses before database preparation');
 }
 
+# The session check accepts SYSTEM only when the server's own zone is UTC or
+# +00:00; 'GMT' is also Europe/London's winter abbreviation, so a server whose
+# system zone reports GMT is refused.
+{
+    package SessionDBH;
+    our @ISA = ('TestSelecto::DBH');
+    sub selectrow_array {
+        my ($self, $sql) = @_;
+        my @row = TestSelecto::DBH::session_row($sql);
+        @row[0, 1] = @{$self->{zone}};
+        return @row;
+    }
+}
+for my $case ([['SYSTEM', 'UTC'], 'ok'], [['SYSTEM', '+00:00'], 'ok'], [['Etc/UTC', 'BST'], 'ok'],
+    [['SYSTEM', 'GMT'], 'session_time_zone'], [['GMT', 'UTC'], 'session_time_zone'],
+    [['SYSTEM', 'BST'], 'session_time_zone'], [['+01:00', 'UTC'], 'session_time_zone']) {
+    my ($zone, $expected) = @$case;
+    for my $name (qw(mysql mariadb)) {
+        my $session = SessionDBH->new({rows => [[1]]});
+        $session->{zone} = $zone;
+        my $adapter = Selecto->adapter($name => (dbh => $session));
+        my $outcome = eval {
+            $adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => [], columns => ['x']));
+            'ok';
+        } // (ref($@) ? $@->details->{reason} : "died: $@");
+        is($outcome, $expected, "$name session time zone @$zone: $expected");
+    }
+}
+
 done_testing;

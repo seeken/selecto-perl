@@ -58,6 +58,12 @@ MySQL and MariaDB compare tenant and site identity exactly, as PostgreSQL
 does: a text tenant column is compared byte for byte as well as under its
 collation, so tenant `t1` never reads or writes the rows of `T1` or `t1 `
 whatever the column's (case-insensitive or PAD SPACE) collation is.
+Every MySQL/MariaDB read, stream and write first checks its session, per
+call: the time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`, or `SYSTEM`
+on a server whose system zone is UTC; never `GMT`), the client, connection
+and result character sets utf8mb4, and `sql_mode` strict
+(`STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`). A connection that breaks it
+is refused with `invalid_connection` (`details.reason` names the setting).
 
 To install from a git checkout:
 
@@ -489,11 +495,15 @@ not start. Adapters take `transaction_mode`:
 - `managed` (default): on an idle handle the write runs in its own
   `begin_work` ... `commit`. On a handle that is already inside a transaction
   (`AutoCommit` off after `begin_work`, an `AutoCommit => 0` handle, or a raw
-  `BEGIN` that PostgreSQL, MySQL/MariaDB or SQL Server reports) it runs in a
+  `BEGIN` that PostgreSQL or SQL Server reports) it runs in a
   `SAVEPOINT` instead (`SAVE TRANSACTION` on SQL Server): it commits or rolls
   back with your transaction, and a failed write rolls back only its
   savepoint, so your transaction stays usable, on PostgreSQL too. DuckDB has
   no savepoints and refuses a managed write inside an open transaction.
+  On MySQL and MariaDB only the driver's `AutoCommit` says whether your
+  transaction is open: open it with `begin_work`. MariaDB refuses a write on a
+  transaction opened with a raw `START TRANSACTION` (`invalid_adapter`);
+  MySQL cannot report one, so the write would commit it.
 - `external`: you own the unit of work. The handle must have `AutoCommit`
   off; the adapter never begins, commits, rolls back or creates savepoints.
   Roll back yourself on every exception.

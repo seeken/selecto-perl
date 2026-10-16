@@ -85,7 +85,10 @@ subtest 'R09 MySQL and MariaDB prove the upsert identity before any mutation' =>
         package Local::NoCatalogDBH;
         our @ISA = ('TestSelecto::DBH');
         sub selectall_arrayref { return []; }
-        sub selectrow_array { return ('InnoDB'); }
+        sub selectrow_array {
+            return TestSelecto::DBH::session_row($_[1]) if TestSelecto::DBH::session_query($_[1]);
+            return ('InnoDB');
+        }
     }
     for my $backend (qw(mysql mariadb)) {
         my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse(contract(), strict => 1),

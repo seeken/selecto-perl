@@ -222,6 +222,7 @@ sub stream_query {
     my ($self, $statement, %options) = @_;
     Selecto::Error->throw('unsupported_feature', 'MySQL-family date formats cannot be streamed')
         if blessed($statement) && $statement->{_selecto_formatters};
+    $self->_require_session;
     return $self->SUPER::stream_query($statement, %options);
 }
 
@@ -1380,6 +1381,7 @@ sub _column_types {
 # canonical as usual.
 sub execute_query {
     my ($self, $statement, %options) = @_;
+    $self->_require_session;
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
     return $self->_apply_formatters($statement, $self->SUPER::execute_query($statement));
 }
@@ -1482,17 +1484,94 @@ sub _related_collection_text_sql {
 }
 
 
-# MySQL 5.7+ and MariaDB report a transaction opened by a raw START
-# TRANSACTION in @@in_transaction; without it the answer is unknown. Asked
-# only when AutoCommit is on.
-sub _server_transaction_open {
-    my ($self) = @_;
+# The session contract every read, stream and write checks first, in one
+# round trip and never cached (a host can SET the session at any time):
+# - the session time zone is UTC ('UTC', '+00:00', 'Etc/UTC', or SYSTEM
+#   while the server's system zone is 'UTC' or '+00:00'; never 'GMT', which
+#   is also Europe/London's winter abbreviation): TIMESTAMP values and
+#   CURRENT_TIMESTAMP are read and written in it;
+# - client, connection and result character sets are utf8mb4 (a narrower
+#   one turns four-byte characters into '?');
+# - sql_mode is strict (STRICT_TRANS_TABLES or STRICT_ALL_TABLES), so a
+#   value a column cannot hold fails instead of being stored altered;
+# - the driver returns utf8mb4 text and DATETIME values unchanged (a handle
+#   of another driver, or without utf8mb4 decoding, is refused).
+# A connection that breaks it is refused with invalid_connection before
+# anything else runs. On MariaDB a write also refuses a handle whose server
+# transaction was opened outside the driver (a raw START TRANSACTION while
+# AutoCommit is on): whether a host transaction is open is decided only by
+# the driver's AutoCommit, never by server introspection, and a write must
+# neither commit nor discard such work. Hosts open transactions with
+# begin_work (MySQL has no @@in_transaction to check this with).
+my %UTC_ZONES = map { ($_ => 1) } ('UTC', '+00:00', 'Etc/UTC');
+
+sub _require_session {
+    my ($self, %options) = @_;
+    return if $self->{_selecto_session_verified};
     my $dbh = $self->{dbh};
-    my ($value) = eval {
+    my $open_check = $options{write} && $self->name eq 'mariadb';
+    my @row;
+    my $ok = eval {
         local $dbh->{PrintError} = 0;
-        $dbh->selectrow_array('SELECT @@in_transaction');
+        @row = $dbh->selectrow_array('SELECT @@SESSION.time_zone, @@system_time_zone, '
+            . '@@SESSION.character_set_client, @@SESSION.character_set_connection, @@SESSION.character_set_results, '
+            . q{@@SESSION.sql_mode, CONVERT(X'F09F9880' USING utf8mb4), CAST('2024-03-10 02:30:00.5' AS DATETIME(6))}
+            . ($open_check ? ', @@in_transaction' : ''));
+        1;
     };
-    return defined($value) && "$value" =~ /\A[01]\z/ ? 0 + $value : undef;
+    die $self->normalize_error($@) unless $ok;
+    my ($zone, $system, $client, $connection, $results, $mode, $text, $datetime, $open) = @row;
+    my $refuse = sub {
+        my ($reason, $message) = @_;
+        Selecto::Error->throw('invalid_connection', $message, {reason => $reason});
+    };
+    $refuse->('session_time_zone', 'MySQL-family sessions must use the UTC time zone')
+        unless defined($zone) && ($UTC_ZONES{$zone}
+            || ($zone eq 'SYSTEM' && defined($system) && ($system eq 'UTC' || $system eq '+00:00')));
+    $refuse->('session_character_set',
+        'MySQL-family sessions must use utf8mb4 client, connection and result character sets')
+        if grep { !defined($_) || lc($_) ne 'utf8mb4' } $client, $connection, $results;
+    $refuse->('session_sql_mode',
+        'MySQL-family sessions must use a strict sql_mode (STRICT_TRANS_TABLES or STRICT_ALL_TABLES)')
+        unless defined($mode) && grep { $_ eq 'STRICT_TRANS_TABLES' || $_ eq 'STRICT_ALL_TABLES' } split /,/, uc($mode);
+    $refuse->('client_decoding', 'MySQL-family connections must return utf8mb4 text and DATETIME values unchanged')
+        unless defined($text) && $text eq "\x{1F600}"
+            && defined($datetime) && "$datetime" eq '2024-03-10 02:30:00.500000';
+    Selecto::Error->throw('invalid_adapter',
+        'the connection is inside a transaction its driver did not open; open host transactions with begin_work',
+        {reason => 'transaction_outside_driver'})
+        if $open_check && defined($open) && "$open" eq '1' && eval { $dbh->{AutoCommit} };
+    return 1;
+}
+
+# Runs $work with the session verified once for the whole call, so reads and
+# writes nested inside it are not checked again.
+sub _with_verified_session {
+    my ($self, $write, $work) = @_;
+    return $work->() if $self->{_selecto_session_verified};
+    $self->_require_session(write => $write);
+    local $self->{_selecto_session_verified} = 1;
+    return $work->();
+}
+
+sub execute_write_unsafe {
+    my ($self, @arguments) = @_;
+    return $self->_with_verified_session(1, sub { $self->SUPER::execute_write_unsafe(@arguments) });
+}
+
+sub execute_batch_unsafe {
+    my ($self, @arguments) = @_;
+    return $self->_with_verified_session(1, sub { $self->SUPER::execute_batch_unsafe(@arguments) });
+}
+
+sub execute_graph_unsafe {
+    my ($self, @arguments) = @_;
+    return $self->_with_verified_session(1, sub { $self->SUPER::execute_graph_unsafe(@arguments) });
+}
+
+sub execute_transaction {
+    my ($self, @arguments) = @_;
+    return $self->_with_verified_session(1, sub { $self->SUPER::execute_transaction(@arguments) });
 }
 
 1;
