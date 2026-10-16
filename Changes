@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - A MySQL/MariaDB tenant comparison written literal-first (a host
+      required predicate eq(literal('t1'), field('tenant_id'))) is exact too.
+      A tenant or site comparison that cannot be rendered exactly (a NULL or
+      non-scalar value, or an operand that is neither a literal nor a field)
+      is refused with unsupported_feature (reason inexact_tenant_comparison)
+      in reads and writes, instead of compiling under the column's collation.
     - MySQL/MariaDB errors for a value a column cannot hold (1264, 1265,
       1292, 1366, 1367, 1406, 1690) are database_data_violation (HTTP 422),
       with no value, column or SQL in the message; an omitted NOT NULL
