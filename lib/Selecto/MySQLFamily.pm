@@ -263,10 +263,101 @@ sub _compile_expression {
         sub { return $self->SUPER::_compile_expression(@_); },
     );
     return $sql if defined $sql;
+    $sql = $self->_identity_predicate_sql($domain, $expression, $params);
+    return $sql if defined $sql;
     Selecto::Error->throw('unsupported_feature', 'MySQL-family grouping markers require a rollup projection')
         if blessed($expression) && $expression->isa('Selecto::Expression')
             && ($expression->kind eq 'grouping' || $expression->kind eq 'dimension_display');
     return $self->SUPER::_compile_expression($domain, $expression, $params, $compiled_selections);
+}
+
+# Tenant and site identity compares exactly, as in PostgreSQL. The servers'
+# default collations (utf8mb4_0900_ai_ci, MariaDB's utf8mb4_uca1400_ai_ci,
+# *_general_ci, *_unicode_ci) fold case and accents, and PAD SPACE ones
+# ignore trailing spaces, so tenant 't1' would otherwise match 'T1', 't1 '
+# and 'tı'. A text tenant comparison keeps the collated equality (which can
+# use the column's index) and adds a byte comparison:
+#   (col = ? AND CAST(col AS BINARY) = CAST(? AS BINARY))
+# with the value bound twice in SQL-text order; IN lists and column pairs
+# take the same form. Numeric tenant columns compile as before.
+sub _exact_identity_compare { return 1; }
+
+sub _identity_equal_sql {
+    my ($self, $left, $right, $exact) = @_;
+    return "$left = $right" unless $exact;
+    return "($left = $right AND CAST($left AS BINARY) = CAST($right AS BINARY))";
+}
+
+sub _identity_values_sql {
+    my ($self, $column, $values, $params, $exact) = @_;
+    return $self->SUPER::_identity_values_sql($column, $values, $params)
+        unless $exact && ref($values) eq 'ARRAY' && @$values && !grep { !defined($_) || ref($_) } @$values;
+    my @collated = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
+    my @binary = map { push @$params, $_; 'CAST(' . $self->placeholder(scalar @$params) . ' AS BINARY)' } @$values;
+    return "($column = $collated[0] AND CAST($column AS BINARY) = $binary[0])" if @$values == 1;
+    return "($column IN (" . join(', ', @collated) . ") AND CAST($column AS BINARY) IN ("
+        . join(', ', @binary) . '))';
+}
+
+# A read predicate (eq or IN) on a text tenant or site column: the root's,
+# a joined relation's, a member's or a retarget hop's, wherever it came from
+# (engine tenant, required predicate, carried tenant set, caller filter).
+sub _identity_predicate_sql {
+    my ($self, $domain, $expression, $params) = @_;
+    return undef unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $kind = $expression->kind;
+    return undef unless $kind eq 'eq' || $kind eq 'in';
+    my ($left, $right) = @{$expression->arguments};
+    return undef unless blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
+        && $self->_identity_field_exact($domain, $left->arguments->[0]);
+    my @values;
+    if ($kind eq 'in') {
+        return undef unless ref($right) eq 'ARRAY' && @$right && !grep { !defined($_) || ref($_) } @$right;
+        @values = @$right;
+    } elsif (blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal') {
+        my $value = $right->arguments->[0];
+        return undef if !defined($value) || ref($value);
+        @values = ($value);
+    } elsif (blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'field') {
+        my $column = $self->_compile_expression($domain, $left, $params);
+        return $self->_identity_equal_sql($column, $self->_compile_expression($domain, $right, $params), 1);
+    } else {
+        return undef;
+    }
+    my $column = $self->_compile_expression($domain, $left, $params);
+    return $self->_identity_values_sql($column, \@values, $params, 1);
+}
+
+# Write predicates, storage re-reads and guarded-insert probes of a governed
+# command compare its text tenant columns (the engine's __selecto_tenant_fields:
+# tenant_field, writes.scope.tenant, pins and stored root tenant columns) the
+# same way. The set is taken from the command being compiled or executed.
+sub _write_identity_columns {
+    my ($self, $command) = @_;
+    my $metadata = blessed($command) && $command->can('metadata') ? $command->metadata : {};
+    my $fields = ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY' ? $metadata->{__selecto_tenant_fields} : [];
+    my $types = ref($metadata->{__selecto_insert_types}) eq 'HASH' ? $metadata->{__selecto_insert_types} : {};
+    return {map { ($_ => 1) } grep { defined($_) && !ref($_) && Selecto::SQL::_identity_text_type($types->{$_}) } @$fields};
+}
+
+sub _compile_write_predicate {
+    my ($self, $expression, $params) = @_;
+    my $columns = $self->{_selecto_identity_columns};
+    if ($columns && %$columns && blessed($expression) && $expression->isa('Selecto::Expression')
+        && ($expression->kind eq 'eq' || $expression->kind eq 'in')) {
+        my ($left, $right) = @{$expression->arguments};
+        my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
+            ? $left->arguments->[0] : undef;
+        if (defined($field) && !ref($field) && $columns->{$field}) {
+            my @values = $expression->kind eq 'in'
+                ? (ref($right) eq 'ARRAY' ? @$right : ())
+                : (blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal'
+                    ? ($right->arguments->[0]) : ());
+            return $self->_identity_values_sql($self->quote_identifier(Selecto::Identifier::checked($field)),
+                \@values, $params, 1) if @values && !grep { !defined($_) || ref($_) } @values;
+        }
+    }
+    return $self->SUPER::_compile_write_predicate($expression, $params);
 }
 
 # OFFSET requires a LIMIT; the largest unsigned BIGINT means no limit.
@@ -729,8 +820,10 @@ sub _compile_lateral_joins {
         push @$params, @{$statement->params};
         my $name = $self->quote_identifier($spec->{name});
         my @on = map {
-            "$name." . $self->quote_identifier("__selecto_lateral_key$_") . ' = '
-                . $self->_qualified($self->_root_alias, $spec->{correlations}{$keys[$_]})
+            $self->_identity_equal_sql("$name." . $self->quote_identifier("__selecto_lateral_key$_"),
+                $self->_qualified($self->_root_alias, $spec->{correlations}{$keys[$_]}),
+                $self->_identity_field_exact($domain, $spec->{correlations}{$keys[$_]})
+                    || $self->_identity_field_exact($spec->{domain}, $keys[$_]))
         } 0 .. $#keys;
         if ($ranked) {
             my $row = "$name." . $self->quote_identifier('__selecto_lateral_row');
@@ -812,6 +905,7 @@ sub _refuse_scoped_upsert {
 sub _compile_write {
     my ($self, $command) = @_;
     _refuse_scoped_upsert($command) if $command->operation eq 'upsert';
+    local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
     return $self->SUPER::_compile_write($command);
 }
 
@@ -999,6 +1093,7 @@ sub _append_returning {
 # A re-read that disagrees with the affected count fails the write.
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
+    local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
     my $operation = $command->operation;
     # Affected-row counts are matched rows only with CLIENT_FOUND_ROWS, the
     # DBD::MariaDB default; a handle that names it off in its DSN is refused.

@@ -1,6 +1,22 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL and MariaDB compare tenant and site identity exactly, as
+      PostgreSQL does (user decision 2026-10-14). Under the servers' default
+      collations a text tenant column compared case- and accent-insensitively
+      (and, under PAD SPACE collations, ignoring trailing spaces), so tenant
+      't1' read and wrote rows of 'T1' and 't1 '. Every comparison of a text
+      tenant, site or pinned column now adds a byte comparison,
+      (col = ? AND CAST(col AS BINARY) = CAST(? AS BINARY)), with the value
+      bound twice in text order: engine and required tenant predicates on the
+      root, joined relations, members, retarget hops and rollup branches;
+      tenant pairs and authored scope keys in joins, related collections and
+      computed fields; member correlations on a tenant column; write
+      predicates, RETURNING re-reads, guarded-insert admission and its stored
+      row re-read, upsert target probes, graph children and reference guards.
+      A caller's eq/IN filter on a tenant column compares exactly too.
+      Numeric tenant columns, PostgreSQL, SQLite and the other dialects
+      compile exactly as before.
     - MySQL and MariaDB upserts insert first inside a savepoint, so two
       sessions on one new key no longer deadlock on a shared gap lock; a
       duplicate on the declared target locks and updates its row, a duplicate

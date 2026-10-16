@@ -103,6 +103,36 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
             ->where($x->eq('state', 'open'))
     });
     is_deeply($ordered->params, ['none', 'open'], "$name binds SELECT parameters before WHERE parameters");
+
+    # Tenant identity compares exactly on a text tenant column (bound twice,
+    # in text order); a numeric tenant column compiles as before.
+    for my $tenant_type ('string', 'integer') {
+        my $relation = sub {
+            my ($table, %columns) = @_;
+            return {source_table => $table, primary_key => 'id', fields => [sort keys %columns],
+                columns => {map { ($_ => {type => $columns{$_}}) } keys %columns}, associations => {},
+                tenant_field => 'tenant_id'};
+        };
+        my $source = $relation->('orders', id => 'integer', tenant_id => $tenant_type, state => 'string');
+        $source->{associations} = {lines => {queryable => 'line', owner_key => 'id', related_key => 'order_id'}};
+        my $tenanted = Selecto::Domain->parse({schema_version => 1, name => 'Orders', source => $source,
+            schemas => {line => $relation->('lines', id => 'integer', order_id => 'integer', tenant_id => $tenant_type)},
+            joins => {}});
+        my $dbh = bless({%{TestSelecto::DBH->new}, version => $version}, 'VersionedDBH');
+        my $engine = Selecto::Engine->new(domain => $tenanted, adapter => Selecto->adapter($name => (dbh => $dbh)),
+            scope => {tenant => 't1'});
+        my $statement = $engine->compile($engine->query->select('id', 'lines.id')->where($x->eq('state', 'open')));
+        if ($tenant_type eq 'string') {
+            like($statement->sql, qr/\(`s0`\.`tenant_id` = \? AND CAST\(`s0`\.`tenant_id` AS BINARY\) = CAST\(\? AS BINARY\)\)/,
+                "$name binds a text tenant exactly");
+            like($statement->sql, qr/\(`s0`\.`tenant_id` = `j_lines`\.`tenant_id` AND CAST\(`s0`\.`tenant_id` AS BINARY\) = CAST\(`j_lines`\.`tenant_id` AS BINARY\)\)/,
+                "$name pairs text tenants exactly");
+            is_deeply($statement->params, ['t1', 't1', 'open'], "$name binds the tenant twice in text order");
+        } else {
+            unlike($statement->sql, qr/BINARY/, "$name compiles a numeric tenant without a byte comparison");
+            is_deeply($statement->params, ['t1', 'open'], "$name binds a numeric tenant once");
+        }
+    }
 }
 
 done_testing;

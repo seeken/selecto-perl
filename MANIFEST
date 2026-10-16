@@ -169,6 +169,7 @@ t/mysql_family_cursor.t
 t/mysql_family_date_format.t
 t/mysql_family_live.t
 t/mysql_family_sql.t
+t/mysql_family_tenant_collation_live.t
 t/naive_utc_storage.t
 t/postgresql.integration.t
 t/postgresql.t
