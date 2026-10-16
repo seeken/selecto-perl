@@ -54,6 +54,11 @@ boolean/websearch modes use FTS5 query grammar. SQLite named timezones,
 LATERAL, rollups and row locks remain unsupported. Decimal calculations use
 SQLite floating-point semantics, with no fixed-scale guarantee.
 
+MySQL and MariaDB compare tenant and site identity exactly, as PostgreSQL
+does: a text tenant column is compared byte for byte as well as under its
+collation, so tenant `t1` never reads or writes the rows of `T1` or `t1 `
+whatever the column's (case-insensitive or PAD SPACE) collation is.
+
 To install from a git checkout:
 
 ```sh

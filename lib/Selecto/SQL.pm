@@ -278,12 +278,13 @@ sub _compile_single {
                 $bridge_alias, $through->{where}, \@params
             );
             if (defined $through->{source_scope_key}) {
-                push @bridge_on,
-                    $self->_qualified($parent_alias, $through->{source_scope_key}) . ' = ' .
-                    $self->_qualified($bridge_alias, $through->{through_scope_key});
-                push @target_on,
-                    $self->_qualified($bridge_alias, $through->{through_scope_key}) . ' = ' .
-                    $self->_qualified($target_alias, $through->{target_scope_key});
+                my $exact = $self->_association_identity_exact($association, $through->{target_scope_key});
+                push @bridge_on, $self->_identity_equal_sql(
+                    $self->_qualified($parent_alias, $through->{source_scope_key}),
+                    $self->_qualified($bridge_alias, $through->{through_scope_key}), $exact);
+                push @target_on, $self->_identity_equal_sql(
+                    $self->_qualified($bridge_alias, $through->{through_scope_key}),
+                    $self->_qualified($target_alias, $through->{target_scope_key}), $exact);
             }
             push @bridge_on, $self->_tenant_pair_sql($association, $parent_alias, $target_alias);
             push @joins,
@@ -321,9 +322,10 @@ sub _compile_single {
                 $lookup_alias, $association->where, \@params
             );
             if (defined $association->source_scope_key) {
-                push @target_on,
-                    $self->_qualified($parent_alias, $association->source_scope_key) . ' = ' .
-                    $self->_qualified($lookup_alias, $association->target_scope_key);
+                push @target_on, $self->_identity_equal_sql(
+                    $self->_qualified($parent_alias, $association->source_scope_key),
+                    $self->_qualified($lookup_alias, $association->target_scope_key),
+                    $self->_association_identity_exact($association, $association->target_scope_key));
             }
             push @target_on, $self->_tenant_pair_sql($association, $parent_alias, $lookup_alias),
                 $self->_tenant_bound_sql($association, $lookup_alias, \@params);
@@ -795,8 +797,9 @@ sub _compile_cte_prefix {
             $spec->{domain}->resolve($join->{owner_key});
             my $recursive_join = 'INNER JOIN ' . $self->quote_identifier($spec->{name}) .
                 ' AS ' . $self->quote_identifier('p_' . $spec->{name}) .
-                ' ON ' . $self->_qualified($root_alias, $join->{owner_key}) . ' = ' .
-                $self->_qualified('p_' . $spec->{name}, $join->{related_key});
+                ' ON ' . $self->_identity_equal_sql($self->_qualified($root_alias, $join->{owner_key}),
+                    $self->_qualified('p_' . $spec->{name}, $join->{related_key}),
+                    $self->_identity_field_exact($spec->{domain}, $join->{owner_key}));
             if (defined $spec->{max_depth}) {
                 my $max_depth = "$spec->{max_depth}";
                 Selecto::Error->throw('invalid_query', 'recursive CTE max_depth must be a positive integer')
@@ -901,8 +904,9 @@ sub _compile_cte_joins {
         push @joins,
             $keyword . ' ' . $self->quote_identifier($spec->{name}) .
             ' AS ' . $self->quote_identifier($spec->{name}) .
-            ' ON ' . $self->_qualified($self->_root_alias, $join->{owner_key}) . ' = ' .
-            $self->_qualified($spec->{name}, $join->{related_key});
+            ' ON ' . $self->_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
+                $self->_qualified($spec->{name}, $join->{related_key}),
+                $self->_identity_field_exact($domain, $join->{owner_key}));
     }
     return \@joins;
 }
@@ -917,8 +921,9 @@ sub _compile_values_joins {
         if ($join) {
             my $owner = $domain->resolve($join->{owner_key});
             Selecto::Error->throw('invalid_query', 'VALUES owner key must be a root field') if $owner->{association};
-            $sql .= ' ON ' . $self->_qualified($self->_root_alias, $join->{owner_key}) . ' = '
-                . $self->_qualified($spec->{name}, $join->{related_key});
+            $sql .= ' ON ' . $self->_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
+                $self->_qualified($spec->{name}, $join->{related_key}),
+                $self->_identity_field_exact($domain, $join->{owner_key}));
         }
         push @joins, $sql;
     }
@@ -950,8 +955,9 @@ sub _compile_subquery_joins {
         for my $condition (@{$spec->{on}}) {
             my $owner = $domain->resolve($condition->{left});
             Selecto::Error->throw('invalid_query', 'subquery owner key must be a root field') if $owner->{association};
-            push @on, $self->_qualified($self->_root_alias, $condition->{left}) . ' = '
-                . $self->_qualified($spec->{name}, $condition->{right});
+            push @on, $self->_identity_equal_sql($self->_qualified($self->_root_alias, $condition->{left}),
+                $self->_qualified($spec->{name}, $condition->{right}),
+                $self->_identity_field_exact($domain, $condition->{left}));
         }
         push @joins, uc($spec->{type}) . ' JOIN (' . $body . ') AS ' . $self->quote_identifier($spec->{name})
             . ' ON ' . join(' AND ', @on);
@@ -991,9 +997,9 @@ sub _compile_lateral_joins {
             my $parent_field = $domain->resolve($parent);
             Selecto::Error->throw('invalid_query', 'lateral correlations require root fields')
                 if $child_field->{association} || $parent_field->{association};
-            push @correlations,
-                $self->_qualified($child_alias, $child) . ' = ' .
-                $self->_qualified($self->_root_alias, $parent);
+            push @correlations, $self->_identity_equal_sql($self->_qualified($child_alias, $child),
+                $self->_qualified($self->_root_alias, $parent),
+                $self->_identity_field_exact($domain, $parent) || $self->_identity_field_exact($spec->{domain}, $child));
         }
         my $statement = $self->_compile_single(
             $spec->{domain}, $spec->{query},
@@ -1882,9 +1888,10 @@ sub _compile_related_collection_at {
     my $from = "$table AS $quoted_alias";
     my @predicates = ("$related_key = $owner_key");
     if (defined $association->source_scope_key) {
-        push @predicates,
-            $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key) .
-            ' = ' . $self->_qualified($parent_alias, $association->source_scope_key);
+        push @predicates, $self->_identity_equal_sql(
+            $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key),
+            $self->_qualified($parent_alias, $association->source_scope_key),
+            $self->_association_identity_exact($association, $association->target_scope_key));
     }
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
@@ -1899,12 +1906,13 @@ sub _compile_related_collection_at {
             ' = ' . $owner_key,
         );
         if (defined $through->{source_scope_key}) {
-            push @predicates,
-                $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
-                ' = ' . $self->_qualified($parent_alias, $through->{source_scope_key});
-            push @target_on,
-                $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}) .
-                ' = ' . $quoted_alias . '.' . $self->quote_identifier($through->{target_scope_key});
+            my $exact = $self->_association_identity_exact($association, $through->{target_scope_key});
+            push @predicates, $self->_identity_equal_sql(
+                $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}),
+                $self->_qualified($parent_alias, $through->{source_scope_key}), $exact);
+            push @target_on, $self->_identity_equal_sql(
+                $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}),
+                $quoted_alias . '.' . $self->quote_identifier($through->{target_scope_key}), $exact);
         }
         # ON precedes WHERE in the emitted SQL, so bind target predicates first.
         # Do not bind the discarded direct-association predicate for this path.
@@ -1933,10 +1941,9 @@ sub _compile_related_collection_at {
             unless ref($filter) eq 'ARRAY' && @$filter == 2
             && defined($filter->[0]) && !ref($filter->[0])
             && exists($association_fields->{$filter->[0]});
-        push @$params, $filter->[1];
-        push @predicates,
-            $self->_qualified($alias, $filter->[0]) . ' = ' .
-            $self->placeholder(scalar @$params);
+        push @predicates, $self->_identity_values_sql($self->_qualified($alias, $filter->[0]), [$filter->[1]], $params,
+            defined($filter->[1]) && !ref($filter->[1])
+                && $self->_identity_field_exact($domain, "$association_name.$filter->[0]"));
     }
     my $where = join(' AND ', @predicates);
     if (defined $options->{aggregate}) {
@@ -2262,9 +2269,10 @@ sub _compile_computed_field {
             $self->_qualified($self->_root_alias, $association->owner_key),
     );
     if (defined $association->source_scope_key) {
-        push @predicates,
-            $self->_qualified($alias, $association->target_scope_key) . ' = ' .
-            $self->_qualified($self->_root_alias, $association->source_scope_key);
+        push @predicates, $self->_identity_equal_sql(
+            $self->_qualified($alias, $association->target_scope_key),
+            $self->_qualified($self->_root_alias, $association->source_scope_key),
+            $self->_association_identity_exact($association, $association->target_scope_key));
     }
     push @predicates, $self->_constant_join_predicates(
         $alias, $association->where, $params
@@ -2487,7 +2495,75 @@ sub _tenant_pair_sql {
         // {source_scope_key => $association->source_scope_key, target_scope_key => $association->target_scope_key};
     return () if defined($authored->{source_scope_key}) && defined($authored->{target_scope_key})
         && $authored->{source_scope_key} eq $source && $authored->{target_scope_key} eq $target;
-    return $self->_qualified($parent_alias, $source) . ' = ' . $self->_qualified($target_alias, $target);
+    return $self->_identity_equal_sql($self->_qualified($parent_alias, $source),
+        $self->_qualified($target_alias, $target), $self->_association_identity_exact($association, $target));
+}
+
+# Comparisons that decide tenant or site identity (tenant pairs and bounds,
+# authored scope keys, reference guards, member correlations on a tenant
+# column, and write predicates on tenant columns) go through these hooks.
+# $exact is true when the dialect compares text under collations that fold
+# case, accents or trailing spaces (MySQL and MariaDB) and the column stores
+# text: such a dialect then compares the bytes as well. Everywhere else the
+# SQL is the plain comparison.
+sub _exact_identity_compare { return 0; }
+
+sub _identity_equal_sql {
+    my ($self, $left, $right, $exact) = @_;
+    return "$left = $right";
+}
+
+# $column compared with bound values: = for one value, IN for several.
+sub _identity_values_sql {
+    my ($self, $column, $values, $params, $exact) = @_;
+    my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
+    return $column . (@markers == 1 ? " = $markers[0]" : ' IN (' . join(', ', @markers) . ')');
+}
+
+# Whether a declared field type stores text; an undeclared type counts as
+# text, so the exact comparison is the fail-closed choice.
+sub _identity_text_type {
+    my ($type) = @_;
+    $type = $type->{type} if ref($type) eq 'HASH';
+    return 1 unless defined($type) && !ref($type);
+    return lc("$type") =~ /\A(?:integer|int|bigint|smallint|tinyint|mediumint|decimal|numeric|number|float|double|real|boolean|bool)\z/
+        ? 0 : 1;
+}
+
+sub _association_identity_exact {
+    my ($self, $association, $field) = @_;
+    return 0 unless $self->_exact_identity_compare;
+    my $fields = eval { $association->fields } // {};
+    return _identity_text_type($fields->{$field});
+}
+
+# Whether a field path of $domain is a tenant or site column of its relation
+# that stores text: the root's tenant_field, writes.scope.tenant column and
+# tenant-family columns, or a joined relation's tenant_field or a column
+# named like one of the root's.
+sub _identity_field_exact {
+    my ($self, $domain, $path) = @_;
+    return 0 unless $self->_exact_identity_compare && blessed($domain) && $domain->can('resolve')
+        && defined($path) && !ref($path);
+    my $resolved = eval { $domain->resolve("$path") };
+    return 0 unless ref($resolved) eq 'HASH' && defined $resolved->{field};
+    my %names = map { ($_ => 1) } $self->_identity_root_columns($domain);
+    if (my $association = $resolved->{association}) {
+        my $target = eval { $association->target_tenant_field };
+        $names{$target} = 1 if defined $target;
+    }
+    return 0 unless $names{$resolved->{field}};
+    my $metadata = eval { $domain->_field_metadata_view("$path") } // {};
+    return 0 if ref($metadata) eq 'HASH' && ref($metadata->{computed}) eq 'HASH';
+    return _identity_text_type($resolved->{type});
+}
+
+sub _identity_root_columns {
+    my ($self, $domain) = @_;
+    my $scope = eval { $domain->write_tenant_scope };
+    my $family = eval { $domain->tenant_family } // {};
+    return grep { defined && !ref } eval { $domain->tenant_field }, (ref($scope) eq 'HASH' ? $scope->{field} : undef),
+        $family->{tenant}, $family->{site};
 }
 
 # Lesson 42: a tenant-scoped relation joined from a shared parent (one that
@@ -2526,16 +2602,13 @@ sub _tenant_bound_sql {
         $refuse->('a relation tenanted on the write-scope column must pair by name with a hop chained to the tenant-bound root');
     }
     my @predicates;
-    if (defined $tenant) {
-        push @$params, $tenant;
-        push @predicates, $self->_qualified($target_alias, $field) . ' = ' . $self->placeholder(scalar @$params);
-    }
+    my $exact = $self->_association_identity_exact($association, $field);
+    my $column = $self->_qualified($target_alias, $field);
+    push @predicates, $self->_identity_values_sql($column, [$tenant], $params, $exact) if defined $tenant;
     for my $set (@$sets) {
         my ($from, $values) = @$set;
         next if $family && $from ne "$field";
-        my @placeholders = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
-        push @predicates, $self->_qualified($target_alias, $field)
-            . (@placeholders == 1 ? " = $placeholders[0]" : ' IN (' . join(', ', @placeholders) . ')');
+        push @predicates, $self->_identity_values_sql($column, $values, $params, $exact);
     }
     return @predicates if @predicates || !$bounded;
     $refuse->('a tenant-scoped relation past an untenanted hop has no tenant boundary of the root to carry');
@@ -2685,9 +2758,9 @@ sub _compile_foreign_key_guards {
         # tenant column, each with its own set, in the same EXISTS.
         my $tenant_sql = join '', map {
             my $condition = $_;
-            my @tenants = map { push @$params, $_; $self->placeholder(scalar @$params) } @{$condition->{tenants}};
-            " AND $alias." . $self->quote_identifier(Selecto::Identifier::checked($condition->{tenant_field}))
-                . (@tenants == 1 ? " = $tenants[0]" : ' IN (' . join(', ', @tenants) . ')');
+            ' AND ' . $self->_identity_values_sql(
+                "$alias." . $self->quote_identifier(Selecto::Identifier::checked($condition->{tenant_field})),
+                $condition->{tenants}, $params, $self->_guard_identity_exact($command));
         } (exists($guard->{tenant_field}) ? ($guard) : ()), @{$guard->{more_tenant_fields} // []};
         $self->_foreign_key_exists_sql(
             'SELECT 1 FROM ' . $self->quote_identifier(Selecto::Identifier::checked($guard->{relation})) . " AS $alias"
@@ -2698,6 +2771,19 @@ sub _compile_foreign_key_guards {
 }
 
 sub _foreign_key_exists_sql { return "EXISTS ($_[1])"; }
+
+# A referenced parent's tenant column is compared with the trusted tenants
+# exactly unless every tenant column of the written relation is declared
+# numeric (the parent's own column type is not part of the guard).
+sub _guard_identity_exact {
+    my ($self, $command) = @_;
+    return 0 unless $self->_exact_identity_compare;
+    my $metadata = $command->metadata;
+    my $types = ref($metadata->{__selecto_insert_types}) eq 'HASH' ? $metadata->{__selecto_insert_types} : {};
+    my $fields = ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY' ? $metadata->{__selecto_tenant_fields} : [];
+    return 1 unless @$fields;
+    return (grep { _identity_text_type($types->{$_}) } @$fields) ? 1 : 0;
+}
 
 sub _guarded_insert_source {
     my ($self, $values, $guard) = @_;
