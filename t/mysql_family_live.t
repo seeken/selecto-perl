@@ -14,6 +14,7 @@ use Selecto::Engine;
 use Selecto::Domain;
 use Selecto::Expression;
 use Selecto::Write ();
+use Selecto::API ();
 
 eval { require Selecto::Certification; 1 }
     or plan skip_all => 'Selecto::Certification is not installed';
@@ -203,6 +204,38 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             is($stale->code, 'query_error', 'a stale errno does not type a non-database error');
             $dbh->do('DROP TABLE selecto_live_kid');
             $dbh->do('DROP TABLE selecto_live_par');
+        };
+
+        subtest 'values a column cannot hold are typed data violations' => sub {
+            $dbh->do('DROP TABLE IF EXISTS selecto_live_data');
+            $dbh->do(q{CREATE TABLE selecto_live_data (id int primary key, short varchar(3), tiny tinyint, day date,
+                amount int, kind enum('a', 'b'), counter int unsigned, ascii varchar(10) CHARACTER SET latin1,
+                needed int NOT NULL) ENGINE=InnoDB});
+            $dbh->do(q{INSERT INTO selecto_live_data (id, counter, needed) VALUES (1, 0, 1)});
+            my $adapter = Selecto->adapter($backend => (dbh => $dbh));
+            my $run = sub {
+                my ($sql) = @_;
+                return eval { $dbh->do($sql); 1 } ? undef : $adapter->normalize_error($@);
+            };
+            for my $case (
+                [q{INSERT INTO selecto_live_data (id, short, needed) VALUES (2, 'secret-value', 1)}, 'too long (1406)'],
+                [q{INSERT INTO selecto_live_data (id, tiny, needed) VALUES (3, 300, 1)}, 'out of range (1264)'],
+                [q{INSERT INTO selecto_live_data (id, day, needed) VALUES (4, 'secret-day', 1)}, 'not a date (1292)'],
+                [q{INSERT INTO selecto_live_data (id, amount, needed) VALUES (5, 'secret', 1)}, 'not an integer (1366)'],
+                [q{INSERT INTO selecto_live_data (id, kind, needed) VALUES (6, 'secret', 1)}, 'not an enum member (1265)'],
+                [q{UPDATE selecto_live_data SET counter = counter - 1 WHERE id = 1}, 'unsigned overflow (1690)'],
+                [qq{INSERT INTO selecto_live_data (id, ascii, needed) VALUES (7, '\x{1F600}', 1)}, 'unrepresentable text (1366)'],
+            ) {
+                my ($sql, $label) = @$case;
+                my $error = $run->($sql);
+                is($error && $error->code, 'database_data_violation', "$label is database_data_violation");
+                unlike(($error && $error->message) // '', qr/secret|selecto_live|short|tiny|counter/,
+                    "$label names no value, table or column");
+                is(Selecto::API::error_status($error && $error->code), 422, "$label is HTTP 422");
+            }
+            my $missing = $run->(q{INSERT INTO selecto_live_data (id) VALUES (8)});
+            is($missing && $missing->code, 'database_not_null_violation', 'an omitted NOT NULL column without a default (1364)');
+            $dbh->do('DROP TABLE selecto_live_data');
         };
         $dbh->disconnect;
     };

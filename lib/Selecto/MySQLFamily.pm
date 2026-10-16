@@ -395,6 +395,20 @@ sub normalize_error {
             message => 'A referenced record does not exist or is not available.',
             details => {constraint => 'foreign_key'});
     }
+    # A value the column cannot hold (too long, out of range, not of the
+    # column's type, not representable in its character set, an unsigned
+    # overflow), as in selecto-c, selecto-cpp and selecto-r; no value, column
+    # or SQL is echoed.
+    if ($errno == 1264 || $errno == 1265 || $errno == 1292 || $errno == 1366 || $errno == 1367
+        || $errno == 1406 || $errno == 1690) {
+        return Selecto::Error->new(code => 'database_data_violation',
+            message => 'A value does not fit the column it was written to.', details => {constraint => 'data'});
+    }
+    # An omitted NOT NULL column without a default is PostgreSQL's not-null violation.
+    if ($errno == 1364) {
+        return Selecto::Error->new(code => 'database_not_null_violation',
+            message => 'A required database field was not provided.', details => {constraint => 'not_null'});
+    }
     if ($errno == 1048) {
         my ($field) = $text =~ /Column '([A-Za-z_][A-Za-z0-9_]*)' cannot be null/;
         return Selecto::Error->new(code => 'database_not_null_violation',

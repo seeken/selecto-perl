@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB errors for a value a column cannot hold (1264, 1265,
+      1292, 1366, 1367, 1406, 1690) are database_data_violation (HTTP 422),
+      with no value, column or SQL in the message; an omitted NOT NULL
+      column without a default (1364) is database_not_null_violation. The
+      PostgreSQL mapping is unchanged.
     - MySQL/MariaDB date formats write years 1-999 with four digits, as
       PostgreSQL does (0001-02-03, not 1-02-03). A stored value PostgreSQL
       cannot hold (year 0, a zero month or day, an impossible date, or an
