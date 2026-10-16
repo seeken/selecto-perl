@@ -1055,9 +1055,16 @@ sub _execute_upsert {
         $self->_savepoint_command(release => $savepoint);
         return $done->();
     }
-    $self->_savepoint_command(rollback => $savepoint);
-    $self->_savepoint_command(release => $savepoint);
-    die $error unless blessed($error) && $error->isa('Selecto::Error')
+    # A deadlock victim's whole transaction is already rolled back, its
+    # savepoint with it: the failed ROLLBACK TO (1305) must not replace the
+    # typed retryable error. Any other failure to restore the savepoint also
+    # ends the upsert with its original error.
+    my $restored = eval {
+        $self->_savepoint_command(rollback => $savepoint);
+        $self->_savepoint_command(release => $savepoint);
+        1;
+    };
+    die $error unless $restored && blessed($error) && $error->isa('Selecto::Error')
         && $error->code eq 'database_unique_violation' && !$null;
     # As PostgreSQL's arbiter index does, the declared target alone decides
     # whether this is a conflict, whichever unique key the server reported
@@ -1270,6 +1277,9 @@ sub _tenant_conjuncts {
     return @kept;
 }
 
+# A locking read: under REPEATABLE READ a plain read returns the snapshot,
+# which after a no-op update or upsert, and for a delete's before image, can
+# be older than the row the write locked and changed.
 sub _returning_rows {
     my ($self, $command, $fields, $identity) = @_;
     my @params;
@@ -1278,7 +1288,7 @@ sub _returning_rows {
     my $key = $self->quote_identifier(Selecto::Identifier::checked($command->metadata->{__selecto_primary_key}));
     my $sql = 'SELECT ' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @$fields)
         . ' FROM ' . $self->quote_identifier(Selecto::Identifier::checked($command->relation))
-        . " WHERE $where ORDER BY $key";
+        . " WHERE $where ORDER BY $key FOR UPDATE";
     my ($sth, $rows);
     my $ok = eval {
         $sth = $self->dbh->prepare($sql);

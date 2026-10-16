@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - A MySQL/MariaDB upsert whose savepointed INSERT is the deadlock victim
+      reports database_deadlock_detected (HTTP 503, retryable) again: the
+      server had already rolled back the whole transaction, and the failed
+      ROLLBACK TO SAVEPOINT replaced the typed error with an untyped one.
+    - MySQL/MariaDB RETURNING re-reads are locking reads (FOR UPDATE). Under
+      REPEATABLE READ a plain read returned the transaction's snapshot, so a
+      delete's before image, or the row of a no-op update or upsert, could be
+      older than the row the write locked.
     - MySQL and MariaDB compare tenant and site identity exactly, as
       PostgreSQL does (user decision 2026-10-14). Under the servers' default
       collations a text tenant column compared case- and accent-insensitively
