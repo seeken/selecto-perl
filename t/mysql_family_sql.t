@@ -8,6 +8,7 @@ use Selecto;
 use Selecto::Domain;
 use Selecto::Engine;
 use Selecto::Expression;
+use Selecto::Write ();
 
 # A recorder handle that reports a server version, so version-gated features
 # compile without a server.
@@ -142,6 +143,36 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
             like($statement->sql, qr/\(`s0`\.`tenant_id` = `j_lines`\.`tenant_id` AND CAST\(CONVERT\(`s0`\.`tenant_id` USING utf8mb4\) AS BINARY\) = CAST\(CONVERT\(`j_lines`\.`tenant_id` USING utf8mb4\) AS BINARY\)\)/,
                 "$name pairs text tenants exactly");
             is_deeply($statement->params, ['t1', 't1', 'open'], "$name binds the tenant twice in text order");
+            # Write predicates on a text tenant column are exact or refused.
+            my $write = sub {
+                my ($predicate) = @_;
+                my $command = Selecto::Write::Command->new(operation => 'delete', relation => 'orders',
+                    predicate => $predicate, metadata => {__selecto_tenant_fields => ['tenant_id'],
+                        __selecto_insert_types => {tenant_id => 'string'}});
+                return eval { Selecto->adapter($name => (dbh => $dbh))->_compile_write($command)->{sql} }
+                    // (ref($@) ? $@->code : "died: $@");
+            };
+            like($write->($x->eq('tenant_id', 't1')), qr/AS BINARY\) = CAST\(\? AS BINARY\)/, "$name writes compare a text tenant exactly");
+            is($write->($x->in('tenant_id', ['t1', undef])), 'unsupported_feature', "$name refuses a write tenant IN with NULL");
+            is($write->($x->eq('tenant_id', undef)), 'unsupported_feature', "$name refuses a write tenant comparison with NULL");
+            # A literal-first comparison in a host required predicate is exact too.
+            my $reversed = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)),
+                domain => $tenanted->with_required_predicate($x->eq($x->literal('t1'), $x->field('tenant_id'))));
+            my $sql = $reversed->compile($reversed->query->select('id'))->sql;
+            like($sql, qr/CAST\(CONVERT\(`s0`\.`tenant_id` USING utf8mb4\) AS BINARY\) = CAST\(\? AS BINARY\)/,
+                "$name compares a literal-first tenant predicate exactly");
+            # A tenant comparison that cannot be rendered exactly is refused.
+            for my $case (
+                ['a NULL', $x->eq('tenant_id', undef)],
+                ['a computed value', $x->eq('tenant_id', $x->value(['coalesce', ['field', 'state'], ['literal', 't1', 'string']]))],
+                ['an IN list with NULL', $x->in('tenant_id', ['t1', undef])],
+            ) {
+                my ($label, $predicate) = @$case;
+                my $plain = Selecto::Engine->new(domain => $tenanted, adapter => Selecto->adapter($name => (dbh => $dbh)));
+                my $refused = eval { $plain->compile($plain->query->select('id')->where($predicate)); 'compiled' }
+                    // (ref($@) ? $@->code : "died: $@");
+                is($refused, 'unsupported_feature', "$name refuses a tenant comparison with $label");
+            }
         } else {
             unlike($statement->sql, qr/BINARY/, "$name compiles a numeric tenant without a byte comparison");
             is_deeply($statement->params, ['t1', 'open'], "$name binds a numeric tenant once");

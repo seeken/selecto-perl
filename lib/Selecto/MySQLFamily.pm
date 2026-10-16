@@ -299,8 +299,8 @@ sub _identity_equal_sql {
 
 sub _identity_values_sql {
     my ($self, $column, $values, $params, $exact) = @_;
-    return $self->SUPER::_identity_values_sql($column, $values, $params)
-        unless $exact && ref($values) eq 'ARRAY' && @$values && !grep { !defined($_) || ref($_) } @$values;
+    return $self->SUPER::_identity_values_sql($column, $values, $params) unless $exact;
+    _refuse_inexact_identity() unless _identity_scalars($values);
     my @collated = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
     my @binary = map { push @$params, $_; 'CAST(' . $self->placeholder(scalar @$params) . ' AS BINARY)' } @$values;
     my $bytes = $self->_identity_bytes_sql($column);
@@ -308,33 +308,57 @@ sub _identity_values_sql {
     return "($column IN (" . join(', ', @collated) . ") AND $bytes IN (" . join(', ', @binary) . '))';
 }
 
+# True for a non-empty list of defined scalars: the only values a tenant
+# comparison is rendered exactly for.
+sub _identity_scalars {
+    my ($values) = @_;
+    return 0 unless ref($values) eq 'ARRAY' && @$values;
+    return (grep { !defined($_) || ref($_) } @$values) ? 0 : 1;
+}
+
+# A tenant or site comparison that cannot be rendered exactly (a NULL, a
+# non-scalar value or an operand that is neither a literal nor a field) is
+# refused rather than compiled under the column's collation.
+sub _refuse_inexact_identity {
+    Selecto::Error->throw('unsupported_feature',
+        'MySQL-family tenant comparisons must compare a tenant field with literal values or another field',
+        {reason => 'inexact_tenant_comparison'});
+}
+
+sub _identity_operand_field {
+    my ($self, $domain, $operand) = @_;
+    return blessed($operand) && $operand->isa('Selecto::Expression') && $operand->kind eq 'field'
+        && $self->_identity_field_exact($domain, $operand->arguments->[0]) ? 1 : 0;
+}
+
 # A read predicate (eq or IN) on a text tenant or site column: the root's,
 # a joined relation's, a member's or a retarget hop's, wherever it came from
-# (engine tenant, required predicate, carried tenant set, caller filter).
+# (engine tenant, required predicate, carried tenant set, caller filter), in
+# either operand order.
 sub _identity_predicate_sql {
     my ($self, $domain, $expression, $params) = @_;
     return undef unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $kind = $expression->kind;
     return undef unless $kind eq 'eq' || $kind eq 'in';
     my ($left, $right) = @{$expression->arguments};
-    return undef unless blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
-        && $self->_identity_field_exact($domain, $left->arguments->[0]);
-    my @values;
     if ($kind eq 'in') {
-        return undef unless ref($right) eq 'ARRAY' && @$right && !grep { !defined($_) || ref($_) } @$right;
-        @values = @$right;
-    } elsif (blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal') {
-        my $value = $right->arguments->[0];
-        return undef if !defined($value) || ref($value);
-        @values = ($value);
-    } elsif (blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'field') {
+        return undef unless $self->_identity_operand_field($domain, $left);
+        _refuse_inexact_identity() unless _identity_scalars($right);
         my $column = $self->_compile_expression($domain, $left, $params);
-        return $self->_identity_equal_sql($column, $self->_compile_expression($domain, $right, $params), 1);
-    } else {
-        return undef;
+        return $self->_identity_values_sql($column, [@$right], $params, 1);
     }
-    my $column = $self->_compile_expression($domain, $left, $params);
-    return $self->_identity_values_sql($column, \@values, $params, 1);
+    my $left_exact = $self->_identity_operand_field($domain, $left);
+    my $right_exact = $self->_identity_operand_field($domain, $right);
+    return undef unless $left_exact || $right_exact;
+    my ($field, $other) = $left_exact ? ($left, $right) : ($right, $left);
+    my $is = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq $_[1] };
+    if ($is->($other, 'field')) {
+        my $left_sql = $self->_compile_expression($domain, $left, $params);
+        return $self->_identity_equal_sql($left_sql, $self->_compile_expression($domain, $right, $params), 1);
+    }
+    _refuse_inexact_identity() unless $is->($other, 'literal') && _identity_scalars([$other->arguments->[0]]);
+    my $column = $self->_compile_expression($domain, $field, $params);
+    return $self->_identity_values_sql($column, [$other->arguments->[0]], $params, 1);
 }
 
 # Write predicates, storage re-reads and guarded-insert probes of a governed
@@ -358,12 +382,12 @@ sub _compile_write_predicate {
         my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
             ? $left->arguments->[0] : undef;
         if (defined($field) && !ref($field) && $columns->{$field}) {
-            my @values = $expression->kind eq 'in'
-                ? (ref($right) eq 'ARRAY' ? @$right : ())
-                : (blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal'
-                    ? ($right->arguments->[0]) : ());
+            my $values = $expression->kind eq 'in' ? $right
+                : blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal'
+                    ? [$right->arguments->[0]] : undef;
+            _refuse_inexact_identity() unless _identity_scalars($values);
             return $self->_identity_values_sql($self->quote_identifier(Selecto::Identifier::checked($field)),
-                \@values, $params, 1) if @values && !grep { !defined($_) || ref($_) } @values;
+                [@$values], $params, 1);
         }
     }
     return $self->SUPER::_compile_write_predicate($expression, $params);
