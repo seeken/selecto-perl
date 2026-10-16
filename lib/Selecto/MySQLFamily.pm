@@ -280,16 +280,21 @@ sub _compile_expression {
 # *_general_ci, *_unicode_ci) fold case and accents, and PAD SPACE ones
 # ignore trailing spaces, so tenant 't1' would otherwise match 'T1', 't1 '
 # and 'tı'. A text tenant comparison keeps the collated equality (which can
-# use the column's index) and adds a byte comparison:
-#   (col = ? AND CAST(col AS BINARY) = CAST(? AS BINARY))
+# use the column's index) and adds a byte comparison of the utf8mb4 text:
+#   (col = ? AND CAST(CONVERT(col USING utf8mb4) AS BINARY) = CAST(? AS BINARY))
 # with the value bound twice in SQL-text order; IN lists and column pairs
-# take the same form. Numeric tenant columns compile as before.
+# take the same form. The column is converted to utf8mb4 first because the
+# bound value arrives in the (verified) utf8mb4 connection character set: a
+# ucs2, utf16, utf16le, utf32 or latin1 column's own bytes would never equal
+# it. Numeric tenant columns compile as before.
 sub _exact_identity_compare { return 1; }
+
+sub _identity_bytes_sql { return "CAST(CONVERT($_[1] USING utf8mb4) AS BINARY)"; }
 
 sub _identity_equal_sql {
     my ($self, $left, $right, $exact) = @_;
     return "$left = $right" unless $exact;
-    return "($left = $right AND CAST($left AS BINARY) = CAST($right AS BINARY))";
+    return "($left = $right AND " . $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right) . ')';
 }
 
 sub _identity_values_sql {
@@ -298,9 +303,9 @@ sub _identity_values_sql {
         unless $exact && ref($values) eq 'ARRAY' && @$values && !grep { !defined($_) || ref($_) } @$values;
     my @collated = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
     my @binary = map { push @$params, $_; 'CAST(' . $self->placeholder(scalar @$params) . ' AS BINARY)' } @$values;
-    return "($column = $collated[0] AND CAST($column AS BINARY) = $binary[0])" if @$values == 1;
-    return "($column IN (" . join(', ', @collated) . ") AND CAST($column AS BINARY) IN ("
-        . join(', ', @binary) . '))';
+    my $bytes = $self->_identity_bytes_sql($column);
+    return "($column = $collated[0] AND $bytes = $binary[0])" if @$values == 1;
+    return "($column IN (" . join(', ', @collated) . ") AND $bytes IN (" . join(', ', @binary) . '))';
 }
 
 # A read predicate (eq or IN) on a text tenant or site column: the root's,

@@ -73,8 +73,12 @@ sub contract {
 }
 
 my %COLLATIONS = (
-    mysql => [['server default', ''], ['case-insensitive NO PAD', 'utf8mb4_0900_ai_ci'], ['PAD SPACE', 'utf8mb4_general_ci']],
-    mariadb => [['server default', ''], ['case-insensitive NO PAD', 'utf8mb4_uca1400_nopad_ai_ci'], ['PAD SPACE', 'utf8mb4_general_ci']],
+    mysql => [['server default', 'utf8mb4', ''], ['case-insensitive NO PAD', 'utf8mb4', 'utf8mb4_0900_ai_ci'],
+        ['PAD SPACE', 'utf8mb4', 'utf8mb4_general_ci'], ['utf16 PAD SPACE', 'utf16', 'utf16_general_ci'],
+        ['latin1 PAD SPACE', 'latin1', 'latin1_swedish_ci']],
+    mariadb => [['server default', 'utf8mb4', ''], ['case-insensitive NO PAD', 'utf8mb4', 'utf8mb4_uca1400_nopad_ai_ci'],
+        ['PAD SPACE', 'utf8mb4', 'utf8mb4_general_ci'], ['utf16 PAD SPACE', 'utf16', 'utf16_general_ci'],
+        ['latin1 PAD SPACE', 'latin1', 'latin1_swedish_ci']],
 );
 
 for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_PERL_TEST_MARIADB_URL']) {
@@ -84,23 +88,25 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             unless defined($ENV{$environment}) && $ENV{$environment} ne '';
         my $dbh = open_db($backend, $ENV{$environment});
         for my $variant (@{$COLLATIONS{$backend}}) {
-            my ($label, $collation) = @$variant;
+            my ($label, $charset, $collation) = @$variant;
             subtest $label => sub {
                 my %t = map { ($_ => "selecto_tc_$_") } qw(orders lines customers);
-                my $tenant = 'tenant_id varchar(16) CHARACTER SET utf8mb4' . (length($collation) ? " COLLATE $collation" : '') . ' NOT NULL';
+                my $tenant = "tenant_id varchar(16) CHARACTER SET $charset" . (length($collation) ? " COLLATE $collation" : '') . ' NOT NULL';
+                # latin1 has no dotless i; an accented i stands in for it.
+                my $other = $charset eq 'latin1' ? 'tí' : 'tı';
                 my $reset = sub {
                     $dbh->do("DROP TABLE IF EXISTS $t{$_}") for qw(lines orders customers);
                     $dbh->do("CREATE TABLE $t{customers} (id int primary key, $tenant, name varchar(20), KEY (tenant_id)) ENGINE=InnoDB");
                     $dbh->do("CREATE TABLE $t{orders} (id int primary key, $tenant, code varchar(20), total int, customer_id int, KEY (tenant_id)) ENGINE=InnoDB");
                     $dbh->do("CREATE TABLE $t{lines} (id int primary key, order_id int, $tenant, qty int, KEY (tenant_id)) ENGINE=InnoDB");
-                    $dbh->do("INSERT INTO $t{customers} VALUES (1, 't1', 'mine'), (2, 'T1', 'upper'), (3, 't1 ', 'padded'), (4, 'tı', 'dotless')");
-                    $dbh->do("INSERT INTO $t{orders} VALUES (1, 't1', 'a', 1, 1), (2, 'T1', 'a', 2, 2), (3, 't1 ', 'a', 3, 3), (4, 'tı', 'a', 4, 4), (5, 't1', 'b', 5, 1)");
+                    $dbh->do("INSERT INTO $t{customers} VALUES (1, 't1', 'mine'), (2, 'T1', 'upper'), (3, 't1 ', 'padded'), (4, '$other', 'dotless')");
+                    $dbh->do("INSERT INTO $t{orders} VALUES (1, 't1', 'a', 1, 1), (2, 'T1', 'a', 2, 2), (3, 't1 ', 'a', 3, 3), (4, '$other', 'a', 4, 4), (5, 't1', 'b', 5, 1)");
                     # Line 11 is a 'T1' row under tenant 't1's order 1.
-                    $dbh->do("INSERT INTO $t{lines} VALUES (10, 1, 't1', 1), (11, 1, 'T1', 2), (12, 2, 'T1', 3), (13, 3, 't1 ', 4), (14, 4, 'tı', 5)");
+                    $dbh->do("INSERT INTO $t{lines} VALUES (10, 1, 't1', 1), (11, 1, 'T1', 2), (12, 2, 'T1', 3), (13, 3, 't1 ', 4), (14, 4, '$other', 5)");
                 };
                 my $rows = sub {
                     my ($table) = @_;
-                    return $dbh->selectall_arrayref("SELECT id, CAST(tenant_id AS BINARY), "
+                    return $dbh->selectall_arrayref("SELECT id, CAST(CONVERT(tenant_id USING utf8mb4) AS BINARY), "
                         . ($table eq 'lines' ? 'qty' : $table eq 'orders' ? 'total' : 'name') . " FROM $t{$table} ORDER BY id");
                 };
                 $reset->();
