@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - A MySQL/MariaDB reference guard compares the referenced parent's tenant
+      column by the parent column's own declared type (carried on the guard
+      as tenant_type), exactly unless it is declared numeric. It was decided
+      by the written relation's tenant type, so an integer tenant on the
+      written table compared a text parent tenant under its collation: on
+      MariaDB (PAD SPACE) tenant 7 could reference a parent of tenant '7 '.
     - Selecto::API::error_status answers invalid_connection (a MySQL/MariaDB
       session that breaks the adapter's contract) with HTTP 500: it is host
       misconfiguration, not a bad request, as in selecto-r and

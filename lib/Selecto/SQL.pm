@@ -2771,7 +2771,7 @@ sub _compile_foreign_key_guards {
             my $condition = $_;
             ' AND ' . $self->_identity_values_sql(
                 "$alias." . $self->quote_identifier(Selecto::Identifier::checked($condition->{tenant_field})),
-                $condition->{tenants}, $params, $self->_guard_identity_exact($command));
+                $condition->{tenants}, $params, $self->_guard_identity_exact($condition));
         } (exists($guard->{tenant_field}) ? ($guard) : ()), @{$guard->{more_tenant_fields} // []};
         $self->_foreign_key_exists_sql(
             'SELECT 1 FROM ' . $self->quote_identifier(Selecto::Identifier::checked($guard->{relation})) . " AS $alias"
@@ -2783,17 +2783,14 @@ sub _compile_foreign_key_guards {
 
 sub _foreign_key_exists_sql { return "EXISTS ($_[1])"; }
 
-# A referenced parent's tenant column is compared with the trusted tenants
-# exactly unless every tenant column of the written relation is declared
-# numeric (the parent's own column type is not part of the guard).
+# A referenced parent's tenant column is compared with the trusted tenants by
+# the parent column's own declared type (the guard's tenant_type), exactly
+# unless it is declared numeric: the written relation's tenant type says
+# nothing about the parent's column.
 sub _guard_identity_exact {
-    my ($self, $command) = @_;
+    my ($self, $condition) = @_;
     return 0 unless $self->_exact_identity_compare;
-    my $metadata = $command->metadata;
-    my $types = ref($metadata->{__selecto_insert_types}) eq 'HASH' ? $metadata->{__selecto_insert_types} : {};
-    my $fields = ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY' ? $metadata->{__selecto_tenant_fields} : [];
-    return 1 unless @$fields;
-    return (grep { _identity_text_type($types->{$_}) } @$fields) ? 1 : 0;
+    return _identity_text_type(ref($condition) eq 'HASH' ? $condition->{tenant_type} : undef);
 }
 
 sub _guarded_insert_source {

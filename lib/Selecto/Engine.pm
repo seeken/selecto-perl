@@ -1569,6 +1569,7 @@ sub _domain_references {
         root_tenant_fields => _root_tenant_fields($domain->tenant_field, $scope),
         foreign_keys => _declared_foreign_keys($contract->{writes}),
         schemas => _schema_tenancy($schemas),
+        types => $domain->fields,
         associations => [map {
             my $association = $associations->{$_};
             my $target = defined($association->queryable) ? $schemas->{$association->queryable} : undef;
@@ -1605,6 +1606,7 @@ sub _contract_references {
         root_tenant_fields => _root_tenant_fields($source->{tenant_field}, $scope),
         foreign_keys => _declared_foreign_keys($contract->{writes}),
         schemas => _schema_tenancy($schemas),
+        types => _column_types($source),
         associations => [map {
             my $spec = $associations->{$_};
             my $target = ref($spec) eq 'HASH' && defined($spec->{queryable}) ? $schemas->{$spec->{queryable}} : undef;
@@ -1642,6 +1644,30 @@ sub _declared_foreign_keys {
     return $constraints->{foreign_keys};
 }
 
+# {column => declared type} of a contract relation (types left out when a
+# column declares none).
+sub _column_types {
+    my ($relation) = @_;
+    my $columns = ref($relation) eq 'HASH' && ref($relation->{columns}) eq 'HASH' ? $relation->{columns} : {};
+    return {map {
+        my $type = ref($columns->{$_}) eq 'HASH' ? $columns->{$_}{type} : $columns->{$_};
+        defined($type) && !ref($type) ? ("$_" => "$type") : ()
+    } keys %$columns};
+}
+
+# The declared types a referenced relation gives a guarded column: from the
+# written relation itself when it references its own table, and from every
+# schema of that table. A reference guard compares the column with the
+# trusted tenants by its own type, never by the written relation's.
+sub _referenced_column_types {
+    my ($references, $relation, $column) = @_;
+    my @types = map { defined($_->{types}{$column}) ? ($_->{types}{$column}) : () }
+        grep { $_->{table} eq $relation } @{$references->{schemas} // []};
+    push @types, $references->{types}{$column}
+        if $relation eq ($references->{table} // '') && defined(($references->{types} // {})->{$column});
+    return @types;
+}
+
 sub _schema_tenancy {
     my ($schemas) = @_;
     return [map {
@@ -1650,6 +1676,7 @@ sub _schema_tenancy {
             table => $schema->{source_table} // $_,
             tenant_field => $schema->{tenant_field},
             static => defined($schema->{values}) ? 1 : 0,
+            types => _column_types($schema),
             stores => {map { (defined($_) && !ref($_) ? ("$_" => 1) : ()) }
                 (ref($schema->{fields}) eq 'ARRAY' ? @{$schema->{fields}} : ()),
                 (ref($schema->{columns}) eq 'HASH' ? keys %{$schema->{columns}} : ())},
@@ -1765,11 +1792,18 @@ sub _foreign_key_guards {
         my $key = join "\0", @{$candidate}{qw(field relation target_field)}, map { $_->[0] } @conditions;
         next if $seen{$key}++;
         my ($first, @more) = @conditions;
+        # The referenced column's declared type, when every declaration of it
+        # agrees; adapters compare an undeclared or text column exactly.
+        my $type_of = sub {
+            my %types = map { (lc($_) => 1) } _referenced_column_types($references, $candidate->{relation}, $_[0]);
+            return keys(%types) == 1 ? (tenant_type => (keys %types)[0]) : ();
+        };
         my $guard={
             field => $candidate->{field}, relation => $candidate->{relation},
             target_field => $candidate->{target_field}, value => $value,
-            ($first ? (tenant_field => $first->[0], tenants => [@{$first->[1]}]) : ()),
-            (@more ? (more_tenant_fields => [map { {tenant_field => $_->[0], tenants => [@{$_->[1]}]} } @more]) : ()),
+            ($first ? (tenant_field => $first->[0], tenants => [@{$first->[1]}], $type_of->($first->[0])) : ()),
+            (@more ? (more_tenant_fields => [map { {tenant_field => $_->[0], tenants => [@{$_->[1]}],
+                $type_of->($_->[0])} } @more]) : ()),
         };
         $output->check_tree($guard,label=>'foreign-key guards');push @guards,$guard;
     }
