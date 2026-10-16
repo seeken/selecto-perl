@@ -222,6 +222,43 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
                 'no order references another tenant\'s parent');
             $dbh->do("DROP TABLE IF EXISTS $_") for qw(selecto_tc_mix_orders selecto_tc_mix_customers);
         };
+
+        # Host-trusted scope on a domain without tenant_field: the required
+        # predicate, a command's scope predicate and query-enforcement
+        # evidence compare their text eq/IN columns exactly.
+        subtest 'host-trusted scope on a text column compares exactly without tenant_field' => sub {
+            my $reset = sub {
+                $dbh->do('DROP TABLE IF EXISTS selecto_tc_host');
+                $dbh->do('CREATE TABLE selecto_tc_host (id int primary key, org_key varchar(16) NOT NULL, name varchar(20)) ENGINE=InnoDB');
+                $dbh->do(q{INSERT INTO selecto_tc_host VALUES (1, 't1', 'a'), (2, 'T1', 'a'), (3, 't1 ', 'a'), (4, 't2', 'a')});
+            };
+            my $changed = sub { [map { $_->[0] } @{$dbh->selectall_arrayref(q{SELECT id FROM selecto_tc_host WHERE name = 'x' ORDER BY id})}] };
+            my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Host',
+                source => relation('selecto_tc_host', id => 'integer', org_key => 'string', name => 'string'),
+                schemas => {}, joins => {},
+                writes => {operations => {update => {enabled => 1, bulk => 1, expected_cardinality => 'many'}},
+                    fields => {name => {updatable => 1}}}});
+            my $adapter = Selecto->adapter($backend => (dbh => $dbh));
+            my $update = sub { Selecto::Write::Command->new(operation => 'update', relation => 'selecto_tc_host',
+                assignments => {name => 'x'}, predicate => $x->in('id', [1, 2, 3, 4]), @_) };
+            $reset->();
+            my $required = Selecto::Engine->new(adapter => $adapter,
+                domain => $domain->with_required_predicate($x->in('org_key', ['t1'])));
+            is_deeply([map { $_->[0] } @{$required->all($required->query->select('id')->order_by('id'))->{rows}}], [1],
+                'a required IN reads only the exact rows');
+            is(code_of(sub { $required->execute_write($update->()) }), 'ok', 'a required-scope update runs');
+            is_deeply($changed->(), [1], 'it changes only the exact row');
+            my $engine = Selecto::Engine->new(adapter => $adapter, domain => $domain);
+            $reset->();
+            is(code_of(sub { $engine->execute_write($update->(scope_predicate => $x->eq('org_key', 't1'))) }), 'ok',
+                'a scope-predicate update runs');
+            is_deeply($changed->(), [1], 'a host scope predicate changes only the exact row');
+            $reset->();
+            is(code_of(sub { $engine->execute_write($engine->enforce_query($update->(),
+                $engine->query->where($x->eq('org_key', 't1')))) }), 'ok', 'a query-enforced update runs');
+            is_deeply($changed->(), [1], 'query-enforcement evidence changes only the exact row');
+            $dbh->do('DROP TABLE selecto_tc_host');
+        };
         $dbh->disconnect;
     };
 }

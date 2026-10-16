@@ -105,7 +105,7 @@ sub selectrow_array {
     die "TestSelecto::DBH has no answer for $sql\n" unless TestSelecto::DBH::session_query($sql);
     return TestSelecto::DBH::session_row($sql);
 }
-sub session_query { return $_[0] =~ /\ASELECT \@\@SESSION\.time_zone\b/ ? 1 : 0; }
+sub session_query { return $_[0] =~ /SELECT \@\@SESSION\.time_zone\b/ ? 1 : 0; }
 sub session_row {
     my ($sql) = @_;
     return ('UTC', 'UTC', 'utf8mb4', 'utf8mb4', 'utf8mb4', 'STRICT_TRANS_TABLES', "\x{1F600}",

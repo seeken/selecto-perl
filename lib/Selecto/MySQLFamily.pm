@@ -11,6 +11,18 @@ use Selecto::InsertAdmission ();
 use Selecto::SQL::RollupEmulation ();
 use Scalar::Util qw(blessed refaddr);
 
+# MariaDB's subquery (expression) cache keys a correlated subquery's outer
+# references under their collation, so a byte-exact correlation reuses the
+# result computed for 't7' when the outer row holds 'T7' or 't7 '. Every
+# statement the library sends to MariaDB turns the cache off for that
+# statement only (the host's session is unchanged).
+my $MARIADB_STATEMENT = q{SET STATEMENT optimizer_switch='subquery_cache=off' FOR };
+
+sub _statement_sql {
+    my ($self, $sql) = @_;
+    return $self->name eq 'mariadb' ? $MARIADB_STATEMENT . $sql : $sql;
+}
+
 sub placeholder {
     my ($self, $index) = @_;
     Selecto::Error->throw('invalid_query', 'placeholder index must be positive')
@@ -297,6 +309,13 @@ sub _identity_equal_sql {
     return "($left = $right AND " . $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right) . ')';
 }
 
+# NULL-safe (<=>), and byte-exact for text identity columns.
+sub _identity_correlation_sql {
+    my ($self, $inner, $outer, $exact) = @_;
+    return "$inner <=> $outer" unless $exact;
+    return "($inner <=> $outer AND " . $self->_identity_bytes_sql($inner) . ' <=> ' . $self->_identity_bytes_sql($outer) . ')';
+}
+
 sub _identity_values_sql {
     my ($self, $column, $values, $params, $exact) = @_;
     return $self->SUPER::_identity_values_sql($column, $values, $params) unless $exact;
@@ -327,8 +346,12 @@ sub _refuse_inexact_identity {
 
 sub _identity_operand_field {
     my ($self, $domain, $operand) = @_;
-    return blessed($operand) && $operand->isa('Selecto::Expression') && $operand->kind eq 'field'
-        && $self->_identity_field_exact($domain, $operand->arguments->[0]) ? 1 : 0;
+    return 0 unless blessed($operand) && $operand->isa('Selecto::Expression') && $operand->kind eq 'field';
+    my $path = $operand->arguments->[0];
+    return 1 if $self->_identity_field_exact($domain, $path);
+    return 0 unless $self->{_selecto_host_identity};
+    my $resolved = eval { $domain->resolve("$path") };
+    return ref($resolved) eq 'HASH' && Selecto::SQL::_identity_text_type($resolved->{type}) ? 1 : 0;
 }
 
 # A read predicate (eq or IN) on a text tenant or site column: the root's,
@@ -341,6 +364,10 @@ sub _identity_predicate_sql {
     my $kind = $expression->kind;
     return undef unless $kind eq 'eq' || $kind eq 'in';
     my ($left, $right) = @{$expression->arguments};
+    # A top-level eq/IN conjunct of the host's required predicate on a text
+    # or undeclared column is tenant or scope identity too.
+    my $host = $self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{refaddr($expression)};
+    local $self->{_selecto_host_identity} = $host ? 1 : 0;
     if ($kind eq 'in') {
         return undef unless $self->_identity_operand_field($domain, $left);
         _refuse_inexact_identity() unless _identity_scalars($right);
@@ -370,7 +397,19 @@ sub _write_identity_columns {
     my $metadata = blessed($command) && $command->can('metadata') ? $command->metadata : {};
     my $fields = ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY' ? $metadata->{__selecto_tenant_fields} : [];
     my $types = ref($metadata->{__selecto_insert_types}) eq 'HASH' ? $metadata->{__selecto_insert_types} : {};
-    return {map { ($_ => 1) } grep { defined($_) && !ref($_) && Selecto::SQL::_identity_text_type($types->{$_}) } @$fields};
+    # The host-trusted parts of an engine-governed command (its scope
+    # predicate and the query-enforcement evidence) decide scope identity
+    # too: every field of their top-level eq/IN conjuncts. Commands compiled
+    # outside the engine (trusted *_unsafe tooling, previews) keep their SQL.
+    my $governed = ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY';
+    my @host = $governed && blessed($command) && $command->can('scope_predicate') ? map {
+        my $field = $_->arguments->[0];
+        blessed($field) && $field->isa('Selecto::Expression') && $field->kind eq 'field'
+            && !ref($field->arguments->[0]) ? ($field->arguments->[0]) : ()
+    } grep { $_->kind eq 'eq' || $_->kind eq 'in' } Selecto::SQL::_top_conjuncts($command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef) : ();
+    return {map { ($_ => 1) } grep { defined($_) && !ref($_) && Selecto::SQL::_identity_text_type($types->{$_}) }
+        @$fields, @host};
 }
 
 sub _compile_write_predicate {
@@ -995,10 +1034,10 @@ sub _admit_upsert_conflict {
     my $dbh = $self->dbh;
     my $indexes;
     my $ok = eval {
-        $dbh->do('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0');
+        $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0'));
         $self->_require_transactional_table($table);
-        $indexes = $dbh->selectall_arrayref(q{SELECT INDEX_NAME, COLUMN_NAME, SUB_PART FROM information_schema.STATISTICS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND NON_UNIQUE = 0 ORDER BY INDEX_NAME, SEQ_IN_INDEX},
+        $indexes = $dbh->selectall_arrayref($self->_statement_sql(q{SELECT INDEX_NAME, COLUMN_NAME, SUB_PART FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND NON_UNIQUE = 0 ORDER BY INDEX_NAME, SEQ_IN_INDEX}),
             undef, $table);
         1;
     };
@@ -1023,8 +1062,8 @@ sub _admit_upsert_conflict {
 # table would apply every statement immediately and ignore both.
 sub _require_transactional_table {
     my ($self, $table) = @_;
-    my ($engine) = $self->dbh->selectrow_array(q{SELECT ENGINE FROM information_schema.TABLES
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}, undef, $table);
+    my ($engine) = $self->dbh->selectrow_array($self->_statement_sql(q{SELECT ENGINE FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
     Selecto::Error->throw('write_capability_missing',
         'MySQL-family writes require an InnoDB table', {reason => 'non_transactional_engine'})
         unless defined($engine) && uc($engine) eq 'INNODB';
@@ -1069,7 +1108,7 @@ sub _execute_upsert {
     # Locks and updates the target's row; false when no such row exists.
     my $update_target = sub {
         my $rows;
-        my $ok = eval { $rows = $self->dbh->selectall_arrayref("SELECT 1 FROM $table WHERE $where FOR UPDATE", undef, @params); 1 };
+        my $ok = eval { $rows = $self->dbh->selectall_arrayref($self->_statement_sql("SELECT 1 FROM $table WHERE $where FOR UPDATE"), undef, @params); 1 };
         die $self->normalize_error($@) unless $ok;
         return 0 unless @$rows;
         my $update = Selecto::Write::Command->new(%shared, operation => 'update', predicate => $target,
@@ -1085,7 +1124,7 @@ sub _execute_upsert {
     # exclusive lock: a deadlock.
     if (!$null) {
         my $present;
-        my $ok = eval { ($present) = $self->dbh->selectrow_array("SELECT 1 FROM $table WHERE $where LIMIT 1", undef, @params); 1 };
+        my $ok = eval { ($present) = $self->dbh->selectrow_array($self->_statement_sql("SELECT 1 FROM $table WHERE $where LIMIT 1"), undef, @params); 1 };
         die $self->normalize_error($@) unless $ok;
         return $done->() if $present && $update_target->();
     }
@@ -1223,7 +1262,7 @@ sub _verify_inserted_row {
     my $sql = 'SELECT COUNT(*) FROM ' . $self->quote_identifier(Selecto::Identifier::checked($command->relation))
         . " WHERE $where";
     my ($count);
-    my $ok = eval { ($count) = $self->dbh->selectrow_array($sql, undef, @params); 1 };
+    my $ok = eval { ($count) = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_violation', 'stored row does not satisfy the enforced query',
         {truth_value => 'false_or_unknown'}) unless defined($count) && $count == $result->affected_rows;
@@ -1252,7 +1291,7 @@ sub _locked_write_keys {
     my $keys;
     my $ok = eval {
         $self->_require_transactional_table(Selecto::Identifier::checked($command->relation));
-        $keys = $self->dbh->selectcol_arrayref($sql, undef, @params);
+        $keys = $self->dbh->selectcol_arrayref($self->_statement_sql($sql), undef, @params);
         1;
     };
     die $@ if !$ok && blessed($@) && $@->isa('Selecto::Error');
@@ -1290,8 +1329,8 @@ sub _inserted_identity {
     my $table = Selecto::Identifier::checked($command->relation);
     my ($extra, $id);
     my $ok = eval {
-        ($extra) = $self->dbh->selectrow_array(q{SELECT EXTRA FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?}, undef, $table, $key);
+        ($extra) = $self->dbh->selectrow_array($self->_statement_sql(q{SELECT EXTRA FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?}), undef, $table, $key);
         $id = $self->dbh->{mariadb_insertid};
         1;
     };
@@ -1338,7 +1377,7 @@ sub _returning_rows {
         . " WHERE $where ORDER BY $key FOR UPDATE";
     my ($sth, $rows);
     my $ok = eval {
-        $sth = $self->dbh->prepare($sql);
+        $sth = $self->dbh->prepare($self->_statement_sql($sql));
         $self->_execute_statement($sth, \@params);
         my @types = $self->_column_types($sth);
         $rows = $sth->fetchall_arrayref;
@@ -1366,16 +1405,16 @@ sub insert_admission_storage {
     my $table = Selecto::Identifier::checked($command->relation);
     my ($mode, $kind, $triggers, $rows);
     my $ok = eval {
-        $dbh->do('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0');
+        $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0'));
         $self->_require_transactional_table($table);
-        ($mode) = $dbh->selectrow_array('SELECT @@SESSION.sql_mode');
-        ($kind) = $dbh->selectrow_array(q{SELECT TABLE_TYPE FROM information_schema.TABLES
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}, undef, $table);
-        ($triggers) = $dbh->selectrow_array(q{SELECT COUNT(*) FROM information_schema.TRIGGERS
-            WHERE EVENT_OBJECT_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = ?}, undef, $table);
-        $rows = $dbh->selectall_arrayref(q{SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, EXTRA,
+        ($mode) = $dbh->selectrow_array($self->_statement_sql('SELECT @@SESSION.sql_mode'));
+        ($kind) = $dbh->selectrow_array($self->_statement_sql(q{SELECT TABLE_TYPE FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
+        ($triggers) = $dbh->selectrow_array($self->_statement_sql(q{SELECT COUNT(*) FROM information_schema.TRIGGERS
+            WHERE EVENT_OBJECT_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = ?}), undef, $table);
+        $rows = $dbh->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, EXTRA,
             CHARACTER_SET_NAME, COLLATION_NAME FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}, {Slice => {}}, $table);
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), {Slice => {}}, $table);
         1;
     };
     die $self->normalize_error($@) unless $ok;
@@ -1559,10 +1598,10 @@ sub _require_session {
     my @row;
     my $ok = eval {
         local $dbh->{PrintError} = 0;
-        @row = $dbh->selectrow_array('SELECT @@SESSION.time_zone, @@system_time_zone, '
+        @row = $dbh->selectrow_array($self->_statement_sql('SELECT @@SESSION.time_zone, @@system_time_zone, '
             . '@@SESSION.character_set_client, @@SESSION.character_set_connection, @@SESSION.character_set_results, '
             . q{@@SESSION.sql_mode, CONVERT(X'F09F9880' USING utf8mb4), CAST('2024-03-10 02:30:00.5' AS DATETIME(6))}
-            . ($open_check ? ', @@in_transaction' : ''));
+            . ($open_check ? ', @@in_transaction' : '')));
         1;
     };
     die $self->normalize_error($@) unless $ok;

@@ -1017,6 +1017,9 @@ sub _savepoint_command {
     return $self->SUPER::_savepoint_command($action, $name);
 }
 
+# NULL-safe identity comparison (retarget rebinding).
+sub _identity_correlation_sql { return "$_[1] IS $_[2]"; }
+
 package Selecto::SQLite::Stream;
 use Mojo::Base 'Selecto::Stream';
 sub next {
@@ -1024,6 +1027,7 @@ sub next {
     return undef if $self->closed;
     return $self->{sqlite_adapter}->_read_only(sub { $self->SUPER::next });
 }
+
 
 1;
 

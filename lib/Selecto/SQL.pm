@@ -204,6 +204,10 @@ sub _compile_single {
     my @joins;
     my $predicate = Selecto::QueryEnforcement::combine(
         $domain->required_predicate, $query->predicate);
+    # The top-level eq/IN conjuncts of the host-trusted required predicate
+    # decide tenant or scope identity even without a declared tenant_field.
+    local $self->{_selecto_host_conjuncts} = $self->_exact_identity_compare
+        ? {map { (refaddr($_) => 1) } _top_conjuncts($domain->required_predicate)} : undef;
     my @association_paths = $self->_referenced_associations($query, $predicate, $domain);
     my ($join_aliases, $through_aliases) = _association_alias_maps(@association_paths);
     local $self->{_join_aliases} = $join_aliases;
@@ -379,7 +383,10 @@ sub _compile_single {
         ref($_) eq 'CODE' ? $_->(\@params) : $_
     } @{$options{extra_predicates} // []};
     push @predicates, map {
-        $self->_compile_expression($domain, $_->[0], \@params) . ' = ' . $_->[1]
+        ref($_) eq 'HASH'
+            ? $self->_identity_correlation_sql($self->_qualified($self->_join_alias($_->{path}), $_->{column}),
+                $_->{outer}, $_->{exact})
+            : $self->_compile_expression($domain, $_->[0], \@params) . ' = ' . $_->[1]
     } @{$options{correlations} // []};
     if (@predicates) {
         $sql .= ' WHERE ' . (@predicates == 1
@@ -523,14 +530,32 @@ sub _compile_retargeted {
         selections => [$key],
         (defined($spec->{context}) ? (predicate => $spec->{context}) : ()),
     );
-    my $outer_key = $self->_qualified($options{root_alias} // 's0', $target->{primary_key});
-    my $exists = $spec->{strategy} eq 'exists';
+    my $outer_alias = $options{root_alias} // 's0';
+    my $outer_key = $self->_qualified($outer_alias, $target->{primary_key});
+    # The target's key alone does not identify its row when the relation is
+    # confined by a tenant field or authored scope columns: the same key can
+    # repeat across tenants or scopes. The target row is rebound on its full
+    # identity (key, declared tenant_field, and the scope column the last hop
+    # pairs on, through a bridge too), NULL-safely, and on dialects whose
+    # collations fold text, byte-exactly. Such a retarget correlates through
+    # EXISTS whatever its strategy.
+    my $association = $target->{association};
+    my $through = $association->through;
+    my %seen;
+    my @identity = grep { defined($_) && !ref($_) && $_ ne $target->{primary_key} && !$seen{$_}++ }
+        $association->target_tenant_field,
+        ($through ? $through->{target_scope_key} : $association->target_scope_key);
+    my $exists = $spec->{strategy} eq 'exists' || @identity;
+    my @identity_correlations = map {
+        {path => $target->{path}, column => $_, outer => $self->_qualified($outer_alias, $_),
+            exact => $self->_association_identity_exact($association, $_)}
+    } @identity;
     my $context_predicate = sub {
         my ($params) = @_;
         my $statement = $self->_compile_single(
             $domain, $context,
             root_alias => 'r0',
-            ($exists ? (correlations => [[$key, $outer_key]]) : ()),
+            ($exists ? (correlations => [[$key, $outer_key], @identity_correlations]) : ()),
         );
         my $sql = $self->_shift_placeholders($statement->sql, scalar @$params);
         push @$params, @{$statement->params};
@@ -1177,7 +1202,11 @@ sub _stream_decoder {
     return sub { return $self->_decode(@_); };
 }
 
-sub _query_transport_sql { return $_[1]->sql; }
+sub _query_transport_sql { return $_[0]->_statement_sql($_[1]->sql); }
+
+# Dialect hook: the text sent for one library statement (reads, streams,
+# writes, probes and re-reads). The default sends it unchanged.
+sub _statement_sql { return $_[1]; }
 sub _execute_statement { return $_[1]->execute(@{$_[2]}); }
 
 # Dialect hook: true when queries and writes reuse statement handles
@@ -2519,9 +2548,28 @@ sub _tenant_pair_sql {
 # SQL is the plain comparison.
 sub _exact_identity_compare { return 0; }
 
+# The top-level conjuncts of an expression (the operands of nested ANDs).
+sub _top_conjuncts {
+    my @pending = grep { defined } @_;
+    my @conjuncts;
+    while (my $expression = shift @pending) {
+        next unless blessed($expression) && $expression->isa('Selecto::Expression');
+        if ($expression->kind eq 'and') { push @pending, @{$expression->arguments->[0]}; next }
+        push @conjuncts, $expression;
+    }
+    return @conjuncts;
+}
+
 sub _identity_equal_sql {
     my ($self, $left, $right, $exact) = @_;
     return "$left = $right";
+}
+
+# A NULL-safe identity comparison of an inner and an outer column (retarget
+# rebinding): two NULLs match. Dialects override with their own operator.
+sub _identity_correlation_sql {
+    my ($self, $inner, $outer, $exact) = @_;
+    return "($inner = $outer OR ($inner IS NULL AND $outer IS NULL))";
 }
 
 # $column compared with bound values: = for one value, IN for several.
@@ -3000,7 +3048,7 @@ sub _typed_insert_admission_probe {
         ->consume_parameters(\@params, label => 'insert policy parameter');
     my ($sth, @row);
     my $ok = eval {
-        $sth = $self->dbh->prepare($sql);
+        $sth = $self->dbh->prepare($self->_statement_sql($sql));
         die _dbi_error($self->dbh, 'insert admission preparation failed') unless $sth;
         defined($self->_execute_statement($sth, \@params))
             or die _dbi_error($sth, 'insert admission failed');
@@ -3079,7 +3127,7 @@ sub _execute_compiled_write_in_transaction {
         if ($self->_statement_cache_enabled) {
             $sth = $self->_cached_execute($compiled->{sql}, $compiled->{params}, 'database write failed');
         } else {
-            $sth = $self->{dbh}->prepare($compiled->{sql});
+            $sth = $self->{dbh}->prepare($self->_statement_sql($compiled->{sql}));
             die _dbi_error($self->{dbh}, 'database prepare failed') unless $sth;
             my $executed = $self->_execute_statement($sth, $compiled->{params});
             die _dbi_error($sth, 'database write failed') unless defined $executed;
@@ -3163,7 +3211,7 @@ sub _bounded_write_command {
     my ($budget, $sth, @identities, $error);
     my $ok = eval {
         $budget = $self->begin_query_budget(timeout_ms => 5000);
-        $sth = $self->dbh->prepare($sql);
+        $sth = $self->dbh->prepare($self->_statement_sql($sql));
         die _dbi_error($self->dbh, 'bounded write preparation failed') unless $sth;
         defined($self->_execute_statement($sth, \@params))
             or die _dbi_error($sth, 'bounded write selection failed');

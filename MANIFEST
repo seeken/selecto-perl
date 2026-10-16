@@ -184,6 +184,16 @@ t/query_member.t
 t/reference_tenant_agreement.t
 t/required_predicate_write_guard.t
 t/retarget.t
+t/retarget_identity_live.t
+t/fixtures/retarget_identity/index.json
+t/fixtures/retarget_identity/setup.sql
+t/fixtures/retarget_identity/sp.json
+t/fixtures/retarget_identity/sp2.json
+t/fixtures/retarget_identity/th.json
+t/fixtures/retarget_identity/v1.json
+t/fixtures/retarget_identity/v3.json
+t/fixtures/retarget_identity/v5.json
+t/fixtures/retarget_identity/v6.json
 t/sqlite.integration.t
 t/sqlite_parity.integration.t
 t/sqlite_json_contains.integration.t
