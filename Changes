@@ -1,6 +1,28 @@
 Revision history for Selecto
 
 Unreleased
+    - A retarget rebinds its target row on the target relation's full
+      identity: its key, its declared tenant_field and the scope column the
+      last hop pairs on (a through bridge's target_scope_key too), on every
+      backend. A key-only correlation returned other tenants' and scopes'
+      rows whenever target keys repeat across them. Such a retarget
+      correlates through EXISTS whatever its strategy; the comparison is
+      NULL-safe (IS NOT DISTINCT FROM on PostgreSQL, IS on SQLite, <=> on
+      MySQL/MariaDB, byte-exact there for text columns), so an unbound
+      retarget still returns target rows whose tenant column is NULL.
+      PostgreSQL and SQLite SQL changes only for retargets onto a relation
+      with a tenant_field or authored scope keys.
+    - Every statement the library sends to MariaDB is prefixed with
+      SET STATEMENT optimizer_switch='subquery_cache=off' FOR: MariaDB's
+      subquery cache keys a correlated subquery's outer references under
+      their collation and answered 'T7' with the result cached for 't7'.
+      The host's session is unchanged.
+    - The top-level eq/IN conjuncts of host-trusted scope on a text or
+      undeclared column compare exactly on MySQL/MariaDB even when the domain
+      declares no tenant_field: the required predicate (required_filters,
+      with_required_predicate, require_tenant_filter, a write context's
+      required filters) in reads and writes, and a command's scope predicate
+      and query-enforcement evidence in writes.
     - A MySQL/MariaDB reference guard compares the referenced parent's tenant
       column by the parent column's own declared type (carried on the guard
       as tenant_type), exactly unless it is declared numeric. It was decided

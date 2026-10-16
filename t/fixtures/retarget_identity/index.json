@@ -1,0 +1,335 @@
+[
+ {
+  "v": "v1",
+  "bounds": [
+   {
+    "label": "engine",
+    "tenant": "t7",
+    "required": null
+   },
+   {
+    "label": "required",
+    "tenant": null,
+    "required": [
+     [
+      "tenant_key",
+      "t7"
+     ]
+    ]
+   }
+  ],
+  "paths": [
+   {
+    "name": "join",
+    "kind": "join",
+    "field": "a.label"
+   },
+   {
+    "name": "retarget a in",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a exists",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "exists"
+   },
+   {
+    "name": "retarget a.reg in",
+    "kind": "retarget",
+    "target": "a.reg",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a.reg exists",
+    "kind": "retarget",
+    "target": "a.reg",
+    "strategy": "exists"
+   }
+  ]
+ },
+ {
+  "v": "v3",
+  "bounds": [
+   {
+    "label": "engine",
+    "tenant": "t7",
+    "required": null
+   },
+   {
+    "label": "required",
+    "tenant": null,
+    "required": [
+     [
+      "tenant_key",
+      "t7"
+     ]
+    ]
+   }
+  ],
+  "paths": [
+   {
+    "name": "join",
+    "kind": "join",
+    "field": "a.label"
+   },
+   {
+    "name": "retarget a in",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a exists",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "exists"
+   },
+   {
+    "name": "retarget a.reg in",
+    "kind": "retarget",
+    "target": "a.reg",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a.reg exists",
+    "kind": "retarget",
+    "target": "a.reg",
+    "strategy": "exists"
+   }
+  ]
+ },
+ {
+  "v": "v5",
+  "bounds": [
+   {
+    "label": "engine",
+    "tenant": "t7",
+    "required": null
+   },
+   {
+    "label": "required",
+    "tenant": null,
+    "required": [
+     [
+      "tenant_key",
+      "t7"
+     ]
+    ]
+   }
+  ],
+  "paths": [
+   {
+    "name": "join",
+    "kind": "join",
+    "field": "a.label"
+   },
+   {
+    "name": "retarget a in",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a exists",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "exists"
+   },
+   {
+    "name": "retarget a.reg in",
+    "kind": "retarget",
+    "target": "a.reg",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a.reg exists",
+    "kind": "retarget",
+    "target": "a.reg",
+    "strategy": "exists"
+   }
+  ]
+ },
+ {
+  "v": "v6",
+  "bounds": [
+   {
+    "label": "engine",
+    "tenant": "t7",
+    "required": null
+   },
+   {
+    "label": "required",
+    "tenant": null,
+    "required": [
+     [
+      "tenant_key",
+      "t7"
+     ]
+    ]
+   }
+  ],
+  "paths": [
+   {
+    "name": "join",
+    "kind": "join",
+    "field": "a.label"
+   },
+   {
+    "name": "retarget a in",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a exists",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "exists"
+   },
+   {
+    "name": "retarget a.reg in",
+    "kind": "retarget",
+    "target": "a.reg",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a.reg exists",
+    "kind": "retarget",
+    "target": "a.reg",
+    "strategy": "exists"
+   }
+  ]
+ },
+ {
+  "v": "th",
+  "bounds": [
+   {
+    "label": "engine",
+    "tenant": "t7",
+    "required": null
+   },
+   {
+    "label": "required",
+    "tenant": null,
+    "required": [
+     [
+      "tenant_key",
+      "t7"
+     ]
+    ]
+   }
+  ],
+  "paths": [
+   {
+    "name": "join",
+    "kind": "join",
+    "field": "th.label"
+   },
+   {
+    "name": "retarget th in",
+    "kind": "retarget",
+    "target": "th",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget th exists",
+    "kind": "retarget",
+    "target": "th",
+    "strategy": "exists"
+   }
+  ]
+ },
+ {
+  "v": "sp",
+  "bounds": [
+   {
+    "label": "engine",
+    "tenant": "t7",
+    "required": null
+   },
+   {
+    "label": "required",
+    "tenant": null,
+    "required": [
+     [
+      "tenant_key",
+      "t7"
+     ]
+    ]
+   }
+  ],
+  "paths": [
+   {
+    "name": "join",
+    "kind": "join",
+    "field": "a.label"
+   },
+   {
+    "name": "collection",
+    "kind": "collection",
+    "assoc": "as",
+    "field": "label"
+   },
+   {
+    "name": "retarget a in",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a exists",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "exists"
+   }
+  ]
+ },
+ {
+  "v": "sp2",
+  "bounds": [
+   {
+    "label": "engine",
+    "tenant": "t7",
+    "required": null
+   },
+   {
+    "label": "required",
+    "tenant": null,
+    "required": [
+     [
+      "tenant_key",
+      "t7"
+     ]
+    ]
+   }
+  ],
+  "paths": [
+   {
+    "name": "join",
+    "kind": "join",
+    "field": "a.label"
+   },
+   {
+    "name": "collection",
+    "kind": "collection",
+    "assoc": "as",
+    "field": "label"
+   },
+   {
+    "name": "retarget a in",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "in"
+   },
+   {
+    "name": "retarget a exists",
+    "kind": "retarget",
+    "target": "a",
+    "strategy": "exists"
+   }
+  ]
+ }
+]

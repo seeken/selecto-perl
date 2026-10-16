@@ -119,6 +119,27 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
     ok(eval { $events->compile($events->query->select($x->datetime_format('at', 'day', timezone => 'Europe/Paris')->as('d'))) },
         "$name compiles an IANA format zone");
 
+    # A host-trusted required predicate's top-level eq/IN on a text column is
+    # tenant or scope identity even when the domain declares no tenant_field.
+    {
+        my $source = {source_table => 'accounts', primary_key => 'id', fields => [qw(id org name)],
+            columns => {id => {type => 'integer'}, org => {type => 'string'}, name => {type => 'string'}}, associations => {}};
+        my $plain = Selecto::Domain->parse({schema_version => 1, name => 'Accounts', source => $source, schemas => {}, joins => {},
+            writes => {operations => {update => {enabled => 1, bulk => 1, expected_cardinality => 'many'}},
+                fields => {name => {updatable => 1}}}});
+        my $hosted = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => bless({%{TestSelecto::DBH->new}, version => $version}, 'VersionedDBH'))),
+            domain => $plain->with_required_predicate($x->all($x->eq('org', 't7'), $x->in('name', ['a', 'b']))));
+        my $sql = $hosted->compile($hosted->query->select('id')->where($x->eq('name', 'c')))->sql;
+        like($sql, qr/\(`s0`\.`org` = \? AND CAST\(CONVERT\(`s0`\.`org` USING utf8mb4\) AS BINARY\) = CAST\(\? AS BINARY\)\)/,
+            "$name compares a host eq conjunct exactly without tenant_field");
+        like($sql, qr/`s0`\.`name` IN \(\?, \?\) AND CAST/, "$name compares a host IN conjunct exactly");
+        like($sql, qr/\(`s0`\.`name` = \?\)\z/, "$name leaves a caller's own filter collated");
+        my $command = $hosted->governed_write(Selecto::Write::Command->new(operation => 'update', relation => 'accounts',
+            assignments => {name => 'z'}, predicate => $x->gt('id', 0)));
+        like($hosted->adapter->_compile_write($command)->{sql}, qr/CAST\(CONVERT\(`org` USING utf8mb4\) AS BINARY\)/,
+            "$name writes compare the host conjunct exactly");
+    }
+
     # Tenant identity compares exactly on a text tenant column (bound twice,
     # in text order); a numeric tenant column compiles as before.
     for my $tenant_type ('string', 'integer') {

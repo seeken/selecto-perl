@@ -172,7 +172,7 @@ package RecordingDBH {
     }
     sub selectrow_array {
         my ($self, $sql) = @_;
-        if (defined($self->{session}) && $sql =~ /\ASELECT \@\@SESSION\.time_zone\b/) {
+        if (defined($self->{session}) && $sql =~ /SELECT \@\@SESSION\.time_zone\b/) {
             push @{$self->{events}}, 'SESSION';
             return @{$self->{session}}[0 .. ($sql =~ /\@\@in_transaction\z/ ? 8 : 7)];
         }

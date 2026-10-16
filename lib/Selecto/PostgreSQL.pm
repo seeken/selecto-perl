@@ -1151,6 +1151,9 @@ sub _refuse_connection_state {
         {state => exists($reason{$state}) ? $state : 'unknown'});
 }
 
+
+sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
+
 1;
 
 __END__
