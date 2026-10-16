@@ -2638,12 +2638,15 @@ sub _identity_text_type {
     return 2 unless length($name);
     # Known non-text: numbers, booleans, temporal values, JSON and binary.
     return 0 if $name =~ /\A(?:integer|int|bigint|smallint|tinyint|mediumint|serial|bigserial|decimal|numeric|number
-        |float|double|double precision|real|money|boolean|bool|bit|date|time|datetime|timestamp|timestamptz
-        |timestamp with time zone|timestamp without time zone|time with time zone|time without time zone|year|interval
+        |float|double|double[ ]precision|real|money|boolean|bool|bit|date|time|datetime|timestamp|timestamptz
+        |timestamp[ ]with[ ]time[ ]zone|timestamp[ ]without[ ]time[ ]zone|time[ ]with[ ]time[ ]zone|time[ ]without[ ]time[ ]zone|year|interval
         |naive_\w+|utc_\w+|epoch_\w+|json|jsonb|map|binary|varbinary|bytes|bytea|blob|tinyblob|mediumblob|longblob)\z/x;
-    # Known text: the declared text names and their synonyms.
-    return 1 if $name =~ /\A(?:string|text|char|character|varchar|character varying|nvarchar|nchar|citext|clob|enum|set)\z/
-        || $name =~ /char|text/;
+    # Known text: the declared text names and their synonyms, listed
+    # explicitly (a name merely containing 'char' or 'text' may be a custom
+    # name for anything; it is guarded below).
+    return 1 if $name =~ /\A(?:string|text|tinytext|mediumtext|longtext|ntext|char|character|nchar|national[ ]char
+        |national[ ]character|varchar|char[ ]varying|character[ ]varying|nvarchar|national[ ]varchar|national[ ]char[ ]varying
+        |national[ ]character[ ]varying|nchar[ ]varying|varchar2|nvarchar2|citext|clob|nclob|enum|set)\z/x;
     # Everything else (uuid, unknown, custom names) is decided by the server.
     return 2;
 }

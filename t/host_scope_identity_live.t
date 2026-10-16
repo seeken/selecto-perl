@@ -186,6 +186,50 @@ for my $backend (@backends) {
         $dbh->do('DROP TABLE IF EXISTS selecto_hs_roots');
     };
 
+    # Custom type names that merely contain 'char' or 'text' are not text:
+    # a TIMESTAMP(3) declared context_ts and a DECIMAL declared charge_amount
+    # compare as PostgreSQL does (the server decides), while the listed text
+    # synonyms stay exact.
+    subtest "$name custom names containing char or text are decided by the server" => sub {
+        my $stamp = $my ? 'TIMESTAMP(3) NULL' : 'TIMESTAMP(3)';
+        my $reset = sub {
+            $dbh->do('DROP TABLE IF EXISTS selecto_hs_ct');
+            $dbh->do("CREATE TABLE selecto_hs_ct (id INT PRIMARY KEY, at $stamp, amt DECIMAL(10,2), label VARCHAR(16), code VARCHAR(16), name VARCHAR(20))");
+            $dbh->do(q{INSERT INTO selecto_hs_ct VALUES (1, '2024-01-01 10:00:00', 1.00, 't1', 't1', 'a'),
+                (2, '2024-01-01 10:00:00', 1.00, 'T1', 'T1', 'a'), (3, '2024-01-01 10:00:00.5', 2.50, 't1 ', 't1 ', 'a')});
+        };
+        my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Ct',
+            source => relation('selecto_hs_ct', id => 'integer', at => 'context_ts', amt => 'charge_amount',
+                label => 'char varying', code => 'national varchar', name => 'string'),
+            schemas => {}, joins => {},
+            writes => {operations => {update => {enabled => 1, bulk => 1, expected_cardinality => 'many'}},
+                fields => {name => {updatable => 1}}}});
+        my $adapter = Selecto->adapter($name => (dbh => $dbh));
+        for my $case (
+            ['context_ts <>', $x->ne('at', '2024-01-01 10:00:00'), [3]],
+            ['context_ts NOT IN', $x->not($x->in('at', ['2024-01-01 10:00:00'])), [3]],
+            ['context_ts =', $x->eq('at', '2024-01-01 10:00:00'), [1, 2]],
+            ['charge_amount <>', $x->ne('amt', '1'), [3]],
+            ['charge_amount NOT IN', $x->not($x->in('amt', ['1'])), [3]],
+            ['charge_amount =', $x->eq('amt', '1'), [1, 2]],
+            ['char varying =', $x->eq('label', 't1'), [1]],
+            ['national varchar =', $x->eq('code', 't1'), [1]],
+        ) {
+            my ($label, $predicate, $expected) = @$case;
+            $reset->();
+            my $engine = Selecto::Engine->new(adapter => $adapter, domain => $domain->with_required_predicate($predicate));
+            my $rows = eval { $engine->all($engine->query->select('id')->order_by('id'))->{rows} };
+            is_deeply([map { $_->[0] } @{$rows // []}], $expected, "required $label reads the PostgreSQL rows")
+                or diag(blessed($@) ? $@->code . ' ' . $@->message : $@);
+            is(code_of(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_hs_ct',
+                assignments => {name => 'x'}, predicate => $x->gt('id', 0), expected_count => scalar(@$expected))) }), 'ok',
+                "required $label update runs");
+            is_deeply([map { $_->[0] } @{$dbh->selectall_arrayref(q{SELECT id FROM selecto_hs_ct WHERE name = 'x' ORDER BY id})}],
+                $expected, "required $label updates the PostgreSQL rows");
+        }
+        $dbh->do('DROP TABLE IF EXISTS selecto_hs_ct');
+    };
+
     # Declared type names: only known non-text types compare plainly. A uuid
     # (stored as text), a custom name and parameterised or synonym text names
     # compare exactly, as PostgreSQL does.
