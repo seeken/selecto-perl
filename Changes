@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Host-trusted scope on MySQL/MariaDB is exact at any depth: every =,
+      <> and IN comparison of a required predicate, a command's scope
+      predicate or query-enforcement evidence on a text or undeclared column
+      (through AND, OR and NOT) uses the byte form; <> and NOT IN negate the
+      exact equality. Range and LIKE comparisons keep the collation. This
+      also holds for writes compiled outside the engine (trusted tooling,
+      previews), whose compiled statement then carries logical_params: the
+      bound values with each exact comparison's repeated copy left out.
     - A retarget rebinds its target row on the target relation's full
       identity: its key, its declared tenant_field and the scope column the
       last hop pairs on (a through bridge's target_scope_key too), on every

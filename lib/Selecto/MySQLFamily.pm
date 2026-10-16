@@ -321,6 +321,10 @@ sub _identity_values_sql {
     return $self->SUPER::_identity_values_sql($column, $values, $params) unless $exact;
     _refuse_inexact_identity() unless _identity_scalars($values);
     my @collated = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
+    # The repeated values are recorded so a compiled write can report its
+    # logical parameter sequence (each value once).
+    push @{$self->{_selecto_bind_copies}}, [refaddr($params), scalar(@$params), scalar(@$values)]
+        if ref($self->{_selecto_bind_copies}) eq 'ARRAY';
     my @binary = map { push @$params, $_; 'CAST(' . $self->placeholder(scalar @$params) . ' AS BINARY)' } @$values;
     my $bytes = $self->_identity_bytes_sql($column);
     return "($column = $collated[0] AND $bytes = $binary[0])" if @$values == 1;
@@ -362,10 +366,19 @@ sub _identity_predicate_sql {
     my ($self, $domain, $expression, $params) = @_;
     return undef unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $kind = $expression->kind;
-    return undef unless $kind eq 'eq' || $kind eq 'in';
+    return undef unless $kind eq 'eq' || $kind eq 'ne' || $kind eq 'in';
+    if ($kind eq 'ne') {
+        # <> on an identity column is the negated exact equality.
+        my $equal = Selecto::Expression->new('eq', @{$expression->arguments});
+        local $self->{_selecto_host_conjuncts} = {%{$self->{_selecto_host_conjuncts} // {}},
+            ($self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{refaddr($expression)}
+                ? (refaddr($equal) => 1) : ())};
+        my $sql = $self->_identity_predicate_sql($domain, $equal, $params);
+        return defined($sql) ? "NOT ($sql)" : undef;
+    }
     my ($left, $right) = @{$expression->arguments};
-    # A top-level eq/IN conjunct of the host's required predicate on a text
-    # or undeclared column is tenant or scope identity too.
+    # An eq/ne/IN anywhere in the host's required predicate on a text or
+    # undeclared column is tenant or scope identity too.
     my $host = $self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{refaddr($expression)};
     local $self->{_selecto_host_identity} = $host ? 1 : 0;
     if ($kind eq 'in') {
@@ -397,17 +410,12 @@ sub _write_identity_columns {
     my $metadata = blessed($command) && $command->can('metadata') ? $command->metadata : {};
     my $fields = ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY' ? $metadata->{__selecto_tenant_fields} : [];
     my $types = ref($metadata->{__selecto_insert_types}) eq 'HASH' ? $metadata->{__selecto_insert_types} : {};
-    # The host-trusted parts of an engine-governed command (its scope
-    # predicate and the query-enforcement evidence) decide scope identity
-    # too: every field of their top-level eq/IN conjuncts. Commands compiled
-    # outside the engine (trusted *_unsafe tooling, previews) keep their SQL.
-    my $governed = ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY';
-    my @host = $governed && blessed($command) && $command->can('scope_predicate') ? map {
-        my $field = $_->arguments->[0];
-        blessed($field) && $field->isa('Selecto::Expression') && $field->kind eq 'field'
-            && !ref($field->arguments->[0]) ? ($field->arguments->[0]) : ()
-    } grep { $_->kind eq 'eq' || $_->kind eq 'in' } Selecto::SQL::_top_conjuncts($command->scope_predicate,
-        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef) : ();
+    # The host-trusted parts of a command (its scope predicate and the
+    # query-enforcement evidence) decide scope identity too: every field any
+    # of their eq/ne/IN comparisons reads, at any depth.
+    my @host = blessed($command) && $command->can('scope_predicate')
+        ? Selecto::SQL::_comparison_fields($command->scope_predicate,
+            defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef) : ();
     return {map { ($_ => 1) } grep { defined($_) && !ref($_) && Selecto::SQL::_identity_text_type($types->{$_}) }
         @$fields, @host};
 }
@@ -415,6 +423,15 @@ sub _write_identity_columns {
 sub _compile_write_predicate {
     my ($self, $expression, $params) = @_;
     my $columns = $self->{_selecto_identity_columns};
+    if ($columns && %$columns && blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind eq 'ne') {
+        my ($left) = @{$expression->arguments};
+        my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
+            ? $left->arguments->[0] : undef;
+        # <> on an identity column is the negated exact equality.
+        return 'NOT (' . $self->_compile_write_predicate(Selecto::Expression->new('eq', @{$expression->arguments}), $params) . ')'
+            if defined($field) && !ref($field) && $columns->{$field};
+    }
     if ($columns && %$columns && blessed($expression) && $expression->isa('Selecto::Expression')
         && ($expression->kind eq 'eq' || $expression->kind eq 'in')) {
         my ($left, $right) = @{$expression->arguments};
@@ -992,7 +1009,20 @@ sub _compile_write {
     my ($self, $command) = @_;
     _refuse_scoped_upsert($command) if $command->operation eq 'upsert';
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
-    return $self->SUPER::_compile_write($command);
+    local $self->{_selecto_bind_copies} = [];
+    my $compiled = $self->SUPER::_compile_write($command);
+    # The logical parameter sequence: the bound values with each exact
+    # comparison's repeated copy left out.
+    my $params = $compiled->{params};
+    my %copy;
+    for my $entry (@{$self->{_selecto_bind_copies}}) {
+        my ($owner, $start, $count) = @$entry;
+        next unless ref($params) eq 'ARRAY' && $owner == refaddr($params);
+        $copy{$_} = 1 for $start .. $start + $count - 1;
+    }
+    # Without repeated values the compiled parameters are the logical ones.
+    return $compiled unless %copy;
+    return {%$compiled, logical_params => [map { $params->[$_] } grep { !$copy{$_} } 0 .. $#$params]};
 }
 
 # A WHERE needs FROM DUAL, and a parent read through a derived table may be

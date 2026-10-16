@@ -207,7 +207,7 @@ sub _compile_single {
     # The top-level eq/IN conjuncts of the host-trusted required predicate
     # decide tenant or scope identity even without a declared tenant_field.
     local $self->{_selecto_host_conjuncts} = $self->_exact_identity_compare
-        ? {map { (refaddr($_) => 1) } _top_conjuncts($domain->required_predicate)} : undef;
+        ? {map { (refaddr($_) => 1) } _comparison_nodes($domain->required_predicate)} : undef;
     my @association_paths = $self->_referenced_associations($query, $predicate, $domain);
     my ($join_aliases, $through_aliases) = _association_alias_maps(@association_paths);
     local $self->{_join_aliases} = $join_aliases;
@@ -1219,7 +1219,8 @@ sub preview_write {
     Selecto::Write::Capabilities->preflight($self, $command);
     $self->_validate_write_cardinality($command);
     my $statement = $self->_compile_write($command);
-    return { sql => $statement->{sql}, params => [@{$statement->{params}}] };
+    return { sql => $statement->{sql}, params => [@{$statement->{params}}],
+        (ref($statement->{logical_params}) eq 'ARRAY' ? (logical_params => [@{$statement->{logical_params}}]) : ()) };
 }
 
 sub _admit_plan_storage { return; }
@@ -2547,6 +2548,33 @@ sub _tenant_pair_sql {
 # text: such a dialect then compares the bytes as well. Everywhere else the
 # SQL is the plain comparison.
 sub _exact_identity_compare { return 0; }
+
+# Every eq, ne or IN comparison anywhere in expression trees, through AND, OR
+# and NOT: the comparisons of a host or trusted predicate that decide tenant
+# or scope identity.
+sub _comparison_nodes {
+    my @pending = grep { defined } @_;
+    my @nodes;
+    while (my $expression = shift @pending) {
+        next unless blessed($expression) && $expression->isa('Selecto::Expression');
+        my $kind = $expression->kind;
+        if ($kind eq 'and' || $kind eq 'or') { push @pending, @{$expression->arguments->[0]}; next }
+        if ($kind eq 'not') { push @pending, $expression->arguments->[0]; next }
+        push @nodes, $expression if $kind eq 'eq' || $kind eq 'ne' || $kind eq 'in';
+    }
+    return @nodes;
+}
+
+# The fields compared by those nodes (plain root fields only).
+sub _comparison_fields {
+    return map {
+        my @operands = ($_->arguments->[0], $_->kind eq 'in' ? () : ($_->arguments->[1]));
+        map {
+            blessed($_) && $_->isa('Selecto::Expression') && $_->kind eq 'field' && !ref($_->arguments->[0])
+                && $_->arguments->[0] !~ /\./ ? ($_->arguments->[0]) : ()
+        } @operands
+    } _comparison_nodes(@_);
+}
 
 # The top-level conjuncts of an expression (the operands of nested ANDs).
 sub _top_conjuncts {
