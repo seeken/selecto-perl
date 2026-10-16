@@ -1288,8 +1288,12 @@ sub resolve_association {
             Selecto::Error->throw('invalid_domain', "missing schema $queryable") unless $relation;
             # The map depends only on the schema graph, joins, tenant family
             # and path, so it is built once rather than on every lookup.
+            # Copy before mapping: map aliases its list, and aliasing a hash
+            # slice creates missing keys on the sealed domain, changing its
+            # digest (configured domain identity has changed).
+            my ($joins, $family) = ($self->{canonical_joins}, $self->{_tenant_family});
             my $cache_key = join "\0",
-                map({ defined($_) ? refaddr($_) : '' } @{$self}{qw(canonical_joins _tenant_family)}),
+                map({ defined($_) ? refaddr($_) : '' } $joins, $family),
                 $queryable, $prefix;
             $associations = $CANONICAL_ASSOCIATIONS{$self->{canonical_schemas}}{$cache_key} //= _canonical_associations(
                 $relation,
