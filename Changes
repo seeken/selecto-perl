@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB identity comparison classifies declared types three
+      ways: known non-text (numbers, booleans, temporal values, JSON,
+      binary) compares plainly; known text, after normalising the name
+      (lowercase, no length or charset/collate clause; string, text, char,
+      varchar, character varying, nvarchar, nchar, citext, clob, enum, set,
+      or any name containing char or text) compares exactly; everything else
+      (uuid, custom names, unknown, undeclared) is decided by the server
+      (COLLATION() guard). A uuid or custom-named text tenant compared under
+      its collation and reached 'AAAA...' and padded rows. A guarded column
+      pair compares plainly only when both sides hold no text, and a tenant
+      or scope pair is exact when either side may hold text, so an integer
+      tenant 7 never matches a text '07' or ' 7'.
     - MySQL/MariaDB exact identity comparison applies only to columns
       declared as text (string, text, char, varchar, citext, enum) and to
       undeclared columns while they hold text (COLLATION() is not

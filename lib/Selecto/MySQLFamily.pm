@@ -312,10 +312,18 @@ sub _identity_text_guard {
     return "(COLLATION($column) = 'binary' OR $bytes)";
 }
 
+# A pair under the guard compares plainly only when BOTH sides hold no text
+# (an INT 7 must not match text '07' or ' 7').
+sub _identity_pair_guard {
+    my ($self, $left, $right, $exact, $bytes) = @_;
+    return $bytes unless ($exact // 0) == 2;
+    return "((COLLATION($left) = 'binary' AND COLLATION($right) = 'binary') OR $bytes)";
+}
+
 sub _identity_equal_sql {
     my ($self, $left, $right, $exact) = @_;
     return "$left = $right" unless $exact;
-    return "($left = $right AND " . $self->_identity_text_guard($left, $exact,
+    return "($left = $right AND " . $self->_identity_pair_guard($left, $right, $exact,
         $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right)) . ')';
 }
 
@@ -323,7 +331,7 @@ sub _identity_equal_sql {
 sub _identity_correlation_sql {
     my ($self, $inner, $outer, $exact) = @_;
     return "$inner <=> $outer" unless $exact;
-    return "($inner <=> $outer AND " . $self->_identity_text_guard($inner, $exact,
+    return "($inner <=> $outer AND " . $self->_identity_pair_guard($inner, $outer, $exact,
         $self->_identity_bytes_sql($inner) . ' <=> ' . $self->_identity_bytes_sql($outer)) . ')';
 }
 
