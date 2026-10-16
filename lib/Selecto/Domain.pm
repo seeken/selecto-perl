@@ -3242,6 +3242,11 @@ Copies of contract sections: C<writes>, C<actions>, C<capabilities>,
 C<imports>, C<editors>, C<detail_actions>, C<components>, C<query_library>,
 C<co_domains>, C<domain_dependencies>, C<operations>, C<experiences>.
 
+C<writes_shared> returns the domain's own sealed C<writes> section, not a
+copy, so the write path need not deep-copy it per command. It is read-only:
+never change it or keep a reference you might change; use C<writes> for a
+copy you own.
+
 =head1 CANONICAL FORMAT
 
 =head2 Top level
