@@ -137,9 +137,9 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
             scope => {tenant => 't1'});
         my $statement = $engine->compile($engine->query->select('id', 'lines.id')->where($x->eq('state', 'open')));
         if ($tenant_type eq 'string') {
-            like($statement->sql, qr/\(`s0`\.`tenant_id` = \? AND CAST\(`s0`\.`tenant_id` AS BINARY\) = CAST\(\? AS BINARY\)\)/,
+            like($statement->sql, qr/\(`s0`\.`tenant_id` = \? AND CAST\(CONVERT\(`s0`\.`tenant_id` USING utf8mb4\) AS BINARY\) = CAST\(\? AS BINARY\)\)/,
                 "$name binds a text tenant exactly");
-            like($statement->sql, qr/\(`s0`\.`tenant_id` = `j_lines`\.`tenant_id` AND CAST\(`s0`\.`tenant_id` AS BINARY\) = CAST\(`j_lines`\.`tenant_id` AS BINARY\)\)/,
+            like($statement->sql, qr/\(`s0`\.`tenant_id` = `j_lines`\.`tenant_id` AND CAST\(CONVERT\(`s0`\.`tenant_id` USING utf8mb4\) AS BINARY\) = CAST\(CONVERT\(`j_lines`\.`tenant_id` USING utf8mb4\) AS BINARY\)\)/,
                 "$name pairs text tenants exactly");
             is_deeply($statement->params, ['t1', 't1', 'open'], "$name binds the tenant twice in text order");
         } else {

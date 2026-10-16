@@ -43,9 +43,11 @@ Unreleased
       collations a text tenant column compared case- and accent-insensitively
       (and, under PAD SPACE collations, ignoring trailing spaces), so tenant
       't1' read and wrote rows of 'T1' and 't1 '. Every comparison of a text
-      tenant, site or pinned column now adds a byte comparison,
-      (col = ? AND CAST(col AS BINARY) = CAST(? AS BINARY)), with the value
-      bound twice in text order: engine and required tenant predicates on the
+      tenant, site or pinned column now adds a byte comparison of its utf8mb4
+      text, (col = ? AND CAST(CONVERT(col USING utf8mb4) AS BINARY) =
+      CAST(? AS BINARY)), with the value bound twice in text order (the
+      conversion makes ucs2, utf16, utf16le, utf32 and latin1 columns compare
+      with the utf8mb4 value rather than with their own bytes): engine and required tenant predicates on the
       root, joined relations, members, retarget hops and rollup branches;
       tenant pairs and authored scope keys in joins, related collections and
       computed fields; member correlations on a tenant column; write
