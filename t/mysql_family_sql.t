@@ -104,6 +104,20 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
     });
     is_deeply($ordered->params, ['none', 'open'], "$name binds SELECT parameters before WHERE parameters");
 
+    # A format zone PostgreSQL would read differently (the host's 'local'
+    # zone, offsets) is refused before execution.
+    my $dated = Selecto::Domain->new(name => 'Events', table => 'events',
+        fields => {id => 'integer', at => 'utc_datetime'});
+    my $events = Selecto::Engine->new(domain => $dated, adapter => Selecto->adapter($name =>
+        (dbh => bless({%{TestSelecto::DBH->new}, version => $version}, 'VersionedDBH'))));
+    for my $zone ('local', '+0500') {
+        my $refused = eval { $events->compile($events->query->select($x->datetime_format('at', 'day', timezone => $zone)->as('d'))); 1 }
+            ? 'compiled' : $@->code;
+        is($refused, 'invalid_query', "$name refuses the format zone $zone");
+    }
+    ok(eval { $events->compile($events->query->select($x->datetime_format('at', 'day', timezone => 'Europe/Paris')->as('d'))) },
+        "$name compiles an IANA format zone");
+
     # Tenant identity compares exactly on a text tenant column (bound twice,
     # in text order); a numeric tenant column compiles as before.
     for my $tenant_type ('string', 'integer') {

@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB date formats write years 1-999 with four digits, as
+      PostgreSQL does (0001-02-03, not 1-02-03). A stored value PostgreSQL
+      cannot hold (year 0, a zero month or day, an impossible date, or an
+      instant shown past year 9999) is a typed query_error (sqlstate 22008,
+      datetime_field_overflow) instead of an untyped failure. Format zones
+      DateTime::TimeZone reads differently from PostgreSQL ('local',
+      'floating', 'Z' and offsets such as '+0500') are refused with
+      invalid_query.
     - Every MySQL/MariaDB read, stream and write checks its session first, in
       one round trip per call (a host can SET it at any time): a UTC time
       zone ('UTC', '+00:00', 'Etc/UTC', or SYSTEM only when the server's
