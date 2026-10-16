@@ -1189,13 +1189,9 @@ sub _write_tenant_fields {
     my $domain = $self->{domain};
     my $scope = $domain->write_tenant_scope;
     my %seen;
-    # The top-level eq/IN conjuncts of the host's required predicate decide
-    # tenant or scope identity even on a domain without tenant_field.
-    my @host = map {
-        my $field = $_->arguments->[0];
-        blessed($field) && $field->isa('Selecto::Expression') && $field->kind eq 'field'
-            && !ref($field->arguments->[0]) && $field->arguments->[0] !~ /\./ ? ($field->arguments->[0]) : ()
-    } grep { $_->kind eq 'eq' || $_->kind eq 'in' } Selecto::SQL::_top_conjuncts($self->_host_required_predicate);
+    # Every eq/ne/IN comparison of the host's required predicate, at any
+    # depth, decides tenant or scope identity even without tenant_field.
+    my @host = Selecto::SQL::_comparison_fields($self->_host_required_predicate);
     return [grep { defined($_) && !$seen{$_}++ } $domain->tenant_field, ($scope ? $scope->{field} : undef),
         @{$self->_write_tenant_rules->{pinned}}, @extra, @host];
 }

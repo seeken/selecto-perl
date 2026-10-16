@@ -140,6 +140,19 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
             "$name writes compare the host conjunct exactly");
     }
 
+    # An un-governed preview is exact too, and reports its logical
+    # parameters (each value once) beside the compiled binds.
+    {
+        my $adapter = Selecto->adapter($name => (dbh => bless({%{TestSelecto::DBH->new}, version => $version}, 'VersionedDBH')));
+        my $preview = $adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'accounts',
+            assignments => {name => 'z'}, predicate => $x->eq('id', 1),
+            scope_predicate => $x->any($x->eq('org', 't7'), $x->not($x->ne('org', 'zz')))));
+        like($preview->{sql}, qr/NOT \(\(`org` = \? AND CAST\(CONVERT\(`org` USING utf8mb4\) AS BINARY\) = CAST\(\? AS BINARY\)\)\)/,
+            "$name renders a host <> as the negated exact equality");
+        is_deeply($preview->{params}, ['z', 1, 't7', 't7', 'zz', 'zz'], "$name binds each exact value twice");
+        is_deeply($preview->{logical_params}, ['z', 1, 't7', 'zz'], "$name reports the logical parameters");
+    }
+
     # Tenant identity compares exactly on a text tenant column (bound twice,
     # in text order); a numeric tenant column compiles as before.
     for my $tenant_type ('string', 'integer') {

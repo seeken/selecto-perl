@@ -257,6 +257,27 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             is(code_of(sub { $engine->execute_write($engine->enforce_query($update->(),
                 $engine->query->where($x->eq('org_key', 't1')))) }), 'ok', 'a query-enforced update runs');
             is_deeply($changed->(), [1], 'query-enforcement evidence changes only the exact row');
+            # Every =, <>, IN comparison at any depth of a host predicate is
+            # exact: through OR, AND and NOT, and next to non-identity terms.
+            for my $case (
+                ['eq OR eq', $x->any($x->eq('org_key', 't1'), $x->eq('org_key', 'zz'))],
+                ['AND(x, OR(eq, eq))', $x->all($x->gte('id', 0), $x->any($x->eq('org_key', 't1'), $x->eq('org_key', 'zz')))],
+                ['eq OR non-identity', $x->any($x->eq('org_key', 't1'), $x->lt('id', 0))],
+                ['NOT(<>)', $x->not($x->ne('org_key', 't1'))],
+                ['NOT IN', $x->not($x->not($x->in('org_key', ['t1'])))],
+            ) {
+                my ($label, $predicate) = @$case;
+                $reset->();
+                my $hosted = Selecto::Engine->new(adapter => $adapter, domain => $domain->with_required_predicate($predicate));
+                is_deeply([map { $_->[0] } @{$hosted->all($hosted->query->select('id')->order_by('id'))->{rows}}], [1],
+                    "a required $label reads only the exact row");
+                is(code_of(sub { $hosted->execute_write($update->()) }), 'ok', "a required $label update runs");
+                is_deeply($changed->(), [1], "a required $label changes only the exact row");
+                $reset->();
+                is(code_of(sub { $engine->execute_write($update->(scope_predicate => $predicate)) }), 'ok',
+                    "a $label scope-predicate update runs");
+                is_deeply($changed->(), [1], "a $label scope predicate changes only the exact row");
+            }
             $dbh->do('DROP TABLE selecto_tc_host');
         };
         $dbh->disconnect;
