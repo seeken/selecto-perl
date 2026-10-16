@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 Unreleased
+    - SQL adapters drop constructor arguments with the _selecto_ prefix:
+      Mojo::Base copied them into the object, so a caller could preset
+      private per-call state such as _selecto_session_verified and skip the
+      MySQL/MariaDB session check.
     - A MySQL/MariaDB tenant comparison written literal-first (a host
       required predicate eq(literal('t1'), field('tenant_id'))) is exact too.
       A tenant or site comparison that cannot be rendered exactly (a NULL or
