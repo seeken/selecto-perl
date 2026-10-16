@@ -185,6 +185,64 @@ for my $backend (@backends) {
         $dbh->do('DROP TABLE IF EXISTS selecto_hs_children');
         $dbh->do('DROP TABLE IF EXISTS selecto_hs_roots');
     };
+
+    # Declared type names: only known non-text types compare plainly. A uuid
+    # (stored as text), a custom name and parameterised or synonym text names
+    # compare exactly, as PostgreSQL does.
+    subtest "$name declared tenant type names compare exactly unless known non-text" => sub {
+        my $key = 'aaaaaaaa-0000-0000-0000-000000000001';
+        for my $type ('uuid', 'tenant_code', 'varchar(255)', 'char(16)', 'character varying', 'VARCHAR(40)') {
+            $dbh->do('DROP TABLE IF EXISTS selecto_hs_keys');
+            $dbh->do('CREATE TABLE selecto_hs_keys (id INT PRIMARY KEY, tk VARCHAR(40) NOT NULL, pin CHAR(36) NOT NULL, vpin VARCHAR(40) NOT NULL, name VARCHAR(20))');
+            $dbh->do('INSERT INTO selecto_hs_keys VALUES (?, ?, ?, ?, ?)', undef, @$_) for
+                [1, $key, $key, $key, 'a'], [2, uc($key), uc($key), uc($key), 'a'], [3, "$key ", "$key ", "$key ", 'a'];
+            my $source = {%{relation('selecto_hs_keys', id => 'integer', tk => $type, pin => $type, vpin => $type, name => 'string')},
+                tenant_field => 'tk'};
+            my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Keys', source => $source, schemas => {}, joins => {},
+                writes => {operations => {update => {enabled => 1, bulk => 1, expected_cardinality => 'many'}},
+                    fields => {name => {updatable => 1}}}});
+            my $adapter = Selecto->adapter($name => (dbh => $dbh));
+            my $engine = Selecto::Engine->new(adapter => $adapter, domain => $domain, scope => {tenant => $key});
+            is_deeply([map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}}], [1],
+                "a $type tenant reads only its exact row");
+            is(code_of(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_hs_keys',
+                assignments => {name => 'x'}, predicate => $x->gt('id', 0), expected_count => 1)) }), 'ok', "a $type tenant update runs");
+            is_deeply([map { $_->[0] } @{$dbh->selectall_arrayref(q{SELECT id FROM selecto_hs_keys WHERE name = 'x' ORDER BY id})}], [1],
+                "a $type tenant updates only its exact row");
+            # CHAR(36) pads on both servers and in PostgreSQL alike, so its
+            # trailing-space row is the same value there.
+            for my $pin (['vpin', [1]], ['pin', [1, 3]]) {
+                my ($column, $expected) = @$pin;
+                my $pinned = Selecto::Engine->new(adapter => $adapter,
+                    domain => $domain->with_required_predicate($x->eq($column, $key)));
+                is_deeply([map { $_->[0] } @{$pinned->all($pinned->query->select('id')->order_by('id'))->{rows}}], $expected,
+                    "a host pin on a $type $column column reads the PostgreSQL rows");
+            }
+        }
+        $dbh->do('DROP TABLE IF EXISTS selecto_hs_keys');
+    };
+
+    # An integer tenant paired with a tenant column of an unrecognised type:
+    # the server decides, and the pair compares plainly only when both sides
+    # hold no text, so tenant 7 never reaches '07' or ' 7'. (PostgreSQL has
+    # no integer = text comparison, so the pair runs on MySQL/MariaDB only.)
+    subtest "$name an integer/text tenant pair under the guard compares exactly" => sub {
+        plan skip_all => 'PostgreSQL has no integer = text comparison' unless $my;
+        $dbh->do("DROP TABLE IF EXISTS $_") for qw(selecto_hs_pair_lines selecto_hs_pair_orders);
+        $dbh->do('CREATE TABLE selecto_hs_pair_orders (id INT PRIMARY KEY, tenant_id INT NOT NULL)');
+        $dbh->do('CREATE TABLE selecto_hs_pair_lines (id INT PRIMARY KEY, order_id INT, tenant_id VARCHAR(8) NOT NULL)');
+        $dbh->do('INSERT INTO selecto_hs_pair_orders VALUES (1, 7)');
+        $dbh->do(q{INSERT INTO selecto_hs_pair_lines VALUES (10, 1, '7'), (11, 1, '07'), (12, 1, ' 7'), (13, 1, '7.0')});
+        my $source = {%{relation('selecto_hs_pair_orders', id => 'integer', tenant_id => 'integer')}, tenant_field => 'tenant_id',
+            associations => {lines => {queryable => 'line', owner_key => 'id', related_key => 'order_id', cardinality => 'many'}}};
+        my $domain = Selecto::Domain->parse({schema_version => 1, name => 'PairOrders', source => $source, joins => {},
+            schemas => {line => {%{relation('selecto_hs_pair_lines', id => 'integer', order_id => 'integer', tenant_id => 'tenant_code')},
+                tenant_field => 'tenant_id'}}});
+        my $engine = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)), domain => $domain, scope => {tenant => 7});
+        is_deeply($engine->all($engine->query->select('id', 'lines.id')->order_by('lines.id'))->{rows}, [[1, 10]],
+            'tenant 7 joins only the line stored as exactly 7');
+        $dbh->do("DROP TABLE IF EXISTS $_") for qw(selecto_hs_pair_lines selecto_hs_pair_orders);
+    };
     $dbh->disconnect;
 }
 

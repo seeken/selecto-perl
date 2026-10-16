@@ -265,6 +265,8 @@ sub _compile_single {
     # SELECT placeholders precede JOIN placeholders, including nested joins.
     for my $path (@association_paths) {
         my $resolved = $domain->resolve_association($path);
+        local $self->{_selecto_pair_parent_types} = $self->_exact_identity_compare
+            ? $self->_association_parent_types($domain, $path) : undef;
         my $association = $resolved->{association};
         my $keyword = $association->join_type eq 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
         my @segments = split /\./, $path;
@@ -294,7 +296,7 @@ sub _compile_single {
                 $bridge_alias, $through->{where}, \@params
             );
             if (defined $through->{source_scope_key}) {
-                my $exact = $self->_association_identity_exact($association, $through->{target_scope_key});
+                my $exact = $self->_association_identity_exact($association, $through->{target_scope_key}, undef);
                 push @bridge_on, $self->_identity_equal_sql(
                     $self->_qualified($parent_alias, $through->{source_scope_key}),
                     $self->_qualified($bridge_alias, $through->{through_scope_key}), $exact);
@@ -341,7 +343,8 @@ sub _compile_single {
                 push @target_on, $self->_identity_equal_sql(
                     $self->_qualified($parent_alias, $association->source_scope_key),
                     $self->_qualified($lookup_alias, $association->target_scope_key),
-                    $self->_association_identity_exact($association, $association->target_scope_key));
+                    $self->_association_identity_exact($association, $association->target_scope_key,
+                $association->source_scope_key));
             }
             push @target_on, $self->_tenant_pair_sql($association, $parent_alias, $lookup_alias),
                 $self->_tenant_bound_sql($association, $lookup_alias, \@params);
@@ -1868,6 +1871,8 @@ sub _compile_related_collection_at {
     Selecto::Error->throw('invalid_query', 'related collection fields are required')
         unless ref($fields) eq 'ARRAY' && @$fields;
     my $resolved_association = $domain->resolve_association($association_name);
+    local $self->{_selecto_pair_parent_types} = $self->_exact_identity_compare
+        ? $self->_association_parent_types($domain, $association_name) : undef;
     my $association = $resolved_association->{association};
     Selecto::Error->throw('invalid_query', 'related collections require a to-many association')
         unless $association->cardinality eq 'many';
@@ -1938,7 +1943,8 @@ sub _compile_related_collection_at {
         push @predicates, $self->_identity_equal_sql(
             $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key),
             $self->_qualified($parent_alias, $association->source_scope_key),
-            $self->_association_identity_exact($association, $association->target_scope_key));
+            $self->_association_identity_exact($association, $association->target_scope_key,
+                $association->source_scope_key));
     }
     if (my $through = $association->through) {
         my $bridge_alias = 'ct_' . $association_name;
@@ -1953,7 +1959,7 @@ sub _compile_related_collection_at {
             ' = ' . $owner_key,
         );
         if (defined $through->{source_scope_key}) {
-            my $exact = $self->_association_identity_exact($association, $through->{target_scope_key});
+            my $exact = $self->_association_identity_exact($association, $through->{target_scope_key}, undef);
             push @predicates, $self->_identity_equal_sql(
                 $quoted_bridge_alias . '.' . $self->quote_identifier($through->{through_scope_key}),
                 $self->_qualified($parent_alias, $through->{source_scope_key}), $exact);
@@ -2311,6 +2317,7 @@ sub _compile_computed_field {
         field => $path, association => $association_name,
     }) unless $association && !$association->through;
     my $alias = 'e_' . $association_name;
+    local $self->{_selecto_pair_parent_types} = $self->_exact_identity_compare ? (eval { $domain->fields } // {}) : undef;
     my @predicates = (
         $self->_qualified($alias, $association->related_key) . ' = ' .
             $self->_qualified($self->_root_alias, $association->owner_key),
@@ -2319,7 +2326,8 @@ sub _compile_computed_field {
         push @predicates, $self->_identity_equal_sql(
             $self->_qualified($alias, $association->target_scope_key),
             $self->_qualified($self->_root_alias, $association->source_scope_key),
-            $self->_association_identity_exact($association, $association->target_scope_key));
+            $self->_association_identity_exact($association, $association->target_scope_key,
+                $association->source_scope_key));
     }
     push @predicates, $self->_constant_join_predicates(
         $alias, $association->where, $params
@@ -2543,7 +2551,7 @@ sub _tenant_pair_sql {
     return () if defined($authored->{source_scope_key}) && defined($authored->{target_scope_key})
         && $authored->{source_scope_key} eq $source && $authored->{target_scope_key} eq $target;
     return $self->_identity_equal_sql($self->_qualified($parent_alias, $source),
-        $self->_qualified($target_alias, $target), $self->_association_identity_exact($association, $target));
+        $self->_qualified($target_alias, $target), $self->_association_identity_exact($association, $target, $source));
 }
 
 # Comparisons that decide tenant or site identity (tenant pairs and bounds,
@@ -2621,15 +2629,50 @@ sub _identity_values_sql {
 sub _identity_text_type {
     my ($type) = @_;
     $type = $type->{type} if ref($type) eq 'HASH';
-    return 2 unless defined($type) && !ref($type) && length("$type") && lc("$type") ne 'unknown';
-    return lc("$type") =~ /\A(?:string|text|char|character|varchar|character varying|citext|enum)\z/ ? 1 : 0;
+    return 2 unless defined($type) && !ref($type);
+    my $name = lc("$type");
+    $name =~ s/\s+(?:character\s+set|charset|collate)\s+\S+//g;
+    $name =~ s/\(.*\)//;
+    $name =~ s/\A\s+|\s+\z//g;
+    $name =~ s/\s+/ /g;
+    return 2 unless length($name);
+    # Known non-text: numbers, booleans, temporal values, JSON and binary.
+    return 0 if $name =~ /\A(?:integer|int|bigint|smallint|tinyint|mediumint|serial|bigserial|decimal|numeric|number
+        |float|double|double precision|real|money|boolean|bool|bit|date|time|datetime|timestamp|timestamptz
+        |timestamp with time zone|timestamp without time zone|time with time zone|time without time zone|year|interval
+        |naive_\w+|utc_\w+|epoch_\w+|json|jsonb|map|binary|varbinary|bytes|bytea|blob|tinyblob|mediumblob|longblob)\z/x;
+    # Known text: the declared text names and their synonyms.
+    return 1 if $name =~ /\A(?:string|text|char|character|varchar|character varying|nvarchar|nchar|citext|clob|enum|set)\z/
+        || $name =~ /char|text/;
+    # Everything else (uuid, unknown, custom names) is decided by the server.
+    return 2;
 }
-
+# Exactness of a comparison on an association's target column; for a pair
+# with a source column ($source_field), of the pair: exact when either side
+# is declared text, plain only when both are known non-text, otherwise
+# decided by the server. The source column's type comes from the parent
+# relation being joined (_selecto_pair_parent_types); a bridge column has
+# none.
 sub _association_identity_exact {
-    my ($self, $association, $field) = @_;
+    my ($self, $association, $field, $source_field) = @_;
     return 0 unless $self->_exact_identity_compare;
     my $fields = eval { $association->fields } // {};
-    return _identity_text_type($fields->{$field});
+    my $target = _identity_text_type($fields->{$field});
+    return $target if @_ < 4;
+    my $types = $self->{_selecto_pair_parent_types};
+    my $source = defined($source_field) && ref($types) eq 'HASH' ? _identity_text_type($types->{$source_field}) : 2;
+    return 1 if $target == 1 || $source == 1;
+    return 0 if $target == 0 && $source == 0;
+    return 2;
+}
+
+# The declared field types of the relation an association path joins from.
+sub _association_parent_types {
+    my ($self, $domain, $path) = @_;
+    my @segments = split /\./, "$path";
+    pop @segments;
+    return @segments ? (eval { $domain->resolve_association(join('.', @segments))->{association}->fields } // {})
+        : (eval { $domain->fields } // {});
 }
 
 # Whether a field path of $domain is a tenant or site column of its relation
