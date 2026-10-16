@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Known text type names are listed explicitly (string, text, tinytext,
+      mediumtext, longtext, ntext, char, character, nchar, national char,
+      varchar, char varying, character varying, nvarchar, national varchar,
+      varchar2, citext, clob, enum, set and their national/varying
+      synonyms). A custom name merely containing 'char' or 'text' (a
+      TIMESTAMP declared context_ts, a DECIMAL declared charge_amount) is no
+      longer treated as text: the server decides, so host <> and NOT IN on
+      such columns match PostgreSQL instead of every row.
     - MySQL/MariaDB identity comparison classifies declared types three
       ways: known non-text (numbers, booleans, temporal values, JSON,
       binary) compares plainly; known text, after normalising the name
