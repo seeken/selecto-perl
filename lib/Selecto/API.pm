@@ -329,7 +329,8 @@ sub _download_filename ($name, $extension) {
 # The HTTP status for a handler error that names none: a query naming a hidden
 # (internal or redacted) field and a request without a trusted tenant scope
 # are forbidden, as in the other runtimes; a tenant-scoped MySQL/MariaDB upsert
-# (unsupported_scope_predicate) is 501; every other refusal is 422.
+# (unsupported_scope_predicate) is 501; a misconfigured connection
+# (invalid_connection) is 500; every other refusal is 422.
 my %FORBIDDEN_CODES = map { $_ => 1 } qw(hidden_field missing_tenant_scope);
 
 # A tenant-scoped upsert on MySQL or MariaDB is refused (ON DUPLICATE KEY UPDATE matches any
@@ -339,6 +340,9 @@ sub error_status ($code) {
     return 501 if defined($code) && !ref($code) && $code eq 'unsupported_scope_predicate';
     # A deadlock victim or lock-wait timeout is retryable server state, not a bad request.
     return 503 if defined($code) && !ref($code) && ($code eq 'database_deadlock_detected' || $code eq 'database_lock_timeout');
+    # A connection whose session breaks the adapter's contract is host
+    # misconfiguration, not a bad request (lesson 16; R and Haskell agree).
+    return 500 if defined($code) && !ref($code) && $code eq 'invalid_connection';
     return defined($code) && !ref($code) && $FORBIDDEN_CODES{$code} ? 403 : 422;
 }
 

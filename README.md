@@ -58,12 +58,15 @@ MySQL and MariaDB compare tenant and site identity exactly, as PostgreSQL
 does: a text tenant column is compared byte for byte as well as under its
 collation, so tenant `t1` never reads or writes the rows of `T1` or `t1 `
 whatever the column's (case-insensitive or PAD SPACE) collation is.
+A uuid tenant stored as `CHAR(36)` therefore compares case-sensitively:
+store it in one case (lowercase, as PostgreSQL's `uuid` type prints it).
 Every MySQL/MariaDB read, stream and write first checks its session, per
 call: the time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`, or `SYSTEM`
 on a server whose system zone is UTC; never `GMT`), the client, connection
 and result character sets utf8mb4, and `sql_mode` strict
 (`STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`). A connection that breaks it
-is refused with `invalid_connection` (`details.reason` names the setting).
+is refused with `invalid_connection` (`details.reason` names the setting;
+`Selecto::API::error_status` answers it with HTTP 500).
 
 To install from a git checkout:
 
