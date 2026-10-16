@@ -96,6 +96,21 @@ sub rollback   { push @{$_[0]->{events}}, 'ROLLBACK'; return 1; }
 sub do         { push @{$_[0]->{events}}, $_[1]; return '0E0'; }
 sub errstr     { return $_[0]->{errstr}; }
 sub prepared   { return [@{$_[0]->{prepared}}]; }
+
+# The recorder answers only the MySQL-family session check, as a UTC,
+# utf8mb4, strict session that decodes exactly (with no open server
+# transaction); every other direct select is unknown to it.
+sub selectrow_array {
+    my ($self, $sql) = @_;
+    die "TestSelecto::DBH has no answer for $sql\n" unless TestSelecto::DBH::session_query($sql);
+    return TestSelecto::DBH::session_row($sql);
+}
+sub session_query { return $_[0] =~ /\ASELECT \@\@SESSION\.time_zone\b/ ? 1 : 0; }
+sub session_row {
+    my ($sql) = @_;
+    return ('UTC', 'UTC', 'utf8mb4', 'utf8mb4', 'utf8mb4', 'STRICT_TRANS_TABLES', "\x{1F600}",
+        '2024-03-10 02:30:00.500000', ($sql =~ /\@\@in_transaction\z/ ? (0) : ()));
+}
 sub events     { return [@{$_[0]->{events}}]; }
 
 package TestSelecto::STH;

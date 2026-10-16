@@ -168,6 +168,7 @@ t/mysql_family.t
 t/mysql_family_cursor.t
 t/mysql_family_date_format.t
 t/mysql_family_live.t
+t/mysql_family_session_live.t
 t/mysql_family_sql.t
 t/mysql_family_tenant_collation_live.t
 t/mysql_family_write_state_live.t
