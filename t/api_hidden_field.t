@@ -135,6 +135,7 @@ subtest 'Selecto::API answers hidden_field with 403' => sub {
         for qw(unknown_field field_not_public invalid_api_query);
     is(Selecto::API::error_status('missing_tenant_scope'), 403, 'missing_tenant_scope maps to 403');
     is(Selecto::API::error_status(undef), 422, 'no code stays 422');
+    is(Selecto::API::error_status('invalid_connection'), 500, 'invalid_connection (host misconfiguration) maps to 500');
     my $api = Selecto::API->new(domain => $domain, base_path => '/api');
     my $run = sub {
         my ($body, $with_status) = @_;

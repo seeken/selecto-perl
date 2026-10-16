@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 Unreleased
+    - Selecto::API::error_status answers invalid_connection (a MySQL/MariaDB
+      session that breaks the adapter's contract) with HTTP 500: it is host
+      misconfiguration, not a bad request, as in selecto-r and
+      selecto_haskell. README notes that a uuid tenant stored as CHAR(36)
+      compares case-sensitively on MySQL/MariaDB.
     - SQL adapters drop constructor arguments with the _selecto_ prefix:
       Mojo::Base copied them into the object, so a caller could preset
       private per-call state such as _selecto_session_verified and skip the
