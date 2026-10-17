@@ -59,6 +59,18 @@ is(Selecto::API->new(domain => $domain, publish_domain => sub { die 'no' })
     ->request($domain_request)->{status}, 403, 'publication exception denies access');
 
 my $small = {columns => ['id'], rows => [[7]]};
+{
+require Excel::Writer::XLSX;
+my $new_workbook = Excel::Writer::XLSX->can('new');
+no warnings 'redefine';
+local *Excel::Writer::XLSX::new = sub {
+    my $workbook = $new_workbook->(@_);
+    # Consecutive real encodings must share metadata for an exact byte-size
+    # comparison: the default creation timestamp changes XML compression size
+    # across seconds. Keep the real encoder and every admission check intact.
+    $workbook->set_properties(created => [gmtime(0)]) if $workbook;
+    return $workbook;
+};
 for my $format (qw(json csv tsv xlsx)) {
     my $normal = $api->request({%$request, response_format => $format}, {query => sub { ['ok', $small] }});
     is $normal->{status}, 200, "$format baseline succeeds";
@@ -73,6 +85,7 @@ for my $format (qw(json csv tsv xlsx)) {
         is $under->request({%$request, response_format => $format}, {query => sub { ['ok', $small] }})->{status}, 422,
             "$format one byte beyond encoded boundary rejected";
     }
+}
 }
 my $tighter = Selecto::API::ResponsePolicy->bind_limits({%$small}, Selecto::Limits->new(max_response_bytes => 500));
 is $api->request({%$request, response_format => 'xlsx'}, {query => sub { ['ok', $tighter] }})->{status}, 422,

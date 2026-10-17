@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Align native certification reads with declared tenant joins and hidden,
+      filterable, sortable and groupable field policy. Public query pages
+      share a one-row lookahead and has_more, including bounded JSON reads.
+      Counted writes with zero RETURNING rows report cardinality_mismatch.
+      Portable rule identifiers, exact versions and normalized conditions
+      follow the common contract. No engine tenant grants writes without
+      explicit writes.scope.tenant or the existing authored host predicate.
     - Database failures keep the driver's SQLSTATE. A query_error from
       normalize_error now carries details.sqlstate and details.category
       (unique_violation, foreign_key_violation, not_null_violation,

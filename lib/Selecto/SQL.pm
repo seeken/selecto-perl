@@ -2408,6 +2408,9 @@ sub _execute_compiled_write_in_transaction {
                 if !@row && eval { $sth->err };
             # A guarded write that yields no row was refused by its guard.
             _guarded_cardinality($command, 0) if !@row && @{$command->foreign_key_guards};
+            Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
+                {expected => $command->expected_count})
+                if !@row && defined($command->expected_count) && $command->expected_count > 0;
             Selecto::Error->throw('write_returning_missing', 'write did not return the requested row') unless @row;
             @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row);
             # RETURNING emits one row per affected row. Some DBI drivers report
