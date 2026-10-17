@@ -2557,7 +2557,8 @@ sub _scopes_tenant_field {
     # engine write binder is still an additional confinement check; it cannot
     # grant this public-surface authority by itself.
     my $scope = $self->{domain}->write_tenant_scope;
-    return $scope && $scope->{field} eq $field && defined($self->{scope}{tenant});
+    my $column = $self->_write_tenant_column;
+    return $scope && defined($column) && $column eq $field && defined($self->{scope}{tenant});
 }
 
 # A scope counts as tenant-scoped only when a positive conjunct (eq or in over

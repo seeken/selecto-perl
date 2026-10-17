@@ -90,7 +90,7 @@ subtest 'bounded reads require the same trusted tenant boundary as the canonical
         'trusted engine context scopes bounded reads');
     my $required = Selecto::Engine->new(adapter => $adapter,
         domain => $domain->with_required_predicate(Selecto::Expression->eq('tenant_id', 20)));
-    is_deeply(Selecto::BoundedQuery->all($required, $query)->{rows}, [['foreign']],
+    is_deeply(Selecto::BoundedQuery->all($required, $required->query->select('label'))->{rows}, [['foreign']],
         'an explicit trusted host predicate retains its authored contract');
     $dbh->disconnect;
 };
