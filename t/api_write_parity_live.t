@@ -8,12 +8,14 @@ use Selecto::Domain ();
 use Selecto::Engine ();
 use Selecto::Expression ();
 use Selecto::PostgreSQL ();
+use lib 't/lib';
+use TestPostgreSQL ();
 
 my $database = $ENV{SELECTO_API_TEST_DATABASE};
-plan skip_all => 'API PostgreSQL database is not configured' unless defined $database && length $database;
+plan skip_all => 'API PostgreSQL database is not configured' unless
+    (defined $database && length $database) || $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBI; require DBD::Pg; 1 };
-my $dbh = DBI->connect("dbi:Pg:dbname=$database;host=/tmp", undef, undef,
-    {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+my $dbh = TestPostgreSQL->connect;
 $dbh->do('CREATE TEMP TABLE records(id INTEGER PRIMARY KEY,name TEXT NOT NULL,tenant_id INTEGER,secret TEXT)');
 $dbh->do(q{INSERT INTO records VALUES(1,'a',7,'s'),(2,'b',8,'s'),(3,'c',7,'s')});
 my $domain = Selecto::Domain->parse({

@@ -350,6 +350,13 @@ connection strings and SQL fragments do not leak into responses.
 
 ### Web applications
 
+`Selecto::API::RemoteQuery` adds a fingerprint-bound, bounded scalar-read
+envelope for shared canonical clients. Hosts provide a fresh authenticated
+engine; complete Domain publication remains opt-in. The sibling
+[`selecto-perl-components` stack guide](../selecto-perl-components/docs/canonical-stack.md)
+shows the same reader behind native HTMX and Vue, including its current
+unsupported wire features and real PostgreSQL verification.
+
 The core has no routes or templates. `Selecto::API` implements the canonical
 Selecto HTTP contract as a pure function from a request hash to a response
 hash, and `Selecto::API::EngineHandler` turns API query and write bodies into

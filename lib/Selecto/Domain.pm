@@ -483,6 +483,22 @@ sub _canonical_associations {
         my $cardinality = $association->{cardinality};
         $cardinality = $association->{related_key} eq $target_primary_key ? 'one' : 'many'
             unless defined $cardinality;
+        my %scope_keys = map { ($_ => $association->{$_}) }
+            grep { exists $association->{$_} } qw(source_scope_key target_scope_key);
+        # Only a direct edge with two declared tenant columns has enough
+        # relation metadata to infer scope. Preserve authored pairs (including
+        # partial pairs, which the association validator must reject).
+        if (!keys(%scope_keys) && !exists($association->{through})
+            && defined($relation->{tenant_field}) && defined($target->{tenant_field})) {
+            my $source_key = _identifier($relation->{tenant_field}, 'tenant field');
+            my $target_key = _identifier($target->{tenant_field}, 'tenant field');
+            my $source_fields = _canonical_fields($relation);
+            Selecto::Error->throw(
+                'invalid_domain', 'tenant field must be a relation field',
+                {association => $path},
+            ) unless exists($source_fields->{$source_key}) && exists($target_fields->{$target_key});
+            %scope_keys = (source_scope_key => $source_key, target_scope_key => $target_key);
+        }
         $associations{$name} = Selecto::Domain::Association->new(
             name => $name,
             value => {
@@ -499,10 +515,7 @@ sub _canonical_associations {
                 join_type => $join_mode eq 'star_dimension' ? 'left' : $join_mode,
                 join_mode => $join_mode,
                 queryable => "$queryable",
-                (exists($association->{source_scope_key}) ? (
-                    source_scope_key => $association->{source_scope_key},
-                    target_scope_key => $association->{target_scope_key},
-                ) : ()),
+                %scope_keys,
                 (exists($association->{through}) ? (through => $association->{through}) : ()),
                 (exists($association->{where}) ? (where => $association->{where}) : ()),
                 (exists($association->{join_strategy}) ? (
@@ -1200,7 +1213,7 @@ sub field_behavior {
 sub field_is_public {
     my ($self, $path) = @_;
     my $metadata = $self->_field_metadata_view($path);
-    return $metadata->{internal} ? 0 : 1;
+    return $metadata->{internal} || $metadata->{hidden} ? 0 : 1;
 }
 
 sub _normalize_fields {
@@ -2647,7 +2660,7 @@ C<storage> column key under L</CANONICAL FORMAT>.
 
 =head2 field_is_public
 
-True unless the field is C<internal> or redacted. Public surfaces (the API
+True unless the field is C<internal>, C<hidden> or redacted. Public surfaces (the API
 handler, canned pages, catalogs) accept only public fields; trusted host code
 may still use internal ones.
 
@@ -2801,6 +2814,18 @@ are enforced in joins and correlated collections.
 For direct associations whose child rows repeat the tenant key. Both are
 required together and are compiled into joins and related collections, so a
 foreign-key match cannot cross tenants.
+
+Canonical direct associations infer this pair when it is entirely absent
+and both the immediate source and target relations declare C<tenant_field>.
+The two tenant columns may have different names. A complete explicit pair
+takes precedence; either key alone is C<invalid_domain>. The same guard
+applies to nested direct joins, correlated collections, computed
+C<association_exists>, and C<lateral_lookup>.
+
+A relation without C<tenant_field> has no inferred guard, allowing genuine
+tenantless lookup data. Through associations still require their explicit
+three-key scope contract. Legacy C<new> associations lack target relation
+tenant declarations and continue to require explicit scope keys.
 
 =item C<where>
 

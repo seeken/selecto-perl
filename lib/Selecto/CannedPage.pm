@@ -473,8 +473,8 @@ sub _predicate {
 
 # A page is a public surface: its users see every selected, grouped, ordered
 # and faceted field, and filters and orders reveal values indirectly. So no
-# part of a definition may name a field the domain withholds (an internal
-# column or one listed in redact_fields; see Selecto::Domain field_is_public),
+# part of a definition may name a field the domain withholds (an internal or
+# hidden column or one listed in redact_fields; see Domain::field_is_public),
 # exactly as the API handler refuses them. The check runs once the
 # definition is otherwise valid, in a fixed order (dataset entity key,
 # dataset predicate, then each view's selections, groups and orders, then
@@ -488,7 +488,8 @@ sub _refuse_withheld_fields {
         for my $path (@paths) {
             my $metadata = eval { $domain->field_metadata($path) } // {};
             my $withheld = $metadata->{redacted} ? 'redacted'
-                : $metadata->{internal} ? 'internal' : undef;
+                : $metadata->{internal} ? 'internal'
+                : $metadata->{hidden} ? 'hidden' : undef;
             next unless defined $withheld;
             Selecto::Error->throw('invalid_canned_page',
                 "$part $id references $withheld field $path",
@@ -640,7 +641,7 @@ The default C<view> and C<filters>.
 =head2 Withheld fields
 
 A page is a public surface, so no part of its definition may name a field
-the domain withholds: a column marked C<internal> or listed in
+the domain withholds: a column marked C<internal>, C<hidden> or listed in
 C<redact_fields> (top-level paths, C<source.redact_fields> or a schema's
 C<redact_fields>), the fields L<Selecto::Domain/field_is_public> reports as
 not public. C<new> checks, in this order, the entity key, every field the

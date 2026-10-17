@@ -66,6 +66,34 @@ sub relation {
     return {source_table=>$table,primary_key=>'id',fields=>[sort keys %$columns],
         columns=>{map{$_=>{type=>$columns->{$_}}}keys %$columns},associations=>{},%extra};
 }
+
+subtest 'bounded reads require the same trusted tenant boundary as the canonical API' => sub {
+    plan skip_all => 'DBD::SQLite unavailable' unless eval { require DBD::SQLite; 1 };
+    my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', '', '', {RaiseError => 1, PrintError => 0});
+    $dbh->do('CREATE TABLE scoped_rows (id INTEGER, tenant_id INTEGER, label TEXT)');
+    $dbh->do(q{INSERT INTO scoped_rows VALUES (1, 10, 'mine'), (2, 20, 'foreign')});
+    my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Scoped rows',
+        source => {%{relation('scoped_rows', {id => 'integer', tenant_id => 'integer', label => 'string'})},
+            tenant_field => 'tenant_id'}, schemas => {}, joins => {}});
+    my $adapter = Selecto->adapter(sqlite => dbh => $dbh);
+    my $unscoped = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+    my $query = $unscoped->query->select('label');
+    my $error = assert_rejected(sub { Selecto::BoundedQuery->all($unscoped, $query) },
+        'native UI cannot execute an unscoped tenant domain');
+    is $error->code, 'missing_tenant_scope', 'same central authority error';
+    my $statement = $unscoped->compile($query);
+    $error = assert_rejected(sub { Selecto::BoundedQuery->execute($unscoped, $statement) },
+        'a previously compiled statement cannot bypass read authority');
+    is $error->code, 'missing_tenant_scope', 'execution rechecks the boundary';
+    my $scoped = Selecto::Engine->new(domain => $domain, adapter => $adapter, scope => {tenant => 10});
+    is_deeply(Selecto::BoundedQuery->all($scoped, $query)->{rows}, [['mine']],
+        'trusted engine context scopes bounded reads');
+    my $required = Selecto::Engine->new(adapter => $adapter,
+        domain => $domain->with_required_predicate(Selecto::Expression->eq('tenant_id', 20)));
+    is_deeply(Selecto::BoundedQuery->all($required, $query)->{rows}, [['foreign']],
+        'an explicit trusted host predicate retains its authored contract');
+    $dbh->disconnect;
+};
 sub child_domain {
     Selecto::Domain->parse({schema_version=>1,name=>'Bounded parents',
         source=>relation('bounded_parents',{id=>'integer',tenant=>'integer'},

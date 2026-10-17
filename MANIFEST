@@ -163,6 +163,11 @@ lib/Selecto/PostgreSQL/Stream.pm
 t/bounded_stream.t
 docs/typed-insert-admission.md
 lib/Selecto/API/ResponsePolicy.pm
+lib/Selecto/API/RemoteQuery.pm
+t/remote_query.t
+t/api_field_roles_adversarial.t
+t/direct_join_tenant_inference.t
+t/lib/TestPostgreSQL.pm
 lib/Selecto/BoundedQuery.pm
 lib/Selecto/InsertAdmission.pm
 lib/Selecto/OperationBudget.pm

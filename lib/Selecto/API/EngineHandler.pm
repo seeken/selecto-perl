@@ -9,6 +9,7 @@ use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Selecto::API::ResultFormatter ();
 use Selecto::API::ResponsePolicy ();
+use Selecto::BoundedQuery ();
 use Selecto::OperationBudget ();
 use Selecto::Engine ();
 use Selecto::Error ();
@@ -31,9 +32,13 @@ has max_offset        => 100_000;
 has default_limit     => 100;
 has max_write_count   => 1000;
 has limits => sub { Selecto::Limits->new };
+has bounded_results => 0;
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
+    Selecto::Error->throw('invalid_api_handler', 'bounded_results must be a trusted boolean')
+        unless defined($self->bounded_results) && !ref($self->bounded_results)
+            && $self->bounded_results =~ /\A[01]\z/;
     Selecto::Error->throw('invalid_api_handler', 'limits must be a Selecto::Limits')
         unless blessed($self->limits) && $self->limits->isa('Selecto::Limits');
     for my $name (qw(
@@ -226,7 +231,7 @@ sub query ($self, $engine, $body, %options) {
     _object($body, 'query body');
     $self->_admit_body($body, 'invalid_api_query');
     _reject_unknown($body, [qw(
-        select projection view segments parameters filters ordering order_by limit offset timezone row_format
+        select projection view segments parameters filters ordering order_by group_by limit offset timezone row_format
     )], 'query body');
 
     my $has_select = exists $body->{select};
@@ -325,7 +330,7 @@ sub query ($self, $engine, $body, %options) {
         # Segments are not permission to filter on an internal field either:
         # with a parameter, a caller could probe its value. They are the only
         # predicate so far (the required predicate is added when compiling).
-        _visible_field_definition($domain, $_) for Selecto::Expression->field_references($query->predicate);
+        _visible_field_definition($domain, $_, 'filter') for Selecto::Expression->field_references($query->predicate);
     } elsif (keys %$parameters) {
         Selecto::Error->throw(
             'invalid_api_query',
@@ -347,7 +352,7 @@ sub query ($self, $engine, $body, %options) {
     if (defined $named_ordering) {
         my $ordering = _required_string($named_ordering, 'ordering');
         # Sorting by an internal field would reveal its order.
-        _visible_field_definition($domain, $_->[0])
+        _visible_field_definition($domain, $_->[0], 'sort')
             for @{Selecto::QueryLibrary->ordering_entries($domain, $ordering)};
         $query = $engine->apply_ordering($query, $ordering);
     } elsif (exists $body->{order_by}) {
@@ -366,9 +371,21 @@ sub query ($self, $engine, $body, %options) {
             Selecto::Error->throw(
                 'invalid_api_query', 'order_by direction must be asc or desc',
             ) unless $direction eq 'asc' || $direction eq 'desc';
-            _visible_field_definition($domain, $field);
+            _visible_field_definition($domain, $field, 'sort');
             $query = $query->order_by($field, $direction);
         }
+    }
+
+    if (exists $body->{group_by}) {
+        my @groups = _string_array($body->{group_by}, 'group_by', $self->max_fields, 1);
+        _visible_field_definition($domain, $_, 'group') for @groups;
+        my %grouped = map {$_ => 1} @groups;
+        my @ungrouped = grep {!$grouped{$_}}
+            map {Selecto::Expression->field_references($_)}
+            (@{$query->selections}, map {$_->[0]} @{$query->orders});
+        Selecto::Error->throw('invalid_api_query', 'Selected and ordered fields must be grouped')
+            if @ungrouped;
+        $query = $query->group_by(@groups);
     }
 
     my $limit = exists($body->{limit})
@@ -397,12 +414,17 @@ sub query ($self, $engine, $body, %options) {
     # to obtain validated column metadata; never execute that statement.
     my $result = $limit == 0
         ? {columns => $engine->compile($query->limit(1))->columns, rows => []}
-        : $engine->all($query, $options{export_scalars} ? (export_scalars => 1) : ());
+        : $self->bounded_results
+            ? Selecto::BoundedQuery->all($engine, $query->limit($limit + 1), limits => $self->limits,
+                max_rows => $limit + 1)
+        : $engine->all($query->limit($limit + 1), $options{export_scalars} ? (export_scalars => 1) : ());
     Selecto::Error->throw(
         'invalid_api_host', 'Selecto adapter returned an invalid result',
     ) unless ref($result) eq 'HASH'
         && ref($result->{columns}) eq 'ARRAY'
         && ref($result->{rows}) eq 'ARRAY';
+    my $has_more = @{$result->{rows}} > $limit;
+    splice @{$result->{rows}}, $limit if $has_more;
     _shape_result_rows($result, \@subtables, $row_format, $self->limits);
     my %subtable_metadata = map {
         $_->{column} => {columns => [@{$_->{columns}}], limit => $_->{limit}, complete => JSON::PP::true}
@@ -415,6 +437,7 @@ sub query ($self, $engine, $body, %options) {
         subtables => \%subtable_metadata,
         limit => $limit,
         offset => $offset,
+        has_more => $has_more ? JSON::PP::true : JSON::PP::false,
         query_library => $query->applied_query_library,
     };
     # Raw-cell checks precede child decoding; this exact JSON-envelope check
@@ -498,6 +521,9 @@ sub describe_openapi ($self, $api) {
                 properties => {
                     columns => {type => 'array', items => {type => 'string'}},
                     rows => {type => 'array', items => {oneOf => [{type => 'array'}, {type => 'object'}]}},
+                    limit => {type => 'integer', minimum => 0},
+                    offset => {type => 'integer', minimum => 0},
+                    has_more => {type => 'boolean', description => 'An additional matching row exists after this page.'},
                     subtables => {type => 'object', additionalProperties => {
                         '$ref' => '#/components/schemas/SelectoSubtableMetadata',
                     }},
@@ -552,6 +578,11 @@ sub describe_openapi ($self, $api) {
             order_by => {
                 type => 'array', maxItems => $self->max_orders,
                 items => {'$ref' => '#/components/schemas/SelectoOrder'},
+            },
+            group_by => {
+                type => 'array', minItems => 1, maxItems => $self->max_fields,
+                items => {type => 'string'},
+                description => 'Public groupable fields. Selected and ordered fields must be grouped.',
             },
             limit => {
                 type => 'integer', minimum => 0, maximum => $self->max_limit,
@@ -845,7 +876,7 @@ sub _filters ($self, $domain, $filters) {
             ]);
             next;
         }
-        my $definition = _visible_field_definition($domain, $field);
+        my $definition = _visible_field_definition($domain, $field, 'filter');
         my $operand = $definition->{type} eq 'epoch_datetime'
             ? Selecto::Expression->epoch_datetime($field)
             : Selecto::Expression->field($field);
@@ -930,9 +961,17 @@ sub _public_field_definition ($domain, $field) {
 # A query that names, or reaches through the query library, an existing field
 # the domain withholds is refused as hidden_field (403 through Selecto::API,
 # as in the other runtimes). An unknown field still fails in resolve first.
-sub _visible_field_definition ($domain, $field) {
+sub _visible_field_definition ($domain, $field, $role = undef) {
     my $definition = $domain->resolve($field);
     _throw_hidden_field($field) unless $domain->field_is_public($field);
+    if (defined $role) {
+        my %flags = (filter => [qw(filterable filterable? query_filterable query_filterable?)],
+            sort => [qw(sortable sortable?)], group => [qw(groupable groupable?)]);
+        my $metadata = $domain->field_metadata($field);
+        my ($flag) = grep { exists $metadata->{$_} } @{$flags{$role}};
+        Selecto::Error->throw('invalid_field', 'Field is unavailable.')
+            if defined($flag) && !$metadata->{$flag};
+    }
     return $definition;
 }
 
@@ -1245,7 +1284,7 @@ domains: the host supplies an engine whose domain already carries every
 required scope and restriction, and the handler validates every field,
 operator and query-library name against that engine's domain.
 
-Only public fields are accepted. Columns marked C<internal> and fields
+Only public fields are accepted. Columns marked C<internal> or C<hidden> and fields
 listed in C<redact_fields> cannot be selected, filtered or ordered by a
 query (C<hidden_field>, details C<field>), nor assigned or returned by a
 write (C<field_not_public>), at any association depth. Query-library names
@@ -1332,6 +1371,17 @@ L<Selecto::DateShortcut>). Values are JSON scalars and are always bound.
 
 A query-library ordering name, or an array of C<< {field, direction} >>.
 
+Filtering and ordering respect explicit C<filterable: false> and
+C<sortable: false> metadata, including fields reached through named
+segments, orderings and views. Such uses fail with C<invalid_field> (422).
+
+=item C<group_by>
+
+A nonempty array of public field names bounded by C<max_fields>. Explicit
+C<groupable: false> refuses grouping with C<invalid_field> (422); internal
+or redacted fields fail with C<hidden_field> (403). All selected and ordered
+fields must be grouped, or the handler refuses the request before execution.
+
 =item C<limit>, C<offset>
 
 Bounded by C<max_limit> and C<max_offset>; C<limit> defaults to
@@ -1348,10 +1398,15 @@ alike.
 
 =back
 
-The result has C<columns>, C<rows>, C<returned>, C<limit>, C<offset>,
+The result has C<columns>, C<rows>, C<returned>, C<limit>, C<offset>, C<has_more>,
 C<row_format>, C<subtables> (per association, its C<columns>, C<limit> and
 C<complete: true>) and
 C<query_library> (the applied definitions).
+
+C<has_more> is observed by fetching one additional matching row; that row is
+removed before response shaping. A zero-sized page executes no database read
+and returns C<has_more: false>. Hosts should publish a deterministic ordering
+with a unique tie-breaker when paging.
 
 =head2 write
 

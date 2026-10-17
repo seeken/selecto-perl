@@ -3,7 +3,7 @@ perl = "5.40.2"
 
 [tasks.test]
 description = "Run the native Perl unit suite"
-run = "script/with-local-deps mise exec -- perl -S prove -lr t"
+run = 'script/with-local-deps "$(mise which perl)" "$(dirname "$(mise which perl)")/prove" --exec "$(mise which perl)" -lr t'
 
 [tasks.build]
 description = "Build the CPAN-style distribution metadata"
@@ -11,4 +11,19 @@ run = "script/with-local-deps sh -c 'mise exec -- perl Makefile.PL && make'"
 
 [tasks.verify]
 description = "Run syntax checks, tests, and distribution build"
-run = "script/with-local-deps sh -c 'mise exec -- perl -Ilib -c bin/selecto-certify && mise exec -- perl -S prove -lr t && mise exec -- perl Makefile.PL && make test'"
+run = '''
+set -eu
+selecto_test_perl=$(mise which perl)
+script/with-local-deps "$selecto_test_perl" -Ilib -c bin/selecto-certify
+script/with-local-deps "$selecto_test_perl" "$(dirname "$selecto_test_perl")/prove" --exec "$selecto_test_perl" -lr t
+script/with-local-deps "$selecto_test_perl" Makefile.PL
+script/with-local-deps make test
+'''
+
+[tasks."test:remote-query"]
+description = "Verify the canonical scalar reader against an owned PostgreSQL database"
+run = '''
+: "${SELECTO_PERL_TEST_POSTGRES_URL:?Set the owned PostgreSQL test URL}"
+export SELECTO_REMOTE_REQUIRE_POSTGRES=1
+script/with-local-deps "$(mise which perl)" "$(dirname "$(mise which perl)")/prove" --exec "$(mise which perl)" -lv t/remote_query.t t/bounded_result.t
+'''

@@ -124,6 +124,18 @@ is_deeply $guard_error->details, {
     field => 'tenant_id', missing_fields => ['tenant_id'],
 }, 'the query-guard error includes a machine-readable missing field';
 
+{
+    my $empty_dbh = TestSelecto::DBH->new({affected => 0, rows => []});
+    my $empty_adapter = Selecto::PostgreSQL->new(dbh => $empty_dbh);
+    eval { $empty_adapter->execute_write_unsafe(Selecto::Write::Command->new(
+        operation => 'update', relation => 'items', assignments => {name => 'after'},
+        predicate => Selecto::Expression->eq('id', 999), expected_count => 1,
+        metadata => {returning => ['id']},
+    )); };
+    is $@->code, 'cardinality_mismatch', 'zero RETURNING rows obey the expected count';
+    is_deeply $empty_dbh->events, ['BEGIN', 'ROLLBACK'], 'empty counted RETURNING rolls back';
+}
+
 for my $expected (2, 1) {
     my $returning_dbh = TestSelecto::DBH->new({ affected => 0, rows => [[7], [8]] });
     my $returning_adapter = Selecto::PostgreSQL->new(dbh => $returning_dbh);
