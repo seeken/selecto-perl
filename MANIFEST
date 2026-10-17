@@ -163,6 +163,7 @@ t/mssql.integration.t
 t/mssql.t
 t/mssql_decimal_scale.t
 t/mutation_expression.t
+t/host_identity_paths_live.t
 t/host_scope_identity_live.t
 t/mysql_family.integration.t
 t/mysql_family.t
@@ -183,6 +184,7 @@ t/query_enforcement_scalar.t
 t/query_library.t
 t/query_member.t
 t/reference_tenant_agreement.t
+t/required_predicate_depth.t
 t/required_predicate_write_guard.t
 t/retarget.t
 t/retarget_identity_live.t

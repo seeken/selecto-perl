@@ -206,9 +206,14 @@ sub _compile_single {
         $domain->required_predicate, $query->predicate);
     # The top-level eq/IN conjuncts of the host-trusted required predicate
     # decide tenant or scope identity even without a declared tenant_field.
+    my @host_trees = $self->_exact_identity_compare ? (grep { defined } $domain->required_predicate,
+        @{$self->{_selecto_trusted_predicates} // []}, @{$domain->{_selecto_authored_predicates} // []}) : ();
     local $self->{_selecto_host_conjuncts} = $self->_exact_identity_compare
-        ? {map { (refaddr($_) => 1) } _comparison_nodes($domain->required_predicate,
-            @{$self->{_selecto_trusted_predicates} // []})} : undef;
+        ? {map { (refaddr($_) => 1) } _comparison_nodes(@host_trees)} : undef;
+    # Every node of those trees: a computed field they reference compiles its
+    # own comparisons as host identity too.
+    local $self->{_selecto_host_nodes} = $self->_exact_identity_compare
+        ? {map { (refaddr($_) => 1) } _expression_nodes(@host_trees)} : undef;
     my @association_paths = $self->_referenced_associations($query, $predicate, $domain);
     my ($join_aliases, $through_aliases) = _association_alias_maps(@association_paths);
     local $self->{_join_aliases} = $join_aliases;
@@ -289,7 +294,7 @@ sub _compile_single {
             # The target ON occurs inside the nested join, before the bridge ON.
             # Accumulate anonymous parameters in that emitted SQL order.
             push @target_on, $self->_constant_join_predicates(
-                $target_alias, $association->where, \@params
+                $target_alias, $association->where, \@params, $association->fields
             );
             push @target_on, $self->_tenant_bound_sql($association, $target_alias, \@params);
             push @bridge_on, $self->_constant_join_predicates(
@@ -337,7 +342,7 @@ sub _compile_single {
                     $self->_qualified($lookup_alias, $association->related_key),
             );
             push @target_on, $self->_constant_join_predicates(
-                $lookup_alias, $association->where, \@params
+                $lookup_alias, $association->where, \@params, $association->fields
             );
             if (defined $association->source_scope_key) {
                 push @target_on, $self->_identity_equal_sql(
@@ -565,10 +570,19 @@ sub _compile_retargeted {
         push @$params, @{$statement->params};
         return $exists ? "EXISTS ($sql)" : "$outer_key IN ($sql)";
     };
+    # The last hop's fixed where policy confines which of the target's rows
+    # the association reaches, and the key alone does not identify them
+    # either: it is applied to the target rows themselves, as on the join
+    # (byte-exact on dialects whose collations fold text).
+    my $where = $association->where;
+    my @policy = ref($where) eq 'HASH' && keys(%$where) ? (sub {
+        my ($params) = @_;
+        return join(' AND ', $self->_constant_join_predicates($outer_alias, $where, $params, $association->fields));
+    }) : ();
     return $self->_compile_single(
         $target_domain, $query->_copy(retarget => undef),
         %options,
-        extra_predicates => [@{$options{extra_predicates} // []}, $context_predicate],
+        extra_predicates => [@{$options{extra_predicates} // []}, @policy, $context_predicate],
     );
 }
 
@@ -839,7 +853,8 @@ sub _compile_cte_prefix {
                 ' AS ' . $self->quote_identifier('p_' . $spec->{name}) .
                 ' ON ' . $self->_identity_equal_sql($self->_qualified($root_alias, $join->{owner_key}),
                     $self->_qualified('p_' . $spec->{name}, $join->{related_key}),
-                    $self->_identity_field_exact($spec->{domain}, $join->{owner_key}));
+                    $self->_member_pair_exact([$spec->{domain}, $join->{owner_key}],
+                        [undef, $self->_exact_identity_compare ? $self->_cte_column_type($spec, $join->{related_key}) : undef]));
             if (defined $spec->{max_depth}) {
                 my $max_depth = "$spec->{max_depth}";
                 Selecto::Error->throw('invalid_query', 'recursive CTE max_depth must be a positive integer')
@@ -946,9 +961,19 @@ sub _compile_cte_joins {
             ' AS ' . $self->quote_identifier($spec->{name}) .
             ' ON ' . $self->_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
                 $self->_qualified($spec->{name}, $join->{related_key}),
-                $self->_identity_field_exact($domain, $join->{owner_key}));
+                $self->_member_pair_exact([$domain, $join->{owner_key}], [undef, $self->_exact_identity_compare
+                    ? $self->_cte_column_type($spec, $join->{related_key}) : undef]));
     }
     return \@joins;
+}
+
+# The declared type of a CTE's column, from the selection that produces it
+# (a recursive CTE's anchor), or undef.
+sub _cte_column_type {
+    my ($self, $spec, $column) = @_;
+    my $query = $spec->{recursive} ? $spec->{anchor} : $spec->{query};
+    return undef unless blessed($query) && blessed($spec->{domain});
+    return eval { $self->_selection_types($spec->{domain}, $query, $spec->{columns})->{$column} };
 }
 
 sub _compile_values_joins {
@@ -963,7 +988,7 @@ sub _compile_values_joins {
             Selecto::Error->throw('invalid_query', 'VALUES owner key must be a root field') if $owner->{association};
             $sql .= ' ON ' . $self->_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
                 $self->_qualified($spec->{name}, $join->{related_key}),
-                $self->_identity_field_exact($domain, $join->{owner_key}));
+                $self->_member_pair_exact([$domain, $join->{owner_key}], [undef, undef]));
         }
         push @joins, $sql;
     }
@@ -997,7 +1022,8 @@ sub _compile_subquery_joins {
             Selecto::Error->throw('invalid_query', 'subquery owner key must be a root field') if $owner->{association};
             push @on, $self->_identity_equal_sql($self->_qualified($self->_root_alias, $condition->{left}),
                 $self->_qualified($spec->{name}, $condition->{right}),
-                $self->_identity_field_exact($domain, $condition->{left}));
+                $self->_member_pair_exact([$domain, $condition->{left}], [undef, $self->_exact_identity_compare
+                    ? $self->_cte_column_type($spec, $condition->{right}) : undef]));
         }
         push @joins, uc($spec->{type}) . ' JOIN (' . $body . ') AS ' . $self->quote_identifier($spec->{name})
             . ' ON ' . join(' AND ', @on);
@@ -1039,7 +1065,7 @@ sub _compile_lateral_joins {
                 if $child_field->{association} || $parent_field->{association};
             push @correlations, $self->_identity_equal_sql($self->_qualified($child_alias, $child),
                 $self->_qualified($self->_root_alias, $parent),
-                $self->_identity_field_exact($domain, $parent) || $self->_identity_field_exact($spec->{domain}, $child));
+                $self->_member_pair_exact([$domain, $parent], [$spec->{domain}, $child]));
         }
         my $statement = $self->_compile_single(
             $spec->{domain}, $spec->{query},
@@ -1970,7 +1996,7 @@ sub _compile_related_collection_at {
         # ON precedes WHERE in the emitted SQL, so bind target predicates first.
         # Do not bind the discarded direct-association predicate for this path.
         push @target_on, $self->_constant_join_predicates(
-            $alias, $association->where, $params
+            $alias, $association->where, $params, $association_fields
         );
         push @target_on, $self->_tenant_bound_sql($association, $alias, $params);
         push @predicates, $self->_constant_join_predicates(
@@ -1981,7 +2007,7 @@ sub _compile_related_collection_at {
             join(' AND ', @target_on);
     } else {
         push @predicates, $self->_constant_join_predicates(
-            $alias, $association->where, $params
+            $alias, $association->where, $params, $association_fields
         );
         push @predicates, $self->_tenant_pair_sql($association, $parent_alias, $alias),
             $self->_tenant_bound_sql($association, $alias, $params);
@@ -2216,9 +2242,36 @@ sub _field_sql {
     if (!$resolved->{association}) {
         my $metadata = $domain->field_metadata($path);
         if (ref($metadata->{computed}) eq 'HASH') {
+            local $self->{_selecto_field_prefix};
             return $self->_compile_computed_field(
                 $domain, $path, $metadata->{computed}, $params
             );
+        }
+    } else {
+        # A joined relation's computed field compiles over that join: the
+        # fields its body names are the relation's own.
+        my $metadata = eval { $domain->_field_metadata_view("$path") };
+        if (ref($metadata) eq 'HASH' && ref($metadata->{computed}) eq 'HASH') {
+            my $computed = $metadata->{computed};
+            my $kind = $computed->{kind} // '';
+            Selecto::Error->throw('unsupported_feature',
+                'a joined relation\'s association_exists computed field is not available through the join', {field => "$path"})
+                if $kind eq 'association_exists';
+            # A joined schema's computed columns are not checked when the
+            # domain is parsed: a reference cycle is refused here, and a value
+            # expression is parsed (typed) as the root's are.
+            Selecto::Error->throw('invalid_domain', 'computed column references itself', {field => "$path"})
+                if $self->{_selecto_computed_stack}{"$path"};
+            local $self->{_selecto_computed_stack} = {%{$self->{_selecto_computed_stack} // {}}, "$path" => 1};
+            if ($kind eq 'expression') {
+                require Selecto::ValueExpression;
+                my $ast = eval { Selecto::ValueExpression->parse($computed->{expression}) };
+                Selecto::Error->throw('invalid_domain', 'computed value expression is invalid', {field => "$path"})
+                    unless defined $ast;
+                $computed = {%$computed, expression => $ast};
+            }
+            local $self->{_selecto_field_prefix} = "$resolved->{association_path}.";
+            return $self->_compile_computed_field($domain, $path, $computed, $params);
         }
     }
     my $table_alias = $resolved->{association}
@@ -2304,12 +2357,11 @@ sub _compile_computed_field {
     }
     if ($computed->{kind} eq 'coalesce_fields') {
         return 'COALESCE(' . join(', ', map {
-            $self->_field_sql($domain, $_, $params)
+            $self->_field_sql($domain, ($self->{_selecto_field_prefix} // '') . $_, $params)
         } @{$computed->{fields}}) . ')';
     }
     if ($computed->{kind} eq 'predicate') {
-        my $expression = Selecto::Expression->from_filter_ast($computed->{expression});
-        return '(' . $self->_compile_expression($domain, $expression, $params) . ')';
+        return '(' . $self->_compile_authored_condition($domain, $computed->{expression}, $params) . ')';
     }
     my $association_name = $computed->{association};
     my $association = $domain->associations->{$association_name};
@@ -2330,13 +2382,42 @@ sub _compile_computed_field {
                 $association->source_scope_key));
     }
     push @predicates, $self->_constant_join_predicates(
-        $alias, $association->where, $params
+        $alias, $association->where, $params, $association->fields
     );
     push @predicates, $self->_tenant_pair_sql($association, $self->_root_alias, $alias),
         $self->_tenant_bound_sql($association, $alias, $params);
     return 'EXISTS (SELECT 1 FROM ' . $self->_association_source_sql($association) .
         ' AS ' . $self->quote_identifier($alias) . ' WHERE ' .
         join(' AND ', @predicates) . ')';
+}
+
+# A condition authored in the domain (a computed predicate's body, a value
+# expression's CASE condition), as a filter AST.
+sub _compile_authored_condition {
+    my ($self, $domain, $ast, $params) = @_;
+    return $self->_compile_expression($domain, $self->_authored_condition($ast), $params);
+}
+
+# The condition as an expression, its fields qualified by the joined
+# relation it belongs to (_selecto_field_prefix), if any.
+sub _authored_condition {
+    my ($self, $ast) = @_;
+    my $expression = Selecto::Expression->from_filter_ast($ast);
+    my $prefix = $self->{_selecto_field_prefix};
+    return defined($prefix) && length($prefix) ? _prefix_fields($expression, $prefix) : $expression;
+}
+
+sub _prefix_fields {
+    my ($value, $prefix) = @_;
+    if (blessed($value) && $value->isa('Selecto::Expression')) {
+        return Selecto::Expression->field($prefix . $value->arguments->[0])
+            if $value->kind eq 'field' && defined($value->arguments->[0]) && !ref($value->arguments->[0]);
+        my $copy = Selecto::Expression->new($value->kind, map { _prefix_fields($_, $prefix) } @{$value->arguments});
+        return defined($value->alias_name) ? $copy->as($value->alias_name) : $copy;
+    }
+    return [map { _prefix_fields($_, $prefix) } @$value] if ref($value) eq 'ARRAY';
+    return {map { ($_ => _prefix_fields($value->{$_}, $prefix)) } keys %$value} if ref($value) eq 'HASH';
+    return $value;
 }
 
 # Compiles a governed value expression (see Selecto::ValueExpression). Every
@@ -2346,7 +2427,8 @@ sub _compile_value_expression {
     Selecto::Error->throw('unsupported_feature', 'adapter does not support value expressions')
         unless $self->supports('value_expressions');
     my ($operator, @arguments) = @$node;
-    return $self->_field_sql($domain, $arguments[0], $params) if $operator eq 'field';
+    return $self->_field_sql($domain, ($self->{_selecto_field_prefix} // '') . $arguments[0], $params)
+        if $operator eq 'field';
     if ($operator eq 'previous') {
         Selecto::Error->throw('invalid_value_expression', 'previous is available only in a recursive member step')
             unless ref($self->{_previous}) eq 'HASH'
@@ -2391,7 +2473,7 @@ sub _compile_value_expression {
             . ' AS ' . $self->_value_type_sql($arguments[1]) . ')';
     }
     if ($operator eq 'json_text') {
-        my $field_sql = $self->_field_sql($domain, $arguments[0], $params);
+        my $field_sql = $self->_field_sql($domain, ($self->{_selecto_field_prefix} // '') . $arguments[0], $params);
         return $self->_compile_json_text($field_sql, $arguments[1], $params);
     }
     if ($operator eq 'case') {
@@ -2401,8 +2483,7 @@ sub _compile_value_expression {
                 push @parts, 'ELSE ' . $self->_compile_value_expression($domain, $branch->[1], $params);
                 next;
             }
-            my $condition = Selecto::Expression->from_filter_ast($branch->[0]);
-            push @parts, 'WHEN ' . $self->_compile_expression($domain, $condition, $params)
+            push @parts, 'WHEN ' . $self->_compile_authored_condition($domain, $branch->[0], $params)
                 . ' THEN ' . $self->_compile_value_expression($domain, $branch->[1], $params);
         }
         return 'CASE ' . join(' ', @parts) . ' END';
@@ -2579,6 +2660,24 @@ sub _comparison_nodes {
     return @nodes;
 }
 
+# Every expression node of expression trees.
+sub _expression_nodes {
+    my @pending = grep { defined } @_;
+    my @nodes;
+    while (@pending) {
+        my $value = shift @pending;
+        if (blessed($value) && $value->isa('Selecto::Expression')) {
+            push @nodes, $value;
+            push @pending, @{$value->arguments};
+        } elsif (ref($value) eq 'ARRAY') {
+            push @pending, @$value;
+        } elsif (ref($value) eq 'HASH' && !blessed($value)) {
+            push @pending, map { $value->{$_} } sort keys %$value;
+        }
+    }
+    return @nodes;
+}
+
 # The fields compared by those nodes (plain root fields only).
 sub _comparison_fields {
     return map {
@@ -2699,6 +2798,35 @@ sub _identity_field_exact {
     return _identity_text_type($resolved->{type});
 }
 
+# Exactness of a member correlation pair (CTE, VALUES, subquery, lateral and
+# recursive joins). Each side is [$domain, $path] (a field of a relation) or
+# [undef, $type] (a source column of known or unknown declared type). The
+# pair decides identity when either side is a tenant or scope column of its
+# relation; it is then classified from both sides' declared types: exact when
+# either is known text, plain only when both are known non-text, otherwise
+# decided by the server (an INT tenant must not match text '07' or ' 7').
+sub _member_pair_exact {
+    my ($self, @sides) = @_;
+    return 0 unless $self->_exact_identity_compare;
+    my ($identity, @classes) = (0);
+    for my $side (@sides) {
+        my ($domain, $path) = @$side;
+        unless (defined $domain) {
+            push @classes, _identity_text_type($path);
+            next;
+        }
+        my $resolved = eval { $domain->resolve("$path") };
+        push @classes, ref($resolved) eq 'HASH' ? _identity_text_type($resolved->{type}) : 2;
+        next unless ref($resolved) eq 'HASH' && defined $resolved->{field};
+        my %names = map { ($_ => 1) } $self->_identity_root_columns($domain);
+        $identity = 1 if !$resolved->{association} && $names{$resolved->{field}};
+    }
+    return 0 unless $identity;
+    return 1 if grep { $_ == 1 } @classes;
+    return 0 unless grep { $_ != 0 } @classes;
+    return 2;
+}
+
 sub _identity_root_columns {
     my ($self, $domain) = @_;
     my $scope = eval { $domain->write_tenant_scope };
@@ -2755,14 +2883,24 @@ sub _tenant_bound_sql {
     $refuse->('a tenant-scoped relation past an untenanted hop has no tenant boundary of the root to carry');
 }
 
+# An association's fixed where policy (on its target, or on a through
+# bridge) is domain-authored scope: on dialects whose collations fold text
+# each pin compares as identity, classified by the column's declared type
+# ($types: the target relation's field types; a bridge column has none, so
+# the server decides).
 sub _constant_join_predicates {
-    my ($self, $alias, $where, $params) = @_;
+    my ($self, $alias, $where, $params, $types) = @_;
     return () unless ref($where) eq 'HASH' && keys %$where;
     my @predicates;
     for my $field (sort keys %$where) {
         my $column = $self->_qualified($alias, $field);
         if (!defined($where->{$field})) {
             push @predicates, "$column IS NULL";
+            next;
+        }
+        if ($self->_exact_identity_compare) {
+            push @predicates, $self->_identity_values_sql($column, [$where->{$field}], $params,
+                _identity_text_type(ref($types) eq 'HASH' ? $types->{$field} : undef));
             next;
         }
         push @$params, $where->{$field};

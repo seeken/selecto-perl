@@ -81,6 +81,8 @@ sub lookup {
         ) unless exists $selection_index{$field};
     }
 
+    # The definition's own filters (its view or segments) are domain-authored.
+    my $authored = $query->predicate;
     my $search = $definition->{search};
     _public_field($target_domain, $_) for @{$search->{fields}};
     for my $order (@{$query->orders}) {
@@ -117,6 +119,12 @@ sub lookup {
     }
     $query = $query->limit($limit);
 
+    # The request scope is the host's (it is asserted as the tenant boundary
+    # above) and the definition's filters are authored: both compile as host
+    # identity, never as a caller filter.
+    my $adapter = $engine->adapter;
+    local $adapter->{_selecto_trusted_predicates} = [@{$adapter->{_selecto_trusted_predicates} // []},
+        grep { defined } $authored, $args{predicate}];
     my $raw = $engine->all($query, canonical_values => 1);
     Selecto::Error->throw('invalid_co_domain_result', 'adapter returned an invalid lookup result')
         unless ref($raw) eq 'HASH' && ref($raw->{rows}) eq 'ARRAY';
