@@ -61,8 +61,8 @@ is_deeply($e->all($q)->{rows},[[1],[2]],'approved scoped copy preserves original
 my $error=caught(sub{$scoped->with_scope(tenant=>8)});is($error->code,'tenant_mismatch','approved transition still refuses another tenant');
 $scoped->read_domain->{required_predicate}=Selecto::Expression->eq('tenant_id',8);$events=0;
 $error=caught(sub{$scoped->all($q)});is($error->code,'domain_modified_after_configuration','cached scoped domain cannot remove trusted tenant');is($events,0,'cached tenant tamper performs no native work');
-my $prepared=Selecto::BoundedQuery->prepare($e,$q);$e->{domain}{table}='other_records';$events=0;
-$error=caught(sub{Selecto::BoundedQuery->execute($e,$prepared)});is($error->code,'domain_modified_after_configuration','prepared bounded statement revalidates current domain before execute');is($events,0,'prepared stale statement performs no native work');
+my $bounded=$e->with_scope(tenant=>7);my $prepared=Selecto::BoundedQuery->prepare($bounded,$bounded->query->select('id'));$bounded->{domain}{table}='other_records';$events=0;
+$error=caught(sub{Selecto::BoundedQuery->execute($bounded,$prepared)});is($error->code,'domain_modified_after_configuration','prepared bounded statement revalidates current domain before execute');is($events,0,'prepared stale statement performs no native work');
 $e=engine();my $hidden=$e->without_action_prerequisites('finish');
 ok(!exists($hidden->domain->fields->{can_finish}),'approved prerequisite removal changes the derived domain');
 is_deeply($hidden->all($hidden->query->select('id'))->{rows},[[1],[2]],'approved prerequisite copy remains executable');

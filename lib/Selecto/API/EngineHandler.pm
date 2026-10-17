@@ -625,7 +625,7 @@ sub _query ($self, $engine, $body, %options) {
         ? {columns => $engine->compile($query->limit(1))->columns, rows => []}
         : $self->bounded_results
             ? Selecto::BoundedQuery->all($engine, $query->limit($limit + 1), limits => $self->limits,
-                max_rows => $limit + 1)
+                max_rows => $limit + 1, canonical_values => 1)
         : $engine->all($query->limit($limit + 1), $options{export_scalars} ? (export_scalars => 1) : (canonical_values => 1));
     Selecto::Error->throw(
         'invalid_api_host', 'Selecto adapter returned an invalid result',

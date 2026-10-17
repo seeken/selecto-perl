@@ -220,14 +220,14 @@ for my $backend (@backends) {
             $refused->("$kind tenant_id = 8: update", 'tenant_mismatch', sub { $engine->(%eight)->execute_write($bulk_update->()) });
             $refused->("$kind tenant_id = 8: delete", 'tenant_mismatch', sub { $engine->(%eight)->execute_write($bulk_delete->()) });
             $refused->("$kind tenant_id = 8: API update", 'tenant_mismatch', sub {
-                my $code = $api_write->($engine->(%eight), {operation => 'update', assignments => {total => 99},
+                my $code = $api_write->($engine->(%eight, scoped => 1), {operation => 'update', assignments => {total => 99},
                     filters => [{field => 'total', op => 'gt', value => 0}], expected_count => 2});
                 Selecto::Error->throw($code, $code) unless $code eq 'ok' });
             $refused->("$kind tenant_id = 8: graph", 'tenant_mismatch', sub { $engine->(%eight)->execute_graph($graph->($root_update->(1))) });
             $accepted->("$kind tenant_id IN (7, 8): update", sub { $engine->(%both)->execute_write($bulk_update->()) }, $updated7);
             $accepted->("$kind tenant_id IN (7, 8): delete", sub { $engine->(%both)->execute_write($bulk_delete->()) }, $deleted7);
             $accepted->("$kind tenant_id IN (7, 8): API update", sub {
-                my $code = $api_write->($engine->(%both), {operation => 'update', assignments => {total => 99},
+                my $code = $api_write->($engine->(%both, scoped => 1), {operation => 'update', assignments => {total => 99},
                     filters => [{field => 'total', op => 'gt', value => 0}], expected_count => 2});
                 die "API: $code" unless $code eq 'ok' }, $updated7);
         }
@@ -239,7 +239,7 @@ for my $backend (@backends) {
         $refused->('caller id = 2: delete', 'cardinality_mismatch', sub {
             $engine->()->execute_write($command->(operation => 'delete', predicate => $E->eq('id', 2), expected_count => 1)) });
         $refused->('caller id = 2: API update', 'cardinality_mismatch', sub {
-            my $code = $api_write->($engine->(), {operation => 'update', assignments => {total => 0},
+            my $code = $api_write->($engine->(scoped => 1), {operation => 'update', assignments => {total => 0},
                 filters => [{field => 'id', op => 'eq', value => 2}]});
             Selecto::Error->throw($code, $code) unless $code eq 'ok' });
         $refused->('caller id = 2: graph root', 'cardinality_mismatch', sub { $engine->()->execute_graph($graph->($root_update->(2))) });
@@ -257,7 +257,7 @@ for my $backend (@backends) {
             operation => 'insert', assignments => {id => 5, code => 'x', total => 1, state => 'open'})) },
             [@$original_orders, [5, 7, 'x', 1, 'open']]);
         $accepted->('API insert omitting the tenant', sub {
-            my $code = $api_write->($engine->(), {operation => 'insert', assignments => {id => 5, code => 'x', total => 1, state => 'open'}});
+            my $code = $api_write->($engine->(scoped => 1), {operation => 'insert', assignments => {id => 5, code => 'x', total => 1, state => 'open'}});
             die "API: $code" unless $code eq 'ok' }, [@$original_orders, [5, 7, 'x', 1, 'open']]);
         $accepted->('upsert on (tenant_id, code) colliding with tenant 8\'s code', sub { $engine->()->execute_write($command->(
             operation => 'upsert', assignments => {id => 9, code => 'a', total => 77, state => 'open'},
@@ -274,9 +274,9 @@ for my $backend (@backends) {
             Selecto::Write::Batch->new($bulk_update->(), $bulk_delete->(predicate => $E->eq('code', 'zzz')))) }, $updated7);
         $refused->('a batch inserting a tenant 8 row', 'tenant_mismatch', sub { $engine->()->execute_batch(Selecto::Write::Batch->new(
             $command->(operation => 'insert', assignments => {id => 5, tenant_id => 8, code => 'x', total => 1, state => 'open'}))) });
-        $accepted->('a query-enforced update', sub { my $e = $engine->();
+        $accepted->('a query-enforced update', sub { my $e = $engine->(scoped => 1);
             $e->execute_write($e->enforce_query($bulk_update->(), $e->query->where($E->gt('total', 0)))) }, $updated7);
-        $refused->('a query-enforced update for tenant 8', 'tenant_mismatch', sub { my $e = $engine->();
+        $refused->('a query-enforced update for tenant 8', 'tenant_mismatch', sub { my $e = $engine->(scoped => 1);
             $e->execute_write($e->enforce_query($bulk_update->(), $e->query->where($E->eq('tenant_id', 8)))) });
         $refused->('an action on tenant 8\'s row', 'cardinality_mismatch', sub { my $e = $engine->();
             $e->execute_action($e->plan_action({action => 'close', target => 2}), resolver => $resolver) });

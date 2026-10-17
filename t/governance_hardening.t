@@ -278,10 +278,10 @@ SKIP: {
         is($dbh->selectrow_array('SELECT title FROM work_orders WHERE id = 2'), 'theirs',
             'no refused write touched the other tenant');
 
-        # Lesson 47: the engine tenant binds tenant_field on every write.
-        is($update->($engine_for->(undef, tenant => 10), 1), 'ok',
-            'an engine tenant without writes.scope.tenant is a write boundary');
-        is($update->($engine_for->(undef, tenant => 10), 2), 'cardinality_mismatch',
+        # Public write authority still requires explicit writes.scope.tenant.
+        is($update->($engine_for->(undef, tenant => 10), 1), 'missing_tenant_scope',
+            'an engine tenant without writes.scope.tenant cannot authorize a public write');
+        is($update->($engine_for->(undef, tenant => 10), 2), 'missing_tenant_scope',
             'and it cannot reach the other tenant\'s row');
         is($dbh->selectrow_array('SELECT title FROM work_orders WHERE id = 2'), 'theirs',
             'which is left untouched');
