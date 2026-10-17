@@ -4,7 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use Scalar::Util qw(blessed);
-use Storable qw(dclone);
+use Selecto::Action::Planner ();
 use Selecto::Action::Plan ();
 use Selecto::Error ();
 
@@ -12,7 +12,7 @@ sub request {
     my ($class, $plan, $phase) = @_;
     _plan($plan);
     _phase($phase);
-    return dclone({
+    return Selecto::Action::Planner->_copy_values({
         phase         => "$phase",
         capability    => $plan->capability,
         action        => $plan->action,

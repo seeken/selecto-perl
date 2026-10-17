@@ -3,12 +3,13 @@ package Selecto::Query;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed reftype);
 use Storable qw(dclone);
 use DateTime::TimeZone ();
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
+use Selecto::QueryBinding ();
 
 our $RECURSION_DEPTH_COLUMN = 'selecto_depth';
 
@@ -26,7 +27,7 @@ sub _build {
     my %allowed = map { $_ => 1 } qw(
         selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
         set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
-        retarget
+        retarget values_sources subqueries function_laterals
     );
     my @unknown = sort grep { !$allowed{$_} } keys %args;
     Selecto::Error->throw(
@@ -82,8 +83,8 @@ sub _build {
         unless ref($members) eq 'ARRAY' && !grep { !defined($_) || ref($_) } @$members;
     my $timezone = $args{timezone};
     my $row_lock = $args{row_lock};
-    Selecto::Error->throw('invalid_query', 'row lock must be share')
-        if defined($row_lock) && (ref($row_lock) || $row_lock ne 'share');
+    Selecto::Error->throw('invalid_query', 'row lock must be share or update')
+        if defined($row_lock) && (ref($row_lock) || $row_lock !~ /\A(?:share|update)\z/);
     Selecto::Error->throw('invalid_query', 'timezone must be a valid IANA timezone name')
         if defined($timezone) && (
             ref($timezone) || !DateTime::TimeZone->is_valid_name("$timezone")
@@ -98,7 +99,18 @@ sub _build {
         unless ref($array_rowsets) eq 'ARRAY';
     Selecto::Error->throw('invalid_query', 'advanced query source entries must be objects')
         if grep { ref($_) ne 'HASH' } (@$ctes, @$lateral_joins, @$json_rowsets, @$array_rowsets);
+    my %extra;
+    for my $key (qw(values_sources subqueries function_laterals)) {
+        my $plans = $args{$key} // [];
+        Selecto::Error->throw('invalid_query', 'query source plans must be an array of objects')
+            unless ref($plans) eq 'ARRAY' && !grep { ref($_) ne 'HASH' } @$plans;
+        require Selecto::Domain::QueryContract;
+        $plans = Selecto::Domain::QueryContract->copy_declaration({plans => $plans})->{plans}
+            if $key ne 'subqueries';
+        $extra{$key} = [map { _clone_source_plan($_) } @$plans];
+    }
     return bless {
+        %extra,
         selections  => [@{$args{selections} // []}],
         predicate   => $args{predicate},
         groups      => [@{$args{groups} // []}],
@@ -129,11 +141,33 @@ sub _build {
 sub select {
     my ($self, @values) = @_;
     $self->_ensure_pre_set_mutation('select');
+    Selecto::Error->throw('raw_sql_forbidden', 'raw SQL is not a governed selection', {path => []})
+        if @values == 1 && ref($values[0]) eq 'ARRAY' && @{$values[0]}
+            && !ref($values[0][0]) && defined($values[0][0]) && $values[0][0] eq 'raw_sql';
     @values = @{$values[0]} if @values == 1 && ref($values[0]) eq 'ARRAY';
     my @expressions = map {
         blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
     } @values;
     return $self->_copy(selections => \@expressions);
+}
+
+# The domain owns the relation graph. Declared associations and query members
+# use their existing governed APIs; caller-created relation overrides do not.
+sub join {
+    my ($self, $name, @options) = @_;
+    $self->_ensure_pre_set_mutation('join');
+    Selecto::Error->throw('ad_hoc_join_forbidden', 'ad-hoc joins are outside the configured domain', {path => []}) if @options;
+    _source_name($name, 'declared join');
+    my $owner = Selecto::QueryBinding->owner($self);
+    Selecto::Error->throw('ad_hoc_join_forbidden', 'join must name a declared association') unless $owner;
+    my $association = $owner->domain->resolve_association($name)->{association};
+    # A declared join participates even when no selected field needs it.
+    return $self->_copy(predicate => defined($self->{predicate})
+        ? Selecto::Expression->all($self->{predicate}, Selecto::Expression->any(
+            Selecto::Expression->is_null("$name." . $association->related_key),
+            Selecto::Expression->not_null("$name." . $association->related_key)))
+        : Selecto::Expression->any(Selecto::Expression->is_null("$name." . $association->related_key),
+            Selecto::Expression->not_null("$name." . $association->related_key)));
 }
 
 sub where {
@@ -280,6 +314,7 @@ sub _set_operation {
         if $operation ne 'union' && $opts{all};
     Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')
         if defined($self->{row_lock}) || defined($query->row_lock);
+    Selecto::QueryBinding->compose($self, $query);
     return $self->_copy(set_operations => [
         @{$self->{set_operations}},
         {operation => $operation, all => $opts{all} ? 1 : 0, query => $query},
@@ -287,15 +322,34 @@ sub _set_operation {
 }
 
 sub with_cte {
-    my ($self, $name, $domain, $query, %opts) = @_;
+    my ($self, $name, $domain, @rest) = @_;
+    my ($query, %opts);
+    if (ref($domain) eq 'CODE') { %opts = @rest }
+    else { ($query, %opts) = @rest }
     $self->_ensure_pre_set_mutation('with_cte');
+    return $self->with_member($name, group => 'ctes') unless defined $domain;
+    Selecto::QueryBinding->guard_source($self, 'ad_hoc_source_forbidden');
+    if (ref($domain) eq 'CODE') {
+        my $owner = Selecto::QueryBinding->owner($self);
+        $owner->assert_domain_identity if $owner;
+        $query = $domain->($owner);
+        my $child_owner = blessed($query) && UNIVERSAL::isa($query, __PACKAGE__) ? Selecto::QueryBinding->owner($query) : undef;
+        Selecto::Error->throw('invalid_query', 'CTE callback must return a configured Selecto query') unless $child_owner;
+        $owner->assert_domain_identity if $owner;
+        $domain = $child_owner->read_domain;
+    }
     _known_options(\%opts, [qw(columns join depends_on)], 'CTE');
     _source_name($name, 'CTE');
     _domain_query($domain, $query, 'CTE');
-    _unique_source_name($self, $name);
+    $domain = Selecto::QueryBinding->source_domain($self, $domain, $query);
+    if (defined($opts{join})) { _unique_source_name($self, $name) }
+    else {
+        Selecto::Error->throw('invalid_query', "duplicate CTE source $name")
+            if grep { $_->{name} eq $name } (@{$self->{ctes}}, @{$self->{values_sources}});
+    }
     my $columns = $opts{columns} // _query_columns($query);
     _columns($columns, 'CTE');
-    my $join = _join_spec($opts{join}, $columns, 'CTE');
+    my $join = defined($opts{join}) ? _join_spec($opts{join}, $columns, 'CTE') : undef;
     my $dependencies = $opts{depends_on} // [];
     $dependencies = [$dependencies] unless ref($dependencies) eq 'ARRAY';
     my %available = map { $_->{name} => 1 } @{$self->{ctes}};
@@ -313,6 +367,7 @@ sub with_cte {
 sub with_recursive_cte {
     my ($self, $name, $domain, $anchor, $recursive, %opts) = @_;
     $self->_ensure_pre_set_mutation('with_recursive_cte');
+    Selecto::QueryBinding->guard_source($self, 'ad_hoc_source_forbidden');
     _known_options(\%opts, [qw(columns join recursive_join max_depth)], 'recursive CTE');
     my $max_depth = $opts{max_depth};
     Selecto::Error->throw('invalid_query', 'recursive CTE max_depth must be a positive integer')
@@ -352,9 +407,11 @@ sub with_recursive_cte {
 sub lateral_join {
     my ($self, $name, $domain, $query, %opts) = @_;
     $self->_ensure_pre_set_mutation('lateral_join');
+    Selecto::QueryBinding->guard_source($self, 'ad_hoc_source_forbidden');
     _known_options(\%opts, [qw(columns correlations type)], 'lateral join');
     _source_name($name, 'lateral alias');
     _domain_query($domain, $query, 'lateral query');
+    $domain = Selecto::QueryBinding->source_domain($self, $domain, $query);
     _unique_source_name($self, $name);
     my $columns = $opts{columns} // _query_columns($query);
     _columns($columns, 'lateral query');
@@ -377,6 +434,7 @@ sub lateral_join {
 sub json_rowset {
     my ($self, $source_field, $name, $columns, %opts) = @_;
     $self->_ensure_pre_set_mutation('json_rowset');
+    Selecto::QueryBinding->guard_source($self, 'ad_hoc_source_forbidden');
     _known_options(\%opts, [qw(path type)], 'JSON rowset');
     _source_name($name, 'JSON rowset alias');
     _unique_source_name($self, $name);
@@ -401,9 +459,22 @@ sub json_rowset {
 # Activates a query member the domain declares; the compiler expands it into a
 # CTE, lateral, or array rowset source.
 sub with_member {
-    my ($self, $name) = @_;
+    my ($self, $name, %options) = @_;
     $self->_ensure_pre_set_mutation('with_member');
     _source_name($name, 'query member');
+    _known_options(\%options, ['group'], 'query member');
+    if (defined $options{group}) {
+        Selecto::Error->throw('invalid_query', 'unknown query member family')
+            unless !defined(reftype($options{group})) && $options{group} =~ /\A(?:ctes|values|subqueries|laterals|unnests)\z/;
+        $name = "$options{group}:$name";
+    }
+    if (my $owner = Selecto::QueryBinding->owner($self)) {
+        my ($group, $member) = $name =~ /\A([^:]+):(.+)\z/ ? ($1, $2) : (undef, $name);
+        my $declared = ($owner->domain->contract // {})->{query_members} // {};
+        my @found = grep { (!defined($group) || $_ eq $group) && ref($declared->{$_}) eq 'HASH' && exists($declared->{$_}{$member}) } keys %$declared;
+        Selecto::Error->throw('unknown_query_member', 'query member is not declared', {member => $member}) unless @found;
+        Selecto::Error->throw('invalid_domain', 'query member is declared in several families', {member => $member}) if @found > 1;
+    }
     Selecto::Error->throw('invalid_query', "query member $name is already active")
         if grep { $_ eq $name } @{$self->{members}};
     return $self->_copy(members => [@{$self->{members}}, "$name"]);
@@ -411,11 +482,102 @@ sub with_member {
 
 sub without_members { return $_[0]->_copy(members => []); }
 
+sub with_values {
+    my ($self, $rows, %options) = @_;
+    $self->_ensure_pre_set_mutation('with_values');
+    return $self->with_member($rows, group => 'values') unless defined(reftype($rows));
+    Selecto::QueryBinding->guard_source($self, 'ad_hoc_source_forbidden');
+    require Selecto::Domain::QueryContract;
+    my $data = Selecto::Domain::QueryContract->copy_declaration({rows => $rows, options => \%options});
+    ($rows, my $opts) = @{$data}{qw(rows options)};
+    _known_options($opts, [qw(columns as alias join type)], 'VALUES source');
+    my $name = $opts->{as} // $opts->{alias};
+    _source_name($name, 'VALUES alias');
+    _unique_source_name($self, $name);
+    my $columns = $opts->{columns};
+    Selecto::Error->throw('invalid_query', "duplicate CTE source $name")
+        if grep { $_->{name} eq $name } @{$self->{ctes}};
+    _columns($columns, 'VALUES');
+    Selecto::Error->throw('invalid_query', 'VALUES rows must be an array of scalar rows matching the declared columns')
+        unless ref($rows) eq 'ARRAY' && !grep {
+            ref($_) ne 'ARRAY' || @$_ != @$columns || grep { ref($_) && ref($_) ne 'JSON::PP::Boolean' } @$_
+        } @$rows;
+    my $join = defined($opts->{join}) ? _join_spec($opts->{join}, $columns, 'VALUES') : undef;
+    return $self->_copy(values_sources => [@{$self->{values_sources}}, {
+        name => "$name", rows => $rows, columns => $columns, join => $join,
+    }]);
+}
+
+sub with_subquery {
+    my ($self, $name) = @_;
+    $self->_ensure_pre_set_mutation('with_subquery');
+    return $self->with_member($name, group => 'subqueries');
+}
+sub subquery_join {
+    my ($self, $name, $domain, $query, %options) = @_;
+    $self->_ensure_pre_set_mutation('subquery_join');
+    Selecto::QueryBinding->guard_source($self, 'ad_hoc_join_forbidden');
+    _known_options(\%options, [qw(columns on type)], 'subquery join');
+    _source_name($name, 'subquery alias');
+    _unique_source_name($self, $name);
+    _domain_query($domain, $query, 'subquery');
+    $domain = Selecto::QueryBinding->source_domain($self, $domain, $query);
+    my $columns = $options{columns} // _query_columns($query);
+    _columns($columns, 'subquery');
+    require Selecto::Domain::QueryContract;
+    my $on = Selecto::Domain::QueryContract->copy_declaration({on => $options{on}})->{on};
+    my $type = $options{type} // 'left';
+    Selecto::Error->throw('invalid_query', 'subquery join must be left or inner')
+        unless !defined(reftype($type)) && ($type eq 'left' || $type eq 'inner');
+    Selecto::Error->throw('invalid_query', 'subquery join requires nonempty equality conditions')
+        unless ref($on) eq 'ARRAY' && @$on;
+    for my $condition (@$on) {
+        Selecto::Error->throw('invalid_query', 'subquery equality condition must contain left and right fields')
+            unless ref($condition) eq 'HASH' && keys(%$condition) == 2;
+        _source_name($condition->{left}, 'subquery owner key');
+        _source_name($condition->{right}, 'subquery related key');
+        Selecto::Error->throw('invalid_query', 'subquery right key must be projected')
+            unless grep { $_ eq $condition->{right} } @$columns;
+    }
+    return $self->_copy(subqueries => [@{$self->{subqueries}}, {
+        name => "$name", domain => $domain, query => $query, columns => $columns, on => $on, type => $type,
+    }]);
+}
+sub with_lateral {
+    my ($self, $name) = @_;
+    $self->_ensure_pre_set_mutation('with_lateral');
+    return $self->with_member($name, group => 'laterals');
+}
+sub function_lateral {
+    my ($self, $function, $arguments, %options) = @_;
+    $self->_ensure_pre_set_mutation('function_lateral');
+    Selecto::QueryBinding->guard_source($self, 'ad_hoc_source_forbidden');
+    require Selecto::Domain::QueryContract;
+    my $data = Selecto::Domain::QueryContract->copy_declaration({function => $function, arguments => $arguments, options => \%options});
+    ($function, $arguments, my $opts) = @{$data}{qw(function arguments options)};
+    _known_options($opts, [qw(as type columns)], 'function lateral');
+    _source_name($function, 'table function');
+    my $name = $opts->{as} // $function;
+    _source_name($name, 'function lateral alias');
+    _unique_source_name($self, $name);
+    Selecto::Error->throw('invalid_query', 'table function arguments must be scalar values')
+        unless ref($arguments) eq 'ARRAY' && !grep { ref($_) && ref($_) ne 'JSON::PP::Boolean' } @$arguments;
+    my $type = $opts->{type} // 'inner';
+    Selecto::Error->throw('invalid_query', 'table function join type must be left, inner or cross')
+        unless !defined(reftype($type)) && $type =~ /\A(?:left|inner|cross)\z/;
+    my $columns = $opts->{columns} // ['value'];
+    _columns($columns, 'table function');
+    return $self->_copy(function_laterals => [@{$self->{function_laterals}}, {
+        name => "$name", function => "$function", arguments => $arguments, columns => $columns, type => $type,
+    }]);
+}
+
 # Expands an array field into one row per element. The source exposes `value`
 # and, with ordinality => 'position', the element's 1-based position.
 sub array_rowset {
     my ($self, $source_field, $name, %opts) = @_;
     $self->_ensure_pre_set_mutation('array_rowset');
+    Selecto::QueryBinding->guard_source($self, 'ad_hoc_source_forbidden');
     _known_options(\%opts, [qw(ordinality type)], 'array rowset');
     _source_name($name, 'array rowset alias');
     _unique_source_name($self, $name);
@@ -439,7 +601,7 @@ sub array_rowset {
 sub _source_name {
     my ($value, $label) = @_;
     Selecto::Error->throw('invalid_query', "$label must be a valid identifier")
-        unless defined($value) && !ref($value) && "$value" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+        unless defined($value) && !defined(reftype($value)) && "$value" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
     return "$value";
 }
 
@@ -482,6 +644,8 @@ sub _columns {
         unless ref($columns) eq 'ARRAY' && @$columns;
     my %seen;
     for my $column (@$columns) {
+        Selecto::Error->throw('invalid_query', "$label column must be a field name")
+            unless defined($column) && !defined(reftype($column));
         Selecto::Identifier::result_name($column);
         Selecto::Error->throw('invalid_query', "$label columns must be unique")
             if $seen{"$column"}++;
@@ -496,7 +660,10 @@ sub _join_spec {
     my $related_key = _source_name($join->{related_key}, "$label related key");
     Selecto::Error->throw('invalid_query', "$label related key must be a projected column")
         unless grep { $_ eq $related_key } @$columns;
-    my $type = lc($join->{type} // 'left');
+    my $type = $join->{type} // 'left';
+    Selecto::Error->throw('invalid_query', "$label join type must be a string")
+        if defined(reftype($type));
+    $type = lc($type);
     Selecto::Error->throw('invalid_query', "$label join type must be left or inner")
         unless $type eq 'left' || $type eq 'inner';
     return {owner_key => $owner_key, related_key => $related_key, type => $type};
@@ -505,8 +672,8 @@ sub _join_spec {
 sub _unique_source_name {
     my ($self, $name) = @_;
     my %names = map { $_->{name} => 1 }
-        (@{$self->{ctes}}, @{$self->{lateral_joins}}, @{$self->{json_rowsets}},
-            @{$self->{array_rowsets}});
+        ((grep { defined($_->{join}) } @{$self->{ctes}}), @{$self->{lateral_joins}}, @{$self->{json_rowsets}},
+            @{$self->{array_rowsets}}, @{$self->{values_sources}}, @{$self->{subqueries}}, @{$self->{function_laterals}});
     Selecto::Error->throw('invalid_query', "duplicate query source $name") if $names{$name};
 }
 
@@ -559,6 +726,18 @@ sub for_share {
     $self->_ensure_pre_set_mutation('for_share');
     return $self->_copy(row_lock => 'share');
 }
+sub filter {
+    my ($self, $expression) = @_;
+    Selecto::Error->throw('invalid_query', 'filter expects an expression')
+        unless blessed($expression) && $expression->isa('Selecto::Expression');
+    return $self->where(defined($self->predicate)
+        ? Selecto::Expression->all($self->predicate, $expression) : $expression);
+}
+sub select_for_update {
+    my ($self, @fields) = @_;
+    require Selecto::Write::LockedQuery;
+    return Selecto::Write::LockedQuery->new($self, @fields);
+}
 
 sub _nonnegative {
     my ($value, $label) = @_;
@@ -587,13 +766,52 @@ sub _copy {
         row_lock => $self->{row_lock},
         retarget => $self->{retarget},
         applied_query_library => $self->{applied_query_library},
+        (map { ($_ => $self->{$_}) } qw(values_sources subqueries function_laterals)),
         %changes,
     );
     my $class = ref($self);
     # A subclass with its own constructor still receives every copy through it.
-    return $class->new(%state) unless $class->can('new') == \&new;
-    return $class->_build(\%state, !exists($changes{applied_query_library})
-        && defined($self->{applied_query_library}));
+    my $copy = $class->can('new') != \&new ? $class->new(%state)
+        : $class->_build(\%state, !exists($changes{applied_query_library}) && defined($self->{applied_query_library}));
+    return Selecto::QueryBinding->inherit($self, $copy);
+}
+
+sub _clone_source_plan {
+    my ($spec) = @_;
+    Selecto::Error->throw('invalid_query', 'source rows must be arrays')
+        if ref($spec->{rows}) eq 'ARRAY' && grep { ref($_) ne 'ARRAY' } @{$spec->{rows}};
+    Selecto::Error->throw('invalid_query', 'source conditions must be objects')
+        if ref($spec->{on}) eq 'ARRAY' && grep { ref($_) ne 'HASH' } @{$spec->{on}};
+    return {%$spec,
+        (ref($spec->{columns}) eq 'ARRAY' ? (columns => [@{$spec->{columns}}]) : ()),
+        (ref($spec->{rows}) eq 'ARRAY' ? (rows => [map { [@$_] } @{$spec->{rows}}]) : ()),
+        (ref($spec->{join}) eq 'HASH' ? (join => {%{$spec->{join}}}) : ()),
+        (ref($spec->{on}) eq 'ARRAY' ? (on => [map { {%$_} } @{$spec->{on}}]) : ()),
+        (ref($spec->{arguments}) eq 'ARRAY' ? (arguments => [@{$spec->{arguments}}]) : ()),
+    };
+}
+sub values_sources { [map { _clone_source_plan($_) } @{$_[0]->{values_sources}}] }
+sub subqueries { [map { _clone_source_plan($_) } @{$_[0]->{subqueries}}] }
+sub function_laterals { [map { _clone_source_plan($_) } @{$_[0]->{function_laterals}}] }
+
+sub _validate_source_plans {
+    my ($self) = @_;
+    for my $spec (@{$self->values_sources}) {
+        _known_options($spec, [qw(name rows columns join)], 'VALUES plan');
+        __PACKAGE__->new->with_values($spec->{rows}, as => $spec->{name}, columns => $spec->{columns},
+            (defined($spec->{join}) ? (join => $spec->{join}) : ()));
+    }
+    for my $spec (@{$self->subqueries}) {
+        _known_options($spec, [qw(name domain query columns on type)], 'subquery plan');
+        __PACKAGE__->new->subquery_join($spec->{name}, $spec->{domain}, $spec->{query},
+            on => $spec->{on}, columns => $spec->{columns}, type => $spec->{type});
+    }
+    for my $spec (@{$self->function_laterals}) {
+        _known_options($spec, [qw(name function arguments columns type)], 'function lateral plan');
+        __PACKAGE__->new->function_lateral($spec->{function}, $spec->{arguments},
+            as => $spec->{name}, columns => $spec->{columns}, type => $spec->{type});
+    }
+    return 1;
 }
 
 sub selections   { return [@{$_[0]->{selections}}]; }
@@ -739,7 +957,8 @@ Sets plain grouping expressions.
 
 Groups with C<ROLLUP> to add subtotal and grand-total rows. Use
 L<Selecto::Expression/AGGREGATES> to tell detail rows from subtotal rows.
-Requires the C<rollup> capability (PostgreSQL, DuckDB). See
+Requires the C<rollup> capability (PostgreSQL, DuckDB, SQLite). SQLite uses
+bounded C<UNION ALL> branches with explicit grouping masks. See
 L<Selecto::PostgreSQL> for rollup ordering behavior.
 
 =head2 order_by
@@ -827,9 +1046,44 @@ their columns are addressed as C<name.column>.
       ->select('id', 'recent_events.kind');
 
 Adds a common table expression. C<columns> defaults to the aliases or field
-names of the CTE query's selections. C<join> is required;
+names of the CTE query's selections. Without C<join>, the CTE is registered
+without adding a root join. When a join is supplied,
 C<related_key> must be one of the columns and C<type> is C<left> or
 C<inner>. C<depends_on> names earlier CTEs this one reads.
+
+C<with_cte('member_id')> activates a declared CTE. In permissive mode an
+explicit host CODE callback may replace the domain/query pair; it receives the
+configured engine and must return a compatible configured query. Strict mode
+refuses that ad-hoc callback before invoking it. CTE names cannot shadow any
+physical domain relation in the bounded structured query tree. C<depends_on>
+permits an earlier CTE as a child domain source only with matching projected
+field identities.
+
+=head2 with_values
+
+C<with_values('member_id')> activates declared VALUES. In permissive mode,
+C<with_values($rows, columns =E<gt> [...], as =E<gt> 'labels', join =E<gt> {...})>
+adds bounded scalar rows; every row matches the declared width, and cells are
+bound parameters. Omit C<join> for a cross join. An empty row list yields an
+empty source. Aliases cannot collide with domain relations or compiler aliases.
+
+=head2 with_subquery, subquery_join
+
+C<with_subquery('member_id')> activates a declared derived join. The permissive
+C<subquery_join($name, $domain, $query, on =E<gt> [{left =E<gt> 'id', right =E<gt> 'id'}])>
+uses explicit left/inner equality conditions and actual projected fields.
+Configured child queries retain their own required predicates and the same
+read policy and tenant identity. Scoped composition refuses an unconfigured
+child query. Unbound query construction cannot override configured authority.
+
+=head2 with_lateral, function_lateral
+
+C<with_lateral('member_id')> activates a declared function or data lateral.
+C<function_lateral($function, $scalar_arguments, as =E<gt> $alias)> is available
+in permissive mode only. Identifiers are quoted and arguments are bound.
+Adapters must advertise lateral support; SQLite refuses table-function
+laterals rather than claiming their execution. Portable callback markers are
+inert; explicit host CTE/subquery builders are configured on the engine.
 
 =head2 with_recursive_cte
 
@@ -859,8 +1113,10 @@ A correlated lateral subquery (PostgreSQL).
       ->select('id', 'items.sku', 'items.quantity');
 
 Expands a JSON column into typed rows through a lateral
-C<JSONB_TO_RECORDSET> (PostgreSQL). Column types are allowlisted; the
-optional SQL/JSON C<path> is a bound parameter.
+C<JSONB_TO_RECORDSET> on PostgreSQL or C<JSON_EACH> on SQLite with JSON1.
+Column types are allowlisted; the optional path is a bound parameter.
+SQLite accepts direct array paths, optionally ending in C<[*]>, and preserves
+roots with empty/missing arrays for left joins.
 
 =head2 array_rowset
 
@@ -893,7 +1149,7 @@ feature fails before any SQL is sent. At the time of writing:
   cte, recursive    yes         yes     3.8+      cte    no
   window functions  yes         yes     3.25+     yes    no
   set operations    yes         yes     yes       yes    no
-  rollup            yes         yes     no        no     no
+  rollup            yes         yes     yes       no     no
   lateral, json     yes         no      no        no     no
   array rowsets     yes         no      no        no     no
   for_share         yes         no      no        no     no

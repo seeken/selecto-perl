@@ -11,6 +11,8 @@ use Selecto::BoundedQuery ();
 use Selecto::Expression ();
 use Selecto::Query ();
 
+my $MAX_TEXT_VALUES = 100;
+
 # A canned page is deliberately HTTP-neutral. The host supplies an authorized
 # engine for every request; the page never accepts a client-selected adapter.
 sub new {
@@ -66,18 +68,22 @@ sub new {
                             && $selection->alias_name =~ /\A[a-z][a-z0-9_]*\z/
                             && $association_path =~ /\A[a-z][a-z0-9_]*\z/
                             && $domain->resolve_association($association_path)->{association}->cardinality eq 'many';
-                    _fail('detail collection selections need one or more scalar child fields')
+                    _fail('detail collection selections need one or more scalar or formatted child fields')
                         unless ref($fields) eq 'ARRAY' && @$fields
-                            && !grep { ref($_) || $_ !~ /\A[a-z][a-z0-9_]*\z/ } @$fields;
+                            && !grep { !_child_field($_, $association_path) } @$fields;
                     _fail('detail collection selections cannot use filters, limits, cursors, or aggregates')
                         if ref($options) eq 'HASH'
                             && grep { $_ ne 'order_by' } keys %$options;
-                    $domain->resolve("$association_path.$_") for @$fields;
+                    $domain->resolve(ref($_) ? _formatted_field($_->{expression})
+                        : "$association_path.$_") for @$fields;
                     next;
                 }
-                _fail('detail selections must be entity-grain fields or related collections')
-                    unless $selection->kind eq 'field';
-                my $resolved = $domain->resolve($selection->arguments->[0]);
+                my $path = $selection->kind eq 'field' ? $selection->arguments->[0]
+                    : _formatted_field($selection);
+                _fail('detail selections must be entity-grain fields, formatted dates or related collections')
+                    unless defined($path)
+                        && ($selection->kind eq 'field' || defined($selection->alias_name));
+                my $resolved = $domain->resolve($path);
                 _fail('detail selections cannot traverse a many association')
                     if grep { $_->cardinality eq 'many' } @{$resolved->{associations}};
             }
@@ -167,10 +173,12 @@ sub new {
             _fail('text control needs a string field and starts_with operator')
                 unless ($resolved->{type} // '') =~ /\A(?:string|text|varchar)\z/i
                     && ($control->{op} // 'starts_with') eq 'starts_with';
-            _fail('text control ignore_case must be a boolean')
-                if exists($control->{ignore_case})
-                    && (!defined($control->{ignore_case}) || ref($control->{ignore_case})
-                        || "$control->{ignore_case}" !~ /\A[01]\z/);
+            for my $flag (qw(ignore_case multiple)) {
+                _fail("text control $flag must be a boolean")
+                    if exists($control->{$flag})
+                        && (!defined($control->{$flag}) || ref($control->{$flag})
+                            || "$control->{$flag}" !~ /\A[01]\z/);
+            }
         } else {
             _fail('range control needs a numeric field')
                 unless ($resolved->{type} // '')
@@ -267,6 +275,12 @@ sub normalize_state {
                 _scalar($value->{$_}, 'range bound'), 'range bound')
                 for grep { exists($value->{$_}) && defined($value->{$_}) && "$value->{$_}" ne '' } qw(min max);
             $normalized{$id} = \%range;
+        } elsif ($control->{multiple}) {
+            _fail('text filter must be a scalar of at most 4096 characters')
+                if !defined($value) || ref($value) || length("$value") > 4096;
+            _fail('text filter has too many values')
+                if _text_values("$value") > $MAX_TEXT_VALUES;
+            $normalized{$id} = "$value";
         } else {
             $normalized{$id} = _scalar($value, 'text filter');
         }
@@ -311,6 +325,9 @@ sub plan {
         groups => $view->{kind} eq 'detail'
             ? [Selecto::Expression->field($key),
                 grep { $_->kind eq 'field' } @{$template->selections},
+                # A formatted date is grouped by the field it formats.
+                (map { Selecto::Expression->field($_) }
+                    grep { defined } map { _formatted_field($_) } @{$template->selections}),
                 map { $_->[0] } @{$template->orders}]
             : $template->groups,
         orders => \@orders,
@@ -389,13 +406,31 @@ sub run {
     my $query_started = time;
     _fail('execution options must be an object') if defined($execution_options) && ref($execution_options) ne 'HASH';
     my $run = sub {
-        return $execution_options ? Selecto::BoundedQuery->all($engine, $_[0], %$execution_options)
-            : $engine->all($_[0]);
+        return $execution_options
+            ? Selecto::BoundedQuery->all($engine, $_[0], %$execution_options, canonical_values => 1)
+            : $engine->all($_[0], canonical_values => 1);
     };
-    my $rows = $run->($plan->{query});
+    my ($rows, $total);
+    my $adapter = $engine->can('adapter') ? $engine->adapter : undef;
+    if ($execution_options && blessed($adapter) && $adapter->can('scalar_column_statement')) {
+        # One round trip: the total rides on the result rows as a last column (an
+        # uncorrelated subquery, evaluated once), then is taken off again.
+        my %options = (%$execution_options, canonical_values => 1);
+        my $prepared = Selecto::BoundedQuery->prepare($engine, $plan->{query}, %options);
+        my $total_prepared = Selecto::BoundedQuery->prepare($engine, $plan->{total_query}, %options);
+        $rows = Selecto::BoundedQuery->execute($engine,
+            Selecto::BoundedQuery->prepare_scalar_column($engine, $prepared, $total_prepared, 'selecto_total'), %options);
+        pop @{$rows->{columns}};
+        my @totals = map { pop @$_ } @{$rows->{rows}};
+        # A page past the end has no rows to carry the total.
+        $total = @totals ? $totals[0]
+            : $plan->{state}{page} > 1 ? $run->($plan->{total_query})->{rows}[0][0] : 0;
+    } else {
+        $rows = $run->($plan->{query});
+        $total = $run->($plan->{total_query})->{rows}[0][0];
+    }
     my $has_more = @{$rows->{rows}} > $plan->{state}{limit} ? 1 : 0;
     pop @{$rows->{rows}} if $has_more;
-    my $total_rows = $run->($plan->{total_query})->{rows};
     my %facets;
     for my $control (@{$self->{controls}}) {
         next unless $control->{kind} eq 'facet';
@@ -430,7 +465,7 @@ sub run {
     }
     return {state => $plan->{state}, view => $plan->{view},
         columns => $rows->{columns}, rows => $rows->{rows},
-        total => $total_rows->[0][0] // 0, has_more => $has_more, facets => \%facets,
+        total => $total // 0, has_more => $has_more, facets => \%facets,
         elapsed_ms => int((time - $query_started) * 1000 + 0.5)};
 }
 
@@ -461,10 +496,13 @@ sub _predicate {
         } elsif ($control->{kind} eq 'range') {
             push @expressions, Selecto::Expression->gte($field, $value->{min}) if exists $value->{min};
             push @expressions, Selecto::Expression->lte($field, $value->{max}) if exists $value->{max};
-        } elsif (length $value) {
-            push @expressions, $control->{ignore_case}
-                ? Selecto::Expression->starts_with_ci($field, $value)
-                : Selecto::Expression->starts_with($field, $value);
+        } else {
+            my @matches = map {
+                $control->{ignore_case}
+                    ? Selecto::Expression->starts_with_ci($field, $_)
+                    : Selecto::Expression->starts_with($field, $_)
+            } $control->{multiple} ? _text_values($value) : grep { length } $value;
+            push @expressions, @matches > 1 ? Selecto::Expression->any(\@matches) : @matches;
         }
     }
     return @expressions == 1 ? $expressions[0]
@@ -509,6 +547,27 @@ sub _refuse_withheld_fields {
     }
 }
 
+# The field a datetime_format of one field formats, or undef.
+sub _formatted_field {
+    my ($expression) = @_;
+    return undef unless blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind eq 'datetime_format';
+    my $operand = $expression->arguments->[0];
+    return blessed($operand) && $operand->kind eq 'field' ? $operand->arguments->[0] : undef;
+}
+sub _child_field {
+    my ($field, $association) = @_;
+    return $field =~ /\A[a-z][a-z0-9_]*\z/ ? 1 : 0 unless ref($field);
+    my $path = ref($field) eq 'HASH' ? _formatted_field($field->{expression}) : undef;
+    return defined($path) && _id($field->{key}) && $path eq "$association.$field->{key}";
+}
+# A multiple text control takes values separated by whitespace, commas or
+# semicolons, such as a pasted column of VINs.
+sub _text_values {
+    my ($value) = @_;
+    my %seen;
+    return grep { length && !$seen{$_}++ } split /[\s,;]+/, $value;
+}
 sub _query { blessed($_[0]) && $_[0]->isa('Selecto::Query') }
 sub _id { defined($_[0]) && !ref($_[0]) && $_[0] =~ /\A[a-z][a-z0-9_]*\z/ }
 sub _scalar {
@@ -616,9 +675,11 @@ composite identities are not supported.
 
 =item C<views>
 
-C<detail> views select entity-grain fields (no to-many paths) or an aliased
-direct to-many L<Selecto::Expression/RELATED COLLECTIONS>, and may order by
-entity-grain fields. C<aggregate> views group by fields, project the group
+C<detail> views select entity-grain fields (no to-many paths), an aliased
+L<Selecto::Expression/datetime_format> of one, or an aliased direct to-many
+L<Selecto::Expression/RELATED COLLECTIONS> whose child fields are names or
+C<< {key => $name, expression => datetime_format("$association.$name", ...)} >>.
+They may order by entity-grain fields. C<aggregate> views group by fields, project the group
 fields first, and may only add C<count_distinct> of the entity key (ordinary
 sums could be multiplied by joins).
 
@@ -631,6 +692,9 @@ and an optional C<label_field>. C<range> controls need a numeric field and
 accept C<min> and C<max>. C<text> controls need a string field and match a
 literal prefix (C<starts_with>), case-insensitively with
 C<< ignore_case => 1 >>; C<%> and C<_> in user input are never wildcards.
+With C<< multiple => 1 >> a text control takes up to 100 values separated by
+whitespace, commas or semicolons, and matches a row that starts with any of
+them.
 
 =item C<initial_state>
 

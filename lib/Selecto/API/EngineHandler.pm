@@ -6,6 +6,7 @@ use warnings;
 
 use Mojo::Base -base, -signatures;
 use JSON::PP ();
+use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed);
 use Selecto::API::ResultFormatter ();
 use Selecto::API::ResponsePolicy ();
@@ -20,6 +21,7 @@ use Selecto::Identifier ();
 use Selecto::QueryLibrary ();
 use Selecto::Limits ();
 use Selecto::Write ();
+use Selecto::Write::Policy ();
 
 has max_fields        => 100;
 has max_filters       => 20;
@@ -33,6 +35,17 @@ has default_limit     => 100;
 has max_write_count   => 1000;
 has limits => sub { Selecto::Limits->new };
 has bounded_results => 0;
+
+# Optional trusted host callback ($engine, \@primary_keys) returning
+# {primary_key => version}: publishes the virtual aggregate_version field.
+has 'versioner';
+
+my $MAX_RESOURCE_FIELDS = 50;
+# Instant formats a resource GET may ask for with date_format (default
+# iso8601). Each is a Selecto::DateFormat compiled through datetime_format.
+my @RESOURCE_DATE_FORMATS = qw(iso8601 rfc3339_millis epoch_seconds epoch_milliseconds);
+my %RESOURCE_DATE_FORMAT = map { ($_ => 1) } @RESOURCE_DATE_FORMATS;
+sub resource_date_formats ($class) { return [@RESOURCE_DATE_FORMATS]; }
 
 sub new ($class, @args) {
     my $self = $class->SUPER::new(@args);
@@ -57,6 +70,8 @@ sub new ($class, @args) {
     Selecto::Error->throw(
         'invalid_api_handler', 'max_write_count must be positive',
     ) if $self->max_write_count < 1;
+    Selecto::Error->throw('invalid_api_handler', 'versioner must be a callback')
+        if defined($self->versioner) && ref($self->versioner) ne 'CODE';
     $self->max_filter_values($self->limits->get('max_filter_values'))
         if $self->max_filter_values > $self->limits->get('max_filter_values');
     $self->max_fields($self->limits->get('max_fields'))
@@ -169,6 +184,13 @@ sub write_command ($self, $engine, $body) {
     Selecto::Error->throw(
         'invalid_api_write', 'insert and upsert expect exactly one affected row',
     ) if ($operation eq 'insert' || $operation eq 'upsert') && $expected_count != 1;
+    # The operation's authored expected_cardinality grant bounds every public
+    # request count. An omitted grant permits exactly one row: bulk is a
+    # separate prerequisite for counts above one and never widens the grant.
+    Selecto::Error->throw(
+        'invalid_api_write', 'expected_count exceeds the operation cardinality grant',
+        {expected_count => $expected_count},
+    ) unless _api_count_granted($operation_spec, $expected_count);
 
     my %metadata;
     for my $key (qw(returning conflict_target upsert_update_fields)) {
@@ -185,6 +207,14 @@ sub write_command ($self, $engine, $body) {
             _public_field_definition($domain, $field);
         }
         $metadata{$key} = \@fields;
+    }
+    # Returning is granted only by the operation's authored returning policy;
+    # an omitted grant returns no fields, whatever the field publication says.
+    if (my @ungranted = _api_returning_ungranted($operation_spec, $metadata{returning} // [])) {
+        Selecto::Error->throw(
+            'invalid_api_write', 'returning fields exceed the operation returning grant',
+            {fields => \@ungranted},
+        );
     }
     if ($operation eq 'upsert') {
         Selecto::Error->throw(
@@ -221,7 +251,186 @@ sub write_command ($self, $engine, $body) {
     return $command;
 }
 
+# A copy of this handler that publishes aggregate versions through $versioner.
+sub with_versioner ($self, $versioner) {
+    Selecto::Error->throw('invalid_api_handler', 'versioner must be a callback')
+        unless ref($versioner) eq 'CODE';
+    return bless {%$self, versioner => $versioner}, ref($self);
+}
+
 sub query ($self, $engine, $body, %options) {
+    return $self->_query($engine, $body, %options)
+        unless $self->versioner && ref($body) eq 'HASH' && ref($body->{select}) eq 'ARRAY'
+            && grep { _is_version_selection($_) } @{$body->{select}};
+
+    # Each aggregate_version entry becomes a hidden primary-key column, which
+    # is replaced by the host's version for that row once the query has run.
+    Selecto::Error->throw(
+        'invalid_api_host', 'API query handler requires a Selecto engine',
+    ) unless blessed($engine) && $engine->isa('Selecto::Engine');
+    my $key = $engine->domain->primary_key;
+    Selecto::Error->throw('invalid_api_query', 'aggregate_version requires a public primary key')
+        unless defined($key) && $engine->domain->field_is_public($key);
+    my %reserved = map { ($_ => 1) } map { _selection_name($_) } @{$body->{select}};
+    my (@select, @versions);
+    my $sequence = 0;
+    for my $selection (@{$body->{select}}) {
+        unless (_is_version_selection($selection)) {
+            push @select, $selection;
+            next;
+        }
+        my $output = 'aggregate_version';
+        if (ref($selection) eq 'HASH') {
+            my @unknown = sort grep { $_ ne 'field' && $_ ne 'alias' } keys %$selection;
+            Selecto::Error->throw('invalid_api_query',
+                'aggregate_version selection accepts only field and alias', {fields => \@unknown})
+                if @unknown;
+            if (exists $selection->{alias}) {
+                Selecto::Error->throw('invalid_api_query', 'aggregate_version alias is invalid')
+                    unless defined($selection->{alias}) && !ref($selection->{alias})
+                        && "$selection->{alias}" =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+                $output = "$selection->{alias}";
+            }
+        }
+        my $alias;
+        do { $alias = '__selecto_version_' . ++$sequence } while $reserved{$alias};
+        $reserved{$alias} = 1;
+        push @select, {field => $key, alias => $alias};
+        push @versions, {output => $output, alias => $alias};
+    }
+    my $result = $self->_query($engine, {%$body, select => \@select}, %options);
+    $self->_inject_versions($engine, $result, \@versions);
+    return $result;
+}
+
+# One resource by primary key: {id => ..., fields => [...] or 'a,b',
+# date_format => ...}. Returns the primary key and the requested public scalar
+# or to-one fields, including aggregate_version when a versioner is
+# configured and it is requested.
+sub resource ($self, $engine, $params) {
+    Selecto::Error->throw(
+        'invalid_api_host', 'API resource handler requires a Selecto engine',
+    ) unless blessed($engine) && $engine->isa('Selecto::Engine');
+    _object($params, 'resource request');
+    my $domain = $engine->domain;
+    my $key = $domain->primary_key;
+    Selecto::Error->throw('invalid_api_query', 'resources require a public primary key')
+        unless defined($key) && $domain->field_is_public($key);
+    my $id = $params->{id};
+    my $key_type = $domain->resolve($key)->{type} // '';
+    Selecto::Error->throw('invalid_api_query', 'resource id is invalid')
+        unless defined($id) && !ref($id) && length("$id") && length("$id") <= 256
+            && ($key_type !~ /int|serial/i || "$id" =~ /\A-?[1-9]\d{0,17}\z/);
+    $id = 0 + $id if $key_type =~ /int|serial/i;
+    my $date_format = $params->{date_format} // 'iso8601';
+    Selecto::Error->throw('invalid_api_query', 'date_format is not available',
+        {parameter => 'date_format'})
+        unless !ref($date_format) && $RESOURCE_DATE_FORMAT{"$date_format"};
+
+    my $maximum = $MAX_RESOURCE_FIELDS < $self->max_fields - 2
+        ? $MAX_RESOURCE_FIELDS : $self->max_fields - 2;
+    my @fields;
+    for my $value (ref($params->{fields}) eq 'ARRAY' ? @{$params->{fields}} : ($params->{fields} // ())) {
+        Selecto::Error->throw('invalid_api_query', 'fields must be strings') if ref($value);
+        next if !defined($value) || "$value" eq '';
+        for my $field (split /,/, "$value", -1) {
+            $field =~ s/\A\s+|\s+\z//g;
+            Selecto::Error->throw('invalid_api_query', 'fields contains an empty field path')
+                unless length $field;
+            push @fields, $field;
+        }
+    }
+    my %seen = ($key => 1);
+    @fields = grep { !$seen{$_}++ } @fields;
+    Selecto::Error->throw('invalid_api_query', "fields may contain at most $maximum field paths")
+        if @fields > $maximum;
+    # The version is opt-in: computing it costs the versioner a lookup.
+    my $versioned = grep { $_ eq 'aggregate_version' } @fields;
+    @fields = grep { $_ ne 'aggregate_version' } @fields;
+    Selecto::Error->throw('invalid_api_query', 'aggregate_version is not published by this domain',
+        {field => 'aggregate_version'}) if $versioned && !$self->versioner;
+    my @select = ($key, ($versioned ? 'aggregate_version' : ()));
+    for my $field (@fields) {
+        Selecto::Error->throw('invalid_api_query', 'fields contains an invalid field path',
+            {field => $field})
+            unless $field =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
+        # As in queries: an unknown field fails to resolve, a withheld one is hidden.
+        my $definition = _visible_field_definition($domain, $field);
+        Selecto::Error->throw('invalid_api_query',
+            'fields cannot include to-many relationships; use the query route', {field => $field})
+            if grep { $_->cardinality eq 'many' } @{$definition->{associations} // []};
+        # Timestamps always take date_format. A DATE keeps its calendar value
+        # under iso8601 (as before) and is midnight UTC under the others.
+        my $type = $definition->{type} // '';
+        push @select, $type =~ /\A(?:datetime|naive_datetime|utc_datetime|epoch_datetime|timestamp|timestamptz)\z/
+            || ($type eq 'date' && $date_format ne 'iso8601')
+            ? {field => $field, format => "$date_format"} : $field;
+    }
+    my $result = $self->query($engine, {
+        select => \@select,
+        filters => [{field => $key, op => 'eq', value => $id}],
+        row_format => 'objects', limit => 2,
+    });
+    my $rows = $result->{rows} // [];
+    Selecto::Error->throw('invalid_api_host', 'resource primary key matched more than one row')
+        if @$rows > 1;
+    Selecto::Error->throw('resource_not_found', 'The requested resource is unavailable')
+        unless @$rows;
+    return {%{$rows->[0]}};
+}
+
+sub _inject_versions ($self, $engine, $result, $versions) {
+    my @names = map { ref($_) eq 'HASH' ? ($_->{id} // $_->{field} // '') : "$_" }
+        @{$result->{columns}};
+    my %index = map { ($names[$_] => $_) } 0 .. $#names;
+    my %output;
+    for my $version (@$versions) {
+        Selecto::Error->throw('invalid_api_host', 'query omitted aggregate-version keys')
+            unless exists $index{$version->{alias}};
+        $output{$index{$version->{alias}}} = $version;
+    }
+    my $first = $versions->[0]{alias};
+    my @keys = map {
+        ref($_) eq 'ARRAY' ? $_->[$index{$first}] : ref($_) eq 'HASH' ? $_->{$first} : undef
+    } @{$result->{rows}};
+    my $by_key = $self->versioner->($engine, [grep { defined } @keys]);
+    Selecto::Error->throw('invalid_api_host', 'versioner must return an object')
+        unless ref($by_key) eq 'HASH';
+    my $version_of = sub ($key) {
+        my $version = defined($key) ? $by_key->{$key} : undef;
+        return defined($version) && !ref($version) ? "$version" : undef;
+    };
+    # In place, so the result keeps its bound response limits.
+    $result->{columns} = [map { $output{$_} ? $output{$_}{output} : $result->{columns}[$_] } 0 .. $#names];
+    $result->{rows} = [map {
+        my $row = $_;
+        ref($row) eq 'ARRAY'
+            ? [map { $output{$_} ? $version_of->($row->[$_]) : $row->[$_] } 0 .. $#names]
+            : do {
+                my %shaped = %$row;
+                $shaped{$_->{output}} = $version_of->(delete $shaped{$_->{alias}}) for @$versions;
+                \%shaped;
+            };
+    } @{$result->{rows}}];
+    Selecto::API::ResponsePolicy->check_json({data => $result, ok => JSON::PP::true}, $self->limits);
+    return $result;
+}
+
+sub _is_version_selection ($selection) {
+    return !ref($selection) ? defined($selection) && "$selection" eq 'aggregate_version'
+        : ref($selection) eq 'HASH' && defined($selection->{field}) && !ref($selection->{field})
+            && "$selection->{field}" eq 'aggregate_version';
+}
+
+sub _selection_name ($selection) {
+    return "$selection" if !ref($selection) && defined($selection);
+    return () unless ref($selection) eq 'HASH';
+    return "$selection->{alias}" if defined($selection->{alias}) && !ref($selection->{alias});
+    return "$selection->{field}" if defined($selection->{field}) && !ref($selection->{field});
+    return ();
+}
+
+sub _query ($self, $engine, $body, %options) {
     Selecto::Error->throw(
         'invalid_api_host', 'API query handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
@@ -264,7 +473,7 @@ sub query ($self, $engine, $body, %options) {
 
     if ($has_select) {
         # Validate caller intent before composing host-mandated output fields.
-        _api_selections($domain, $body->{select}, $self->max_fields, $self->limits, $engine->adapter->name);
+        _api_selections($domain, $body->{select}, $self->max_fields, $self->limits, $engine->adapter);
         my @required = @{($domain->contract // {})->{required_selected} // []};
         my %required = map { $_ => 1 } @required;
         my $field_identity = sub {
@@ -283,7 +492,7 @@ sub query ($self, $engine, $body, %options) {
             (grep { my $field = $field_identity->($_); !defined($field) || !$required{$field} } @{$body->{select}}),
         );
         my $selection_plan = _api_selections(
-            $domain, \@selections, $self->max_fields, $self->limits, $engine->adapter->name,
+            $domain, \@selections, $self->max_fields, $self->limits, $engine->adapter,
         );
         $query = $query->select($selection_plan->{expressions});
         @subtables = @{$selection_plan->{subtables}};
@@ -319,7 +528,7 @@ sub query ($self, $engine, $body, %options) {
     if (!$has_select) {
         # Named library definitions are not permission to expose internal fields.
         my @fields = map { $_->arguments->[0] } @{$query->selections};
-        my $selection_plan = _api_selections($domain, \@fields, $self->max_fields, $self->limits, $engine->adapter->name);
+        my $selection_plan = _api_selections($domain, \@fields, $self->max_fields, $self->limits, $engine->adapter);
         $query = $query->replace_selections($selection_plan->{expressions});
     }
 
@@ -417,7 +626,7 @@ sub query ($self, $engine, $body, %options) {
         : $self->bounded_results
             ? Selecto::BoundedQuery->all($engine, $query->limit($limit + 1), limits => $self->limits,
                 max_rows => $limit + 1)
-        : $engine->all($query->limit($limit + 1), $options{export_scalars} ? (export_scalars => 1) : ());
+        : $engine->all($query->limit($limit + 1), $options{export_scalars} ? (export_scalars => 1) : (canonical_values => 1));
     Selecto::Error->throw(
         'invalid_api_host', 'Selecto adapter returned an invalid result',
     ) unless ref($result) eq 'HASH'
@@ -485,7 +694,7 @@ sub _for_engine ($self, $engine) {
 # original engine's. Copy request-local state; never mutate a shared engine's
 # policy while a callback or adapter can re-enter it.
 sub _engine_with_limits ($self, $engine) {
-    return bless {%$engine, limits => $self->limits->intersect($engine->limits)}, ref($engine);
+    return $engine->with_limits($self->limits);
 }
 
 sub describe_openapi ($self, $api) {
@@ -616,7 +825,7 @@ sub describe_openapi ($self, $api) {
     };
     $openapi->{components}{schemas}{SelectoSubtableSelection} = {
         type => 'array', minItems => 1, maxItems => $self->max_fields,
-        description => 'PostgreSQL only. Stable primary-key order; each collection must fit the configured per-parent limit or the request is refused. Successful subtable metadata includes limit and complete=true.',
+        description => 'Stable primary-key order; each collection must fit the configured per-parent limit or the request is refused. Successful subtable metadata includes limit and complete=true.',
         'x-selecto-max-rows-per-parent' => $self->limits->get('max_collection_rows'),
         items => {
             oneOf => [
@@ -688,7 +897,25 @@ sub describe_openapi ($self, $api) {
             value => {},
         },
     };
+    $self->_describe_aggregate_version($api) if $self->versioner;
     return $api;
+}
+
+# The virtual aggregate_version column: selectable on queries and returned by
+# resource reads, never filterable, sortable or writable.
+sub _describe_aggregate_version ($self, $api) {
+    my $source = $api->domain->{source};
+    return unless ref($source) eq 'HASH' && ref($source->{columns}) eq 'HASH'
+        && !exists($source->{columns}{aggregate_version});
+    push @{$source->{fields}}, 'aggregate_version';
+    $source->{columns}{aggregate_version} = {
+        type => 'string', label => 'Aggregate Version',
+        read_only => JSON::PP::true,
+        filterable => JSON::PP::false,
+        sortable => JSON::PP::false,
+    };
+    my $hidden = ($api->domain->{components} //= {})->{filter_picker_hidden_paths} //= [];
+    push @$hidden, 'aggregate_version' unless grep { ($_ // '') eq 'aggregate_version' } @$hidden;
 }
 
 sub _write_filters ($self, $domain, $filters) {
@@ -823,6 +1050,29 @@ sub _write_bounded_integer ($value, $label, $minimum, $maximum) {
     Selecto::Error->throw('invalid_api_write', "$label exceeds its maximum")
         if defined($maximum) && $integer > $maximum;
     return $integer;
+}
+
+# Public API write grants. Both fail closed: a missing grant is the strict
+# default (one row, no returning) and a malformed grant admits nothing.
+sub _api_count_granted ($spec, $count) {
+    return $count == 1 unless defined $spec->{expected_cardinality};
+    my $bounds = eval {
+        Selecto::Write::Policy->cardinality_bounds($spec->{expected_cardinality});
+    };
+    Selecto::Error->throw('invalid_api_write', 'operation expected_cardinality grant is invalid')
+        unless ref($bounds) eq 'ARRAY';
+    my ($minimum, $maximum) = @$bounds;
+    return $count >= $minimum && (!defined($maximum) || $count <= $maximum);
+}
+
+sub _api_returning_ungranted ($spec, $fields) {
+    return () unless @$fields;
+    my $grant = eval { Selecto::Write::Policy->normalize_returning($spec->{returning}) };
+    Selecto::Error->throw('invalid_api_write', 'operation returning grant is invalid')
+        unless defined $grant;
+    return () if !ref($grant) && $grant eq 'all';
+    my %granted = ref($grant) eq 'ARRAY' ? map { ($_ => 1) } @$grant : ();
+    return grep { !$granted{$_} } @$fields;
 }
 
 sub _filters ($self, $domain, $filters) {
@@ -1001,7 +1251,8 @@ sub _required_string ($value, $label) {
     return "$value";
 }
 
-sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
+sub _api_selections ($domain, $value, $maximum, $limits, $adapter) {
+    my $adapter_name = $adapter->name;
     Selecto::Error->throw('invalid_api_query', 'select must be an array')
         unless ref($value) eq 'ARRAY';
     Selecto::Error->throw('invalid_api_query', 'select must not be empty')
@@ -1023,8 +1274,9 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
         }
         Selecto::Error->throw('invalid_api_query', 'subtable selection must not be empty')
             unless @$entry;
-        Selecto::Error->throw('unsupported_feature', 'bounded API collections require PostgreSQL')
-            unless $adapter_name eq 'postgresql';
+        Selecto::Error->throw('unsupported_feature', 'bounded API collections require a certified dialect')
+            unless $adapter_name eq 'postgresql' || $adapter_name eq 'sqlite'
+                || $adapter->supports('bounded_related_collections');
         my (@fields, %nested_names, $association);
         for my $nested_entry (@$entry) {
             Selecto::Error->throw(
@@ -1070,8 +1322,10 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter_name) {
         ) if $column_names{$association}++;
         my $related = $domain->resolve_association($association)->{association};
         my $primary_key = $related->target_primary_key;
-        Selecto::Error->throw('invalid_api_query', 'bounded collection requires a public target primary key')
-            unless defined($primary_key) && $domain->field_is_public("$association.$primary_key");
+        # The key only orders the bounded collection and is never returned, so
+        # an internal key serves this internal use.
+        Selecto::Error->throw('invalid_api_query', 'bounded collection requires a target primary key')
+            unless defined($primary_key);
         my $child_limit = $limits->get('max_collection_rows');
         push @subtables, {
             limit => $child_limit,
@@ -1144,17 +1398,8 @@ sub _api_selection_entry ($domain, $entry, $label, $hidden) {
 }
 
 sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
-    Selecto::OperationBudget->new(limits => $limits, code => 'api_result_limit_exceeded')->check_tree(
-        $result, label => 'adapter result', bytes_limit => 'max_response_bytes');
-    my ($total_bytes, $total_children) = (0, 0);
-    for my $row (@{$result->{rows}}) {
-        for my $value (@$row) {
-            $total_bytes += ref($value)
-                ? Selecto::API::ResponsePolicy->check_json($value, $limits)
-                : $limits->check_bytes('max_response_bytes', $value, 'api_result_limit_exceeded', 'result cell');
-            $limits->check_count('max_response_bytes', $total_bytes, 'api_result_limit_exceeded', 'result bytes');
-        }
-    }
+    _check_result_cells($result, $limits);
+    my $total_children = 0;
     my %subtable = map { $_->{column} => $_ } @$subtables;
     for my $index (0 .. $#{$result->{columns}}) {
         my $specification = $subtable{$result->{columns}[$index]};
@@ -1166,7 +1411,7 @@ sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
             my $decoded = $row->[$index];
             my $ok = ref($decoded) eq 'ARRAY';
             $ok = defined($decoded) && !ref($decoded)
-                && eval { $decoded = JSON::PP->new->max_depth($limits->get('max_response_depth'))->decode($decoded); 1 }
+                && eval { $decoded = Cpanel::JSON::XS->new->max_depth($limits->get('max_response_depth'))->decode($decoded); 1 }
                 unless $ok;
             Selecto::Error->throw(
                 'invalid_api_host', 'Selecto adapter returned an invalid related collection',
@@ -1201,6 +1446,32 @@ sub _shape_result_rows ($result, $subtables, $row_format, $limits) {
     } @{$result->{rows}}];
 }
 
+# The adapter result's traversal limits, then each cell's bytes and their
+# running total. A single pass (_tree_within with the rows) returns when every
+# limit holds: each compares a total that only grows, so its final value
+# decides it. Otherwise the checks run one by one and raise the same error as
+# before.
+sub _check_result_cells ($result, $limits) {
+    return if ref($result) eq 'HASH' && ref($result->{rows}) eq 'ARRAY'
+        && Selecto::API::ResponsePolicy::_tree_within($result, $limits, $result->{rows});
+    return _check_result_cells_exact($result, $limits);
+}
+
+sub _check_result_cells_exact ($result, $limits) {
+    Selecto::OperationBudget->new(limits => $limits, code => 'api_result_limit_exceeded')->check_tree(
+        $result, label => 'adapter result', bytes_limit => 'max_response_bytes');
+    my $total_bytes = 0;
+    for my $row (@{$result->{rows}}) {
+        for my $value (@$row) {
+            $total_bytes += ref($value)
+                ? Selecto::API::ResponsePolicy->check_json($value, $limits)
+                : $limits->check_bytes('max_response_bytes', $value, 'api_result_limit_exceeded', 'result cell');
+            $limits->check_count('max_response_bytes', $total_bytes, 'api_result_limit_exceeded', 'result bytes');
+        }
+    }
+    return;
+}
+
 sub _collection_json_value ($value) {
     return [map { _collection_json_value($_) } @$value] if ref($value) eq 'ARRAY';
     return {map { $_ => _collection_json_value($value->{$_}) } keys %$value}
@@ -1208,7 +1479,7 @@ sub _collection_json_value ($value) {
     return $value unless defined($value) && !ref($value);
     # Preserve strings and safe numeric JSON types. Comparing decimal digits
     # avoids routing exact 64-bit IDs through floating-point arithmetic.
-    my $wire = JSON::PP->new->allow_nonref(1)->encode($value);
+    my $wire = Cpanel::JSON::XS->new->allow_nonref(1)->encode($value);
     if ($wire =~ /\A-?([0-9]+)\z/) {
         my $digits = $1;
         return substr($wire, 0) if length($digits) > 16
@@ -1322,6 +1593,19 @@ All limits are optional non-negative integers:
   max_write_count   1000     largest expected_count
 
 Throws C<invalid_api_handler> for invalid limits.
+
+C<versioner> is an optional trusted callback that publishes the virtual,
+read-only C<aggregate_version> field:
+
+  versioner => sub {
+      my ($engine, $primary_keys) = @_;
+      return {map { ($_ => version_of($_)) } @$primary_keys};
+  },
+
+It receives the primary keys of the rows a query returned and answers an
+opaque version string for each one it can see; the host decides what a
+version covers (a change timestamp, a content hash). Versions require a
+public primary key.
 
 =head1 METHODS
 
@@ -1445,11 +1729,26 @@ the returned command does not carry it, so it is never applied twice.
 
 =item C<expected_count>
 
-Default 1; values above 1 need C<bulk> on the operation.
+Default 1, bounded by C<max_write_count>. The count must fall within the
+operation's authored C<expected_cardinality> grant (C<"many">,
+C<["exactly", n]>, C<["at_most", n]>, C<["at_least", n]> or
+C<["between", min, max]>). An operation without that grant permits exactly
+one row: C<bulk> is still required for counts above 1 on updates and
+deletes, but C<bulk> alone never admits them. Inserts and upserts always
+expect one row. A count outside the grant is refused with
+C<invalid_api_write> before anything executes.
 
-=item C<returning>, C<conflict_target>, C<upsert_update_fields>
+=item C<returning>
 
-Root field lists. Upserts require the last two and are refused on domains
+Root field list, permitted only within the operation's authored
+C<returning> grant: a field list, or C<true>/C<"all"> for every field.
+Without a grant (or with C<false>, C<"none"> or an empty list) no fields may
+be returned, and any requested field is refused with C<invalid_api_write>
+before anything executes. An empty list requests nothing.
+
+=item C<conflict_target>, C<upsert_update_fields>
+
+Root field lists. Upserts require both and are refused on domains
 with a required predicate (C<query_enforcement_unsupported_operation>).
 
 =back
@@ -1465,17 +1764,71 @@ you set another status.
 A rolled-back write reports C<cardinality_mismatch> with the expected count
 only.
 
+=head2 with_versioner
+
+  my $versioned = $handler->with_versioner(sub { ... });
+
+A copy of the handler with C<versioner> set; the original is unchanged.
+
+=head2 resource
+
+  my $data = $handler->resource($engine, {id => 7, fields => 'name,status'});
+
+One resource by primary key, for L<Selecto::API>'s C<getResource> route. It
+returns the primary key and up to 50 requested public scalar or to-one fields.
+C<aggregate_version> is returned only when
+requested, and only with a versioner configured (otherwise
+C<invalid_api_query>). A withheld field is C<hidden_field>, a to-many one C<invalid_api_query>
+and a missing row C<resource_not_found>.
+
+C<date_format> selects how every temporal field is returned:
+
+=over 4
+
+=item C<iso8601> (the default)
+
+C<utc_datetime> and C<epoch_datetime> fields are UTC instants,
+C<YYYY-MM-DDTHH:MM:SSZ>; C<naive_datetime> fields are their wall time,
+C<YYYY-MM-DDTHH:MM:SS>, without a zone; C<date> fields are C<YYYY-MM-DD>.
+Fractional seconds are dropped. This is the output from before the
+parameter existed.
+
+=item C<rfc3339_millis>
+
+C<YYYY-MM-DDTHH:MM:SS.sssZ> in UTC, milliseconds truncated.
+
+=item C<epoch_seconds>, C<epoch_milliseconds>
+
+Integers: whole seconds or milliseconds since 1970-01-01T00:00:00Z, rounded
+down (towards negative infinity).
+
+=back
+
+The resource route has no time zone parameter, so the instant formats are
+always UTC. A C<naive_datetime> is read as UTC wall time, and a C<date> as
+midnight UTC that day, for every format but C<iso8601>. A null field is null
+in every format. The format is compiled into the SQL (see
+L<Selecto::Expression/datetime_format>). Any other value, an empty one or a
+repeated one is C<invalid_api_query> with C<< {parameter => 'date_format'} >>.
+There is no C<raw> format: API responses carry canonical JSON, and a
+driver's own timestamp text differs between runtimes and session settings.
+C<< Selecto::API::EngineHandler->resource_date_formats >> lists the values.
+
+Queries may select C<aggregate_version> (optionally C<< {field =>
+'aggregate_version', alias => NAME} >>) when a versioner is configured.
+
 =head2 describe_openapi
 
   $handler->describe_openapi($api);
 
 Adds this handler's request schemas and limits to a L<Selecto::API>
-object's OpenAPI document.
+object's OpenAPI document. With a versioner it also lists the read-only
+C<aggregate_version> column in the published domain.
 
 =head1 ERRORS
 
 C<invalid_api_query>, C<invalid_api_write>, C<hidden_field>,
-C<field_not_public>, C<missing_tenant_scope>, plus any engine or
+C<field_not_public>, C<missing_tenant_scope>, C<resource_not_found>, plus any engine or
 query-library error.
 
 =head1 SEE ALSO

@@ -1,0 +1,57 @@
+{
+  "D045": {
+    "binding_kind": "reference",
+    "choice_source": "owner_choices",
+    "constraint_filters": {
+      "choice_source": [
+        [
+          "eq",
+          "owners.tenant_id",
+          [
+            "context",
+            "tenant_id"
+          ]
+        ]
+      ],
+      "domain_of_interest": [],
+      "source_relationship": [
+        [
+          "eq",
+          "owners.active",
+          true
+        ]
+      ]
+    },
+    "constraint_policy": {
+      "domain_of_interest": "fail_closed"
+    },
+    "field": "owner_id",
+    "source_relationship": "owner",
+    "tenant": 7
+  },
+  "D046": {
+    "choice_source": "owner_choices",
+    "declared_order_by": [
+      "owners.name"
+    ],
+    "limit": 20,
+    "offset": 5,
+    "request_order_by": [],
+    "search": "Ada",
+    "tenant": 7
+  },
+  "D047": [
+    {
+      "reason": "resolver_required",
+      "status": "unknown"
+    },
+    {
+      "reason": "certified_member",
+      "status": "valid"
+    },
+    {
+      "reason": "outside_domain",
+      "status": "invalid"
+    }
+  ]
+}

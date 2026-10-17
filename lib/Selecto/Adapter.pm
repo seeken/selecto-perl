@@ -42,7 +42,11 @@ sub assert_contract ($self) {
 
 sub feature_inventory ($self) { return []; }
 sub write_capabilities ($self) { return {}; }
+sub edit_transaction_identity ($self) {
+    Selecto::Error->throw('write_capability_missing', 'adapter does not support transaction-scoped editable rows');
+}
 sub supports ($self, $feature) { return 0; }
+sub text_search_rank_direction ($self) { return 'desc'; }
 sub capability ($self, $feature) { return { supported => $self->supports($feature) ? 1 : 0 }; }
 
 sub normalize_execution_result ($self, $result) {
@@ -51,6 +55,12 @@ sub normalize_execution_result ($self, $result) {
         columns => [map { "$_" } @{$result->{columns} // []}],
         rows => [map { [@$_] } @{$result->{rows} // []}],
     };
+}
+
+# A trusted adapter may opt into a supported native parameter representation.
+# The default contract remains scalar-only, with all ordinary budget checks.
+sub admit_parameters ($self, $budget, $parameters, %options) {
+    return $budget->consume_parameters($parameters, %options);
 }
 
 # Driver SQLSTATEs with a stable category, as in the Elixir library's
@@ -88,6 +98,7 @@ sub normalize_error ($self, $error) {
 # The handle's current SQLSTATE, or undef when it reports none or only a
 # generic one (00000 success, DBI's S1000 and HY000 general errors).
 sub driver_sqlstate ($self) {
+    return undef unless exists $self->{dbh};
     my $dbh = $self->{dbh};
     return undef unless blessed($dbh) && $dbh->can('state');
     my $state = eval { $dbh->state } // '';
@@ -153,6 +164,14 @@ execution, streaming and transactions for SQL databases; a new SQL adapter
 usually only needs its identity, placeholder style, identifier quoting,
 capability list and value decoding.
 
+C<admit_parameters($budget, $parameters, %options)> is an optional trusted
+adapter hook, inherited by every adapter. Its default applies scalar-only
+parameter admission through the supplied operation budget. An adapter that
+supports native flat array binds may explicitly select
+C<allow_flat_array_parameters> on that budget; bind-slot, element and byte
+limits still apply. The hook preserves the original parameter representation.
+It adds no required method or contract-version change.
+
 Adapters are registered by a stable lowercase name in a
 L<Selecto::Adapter::Registry>. An independently distributed adapter can
 register itself when its module is loaded, as in the synopsis.
@@ -177,9 +196,12 @@ An identifier for the SQL dialect, usually the class name.
 Returns a L<Selecto::Statement>. The root relation always comes from the
 domain; queries never name a table.
 
-=item C<execute_query($statement)>
+=item C<execute_query($statement, %options)>
 
-Returns C<< {columns => [...], rows => [[...], ...]} >>.
+Returns C<< {columns => [...], rows => [[...], ...]} >>. Engines pass
+C<< canonical_values => 1 >> when the caller asks for canonical values and
+C<< export_scalars => 1 >> for export scalars; an adapter that always
+returns canonical values may ignore the first.
 
 =item C<preview_write($command)>
 
@@ -228,9 +250,15 @@ Returns C<< {supported => 0|1} >> for a feature.
 
 =head2 write_capabilities
 
-A hash of write features such as C<insert>, C<update>, C<upsert>,
+A hash with numeric C<protocol_version =E<gt> 1> and explicit Boolean write
+features such as C<insert>, C<update>, C<upsert>,
 C<delete>, C<transactions>, C<atomic_batch>, C<mutation_expressions>,
-C<returning> and C<write_graph>.
+C<returning>, C<generated_keys> and C<write_graph>. The default empty report
+indicates that the write protocol is unimplemented. Actual execution preflight
+refuses missing/incompatible protocols and missing requested semantics.
+An optional internal C<_validate_write_intent($write)> hook may return a more
+specific typed refusal for unsupported structured intent before report lookup.
+It must remain pure; it neither grants capabilities nor prepares or executes SQL.
 
 =head2 feature_inventory
 

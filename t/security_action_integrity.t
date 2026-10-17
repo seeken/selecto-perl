@@ -78,15 +78,27 @@ subtest 'R10 every governed upsert uses the declared exact identity' => sub {
         'conflict_target_not_declared', 'batch shares the validator');
 };
 
-subtest 'R09 MySQL and MariaDB refuse unsupported identity semantics before DB work' => sub {
-    for my $backend (qw(mysql mariadb)) {
-        my $engine = engine(undef, $backend);
-        ok(!$engine->adapter->write_capabilities->{upsert}, "$backend does not advertise upsert");
-        for my $method (qw(preview_write execute_write)) {
-            is(error_code(sub {$engine->$method(upsert(['id']))}), 'unsupported_upsert_conflict_target',
-                "$backend $method refuses target-specific upsert");
+subtest 'R09 MySQL and MariaDB prove the upsert identity before any mutation' => sub {
+    # The recorder has no catalog rows, so the physical unique-index proof
+    # cannot show that ON DUPLICATE KEY UPDATE resolves only on the target.
+    {
+        package Local::NoCatalogDBH;
+        our @ISA = ('TestSelecto::DBH');
+        sub selectall_arrayref { return []; }
+        sub selectrow_array {
+            return TestSelecto::DBH::session_row($_[1]) if TestSelecto::DBH::session_query($_[1]);
+            return ('InnoDB');
         }
-        is_deeply($engine->adapter->dbh->prepared, [], "$backend prepares no mutation");
+    }
+    for my $backend (qw(mysql mariadb)) {
+        my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse(contract(), strict => 1),
+            adapter => Selecto->adapter($backend => (dbh => Local::NoCatalogDBH->new)));
+        ok($engine->adapter->write_capabilities->{upsert}, "$backend advertises proved upserts");
+        unlike($engine->preview_write(upsert(['id']))->{sql}, qr/ON DUPLICATE KEY/,
+            "$backend never previews ON DUPLICATE KEY UPDATE");
+        is(error_code(sub {$engine->execute_write(upsert(['id']))}), 'unsupported_upsert_conflict_target',
+            "$backend execute_write refuses an upsert its catalog cannot prove");
+        is_deeply([grep { $_->{sql} =~ /\AINSERT/ } @{$engine->adapter->dbh->prepared}], [], "$backend prepares no mutation");
     }
 };
 
@@ -140,7 +152,15 @@ subtest 'R14 caller references never become authored instructions' => sub {
     $default->system_values({});
     is(error_code(sub {$engine->preview_action($default, grant => $grant)}), 'action_grant_mismatch',
         'instruction provenance is covered by the grant digest');
-    my $nested = $engine->plan_action({action => 'json', target => 1,
+    my $variant_raw = contract();
+    $variant_raw->{actions}{mark}{inputs} = {choice => {type => 'string', default => 'yes'}};
+    $variant_raw->{actions}{mark}{variants} = [{id => 'timed', when => {choice => 'yes'},
+        inputs => {time => {type => 'utc_datetime', default => ['system', 'now']}}}];
+    my $variant_engine = engine($variant_raw);
+    my $variant_default = $variant_engine->plan_action({action => 'mark', target => 1});
+    like($variant_engine->preview_action($variant_default)->{statement}{sql}, qr/CURRENT_TIMESTAMP/,
+        'variant-authored temporal default survives intent revalidation');
+    my $nested = $engine->plan_action({action => 'json' , target => 1,
         inputs => {value => {nested => [['system', 'now']]}}});
     my $preview = $engine->preview_action($nested)->{statement};
     unlike($preview->{sql}, qr/CURRENT_TIMESTAMP/, 'nested caller arrays stay literal');

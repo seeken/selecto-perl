@@ -4,7 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use Digest::SHA qw(sha256_hex);
-use JSON::PP ();
+use Selecto::CanonicalJSON ();
 use Scalar::Util qw(blessed looks_like_number);
 use Math::BigInt ();
 use Selecto::Error ();
@@ -139,7 +139,7 @@ sub evaluate {
 
 sub predicate_fingerprint_value {
     my ($expression) = @_;
-    my $json = JSON::PP->new->canonical(1)->encode(_predicate_value($expression));
+    my $json = Selecto::CanonicalJSON->encode_utf8(_predicate_value($expression));
     return 'sha256:' . sha256_hex($json);
 }
 

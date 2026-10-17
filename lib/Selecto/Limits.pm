@@ -21,7 +21,7 @@ my %DEFAULTS = (
     max_expression_nodes => 10_000,
     max_expression_depth => 64, max_expression_arity => 1_000,
     max_json_path_segments => 64,
-    max_rule_numeric_digits => 1_024, max_rule_work => 1_000_000,
+    max_rule_numeric_digits => 1_024, max_rule_work => 2_000_000,
     max_regex_states => 4_096, max_import_preview_bytes => 16_777_216,
     max_result_cell_bytes => 65_536, max_response_temp_bytes => 33_554_432,
     max_response_nodes => 100_000, max_response_depth => 32,
@@ -40,10 +40,10 @@ sub new {
 }
 
 sub get {
-    my ($self, $name) = @_;
-    Selecto::Error->throw('invalid_limits', 'unknown resource limit')
-        unless exists $DEFAULTS{$name};
-    return $self->{$name};
+    # Every limit object holds every known name (new() and tightened() copy all of
+    # %DEFAULTS), so one hash lookup both validates the name and returns the value.
+    return $_[0]{$_[1]} if exists $_[0]{$_[1]};
+    Selecto::Error->throw('invalid_limits', 'unknown resource limit');
 }
 
 sub tightened {
@@ -81,7 +81,7 @@ sub check_bytes {
         ($label // $name) . ' must be a scalar') if ref($value);
     # Perl's byte length counts the UTF-8 representation of decoded strings
     # without allocating an encoded copy; raw byte strings retain their size.
-    return $self->check_count($name, defined($value) ? bytes::length($value) : 0,
+    return $self->check_count($name, defined($value) ? do { use bytes; length($value) } : 0,
         $code, $label);
 }
 

@@ -3,7 +3,7 @@ package Selecto::InsertAdmission;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(blessed looks_like_number);
+use Scalar::Util qw(blessed looks_like_number reftype);
 use Selecto::Error ();
 
 # The standalone QueryEnforcement scalar evaluator has a portable, untyped
@@ -56,7 +56,17 @@ sub prepare {
 sub _value {
     my ($type, $value, $field) = @_;
     return undef unless defined $value;
-    _not_evaluable($field) if ref($value);
+    if (defined(reftype($value))) {
+        # Read only the canonical Boolean scalar, without overload or tied
+        # callbacks. Other domain types still require ordinary scalar values.
+        my $class = blessed($value) // '';
+        _not_evaluable($field) unless $type eq 'boolean'
+            && $class =~ /\A(?:JSON::PP::Boolean|JSON::XS::Boolean|Types::Serialiser::Boolean)\z/
+            && (reftype($value) // '') eq 'SCALAR';
+        _not_evaluable($field) if defined(tied($$value));
+        $value = $$value;
+        _not_evaluable($field) unless defined($value) && !defined(reftype($value));
+    }
     my $text = "$value";
     if ($type eq 'integer') {
         _not_evaluable($field) unless $text =~ /\A-?(?:0|[1-9][0-9]*)\z/;

@@ -1,0 +1,286 @@
+{
+  "DQ001": {
+    "baseline_rows": [
+      [
+        1
+      ],
+      [
+        2
+      ],
+      [
+        4
+      ]
+    ],
+    "narrowed_rows": [
+      [
+        1
+      ]
+    ]
+  },
+  "DS001": [
+    {
+      "accepted": true,
+      "id": "baseline"
+    },
+    {
+      "accepted": true,
+      "id": "empty_components"
+    },
+    {
+      "accepted": true,
+      "id": "empty_domain_data"
+    },
+    {
+      "accepted": true,
+      "id": "empty_json_schemas"
+    },
+    {
+      "accepted": true,
+      "id": "empty_events"
+    },
+    {
+      "accepted": true,
+      "id": "components_policy"
+    },
+    {
+      "accepted": true,
+      "id": "opaque_domain_data"
+    },
+    {
+      "accepted": true,
+      "id": "domain_data_payload"
+    },
+    {
+      "accepted": true,
+      "id": "json_schemas_payload"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_events_shape"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_query_library_shape"
+    },
+    {
+      "accepted": true,
+      "id": "event_contract"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_event_version"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_event_data"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_event_additional_fields"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_event_type"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_event_enum"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_event_list_item"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_event_non_list_item"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_event_boolean"
+    },
+    {
+      "accepted": true,
+      "id": "operations_envelope"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_operations_entry"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_operations_id"
+    },
+    {
+      "accepted": true,
+      "id": "experiences_envelope"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_experiences_entry"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_experiences_id"
+    },
+    {
+      "accepted": true,
+      "id": "query_library_contract"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_registry"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_definition"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_fields"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_field"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_reference"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_projection_cycle"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_segment_cycle"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_group_not"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_group_xor"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_parameter"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_ordering"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_library_view"
+    },
+    {
+      "accepted": true,
+      "id": "nested_projection"
+    },
+    {
+      "accepted": false,
+      "id": "invalid_nested_field"
+    },
+    {
+      "accepted": false,
+      "id": "source_null_relation_members"
+    },
+    {
+      "accepted": false,
+      "id": "schema_null_relation_members"
+    },
+    {
+      "accepted": false,
+      "id": "source_null_fields"
+    },
+    {
+      "accepted": false,
+      "id": "schema_null_fields"
+    },
+    {
+      "accepted": false,
+      "id": "source_null_columns"
+    },
+    {
+      "accepted": false,
+      "id": "schema_null_columns"
+    },
+    {
+      "accepted": false,
+      "id": "source_scalar_column_spec"
+    },
+    {
+      "accepted": false,
+      "id": "schema_scalar_column_spec"
+    },
+    {
+      "accepted": false,
+      "id": "source_invalid_source_kind"
+    },
+    {
+      "accepted": false,
+      "id": "schema_invalid_source_kind"
+    },
+    {
+      "accepted": false,
+      "id": "source_null_source_kind"
+    },
+    {
+      "accepted": false,
+      "id": "schema_null_source_kind"
+    },
+    {
+      "accepted": false,
+      "id": "source_invalid_readonly"
+    },
+    {
+      "accepted": false,
+      "id": "schema_invalid_readonly"
+    },
+    {
+      "accepted": false,
+      "id": "source_null_readonly"
+    },
+    {
+      "accepted": false,
+      "id": "schema_null_readonly"
+    },
+    {
+      "accepted": true,
+      "id": "source_valid_table_metadata"
+    },
+    {
+      "accepted": true,
+      "id": "source_valid_view_metadata"
+    },
+    {
+      "accepted": true,
+      "id": "source_valid_materialized_view_metadata"
+    },
+    {
+      "accepted": false,
+      "id": "source_scalar_columns"
+    },
+    {
+      "accepted": false,
+      "id": "schema_scalar_columns"
+    },
+    {
+      "accepted": false,
+      "id": "source_string_columns"
+    },
+    {
+      "accepted": false,
+      "id": "schema_string_columns"
+    },
+    {
+      "accepted": false,
+      "id": "source_list_columns"
+    },
+    {
+      "accepted": false,
+      "id": "schema_list_columns"
+    }
+  ]
+}

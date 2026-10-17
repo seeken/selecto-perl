@@ -97,7 +97,7 @@ subtest 'query state' => sub {
         'the context cannot be switched off');
     is(code_of(sub { $pg->query->retarget('no such path!') }), 'invalid_query',
         'the path must be an association path');
-    is(code_of(sub { $pg->query->with_member('x')->retarget('attendees') }), 'invalid_query',
+    is(code_of(sub { Selecto::Query->new->with_member('x')->retarget('attendees') }), 'invalid_query',
         'root query sources must follow the retarget');
     is(code_of(sub { $pg->query->for_share->retarget('attendees') }), 'invalid_query',
         'a row-locked query cannot be retargeted');
@@ -111,9 +111,11 @@ subtest 'compiled shape' => sub {
     my $sql = $statement->sql;
     like($sql, qr/\ASELECT .* FROM "orders" AS "s0" LEFT JOIN "products" AS "j_product"/,
         'the target is the root and its own associations join from it');
-    like($sql, qr/"s0"\."id" IN \(SELECT "j_attendees__orders"\."id" AS "attendees\.orders\.id" FROM "events" AS "r0" LEFT JOIN "attendees" AS "j_attendees" ON "r0"\."id" = "j_attendees"\."event_id" AND "r0"\."tenant_id" = "j_attendees"\."tenant_id" INNER JOIN "orders" AS "j_attendees__orders" ON "j_attendees"\."id" = "j_attendees__orders"\."attendee_id" AND "j_attendees"\."tenant_id" = "j_attendees__orders"\."tenant_id"/,
+    # orders declares tenant_field, so the target row is rebound on its key
+    # and its tenant column (NULL-safe), through EXISTS.
+    like($sql, qr/EXISTS \(SELECT "j_attendees__orders"\."id" AS "attendees\.orders\.id" FROM "events" AS "r0" LEFT JOIN "attendees" AS "j_attendees" ON "r0"\."id" = "j_attendees"\."event_id" AND "r0"\."tenant_id" = "j_attendees"\."tenant_id" INNER JOIN "orders" AS "j_attendees__orders" ON "j_attendees"\."id" = "j_attendees__orders"\."attendee_id" AND "j_attendees"\."tenant_id" = "j_attendees__orders"\."tenant_id"/,
         'the context selects the target key through both declared tenant-scoped edges');
-    like($sql, qr/WHERE \("s0"\."total" > \$1\) AND \("s0"\."id" IN \(.* WHERE "r0"\."region" = \$2\)\)/,
+    like($sql, qr/WHERE \("s0"\."total" > \$1\) AND \(EXISTS \(.* WHERE \("r0"\."region" = \$2\) AND \("j_attendees__orders"\."id" = "s0"\."id"\) AND \("j_attendees__orders"\."tenant_id" IS NOT DISTINCT FROM "s0"\."tenant_id"\)\)\)/,
         'target filters and the context are both applied');
     like($sql, qr/ORDER BY "s0"\."total" DESC LIMIT 2\z/, 'ordering and pagination are kept');
     is_deeply($statement->params, [10, 'west'], 'parameters follow their placeholders');
@@ -121,8 +123,8 @@ subtest 'compiled shape' => sub {
     my $exists = $pg->compile($pg->query->where($E->eq('region', 'west'))
         ->retarget('attendees.orders', strategy => 'exists')->select('id'));
     like($exists->sql,
-        qr/WHERE EXISTS \(SELECT .* WHERE \("r0"\."region" = \$1\) AND \("j_attendees__orders"\."id" = "s0"\."id"\)\)\z/,
-        'exists correlates the context with the target key');
+        qr/WHERE EXISTS \(SELECT .* WHERE \("r0"\."region" = \$1\) AND \("j_attendees__orders"\."id" = "s0"\."id"\) AND \("j_attendees__orders"\."tenant_id" IS NOT DISTINCT FROM "s0"\."tenant_id"\)\)\z/,
+        'exists correlates the context with the target key and tenant');
 
     my $hop_where = $pg->compile($pg->query->retarget('active_attendees')->select('id'));
     like($hop_where->sql, qr/LEFT JOIN "attendees" AS "j_active_attendees" ON .* AND "j_active_attendees"\."active" = \$1/,
@@ -190,7 +192,7 @@ subtest 'tenant scope' => sub {
     my $scoped = Selecto::Engine->new(domain => $domain, scope => {tenant => 7},
         adapter => Selecto->adapter(postgresql => (dbh => $offline)));
     my $statement = $scoped->compile($scoped->query->retarget('attendees.orders')->select('id'));
-    like($statement->sql, qr/WHERE \("s0"\."tenant_id" = \$1\) AND \("s0"\."id" IN \(.* WHERE "r0"\."tenant_id" = \$2\)\)/,
+    like($statement->sql, qr/WHERE \("s0"\."tenant_id" = \$1\) AND \(EXISTS \(.* WHERE \("r0"\."tenant_id" = \$2\) AND \("j_attendees__orders"\."id" = "s0"\."id"\) AND \("j_attendees__orders"\."tenant_id" IS NOT DISTINCT FROM "s0"\."tenant_id"\)\)\)/,
         'the root tenant applies to the context and to a tenant-scoped target');
     is_deeply($statement->params, [7, 7], 'both tenant conditions bind the trusted tenant');
 

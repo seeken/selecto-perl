@@ -6,29 +6,34 @@ use warnings;
 use Digest::SHA qw(sha256_hex);
 use Encode qw(encode_utf8);
 use JSON::PP ();
-use Scalar::Util qw(blessed);
+use Cpanel::JSON::XS ();
+use Selecto::CanonicalJSON ();
+use Hash::Util::FieldHash qw(fieldhash);
+use Scalar::Util qw(blessed refaddr);
 use Storable qw(dclone);
 use Selecto::Error ();
+use Selecto::ConfiguredDomain ();
 use Selecto::DataRules ();
 use Selecto::Write::Scope ();
 
 my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
-    default_selected required_selected required_order_by
+    default_selected required_selected required_order_by required_group_by required_filters
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions imports editors extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
-    query_library co_domains domain_dependencies operations experiences rules
+    query_library co_domains domain_dependencies operations experiences rules tenant_required require_tenant
 );
-my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields);
+my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields fts5_index);
 my %RELATION = map { $_ => 1 } qw(
     source_table values primary_key fields columns associations tenant_field redact_fields
 );
 my %ASSOCIATION = map { $_ => 1 } qw(
-    queryable owner_key related_key cardinality through source_scope_key target_scope_key where
+    queryable field owner_key related_key cardinality through source_scope_key target_scope_key where
     join_strategy
 );
 my %JOIN = map { $_ => 1 } qw(
+    source fields on
     type name display_field dimension_key display_fallback joins
 );
 my %THROUGH = map { $_ => 1 } qw(
@@ -53,6 +58,19 @@ my %EDITOR_COLLECTION_FIELD = map { $_ => 1 } qw(field label);
 
 sub new {
     my ($class, %args) = @_;
+    my $self = $class->_construct(%args);
+    $self->validate_query_library;
+    return $self;
+}
+
+# Canonical parsing attaches its full schema graph before library validation.
+sub _construct {
+    my ($class, %args) = @_;
+    require Selecto::Tenant::Context;
+    my $tenant_required = Selecto::Tenant::Context->boolean($args{tenant_required} // $args{require_tenant} // 0, 'domain tenant_required');
+    Selecto::Error->throw('invalid_tenant_context', 'domain requirement aliases conflict')
+        if defined($args{tenant_required}) && defined($args{require_tenant})
+            && $tenant_required != Selecto::Tenant::Context->boolean($args{require_tenant}, 'domain require_tenant');
     my $fields = _normalize_fields($args{fields}, 'fields');
     my %associations;
     my $input = $args{associations} // {};
@@ -81,21 +99,30 @@ sub new {
         detail_actions => {},
         rules        => undef,
         primary_key  => undef,
+        fts5_index   => _normalize_fts5_index($args{fts5_index}),
         required_predicate => $args{required_predicate},
         tenant_field => $args{tenant_field},
+        tenant_required => $tenant_required,
     }, $class;
-    $self->{primary_key} = _identifier(
-        $args{primary_key} // (exists($fields->{id}) ? 'id' : (sort keys %$fields)[0]),
-        'primary key',
-    );
+    my $primary = $args{primary_key} // (exists($fields->{id}) ? 'id' : (sort keys %$fields)[0]);
+    my @primary = ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    my %primary;
+    Selecto::Error->throw('invalid_domain', 'primary key must contain distinct root fields')
+        unless @primary && !grep { $primary{_identifier($_, 'primary key')}++ } @primary;
     Selecto::Error->throw('invalid_domain', 'primary key must be a root field')
-        unless exists $fields->{$self->{primary_key}};
+        if grep { !exists $fields->{$_} } @primary;
+    $self->{primary_key} = ref($primary) eq 'ARRAY' ? [@primary] : $primary;
     if (defined($self->{tenant_field})) {
         $self->{tenant_field} = _identifier($self->{tenant_field}, 'tenant field');
         Selecto::Error->throw('invalid_domain', 'tenant field must be a root field')
             unless exists $fields->{$self->{tenant_field}};
     }
     for my $association (values %associations) {
+        Selecto::Error->throw(
+            'invalid_domain', 'association tenant fields must be relation fields',
+            {association => $association->name, code => 'foreign_key_tenant_scope_undeclared'},
+        ) if defined($association->source_tenant_field) && !exists($fields->{$association->source_tenant_field})
+            || defined($association->target_tenant_field) && !exists($association->fields->{$association->target_tenant_field});
         if (defined $association->source_scope_key) {
             Selecto::Error->throw(
                 'invalid_domain',
@@ -159,6 +186,7 @@ sub _refresh_fingerprint {
         tenant_field => $self->{tenant_field},
     };
     $fingerprint_value->{components} = $self->{components} if keys %{$self->{components}};
+    $fingerprint_value->{fts5_index} = $self->{fts5_index} if defined $self->{fts5_index};
     $fingerprint_value->{query_library} = $self->{query_library}
         if keys %{$self->{query_library}};
     $fingerprint_value->{co_domains} = $self->{co_domains}
@@ -173,12 +201,13 @@ sub _refresh_fingerprint {
         if keys %{$self->{detail_actions}};
     # Derived domains keep the governed write surface of their contract.
     my $contract = $self->{contract};
+    $fingerprint_value->{tenant_required} = 1 if $self->{tenant_required};
     if (ref($contract) eq 'HASH') {
         for my $key (qw(writes actions capabilities choice_sources query_members)) {
             $fingerprint_value->{$key} = $contract->{$key} if defined $contract->{$key};
         }
     }
-    my $json = JSON::PP->new->canonical(1)->encode($fingerprint_value);
+    my $json = Selecto::CanonicalJSON->encode($fingerprint_value);
     $self->{fingerprint} = 'sha256:' . sha256_hex(encode_utf8($json));
     return $self;
 }
@@ -203,6 +232,53 @@ sub with_tenant_field {
     return $copy->_refresh_fingerprint;
 }
 
+# Action prerequisite columns (can_<action>) a host must not show this request,
+# because the action itself is hidden. The columns, their filter choices and
+# their fields are removed; the actions keep prerequisite_column false so a
+# re-parse of the contract does not bring them back.
+sub without_action_prerequisites {
+    my ($self, @action_ids) = @_;
+    my $derived = $self->action_prerequisite_fields;
+    my @hidden = grep { defined $derived->{$_} } @action_ids;
+    return $self unless @hidden;
+    my %remove = map { $derived->{$_} => 1 } @hidden;
+    my @remove = sort keys %remove;
+
+    my $copy = bless {%$self}, ref($self);
+    $copy->{fields} = {%{$self->{fields}}};
+    delete @{$copy->{fields}}{@remove};
+    my $contract = _clone_with_rules($self->{contract});
+    delete @{$contract->{source}{columns}}{@remove};
+    $contract->{source}{fields} = [grep { !$remove{$_} } @{$contract->{source}{fields}}];
+    $contract->{actions}{$_}{prerequisite_column} = JSON::PP::false for @hidden;
+    if (ref($contract->{components}) eq 'HASH'
+        && ref($contract->{components}{filter_choices}) eq 'HASH') {
+        delete @{$contract->{components}{filter_choices}}{@remove};
+    }
+    $copy->{contract} = $contract;
+    if (ref($self->{components}{filter_choices}) eq 'HASH') {
+        $copy->{components} = dclone($self->{components});
+        delete @{$copy->{components}{filter_choices}}{@remove};
+    }
+    return $copy->_refresh_fingerprint;
+}
+
+# {action id => field} for the action prerequisite columns this domain has.
+sub action_prerequisite_fields {
+    my ($self) = @_;
+    my $contract = $self->{contract};
+    my $columns = ref($contract) eq 'HASH' && ref($contract->{source}) eq 'HASH'
+        ? $contract->{source}{columns} : undef;
+    return {} unless ref($columns) eq 'HASH';
+    return {
+        map { ($columns->{$_}{action_prerequisites} => $_) }
+        grep {
+            exists($self->{fields}{$_}) && ref($columns->{$_}) eq 'HASH'
+                && defined($columns->{$_}{action_prerequisites})
+        } sort keys %$columns
+    };
+}
+
 sub parse {
     my ($class, $document, %options) = @_;
     my $strict = exists($options{strict}) ? $options{strict} : 1;
@@ -210,14 +286,27 @@ sub parse {
     if (ref($document)) {
         $raw = $document;
     } else {
-        my $ok = eval { $raw = JSON::PP->new->allow_nonref(0)->decode($document); 1 };
+        my $ok = eval { $raw = Cpanel::JSON::XS->new->allow_nonref(0)->decode($document); 1 };
         Selecto::Error->throw('invalid_domain', 'domain JSON is malformed', { parser => 'JSON::PP' })
             unless $ok;
     }
     _object($raw, 'domain');
+    require Selecto::Tenant::Context;
+    Selecto::Error->throw('invalid_query_contract', 'domain read requirement must be plain metadata')
+        if defined(tied(%$raw)) || grep { exists($raw->{$_}) && defined(tied($raw->{$_})) } qw(tenant_required require_tenant);
+    Selecto::Tenant::Context->boolean($raw->{$_}, "domain $_") for grep { defined $raw->{$_} } qw(tenant_required require_tenant);
+    Selecto::Error->throw('invalid_tenant_context', 'domain requirement aliases conflict')
+        if defined($raw->{tenant_required}) && defined($raw->{require_tenant})
+            && Selecto::Tenant::Context->boolean($raw->{tenant_required}, 'domain tenant_required')
+                != Selecto::Tenant::Context->boolean($raw->{require_tenant}, 'domain require_tenant');
+    if (defined($raw->{query_library})) {
+        require Selecto::ConfiguredDomain;
+        Selecto::ConfiguredDomain->admit_library($raw->{query_library});
+    }
     _reject_unknown($raw, \%TOP_LEVEL, 'domain') if $strict;
     _required_key($raw, 'source', 'domain');
     _object($raw->{source}, 'source');
+    _normalize_fts5_index($raw->{source}{fts5_index}) if defined $raw->{source}{fts5_index};
 
     if (exists $raw->{source}{source_table}) {
         return $class->_parse_canonical($raw, $raw->{source}, $strict);
@@ -227,10 +316,11 @@ sub parse {
     _required_key($raw, 'name', 'domain');
     _required_key($raw->{source}, 'table', 'source');
     _required_key($raw->{source}, 'fields', 'source');
-    return $class->new(
+    my $domain = $class->new(
         name => $raw->{name},
         table => $raw->{source}{table},
         fields => $raw->{source}{fields},
+        fts5_index => $raw->{source}{fts5_index},
         associations => $raw->{associations} // {},
         components => $raw->{components},
         query_library => $raw->{query_library},
@@ -240,23 +330,55 @@ sub parse {
         experiences => $raw->{experiences},
         detail_actions => $raw->{detail_actions},
         rules => $raw->{rules},
+        tenant_required => $raw->{tenant_required} // $raw->{require_tenant},
     );
+    return _apply_required_filters($domain, $raw->{required_filters});
+}
+
+sub _clone_with_rules {
+    my ($raw) = @_;
+    # Preserve canonical rules, write validators and action values before
+    # Storable sees them. Nested relationship domains are in the same write
+    # component. Unrelated domain components retain their established paths.
+    my %policy;
+    for my $part (qw(rules writes actions)) {
+        next unless exists $raw->{$part};
+        $policy{$part} = Selecto::DataRules::_copy_plain($raw->{$part}, Selecto::Limits->new,
+            $part eq 'rules' ? 'invalid_data_rules_contract'
+                : $part eq 'writes' ? 'invalid_write_contract' : 'invalid_action_contract', "$part contract");
+    }
+    # Do not let Storable inspect the originals either: its integer encoding
+    # can populate an IV cache on an NV-only 1.0 in the source record.
+    my %other = %$raw;
+    delete @other{keys %policy};
+    my $copy = dclone(\%other);
+    @{$copy}{keys %policy} = values %policy;
+    return $copy;
 }
 
 sub _parse_canonical {
     my ($class, $raw, $source, $strict) = @_;
-    $raw = dclone($raw);
+    $raw = _clone_with_rules($raw);
     $source = $raw->{source};
-    _reject_unknown($source, \%RELATION, 'source') if $strict;
+    _reject_unknown($source, {%RELATION, fts5_index => 1}, 'source') if $strict;
     Selecto::Error->throw(
         'invalid_domain', 'root source must use source_table rather than values',
     ) if exists $source->{values};
+    _derive_action_prerequisite_columns($raw);
     my $schemas = $raw->{schemas} // {};
     my $joins = $raw->{joins} // {};
     _object($schemas, 'schemas');
     _object($joins, 'joins');
+    my $scope_tenant = ref($raw->{writes}) eq 'HASH' && ref($raw->{writes}{scope}) eq 'HASH'
+        && ref($raw->{writes}{scope}{tenant}) eq 'HASH'
+        ? ($raw->{writes}{scope}{tenant}{field} // $raw->{writes}{scope}{tenant}{tenant_field}) : undef;
+    # Lessons 41a and 41b: a two-column root (writes.scope.tenant on one
+    # column, source.tenant_field on another) makes a tenant family. Every
+    # hop of its domain, and of the domains a retarget rebuilds from it
+    # ($DERIVED_TENANT_FAMILY), pairs tenant columns by name.
+    my ($family, $anchors) = _tenant_family($source, $scope_tenant);
     my $associations = _canonical_associations(
-        $source, $schemas, $joins, $strict, '',
+        $source, $schemas, $joins, $strict, '', $family, $anchors,
     );
     _apply_values_foreign_key_metadata(
         $source, $associations, $raw->{writes},
@@ -268,13 +390,15 @@ sub _parse_canonical {
 
     _required_key($raw, 'name', 'domain');
     _required_key($source, 'source_table', 'source');
-    my $domain = $class->new(
+    my $domain = $class->_construct(
         name => $raw->{name},
         table => $source->{source_table},
         fields => _canonical_fields($source),
         associations => $associations,
         primary_key => $source->{primary_key} // 'id',
+        fts5_index => $source->{fts5_index},
         tenant_field => $source->{tenant_field},
+        tenant_required => $raw->{tenant_required} // $raw->{require_tenant},
         components => $raw->{components},
         query_library => $raw->{query_library},
         co_domains => $raw->{co_domains},
@@ -283,15 +407,19 @@ sub _parse_canonical {
         experiences => $raw->{experiences},
         rules => $raw->{rules},
     );
-    $domain->{contract} = dclone($raw);
+    $domain->{_tenant_family} = $family if $family;
+    _apply_required_filters($domain, $raw->{required_filters});
+    $domain->{contract} = _clone_with_rules($raw);
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
     _validate_value_expressions($domain, $source, $raw->{writes});
-    require Selecto::QueryMember;
-    Selecto::QueryMember->validate($domain);
+    # The write scope is known before members are validated: on a two-column
+    # root a member's tenant column pairs with the root column of its name.
     $domain->{write_tenant_scope} = Selecto::Write::Scope->parse_tenant(
         $raw->{writes}, fields => $domain->fields, tenant_field => $source->{tenant_field},
     );
+    require Selecto::QueryMember;
+    Selecto::QueryMember->validate($domain);
     _validate_conditional_filter_choices($domain);
     _validate_picker_visible_id_paths($domain);
     require Selecto::Retarget;
@@ -302,12 +430,49 @@ sub _parse_canonical {
     $domain->{detail_actions} = _validate_detail_actions(
         $domain, $raw->{detail_actions},
     );
-    my $fingerprint_document = dclone($raw);
+    $domain->validate_query_library;
+    my $fingerprint_document = _clone_with_rules($raw);
     delete $fingerprint_document->{domain_fingerprint};
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
-        encode_utf8(JSON::PP->new->canonical(1)->encode($fingerprint_document))
+        encode_utf8(Selecto::CanonicalJSON->encode($fingerprint_document))
     );
     return $domain;
+}
+
+sub _apply_required_filters {
+    my ($domain, $filters) = @_;
+    return $domain unless defined $filters;
+    Selecto::Error->throw('invalid_domain', 'required_filters must be a bounded array')
+        unless ref($filters) eq 'ARRAY' && @$filters <= 1000;
+    require Selecto::Expression;
+    require Selecto::QueryEnforcement;
+    my @predicates;
+    my $ok = eval {
+        for my $raw (@$filters) {
+            Selecto::Error->throw('invalid_domain', 'required filter must be an expression array')
+                unless ref($raw) eq 'ARRAY';
+            my $predicate;
+            if (@$raw == 2 && defined($raw->[0]) && !ref($raw->[0])
+                && exists($domain->fields->{$raw->[0]})) {
+                if (!defined($raw->[1])) {
+                    $predicate = Selecto::Expression->is_null($raw->[0]);
+                } elsif (ref($raw->[1]) eq 'ARRAY' && @{$raw->[1]} == 2) {
+                    $predicate = Selecto::Expression->from_filter_ast([$raw->[1][0], $raw->[0], $raw->[1][1]]);
+                } else {
+                    $predicate = Selecto::Expression->eq($raw->[0], $raw->[1]);
+                }
+            } else {
+                $predicate = Selecto::Expression->from_filter_ast($raw);
+            }
+            Selecto::QueryEnforcement::validate($domain, $predicate);
+            push @predicates, $predicate;
+        }
+        1;
+    };
+    Selecto::Error->throw('invalid_domain', 'required_filters contains an unsupported or invalid guard') unless $ok;
+    $domain->{required_predicate} = Selecto::QueryEnforcement::combine(@predicates);
+    $domain->{required_predicate}{_query_filter_list} = 1 if @predicates > 1;
+    return $domain->_refresh_fingerprint;
 }
 
 my %ARRAY_ITEMS = map { $_ => 1 } qw(string integer decimal boolean date uuid);
@@ -412,8 +577,43 @@ sub _apply_values_foreign_key_metadata {
     }
 }
 
+# The tenant family of a root relation: on a two-column root (lesson 41a)
+# {tenant => tenant_field, site => the writes.scope.tenant column}, with both
+# columns as the root's pairing anchors. A domain a retarget rebuilds from it
+# is parsed under $DERIVED_TENANT_FAMILY and anchors only its own tenant
+# column. Elsewhere there is no family and tenant columns pair by position.
+our $DERIVED_TENANT_FAMILY;
+sub _tenant_family {
+    my ($source, $scope_tenant) = @_;
+    my $tenant = $source->{tenant_field};
+    if (defined($scope_tenant) && !ref($scope_tenant) && defined($tenant) && !ref($tenant) && "$scope_tenant" ne "$tenant") {
+        return ({tenant => "$tenant", site => "$scope_tenant", root => 1}, ["$tenant", "$scope_tenant"]);
+    }
+    return (undef, undef) unless $DERIVED_TENANT_FAMILY;
+    return ({%$DERIVED_TENANT_FAMILY, root => 0}, [defined($tenant) ? ("$tenant") : ()]);
+}
+
 sub _canonical_associations {
-    my ($relation, $schemas, $joins, $strict, $prefix) = @_;
+    my ($relation, $schemas, $joins, $strict, $prefix, $family, $anchors) = @_;
+    # Lessons 41a and 41b: in a tenant family every hop pairs a target's
+    # tenant column only with a column of its own name that anchors the
+    # parent (the root's two columns; a nested or rebuilt hop's own tenant
+    # column), never with the parent's tenant_field by position. A target
+    # tenant column naming neither family column is refused; one with no
+    # anchor of its name is left unpaired (Selecto::SQL binds or refuses it).
+    my $paired_source = sub {
+        my ($target_key, $path) = @_;
+        return _identifier($relation->{tenant_field}, 'tenant field') unless $family;
+        return (grep { $_ eq $target_key } @{$anchors // []}) ? $target_key : undef;
+    };
+    my $family_column = sub {
+        my ($target_key, $path) = @_;
+        return unless $family;
+        Selecto::Error->throw(
+            'invalid_domain', 'a tenant column on a two-column root must pair with the root column of its own name',
+            {association => $path, code => 'foreign_key_tenant_scope_undeclared', tenant_field => $target_key},
+        ) unless $target_key eq $family->{tenant} || $target_key eq $family->{site};
+    };
     my $source_associations = $relation->{associations} // {};
     _object($source_associations, $prefix eq '' ? 'source associations' : "schema $prefix associations");
     my %associations;
@@ -423,6 +623,7 @@ sub _canonical_associations {
         _object($association, "association $path");
         _reject_unknown($association, \%ASSOCIATION, "association $path") if $strict;
         _required_key($association, 'queryable', "association $path");
+        _identifier($association->{field}, 'association field') if exists $association->{field};
         my $queryable = $association->{queryable};
         Selecto::Error->throw('invalid_domain', "missing schema $queryable")
             unless exists $schemas->{$queryable};
@@ -440,6 +641,32 @@ sub _canonical_associations {
         Selecto::Error->throw(
             'invalid_domain', "schema $queryable must declare exactly one of source_table or values",
         ) unless $has_table != $has_values;
+        # Canonical portable joins may repeat relation identity. Repetition
+        # cannot replace the source association or its declared target schema.
+        if (exists $join->{source}) {
+            Selecto::Error->throw('invalid_domain', "join $path source conflicts with its schema")
+                unless !ref($join->{source}) && defined($target->{source_table})
+                    && $join->{source} eq $target->{source_table};
+        }
+        if (exists $join->{fields}) {
+            _object($join->{fields}, "join $path fields");
+            my $expected = _canonical_fields($target);
+            my %given;
+            for my $field (keys %{$join->{fields}}) {
+                _object($join->{fields}{$field}, "join $path field $field");
+                $given{$field} = $join->{fields}{$field}{type};
+            }
+            Selecto::Error->throw('invalid_domain', "join $path fields conflict with its schema")
+                unless Selecto::ConfiguredDomain->digest(\%given, {}) eq Selecto::ConfiguredDomain->digest($expected, {});
+        }
+        if (exists $join->{on}) {
+            my $on = $join->{on};
+            Selecto::Error->throw('invalid_domain', "join $path conditions conflict with its association")
+                unless ref($on) eq 'ARRAY' && @$on == 1 && ref($on->[0]) eq 'HASH'
+                    && keys(%{$on->[0]}) == 2 && defined($on->[0]{left}) && !ref($on->[0]{left})
+                    && defined($on->[0]{right}) && !ref($on->[0]{right})
+                    && $on->[0]{left} eq $association->{owner_key} && $on->[0]{right} eq $association->{related_key};
+        }
         my $target_fields = _canonical_fields($target);
         my $values = $has_values
             ? _canonical_relation_values($target, "schema $queryable")
@@ -490,14 +717,39 @@ sub _canonical_associations {
         # partial pairs, which the association validator must reject).
         if (!keys(%scope_keys) && !exists($association->{through})
             && defined($relation->{tenant_field}) && defined($target->{tenant_field})) {
-            my $source_key = _identifier($relation->{tenant_field}, 'tenant field');
             my $target_key = _identifier($target->{tenant_field}, 'tenant field');
+            $family_column->($target_key, $path);
+            my $source_key = $paired_source->($target_key, $path);
+            if (defined $source_key) {
+                my $source_fields = _canonical_fields($relation);
+                Selecto::Error->throw(
+                    'invalid_domain', 'tenant field must be a relation field',
+                    {association => $path},
+                ) unless exists($source_fields->{$source_key}) && exists($target_fields->{$target_key});
+                %scope_keys = (source_scope_key => $source_key, target_scope_key => $target_key);
+            }
+        }
+        # Lessons 41 and 42: every joined relation that declares tenant_field
+        # is tenant-bounded. When both relations declare one, the join also
+        # pairs those tenant fields, even when its authored scope keys pair
+        # another column (region_id -> region_id) or it runs through a bridge
+        # (authored pairs are kept as well); otherwise a tenant 7 row reaches
+        # tenant 8's row sharing that column or bridge. When only the target
+        # declares one (a shared parent), compilation binds the target's
+        # tenant field to the trusted engine tenant (Selecto::SQL).
+        my %tenant_keys;
+        if (defined $target->{tenant_field}) {
+            my $target_key = _identifier($target->{tenant_field}, 'tenant field');
+            $family_column->($target_key, $path);
+            my $source_key = defined($relation->{tenant_field}) ? $paired_source->($target_key, $path) : undef;
             my $source_fields = _canonical_fields($relation);
             Selecto::Error->throw(
-                'invalid_domain', 'tenant field must be a relation field',
-                {association => $path},
-            ) unless exists($source_fields->{$source_key}) && exists($target_fields->{$target_key});
-            %scope_keys = (source_scope_key => $source_key, target_scope_key => $target_key);
+                'invalid_domain', 'an association to a tenant-scoped relation must be able to bound its tenant field',
+                {association => $path, code => 'foreign_key_tenant_scope_undeclared'},
+            ) unless exists($target_fields->{$target_key})
+                && (!defined($source_key) || exists($source_fields->{$source_key}));
+            %tenant_keys = (target_tenant_field => $target_key,
+                (defined($source_key) ? (source_tenant_field => $source_key) : ()));
         }
         $associations{$name} = Selecto::Domain::Association->new(
             name => $name,
@@ -516,6 +768,7 @@ sub _canonical_associations {
                 join_mode => $join_mode,
                 queryable => "$queryable",
                 %scope_keys,
+                %tenant_keys,
                 (exists($association->{through}) ? (through => $association->{through}) : ()),
                 (exists($association->{where}) ? (where => $association->{where}) : ()),
                 (exists($association->{join_strategy}) ? (
@@ -847,6 +1100,91 @@ sub _validate_action_eligibility {
     }
 }
 
+my %PREREQUISITE_COMPARATOR = (
+    eq => 'eq', neq => 'ne', gt => 'gt', gte => 'gte', lt => 'lt', lte => 'lte', in => 'in',
+);
+
+# Every action whose prerequisites (preconditions and transition source state)
+# are non-empty gets a boolean predicate column can_<action>, with Yes/No
+# filter choices, unless it sets prerequisite_column false. Columns from an
+# earlier parse carry action_prerequisites and are derived again here.
+# Malformed prerequisites get no column: plan() rejects the action itself. A
+# declared field already named can_<action> is left as it is.
+sub _derive_action_prerequisite_columns {
+    my ($raw) = @_;
+    my $source = $raw->{source};
+    my $columns = $source->{columns};
+    return unless ref($columns) eq 'HASH' && ref($source->{fields}) eq 'ARRAY';
+
+    my %stale = map { $_ => 1 } grep {
+        ref($columns->{$_}) eq 'HASH' && exists $columns->{$_}{action_prerequisites}
+    } keys %$columns;
+    delete @$columns{keys %stale};
+    $source->{fields} = [grep { !$stale{$_} } @{$source->{fields}}];
+
+    my $actions = $raw->{actions};
+    my %derived;
+    for my $action_id (sort keys %{ref($actions) eq 'HASH' ? $actions : {}}) {
+        my $action = $actions->{$action_id};
+        next unless ref($action) eq 'HASH' && _prerequisite_column_enabled($action, $action_id);
+        require Selecto::Action::Planner;
+        my $guards = eval { Selecto::Action::Planner->prerequisites($raw, $action) };
+        next unless ref($guards) eq 'ARRAY' && @$guards;
+        my $expression = _prerequisite_expression($guards) or next;
+        my $field = "can_$action_id";
+        next if exists($columns->{$field}) || grep { $_ eq $field } @{$source->{fields}};
+        my $label = (defined($action->{label}) && !ref($action->{label})
+            ? "$action->{label}" : $action_id) . ' prerequisites met';
+        $columns->{$field} = {
+            type => 'boolean',
+            (length($label) <= 80 ? (label => $label) : ()),
+            action_prerequisites => $action_id,
+            computed => {kind => 'predicate', expression => $expression},
+        };
+        push @{$source->{fields}}, $field;
+        $derived{$field} = 1;
+        $raw->{components}{filter_choices}{$field} //= {
+            (length($label) <= 80 ? (label => $label) : (label => $field)),
+            choices => [{value => 'true', label => 'Yes'}, {value => 'false', label => 'No'}],
+        };
+    }
+
+    my $choices = ref($raw->{components}) eq 'HASH' ? $raw->{components}{filter_choices} : undef;
+    delete @$choices{grep { !$derived{$_} } keys %stale} if ref($choices) eq 'HASH';
+}
+
+sub _prerequisite_column_enabled {
+    my ($action, $action_id) = @_;
+    return 1 unless exists $action->{prerequisite_column};
+    my $enabled = $action->{prerequisite_column};
+    Selecto::Error->throw(
+        'invalid_domain', "action $action_id prerequisite_column must be boolean",
+    ) unless JSON::PP::is_bool($enabled)
+        || (defined($enabled) && !ref($enabled) && "$enabled" =~ /\A(?:0|1)\z/);
+    return $enabled ? 1 : 0;
+}
+
+# True exactly when every guard holds. A NULL column would make a comparison
+# NULL rather than false, so each guarded field must also be non-null; a NULL
+# guard value never matches when the action runs, so the column is false.
+# Undef when a guard compares with something other than literals.
+sub _prerequisite_expression {
+    my ($guards) = @_;
+    my (@terms, %not_null);
+    for my $guard (@$guards) {
+        my ($field, $value) = @{$guard}{qw(field value)};
+        my $comparator = $PREREQUISITE_COMPARATOR{$guard->{comparator} // 'eq'};
+        return ['and', [['is_null', $field], ['not_null', $field]]] unless defined $value;
+        my $literal = $comparator eq 'in'
+            ? !grep { ref($_) && !JSON::PP::is_bool($_) } @$value
+            : !ref($value) || JSON::PP::is_bool($value);
+        return undef unless $literal;
+        push @terms, ['not_null', $field] unless $not_null{$field}++;
+        push @terms, [$comparator, $field, $value];
+    }
+    return ['and', \@terms];
+}
+
 sub _computed_predicate_fields {
     my ($expression) = @_;
     return () unless blessed($expression) && $expression->isa('Selecto::Expression');
@@ -924,6 +1262,11 @@ sub resolve {
     };
 }
 
+# Canonical nested association maps, by the canonical schema graph they were
+# built from. Kept off the domain so its digest is unchanged; derived copies
+# share the graph, and so the cache, which is freed with it.
+fieldhash my %CANONICAL_ASSOCIATIONS;
+
 sub resolve_association {
     my ($self, $path) = @_;
     my @segments = split /\./, defined($path) ? "$path" : '', -1;
@@ -943,12 +1286,23 @@ sub resolve_association {
         if (defined($queryable) && ref($self->{canonical_schemas}) eq 'HASH') {
             my $relation = $self->{canonical_schemas}{$queryable};
             Selecto::Error->throw('invalid_domain', "missing schema $queryable") unless $relation;
-            $associations = _canonical_associations(
+            # The map depends only on the schema graph, joins, tenant family
+            # and path, so it is built once rather than on every lookup.
+            # Copy before mapping: map aliases its list, and aliasing a hash
+            # slice creates missing keys on the sealed domain, changing its
+            # digest (configured domain identity has changed).
+            my ($joins, $family) = ($self->{canonical_joins}, $self->{_tenant_family});
+            my $cache_key = join "\0",
+                map({ defined($_) ? refaddr($_) : '' } $joins, $family),
+                $queryable, $prefix;
+            $associations = $CANONICAL_ASSOCIATIONS{$self->{canonical_schemas}}{$cache_key} //= _canonical_associations(
                 $relation,
                 $self->{canonical_schemas},
                 $self->{canonical_joins} // {},
                 1,
                 $prefix,
+                $self->{_tenant_family},
+                [defined($relation->{tenant_field}) ? ("$relation->{tenant_field}") : ()],
             );
         } else {
             $associations = $association->associations;
@@ -970,7 +1324,7 @@ sub compose {
 
 sub as_contract {
     my ($self) = @_;
-    return dclone($self->{contract}) if defined $self->{contract};
+    return _clone_with_rules($self->{contract}) if defined $self->{contract};
     Selecto::Error->throw(
         'invalid_domain_overlay',
         'runtime predicate domains cannot be converted to portable overlay contracts',
@@ -989,10 +1343,11 @@ sub as_contract {
         name => $self->{name},
         source => {
             source_table => $self->{table},
-            primary_key => $self->{primary_key},
+            primary_key => $self->primary_key,
             fields => [sort keys %{$self->{fields}}],
             columns => \%columns,
             associations => $source_associations,
+            (defined($self->{fts5_index}) ? (fts5_index => {%{$self->{fts5_index}}}) : ()),
             (defined($self->{tenant_field}) ? (tenant_field => $self->{tenant_field}) : ()),
         },
         schemas => \%schemas,
@@ -1033,6 +1388,10 @@ sub _portable_associations {
             primary_key => $target_primary_key,
             fields => [sort keys %$fields],
             columns => \%target_columns,
+            # Lesson 42a: a rebuilt domain keeps the target's tenant field, so
+            # its joins stay bounded by the engine tenant.
+            (defined($association->target_tenant_field)
+                ? (tenant_field => $association->target_tenant_field) : ()),
             associations => _portable_associations(
                 $association->associations, \@path, $schemas, $joins,
             ),
@@ -1372,11 +1731,13 @@ sub _normalize_query_library {
     my ($value) = @_;
     return {} unless defined $value;
     _object($value, 'query_library');
+    require Selecto::ConfiguredDomain;
+    Selecto::ConfiguredDomain->admit_library($value);
     my %known = map { $_ => 1 } qw(segments projections orderings views segment_picker_groups);
     _reject_unknown($value, \%known, 'query_library');
     my %library;
     for my $registry (qw(segments projections orderings views)) {
-        my $definitions = $value->{$registry} // {};
+        my $definitions = exists($value->{$registry}) ? $value->{$registry} : {};
         _object($definitions, "query_library $registry");
         $library{$registry} = dclone($definitions);
     }
@@ -2128,13 +2489,39 @@ sub _identifier {
 
 sub name         { return $_[0]->{name}; }
 sub table        { return $_[0]->{table}; }
+sub fts5_index   {
+    my $index = $_[0]->{fts5_index};
+    return undef unless defined $index;
+    return _normalize_fts5_index($index);
+}
+
+sub _normalize_fts5_index {
+    my ($value) = @_;
+    return undef unless defined $value;
+    require Selecto::ConfiguredDomain;
+    Selecto::ConfiguredDomain->admit_library($value);
+    _object($value, 'source fts5_index');
+    _reject_unknown($value, {table => 1, key => 1}, 'source fts5_index');
+    return {map { $_ => _identifier($value->{$_}, "source fts5_index $_") } qw(table key)};
+}
 sub fields       { return { %{$_[0]->{fields}} }; }
 sub associations { return { %{$_[0]->{associations}} }; }
 sub fingerprint  { return $_[0]->{fingerprint}; }
-sub primary_key  { return $_[0]->{primary_key}; }
+sub primary_key  { my $key = $_[0]->{primary_key}; return ref($key) eq 'ARRAY' ? [@$key] : $key; }
+sub primary_keys { my $key = $_[0]->{primary_key}; return ref($key) eq 'ARRAY' ? [@$key] : [$key]; }
 sub required_predicate { return $_[0]->{required_predicate}; }
+# The tenant family of a two-column domain ({tenant, site}; see
+# _tenant_family), or undef, and the root columns its hops pair with by name.
+sub tenant_family { return $_[0]->{_tenant_family} ? {%{$_[0]->{_tenant_family}}} : undef; }
+sub tenant_anchors {
+    my ($self) = @_;
+    my $family = $self->{_tenant_family};
+    return [$family->{tenant}, $family->{site}] if $family && $family->{root};
+    return [defined($self->{tenant_field}) ? ("$self->{tenant_field}") : ()];
+}
 sub tenant_field { return $_[0]->{tenant_field}; }
-sub contract     { return defined($_[0]->{contract}) ? dclone($_[0]->{contract}) : undef; }
+sub tenant_required { return $_[0]->{tenant_required} // 0; }
+sub contract     { return defined($_[0]->{contract}) ? _clone_with_rules($_[0]->{contract}) : undef; }
 # The contract itself, for library code that only reads it; never modify it.
 sub _contract_view { return $_[0]->{contract}; }
 sub retarget_config {
@@ -2150,16 +2537,136 @@ sub write_tenant_scope {
 }
 # Each section is deep-copied straight from the contract, rather than from a
 # deep copy of the whole contract; the caller receives the same fresh copy.
-sub writes       { my $contract = $_[0]->{contract} // {}; return dclone($contract->{writes} // {}); }
-sub actions      { my $contract = $_[0]->{contract} // {}; return dclone($contract->{actions} // {}); }
+sub writes       { my $contract = $_[0]->{contract} // {}; return Selecto::DataRules::_copy_plain(
+    $contract->{writes} // {}, Selecto::Limits->new, 'invalid_write_contract', 'writes contract'); }
+# The domain's own sealed write contract, not a copy. It was validated and copied when the
+# domain was parsed. Callers must treat it as read-only: use writes() for anything that is
+# kept or changed. It exists so the hot write path does not deep-copy the contract per
+# command.
+sub writes_shared { my $contract = $_[0]->{contract} // {}; return $contract->{writes} // {}; }
+sub actions      { my $contract = $_[0]->{contract} // {}; return Selecto::DataRules::_copy_plain(
+    $contract->{actions} // {}, Selecto::Limits->new, 'invalid_action_contract', 'actions contract'); }
 sub imports      { my $contract = $_[0]->{contract} // {}; return dclone($contract->{imports} // {}); }
 sub editors      { return dclone($_[0]->{editors} // {}); }
 sub detail_actions { return dclone($_[0]->{detail_actions} // {}); }
 sub capabilities { my $contract = $_[0]->{contract} // {}; return dclone($contract->{capabilities} // {}); }
+sub validate_capability_policy {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::CapabilityPolicy;
+    return Selecto::Domain::CapabilityPolicy->validate($contract);
+}
 sub components   { return dclone($_[0]->{components} // {}); }
-sub query_library { return dclone($_[0]->{query_library} // {}); }
+sub query_library {
+    require Selecto::ConfiguredDomain;
+    my $library = $_[0]->{query_library} // {};
+    Selecto::ConfiguredDomain->admit_library($library);
+    return dclone($library);
+}
+sub query_contract {
+    my ($self) = @_;
+    require Selecto::Domain::Identity;
+    return Selecto::Domain::Identity->normalize($self)->{normalized}{query};
+}
+sub project_query_contract {
+    # Additive raw portable metadata API. Keep query_contract's independently
+    # published raw identity projection and native parser semantics unchanged.
+    my ($class, $contract) = @_;
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->project($contract);
+}
+sub validate_write_contract {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::WriteContract;
+    return Selecto::Domain::WriteContract->validate($contract);
+}
+sub compile_write_contract {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::WriteContract;
+    return Selecto::Domain::WriteContract->compile($contract);
+}
+sub validate_query_contract {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::QueryContract;
+    return Selecto::Domain::QueryContract->validate($contract);
+}
+sub validate_schema {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::Schema;
+    return Selecto::Domain::Schema->validate($contract);
+}
+sub project {
+    my ($class, $contract, $projection) = @_;
+    require Selecto::Domain::Projection;
+    return Selecto::Domain::Projection->project($contract, $projection);
+}
+sub validate_source_relationships {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::SourceRelationships;
+    return Selecto::Domain::SourceRelationships->validate($contract);
+}
+sub project_source_relationships {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::SourceRelationships;
+    return Selecto::Domain::SourceRelationships->project($contract);
+}
+sub validate_choice_sources {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::ChoiceSources;
+    return Selecto::Domain::ChoiceSources->validate($contract);
+}
+sub project_query_members {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::QueryMembers;
+    return Selecto::Domain::QueryMembers->project($contract);
+}
+sub validate_query_members {
+    my ($class, $contract) = @_;
+    require Selecto::Domain::QueryMembers;
+    return Selecto::Domain::QueryMembers->validate($contract);
+}
+sub validate_query_library {
+    my ($self, $limits) = @_;
+    require Selecto::QueryLibrary;
+    my $report = Selecto::QueryLibrary->validate($self, $limits);
+    Selecto::Error->throw('invalid_query_library', 'query-library declaration failed validation', $report)
+        unless $report->{valid};
+    return $report;
+}
 sub co_domains   { return dclone($_[0]->{co_domains} // {}); }
 sub domain_dependencies { return dclone($_[0]->{domain_dependencies} // []); }
+sub contract_snapshot {
+    require Selecto::Domain::ContractVerification;
+    return Selecto::Domain::ContractVerification->snapshot($_[0]);
+}
+sub normalize_identity {
+    my ($invocant, @args) = @_;
+    require Selecto::Domain::Identity;
+    return Selecto::Domain::Identity->normalize(ref($invocant) ? $invocant : $args[0]);
+}
+sub validate_identity {
+    my ($invocant, @args) = @_;
+    require Selecto::Domain::Identity;
+    return Selecto::Domain::Identity->validate(ref($invocant) ? $invocant : $args[0]);
+}
+sub compose_identity {
+    my ($invocant, @args) = @_;
+    require Selecto::Domain::Identity;
+    my $base = ref($invocant) ? $invocant : shift @args;
+    return Selecto::Domain::Identity->compose($base, $args[0]);
+}
+sub query_identity {
+    my ($invocant, @args) = @_;
+    require Selecto::Domain::Identity;
+    return Selecto::Domain::Identity->query_identity(ref($invocant) ? $invocant : $args[0]);
+}
+sub verify_contract_compatibility {
+    require Selecto::Domain::ContractVerification;
+    return Selecto::Domain::ContractVerification->verify($_[0], $_[1]);
+}
+sub diff_contract_snapshots {
+    require Selecto::Domain::ContractVerification;
+    return Selecto::Domain::ContractVerification->diff_snapshots($_[1], $_[2]);
+}
 sub operations   { return dclone($_[0]->{operations} // {}); }
 sub experiences  { return dclone($_[0]->{experiences} // {}); }
 
@@ -2337,6 +2844,8 @@ sub new {
         join_type => $join_type,
         join_mode => $join_mode,
         (defined($join_strategy) ? (join_strategy => $join_strategy) : ()),
+        (map { defined($value->{$_}) ? ($_ => Selecto::Domain::_identifier($value->{$_}, $_ =~ tr/_/ /r)) : () }
+            qw(source_tenant_field target_tenant_field)),
         (defined($source_scope_key) ? (
             source_scope_key => $source_scope_key,
             target_scope_key => $target_scope_key,
@@ -2380,6 +2889,7 @@ sub fingerprint_value {
             ? (target_primary_key => $self->{target_primary_key}) : ()),
         (defined($self->{through}) ? (through => {%{$self->{through}}}) : ()),
         (defined($self->{where}) ? (where => {%{$self->{where}}}) : ()),
+        (map { defined($self->{$_}) ? ($_ => $self->{$_}) : () } qw(source_tenant_field target_tenant_field)),
         (defined($self->{source_scope_key}) ? (
             source_scope_key => $self->{source_scope_key},
             target_scope_key => $self->{target_scope_key},
@@ -2417,6 +2927,8 @@ sub through { return defined($_[0]->{through}) ? {%{$_[0]->{through}}} : undef; 
 sub where { return defined($_[0]->{where}) ? {%{$_[0]->{where}}} : {}; }
 sub source_scope_key { return $_[0]->{source_scope_key}; }
 sub target_scope_key { return $_[0]->{target_scope_key}; }
+sub source_tenant_field { return $_[0]->{source_tenant_field}; }
+sub target_tenant_field { return $_[0]->{target_tenant_field}; }
 
 1;
 
@@ -2507,6 +3019,12 @@ written through an engine or hosted by L<Selecto::API>.
 
 A compact JSON form equivalent to the constructor form.
 
+SQLite ordinary-table search may declare C<source.fts5_index> as
+C<{table =E<gt> 'items_search', key =E<gt> 'id'}>. The constructor accepts the
+same C<fts5_index> argument. It names a host-maintained external-content FTS5
+index; the adapter verifies native main-table, rowid-key and text-column
+identity on the connected handle before compiling a search.
+
 =item Constructor form (L</new>)
 
 A Perl-only shortcut for read-only use. It has no contract, so an engine
@@ -2550,6 +3068,12 @@ are also accepted and validated as in the canonical form.
 
 =head2 compose
 
+The separate C<normalize_identity>, C<validate_identity>, C<compose_identity>,
+and C<query_identity> methods delegate to L<Selecto::Domain::Identity>. They
+inspect metadata and return structured source-identity diagnostics without
+executing callbacks or authorizing query/write policy. Declared domain version
+and fingerprint labels remain separate from this runtime's C<fingerprint>.
+
   my ($domain, $diagnostics) = Selecto::Domain->compose($base, @overlays);
   my ($domain, $diagnostics) = $base_domain->compose(@overlays);
 
@@ -2561,6 +3085,18 @@ C<capabilities>, C<source_relationships> and C<choice_sources> entries. See
 L<Selecto::Domain::Overlay>.
 
 =head1 METHODS
+
+=head2 project_query_members, validate_query_members
+
+  my $members = Selecto::Domain->project_query_members($complete_plain_contract);
+  my $report = Selecto::Domain->validate_query_members($complete_plain_contract);
+
+These bounded metadata APIs retain the whole declaration and inspect its five
+named-source families without executing portable callback markers. Projection
+returns sorted descriptors and an independent declaration copy; validation
+accumulates diagnostics. Native activation separately checks source columns,
+joins, configured query policy, tenant authority and adapter capabilities.
+See L<Selecto::Domain::QueryMembers> and L<Selecto::QueryMember>.
 
 =head2 resolve
 
@@ -2634,6 +3170,26 @@ Returns a copy that treats another root field as the tenant field. This is
 for role-dependent ownership where the trusted host picks the boundary per
 request. It never changes the shared domain.
 
+=head2 action_prerequisite_fields
+
+  my $fields = $domain->action_prerequisite_fields;   # {archive => 'can_archive'}
+
+The action prerequisite columns the domain has, by action id. See
+L</Action prerequisite columns>.
+
+=head2 without_action_prerequisites
+
+  my $for_user = $domain->without_action_prerequisites(@hidden_action_ids);
+
+Returns a copy without the prerequisite columns of the named actions: their
+fields, columns and filter choices are removed, so the API and component
+catalogs neither show nor accept them. Hosts call this per request for the
+actions the caller cannot see, because a prerequisite column should be
+visible only where its action is. The copy's contract sets
+C<prerequisite_column> false on those actions, so parsing it again keeps them
+hidden. Ids without a column are ignored; when none has one, the domain itself
+is returned. It never changes the shared domain.
+
 =head2 as_contract
 
   my $hash = $domain->as_contract;
@@ -2690,6 +3246,11 @@ Copies of contract sections: C<writes>, C<actions>, C<capabilities>,
 C<imports>, C<editors>, C<detail_actions>, C<components>, C<query_library>,
 C<co_domains>, C<domain_dependencies>, C<operations>, C<experiences>.
 
+C<writes_shared> returns the domain's own sealed C<writes> section, not a
+copy, so the write path need not deep-copy it per command. It is read-only:
+never change it or keep a reference you might change; use C<writes> for a
+copy you own.
+
 =head1 CANONICAL FORMAT
 
 =head2 Top level
@@ -2724,7 +3285,10 @@ root C<source> must use C<source_table>.
 
 =item C<primary_key>
 
-Defaults to C<id>.
+Defaults to C<id>. A scalar names one root field; an array reference names
+distinct root fields making up a compound identity. C<primary_keys> always
+returns a fresh array reference, while C<primary_key> preserves the authored
+scalar or array shape and copies arrays.
 
 =item C<fields> and C<columns>
 
@@ -2896,12 +3460,38 @@ A boolean that is true when the direct association has a matching row.
 
 Computed columns may build on each other; cycles are rejected.
 
+=head2 Action prerequisite columns
+
+Every action whose prerequisites are not empty gets a boolean predicate
+column C<can_E<lt>actionE<gt>>. The prerequisites are its C<preconditions>
+followed by its C<transition> source state (C<< field = from >>), as
+L<Selecto::Action/prerequisites> returns them. The column is true
+exactly when every guard holds: each guarded field must also be non-null, so
+the column is never NULL, and a guard comparing with NULL makes it always
+false, as that action never runs. It is labelled
+"E<lt>action labelE<gt> prerequisites met", is public (although guards may
+read internal fields), and is filtered with Yes/No
+C<components.filter_choices> unless the domain declares choices for it. The
+column carries C<< action_prerequisites => 'E<lt>action idE<gt>' >>, by which
+a later parse of the same contract recognises and derives it again.
+
+Set C<< prerequisite_column => false >> on an action to leave it out. An action
+gets no column when its prerequisites are malformed or compare with something
+other than literals (C<plan> rejects such an action), or when the domain
+already declares a field named C<can_E<lt>actionE<gt>>.
+
+The column describes row state only. It does not authorize the action, and
+C<plan> still enforces the guards when the action runs. Hosts hide the
+columns of actions a caller cannot see with
+L</without_action_prerequisites>.
+
 =head2 writes
 
   writes => {
       operations => {
           insert => {enabled => 1},
-          update => {enabled => 1, bulk => 1, require_filter => 1},
+          update => {enabled => 1, bulk => 1, require_filter => 1,
+                     expected_cardinality => 'many', returning => ['id', 'status']},
           upsert => {enabled => 1, conflict_targets => [['sku']]},
           delete => {enabled => 1},
       },
@@ -2917,6 +3507,10 @@ Computed columns may build on each other; cycles are rejected.
 An engine with the default strict policy writes only what this section
 grants. C<required> fields must be supplied by inserts and upserts
 (C<missing_required_write_fields>). A count greater than one needs C<bulk>.
+Public API writes (L<Selecto::API::EngineHandler>) are also confined to each
+operation's authored grants: without C<expected_cardinality> an operation
+permits exactly one row, even with C<bulk>, and without C<returning> no
+fields may be returned.
 See L<Selecto::Write> and L<Selecto::Engine>.
 
 =head2 Other sections

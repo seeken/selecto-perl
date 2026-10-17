@@ -3,12 +3,27 @@ package Selecto::QueryBudget;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(refaddr weaken);
+use Scalar::Util qw(blessed refaddr weaken);
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
 use Selecto::Error ();
 
 my %ACTIVE;
+my $SERIAL = 0;
 sub _now { clock_gettime(CLOCK_MONOTONIC) }
+
+# A statement that sets a transaction-scoped statement_timeout of the stricter of $limit
+# milliseconds and the current setting (0 is none), and returns the setting it replaced.
+# $limit is SQL: a placeholder or a validated integer. The subquery is evaluated first,
+# so it reads the setting in force before this statement changes it.
+sub _transaction_timeout_sql {
+    my ($limit) = @_;
+    return q{SELECT current_ceiling.prior, set_config('statement_timeout', }
+        . qq{CAST(CASE WHEN current_ceiling.ms > 0 AND current_ceiling.ms < CAST($limit AS bigint) }
+        . qq{THEN current_ceiling.ms ELSE CAST($limit AS bigint) END AS text) || 'ms', true) }
+        . q{FROM (SELECT current_setting('statement_timeout') AS prior, CAST(setting AS bigint) AS ms }
+        . q{FROM pg_settings WHERE name = 'statement_timeout' OFFSET 0) AS current_ceiling};
+}
+use constant TRANSACTION_TIMEOUT_SQL => _transaction_timeout_sql('$1');
 
 sub supported {
     my ($class, $adapter) = @_;
@@ -29,12 +44,24 @@ sub begin {
         unless defined($ms) && !ref($ms) && "$ms" =~ /\A[1-9]\d{0,8}\z/;
     Selecto::Error->throw('query_budget_unsupported', 'adapter cannot enforce a database query deadline')
         unless $class->supported($adapter);
+    Selecto::Error->throw('invalid_query_budget', 'savepoint query budgets need PostgreSQL')
+        if $options{savepoint} && $adapter->name ne 'postgresql';
     my $dbh = $adapter->dbh;
     my $identity = refaddr($dbh);
     Selecto::Error->throw('query_budget_busy', 'database handle already has an active query budget')
         if $ACTIVE{$identity};
     Selecto::Error->throw('query_budget_unavailable', 'database handle requires recovery after a budget restore failure')
         if $dbh->{private_selecto_query_budget_poisoned};
+    # A savepoint budget is a read guard: it starts only on the host's healthy
+    # transaction, never on an aborted one or beside a pending result, and it
+    # refuses before it sends anything. Other PostgreSQL budgets still refuse
+    # a pending asynchronous result, which their statements would disturb.
+    if ($options{savepoint}) {
+        Selecto::Error->throw('invalid_query_budget', 'savepoint query budgets need an open transaction')
+            unless $adapter->_read_guard_scope eq 'host';
+    } elsif ($adapter->name eq 'postgresql' && $adapter->can('_refuse_pending_result')) {
+        $adapter->_refuse_pending_result;
+    }
     my $self = bless {dbh => $dbh, identity => $identity, deadline => _now() + $ms / 1000,
         closed => 0, restore => sub {}}, $class;
     $ACTIVE{$identity} = $self;
@@ -60,6 +87,48 @@ sub begin {
                 return 1 if _now() >= $deadline;
                 return $callback ? $callback->() : 0;
             });
+        } elsif ($options{savepoint}) {
+            # A read inside the host's transaction, under a savepoint opened in the same
+            # round trip as its timeout. Closing rolls back to the savepoint and releases
+            # it in one more, which undoes the timeout and keeps an error (a timeout among
+            # them) from aborting the host's transaction. Rolling back also undoes anything
+            # run under the budget and frees its locks, so this is for reads only.
+            # The name is unique, so a cleanup can only ever roll back to this
+            # budget's own savepoint, and the budget counts as begun (its close
+            # rolls back) only once that savepoint exists.
+            my $savepoint = 'selecto_budget_' . $$ . '_' . ++$SERIAL;
+            my $rollback = "ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint";
+            my $opened = eval {
+                defined($dbh->do("SAVEPOINT $savepoint; " . _transaction_timeout_sql(0 + $ms))) or die;
+                1;
+            };
+            if (!$opened) {
+                # The savepoint may exist with the timeout statement failed after
+                # it. Rolling back to it undoes only that; when it was never
+                # created the unique name matches nothing and the transaction
+                # stays as the failure left it.
+                eval { $dbh->do($rollback) };
+                die 'query timeout configuration failed';
+            }
+            $self->{restore} = sub {
+                defined($dbh->do($rollback)) or die 'query timeout restoration failed';
+            };
+            $self->{rearm} = _transaction_rearm($dbh);
+        } elsif ($name eq 'postgresql' && !$dbh->{AutoCommit}) {
+            # Inside the host's transaction: SET LOCAL semantics, never the session
+            # setting, so nothing can outlive the transaction (a session-scoped restore
+            # could read back a transaction-scoped value and keep it after commit). One
+            # statement applies the stricter of the budget and the setting in force, so a
+            # stricter host ceiling is never replaced, and returns that setting; closing
+            # sets it back, so the rest of the host's transaction (its writes after a
+            # bounded probe, a later budget) runs under its own timeout again.
+            my ($prior) = $dbh->selectrow_array(TRANSACTION_TIMEOUT_SQL, undef, $ms);
+            die 'query timeout configuration failed' unless defined $prior;
+            $self->{restore} = sub {
+                defined($dbh->do(q{SELECT set_config('statement_timeout', ?, true)}, undef, $prior))
+                    or die 'query timeout restoration failed';
+            };
+            $self->{rearm} = _transaction_rearm($dbh);
         } elsif ($name eq 'postgresql') {
             my ($prior) = $dbh->selectrow_array(q{SELECT current_setting('statement_timeout')});
             $self->{restore} = sub {
@@ -80,14 +149,21 @@ sub begin {
             };
         } elsif ($name eq 'mysql' || $name eq 'mariadb') {
             my $setting = $name eq 'mysql' ? 'max_execution_time' : 'max_statement_time';
-            my ($prior) = $dbh->selectrow_array('SELECT @@SESSION.' . $setting);
+            my $read = 'SELECT @@SESSION.' . $setting;
+            $read = $adapter->_statement_sql($read) if $adapter->can('_statement_sql');
+            my ($prior) = $dbh->selectrow_array($read);
+            # Literal numbers: DBD::MariaDB binds placeholders client-side as
+            # quoted strings, which these system variables reject.
+            die 'query timeout configuration failed'
+                unless defined($prior) && "$prior" =~ /\A\d{1,12}(?:\.\d{1,6})?\z/;
             my $value = $name eq 'mysql' ? 0 + $ms : $ms / 1000;
-            $value = $prior if $prior && $prior < $value;
+            $value = 0 + $prior if $prior > 0 && $prior < $value;
+            my $literal = sub { return $name eq 'mysql' ? sprintf('%d', $_[0]) : sprintf('%.6f', $_[0]); };
             $self->{restore} = sub {
-                defined($dbh->do('SET SESSION ' . $setting . ' = ?', undef, $prior))
+                defined($dbh->do('SET SESSION ' . $setting . ' = ' . $literal->($prior)))
                     or die 'query timeout restoration failed';
             };
-            defined($dbh->do('SET SESSION ' . $setting . ' = ?', undef, $value))
+            defined($dbh->do('SET SESSION ' . $setting . ' = ' . $literal->($value)))
                 or die 'query timeout configuration failed';
         } elsif ($name eq 'mssql') {
             my $prior = $dbh->{odbc_query_timeout};
@@ -138,6 +214,17 @@ sub before_blocking {
     return 1;
 }
 
+# Re-arms a transaction-scoped timeout to the stricter of the time left and the setting
+# in force, which this budget set, so re-arming can only tighten it.
+sub _transaction_rearm {
+    my ($dbh) = @_;
+    return sub {
+        my ($limit_ms) = @_;
+        defined(scalar $dbh->selectrow_array(TRANSACTION_TIMEOUT_SQL, undef, $limit_ms))
+            or die 'query timeout configuration failed';
+    };
+}
+
 sub _rearm {
     my ($self, $remaining) = @_;
     my $ms = int($remaining * 1000);
@@ -161,7 +248,17 @@ sub close {
     return;
 }
 
-sub DESTROY { my ($self) = @_; local $@; eval { $self->close } unless $self->{closed}; }
+# Destruction cannot raise: a failed restore is reported as a warning and
+# poisons the handle for later budgets, so it never looks clean.
+sub DESTROY {
+    my ($self) = @_;
+    return if $self->{closed};
+    local $@;
+    return if eval { $self->close; 1 };
+    my $error = $@;
+    warn 'Selecto query budget abandoned: '
+        . (blessed($error) && $error->can('message') ? $error->message : 'restore failed') . "\n";
+}
 1;
 
 __END__
@@ -173,6 +270,25 @@ Selecto::QueryBudget - scoped driver and server query deadlines
 =head1 DESCRIPTION
 
 Obtain a guard with C<< $adapter->begin_query_budget(timeout_ms => 5000) >>.
+On PostgreSQL inside a transaction (C<AutoCommit> off), the server timeout is
+set with C<SET LOCAL> semantics, never loosening a stricter setting, in one
+round trip that also reads the setting it replaces; C<close> sets that back,
+again transaction-locally, so the rest of the host's transaction runs under its
+own timeout and the session setting is never touched. Outside a transaction the
+session setting is set and restored on C<close>.
+
+C<< begin_query_budget(timeout_ms => 5000, savepoint => 1) >> (PostgreSQL inside
+a transaction, for reads only) opens a savepoint in the same round trip as the
+timeout, and C<close> rolls back to it and releases it in one more. That undoes
+the timeout and keeps an error, a timeout among them, from aborting the host's
+transaction. It also undoes anything run under the budget and frees its locks,
+so never use it around writes or locking reads. Its savepoint name is
+unique, and it starts only inside the host's healthy transaction: an
+aborted transaction, a pending asynchronous result or an unknown connection
+state is refused with C<transaction_state_unsafe> before anything is sent
+(see L<Selecto::PostgreSQL/TRANSACTION STATE>), and outside a transaction
+with C<invalid_query_budget>. Other PostgreSQL budgets refuse a pending
+asynchronous result the same way.
 Keep it alive through execution and fetch, call C<check> between application
 operations, and call C<close> after closing result streams. Between rows of a
 bounded stream, C<< check(defer_rearm => 1) >> checks the wall deadline but

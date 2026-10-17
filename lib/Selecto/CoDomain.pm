@@ -113,11 +113,11 @@ sub lookup {
         my $rank = Selecto::Expression->text_rank(
             $search->{fields}, $search_text, %search_options,
         );
-        $query = $query->replace_orders([[$rank, 'desc'], @$orders]);
+        $query = $query->replace_orders([[$rank, $engine->adapter->text_search_rank_direction], @$orders]);
     }
     $query = $query->limit($limit);
 
-    my $raw = $engine->all($query);
+    my $raw = $engine->all($query, canonical_values => 1);
     Selecto::Error->throw('invalid_co_domain_result', 'adapter returned an invalid lookup result')
         unless ref($raw) eq 'HASH' && ref($raw->{rows}) eq 'ARRAY';
     my @description_fields = @{$result->{description_fields} // []};
@@ -221,9 +221,11 @@ optional C<predicate> can only restrict the lookup further (for example to
 rows eligible for the current action). On a tenant-field domain the lookup
 requires a tenant boundary (C<missing_tenant_scope>).
 
-Searching uses full-text search, so the target adapter needs the
-C<text_search> capability (PostgreSQL); others fail with
-C<unsupported_feature>.
+Searching requires the target adapter's C<text_search> capability.
+PostgreSQL supports its native text-search expressions; SQLite uses a proved
+supplied FTS5 root or external-content index. Lookup ordering follows the
+adapter's native rank direction. Unsupported adapters or index declarations
+fail with C<unsupported_feature>.
 
 =head1 CLASS METHODS
 

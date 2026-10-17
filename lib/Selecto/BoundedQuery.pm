@@ -9,6 +9,19 @@ use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Limits ();
 use Selecto::OperationBudget ();
+use Hash::Util::FieldHash qw(fieldhash);
+use Selecto::ConfiguredDomain ();
+
+fieldhash my %PREPARED_POLICY;
+sub _assert_prepared_policy {
+    my ($engine, $prepared) = @_;
+    $engine->_ensure_read_scope;
+    my $record = ref($prepared) eq 'HASH' && $PREPARED_POLICY{$prepared};
+    return unless $engine->_has_read_tenant_policy || $record && $record->{tenant_policy};
+    Selecto::Error->throw('domain_modified_after_configuration', 'prepared read policy is absent or changed', {path => []})
+        unless $record && $record->{policy} eq $engine->_read_policy_identity
+            && $record->{statement} eq Selecto::ConfiguredDomain->prepared_digest($prepared);
+}
 
 # HTTP-neutral finite result consumption. Dialects own transfer guards; a host
 # adapter must explicitly implement that capability, bounded streaming and a
@@ -16,9 +29,12 @@ use Selecto::OperationBudget ();
 sub prepare {
     my ($class, $engine, $query, %args) = @_;
     $engine->assert_tenant_boundary(access => 'read');
+    $engine->assert_domain_identity;
     my $limits = _limits($engine, $args{limits});
     my $adapter = $engine->adapter;
     _capabilities($adapter);
+    require Selecto::QueryPolicy;
+    $query = Selecto::QueryPolicy->apply($engine->read_domain, $query, $limits);
     Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query')->check_tree($query,
         allowed_classes => ['Selecto::Query', 'Selecto::Expression'], label => 'Bounded query');
     my %top = map { refaddr($_) => 1 } @{$query->selections};
@@ -44,10 +60,10 @@ sub prepare {
             my ($path, $fields, $options) = @{$expression->arguments};
             $options //= {};
             if (!defined($options->{aggregate})) {
-                Selecto::Error->throw('unsupported_feature', 'bounded child collections require PostgreSQL')
-                    unless $adapter->name eq 'postgresql';
-                Selecto::Error->throw('unsupported_feature', 'bounded child collections require scalar child fields')
-                    if grep { ref($_) } @$fields;
+                Selecto::Error->throw('unsupported_feature', 'bounded child collections require a certified dialect')
+                    unless $adapter->name eq 'postgresql' || $adapter->supports('bounded_related_collections');
+                Selecto::Error->throw('unsupported_feature', 'bounded child collections require scalar or formatted child fields')
+                    if grep { ref($_) && !_formatted_child($_) } @$fields;
                 my $association = $engine->domain->resolve_association($path)->{association};
                 my $key = $association->target_primary_key;
                 Selecto::Error->throw('unsupported_feature', 'bounded child collections require a primary key')
@@ -66,7 +82,42 @@ sub prepare {
         push @select, $expression;
     }
     my $bounded = $query->_copy(selections => \@select);
-    return {statement => $engine->compile($bounded), query => $bounded, collections => \@collections, limits => $limits};
+    my $prepared = {statement => $engine->compile($bounded), query => $bounded, collections => \@collections, limits => $limits};
+    $PREPARED_POLICY{$prepared} = {policy => $engine->_read_policy_identity, tenant_policy => $engine->_has_read_tenant_policy ? 1 : 0,
+        statement => Selecto::ConfiguredDomain->prepared_digest($prepared)};
+    return $prepared;
+}
+
+# A formatted child date is still one value per child row. Any other child
+# expression could conceal a nested collection outside the per-parent cap.
+sub _formatted_child {
+    my ($field) = @_;
+    my $expression = ref($field) eq 'HASH' ? $field->{expression} : undef;
+    return 0 unless blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind eq 'datetime_format';
+    my $operand = $expression->arguments->[0];
+    return blessed($operand) && $operand->kind eq 'field' ? 1 : 0;
+}
+
+# A prepared bundle whose rows carry one more column holding the single value
+# of another prepared bundle's statement (the adapter's scalar_column_statement,
+# such as a canned page's total). Both bundles must carry this engine's read
+# policy evidence; the combined bundle then carries it too, so explicit read
+# tenant policy still admits it at execution.
+sub prepare_scalar_column {
+    my ($class, $engine, $prepared, $scalar, $alias) = @_;
+    $engine->assert_domain_identity;
+    Selecto::Error->throw('invalid_query', 'scalar columns join two prepared bounded queries')
+        unless ref($prepared) eq 'HASH' && ref($scalar) eq 'HASH';
+    _assert_prepared_policy($engine, $_) for $prepared, $scalar;
+    my $adapter = $engine->adapter;
+    Selecto::Error->throw('unsupported_feature', 'configured adapter does not support scalar columns')
+        unless $adapter->can('scalar_column_statement');
+    my $combined = {%$prepared,
+        statement => $adapter->scalar_column_statement($prepared->{statement}, $scalar->{statement}, $alias)};
+    $PREPARED_POLICY{$combined} = {policy => $engine->_read_policy_identity, tenant_policy => $engine->_has_read_tenant_policy ? 1 : 0,
+        statement => Selecto::ConfiguredDomain->prepared_digest($combined)};
+    return $combined;
 }
 
 sub all {
@@ -77,6 +128,9 @@ sub all {
 sub execute {
     my ($class, $engine, $prepared, %args) = @_;
     $engine->assert_tenant_boundary(access => 'read');
+    $engine->assert_domain_identity;
+    _assert_prepared_policy($engine, $prepared);
+    $engine->_check_read_execution_options(\%args);
     my $statement = ref($prepared) eq 'HASH' ? $prepared->{statement} : $prepared;
     my $collections = ref($prepared) eq 'HASH' ? $prepared->{collections} : [];
     my $limits = _limits($engine, $args{limits} // (ref($prepared) eq 'HASH' ? $prepared->{limits} : undef));
@@ -86,6 +140,12 @@ sub execute {
         Selecto::Error->throw('invalid_query', 'bounded execution limits must be positive integers')
             unless defined($_) && !ref($_) && "$_" =~ /\A[1-9][0-9]{0,8}\z/;
     }
+    # The query's own LIMIT is a firmer row ceiling than the caller's allowance.
+    my $query = ref($prepared) eq 'HASH' ? $prepared->{query} : undef;
+    my $query_limit = blessed($query) && $query->can('limit_value') ? $query->limit_value : undef;
+    $max_rows = 0 + $query_limit
+        if defined($query_limit) && !ref($query_limit) && "$query_limit" =~ /\A[1-9][0-9]{0,8}\z/
+            && $query_limit < $max_rows;
     my $adapter = $engine->adapter;
     _capabilities($adapter);
     Selecto::OperationBudget->new(limits => $limits, code => 'invalid_query')->consume_parameters($statement->params);
@@ -98,16 +158,41 @@ sub execute {
     my $guarded = $adapter->bounded_result_statement($statement, max_cell_bytes => $cell_limit, max_rows => $max_rows + 1);
     my ($stream, $deadline, @rows);
     my $budget = $class->result_budget($limits);
+    my @canonical = exists($args{canonical_values}) && $adapter->supports('canonical_values')
+        ? (canonical_values => $args{canonical_values} ? 1 : 0) : ();
+    my $admit = sub {
+        my ($row) = @_;
+        $deadline->check(defer_rearm => 1);
+        Selecto::Error->throw('result_limit_exceeded', 'Result exceeds its transfer limit')
+            unless @$row == @columns + 1 && !pop(@$row);
+        Selecto::Error->throw('result_limit_exceeded', 'Result row limit exceeded') if @rows >= $max_rows;
+        $class->admit_row($budget, $row, $collections);
+        push @rows, $row;
+    };
+    # A result whose guard keeps it within one fetch batch buffers no more as a
+    # plain statement than a cursor would: run it directly inside the host's
+    # transaction, under a savepoint opened with its timeout and rolled back
+    # afterwards, so neither the timeout nor an error outlives it. Four round
+    # trips (the connection state check, savepoint with timeout, query,
+    # rollback) instead of a cursor's savepoint, declare, fetches, close and
+    # timeout restore.
+    my $direct = $max_rows + 1 <= DIRECT_ROWS()
+        && $adapter->can('bounded_direct_supported') && $adapter->bounded_direct_supported;
     my $ok = eval {
-        $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
-        $stream = $adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows));
-        while (my $row = $stream->next) {
+        if ($direct) {
+            $deadline = $adapter->begin_query_budget(timeout_ms => $timeout, savepoint => 1);
+            $engine->assert_domain_identity;
+            _assert_prepared_policy($engine, $prepared);
             $deadline->check(defer_rearm => 1);
-            Selecto::Error->throw('result_limit_exceeded', 'Result exceeds its transfer limit')
-                unless @$row == @columns + 1 && !pop(@$row);
-            Selecto::Error->throw('result_limit_exceeded', 'Result row limit exceeded') if @rows >= $max_rows;
-            $class->admit_row($budget, $row, $collections);
-            push @rows, $row;
+            $admit->($_) for @{$adapter->execute_query($guarded, @canonical)->{rows}};
+        } else {
+            $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
+            $engine->assert_domain_identity;
+            _assert_prepared_policy($engine, $prepared);
+            $stream =$adapter->stream_query($guarded, bounded => 1, fetch_size => fetch_rows($max_rows), @canonical);
+            while (my $row = $stream->next) {
+                $admit->($row);
+            }
         }
         1;
     };
@@ -123,6 +208,11 @@ sub execute {
 # is already capped by the transfer guard, so a batch is bounded too.
 use constant FETCH_ROWS => 100;
 sub fetch_rows { my ($max_rows) = @_; return $max_rows + 1 < FETCH_ROWS ? $max_rows + 1 : FETCH_ROWS; }
+
+# Rows a guarded result may hold and still run as one plain statement: a page of
+# up to 100 rows, the row that detects another page and the row that detects
+# excess, about one FETCH_ROWS batch.
+use constant DIRECT_ROWS => 102;
 
 sub result_budget {
     my ($class, $limits) = @_;
@@ -222,6 +312,10 @@ for rejection. C<max_rows + 1> detects excess rows; excess children or bytes
 raise an error, never a successful truncated result. Advanced query-source
 shapes and nested collections on unsupported adapters fail closed.
 
+Rows hold the adapter's default result values; pass
+C<< canonical_values => 1 >> to C<all> or C<execute> for canonical values
+(see L<Selecto::PostgreSQL/RESULT VALUES>). L<Selecto::CannedPage> does.
+
 The result walker checks cumulative cells, child counts, UTF-8 bytes, nodes,
 depth and cycles. This bounds application transfer/materialization; it is not
 a general database query-plan memory proof. Transports must additionally
@@ -234,5 +328,14 @@ scalar-result statement. Never accept compiled SQL or execution options from
 request data. C<validate_result> admits cached result structures using the
 same trusted result limits; cache authorization namespacing belongs to the
 host, independently of this module.
+
+For engines with explicit read tenant policy, execution requires the actual
+prepared bundle and private evidence tying its statement, transfer metadata
+and configured read policy together. Changed bundles, another tenant context,
+or an unbound scalar statement fail before SQL. Approved C<with_limits> copies
+retain read authority while still intersecting execution resource limits.
+C<prepare_scalar_column($engine, $prepared, $scalar, $alias)> joins two such
+bundles through the adapter's C<scalar_column_statement> and carries the same
+evidence, after checking both.
 
 =cut

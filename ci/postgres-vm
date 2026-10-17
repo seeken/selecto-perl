@@ -1,0 +1,59 @@
+#!/bin/sh
+# Only the disposable beep-vm guest's Docker daemon is used.
+set -eu
+image=docker.io/library/postgres:17-trixie@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+name=selecto-perl-ci-postgres
+socket_dir=${RUNNER_TEMP:?}/selecto-perl-ci-postgres-socket
+socket_link=/tmp/.s.PGSQL.5432
+case ${1:-} in
+  start)
+    test "${SELECTO_CI_RUNNER_KIND:-}" = vm
+    test -d "$RUNNER_TEMP"
+    test ! -e "$socket_link"
+    test ! -L "$socket_link"
+    test ! -e "$socket_dir"
+    test ! -L "$socket_dir"
+    tmp_mode_before=$(stat -c '%a' /tmp)
+    test "$tmp_mode_before" = 1777
+    mkdir "$socket_dir"
+    # PostgreSQL changes its socket directory's ownership and mode. Bind only
+    # this job's directory so APT can continue creating files in guest /tmp.
+    docker run -d --name "$name" --publish 127.0.0.1:5432:5432 \
+      --mount "type=bind,src=$socket_dir,dst=/var/run/postgresql" \
+      --tmpfs /var/lib/postgresql:rw,size=1g \
+      --env POSTGRES_HOST_AUTH_METHOD=trust --env POSTGRES_USER=postgres \
+      --env POSTGRES_DB=postgres "$image" >/dev/null
+    ready=0
+    for attempt in $(seq 1 60); do
+      if docker exec "$name" pg_isready -U postgres -d postgres >/dev/null 2>&1; then ready=1; break; fi
+      sleep 1
+    done
+    test "$ready" = 1
+    ln -s "$socket_dir/.s.PGSQL.5432" "$socket_link"
+    test -S "$socket_link"
+    tmp_mode_after=$(stat -c '%a' /tmp)
+    test "$tmp_mode_after" = "$tmp_mode_before"
+    version=$(docker exec "$name" psql -U postgres -d postgres -Atc 'show server_version_num')
+    case "$version" in 17[0-9][0-9][0-9][0-9]) ;; *) exit 1 ;; esac
+    mkdir -p "${SELECTO_CI_EVIDENCE_DIR:?}"
+    printf '{"postgres_server_version_num":%s,"image":"%s","socket_ready":true,"isolated_guest":true,"guest_tmp_mode_before":"%s","guest_tmp_mode_after":"%s"}\n' "$version" "$image" "$tmp_mode_before" "$tmp_mode_after" > "$SELECTO_CI_EVIDENCE_DIR/postgres.json"
+    ;;
+  stop)
+    test "${SELECTO_CI_RUNNER_KIND:-}" = vm
+    stop_status=0
+    if test -L "$socket_link"; then
+      if test "$(readlink "$socket_link")" = "$socket_dir/.s.PGSQL.5432"; then
+        rm "$socket_link" || stop_status=1
+      else
+        stop_status=1
+      fi
+    elif test -e "$socket_link"; then
+      stop_status=1
+    fi
+    docker stop --time 10 "$name" >/dev/null 2>&1 || true
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    rmdir "$socket_dir" 2>/dev/null || true
+    exit "$stop_status"
+    ;;
+  *) echo 'usage: postgres-vm start|stop' >&2; exit 2 ;;
+esac

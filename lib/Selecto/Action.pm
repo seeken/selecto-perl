@@ -5,10 +5,61 @@ use strict;
 use warnings;
 use Selecto::Action::Capability ();
 use Selecto::Action::Planner ();
+use Selecto::Error ();
 
 sub plan {
     my ($class, $domain, $intent, %options) = @_;
     return Selecto::Action::Planner->plan($domain, $intent, %options);
+}
+
+# An opaque handle for a genuine planned action is deliberately not a portable
+# authored Operation. Execute an accepted plan through the native action path.
+sub planned_operation {
+    my ($class, $domain, $intent, %options) = @_;
+    require Scalar::Util;
+    require Selecto::Domain::QueryContract;
+    require Selecto::ConfiguredDomain;
+    require Selecto::OperationBudget;
+    my $plain_intent = Selecto::Domain::QueryContract->copy_declaration($intent);
+    if ((Scalar::Util::blessed($domain) // '') eq 'Selecto::Domain') {
+        Selecto::ConfiguredDomain->digest($domain, {});
+    } else {
+        $domain = Selecto::Domain::QueryContract->copy_declaration($domain);
+    }
+    Selecto::Error->throw('invalid_argument', 'unknown planned operation option')
+        if grep { $_ ne 'limits' } keys %options;
+    Selecto::Action::Planner->_admit_provenance_tree(\%options, 1);
+    my $plan = $class->plan($domain, $plain_intent, %options);
+    require Selecto::Write::PlannedOperation;
+    return Selecto::Write::PlannedOperation->_from_plan($plan);
+}
+
+sub validate_provenance {
+    my ($class, $plan) = @_;
+    return Selecto::Action::Planner->validate_provenance($plan);
+}
+
+sub authorize_and_issue {
+    my ($class, $plan, $phase, %options) = @_;
+    # Provenance comes before resolver lookup or invocation, including for an
+    # unregistered plan whose authored fields otherwise look legitimate.
+    $class->validate_provenance($plan);
+    my $engine = delete $options{engine};
+    my $resolver = delete $options{resolver};
+    require Scalar::Util;
+    Selecto::Error->throw('invalid_action_engine', 'issuing an action grant requires a configured native engine')
+        unless (Scalar::Util::blessed($engine) // '') eq 'Selecto::Engine';
+    Selecto::Error->throw('invalid_argument', 'unknown planned action authorization option')
+        if grep { $_ ne 'context' && $_ ne 'expires_in' } keys %options;
+    require Selecto::Domain::QueryContract;
+    my $plain = Selecto::Domain::QueryContract->copy_declaration({phase => $phase, options => \%options});
+    Selecto::Error->throw('invalid_action_phase', 'action phase must be preview or execute')
+        unless defined($plain->{phase}) && !ref($plain->{phase})
+            && $plain->{phase} =~ /\A(?:preview|execute)\z/;
+    Selecto::Error->throw('invalid_capability_decision', 'capability resolver must be explicit host code')
+        if defined($resolver) && ref($resolver) ne 'CODE';
+    return $engine->grant_action($plan, phase => $plain->{phase},
+        resolver => $resolver, %{$plain->{options}});
 }
 
 # Resolve conditional input specifications without requiring a write executor
@@ -17,6 +68,16 @@ sub plan {
 sub input_form {
     my ($class, $action, $inputs) = @_;
     return Selecto::Action::Planner->input_form($action, $inputs);
+}
+
+# The row-state guards of a declared action, without a target or inputs.
+sub prerequisites {
+    my ($class, $domain, $action_id) = @_;
+    my $contract = Selecto::Action::Planner::_contract($domain);
+    my $action = ref($contract->{actions}) eq 'HASH' ? $contract->{actions}{$action_id} : undef;
+    Selecto::Error->throw('invalid_action_intent', 'action is not exposed by this domain contract',
+        {action => $action_id}) unless ref($action) eq 'HASH';
+    return Selecto::Action::Planner->prerequisites($contract, $action);
 }
 
 sub authorize {
@@ -136,6 +197,29 @@ The data a resolver receives: C<phase>, C<capability>, C<action>,
 C<operation>, C<scope>, C<target>, C<filters>, C<transition> and
 C<preconditions>.
 
+=head2 prerequisites
+
+  my $guards = Selecto::Action->prerequisites($domain, 'archive');
+  # [{type => 'filter', field => 'priority', comparator => 'lte', value => 3, ...},
+  #  {type => 'field_equals', field => 'state', comparator => 'eq', value => 'done', ...}]
+
+The row state the action requires, without a target or inputs: its normalized
+C<preconditions>, then its transition source state. Domains build their
+C<can_E<lt>actionE<gt>> columns from these (see
+L<Selecto::Domain/Action prerequisite columns>). C<plan> still checks the
+operation and the full transition. Throws C<invalid_action_intent> for an
+unknown action and the precondition errors of C<plan> for malformed guards.
+
+=head2 planned_operation / validate_provenance / authorize_and_issue
+
+C<planned_operation($domain, $intent)> creates an opaque handle by actual public
+planning. It cannot be passed to the portable authored-operation compiler.
+C<validate_provenance($plan)> requires the exact accepted planning object and
+unchanged content. C<authorize_and_issue($plan, $phase, engine =E<gt> $engine,
+resolver =E<gt> $resolver, context =E<gt> $context)> validates that provenance
+before delegating to the engine's native, context-bound, expiring single-use
+action grant. Serialized or caller-constructed lookalikes are refused.
+
 =head2 input_form
 
   my $form = Selecto::Action->input_form($domain->actions->{check_in}, {
@@ -185,6 +269,13 @@ C<< {field => 'state', from => 'done', to => 'archived'} >>.
 
 Extra guards such as C<[['eligible', 1], ['<=', 'priority', 3]]>; update and
 delete only.
+
+=item C<prerequisite_column>
+
+Defaults to true: an action with preconditions or a transition gets a boolean
+C<can_E<lt>actionE<gt>> column and Yes/No filter that tell which rows meet
+them (see L<Selecto::Domain/Action prerequisite columns>). Set it false to
+leave the column out.
 
 =item C<selection>
 

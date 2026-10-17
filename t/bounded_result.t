@@ -86,7 +86,7 @@ subtest 'bounded reads require the same trusted tenant boundary as the canonical
         'a previously compiled statement cannot bypass read authority');
     is $error->code, 'missing_tenant_scope', 'execution rechecks the boundary';
     my $scoped = Selecto::Engine->new(domain => $domain, adapter => $adapter, scope => {tenant => 10});
-    is_deeply(Selecto::BoundedQuery->all($scoped, $query)->{rows}, [['mine']],
+    is_deeply(Selecto::BoundedQuery->all($scoped, $scoped->query->select('label'))->{rows}, [['mine']],
         'trusted engine context scopes bounded reads');
     my $required = Selecto::Engine->new(adapter => $adapter,
         domain => $domain->with_required_predicate(Selecto::Expression->eq('tenant_id', 20)));
@@ -161,8 +161,13 @@ subtest 'PostgreSQL per-parent bounded aggregation and transfer' => sub {
     is_deeply(\@fetch_sizes,[100,51,100,100],'fetch size is min(max_rows + 1, 100)');
     is $dbh->selectrow_array('SELECT 1'),1,'PG handle usable after batched bounded reads';
     my $sqlite=engine('sqlite',child_domain(),DBI->connect('dbi:SQLite:dbname=:memory:','','',{RaiseError=>1,PrintError=>0}));
-    my $error=assert_rejected(sub{Selecto::BoundedQuery->prepare($sqlite,$query)},'unsupported bounded nested SQLite refuses before database prepare');
-    is $error->code,'unsupported_feature','unsupported capability remains explicit';
+    my $downgrade=assert_rejected(sub{Selecto::BoundedQuery->prepare($sqlite,$query)},
+        'a query configured under a tenant predicate cannot run on an engine without it');
+    is $downgrade->code,'mixed_tenant_scopes','dropping the required tenant predicate is refused';
+    my $sqlite_query=$sqlite->query->select('id',Selecto::Expression->related_collection('children',['label'])->as('children'))->order_by('id');
+    my $sqlite_prepared=Selecto::BoundedQuery->prepare($sqlite,$sqlite_query);
+    ok @{$sqlite_prepared->{collections}},'SQLite supports bounded nested collection planning';
+    like $sqlite_prepared->{statement}->sql,qr/LIMIT \d+/,'SQLite collection planning applies a finite child limit';
     $dbh->disconnect;
 };
 
