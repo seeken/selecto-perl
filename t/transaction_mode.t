@@ -172,9 +172,11 @@ package RecordingDBH {
     }
     sub selectrow_array {
         my ($self, $sql) = @_;
-        if (defined($self->{session}) && $sql =~ /SELECT \@\@SESSION\.time_zone\b/) {
+        if (defined($self->{session}) && $sql =~ /SELECT VERSION\(\), \@\@SESSION\.time_zone\b/) {
             push @{$self->{events}}, 'SESSION';
-            return @{$self->{session}}[0 .. ($sql =~ /\@\@in_transaction\z/ ? 8 : 7)];
+            # VERSION() of the adapter's own server family comes first.
+            return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'),
+                @{$self->{session}}[0 .. ($sql =~ /\@\@in_transaction\z/ ? 8 : 7)]);
         }
         push @{$self->{events}}, $sql;
         return exists $self->{answers}{$sql} ? ($self->{answers}{$sql}) : die "no answer for $sql\n";

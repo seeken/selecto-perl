@@ -27,7 +27,11 @@ for my $name (qw(sqlite mysql mariadb mssql postgresql duckdb)) {
             my $statement = $engine->compile($engine->query->select(
                 Selecto::Expression->literal(99)->as('value'), 'child.name')
                 ->where(Selecto::Expression->eq('id', 1)));
-            is_deeply $statement->params, $through ? [99, 7, 3, 1] : [99, 7, 1],
+            # On MySQL and MariaDB the bridge pin (a column with no declared
+            # type) compares as identity, decided by the server: its value is
+            # bound for the collated and the byte comparison.
+            my $bridge = $name eq 'mysql' || $name eq 'mariadb' ? [3, 3] : [3];
+            is_deeply $statement->params, $through ? [99, 7, @$bridge, 1] : [99, 7, 1],
                 'bindings follow SELECT, target JOIN, bridge JOIN, WHERE';
             if ($name eq 'postgresql' || $name eq 'duckdb') {
                 like $statement->sql, qr/SELECT \$1 AS/, 'selected literal has first numbered identity';

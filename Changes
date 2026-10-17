@@ -1,6 +1,41 @@
 Revision history for Selecto
 
 Unreleased
+    - A retarget onto an association confined by a fixed where policy
+      applies that policy to the target rows themselves (all backends,
+      PostgreSQL and SQLite included): with keys repeating across sites the
+      key-only correlation returned rows the join excludes. The policy's
+      parameters precede the context's.
+    - MySQL/MariaDB: association where policies (on joins, collections,
+      association_exists, through bridges and retarget targets) compare as
+      identity by the column's declared type (a bridge column is decided by
+      the server); a string, custom-named or CHAR(36) uuid pin reached 'S1'
+      and 's1 ' rows.
+    - MySQL/MariaDB: a computed field referenced by a host-trusted predicate
+      (a computed predicate's body, a value expression's CASE/IN conditions,
+      nested computed fields) compares its own eq/ne/IN leaves as identity.
+      An exact comparison over an expression compares its bytes and repeats
+      the expression's parameters for every paste (8 markers with 5 values
+      raised query_error). Caller filters stay plain.
+    - A joined relation's computed predicate or value expression compiles
+      over the join (it was read as a physical column); its
+      association_exists kind is refused with unsupported_feature, and a
+      self-reference with invalid_domain.
+    - Co-domain lookups compile the request scope and the definition's own
+      view or segment filters, and canned pages the dataset predicate and
+      request scope (page, total and facet queries), as host scope.
+    - Query members' authored filters are host scope of the member's
+      relation; member correlations (lateral, MariaDB lowered lateral and
+      its ROW_NUMBER partition, CTE, recursive, VALUES, subquery) that touch
+      a tenant or scope column classify both sides, so an INT tenant 7
+      never matches a text '07', '7 ' or ' 7'.
+    - MySQL/MariaDB: the per-call session check also reads VERSION() and
+      refuses an adapter on the other server family with invalid_connection
+      (reason server_family); a MariaDB adapter on MySQL is recognised from
+      its rejected statement prefix instead of an untyped query_error.
+    - A required predicate nested past the expression depth limit is
+      refused with invalid_query (reason expression_depth) instead of
+      domain_modified_after_configuration or a serializer failure.
     - Known text type names are listed explicitly (string, text, tinytext,
       mediumtext, longtext, ntext, char, character, nchar, national char,
       varchar, char varying, character varying, nvarchar, national varchar,

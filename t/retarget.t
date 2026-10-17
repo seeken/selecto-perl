@@ -127,8 +127,12 @@ subtest 'compiled shape' => sub {
         'exists correlates the context with the target key and tenant');
 
     my $hop_where = $pg->compile($pg->query->retarget('active_attendees')->select('id'));
-    like($hop_where->sql, qr/LEFT JOIN "attendees" AS "j_active_attendees" ON .* AND "j_active_attendees"\."active" = \$1/,
+    like($hop_where->sql, qr/LEFT JOIN "attendees" AS "j_active_attendees" ON .* AND "j_active_attendees"\."active" = \$2/,
         'a hop keeps its join conditions');
+    # The last hop's where policy confines the target rows themselves too:
+    # the key alone does not identify the row the join reaches.
+    like($hop_where->sql, qr/\ASELECT "s0"\."id" FROM "attendees" AS "s0" WHERE \("s0"\."active" = \$1\) AND \(EXISTS /,
+        'the where policy is applied to the target rows');
 
     my $grouped = $pg->compile($pg->query->retarget('attendees.orders')
         ->select('product.name', $E->count->as('orders'))->group_by('product.name'));
