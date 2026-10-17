@@ -6,6 +6,7 @@ use lib 't/lib';
 use TestSelecto;
 use Selecto::PostgreSQL ();
 use Selecto::Stream ();
+use Hash::Util qw(lock_hash);
 
 # A DBI double whose SQLSTATE, like DBI's, is cleared by the next call on the
 # handle: rollback, or finish on one of its statements.
@@ -71,6 +72,18 @@ for my $generic ('', '00000', 'S1000', 'HY000', 'nonsense') {
 my $plain = Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new);
 is_deeply $plain->normalize_error("boom\n")->details, {cause => 'database_error'},
     'a handle without state reports only the cause';
+
+subtest 'locked native adapter without a DBI handle' => sub {
+    my %native = (client => bless({}, 'NativeClient'));
+    my $adapter = bless \%native, 'Selecto::Adapter';
+    lock_hash %native;
+    is $adapter->driver_sqlstate, undef, 'absent DBI handle has no SQLSTATE';
+    my $error = $adapter->normalize_error('private native driver detail');
+    isa_ok $error, 'Selecto::Error';
+    is $error->code, 'query_error', 'native failures keep the public error contract';
+    is_deeply $error->details, {cause => 'database_error'}, 'no DBI details are invented';
+    is $error->message, 'Execution failed', 'private native detail stays hidden';
+};
 
 # The constraint codes keep their specific public errors.
 my $unique_dbh = StateDBH->new;

@@ -95,4 +95,49 @@ subtest 'PostgreSQL server timeout bounds blocking execution' => sub {
     is(($dbh->selectrow_array(q{SHOW statement_timeout}))[0], '0', 'host timeout restored after deferred re-arm');
     $dbh->disconnect;
 };
+
+subtest 'PostgreSQL budgets inside a transaction restore its timeout' => sub {
+    my $database=$ENV{SELECTO_API_TEST_DATABASE};
+    plan skip_all => 'disposable PostgreSQL unavailable' unless $database && eval {require DBI;require DBD::Pg;1};
+    my $dbh=DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,{RaiseError=>1,PrintError=>0,AutoCommit=>0});
+    my $adapter=Selecto->adapter(postgresql=>(dbh=>$dbh));
+    my $timeout=sub {($dbh->selectrow_array(q{SHOW statement_timeout}))[0]};
+    # As a bounded write probe does: a budget under a savepoint that is then released.
+    $dbh->do('SAVEPOINT probe');
+    my $guard=$adapter->begin_query_budget(timeout_ms=>300);
+    is $timeout->(),'300ms','the budget applies inside the transaction';
+    $dbh->do('SELECT pg_sleep(0.05)');
+    $guard->check;
+    cmp_ok(($dbh->selectrow_array(q{SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'}))[0],'<',300,
+        're-armed with the time left');
+    $guard->close;
+    $dbh->do('RELEASE SAVEPOINT probe');
+    is $timeout->(),'0','closing restores the timeout, so the write after the probe runs under its own';
+    ok eval {$dbh->do('SELECT pg_sleep(0.4)');1},'a statement longer than the budget then runs';
+    $dbh->do(q{SET LOCAL statement_timeout='7s'});
+    $guard=$adapter->begin_query_budget(timeout_ms=>300);
+    $guard->close;
+    is $timeout->(),'7s','a transaction-scoped host timeout is restored as it was';
+    $dbh->commit;
+    is $timeout->(),'0','and no budget changed the session setting';
+    $dbh->do(q{SET statement_timeout='2s'});
+    $dbh->commit;
+    $guard=$adapter->begin_query_budget(timeout_ms=>300,savepoint=>1);
+    my $ok=eval {$dbh->do('SELECT pg_sleep(0.5)');1};
+    ok !$ok,'a savepoint budget interrupts its statement';
+    $guard->close;
+    is_deeply [$dbh->selectrow_array('SELECT 1')],[1],'and its savepoint keeps the transaction usable';
+    is $timeout->(),'2s','with the session timeout in force again';
+    $dbh->do('SET statement_timeout=0');
+    $dbh->commit;
+    $dbh->disconnect;
+};
+
+subtest 'savepoint budgets need PostgreSQL' => sub {
+    plan skip_all => 'SQLite driver unavailable' unless eval { require DBI; require DBD::SQLite; 1 };
+    my $adapter = Selecto->adapter(sqlite => (dbh=>DBI->connect('dbi:SQLite:dbname=:memory:', '', '', {RaiseError=>1, PrintError=>0})));
+    my $ok = eval { $adapter->begin_query_budget(timeout_ms=>100, savepoint=>1); 1 };
+    is $ok ? 'ok' : $@->code, 'invalid_query_budget', 'refused';
+    ok eval { $adapter->begin_query_budget(timeout_ms=>100)->close; 1 }, 'and the handle stays usable';
+};
 done_testing;

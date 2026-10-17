@@ -33,6 +33,44 @@ database you use:
 | Microsoft SQL Server | `mssql`      | `DBD::ODBC` 1.61+ (Unicode build) and an ODBC driver |
 | DuckDB               | `duckdb`     | `DBD::DuckDB` 0.16+                         |
 
+SQLite checks the connected library for CTEs (3.8.3), modern window frames
+(3.28.0), RETURNING/write graphs and bounded materialization (3.35.0), JSON1
+and FTS5. It supports typed computed values, JSON extraction and structural
+containment, JSON/array rowsets, UTC calendar formats and buckets, streaming,
+schema introspection and query plans. JSON containment distinguishes missing
+keys, null, booleans, numbers and strings recursively. JSON-backed typed
+arrays use the existing array builders.
+
+SQLite related collections support stable ordering, per-parent limits/cursors,
+scoped through relations and bounded API subtables. A child overflow refuses
+the whole response; successful subtable metadata includes `limit` and
+`complete=true`. Query execution and streaming preserve the supplied DBI
+handle's transaction and `query_only` state. Trusted adapter tools may use
+the explicitly named `execute_query_unsafe` method.
+
+FTS5 queries require a supplied root virtual table with fields declared
+`fts5` or `text_search_document`; plain/phrase modes quote input, while
+boolean/websearch modes use FTS5 query grammar. SQLite named timezones,
+LATERAL, rollups and row locks remain unsupported. Decimal calculations use
+SQLite floating-point semantics, with no fixed-scale guarantee.
+
+MySQL and MariaDB compare tenant and site identity exactly, as PostgreSQL
+does: a text tenant column is compared byte for byte as well as under its
+collation, so tenant `t1` never reads or writes the rows of `T1` or `t1 `
+whatever the column's (case-insensitive or PAD SPACE) collation is.
+Exact comparison applies to columns declared as text (`string`, `text`,
+`char`, `varchar`) and to undeclared columns that hold text; a tenant uuid
+declared `string` and stored as `CHAR(36)` therefore compares case-sensitively
+(store it in one case). Columns declared temporal, decimal, json, uuid or
+binary compare as PostgreSQL compares them.
+Every MySQL/MariaDB read, stream and write first checks its session, per
+call: the time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`, or `SYSTEM`
+on a server whose system zone is UTC; never `GMT`), the client, connection
+and result character sets utf8mb4, and `sql_mode` strict
+(`STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`). A connection that breaks it
+is refused with `invalid_connection` (`details.reason` names the setting;
+`Selecto::API::error_status` answers it with HTTP 500).
+
 To install from a git checkout:
 
 ```sh
@@ -128,6 +166,15 @@ Tent | Globex | 120
 The remaining examples in this README continue from this program.
 
 ## Core concepts
+
+Native fluent writes and named domain actions are available through
+`$engine->write()` and `$engine->action($name)`. Bind the trusted tenant once
+with `$engine = $engine->with_tenant(8)`; the domain declares its tenant field. Setters return the same local builder;
+`execute` consumes it once. Trusted `with_tenant` fills omitted tenant
+assignments. PostgreSQL additionally supports transaction-scoped
+`return_for_update`, owned related inserts, and read-side `select_for_update`.
+See [fluent writes and editable rows](docs/fluent-writes.md) for complete
+domain configuration, SQL previews, permission checks, and transaction lifetime.
 
 ### Domains
 
@@ -265,8 +312,7 @@ my $notes = Selecto::Domain->parse({
 my $shop7 = Selecto::Engine->new(
     domain  => $notes,
     adapter => Selecto->adapter(sqlite => (dbh => $dbh)),
-    scope   => {tenant => 7},
-);
+)->with_tenant(7);
 
 my $rows = $shop7->all($shop7->query->select('id', 'body'))->{rows};
 print scalar(@$rows), " visible note(s)\n";                   # 1 visible note(s)
@@ -328,6 +374,11 @@ print $@->code, "\n";                                  # cardinality_mismatch
 
 `perldoc Selecto::Action` covers inputs, variants, bulk targets and
 single-use grants for confirm-then-execute flows.
+
+Domains can also declare all 27 portable DataRules operators and six text
+normalizers. Public writes and collection actions evaluate actual prospective
+stored candidates before dispatch. See [native rule admission](docs/data-rules-native.md)
+for input boundaries, resource limits and explicit SQLite refusals.
 
 ### Errors
 
@@ -396,6 +447,20 @@ print "$response->{status} $response->{headers}{'content-type'}\n";
 print $response->{body}, "\n";   # UTF-8 encoded canonical JSON bytes
 ```
 
+API writes are confined to each operation's authored grants in
+`writes.operations`. Without `expected_cardinality` an operation permits exactly
+one row; `bulk => 1` is still needed for larger update/delete counts but never
+admits them alone. Without `returning` (a field list, true or `"all"`) no fields
+may be returned. Refusals are `invalid_api_write`, before any statement runs:
+
+```perl
+writes => {operations => {
+    update => {enabled => 1, bulk => 1, expected_cardinality => 'many',
+               returning => ['id', 'stock']},
+    delete => {enabled => 1, bulk => 1, expected_cardinality => ['between', 1, 50]},
+}},
+```
+
 `GET .../domain` defaults to 403: the complete contract can contain internal
 expressions and policy metadata. A trusted host can set `publish_domain => 1`
 for an intentionally public contract, or supply a callback that returns exactly
@@ -443,11 +508,15 @@ not start. Adapters take `transaction_mode`:
 - `managed` (default): on an idle handle the write runs in its own
   `begin_work` ... `commit`. On a handle that is already inside a transaction
   (`AutoCommit` off after `begin_work`, an `AutoCommit => 0` handle, or a raw
-  `BEGIN` that PostgreSQL, MySQL/MariaDB or SQL Server reports) it runs in a
+  `BEGIN` that PostgreSQL or SQL Server reports) it runs in a
   `SAVEPOINT` instead (`SAVE TRANSACTION` on SQL Server): it commits or rolls
   back with your transaction, and a failed write rolls back only its
   savepoint, so your transaction stays usable, on PostgreSQL too. DuckDB has
   no savepoints and refuses a managed write inside an open transaction.
+  On MySQL and MariaDB only the driver's `AutoCommit` says whether your
+  transaction is open: open it with `begin_work`. MariaDB refuses a write on a
+  transaction opened with a raw `START TRANSACTION` (`invalid_adapter`);
+  MySQL cannot report one, so the write would commit it.
 - `external`: you own the unit of work. The handle must have `AutoCommit`
   off; the adapter never begins, commits, rolls back or creates savepoints.
   Roll back yourself on every exception.
@@ -463,6 +532,78 @@ $dbh->rollback;                     # the write is undone with the rest
 my $external = Selecto->adapter(postgresql => (
     dbh => $dbh, transaction_mode => 'external'));
 ```
+
+#### PostgreSQL result values
+
+**Breaking since 0.2.2:** the PostgreSQL adapter returns the values DBD::Pg
+fetched, untouched, unless you ask for *canonical values*. Ask per call or
+for the whole adapter:
+
+```perl
+my $rows = $engine->all($query, canonical_values => 1)->{rows};   # one read
+my $stream = $engine->stream($query, canonical_values => 1);
+
+my $adapter = Selecto->adapter(postgresql => (
+    dbh => $dbh,
+    canonical_values => 1,   # every read, as before 0.2.2; a call may pass 0
+));
+```
+
+| PostgreSQL type | Driver value (default, DBD::Pg 3) | Canonical value |
+| --- | --- | --- |
+| `smallint`, `integer`, `bigint` | Perl number, `42` | the same |
+| `boolean` | `1` / `0` | the same |
+| `numeric` | string at the column scale, `"10.500"`, `"7152.00"` | string without trailing zeros, `"10.5"`, `"7152"` |
+| `real`, `double precision` | Perl number (a JSON number), `1.5`, `1e+10` | its Perl string (a JSON string), `"1.5"`, `"10000000000"`, `"Inf"` |
+| `timestamp` | `"2024-01-01 10:00:00"` | `"2024-01-01T10:00:00"` |
+| `timestamptz` | server text, `"2024-01-01 10:00:00+00"` | ISO in the session time zone, `"2024-01-01T10:00:00"`, `"2024-01-01T04:00:00-06"` (a zero offset is removed; other offsets kept) |
+| `date` | server text, `"2024-01-01"` | `"2024-01-01"` |
+| text, `json`/`jsonb` (text), arrays, others | unchanged | unchanged |
+
+The API handler (`Selecto::API::EngineHandler`), canned pages, co-domain
+lookups and `export_scalars` ask for canonical values themselves, so their
+JSON is unchanged. Canonical values are decoded in Perl by default, exactly
+as before: dates and timestamps follow the session `DateStyle`, so a non-ISO
+`DateStyle` (`SQL`, `Postgres`, `German`) shows through as it always has.
+`canonical_sql => 1` (opt-in, default 0) has PostgreSQL format the canonical
+values of fields declared `decimal` (PostgreSQL 13 and newer), `date`,
+`naive_datetime` and `utc_datetime` in the outermost select list with
+`trim_scale` and `TO_CHAR` (chosen by the column's actual type); those are
+always ISO, whatever the session `DateStyle`, and the rest is decoded in
+Perl. The Perl decode measured faster at every result size, so the SQL path
+is off by default. See `perldoc Selecto::PostgreSQL` (RESULT VALUES). The
+other adapters always return canonical values.
+
+#### PostgreSQL statement cache (opt-in)
+
+By default every query and write prepares a new statement handle, which
+DBD::Pg sends unnamed, so PostgreSQL parses and plans each call. With
+`statement_cache => 1` the PostgreSQL adapter reuses one handle per distinct
+SQL text on each connection: DBD::Pg prepares it once as a named statement
+and later calls send only the bound values.
+
+```perl
+my $adapter = Selecto->adapter(postgresql => (
+    dbh => $dbh,
+    statement_cache      => 1,     # default 0 (off)
+    statement_cache_size => 256,   # handles kept per connection (default)
+));
+```
+
+- The cache belongs to the DBI handle (it lives in its `CachedKids`, apart
+  from your own `prepare_cached` entries) and is freed with it. It is keyed
+  by the SQL text only; values, tenant ids included, are always bound.
+- At most `statement_cache_size` handles per connection, least recently
+  used first out; an evicted statement is deallocated.
+- Results, types and errors (including `details.sqlstate`) are the same as
+  with the cache off. A statement the server lost (26000) or whose result
+  type changed after DDL (0A000) is prepared again once outside a
+  transaction; inside one the error stands, as it has aborted it. If you run
+  `DISCARD ALL` or `DEALLOCATE ALL` yourself, call
+  `Selecto::PostgreSQL::StatementCache->forget($dbh)`.
+- Leave it off behind a transaction-mode pooler such as PgBouncer before
+  1.21: named statements must reach the server connection that prepared
+  them. That is why it is opt-in.
 
 ### Security checklist
 

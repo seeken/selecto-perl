@@ -1,0 +1,106 @@
+{
+ "schema_version": 1,
+ "name": "Items",
+ "source": {
+  "source_table": "rs2_items",
+  "primary_key": "id",
+  "fields": [
+   "id",
+   "tenant_key",
+   "account_id",
+   "name"
+  ],
+  "columns": {
+   "id": {
+    "type": "integer"
+   },
+   "tenant_key": {
+    "type": "string"
+   },
+   "account_id": {
+    "type": "integer"
+   },
+   "name": {
+    "type": "string"
+   }
+  },
+  "associations": {
+   "a": {
+    "queryable": "acc",
+    "owner_key": "account_id",
+    "related_key": "id",
+    "cardinality": "one",
+    "source_scope_key": "tenant_key",
+    "target_scope_key": "tenant_key"
+   }
+  },
+  "tenant_field": "tenant_key"
+ },
+ "schemas": {
+  "acc": {
+   "source_table": "rs2_acc",
+   "primary_key": "id",
+   "fields": [
+    "id",
+    "tenant_key",
+    "region_id",
+    "label"
+   ],
+   "columns": {
+    "id": {
+     "type": "integer"
+    },
+    "tenant_key": {
+     "type": "string"
+    },
+    "region_id": {
+     "type": "integer"
+    },
+    "label": {
+     "type": "string"
+    }
+   },
+   "associations": {
+    "reg": {
+     "queryable": "reg",
+     "owner_key": "region_id",
+     "related_key": "id",
+     "cardinality": "one",
+     "source_scope_key": "tenant_key",
+     "target_scope_key": "tenant_key"
+    }
+   }
+  },
+  "reg": {
+   "source_table": "rs2_reg",
+   "primary_key": "id",
+   "fields": [
+    "id",
+    "tenant_key",
+    "label"
+   ],
+   "columns": {
+    "id": {
+     "type": "integer"
+    },
+    "tenant_key": {
+     "type": "string"
+    },
+    "label": {
+     "type": "string"
+    }
+   },
+   "associations": {}
+  }
+ },
+ "joins": {
+  "a": {
+   "type": "left",
+   "joins": {
+    "reg": {
+     "type": "left"
+    }
+   }
+  }
+ }
+}

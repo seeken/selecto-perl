@@ -30,16 +30,16 @@ use Selecto::Expression ();
 #
 # Members are activated by name: $query->with_member('usage_totals').
 
-my %GROUPS = map { $_ => 1 } qw(ctes laterals unnests);
+my %GROUPS = map { $_ => 1 } qw(ctes values subqueries laterals unnests);
 my %QUERY_KEYS = map { $_ => 1 } qw(select filter group_by order_by limit);
 my %AGGREGATES = map { $_ => 1 } qw(count sum avg min max);
 my $IDENTIFIER = qr/\A[A-Za-z_][A-Za-z0-9_]*\z/;
 our $DEFAULT_MAX_DEPTH = 100;
 my $MAX_DEPTH_LIMIT = 10_000;
 
-# Validates every data member of a domain. Groups this runtime does not
-# execute (for example Elixir `values` or function members) are left alone and
-# fail only if a query activates them.
+# Validate native data plans and inert portable callback declarations. Native
+# activation still requires the configured host's explicit callback registry;
+# a portable marker is never itself executable.
 sub validate {
     my ($class, $domain) = @_;
     my $members = _members($domain);
@@ -49,6 +49,14 @@ sub validate {
         _fail("query_members.$group must be an object") unless ref($specs) eq 'HASH';
         for my $name (sort keys %$specs) {
             _fail("query member name $name must be an identifier") unless $name =~ $IDENTIFIER;
+            my $spec = $specs->{$name};
+            if (ref($spec) eq 'HASH' && (_callback($spec->{query}) || _callback($spec->{query_builder})
+                    || $group eq 'laterals' && ref($spec->{source}) eq 'ARRAY')) {
+                require Selecto::Domain::QueryMembers;
+                my $report = Selecto::Domain::QueryMembers->validate({query_members => {$group => {$name => $spec}}});
+                _fail("query member $name declaration is invalid") unless $report->{valid};
+                next;
+            }
             $class->_source($domain, $group, $name, $specs->{$name});
         }
     }
@@ -57,11 +65,17 @@ sub validate {
 
 # Returns $query with every activated member added as a query source.
 sub expand {
-    my ($class, $domain, $query) = @_;
+    my ($class, $domain, $query, $engine) = @_;
     my $members = _members($domain);
-    my $expanded = $query->without_members;
-    for my $name (@{$query->members}) {
-        my @found = grep { ref($members->{$_}) eq 'HASH' && exists $members->{$_}{$name} } sort keys %$members;
+    # Expand only after the original intent and configured authority have been
+    # validated. Transient plans are never exposed as declaration authority.
+    my $expanded = Selecto::Query->new(%{$query->without_members});
+    # The trusted engine tenant bounds every member over a tenant-scoped
+    # relation, whether or not the root relation is itself tenant-scoped.
+    my $tenant = $engine ? $engine->scope->{tenant} : undef;
+    for my $activation (@{$query->members}) {
+        my ($requested, $name) = $activation =~ /\A([^:]+):(.+)\z/ ? ($1, $2) : (undef, $activation);
+        my @found = grep { (!defined($requested) || $_ eq $requested) && ref($members->{$_}) eq 'HASH' && exists $members->{$_}{$name} } sort keys %$members;
         Selecto::Error->throw('unknown_query_member', "query member $name is not declared by the domain",
             {member => $name}) unless @found;
         Selecto::Error->throw('invalid_domain', "query member $name is declared in several groups",
@@ -69,11 +83,41 @@ sub expand {
         my ($group) = @found;
         Selecto::Error->throw('unsupported_query_member', "query member group $group is not supported",
             {member => $name, group => $group}) unless $GROUPS{$group};
-        $expanded = $class->_source($domain, $group, $name, $members->{$group}{$name}, $expanded);
+        my $spec = $members->{$group}{$name};
+        if (($group eq 'ctes' || $group eq 'subqueries') && (_callback($spec->{query}) || _callback($spec->{query_builder}))) {
+            _fail('callback member requires a configured engine') unless $engine;
+            require Selecto::QueryBinding;
+            my ($child_domain, $child) = Selecto::QueryBinding->builder($engine, $group, $name);
+            if ($group eq 'ctes') {
+                my $join = defined($spec->{join}) ? _pairs($spec->{join}, "query member $name join") : undef;
+                delete $join->{fields} if $join && ($join->{fields} // '') eq 'infer';
+                $expanded = $expanded->with_cte($name, $child_domain, $child,
+                    (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()), join => $join);
+            } else {
+                $expanded = $expanded->subquery_join($spec->{join_id} // $name, $child_domain, $child,
+                    on => $spec->{on}, type => $spec->{type} // 'left',
+                    (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()));
+            }
+        } else {
+            $expanded = $class->_source($domain, $group, $name, $spec, $expanded, $tenant);
+        }
     }
     return $expanded;
 }
 
+sub _callback { ref($_[0]) eq 'HASH' && keys(%{$_[0]}) == 1 && !ref($_[0]{kind}) && ($_[0]{kind} // '') eq 'declared_callback' }
+sub _pairs {
+    my ($given, $label) = @_;
+    return {%$given} if ref($given) eq 'HASH';
+    _fail("$label must be an object or keyword pairs") unless ref($given) eq 'ARRAY';
+    my %pairs;
+    for my $pair (@$given) {
+        _fail("$label has malformed or duplicate keys")
+            unless ref($pair) eq 'ARRAY' && @$pair == 2 && defined($pair->[0]) && !ref($pair->[0]) && !exists($pairs{$pair->[0]});
+        $pairs{$pair->[0]} = $pair->[1];
+    }
+    return \%pairs;
+}
 sub _members {
     my ($domain) = @_;
     my $contract = $domain->contract // {};
@@ -84,9 +128,28 @@ sub _members {
 
 # Builds (and so validates) a member. With $query, adds it as a source.
 sub _source {
-    my ($class, $domain, $group, $name, $spec, $query) = @_;
+    my ($class, $domain, $group, $name, $spec, $query, $tenant) = @_;
     my $label = "query member $name";
     _fail("$label must be an object") unless ref($spec) eq 'HASH';
+    if ($group eq 'values') {
+        my $join = defined($spec->{join}) ? _pairs($spec->{join}, "$label join") : undef;
+        delete $join->{fields} if $join && ($join->{fields} // '') eq 'infer';
+        my $base = $query // Selecto::Query->new;
+        my $result = $base->with_values($spec->{rows} // $spec->{data}, columns => $spec->{columns},
+            as => $spec->{as} // $spec->{alias} // $name, (defined($join) ? (join => $join) : ()));
+        $domain->resolve($join->{owner_key}) if $join;
+        return $query ? $result : 1;
+    }
+    if ($group eq 'laterals' && ref($spec->{source}) eq 'ARRAY') {
+        my $source = $spec->{source};
+        _fail("$label requires a declared function tuple")
+            unless @$source == 3 && !ref($source->[0]) && $source->[0] eq 'function';
+        my $base = $query // Selecto::Query->new;
+        my $result = $base->function_lateral($source->[1], $source->[2],
+            as => $spec->{as} // $name, type => $spec->{join_type} // 'inner',
+            (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()));
+        return $query ? $result : 1;
+    }
     if ($group eq 'unnests') {
         _keys($spec, [qw(array_field field as alias ordinality)], $label);
         my $field = $spec->{array_field} // $spec->{field};
@@ -97,7 +160,16 @@ sub _source {
         return $query->array_rowset($field, $as,
             (defined($spec->{ordinality}) ? (ordinality => $spec->{ordinality}) : ()));
     }
-    my $member_domain = _source_domain($domain, $spec->{source}, $label);
+    my $member_domain = _source_domain($domain, $spec->{source}, $label, $tenant);
+    if ($group eq 'subqueries') {
+        _keys($spec, [qw(source query columns on type join_id kind capability)], $label);
+        my $child = build_query($member_domain, $spec->{query}, "$label query");
+        my $base = $query // Selecto::Query->new;
+        my $result = $base->subquery_join($spec->{join_id} // $name, $member_domain, $child,
+            on => $spec->{on}, type => $spec->{type} // 'left',
+            (defined($spec->{columns}) ? (columns => $spec->{columns}) : ()));
+        return $query ? $result : 1;
+    }
     if ($group eq 'laterals') {
         _keys($spec, [qw(source query correlations join_type columns)], $label);
         my $member = build_query($member_domain, $spec->{query}, "$label query");
@@ -155,7 +227,7 @@ sub _source {
 
 # A member's root relation: a relation in the domain's own schemas section.
 sub _source_domain {
-    my ($domain, $source, $label) = @_;
+    my ($domain, $source, $label, $tenant) = @_;
     _fail("$label requires a source naming a domain schema")
         unless defined($source) && !ref($source) && "$source" =~ $IDENTIFIER;
     my $schemas = ($domain->contract // {})->{schemas} // {};
@@ -170,34 +242,109 @@ sub _source_domain {
         schemas => {},
         joins => {},
     });
-    return _scoped_member_domain($domain, $member, $relation, $label);
+    $member = bless {%$member, _read_prefix => $domain->{_read_prefix}}, ref($member) if defined $domain->{_read_prefix};
+    return __PACKAGE__->bound_source_domain($domain, $member, label => $label, tenant => $tenant);
 }
 
 # A member reads its own relation, so the root's request scope does not reach
 # it through any join. When the member relation declares a tenant_field, the
-# root's tenant conditions are re-expressed on that field and required of the
-# member too. A scoped root whose tenant condition cannot be carried over
-# fails closed rather than reading every tenant's rows.
-sub _scoped_member_domain {
-    my ($domain, $member, $relation, $label) = @_;
-    my $required = $domain->required_predicate;
-    my $member_tenant = $relation->{tenant_field};
-    return $member unless defined($required) && defined($member_tenant);
-    my $root_tenant = $domain->tenant_field;
-    my @conjuncts = $required->kind eq 'and' ? @{$required->arguments->[0]} : ($required);
+# root's trusted tenant boundary is required of the member too: the root's
+# tenant conditions re-expressed on the member's tenant field and, when the
+# root relation has no tenant field of its own, the trusted engine tenant. A
+# scoped root whose boundary cannot be carried over fails closed with
+# missing_tenant_scope rather than reading every tenant's rows (lesson 39).
+# The same rule bounds inline CTE, lateral and subquery sources at compile;
+# there an inline source already confined to the root's attached tenant
+# prefix (schema-per-tenant) is admitted as it is (allow_prefix).
+sub bound_source_domain {
+    my ($class, $root, $source, %options) = @_;
+    my $member_tenant = $source->tenant_field;
+    return $source unless defined $member_tenant;
+    my $required = $root->required_predicate;
+    my $root_tenant = $root->tenant_field;
+    my $tenant = $options{tenant};
+    my $prefix = $options{allow_prefix} ? $root->{_read_prefix} : undef;
+    my $carry = $root->{_tenant_carry};
+    return $source unless defined($required) || defined($tenant) || defined($prefix) || $carry;
+    # In a tenant family (lessons 41a, 41b) the member's tenant column carries
+    # the conditions of the root column of its own name, never tenant_field's
+    # by position; matching no anchor of the root, nothing is carried.
+    my $family = $root->tenant_family;
+    my $paired = $root_tenant;
+    if ($family) {
+        $paired = grep({ $_ eq "$member_tenant" } @{$root->tenant_anchors}) ? "$member_tenant" : undef;
+    }
     my @carried;
-    if (defined $root_tenant) {
+    # A root rebuilt at an untenanted retarget hop carries the original root's
+    # admitted tenant sets (lesson 41b) onto the member's tenant column.
+    if ($carry && (!$family || defined($carry->{field}) && $carry->{field} eq "$member_tenant")) {
+        push @carried, map { @$_ == 1 ? Selecto::Expression->eq("$member_tenant", $_->[0])
+            : Selecto::Expression->in("$member_tenant", [@$_]) } @{$carry->{sets}};
+    }
+    if (defined($required) && defined($paired)) {
+        my @conjuncts = $required->kind eq 'and' ? @{$required->arguments->[0]} : ($required);
         for my $conjunct (@conjuncts) {
-            my $rewritten = eval { _rename_fields($conjunct, {"$root_tenant" => "$member_tenant"}) };
+            my $rewritten = eval { _rename_fields($conjunct, {"$paired" => "$member_tenant"}) };
             push @carried, $rewritten if $rewritten;
         }
     }
-    Selecto::Error->throw(
-        'missing_tenant_scope',
-        "$label reads a tenant-scoped relation but the root tenant scope cannot be applied to it",
-        {tenant_field => "$member_tenant"},
-    ) unless @carried;
-    return $member->with_required_predicate(@carried == 1 ? $carried[0] : Selecto::Expression->all(@carried));
+    # A tenant-scoped root already carries the engine tenant in its required
+    # predicate (Selecto::Engine::read_domain); a root without a tenant field
+    # does not, so the trusted tenant is applied to the member directly.
+    push @carried, Selecto::Expression->eq("$member_tenant", $tenant)
+        if defined($tenant) && !defined($root_tenant);
+    unless (@carried) {
+        return $source if defined($prefix) && defined($source->{_read_prefix})
+            && "$source->{_read_prefix}" eq "$prefix";
+        # A retarget target tenanted on the family's site column is reached
+        # only through the context's by-name chain from the tenant-bound
+        # root (Selecto::SQL refuses an unchained one), so it is admitted.
+        return $source if $options{chained_site} && $family && $family->{root}
+            && "$member_tenant" eq $family->{site};
+        Selecto::Error->throw(
+            'missing_tenant_scope',
+            ($options{label} // 'query source') . ' reads a tenant-scoped relation but the root tenant scope cannot be applied to it',
+            {tenant_field => "$member_tenant"},
+        );
+    }
+    # Conditions the source already requires (an owned query's own engine
+    # boundary, or an earlier expansion) are not repeated.
+    require Selecto::SQL;
+    my $existing = $source->required_predicate;
+    my %present = map { (Selecto::SQL::_value_key($_) => 1) }
+        defined($existing) ? ($existing->kind eq 'and' ? @{$existing->arguments->[0]} : $existing) : ();
+    @carried = grep { !$present{Selecto::SQL::_value_key($_)}++ } @carried;
+    return $source unless @carried;
+    my $carried = @carried == 1 ? $carried[0] : Selecto::Expression->all(@carried);
+    return $source->with_required_predicate(defined($existing) ? Selecto::Expression->all($existing, $carried) : $carried);
+}
+
+# The tenant sets a read domain admits (lessons 41b, 41f): each top-level
+# positive conjunct (eq or IN over literals) of its required predicate on its
+# own tenant_field, and the sets a root rebuilt at an untenanted retarget hop
+# carries, as [[field, [values]], ...]. The flag says whether the domain is
+# bounded at all (a required predicate, or a carried boundary).
+sub admitted_tenant_sets {
+    my ($class, $domain) = @_;
+    my @sets;
+    my $required = $domain->required_predicate;
+    if (defined(my $field = $domain->tenant_field)) {
+        require Selecto::Engine;
+        my @conjuncts = defined($required) ? ($required) : ();
+        while (my $conjunct = shift @conjuncts) {
+            next unless Scalar::Util::blessed($conjunct) && $conjunct->isa('Selecto::Expression');
+            if ($conjunct->kind eq 'and') { push @conjuncts, @{$conjunct->arguments->[0] // []}; next }
+            next unless ($conjunct->kind eq 'eq' || $conjunct->kind eq 'in')
+                && Selecto::Engine::_is_tenant_comparison($conjunct, "$field");
+            my $value = $conjunct->arguments->[1];
+            push @sets, ["$field", $conjunct->kind eq 'eq' ? [$value->arguments->[0]] : [@$value]];
+        }
+    }
+    my $carry = $domain->{_tenant_carry};
+    push @sets, map { [$carry->{field}, [@$_]] } @{$carry->{sets}} if $carry;
+    # A root without a tenant field of its own (a shared root) has no tenant
+    # boundary to carry, whatever else its required predicate bounds.
+    return (\@sets, defined($domain->tenant_field) && defined($required) || $carry ? 1 : 0);
 }
 
 # Copies an expression tree, renaming field references by $map. Dies when the
@@ -371,7 +518,7 @@ Selecto::QueryMember - named query members declared as domain data
 
 =head1 DESCRIPTION
 
-Query members are reusable CTE, recursive CTE, lateral and array-expansion
+Query members are reusable CTE, recursive CTE, VALUES, derived-subquery, lateral and array-expansion
 sources declared as data in the domain, activated by name with
 L<Selecto::Query/with_member>. A member's query is rooted at a relation in
 the domain's own C<schemas> and is written as data, never SQL, so the same
@@ -389,17 +536,26 @@ most 10,000) and adds a trailing C<selecto_depth> column, which a member may
 not declare itself.
 
 A member reads its own relation, so the root's request scope does not reach
-it through a join. When the root domain carries a required predicate and the
-member's source schema declares C<tenant_field>, the root's tenant
-conditions are re-expressed on the member's tenant field. A scoped root
-whose predicate has no tenant condition fails with C<missing_tenant_scope>
-for such a member, so declare C<tenant_field> on every schema holding tenant
-data.
+it through a join. When the member's source schema declares C<tenant_field>,
+the root's trusted tenant boundary is required of the member too: the root's
+tenant conditions (its required predicate, which carries the engine tenant on
+a tenant-scoped root) are re-expressed on the member's tenant field, and on a
+root relation without a tenant field the trusted engine tenant is applied to
+it directly. A scoped root whose boundary cannot be carried fails with
+C<missing_tenant_scope> for such a member, so declare C<tenant_field> on every
+schema holding tenant data. The same rule bounds inline CTE, recursive CTE,
+lateral and subquery sources (L<Selecto::Query/with_cte> and friends) over a
+domain that declares C<tenant_field>.
 
 Members are validated when the domain is parsed and are part of its
 fingerprint. Naming an undeclared member fails with C<unknown_query_member>.
-Member groups this runtime does not execute are ignored until a query
-activates them.
+All five groups receive structural validation. Native activation remains
+subject to adapter support; SQLite refuses lateral table-function execution.
+Portable C<{kind =E<gt> 'declared_callback'}> markers are inert metadata.
+An application may separately configure explicit C<ctes:id> or C<subqueries:id>
+host builders on L<Selecto::Engine>; those callbacks must return compatible
+configured queries. They are trusted application code, not portable imports.
+Use family-specific query methods when an ID occurs in more than one group.
 
 This module's Perl interface (C<validate>, C<expand>, C<build_query>) is
 used internally by L<Selecto::Domain> and the SQL compiler and may change;

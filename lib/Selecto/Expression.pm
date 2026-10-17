@@ -6,10 +6,13 @@ use warnings;
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
 use Selecto::OperationBudget ();
+use Cpanel::JSON::XS ();
 our $_CONSTRUCTION_LIMITS;
 
 sub new {
     my ($class, $kind, @arguments) = @_;
+    Selecto::Error->throw('raw_sql_forbidden', 'raw SQL is outside governed expressions', {path => []})
+        if defined($kind) && !ref($kind) && $kind eq 'raw_sql';
     my $budget = Selecto::OperationBudget->new(
         (defined($_CONSTRUCTION_LIMITS) ? (limits => $_CONSTRUCTION_LIMITS) : ()), code => 'invalid_query');
     $budget->check_tree(\@arguments, label => 'expression arguments', allowed_classes => ['Selecto::Expression']);
@@ -19,7 +22,7 @@ sub new {
         # admission must not replace that later type/authority decision.
         my $value = $arguments[0];
         if (ref($value) && !JSON::PP::is_bool($value)) {
-            $value = JSON::PP->new->canonical->utf8->encode($value);
+            $value = Cpanel::JSON::XS->new->allow_nonref(1)->canonical->utf8->encode($value);
         }
         $budget->consume_value($value, label => 'expression literal');
     } elsif ($kind =~ /\A(?:in|array_contains|array_contained|array_overlap)\z/ && ref($arguments[1]) eq 'ARRAY') {
@@ -250,8 +253,23 @@ sub count_bucket {
     );
 }
 sub datetime_format {
-    my ($class, $field, $format) = @_;
-    return $class->new('datetime_format', $class->_operand($field), "$format");
+    my ($class, $field, $format, %options) = @_;
+    _known_options(\%options, [qw(timezone)], 'datetime format');
+    my $timezone = $options{timezone};
+    if (defined $timezone) {
+        require DateTime::TimeZone;
+        Selecto::Error->throw('invalid_query', 'timezone must be a valid IANA timezone name')
+            if ref($timezone) || !DateTime::TimeZone->is_valid_name("$timezone");
+    }
+    return $class->new('datetime_format', $class->_operand($field), "$format",
+        (defined($timezone) ? "$timezone" : ()));
+}
+sub date_shortcut {
+    my ($class, $field, $shortcut) = @_;
+    require Selecto::DateShortcut;
+    Selecto::Error->throw('invalid_query', 'date shortcut is not available')
+        unless Selecto::DateShortcut->valid($shortcut);
+    return $class->new('date_shortcut', $class->_operand($field), "$shortcut");
 }
 sub epoch_datetime {
     my ($class, $field) = @_;
@@ -346,8 +364,9 @@ sub _array_predicate {
 # JSON containment: the field's document contains the bound document.
 sub json_contains {
     my ($class, $field, $document) = @_;
-    Selecto::Error->throw('invalid_query', 'json_contains requires an object or array document')
-        unless ref($document) eq 'HASH' || ref($document) eq 'ARRAY';
+    require JSON::PP;
+    Selecto::Error->throw('invalid_query', 'json_contains requires a JSON value')
+        unless !ref($document) || ref($document) eq 'HASH' || ref($document) eq 'ARRAY' || JSON::PP::is_bool($document);
     return $class->new('json_contains', $class->_operand($field), $document);
 }
 
@@ -415,8 +434,7 @@ sub _from_filter_ast {
             unless @arguments == 2;
         # The whole document was admitted before cloning; charge its exact JSON
         # parameter now, after a bounded traversal made encoding safe.
-        require JSON::PP;
-        $budget->consume_value(JSON::PP->new->canonical->utf8->encode($value), label => 'JSON containment value');
+        $budget->consume_value(Cpanel::JSON::XS->new->canonical->allow_nonref(1)->utf8->encode($value), label => 'JSON containment value');
         return $class->json_contains(_filter_field($field), $value);
     }
     Selecto::Error->throw('invalid_query', 'filter field must be a governed field name')
@@ -760,18 +778,34 @@ be C<< {key => 'name', expression => $expression} >>.
 =head2 datetime_format
 
   Selecto::Expression->datetime_format('ordered_at', 'month')
+  Selecto::Expression->datetime_format('ordered_at', 'us_datetime',
+      timezone => 'America/New_York')
 
 Formats a date or time with an allowlisted format name (C<iso8601>,
 C<rfc3339_millis>, C<epoch_seconds>, C<epoch_milliseconds>, C<day>,
-C<time>, C<day_hour>, C<week>, C<iso_week>, C<iso_week_date>, C<month>,
-C<quarter>, C<year>, C<month_of_year>, C<day_of_month>, C<day_of_week>,
-C<day_of_week_num>, C<day_of_year>, C<hour>, C<timezone_offset>). Use the
-same expression in C<select>, C<group_by> and C<order_by>. PostgreSQL and
+C<time>, C<day_hour>, C<day_minute>, C<week>, C<iso_week>, C<iso_week_date>,
+C<month>, C<quarter>, C<year>, C<month_of_year>, C<day_of_month>, C<day_of_week>,
+C<day_of_week_num>, C<day_of_year>, C<hour>, C<timezone_offset>, and the
+display formats C<us_date> (C<10/08/2026>) and C<us_datetime>
+(C<10/08/2026 2:30 PM>)). Use the same expression in C<select>, C<group_by>
+and C<order_by>. The C<timezone> option shows this value in an IANA time
+zone, as L<Selecto::Query/use_timezone> does for a whole query, without
+changing how filters compare the field. PostgreSQL and
 DuckDB implement these; other adapters fail closed. The instant formats
 (C<iso8601> of a C<utc_datetime>, C<rfc3339_millis>, the epochs and
 C<timezone_offset>) read a C<utc_datetime> column declared
 C<< storage => 'naive_utc' >> as C<(column AT TIME ZONE 'UTC')>, with or
 without L<Selecto::Query/use_timezone>.
+
+=head2 date_shortcut
+
+  Selecto::Expression->date_shortcut('ordered_at', 'this_quarter')
+
+True when a date or time is within a L<Selecto::DateShortcut> period. On
+PostgreSQL and DuckDB the period is measured from the database's current
+date, so the session time zone (or the query's
+L<Selecto::Query/use_timezone>) decides when a day begins; other adapters
+bind the server's date. An epoch column compares as an instant.
 
 =head2 epoch_datetime
 
@@ -802,9 +836,10 @@ search text is bound.
 Array predicates over a column declared with an C<items> type. Each value is
 bound and the list is cast to the element type. Null arrays never match.
 
-=item C<json_contains($field, \%document)>
+=item C<json_contains($field, $document)>
 
-JSON containment with the document bound as canonical JSON.
+JSON containment with an object, array, string, number, Boolean or JSON null
+(C<undef>) bound as canonical JSON. Structural comparison preserves JSON types.
 
 =back
 

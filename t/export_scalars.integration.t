@@ -66,11 +66,16 @@ my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter
 my @fields = qw(id label price ratio units open due logged meta);
 my $query = $engine->query->select(@fields)->order_by('id');
 
-is_deeply($engine->all($query)->{rows}, [
+is_deeply($engine->all($query, canonical_values => 1)->{rows}, [
     [1, 'Crate, small', '19.9', '0.5', '12', 1, '2024-03-01', '2024-03-01T08:00:00', '{"a": ["ü"], "z": 1}'],
     [2, 'Größe', '300', '-0.0002', '-3', 0, '2020-02-29', '2020-02-29T23:59:01', '[]'],
     [3, '  +lead', '-0.4', '0', '0', undef, undef, undef, undef],
-], 'plain results are unchanged: normalized decimals, 1/0 booleans, JSON text');
+], 'canonical results: normalized decimals, 1/0 booleans, JSON text');
+is_deeply($engine->all($query)->{rows}, [
+    [1, 'Crate, small', '19.90', '0.5000', '12', 1, '2024-03-01', '2024-03-01 08:00:00', '{"a": ["ü"], "z": 1}'],
+    [2, 'Größe', '300.00', '-0.0002', '-3', 0, '2020-02-29', '2020-02-29 23:59:01', '[]'],
+    [3, '  +lead', '-0.40', '0.0000', '0', undef, undef, undef, undef],
+], 'default results are the driver values');
 
 my $exported = $engine->all($query, export_scalars => 1);
 is(JSON::PP->new->canonical->utf8(0)->encode($exported->{rows}),
@@ -96,7 +101,8 @@ is(decode('UTF-8', $response->{body}), join('',
 ), 'the CSV export carries the export scalars through the certified cell rules');
 
 my $plain = $handler->query($engine, $body);
-is_deeply($plain->{rows}, $engine->all($query)->{rows}, 'the handler without export_scalars is unchanged');
+is_deeply($plain->{rows}, $engine->all($query, canonical_values => 1)->{rows},
+    'the handler without export_scalars returns canonical values');
 
 $dbh->do("DROP TABLE IF EXISTS $table");
 done_testing;

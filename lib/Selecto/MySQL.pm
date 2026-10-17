@@ -25,11 +25,13 @@ Registered as C<mysql>. It uses L<DBD::MariaDB> 1.24 or newer and shares its
 mechanics with L<Selecto::MariaDB> through L<Selecto::MySQLFamily>, but is a
 separate adapter with its own identity and certification target.
 
-It quotes identifiers with backticks, uses C<?> parameters and implements
-upserts with C<ON DUPLICATE KEY UPDATE> (reporting one logical affected row).
-Transactions and streaming are supported. CTEs, window functions, set
-operations, rollups and the other advanced query features are not yet
-implemented and fail closed with C<unsupported_feature>.
+It quotes identifiers with backticks, uses C<?> parameters and gives
+upserts PostgreSQL C<ON CONFLICT> semantics without C<ON DUPLICATE KEY UPDATE>
+(see L<Selecto::MySQLFamily>). Transactions and streaming are supported, as
+are CTEs, window functions, set operations, rollups (as grouped C<UNION ALL>
+branches), C<LATERAL> (MySQL 8.0.14+), JSON rowsets and containment, ordered
+and bounded related collections and FULLTEXT search, each gated on the
+connected server version.
 
 =head1 SEE ALSO
 

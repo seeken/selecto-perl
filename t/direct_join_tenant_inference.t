@@ -141,8 +141,9 @@ sub check_live_reads {
 }
 
 subtest 'actual SQLite joined and correlated reads preserve root rows and hide foreign collisions' => sub {
-    require DBD::SQLite;
+    plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
     my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', undef, undef, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+    $dbh->do('PRAGMA temp_store = MEMORY');
     check_live_reads($dbh, 'sqlite');
     $dbh->disconnect;
 };

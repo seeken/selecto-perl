@@ -10,10 +10,11 @@ use Selecto::Expression ();
 use Selecto::PostgreSQL ();
 use Selecto::SQLite ();
 
-my $dbh = TestSelecto::DBH->new({
+my $fixture = {
     rows => [[1, '10.500', 't'], [2, undef, 'f']],
     types => ['int4', 'numeric', 'bool'],
-});
+};
+my $dbh = TestSelecto::DBH->new(({%$fixture}) x 3);
 my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
 my $statement = Selecto::Statement->new(
     sql => 'SELECT id, score, active FROM people',
@@ -23,8 +24,26 @@ my $statement = Selecto::Statement->new(
 );
 is_deeply($adapter->execute_query($statement), {
     columns => ['id', 'score', 'active'],
+    rows => [[1, '10.500', 't'], [2, undef, 'f']],
+}, 'by default rows hold the driver values');
+is_deeply($adapter->execute_query($statement, canonical_values => 1), {
+    columns => ['id', 'score', 'active'],
     rows => [[1, '10.5', 1], [2, undef, 0]],
-}, 'DBI rows are normalized by PostgreSQL type');
+}, 'canonical_values => 1 normalizes rows by PostgreSQL type');
+is_deeply(Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new({%$fixture}), canonical_values => 1)
+    ->execute_query($statement)->{rows}, [[1, '10.5', 1], [2, undef, 0]],
+    'the canonical_values attribute makes canonical values the adapter default');
+is_deeply(Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new({%$fixture}), canonical_values => 1)
+    ->execute_query($statement, canonical_values => 0)->{rows}, [[1, '10.500', 't'], [2, undef, 'f']],
+    'canonical_values => 0 asks for the driver values');
+ok($adapter->supports('canonical_values'), 'PostgreSQL chooses between driver and canonical values');
+{
+    package Local::OverridingAdapter;
+    use parent -norequire, 'Selecto::PostgreSQL';
+    sub execute_query { return {columns => [], rows => []} }
+}
+ok(!Local::OverridingAdapter->new(dbh => $dbh)->supports('canonical_values'),
+    'a subclass that replaces execute_query is not sent canonical_values');
 
 is($adapter->quote_identifier(q{odd`"name]}), q{"odd`""name]"}, 'identifier quoting doubles embedded quotes');
 is($adapter->placeholder(2), '$2', 'PostgreSQL placeholder numbering is explicit');

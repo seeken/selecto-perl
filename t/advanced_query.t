@@ -175,18 +175,16 @@ is($@->code, 'invalid_query', 'unknown full-text options fail instead of changin
 
 my $sqlite = Selecto::SQLite->new(dbh => TestSelecto::DBH->new);
 my $sqlite_engine = Selecto::Engine->new(domain => TestSelecto::orders_domain(), adapter => $sqlite);
-eval {
-    $sqlite_engine->compile(
-        $sqlite_engine->query->select('id')->group_by_rollup('id'),
-    );
-};
-is($@->code, 'unsupported_feature', 'unsupported dialect rollups fail at capability gating');
+my $sqlite_rollup = $sqlite_engine->compile(
+    $sqlite_engine->query->select('id')->group_by_rollup('id'),
+);
+like($sqlite_rollup->sql, qr/UNION ALL/, 'SQLite compiles rollups as grouping-set branches');
 eval {
     $sqlite_engine->compile($sqlite_engine->query->select('id')->where(
         Selecto::Expression->text_search(['person.name'], 'open'),
     ));
 };
-is($@->code, 'invalid_query', 'unsupported dialect full-text search fails closed');
+is($@->code, 'unsupported_feature', 'unavailable SQLite full-text search fails closed');
 
 my $orders_domain = Selecto::Domain->new(
     name => 'JSON orders', table => 'orders',

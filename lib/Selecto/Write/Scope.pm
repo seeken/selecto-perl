@@ -18,7 +18,12 @@ use Selecto::Expression ();
 #
 # The declaration is enforced data. When a domain declares it, every governed
 # mutation of that domain requires a trusted tenant supplied by the host
-# (Selecto::Engine->new(scope => {tenant => ...})), never by the caller:
+# (Selecto::Engine->new(scope => {tenant => ...})), never by the caller.
+# When the field is the domain's source.tenant_field (or the domain has
+# none) the engine applies the rules below with apply. On a two-column
+# domain (lesson 47a) the engine tenant binds source.tenant_field instead
+# (Selecto::Engine::_apply_write_tenant) and this field is pinned only by
+# host or required conjuncts, never bound to the trusted tenant:
 #
 # - update and delete gain `field = trusted` in their scope predicate;
 # - insert and upsert are assigned the trusted tenant;
@@ -93,16 +98,7 @@ sub apply {
     return $command unless $scope;
     my $field = $scope->{field};
     my $label = {relation => $args{label} // $command->relation, %{$args{details} // {}}};
-    Selecto::Error->throw(
-        'unsupported_tenant_scope_source',
-        'this runtime satisfies tenant scope from trusted context only',
-        {%$label, satisfied_by => [@{$scope->{satisfied_by}}]},
-    ) unless grep { $_ eq 'trusted_context' } @{$scope->{satisfied_by}};
-    Selecto::Error->throw(
-        'missing_tenant_scope',
-        'tenant-scoped writes require a trusted tenant from the host',
-        {%$label, field => $field},
-    ) unless defined $trusted;
+    $class->require_trusted($scope, $trusted, %args, label => $label->{relation});
 
     for my $expression (grep { defined } $command->predicate, $command->scope_predicate) {
         _check_references($expression, $field, $trusted, $label);
@@ -130,6 +126,25 @@ sub apply {
     return $command
         ->with_assignments($assignments)
         ->with_scope_predicate(defined($existing) ? Selecto::Expression->all($existing, $guard) : $guard);
+}
+
+# A declared writes.scope.tenant can be written only with a trusted tenant
+# from the host, whichever column the engine tenant binds.
+sub require_trusted {
+    my ($class, $scope, $trusted, %args) = @_;
+    return unless $scope;
+    my $label = {relation => $args{label}, %{$args{details} // {}}};
+    Selecto::Error->throw(
+        'unsupported_tenant_scope_source',
+        'this runtime satisfies tenant scope from trusted context only',
+        {%$label, satisfied_by => [@{$scope->{satisfied_by}}]},
+    ) unless grep { $_ eq 'trusted_context' } @{$scope->{satisfied_by}};
+    Selecto::Error->throw(
+        'missing_tenant_scope',
+        'tenant-scoped writes require a trusted tenant from the host',
+        {%$label, field => $scope->{field}},
+    ) unless defined $trusted;
+    return;
 }
 
 # A caller may restate the trusted tenant, but may not name another tenant or

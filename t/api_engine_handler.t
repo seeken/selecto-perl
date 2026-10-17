@@ -83,7 +83,10 @@ my $domain = Selecto::Domain->parse({
         operations => {
             insert => {enabled => JSON::PP::true},
             upsert => {enabled => JSON::PP::true},
-            update => {enabled => JSON::PP::true, bulk => JSON::PP::true},
+            update => {
+                enabled => JSON::PP::true, bulk => JSON::PP::true,
+                expected_cardinality => 'many', returning => ['id'],
+            },
             delete => {enabled => JSON::PP::true},
         },
         fields => {
@@ -363,6 +366,25 @@ like $adapter->{last_statement}->sql,
 unlike $adapter->{last_statement}->sql, qr/JOIN "record_lines"/,
     'an explicit subtable does not multiply root rows';
 
+{
+    # An internal child key only orders the bounded collection, an internal use.
+    my $contract = $domain->contract;
+    delete $contract->{domain_fingerprint};
+    $contract->{schemas}{record_lines}{columns}{id}{internal} = 1;
+    my $internal_key_engine = Selecto::Engine->new(
+        domain => Selecto::Domain->parse($contract, strict => 1), adapter => $adapter,
+    );
+    my $internal_key_result = $handler->query($internal_key_engine, {
+        select => ['id', ['lines.sku']],
+    });
+    is_deeply $internal_key_result->{subtables}{lines}{columns}, ['lines.sku'],
+        'a subtable whose child key is internal still runs';
+    like $adapter->{last_statement}->sql, qr/ORDER BY "c_lines"\."id" ASC/,
+        'the internal child key orders the bounded collection';
+    unlike $adapter->{last_statement}->sql, qr/'lines\.id'/,
+        'the internal child key is not returned';
+}
+
 $result = $handler->query($engine, {
     select => ['id', 'lines.sku'],
 });
@@ -473,29 +495,23 @@ my $timezone_error = eval {
 is $timezone_error->code, 'invalid_api_query',
     'unknown IANA timezone names fail during API validation';
 
-my ($shortcut_start, $shortcut_end) = Selecto::DateShortcut->bounds('this_week');
 $handler->query($engine, {
     select => ['id'],
     filters => [{field => 'occurred_at', op => 'date_shortcut', value => 'this_week'}],
 });
 like $adapter->{last_statement}->sql,
-    qr/TO_TIMESTAMP\("s0"\."occurred_at"\) >= \$2\) AND \(TO_TIMESTAMP\("s0"\."occurred_at"\) < \$3/,
-    'date shortcuts compile as a half-open temporal range';
-is_deeply $adapter->{last_statement}->params,
-    [41, $shortcut_start, $shortcut_end],
-    'date shortcut intent resolves to server-local bound parameters';
+    qr/TO_TIMESTAMP\("s0"\."occurred_at"\) >= CAST\(DATE_TRUNC\('week', CURRENT_DATE\) AS DATE\)\) AND \(TO_TIMESTAMP\("s0"\."occurred_at"\) < \(CAST\(DATE_TRUNC\('week', CURRENT_DATE\) AS DATE\) \+ 7\)/,
+    'date shortcuts compile as a half-open range from the database current date';
+is_deeply $adapter->{last_statement}->params, [41],
+    'so the session time zone, not the server, decides when a day begins';
 
-my $recurring_plan = Selecto::DateShortcut->plan('ytd_all_years');
 $handler->query($engine, {
     select => ['id'],
     filters => [{field => 'occurred_at', op => 'date_shortcut', value => 'ytd_all_years'}],
 });
 like $adapter->{last_statement}->sql,
-    qr/TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) >= \$2\).*TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) <= \$3/,
+    qr/TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) >= TO_CHAR\(CAST\(DATE_TRUNC\('year', CURRENT_DATE\) AS DATE\), 'MM-DD'\)\).*TO_CHAR\(TO_TIMESTAMP\("s0"\."occurred_at"\), 'MM-DD'\) <= TO_CHAR\(CURRENT_DATE, 'MM-DD'\)/,
     'all-years date shortcuts compare recurring calendar positions';
-is_deeply $adapter->{last_statement}->params,
-    [41, $recurring_plan->{start}, $recurring_plan->{end}],
-    'recurring date shortcut boundaries remain bound parameters';
 
 my $shortcut_error = eval {
     $handler->query($engine, {

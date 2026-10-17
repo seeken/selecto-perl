@@ -317,13 +317,13 @@ subtest 'TW-04/BD-07 (S9 analog): scoped upserts stay inside the tenant' => sub 
     is_deeply(order_rows($dbh), [[1, 10, 'A', 'upserted', 1], [2, 20, 'A', 'theirs', 2]],
         "another tenant's row is untouched");
 
-    # MySQL resolves ON DUPLICATE KEY on every unique key, so a scoped
-    # upsert could update another tenant's row through its primary key.
+    # MySQL resolves ON DUPLICATE KEY on every unique key and has no WHERE
+    # for its update, so a scoped upsert is refused outright.
     for my $name (qw(mysql mariadb)) {
         my $scoped = Selecto::Engine->new(domain => order_domain(),
             adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)), scope => {tenant => 10});
         is(code_of(sub { $handler->write($scoped, {operation => 'upsert', assignments => {id => 2, code => 'Z', title => 'x'},
-            conflict_target => [qw(site_id code)], upsert_update_fields => ['title']}) }), 'unsupported_upsert_conflict_target',
+            conflict_target => [qw(site_id code)], upsert_update_fields => ['title']}) }), 'unsupported_scope_predicate',
             "$name refuses a tenant-scoped upsert");
     }
 };

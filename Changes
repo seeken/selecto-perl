@@ -8,6 +8,917 @@ Unreleased
       Portable rule identifiers, exact versions and normalized conditions
       follow the common contract. No engine tenant grants writes without
       explicit writes.scope.tenant or the existing authored host predicate.
+    - Known text type names are listed explicitly (string, text, tinytext,
+      mediumtext, longtext, ntext, char, character, nchar, national char,
+      varchar, char varying, character varying, nvarchar, national varchar,
+      varchar2, citext, clob, enum, set and their national/varying
+      synonyms). A custom name merely containing 'char' or 'text' (a
+      TIMESTAMP declared context_ts, a DECIMAL declared charge_amount) is no
+      longer treated as text: the server decides, so host <> and NOT IN on
+      such columns match PostgreSQL instead of every row.
+    - MySQL/MariaDB identity comparison classifies declared types three
+      ways: known non-text (numbers, booleans, temporal values, JSON,
+      binary) compares plainly; known text, after normalising the name
+      (lowercase, no length or charset/collate clause; string, text, char,
+      varchar, character varying, nvarchar, nchar, citext, clob, enum, set,
+      or any name containing char or text) compares exactly; everything else
+      (uuid, custom names, unknown, undeclared) is decided by the server
+      (COLLATION() guard). A uuid or custom-named text tenant compared under
+      its collation and reached 'AAAA...' and padded rows. A guarded column
+      pair compares plainly only when both sides hold no text, and a tenant
+      or scope pair is exact when either side may hold text, so an integer
+      tenant 7 never matches a text '07' or ' 7'.
+    - MySQL/MariaDB exact identity comparison applies only to columns
+      declared as text (string, text, char, varchar, citext, enum) and to
+      undeclared columns while they hold text (COLLATION() is not
+      'binary'). Declared temporal, json, decimal, uuid and binary columns
+      compare plainly again: a byte comparison widened host <> and NOT IN on
+      a TIMESTAMP(3) column and made the ISO 'T' form match nothing.
+    - Graph read anchors (reference-only roots), data-rule candidate reads
+      and action-plan anchor previews compile the command's scope predicate
+      and query-enforcement evidence as host identity, not as a caller
+      filter: on MySQL/MariaDB a child could bind to tenant 'T1''s root.
+    - Each logical-parameter drop is checked against its collated twin;
+      SELECT VERSION() and MariaDB's max_statement_time read carry the
+      subquery-cache prefix too.
+    - Host-trusted scope on MySQL/MariaDB is exact at any depth: every =,
+      <> and IN comparison of a required predicate, a command's scope
+      predicate or query-enforcement evidence on a text or undeclared column
+      (through AND, OR and NOT) uses the byte form; <> and NOT IN negate the
+      exact equality. Range and LIKE comparisons keep the collation. This
+      also holds for writes compiled outside the engine (trusted tooling,
+      previews), whose compiled statement then carries logical_params: the
+      bound values with each exact comparison's repeated copy left out.
+    - A retarget rebinds its target row on the target relation's full
+      identity: its key, its declared tenant_field and the scope column the
+      last hop pairs on (a through bridge's target_scope_key too), on every
+      backend. A key-only correlation returned other tenants' and scopes'
+      rows whenever target keys repeat across them. Such a retarget
+      correlates through EXISTS whatever its strategy; the comparison is
+      NULL-safe (IS NOT DISTINCT FROM on PostgreSQL, IS on SQLite, <=> on
+      MySQL/MariaDB, byte-exact there for text columns), so an unbound
+      retarget still returns target rows whose tenant column is NULL.
+      PostgreSQL and SQLite SQL changes only for retargets onto a relation
+      with a tenant_field or authored scope keys.
+    - Every statement the library sends to MariaDB is prefixed with
+      SET STATEMENT optimizer_switch='subquery_cache=off' FOR: MariaDB's
+      subquery cache keys a correlated subquery's outer references under
+      their collation and answered 'T7' with the result cached for 't7'.
+      The host's session is unchanged.
+    - The top-level eq/IN conjuncts of host-trusted scope on a text or
+      undeclared column compare exactly on MySQL/MariaDB even when the domain
+      declares no tenant_field: the required predicate (required_filters,
+      with_required_predicate, require_tenant_filter, a write context's
+      required filters) in reads and writes, and a command's scope predicate
+      and query-enforcement evidence in writes.
+    - A MySQL/MariaDB reference guard compares the referenced parent's tenant
+      column by the parent column's own declared type (carried on the guard
+      as tenant_type), exactly unless it is declared numeric. It was decided
+      by the written relation's tenant type, so an integer tenant on the
+      written table compared a text parent tenant under its collation: on
+      MariaDB (PAD SPACE) tenant 7 could reference a parent of tenant '7 '.
+    - Selecto::API::error_status answers invalid_connection (a MySQL/MariaDB
+      session that breaks the adapter's contract) with HTTP 500: it is host
+      misconfiguration, not a bad request, as in selecto-r and
+      selecto_haskell. README notes that a uuid tenant stored as CHAR(36)
+      compares case-sensitively on MySQL/MariaDB.
+    - SQL adapters drop constructor arguments with the _selecto_ prefix:
+      Mojo::Base copied them into the object, so a caller could preset
+      private per-call state such as _selecto_session_verified and skip the
+      MySQL/MariaDB session check.
+    - A MySQL/MariaDB tenant comparison written literal-first (a host
+      required predicate eq(literal('t1'), field('tenant_id'))) is exact too.
+      A tenant or site comparison that cannot be rendered exactly (a NULL or
+      non-scalar value, or an operand that is neither a literal nor a field)
+      is refused with unsupported_feature (reason inexact_tenant_comparison)
+      in reads and writes, instead of compiling under the column's collation.
+    - MySQL/MariaDB errors for a value a column cannot hold (1264, 1265,
+      1292, 1366, 1367, 1406, 1690) are database_data_violation (HTTP 422),
+      with no value, column or SQL in the message; an omitted NOT NULL
+      column without a default (1364) is database_not_null_violation. The
+      PostgreSQL mapping is unchanged.
+    - MySQL/MariaDB date formats write years 1-999 with four digits, as
+      PostgreSQL does (0001-02-03, not 1-02-03). A stored value PostgreSQL
+      cannot hold (year 0, a zero month or day, an impossible date, or an
+      instant shown past year 9999) is a typed query_error (sqlstate 22008,
+      datetime_field_overflow) instead of an untyped failure. Format zones
+      DateTime::TimeZone reads differently from PostgreSQL ('local',
+      'floating', 'Z' and offsets such as '+0500') are refused with
+      invalid_query.
+    - Every MySQL/MariaDB read, stream and write checks its session first, in
+      one round trip per call (a host can SET it at any time): a UTC time
+      zone ('UTC', '+00:00', 'Etc/UTC', or SYSTEM only when the server's
+      system zone is 'UTC' or '+00:00'; 'GMT' is refused, being also
+      Europe/London's winter abbreviation), utf8mb4 client, connection and
+      result character sets, a strict sql_mode, and a driver that returns
+      utf8mb4 text and DATETIME values unchanged. Otherwise the call is
+      refused with the new invalid_connection error (details.reason names
+      the setting) before anything runs.
+    - MySQL/MariaDB no longer infer an open host transaction from the
+      server's @@in_transaction: the driver's AutoCommit alone decides
+      between the write's own transaction and a savepoint. On MariaDB a write
+      on a server transaction opened outside the driver (a raw START
+      TRANSACTION with AutoCommit on) is refused with invalid_adapter
+      (reason transaction_outside_driver) instead of running in a savepoint;
+      MySQL cannot report one. Open host transactions with begin_work.
+    - A MySQL/MariaDB upsert whose savepointed INSERT is the deadlock victim
+      reports database_deadlock_detected (HTTP 503, retryable) again: the
+      server had already rolled back the whole transaction, and the failed
+      ROLLBACK TO SAVEPOINT replaced the typed error with an untyped one.
+    - MySQL/MariaDB RETURNING re-reads are locking reads (FOR UPDATE). Under
+      REPEATABLE READ a plain read returned the transaction's snapshot, so a
+      delete's before image, or the row of a no-op update or upsert, could be
+      older than the row the write locked.
+    - MySQL and MariaDB compare tenant and site identity exactly, as
+      PostgreSQL does (user decision 2026-10-14). Under the servers' default
+      collations a text tenant column compared case- and accent-insensitively
+      (and, under PAD SPACE collations, ignoring trailing spaces), so tenant
+      't1' read and wrote rows of 'T1' and 't1 '. Every comparison of a text
+      tenant, site or pinned column now adds a byte comparison of its utf8mb4
+      text, (col = ? AND CAST(CONVERT(col USING utf8mb4) AS BINARY) =
+      CAST(? AS BINARY)), with the value bound twice in text order (the
+      conversion makes ucs2, utf16, utf16le, utf32 and latin1 columns compare
+      with the utf8mb4 value rather than with their own bytes): engine and required tenant predicates on the
+      root, joined relations, members, retarget hops and rollup branches;
+      tenant pairs and authored scope keys in joins, related collections and
+      computed fields; member correlations on a tenant column; write
+      predicates, RETURNING re-reads, guarded-insert admission and its stored
+      row re-read, upsert target probes, graph children and reference guards.
+      A caller's eq/IN filter on a tenant column compares exactly too.
+      Numeric tenant columns, PostgreSQL, SQLite and the other dialects
+      compile exactly as before.
+    - MySQL and MariaDB upserts insert first inside a savepoint, so two
+      sessions on one new key no longer deadlock on a shared gap lock; a
+      duplicate on the declared target locks and updates its row, a duplicate
+      on any other unique key is database_unique_violation. An existing row
+      is found by a plain read first and locked directly, so racing updates
+      of one row do not deadlock. Server errors are
+      typed like PostgreSQL's (database_unique_violation,
+      database_foreign_key_violation, database_not_null_violation,
+      database_check_violation); a deadlock (1213) or lock-wait timeout (1205)
+      is the retryable database_deadlock_detected / database_lock_timeout,
+      answered with HTTP 503 by API::error_status. Upsert
+      admission, guarded-insert admission and RETURNING key locking refuse a
+      table that is not InnoDB (views and TEMPORARY tables, invisible in
+      information_schema.TABLES, too); plain inserts and bulk updates run
+      regardless. MariaDB LAG/LEAD with a default argument is refused.
+      Related-collection keyset cursors no longer lose rows on MySQL/MariaDB
+      (the null-safe rewrite swallowed an opening parenthesis).
+    - A refused tenant-scoped MySQL/MariaDB upsert (unsupported_scope_predicate)
+      is HTTP 501 from API::error_status in every runtime, not a 422.
+    - A filtered association (one with where) is a lookup, not a reference:
+      it picks one of the rows matching its owner key (a customer's option in
+      one group) rather than the row the key identifies. It no longer counts
+      as a declaration of its owner key's reference, so it neither contradicts
+      that key's association or foreign key nor gets a write guard of its own.
+    - A relationship whose child_key is the child's primary key and whose child
+      domain is tenant-bounded (tenant_field or writes.scope.tenant) may name
+      any parent_key under a tenant-bounded root: the parent holds its child's
+      id (as a truck holds its trailer's), so it binds at most one child, which
+      the child's tenant boundary keeps in reach. Without the child's tenant
+      boundary it is still refused (foreign_key_tenant_scope_undeclared).
+    - Encode JSON with Cpanel::JSON::XS (4.38 or later, now required) instead of
+      JSON::PP. Domain and predicate fingerprints and Canonical JSON v1 bodies
+      go through Selecto::CanonicalJSON and keep the bytes JSON::PP wrote,
+      including whole numbers held as floats (3, not 3.0). Integer-looking
+      floats of 1e16 and above, which JSON::PP wrote as strings, are now
+      refused by canonical_json as floats.
+    - Domain identity re-verification is opt-in (verify_domain_identity or
+      $Selecto::Engine::VERIFY_DOMAIN_IDENTITY) and runs once per outermost call.
+    - Add scalar engine with_tenant(value), write(), and action(name) as the
+      common native facade. Domain-owned tenant columns and trusted context
+      are inherited by reads, writes, actions, and transaction engines;
+      omitted insert tenant values remain bound SQL data. Two-column native
+      fluent writes preserve independent write scope through engine governance.
+      Scalar engine with_tenant now binds trusted read/write scope: migrate
+      read-only scalar attachment to with_read_context. Structured legacy
+      with_tenant contexts stay read-only and cannot be promoted into writes.
+      Existing scope/write_context constructors and Write->new stay supported.
+    - Keep computed query fields, including derived action-prerequisite columns,
+      out of write RETURNING all. Explicit computed projections refuse before
+      execution instead of targeting nonexistent physical columns.
+    - Support compound root primary keys in native domains, bounded writes,
+      PostgreSQL edit handles and exact row-action targets. Every component
+      is required and retained without JSON round-tripping. Encode Unicode
+      query/action fingerprint inputs as UTF-8 before hashing.
+    - Add native fluent write and domain-action helpers through
+      Selecto::Write->new($engine), with trusted omitted-tenant fills,
+      bound SQL previews, exact-count defaults and single-use execution.
+      Existing immutable Operation builders remain compatible; upsert masks
+      may narrow their assigned writable conflict fields.
+    - Add engine transaction callbacks and PostgreSQL opaque editable-row
+      results through return_for_update and select_for_update. Follow-up
+      exact-key updates and owned one-to-many inserts share the caller's
+      transaction; expired/forged references and unsupported result modes
+      refuse. Caught child failures still roll back the callback. Errors
+      after callback completion preserve unknown commit state and prohibit
+      automatic retry. See docs/fluent-writes.md for capability limits.
+    - MySQL and MariaDB support datetime_format as a selected value of the
+      outermost query. The stored value is selected with a marker and
+      formatted in Perl with DateTime::TimeZone (PostgreSQL gap/fold rules)
+      because CONVERT_TZ leaves pre-1970 and (MariaDB) post-2038 values
+      unconverted and drops DST after 2037. Formats in filters, grouping,
+      ordering, nested sources, set operands or rollups, and streamed
+      formatted statements, are refused with unsupported_feature.
+      utc_datetime columns must hold UTC in DATETIME (a TIMESTAMP column is
+      read through the session time zone).
+    - MySQL and MariaDB writes: unscoped upserts follow PostgreSQL ON
+      CONFLICT semantics without ON DUPLICATE KEY UPDATE (which resolves on
+      the primary key before the declared target and has no WHERE). In the
+      write transaction the declared target must be exactly a real unique
+      index (under the table's metadata lock); the row holding the target
+      values is locked (FOR UPDATE) and updated, or the row is inserted, so
+      any other unique collision fails as in PostgreSQL. Upserts carrying a
+      write scope (tenant, caller or required predicate) and bound graph
+      child upserts are refused with unsupported_scope_predicate.
+      RETURNING, generated keys and write graphs are emulated: update and
+      delete lock the keys their full condition selects (FOR UPDATE), the
+      write is confined to them, and rows are re-read by those keys and the
+      tenant conjuncts only (or by the inserted key / conflict target);
+      captured, written and re-read counts must agree or the write rolls
+      back. Broad writes are bounded with locking key probes, guarded
+      inserts are admitted against the column storage contract (strict
+      sql_mode, no triggers, column type and collation) and the stored row
+      is re-checked against the enforced predicate before commit. Updates
+      and upserts refuse a handle whose DSN disables
+      mariadb_client_found_rows. Query budgets set max_execution_time /
+      max_statement_time as literals (DBD::MariaDB quotes bound values).
+    - MySQL and MariaDB adapters gain the advanced read features, each gated
+      on the connected server version: CTEs and recursive CTEs, window
+      functions (rows and range frames), INTERSECT/EXCEPT, rollups (as
+      grouped UNION ALL branches with typed NULL dimensions, since MariaDB
+      has no GROUPING() and neither server has NULLS FIRST/LAST), LATERAL
+      joins (native on MySQL 8.0.14+; on MariaDB lowered to a derived table
+      with per-parent ROW_NUMBER, refusing grouped or aggregate children),
+      JSON_TABLE JSON and array rowsets, exact
+      jsonb-style JSON containment and typed array predicates (JSON_CONTAINS
+      also matches scalars inside nested arrays, so it is not used), JSON
+      text extraction, value expressions, ordered and per-parent bounded
+      related collections, and FULLTEXT boolean-mode text search for
+      co-domain lookups. The SQLite rollup emulation moved to
+      Selecto::SQL::RollupEmulation, shared with them.
+    - MySQL and MariaDB results order NULLs as PostgreSQL does: last
+      ascending and first descending. Every ORDER BY term (queries, set
+      operations, windows, rollups, related collections) gets a leading
+      (expression IS NULL) key, and related-collection cursors compare with
+      <=> so keyset pages stay consistent with that order. Previously both
+      servers sorted NULLs first ascending.
+    - SQLite batches may combine protected UPSERTs with ordinary inserts,
+      updates, deletes and upserts (and protected inserts) when each
+      protected candidate is proved independent of every other command on
+      its table, ported from the Elixir reference. The proof compares
+      arbiter keys, stored and final candidate rows, other UPSERTs' own
+      arbiters (the different-unique-key hazard), UPDATE/DELETE predicates
+      and key-moving updates through SQLite affinity and collation, in
+      both orders and both directions between protected candidates. Unknown
+      generated rowids, volatile defaults, same-table cleanup and anything
+      else unprovable refuse as required_data_rule_pending before DML.
+      Previously every such batch refused; stored UPDATE/DELETE deltas, a
+      protected insert beside an ordinary delta, and protected UPSERTs in
+      graphs still do.
+    - Document and pin that on a native DBD::SQLite handle every write
+      governed by stored-stage rules (insert, update and upsert, since the
+      protected UPSERT port) requires an open native transaction on the
+      adapter's connection. A host transaction_handler that runs the work
+      in autocommit, contrary to its documented contract, is refused with
+      required_data_rule_pending (native_transaction_required) before DML;
+      before the port such inserts and updates ran their candidate proof
+      and write non-atomically. Writes without stored rules and handlers
+      that open a transaction are unaffected.
+    - Protected SQLite UPSERT receipts are rechecked against the live
+      trusted write context at dispatch. The engine now opens the candidate
+      scope with its write context; projection refuses a request under a
+      different context and the dispatch recheck compares the receipt with
+      the running scope's context (a nested scope swaps it in and restores
+      it), refusing with required_data_rule_pending, reason
+      receipt_context_mismatch. Previously dispatch compared the receipt's
+      recorded context with itself, contrary to the docs.
+    - An empty UPSERT update mask compiles to DO NOTHING only on the
+      protected SQLite path (a SQLite engine whose domain has stored UPSERT
+      rules, dispatched with its private candidate receipt). Since the
+      protected UPSERT port every adapter accepted an empty mask; PostgreSQL,
+      DuckDB, MSSQL and unprotected SQLite engines refuse it again with
+      invalid_write, and their upsert actions with no updatable change with
+      invalid_action_plan. The HTTP API still requires a non-empty mask.
+    - SECURITY: a portable-compiled protected UPSERT, whose choice
+      membership is deferred to native branch projection, is refused with
+      compiled_upsert_mismatch when the executing engine's domain, trusted
+      context or stored UPSERT rules differ from the compiler's. Previously
+      an engine with no stored UPSERT rules returned before governance, so
+      the deferred membership was never checked (reproduced: a resolver
+      that rejected "forbidden" was never called and the row was stored
+      through execute_write, preview_write and execute_batch). The check
+      runs in governed_write, before any provider or DML.
+    - SECURITY: INPUT and ACTION_INPUT bindings whose rule or condition
+      reads another root path (value.compare_path) are re-tested, without
+      normalizers, against the fully normalized submission. Bindings run in
+      sorted-id order, so a confirmation binding could pass against a
+      related field before that field's own normalizer ran (reproduced:
+      confirm "A@X" passed eq ['email'] and email was stored as "a@x").
+      The recheck covers native writes, previews, portable compilation and
+      action plans, and refuses with data_rule_failed before DML. Bindings
+      reading only their own path keep their ordered semantics.
+    - SECURITY: a protected SQLite UPSERT refuses a connection with
+      PRAGMA read_uncommitted on (required_data_rule_pending, reason
+      read_uncommitted_isolation). On a shared cache such a connection
+      takes no table read locks: in a deferred transaction (caller-owned
+      BEGIN DEFERRED, or adapter-owned with
+      sqlite_use_immediate_transaction off) the candidate proof could read
+      a peer's uncommitted conflict row, validate the conflict branch
+      against it, and then, after the peer rolled back between the
+      dispatch recheck and the business DML, insert a row whose rules were
+      never checked (reproduced: a nonblank-extra rule admitted a NULL
+      extra). A peer committing in the same window turned a proved insert
+      into an unproved update. The scope, each projection and the dispatch
+      recheck read the pragma; the caller's transaction, savepoints and
+      pragma are left unchanged. A private connection with the pragma on
+      refuses too, as the adapter cannot tell a shared cache apart.
+      Default locking reads, shared or not, are unaffected.
+    - SECURITY, BREAKING: on a two-column domain under an engine tenant,
+      every write that sets site_id needs a host or required site pin
+      (lesson 47b). Once writes bind tenant_id only (47a), tenant 7 could
+      relabel its own row to tenant 8's site 7 and then read tenant 8's
+      site 7 rows through by-name site pairing (41c); at 47a this worked
+      through Engine writes, the public write route, batches, graph roots
+      and children. Now an insert, update, upsert, batch member, graph
+      root or child, owned-sync row, API write or action that sets site_id
+      is refused with missing_tenant_scope unless a positive top-level
+      eq/IN conjunct of the required predicate or a trusted write_context
+      required filter pins the allowed sites (host and required pins count
+      alike and are intersected; a pin set they leave empty is
+      tenant_mismatch); the value must be a literal inside the pin
+      (tenant_mismatch), also on update. An insert omitting site_id is
+      assigned the pin when exactly one site is pinned and refused
+      otherwise. A graph child tenanted on site_id is checked against the
+      root's pin intersected with its own, is never given site_id = engine
+      value, and its updates, deletes and owned-sync cleanup match only
+      rows inside a pin. Writes that do not set site_id are unaffected.
+      Previews refuse exactly what execution refuses. Host-visible: such
+      inserts now require a site pin.
+    - BEHAVIOUR, BREAKING: on a two-column domain (source.tenant_field
+      tenant_id, writes.scope.tenant site_id) the engine tenant means
+      tenant_id on writes too, as on reads (lesson 47a, reversing the
+      write half of 41a that 41c kept). Before, every write bound
+      site_id = engine value: with tenant 7 at sites 70 and 71 and tenant 8
+      at site 7, an engine tenant 7 update, delete, API write or graph root
+      changed tenant 8's site 7 row and could not reach tenant 7's own
+      rows, inserts were assigned site_id = 7, and a graph child tenanted
+      on site_id was bound site_id = 7. Now writes bind tenant_id = engine
+      tenant (lesson 47's rules), and site_id is never bound to the engine
+      value: a host trusted-scope (write_context required_filters) or
+      required predicate conjunct on site_id pins it, and a caller filter
+      on it only narrows. A writes.scope.tenant on site_id still requires
+      a trusted tenant. Reference guards pairing with site_id take the
+      pinned set (refused with missing_tenant_scope without one), stored
+      child candidates of data rules are read under the same binding, and
+      the portable foreign-key guard description pairs the context tenant
+      with tenant_id. Host-visible: an engine tenant's writes on such a
+      domain now touch the rows of that tenant_id at any site.
+    - SECURITY, BREAKING: a trusted engine tenant limits every write of a
+      domain that declares source.tenant_field, with or without
+      writes.scope.tenant (lesson 47). Before, such a domain without
+      writes.scope.tenant was written unbounded: under engine tenant 7 an
+      update or delete with a required or host (write_context
+      required_filters) tenant_id = 8, a tenant_id IN (7, 8), or only a
+      caller filter id = 2 changed tenant 8's rows, through Engine writes,
+      the public API write route and graph roots. Now updates, deletes,
+      upserts, batch members, graph roots and children, owned-sync
+      cleanup, actions and query-enforced writes AND tenant_id = 7 into
+      their scope; inserts and upserts carry it (filled when absent,
+      tenant_mismatch when another value is given or an update re-tags a
+      row); an upsert must resolve conflicts on a target including
+      tenant_id (tenant_scope_conflict_target). A required, host, caller
+      or query-evidence predicate whose top-level tenant_id conjunct
+      excludes the engine tenant is refused with tenant_mismatch before
+      any DML, also on a domain whose writes.scope.tenant names that column
+      (it matched no row before); an IN list admitting it is intersected.
+      Host-visible: the public write handler accepts an engine tenant as
+      the write boundary of such a domain (it was missing_tenant_scope),
+      and an engine-tenant write that used to reach other tenants' rows
+      now affects only its own. Every update of a root tenant column,
+      the writes.scope.tenant column included, must keep a value its
+      required and host conjuncts admit. A graph child binds the engine
+      tenant only onto a column pairing with the root's. A domain whose
+      writes.scope.tenant names the tenant column is otherwise unchanged,
+      and a public write with no tenant boundary is still refused with
+      missing_tenant_scope.
+    - SECURITY: a plain join path past an untenanted hop keeps the root's
+      admitted tenant set (lesson 41f). root (tenant_id) -> shared bin ->
+      tenant notes, with the root bounded only by a required predicate
+      (tenant_id IN (7, 8) or = 7, no engine tenant), paired tenants per
+      adjacent edge only, so the notes went unbounded: bin.notes.body,
+      a through join's labels, a filter on bin.notes.body, the public
+      query handler and API route (200), and a retarget to the bin
+      returned tenant 9's notes. The lesson 41b change binds such a
+      relation to the root's admitted set (IN (7, 8)) as well as to any
+      engine tenant, and refuses it with missing_tenant_scope when the
+      root is bounded by a predicate without a tenant set; this pins the
+      join, through-join, filter, handler, API and retarget forms. A root
+      with no boundary still reads every tenant.
+    - SECURITY: on a two-column root a shared hop that merely stores the
+      write-scope column is not a by-name pairing source (lesson 41e).
+      customers (tenant 7, site 5) -> shared bins (a bin at site 7) ->
+      lines tenanted on site_id returned tenant 8's site 7 line through the
+      join path (Engine reads and the public query handler), a filter on
+      bin.lines.code, retarget('bin.lines'), retarget('bin') plus
+      lines.code or a lines filter, and a collection after
+      retarget('bin'): under an engine tenant the line was bound
+      lines.site_id = 7 (the engine value), and under a required tenant_id
+      predicate alone it was unbounded, also when the shared hop authored
+      a site_id scope pair. A site_id relation now pairs only with a hop
+      chained back to the root's tenant-bound rows, or is refused with
+      missing_tenant_scope (the lesson 41b change); this pins every access
+      form. Site rows paired with the root itself are unchanged.
+    - SECURITY: every hop of a two-column domain pairs tenant columns by
+      name, and an untenanted retarget hop carries the root's admitted
+      tenant set (lesson 41b). On a two-column root (source.tenant_field
+      tenant_id, writes.scope.tenant site_id) only root hops paired by
+      name: nested hops and the domain a retarget rebuilds at its target
+      lost the root's write scope and paired positionally, so once reads
+      bind tenant_id (41c) an accounts hop paired accounts.tenant_id =
+      lines.site_id (a tenant 7 read of account.lines.code, or of
+      retarget('account') + lines.code, returned site 7's line) and a lines
+      hop paired lines.site_id = notes.tenant_id (lines.notes.body
+      returned tenant 5's note at site 5). Every hop
+      now pairs a tenant column only with a same-named tenant column of a
+      hop chained to the root; a tenant_id relation reached otherwise is
+      bound to the engine tenant or the root's admitted set, and a site_id
+      relation reached otherwise is refused with missing_tenant_scope. A
+      retarget target carries each root conjunct only onto its same-named
+      column; a site_id target chained to the root by name is admitted on
+      the retarget context's bound. And under a required predicate such
+      as tenant_id IN (7, 8) with no engine tenant, a retarget to a shared
+      hop (retarget('bin')) let later tenant joins, filters, collections
+      and inline sources read every tenant's notes; the rebuilt domain now
+      carries the root's admitted set onto them (as IN), and refuses them
+      with missing_tenant_scope when the root's boundary has no tenant set.
+    - SECURITY: every Engine read honours the trusted engine tenant
+      (lesson 43). Probed under engine tenant 7 with tenant 8 rows present,
+      on SQLite and PostgreSQL: all, compile, stream, projection_sum,
+      export scalars, BoundedQuery, canned pages, the public query handler,
+      joined fields and filters, retargets (IN and EXISTS), related
+      collections, query members, inline subqueries and laterals, lateral
+      lookups, query library segments and with_limits copies all bound the
+      root of a tenant_field domain to the engine tenant already, and a
+      required predicate agreeing with it or wider (tenant_id IN (7, 8))
+      returned only tenant 7's rows. A required tenant condition that
+      excludes the engine tenant (required_filters, a required predicate
+      or require_tenant_filter) was refused only as tenant_scope_ambiguous;
+      it is now refused with tenant_mismatch before any read path runs,
+      and require_tenant_filter refuses it when it is attached.
+    - BEHAVIOUR: on a two-column root (source.tenant_field tenant_id,
+      writes.scope.tenant site_id) the engine tenant bounds reads on the
+      tenant_field column only (lesson 41c, reversing that part of 41a).
+      The root binds tenant_id to the engine tenant, a relation whose tenant
+      column is tenant_id pairs s0.tenant_id and so carries that bound, and
+      a relation whose tenant column is site_id is never bound to the
+      engine value: it pairs s0.site_id by name with the tenant-bound root
+      rows, returning the caller's own site rows. Before (since 41a) a
+      site 7 engine read bound site_id = 7 on reads and ignored tenant_id,
+      so a tenant 7 engine read returned another tenant's rows whose
+      site_id was 7. A required predicate on tenant_id is intersected with
+      the engine tenant, and one excluding it is refused. A query member,
+      inline source or retarget target over a site_id relation carries
+      only a site_id bound of the root's required predicate, so with none
+      it is refused with missing_tenant_scope (also when the domain is
+      parsed: the write scope is now known before members are validated,
+      where it had paired positionally). By-name pairing and the
+      invalid_domain refusal of a target tenant column matching neither
+      root column are kept. Writes still bound the write-scope column
+      until lesson 47a, which binds tenant_id on writes too.
+    - SECURITY: the engine tenant survives domain rebuilds (lesson 42a).
+      Multi-hop joins and retargets from a shared root through a shared
+      middle hop (products -> categories -> notes), engine copies and
+      parsed-domain rebuilds were already bounded and are now pinned by
+      tests. A directly constructed domain whose association records its
+      target's tenant field lost it through as_contract, so the rebuilt
+      domain joined every tenant's rows; the portable projection now keeps
+      the target schema's tenant_field.
+    - SECURITY: on a two-column root (writes.scope.tenant on one column,
+      source.tenant_field on another) reads pair tenant columns by name,
+      never by position (lesson 41a). A join to a target whose tenant_field
+      names the write-scope column (site_id) inferred
+      s0.tenant_id = target.site_id and the lesson 41 pairing repeated it;
+      it now pairs s0.site_id = target.site_id, and a target tenant column
+      matching neither root column is refused with invalid_domain (details
+      code foreign_key_tenant_scope_undeclared). The engine tenant bounds
+      only the write-scope column on reads too, as on writes: before, a
+      read bound tenant_field to the engine tenant, so a site 7 engine read
+      the rows whose tenant_id was 7 (or refused with
+      tenant_scope_ambiguous beside a required tenant_id predicate). Query
+      members, inline sources and retarget targets carry the root column
+      of their own tenant column's name.
+    - SECURITY: every query source over a tenant-scoped relation carries the
+      root's trusted tenant boundary or is refused with missing_tenant_scope
+      (lesson 39). Inline sources built with with_cte, with_recursive_cte,
+      subquery_join and lateral_join over a domain declaring tenant_field
+      ran unbounded under a root bounded by the engine tenant or only by its
+      required predicate (required_filters or with_required_predicate): a
+      tenant 7 read summed tenant 8's orders through an inline CTE, subquery
+      or lateral. They now receive the root's tenant conditions re-expressed
+      on their tenant field, as declared query members already did, and a
+      scoped root whose predicate has no tenant condition refuses them. A
+      root relation without a tenant field of its own now applies the
+      trusted engine tenant to every tenant-scoped declared member, inline
+      source and retarget target; before, those read every tenant's rows.
+      Sources already bounded by a same-tenant configured engine are
+      unchanged, and roots with no boundary keep reading every tenant.
+    - SECURITY: under a trusted engine tenant, a read from a shared root
+      (one that declares no tenant_field) binds every joined or through
+      relation that declares tenant_field to the engine tenant, in the join
+      condition, so a left join keeps the shared row without another
+      tenant's (lesson 42). Before, the engine tenant bounded only domains
+      that themselves declare tenant_field, so a products root under tenant
+      7 returned tenant 8's orders.total through Engine reads, lateral
+      lookups and the public query route (200), and such a field was a
+      filter oracle. A tenant-scoped parent keeps carrying the bound through
+      its tenant pair (lesson 41).
+    - SECURITY: a join between two relations that both declare tenant_field
+      pairs their tenant fields even when the association authors scope
+      keys on another column (lesson 41). Before, an authored pair such as
+      region_id -> region_id replaced the inferred tenant pair, and through
+      associations never paired tenants, so under a root bounded by the
+      engine tenant or only by its required predicate a tenant 7 read of
+      `select id, account.name` (or a through association's field) returned
+      tenant 8's row sharing tenant 7's region or bridge row, through Engine
+      reads, lateral lookups and the public query route (200), and such a
+      field was a filter oracle. Authored pairs are kept as well. A target
+      whose declared tenant_field is not one of its fields is refused with
+      invalid_domain (details code foreign_key_tenant_scope_undeclared).
+    - SECURITY (low): a choice source or co-domain declaration that would
+      return a redacted (or internal or hidden) field is refused when the
+      engine is built (lesson 37), with invalid_domain and details code
+      choice_source_redacted_field (a choice source's value_source,
+      caption_source or description_source, a field reference's
+      value_source, caption_source or caption_field, or value/label fields of
+      a choice domain this contract describes) or co_domain_redacted_field (a
+      co-domain targeting this domain). Before, a host resolver was handed a
+      choice source naming a redacted field such as owners.ssn as its
+      caption or description. Co-domain lookups into another domain already
+      refused its non-public fields at lookup time (invalid_co_domain); that
+      is now pinned by a test.
+    - SECURITY: context-sourced foreign keys (source ['context', k]) are
+      paired like input foreign keys (item 34). A foreign key that records
+      no tenancy of its own no longer drops the tenancy an association on
+      the same owner key records: before, its context-owned existence-only
+      exemption let a context person_id reference another tenant's person
+      although the association paired person.tenant_id with the root's
+      tenant_id. The exemption now applies only when nothing declares the
+      target's tenancy. On a two-column root the guard takes the set of the
+      root column it pairs with (lesson 29e), so the site value never guards
+      a tenant_id column, and the portable description from
+      Selecto::Write::Context no longer pairs the trusted context tenant
+      (the write-scope column's) with another tenant column.
+    - SECURITY: graph children and owned-sync rows are confined to the root's
+      admitted tenants exactly as the root is (lesson 33). Under a root
+      bounded only by its required predicate (no engine tenant), a child
+      that stores the root's tenant column could be inserted or re-tagged
+      with another tenant's tenant_id, update or delete a tenant 8 row
+      under tenant 7's parent, and owned-sync cleanup deleted such rows.
+      Now, unless the child declares its own writes.scope.tenant, each root
+      tenant column it stores is ANDed into its UPDATE and DELETE scope (and
+      into owned-sync cleanup), an insert must land inside the set (the
+      adapter admits insert candidates against the scope), an assignment to
+      the column must be one of the set's literal values (tenant_mismatch,
+      before any DML), and an upsert is refused
+      (query_enforcement_unsupported_operation), as on the root.
+    - SECURITY: under a tenant-bounded root (an engine tenant, a
+      tenant_field, writes.scope.tenant or a required predicate) a graph or
+      sync relationship's parent_key must be the parent's primary key or
+      exactly a single-column upsert conflict target the parent declares
+      (lesson 36), at every hop of nested relationship domains. Otherwise
+      the engine is refused when it is built with invalid_domain (details
+      code foreign_key_tenant_scope_undeclared, relationship, parent_key).
+      A composite conflict target or a sync identity does not count.
+      Previously, on PostgreSQL, parts bound to their item by a code two
+      tenants' items shared were reachable through tenant 7's item: a
+      two-hop graph updated tenant 8's part. (SQLite already refused it
+      through its native ownership storage proof.)
+    - SECURITY: on a two-column root (writes.scope.tenant on one column,
+      source.tenant_field on another) reference guards took the write-scope
+      tenant set whatever root column they paired with. An association
+      authored as source_scope_key tenant_id -> target_scope_key site_id was
+      guarded as warehouses.site_id IN <site set>, accepting another
+      tenant's row and refusing the right one; a target column named after
+      no root column (tenant_id -> org_id) accepted a row tagged with the
+      site value. Each root column now has its own admitted set (the engine
+      tenant for the write-scope column, the required predicate's eq/in
+      conjuncts for the tenant_field column) and a guard takes the set of
+      the column it pairs with (lesson 29e): an authored pair takes its
+      source_scope_key's set, a target storing both root columns is guarded
+      on each by name with its own set, and any other tenant column pairs
+      by name. Scope keys that disagree with the target's tenant_field, a
+      column two pairings would give different sets (29j), an authored pair
+      crossing names on a both-columns target, and a tenant column pairing
+      with no root column are refused with invalid_domain
+      (foreign_key_tenant_scope_undeclared) when the engine is built; a
+      reference whose paired column no set bounds fails with
+      missing_tenant_scope.
+    - SECURITY/correctness (PostgreSQL): read guards (bounded streams,
+      savepoint query budgets, direct bounded reads) and managed writes no
+      longer start on a connection whose transaction they cannot account
+      for. A pending asynchronous host result (pg_async before pg_result),
+      a busy connection, an already aborted host transaction or an unknown
+      state is refused with the new typed error transaction_state_unsafe
+      (details state: active, inerror or unknown) before any statement is
+      sent. Previously, with a pending async INSERT inside a raw BEGIN, a
+      bounded stream or managed write treated the connection as idle and its
+      rollback discarded the host's transaction (its earlier INSERT and the
+      pending one), so the host's next INSERT autocommitted; inside an
+      aborted transaction a savepoint budget failed with
+      query_budget_unavailable and poisoned the handle for later budgets.
+    - SECURITY/correctness (PostgreSQL): a bounded stream rolls back only
+      what it can prove is its own. When the host aborted the transaction
+      while a stream was open inside it (a failing statement, or a failing
+      async query), the stream's next FETCH or close rolled back to its
+      savepoint and so silently un-aborted the host's transaction: the
+      host's later INSERT and COMMIT went through. When the host took the
+      connection over during a stream in its own transaction (ROLLBACK,
+      BEGIN, INSERT), the stream's close rolled back the host's new
+      transaction. The stream now marks its own transaction
+      (SET LOCAL selecto.guard) and checks the marker before rolling back,
+      rolls back its savepoint only after its own statement failed, and
+      otherwise fails with transaction_state_unsafe, leaving the connection
+      untouched for the host. Healthy streams, and a stream's own failures
+      (a timeout, a decode error), behave as before.
+    - SECURITY/correctness: ending a stream or budget never hides a cleanup
+      that left the host's transaction aborted (PostgreSQL's COMMIT of an
+      aborted transaction silently rolls back). When a stream's own failure
+      cannot be undone, next raises stream_cleanup_failed instead of the
+      original error, close raises as before, and an abandoned stream or
+      budget whose cleanup failed or was left to the host now warns from
+      DESTROY; the aborted transaction, the poisoned handle and the refusal
+      of every later guard keep the state detectable.
+    - Every Selecto savepoint (writes, bounded write probes, typed insert
+      admission, budgets, streams) now has a process-unique name
+      (selecto_write_<pid>_<n> instead of selecto_write_<depth>), so a
+      cleanup can only ever roll back to its own savepoint. A savepoint
+      budget counts as begun only once its savepoint exists.
+    - SECURITY: an association source_scope_key that is not a root tenant
+      column (for example region_id -> region_id) no longer becomes the
+      reference's tenant guard. It was guarded as
+      target.region_id IN <tenant set>, which admitted another tenant's row
+      in the same region. On a single-column root such a reference is now
+      guarded by the target schema's tenant_field and refused with
+      invalid_domain (foreign_key_tenant_scope_undeclared) when the target
+      declares none; on a two-column root it is refused outright. Both
+      refusals happen at engine construction, before any query or write.
+    - SECURITY: a declared foreign key and the associations on the same
+      owner key must describe one reference. When they name different
+      relations, or pair a target tenant column with a different tenant
+      column (or a different root tenant column), the domain is refused with
+      invalid_domain (code foreign_key_tenant_scope_undeclared) when the
+      engine is built and on every write, before any query or DML.
+      Previously the declared foreign key silently won and the
+      association's tenant guard was skipped, so a write could reference
+      another tenant's row. An agreeing foreign key and association are
+      guarded once, and an explicit shared foreign key
+      (references.tenant_field false) remains usable.
+    - BREAKING: public API writes (Selecto::API::EngineHandler) are confined
+      to each operation's authored grants. Without an expected_cardinality
+      grant an operation permits exactly one row: bulk => 1 is still
+      required for update/delete counts above one but no longer admits them
+      by itself. Without a returning grant (a field list, true or "all") no
+      fields may be returned. Either request is refused with
+      invalid_api_write during admission, before any statement runs. Domain
+      documents that relied on bulk alone, or on ungranted returning, must
+      add expected_cardinality (for example "many" or ["between", 1, 50])
+      and returning grants to their writes.operations. Request limits,
+      tenant and scope checks, and native/portable write policy are
+      unchanged.
+    - Selecto::BoundedQuery->prepare_scalar_column joins two prepared bundles
+      through the adapter's scalar_column_statement and carries their read
+      policy evidence, so a canned page that carries its total on its rows
+      still runs on an engine with explicit read tenant policy.
+    - Date shortcuts are measured from the database's current date: without
+      an explicit today, Selecto::DateShortcut->expression returns the new
+      date_shortcut expression, which PostgreSQL and DuckDB compile against
+      CURRENT_DATE (or today in the query's use_timezone), so the session
+      time zone decides when a day begins. Other adapters still bind the
+      server's date. An epoch column now compares as an instant. Shortcut
+      bounds are defined once, as terms(), for Perl and SQL alike.
+    - Bounded child collections accept a formatted child date
+      ({key, expression => datetime_format(...)}); other child expressions
+      are still refused.
+    - A canned text control with multiple => 1 takes up to 100 values
+      separated by whitespace, commas or semicolons (such as pasted VINs)
+      and matches a row that starts with any of them.
+    - datetime_format takes a timezone option, which shows that one value in
+      an IANA zone without localizing the query's filters, and two display
+      formats: us_date (10/08/2026) and us_datetime (10/08/2026 2:30 PM),
+      on PostgreSQL and DuckDB. A day_minute format (2026-10-08 14:30)
+      sorts in date order, so it is also offered for grouping.
+    - Canned detail views may select an aliased datetime_format of an
+      entity-grain field, and related collections may format a child date
+      with {key, expression}. The formatted field joins the detail GROUP BY.
+    - Faster API query responses, byte for byte the same. EngineHandler->query
+      checks the adapter result (its traversal limits and every cell's
+      bytes) and the response's exact JSON bytes
+      (Selecto::API::ResponsePolicy->check_json) in one pass each, without a
+      method call per cell, and Selecto::API->request skips its second walk
+      of the result (public_data's traversal check) and canonical_json's
+      per-value validation when the value cannot fail them. Each limit
+      compares a running total that only grows, so the single pass decides
+      exactly what the previous checks decided; a result or response that
+      reaches a limit, or holds anything the single pass does not take
+      (blessed or unsupported references, cycles, and in check_json numbers
+      that are not integers), goes through the previous checks, which raise
+      the same error. Limits, defaults, statuses and response bytes are
+      unchanged. 100,000 rows of 10 columns (median of 5 interleaved runs,
+      RAM PostgreSQL): EngineHandler->query with a Mojo::JSON encode 4.81 s
+      to 1.44 s (arrays) and 6.87 s to 2.09 s (objects); Selecto::API->request
+      11.1 s to 2.9 s; peak RSS unchanged. A 50-row objects page: 4.5 to 1.9 ms
+      (handler), 9.0 to 3.1 ms (Selecto::API).
+    - Breaking: Selecto::PostgreSQL returns the values DBD::Pg fetched,
+      untouched, unless canonical values are asked for. Engine::all,
+      Engine::stream (bounded too) and Engine::projection_sum take
+      canonical_values => 1 per call, and the adapter takes
+      canonical_values => 1 (default 0) to make them the default again
+      (a call's canonical_values => 0 then asks for driver values). What a
+      host that does not ask sees, per PostgreSQL type (DBD::Pg 3): numeric
+      keeps its scale ("10.500", not "10.5"); real and
+      double precision are Perl numbers, so JSON numbers (1.5, 1e+20),
+      instead of their Perl strings ("1.5", "1e+20", "10000000000",
+      "Inf"); timestamp and timestamptz keep the server text
+      ("2024-01-01 10:00:00+00" or "2024-01-01 04:00:00-06" under the
+      session TimeZone, not "2024-01-01T10:00:00"); integers and booleans
+      (already numbers and 1/0), text, date, json text and the rest are
+      unchanged. To keep the old behaviour:
+          Selecto->adapter(postgresql => (dbh => $dbh, canonical_values => 1));
+      or $engine->all($query, canonical_values => 1). The API query and
+      resource handlers, canned pages, co-domain lookups and export_scalars
+      ask for canonical values, so their responses are unchanged. Other
+      adapters always return canonical values. A Selecto::PostgreSQL
+      subclass that overrides execute_query is not sent the option unless
+      its supports('canonical_values') is true.
+    - Canonical values are decoded in Perl by default, as before: a host
+      that asks for them gets exactly the values 0.2.2 returned, and dates
+      and timestamps follow the session DateStyle (a non-ISO DateStyle such
+      as SQL, Postgres or German shows through, as it always has). Integer
+      columns that DBD::Pg fetched as Perl numbers skip int() on Perl 5.36
+      and newer.
+    - Opt-in canonical_sql => 1 (default 0) has PostgreSQL format the
+      canonical values of fields declared decimal (PostgreSQL 13+), date,
+      naive_datetime and utc_datetime in the outermost select list: trim_scale
+      for numeric, and TO_CHAR for dates and timestamps, in the session
+      TimeZone, with the offset from TO_CHAR's OF unless it is +00. Its
+      dates and timestamps are always the ISO form in the session time zone,
+      whatever the DateStyle; under ISO they equal the Perl decode (BC,
+      infinities, fractions and historic offsets with seconds included). The
+      declared type chooses the columns and the column's PostgreSQL type
+      (CASE on pg_typeof) the formatter, so a mis-declared temporal kind or a
+      date kept as text is unchanged. Columns PostgreSQL does not format
+      (integers, floats, booleans, aggregates and other expressions,
+      computed fields, ordered rollups, set operations) are decoded in Perl.
+      A float or integer column declared decimal comes out as its
+      PostgreSQL text ("1e+20", "Infinity"; "7" as a string). ORDER BY and
+      GROUP BY keep the underlying expressions. Streams, bounded streams and
+      BoundedQuery format the same columns (so a bounded result's cell-size
+      guard measures the canonical text). It is off by default because the
+      Perl decode measured faster at every result size (100,000 rows: 154 ms
+      in Perl, 213 ms in SQL), and PostgreSQL parses and plans the longer
+      statement on every call without the statement cache (roughly 30-50
+      microseconds per formatted datetime column; point reads were 100-150
+      microseconds slower). With canonical_sql off, compile records nothing
+      for it.
+    - getResource takes an optional date_format query parameter (iso8601,
+      the default and the previous output; rfc3339_millis; epoch_seconds;
+      epoch_milliseconds) that formats every temporal field in UTC,
+      compiled into the SQL through datetime_format. Under the non-default
+      formats a date is midnight UTC and a naive datetime is UTC wall time;
+      epochs round down; null stays null. Any other value is
+      invalid_api_query with details {parameter => 'date_format'} (public
+      error details may now carry parameter). Documented in the OpenAPI
+      document (an enum), Selecto::API and Selecto::API::EngineHandler;
+      EngineHandler->resource_date_formats lists the values.
+    - Govern individual protected SQLite UPSERTs against their actual native
+      conflict branch, exact update mask, literal defaults and transaction-bound
+      private receipts. Compile empty masks as DO NOTHING while retaining caller
+      cardinality. Resolve choices from the final canonical persisted candidate.
+      Refuse UPSERTs whose TRANSACTION or EVIDENCE normalizers would change a
+      persisted value, since their rules would test a value that is never stored.
+    - Add bounded value.compare_path rules with absolute root dependencies,
+      exact related-value comparisons and unconditional resource preflight.
+    - Preserve native integer, unsigned integer, floating and authored text
+      identity through bounded rule/policy copies, including canonical domain
+      parsing and returned subjects. Admit literal opening brackets in bounded
+      ASCII character classes while refusing POSIX/intersection syntax.
+    - Preserve rule, validator and action scalar identity through domain
+      composition, overlay DSL construction and action planning/serialization,
+      including submitted JSON and declared action literals/defaults.
+    - Compile sealed portable operations through trusted tenant/context fills,
+      native foreign-key guards, required/captured query predicates and SQLite
+      typed insert admission. Preserve nested generated-key ownership and named
+      atomic batches across explicitly configured domains. Keep internal graph
+      identity keys separate from public returning ceilings. Refuse authored
+      document action policies until their full native mutation path exists.
+    - Verify the complete six portable write models through production APIs,
+      and expose genuine private planned-operation authorization/execution.
+    - Validate the complete bounded portable write contract and expose sealed
+      authored operation snapshots. Keep declarations separate from grants.
+    - Preflight versioned native write capabilities before dispatch, preserving
+      requested returning, generated bindings, transactions and atomic graphs.
+      Exercise the complete 30-state capability safety model.
+    - Enforce explicit returning/cardinality limits, required insert fields,
+      protected upsert fields and atomic write-once guards. Check cardinality
+      ranges before commit and retain caller-owned transaction/savepoint work.
+    - Add complete bounded choice-source metadata validation and public choice
+      binding/request/options APIs with explicit trusted host providers and
+      sealed native membership/options results. Preserve actual join target
+      authority, full aliases and unique established nested shorthand.
+    - Add bounded plain-domain schema validation for relation metadata, query
+      libraries, event payload schemas and consumer registry envelopes. Cover
+      imported native required filters when caller queries add disjunctions.
+    - Add public metadata domain identity APIs and native identity observations.
+    - Publish stable provider contract snapshots and verify consumer fields,
+      filters, query members, versions, fingerprints, and required scopes.
+      Snapshot diffs distinguish additive surfaces from breaking removals,
+      result type changes, and added required scopes. A public exhaustive
+      32-state compatibility model checks two independent invariants.
+    - Implement the complete 27-operator DataRules v1 AST and six text
+      normalizers with exact arithmetic, bounded ASCII patterns, shared
+      resource budgets and unconditional advisory/condition resource errors.
+    - Preserve submitted INPUT values separately from physical SQLite
+      candidates; consumed generated fields remain pending across logical
+      branches and conditions. Batch inserts preflight all rules before DML.
+    - Prove native graph/owned-set ownership with actual key affinities,
+      collations, complete single-key uniqueness and every present FK group.
+      Protected candidate storage refuses generated columns and automatic
+      foreign-key updates outside the admitted plan.
+    - Govern native SQLite stored candidates and complete child collections inside
+      their write transaction, applying required rules and normalizers before writes.
+    - Execute owned one-root action collection patches with policy-scoped read
+      anchors, exact returned client identities, plan revalidation, and atomic rollback.
+    - SQLite write graphs support explicitly declared owned-set reconciliation.
+      Cleanup uses actual RETURNING identities, whole composite keys and
+      independently derived parent, child tenant and required scopes. Empty
+      sets, exact generated identities, duplicate refusal and late rollback
+      are verified with native in-memory SQLite. Canonical required_filters
+      now guard both reads and writes, including nested domains.
+    - SQLite supports typed values, JSON extraction and recursive typed JSON
+      containment, JSON/array rowsets, array predicates, UTC calendar formats
+      and buckets, FTS5 predicates/ranking, schema metadata and query plans.
+      Version gates compare full tuples; CTEs require 3.8.3, windows 3.28.0,
+      and bounded materialization/RETURNING 3.35.0. Offset-only paging uses
+      LIMIT -1. Governed query/stream execution rejects writes and preserves
+      caller-owned query_only and raw/DBI transactions; trusted tooling has
+      an explicit execute_query_unsafe escape.
+    - SQLite ordered/bounded related collections retain boolean/JSON types,
+      child/bridge policies and tenant guards. Limits/cursors and API subtables
+      execute with stable ordering and whole-response overflow refusal.
+    - Canonical direct associations infer tenant equality from both declared
+      relation tenant fields, including nested edges, correlated collections,
+      computed EXISTS and PostgreSQL lateral lookups. Explicit complete pairs
+      retain precedence; either partial pair is invalid_domain. Tenantless
+      targets, legacy explicit scope and through contracts retain their policy.
+    - Explicit hidden column metadata now withholds the field from every
+      public surface using Domain::field_is_public, matching internal and
+      redacted fields. API query roles and named routes refuse hidden_field
+      (403), while trusted Engine reads remain available.
+    - Public API queries enforce explicit filterable/sortable field roles on
+      direct intent and named query-library routes, with invalid_field (422).
+      Optional bounded group_by enforces public/groupable fields and refuses
+      nongrouped selections or orderings before database execution.
+    - Public API query pages publish has_more from one extra fetched row and
+      return at most the requested limit. Zero-sized pages fetch no rows.
+    - Opt-in PostgreSQL statement cache. Selecto::PostgreSQL takes
+      statement_cache (default 0) and statement_cache_size (default 256).
+      When on, execute_query and executed writes reuse one statement handle
+      per SQL text and connection (kept with prepare_cached under a private
+      attribute, so it is freed with the handle), and DBD::Pg runs them as
+      named server-side statements. Least recently used handles beyond the
+      bound are deallocated, only right after a statement succeeded. A lost
+      statement (26000) or changed result type (0A000) is prepared again
+      once outside a transaction; inside one the original error and
+      SQLSTATE stand. New Selecto::PostgreSQL::StatementCache (forget,
+      count). Unchanged with it off (the default): every call prepares a new
+      handle as before. Streams, insert admission and bounded-write probes
+      always prepare afresh. Not for transaction-mode poolers before
+      PgBouncer 1.21.
+    - Each domain action with preconditions or a transition gets a boolean
+      can_<action> column, true when the row meets them, with Yes/No filter
+      choices, so the API and Explorer can show and filter the rows an
+      action could run on. Actions opt out with prerequisite_column false.
+      Domain::without_action_prerequisites removes the columns of actions a
+      caller cannot see, and Selecto::Action->prerequisites returns the
+      guards without planning a target.
+    - Selecto::API serves GET .../resources/{id} (getResource) when constructed
+      with resources => 1; a resource's aggregate_version is its ETag, and
+      resource_not_found maps to 404.
+    - Selecto::API::EngineHandler reads one resource by primary key with
+      resource(), and publishes a virtual, read-only aggregate_version field
+      through an optional host versioner. Resources and queries return it only
+      when it is requested.
+    - API subtables may be ordered by an internal child primary key. The key
+      only orders the bounded collection and is never returned.
+    - Trusted adapters may admit native flat array parameters under finite
+      bind-slot, element and conservative wire-byte budgets. Other adapters
+      retain scalar-only parameter admission.
+    - Query compilation admits Selecto::Query subclasses used by typed SQL
+      pattern builders while retaining depth, size, cycle and reference checks.
+    - Native adapters without a DBI handle keep normalized query_error
+      responses when their state is locked. SQLSTATE inspection now checks
+      whether a handle exists before reading it.
     - Database failures keep the driver's SQLSTATE. A query_error from
       normalize_error now carries details.sqlstate and details.category
       (unique_violation, foreign_key_violation, not_null_violation,

@@ -12,6 +12,7 @@ my @PUBLIC_FORMATS = (
     {id => 'day',           label => 'Day'},
     {id => 'time',          label => 'Time'},
     {id => 'day_hour',      label => 'Day + Hour'},
+    {id => 'day_minute',    label => 'Day + Minute'},
     {id => 'week',          label => 'Week'},
     {id => 'iso_week',      label => 'ISO Week'},
     {id => 'iso_week_date', label => 'ISO Week Date'},
@@ -25,6 +26,9 @@ my @PUBLIC_FORMATS = (
     {id => 'day_of_year',   label => 'Day of Year'},
     {id => 'hour',          label => 'Hour of Day'},
     {id => 'timezone_offset', label => 'Timezone Offset'},
+    # Display formats: they do not sort in date order, so are not for grouping.
+    {id => 'us_date',       label => 'US Date (MM/DD/YYYY)', display => 1},
+    {id => 'us_datetime',   label => 'US Date and Time', display => 1},
 );
 my %PUBLIC = map { $_->{id} => 1 } @PUBLIC_FORMATS;
 

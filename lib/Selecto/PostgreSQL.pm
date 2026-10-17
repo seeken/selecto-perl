@@ -1,18 +1,51 @@
 package Selecto::PostgreSQL;
 
 use Mojo::Base 'Selecto::SQL';
+use Hash::Util::FieldHash ();
 use JSON::PP ();
 use Mojo::JSON ();
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
+use Selecto::PostgreSQL::StatementCache ();
 use Selecto::Statement ();
 
 has rollup_sort_fix => 'auto';
+# Perl 5.36 and newer tell a value made as a number from a string.
+use constant CREATED_AS_NUMBER => $] >= 5.036 ? 1 : 0;
+BEGIN {
+    no strict 'refs';
+    *_created_as_number = CREATED_AS_NUMBER ? \&{'builtin::created_as_number'} : sub { 0 };
+}
+# Result values are the driver's unless canonical values are asked for: see
+# RESULT VALUES below.
+has canonical_values => 0;
+# Canonical values are decoded in Perl unless canonical_sql => 1 asks
+# PostgreSQL to format them: see Canonical values in SQL.
+has canonical_sql => 0;
+# Each compiled statement's outermost SELECT list: see Canonical values in SQL.
+Hash::Util::FieldHash::fieldhash(my %PROJECTION);
+# Opt-in, off by default: see STATEMENT CACHE below.
+has statement_cache => 0;
+has statement_cache_size => 256;
 
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
+sub edit_transaction_identity {
+    my ($self) = @_;
+    my $dbh = $self->dbh;
+    Selecto::Error->throw('write_capability_missing', 'editable rows require a native PostgreSQL connection')
+        unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' };
+    Selecto::Error->throw('edit_handle_expired', 'editable rows require an active PostgreSQL transaction')
+        unless $dbh->{Active} && (!$dbh->{AutoCommit} || $dbh->pg_ping == 3);
+    my $identity = eval { $dbh->selectrow_array("SELECT pg_backend_pid()::text || ':' || txid_current()::text") };
+    die $self->normalize_error($@) if $@;
+    Selecto::Error->throw('edit_handle_expired', 'transaction identity is unavailable') unless defined $identity;
+    Selecto::Error->throw('edit_handle_expired', 'editable rows require a pinned PostgreSQL transaction')
+        unless $dbh->pg_ping == 3;
+    return refaddr($dbh) . ':' . $identity;
+}
 sub _reuses_parameter_identity { return 1; }
 
 sub bounded_stream_supported {
@@ -20,9 +53,45 @@ sub bounded_stream_supported {
     return eval { $self->dbh->isa('DBI::db') && $self->dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0;
 }
 
+# A bounded result that its own LIMIT keeps to one fetch batch can run as a plain
+# statement inside the host's transaction, under a savepoint budget (see
+# Selecto::QueryBudget): no cursor and no extra FETCH.
+sub bounded_direct_supported {
+    my ($self) = @_;
+    return $self->bounded_stream_supported && $self->_transaction_open ? 1 : 0;
+}
+
+# $statement with one more column, $alias, holding the single value of $scalar
+# (a one-row, one-column statement such as a total), so both run in one round
+# trip. The scalar is an uncorrelated subquery, evaluated once. Its placeholders
+# follow the outer statement's. The outer rows keep their order, as the bounded
+# result guard's own wrapping relies on.
+sub scalar_column_statement {
+    my ($self, $statement, $scalar, $alias) = @_;
+    Selecto::Error->throw('invalid_query', 'scalar columns join two Selecto statements')
+        unless blessed($statement) && $statement->isa('Selecto::Statement')
+            && blessed($scalar) && $scalar->isa('Selecto::Statement')
+            && @{$scalar->columns} == 1;
+    Selecto::Error->throw('invalid_query', 'scalar column alias is invalid or taken')
+        unless defined($alias) && $alias =~ /\A[a-z][a-z0-9_]*\z/
+            && !grep { defined($_) && $_ eq $alias } @{$statement->columns};
+    my $scalar_sql = $self->_renumber_dollar_placeholders($scalar->sql, scalar @{$statement->params});
+    return Selecto::Statement->new(
+        sql => 'SELECT selecto_rows.*, (' . $scalar_sql . ') AS ' . $self->quote_identifier($alias)
+            . ' FROM (' . $statement->sql . ') AS selecto_rows',
+        params => [@{$statement->params}, @{$scalar->params}],
+        columns => [@{$statement->columns}, $alias],
+        adapter_name => $self->name,
+    );
+}
+
 sub stream_query {
     my ($self, $statement, %options) = @_;
-    return $self->SUPER::stream_query($statement, %options) unless $options{bounded};
+    unless ($options{bounded}) {
+        $statement = $self->_canonical_statement($statement)
+            if blessed($statement) && !$options{export_scalars} && $self->_canonical_requested(%options);
+        return $self->SUPER::stream_query($statement, %options);
+    }
     Selecto::Error->throw('unsupported_feature', 'bounded streaming requires a real PostgreSQL DBI handle')
         unless $self->supports('stream') && $self->bounded_stream_supported;
     Selecto::Error->throw('invalid_stream', 'stream_query requires a Selecto statement')
@@ -30,9 +99,27 @@ sub stream_query {
     my $size = $options{fetch_size} // 1;
     Selecto::Error->throw('invalid_stream', 'stream fetch size must be a positive integer')
         unless !ref($size) && "$size" =~ /\A[1-9]\d*\z/;
+    my $canonical = $self->_canonical_requested(%options);
     require Selecto::PostgreSQL::Stream;
-    return Selecto::PostgreSQL::Stream->new(adapter => $self, statement => $statement,
-        fetch_size => $size);
+    return Selecto::PostgreSQL::Stream->new(adapter => $self,
+        statement => $canonical && !$options{export_scalars} ? $self->_canonical_statement($statement) : $statement,
+        fetch_size => $size, canonical_values => $canonical);
+}
+
+# A stream decodes canonical values in Perl, cell by cell, when they are asked
+# for; otherwise its rows are the driver's values.
+sub _stream_decoder {
+    my ($self, %options) = @_;
+    return $self->_canonical_requested(%options)
+        ? sub { return $self->_decode(@_); }
+        : sub { return $_[0]; };
+}
+
+sub _canonical_requested {
+    my ($self, %options) = @_;
+    return 1 if $options{export_scalars};
+    return (exists($options{canonical_values}) ? $options{canonical_values} : $self->canonical_values)
+        ? 1 : 0;
 }
 
 # The guard suppresses an oversized value on the server before DBI receives
@@ -57,11 +144,18 @@ sub bounded_result_statement {
     # Fence the computed projection: volatile expressions must be evaluated
     # once, so the size predicate and emitted cell inspect the same value.
     # Cap materialization at the finite transfer row allowance.
-    return Selecto::Statement->new(sql => 'WITH selecto_bounded AS MATERIALIZED (SELECT * FROM ('
+    my $prefix = 'WITH selecto_bounded AS MATERIALIZED (SELECT * FROM (';
+    my $guarded = Selecto::Statement->new(sql => $prefix
         . $statement->sql . ') AS selecto_source LIMIT ' . int($rows) . ') SELECT '
         . join(', ', @values) . ' FROM selecto_bounded LIMIT ' . int($rows),
         params => $statement->params, columns => [@{$statement->columns}, 'selecto_transfer_overflow'],
         adapter_name => $self->name);
+    # Canonical values are formatted in the wrapped statement's SELECT list,
+    # so the size guard measures the canonical text.
+    my $plan = $PROJECTION{$statement};
+    $PROJECTION{$guarded} = {%$plan, sql => $guarded->sql, start => length($prefix) + $plan->{start},
+        formatted => undef} if $plan && $plan->{sql} eq $statement->sql;
+    return $guarded;
 }
 
 sub placeholder {
@@ -181,6 +275,10 @@ sub normalize_error {
 
 sub supports {
     my ($self, $feature) = @_;
+    # A subclass that replaces execute_query keeps its own signature: engines
+    # send it canonical_values only if it says so by overriding supports.
+    return $self->can('execute_query') == \&execute_query ? 1 : 0
+        if "$feature" eq 'canonical_values';
     return "$feature" eq 'transactions' || "$feature" eq 'returning'
         || "$feature" eq 'rollup' || "$feature" eq 'set_operations'
         || "$feature" eq 'window_functions' || "$feature" eq 'text_search'
@@ -193,16 +291,196 @@ sub supports {
         || "$feature" eq 'export_scalars' ? 1 : 0;
 }
 
-# export_scalars => 1 asks for canonical export scalars: NUMERIC keeps the
-# text PostgreSQL writes for it (plain notation at the column's scale), a
-# boolean is a JSON::PP boolean and json/jsonb is the decoded JSON value.
-# Every other value, and every result without the option, is decoded exactly
-# as before.
+# Without canonical_values (the default) rows hold exactly what DBD::Pg
+# returns. canonical_values => 1 asks for canonical values; see RESULT VALUES
+# in the POD. export_scalars => 1 asks for canonical export scalars: NUMERIC
+# keeps the text PostgreSQL writes for it (plain notation at the column's
+# scale), a boolean is a JSON::PP boolean and json/jsonb is the decoded JSON
+# value; every other value is canonical. Export scalars are decoded in Perl.
 sub execute_query {
     my ($self, $statement, %options) = @_;
-    return $self->SUPER::execute_query($statement) unless $options{export_scalars};
-    local $self->{_selecto_export_scalars} = 1;
-    return $self->SUPER::execute_query($statement);
+    if ($options{export_scalars}) {
+        local $self->{_selecto_export_scalars} = 1;
+        return $self->SUPER::execute_query($statement);
+    }
+    unless ($self->_canonical_requested(%options)) {
+        local $self->{_selecto_raw_values} = 1;
+        return $self->SUPER::execute_query($statement);
+    }
+    return $self->SUPER::execute_query($self->_canonical_statement($statement));
+}
+
+# ---- Canonical values in SQL ------------------------------------------------
+#
+# Opt-in (canonical_sql => 1; by default canonical values are decoded in
+# Perl). When canonical values are asked for, each top-level selection of a plain
+# stored field whose declared domain type is decimal, date, naive_datetime or
+# utc_datetime is formatted by PostgreSQL in the outermost SELECT list (the
+# declared type is the source the datetime_format compilers use too). The
+# formatted columns arrive as text, which the Perl decode leaves alone; every
+# other column (integers, floats, booleans, aggregates, computed fields and
+# other expressions) is decoded in Perl from its PostgreSQL result type, as
+# before. Within a formatted column the expression's own type picks the
+# formatter (see _canonical_format), so a timestamptz declared naive_datetime,
+# a utc_datetime localized by a query timezone or a date kept as text all
+# come out as the Perl decode gives them:
+#
+#   numeric       CAST(trim_scale(x) AS TEXT), PostgreSQL 13+ (trim_scale);
+#                 before 13 decimal fields are decoded in Perl
+#   date          TO_CHAR(x, 'YYYY-MM-DD'), ' BC' for BC dates
+#   timestamp     TO_CHAR(x, 'YYYY-MM-DD"T"HH24:MI:SS.US') without trailing
+#                 fractional zeros or point; 'TBC' for BC
+#   timestamptz   the same in the session TimeZone, plus TO_CHAR(x, 'OF')
+#                 unless it is +00 (and an offset's seconds, which OF omits)
+#   other types   CAST(x AS TEXT)
+#
+# Infinities and NULL are the type's own text. The output is the ISO form
+# whatever the session DateStyle. No regular expressions, no type learning:
+# the SQL depends only on the compiled statement and the server version.
+#
+# Only the outermost SELECT list changes: ORDER BY and GROUP BY are compiled
+# expressions, never output names or positions (a rollup ordered by position
+# records no projection), so they still sort and group the underlying values.
+# Set operations, projection sums and statements built outside compile carry
+# no projection and decode in Perl.
+
+my %CANONICAL_KIND = (decimal => 'numeric', date => 'date', naive_datetime => 'datetime',
+    utc_datetime => 'datetime');
+
+# The declared type of a selected stored field, as _field_sql read it while
+# compiling the selection (computed, query-source and star-dimension fallback
+# fields have none).
+sub _canonical_kind {
+    my ($self, $domain, $selection) = @_;
+    # Without canonical_sql nothing is formatted, so compile records nothing.
+    return undef unless $self->canonical_sql
+        && $selection->kind eq 'field' && ref($self->{_field_types}) eq 'HASH';
+    my $type = $self->{_field_types}{$selection->arguments->[0]};
+    return defined($type) && !ref($type) ? $CANONICAL_KIND{$type} : undef;
+}
+
+sub _note_projection {
+    my ($self, $statement, %projection) = @_;
+    return unless grep { defined $_->[2] } @{$projection{items}};
+    # A formatted selection keeps its output name (a wrapping statement, such
+    # as the bounded-result guard, selects the columns by name).
+    $PROJECTION{$statement} = {sql => $statement->{sql}, start => $projection{start},
+        items => $projection{items}, columns => $statement->{columns}};
+    return;
+}
+
+# The statement to run for canonical values: a copy whose outermost SELECT
+# list formats the canonical columns, or the statement itself.
+sub _canonical_statement {
+    my ($self, $statement) = @_;
+    return $statement unless $self->canonical_sql;
+    my $plan = $PROJECTION{$statement};
+    return $statement unless $plan && $plan->{sql} eq $statement->sql;
+    my $version = $self->_canonical_server_version or return $statement;
+    my $numeric = $version >= 130000 ? 1 : 0;
+    my $sql = $plan->{formatted}[$numeric] //= $self->_canonical_sql($plan, $numeric) // '';
+    return $statement if $sql eq '';
+    return Selecto::Statement->new(sql => $sql, params => $statement->params,
+        columns => $statement->columns, adapter_name => $statement->adapter_name);
+}
+
+# The result columns _canonical_statement formats (for tests and diagnostics).
+sub _canonical_columns {
+    my ($self, $statement) = @_;
+    my $plan = $PROJECTION{$statement};
+    return () unless $self->canonical_sql && $plan && $plan->{sql} eq $statement->sql;
+    my $version = $self->_canonical_server_version or return ();
+    my $items = $plan->{items};
+    return grep { defined($items->[$_][2]) && ($items->[$_][2] ne 'numeric' || $version >= 130000) } 0 .. $#$items;
+}
+
+# The server version of a DBD::Pg handle (libpq reads it once, at connect), or
+# undef for any other handle.
+sub _canonical_server_version {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' } ? $dbh->{pg_server_version} : undef;
+}
+
+sub _canonical_sql {
+    my ($self, $plan, $numeric) = @_;
+    my ($sql, $position) = ($plan->{sql}, $plan->{start});
+    my $text = substr($sql, 0, $position);
+    my $formatted = 0;
+    for my $index (0 .. $#{$plan->{items}}) {
+        my ($expression_length, $item_length, $kind) = @{$plan->{items}[$index]};
+        $text .= ', ' if $index;
+        $kind = undef if defined($kind) && $kind eq 'numeric' && !$numeric;
+        if (defined $kind) {
+            $text .= _canonical_format($kind, '(' . substr($sql, $position, $expression_length) . ')')
+                . ($item_length == $expression_length ? ' AS ' . $self->quote_identifier($plan->{columns}[$index])
+                    : substr($sql, $position + $expression_length, $item_length - $expression_length));
+            $formatted++;
+        } else {
+            $text .= substr($sql, $position, $item_length);
+        }
+        $position += $item_length + 2;
+    }
+    return undef unless $formatted;
+    return $text . substr($sql, $position - 2);
+}
+
+# The canonical text of one value, given the SQL expression x. The declared
+# type says which formatters apply; the expression's PostgreSQL type picks
+# one: CASE on pg_typeof of a NULL of that type (CASE WHEN FALSE THEN x END
+# folds to one, and CASE resolves a domain to its base type), so x is not
+# evaluated for it. A column of any other type (a date kept in a VARCHAR, say,
+# or a date declared as a datetime) is its own text, which is what the Perl
+# decode leaves of it under DateStyle ISO. Untyped literals take the branch's
+# type; the timestamptz ones carry an explicit +00, so they do not depend on
+# the session TimeZone.
+sub _canonical_format {
+    my ($kind, $x) = @_;
+    my $type = "CAST(pg_catalog.pg_typeof(CASE WHEN FALSE THEN $x END) AS OID)";
+    my $text = "CAST($x AS TEXT)";
+    return "CASE WHEN $type = 1700 THEN CAST(pg_catalog.trim_scale(CAST($x AS NUMERIC)) AS TEXT) ELSE $text END"
+        if $kind eq 'numeric';
+    return "CASE WHEN $type = 1082 THEN " . _canonical_date("CAST($x AS DATE)") . " ELSE $text END"
+        if $kind eq 'date';
+    # A naive_datetime may be a timestamptz column, a utc_datetime a naive
+    # one (stored naive_utc, localized by a query timezone, or undeclared).
+    return "CASE $type WHEN 1114 THEN " . _canonical_timestamp("CAST($x AS TIMESTAMP)")
+        . " WHEN 1184 THEN " . _canonical_timestamptz("CAST($x AS TIMESTAMPTZ)") . " ELSE $text END";
+}
+
+# Each formatter names as few functions as it can: parsing and planning a
+# function call costs more than running it for a page of rows.
+sub _canonical_date {
+    my ($x) = @_;
+    return "CASE WHEN pg_catalog.isfinite($x) THEN pg_catalog.to_char(CAST($x AS TIMESTAMP), 'YYYY-MM-DD')"
+        . " || CASE WHEN $x < '0001-01-01' THEN ' BC' ELSE '' END ELSE CAST($x AS TEXT) END";
+}
+
+sub _canonical_local {
+    my ($x) = @_;
+    return q{pg_catalog.rtrim(pg_catalog.rtrim(pg_catalog.to_char(} . $x
+        . q{, 'YYYY-MM-DD"T"HH24:MI:SS.US'), '0'), '.')};
+}
+
+sub _canonical_timestamp {
+    my ($x) = @_;
+    return "CASE WHEN pg_catalog.isfinite($x) THEN " . _canonical_local($x)
+        . " || CASE WHEN $x < '0001-01-01' THEN 'TBC' ELSE '' END ELSE CAST($x AS TEXT) END";
+}
+
+# TO_CHAR's OF has no seconds. The last tz database offset with seconds
+# (Africa/Monrovia's -00:44:30) ended on 1972-01-07, so later values take OF
+# as it is, and earlier ones (and BC, where even +00 is kept before the TBC)
+# take the exact offset.
+sub _canonical_timestamptz {
+    my ($x) = @_;
+    my $seconds = "CAST(pg_catalog.date_part('timezone', $x) AS INTEGER) % 60";
+    my $exact = "pg_catalog.to_char($x, 'OF') || CASE WHEN $seconds = 0 THEN ''"
+        . " ELSE pg_catalog.to_char(pg_catalog.abs($seconds), '\":\"FM00') END"
+        . " || CASE WHEN $x < '0001-01-02 00:00:00+00' AND pg_catalog.to_char($x, 'BC') = 'BC' THEN 'TBC' ELSE '' END";
+    return "CASE WHEN pg_catalog.isfinite($x) THEN " . _canonical_local($x)
+        . " || COALESCE(NULLIF(CASE WHEN $x >= '1972-01-08 00:00:00+00' THEN pg_catalog.to_char($x, 'OF')"
+        . " ELSE $exact END, '+00'), '') ELSE CAST($x AS TEXT) END";
 }
 
 my %ARRAY_SQL_TYPE = (
@@ -256,8 +534,8 @@ sub _compile_json_text {
 sub _compile_row_lock {
     my ($self, $mode) = @_;
     Selecto::Error->throw('invalid_query', 'unsupported row lock mode')
-        unless $mode eq 'share';
-    return ' FOR SHARE OF ' . $self->quote_identifier($self->_root_alias);
+        unless $mode eq 'share' || $mode eq 'update';
+    return ($mode eq 'update' ? ' FOR UPDATE OF ' : ' FOR SHARE OF ') . $self->quote_identifier($self->_root_alias);
 }
 
 sub projection_sum_statement {
@@ -295,7 +573,8 @@ sub _rollup_sort_fix_enabled {
 }
 
 sub write_capabilities {
-    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, write_graph => 1 };
+    return { %{$_[0]->SUPER::write_capabilities}, returning => 1, generated_keys => 1, write_graph => 1,
+        transaction_edit_handles => 1 };
 }
 
 sub _renumber_placeholders {
@@ -340,6 +619,7 @@ sub _compile_dialect_expression {
             day => 'YYYY-MM-DD',
             time => 'HH24:MI:SS',
             day_hour => 'YYYY-MM-DD HH24',
+            day_minute => 'YYYY-MM-DD HH24:MI',
             week => 'IYYY-"W"IW',
             iso_week => 'IYYY-"W"IW',
             iso_week_date => 'IYYY-"W"IW-ID',
@@ -353,8 +633,11 @@ sub _compile_dialect_expression {
             day_of_week_num => 'ID',
             day_of_year => 'DDD',
             hour => 'HH24',
+            us_date => 'MM/DD/YYYY',
+            us_datetime => 'MM/DD/YYYY FMHH12:MI AM',
         );
-        my ($field, $format) = @$arguments;
+        my ($field, $format, $timezone) = @$arguments;
+        local $self->{_timezone} = $timezone // $self->{_timezone};
         Selecto::Error->throw('invalid_query', 'datetime format field must be a governed temporal field')
             unless blessed($field) && $field->isa('Selecto::Expression')
                 && ($field->kind eq 'field' || $field->kind eq 'epoch_datetime');
@@ -460,6 +743,10 @@ sub _compile_naive_utc_instant_sql {
     my ($self, $sql) = @_;
     return '(' . $sql . q{ AT TIME ZONE 'UTC')};
 }
+
+sub _current_date_shortcuts { return 1 }
+sub _months_interval_sql { return 'MAKE_INTERVAL(months => ' . int($_[1]) . ')' }
+sub _month_day_sql { return "TO_CHAR($_[1], 'MM-DD')" }
 
 sub _compile_timezone_sql {
     my ($self, $sql, $type, $timezone, $params) = @_;
@@ -703,9 +990,11 @@ sub _decode {
 # it. A subclass that redefines _decode keeps the per-cell path.
 sub _decode_rows {
     my ($self, $rows, $types) = @_;
+    return if $self->{_selecto_raw_values};
     return $self->SUPER::_decode_rows($rows, $types)
         unless $self->can('_decode') == \&_decode;
     my $export = $self->{_selecto_export_scalars};
+    my $driver_numbers;
     for my $i (0 .. $#$types) {
         my $type = $types->[$i] // '';
         if ($export && $type =~ /\A(?:numeric|bool|json|jsonb)\z/) {
@@ -718,8 +1007,16 @@ sub _decode_rows {
                 $row->[$i] = ($value eq 't' || "$value" eq '1') ? 1 : 0 if defined $value;
             }
         } elsif ($type eq 'int2' || $type eq 'int4' || $type eq 'int8') {
+            # DBD::Pg fetches integers as Perl integers (IVs), for which int()
+            # returns the same IV, so a value it made as a number is kept.
+            # It never makes one any other way, but other handles (and Perl
+            # before 5.36, without builtin::created_as_number) take the
+            # check below.
+            BEGIN { warnings->unimport('experimental::builtin') if CREATED_AS_NUMBER }
+            $driver_numbers //= CREATED_AS_NUMBER && defined($self->_canonical_server_version) ? 1 : 0;
             for my $row (@$rows) {
                 next unless defined(my $value = $row->[$i]);
+                next if $driver_numbers && _created_as_number($value);
                 if (ref $value) {
                     $row->[$i] = int($value) if "$value" =~ /\A-?\d+\z/;
                     next;
@@ -768,15 +1065,94 @@ sub _export_scalar {
     return Mojo::JSON::from_json("$value");
 }
 
+sub _statement_cache_enabled {
+    my ($self) = @_;
+    return 0 unless $self->statement_cache;
+    my $size = $self->statement_cache_size;
+    Selecto::Error->throw('invalid_adapter', 'statement_cache_size must be a positive integer')
+        unless defined($size) && !ref($size) && "$size" =~ /\A[1-9]\d{0,5}\z/;
+    return 1;
+}
+
+sub _cached_execute {
+    my ($self, $sql, $params, $failure) = @_;
+    return Selecto::PostgreSQL::StatementCache->execute($self->{dbh}, $sql, $params,
+        size => 0 + $self->statement_cache_size,
+        execute => sub { return $self->_execute_statement(@_); },
+        normalize => sub { return $self->normalize_error($_[0]); },
+        failure => $failure,
+    );
+}
+
 # A raw BEGIN leaves AutoCommit on, but the server still reports the
 # transaction: pg_ping answers 3 (idle in a transaction) or 4 (in a failed
-# one). Asked only when AutoCommit is on.
+# one). Asked only when AutoCommit is on. A connection busy with the host's
+# own statement (2) is refused: Selecto never begins, rolls back or creates a
+# savepoint around a result it does not own.
 sub _server_transaction_open {
     my ($self) = @_;
     my $status = eval { $self->{dbh}->pg_ping };
     return undef unless defined($status) && $status > 0;
+    _refuse_connection_state('active') if $status == 2;
     return $status >= 3 ? 1 : 0;
 }
+
+# DBD::Pg holds the host's asynchronous query (pg_async) until the host takes
+# its result. Its rollback would silently discard that result and the host's
+# transaction with it, so nothing Selecto runs may start while one is pending.
+sub _transaction_open {
+    my ($self) = @_;
+    $self->_refuse_pending_result;
+    return $self->SUPER::_transaction_open;
+}
+
+sub _refuse_pending_result {
+    my ($self) = @_;
+    _refuse_connection_state('active') if eval { $self->{dbh}{pg_async_status} };
+    return;
+}
+
+# The connection state, as libpq reports it, before a read guard (a bounded
+# stream or a savepoint query budget) sends anything: 'idle', 'intrans',
+# 'active', 'inerror' or 'unknown'. A pending asynchronous result is
+# 'active' whatever pg_ping says.
+sub _connection_state {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return 'active' if eval { $dbh->{pg_async_status} };
+    my $status = eval { $dbh->pg_ping };
+    return 'unknown' unless defined $status;
+    return {1 => 'idle', 2 => 'active', 3 => 'intrans', 4 => 'inerror'}->{$status} // 'unknown';
+}
+
+# Where a read guard may run: 'own' (an idle handle: the guard begins and
+# rolls back its own transaction) or 'host' (the host's healthy transaction,
+# or an AutoCommit => 0 handle DBD::Pg has not begun yet: a savepoint).
+# Anything else (a pending result, an aborted transaction, an unknown or
+# broken connection) is refused before a single statement is sent.
+sub _read_guard_scope {
+    my ($self) = @_;
+    my $state = $self->_connection_state;
+    my $auto_commit = eval { $self->{dbh}{AutoCommit} };
+    return $auto_commit ? 'own' : 'host' if $state eq 'idle' && defined $auto_commit;
+    return 'host' if $state eq 'intrans';
+    _refuse_connection_state($state);
+}
+
+sub _refuse_connection_state {
+    my ($state) = @_;
+    my %reason = (
+        active => 'the database connection is busy with another statement or a pending result',
+        inerror => 'the host transaction has already failed',
+    );
+    Selecto::Error->throw('transaction_state_unsafe',
+        ($reason{$state} // 'the database connection state is unknown')
+            . '; Selecto will not open a transaction or savepoint on it',
+        {state => exists($reason{$state}) ? $state : 'unknown'});
+}
+
+
+sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
 
 1;
 
@@ -800,7 +1176,14 @@ Selecto::PostgreSQL - PostgreSQL adapter
       dbh              => $dbh,
       transaction_mode => 'external',  # see Selecto::SQL
       rollup_sort_fix  => 'auto',      # 'auto' (default), 1 or 0
+      statement_cache  => 1,           # opt-in, default 0; see below
+      statement_cache_size => 256,     # handles kept per connection
+      canonical_values => 1,           # default 0: driver values; see RESULT VALUES
+      canonical_sql    => 0,           # default 0: decode canonical values in Perl
   ));
+
+  # Or per call:
+  my $rows = $engine->all($query, canonical_values => 1)->{rows};
 
 =head1 DESCRIPTION
 
@@ -822,6 +1205,122 @@ DBD::Pg handle then uses a server cursor, not a C<RowCacheSize> hint, and
 buffers at most C<fetch_size> rows (default 1) per round trip. See
 L<Selecto::PostgreSQL::Stream> for transaction ownership and cleanup rules.
 
+=head1 RESULT VALUES
+
+By default (C<< canonical_values => 0 >>) C<execute_query>, and so
+C<< $engine->all >>, C<< $engine->stream >> and C<projection_sum>, return
+exactly the values DBD::Pg fetched: Selecto does not touch them.
+
+Ask for I<canonical values> per call with C<< canonical_values => 1 >>
+(C<< $engine->all($query, canonical_values => 1) >>, likewise C<stream> and
+C<projection_sum>), or for every call with the adapter attribute
+C<< canonical_values => 1 >>; a call's C<< canonical_values => 0 >> then asks
+for driver values again. Canonical values are what this adapter returned by
+default up to version 0.2.2 (the API, canned pages, co-domain lookups and
+certification ask for them):
+
+=over 4
+
+=item * C<smallint>, C<integer>, C<bigint>: Perl numbers (C<int()>), so they
+encode as JSON numbers. DBD::Pg 3 already returns them as numbers.
+
+=item * C<boolean>: C<1> or C<0>, as DBD::Pg returns them.
+
+=item * C<numeric>: the driver text without trailing fractional zeros or a
+trailing point, and C<-0> as C<0> (C<10.500> is C<10.5>, C<7152.00> is
+C<7152>; C<NaN> and the infinities are unchanged).
+
+=item * C<real>, C<double precision>: DBD::Pg returns Perl numbers; the
+canonical value is their Perl string, with the same trimming (C<1.5>,
+C<10000000000> for C<1e+10>, C<0.3> for C<0.30000000000000004>, C<Inf>), so
+it encodes as a JSON string.
+
+=item * C<timestamp>, C<timestamptz>: the ISO form in the session
+C<TimeZone>, with C<T> between date and time, the fraction without trailing
+zeros, and the session's UTC offset unless it is zero (C<2024-01-01T10:00:00>,
+C<2024-06-01T12:34:56.789+05:30>, C<2024-01-01T04:00:00-06>; historic offsets
+keep their seconds, C<1849-12-31T18:09:24-05:50:36>). A BC value ends in
+C<TBC> (after its offset, zero included), and the infinities are
+C<infinity> and C<-infinity>.
+
+=item * C<date>: C<YYYY-MM-DD>, C<0044-03-15 BC>, C<infinity>.
+
+=item * Everything else (text, C<json>/C<jsonb> text, UUIDs, arrays): the
+driver value.
+
+=back
+
+By default (C<< canonical_sql => 0 >>) canonical values are decoded in Perl
+from the driver's values and result types, exactly as up to 0.2.2. Dates and
+timestamps are therefore the session C<DateStyle>'s text: under the default
+C<ISO> they are the forms above, and under a non-ISO C<DateStyle> (C<SQL>,
+C<Postgres>, C<German>) that style shows through, as it always has.
+
+=head2 Canonical values in SQL (opt-in)
+
+With C<< canonical_sql => 1 >> PostgreSQL formats some canonical values
+itself, and their dates and timestamps are always the ISO form, whatever the
+session C<DateStyle> (under C<ISO> the values are the same as the Perl
+decode's). It is off by default because the Perl decode measured faster at
+every result size (100,000 rows: about 154 ms in Perl against 213 ms in SQL),
+and the longer statement costs every small query its parse and plan time. With
+it on, each top-level selection of a stored field whose declared domain type
+is C<decimal>, C<date>, C<naive_datetime> or C<utc_datetime> is wrapped, in
+the outermost select list only, in SQL that gives the canonical text. The
+declared type chooses the columns and the formatters that may apply; the
+column's PostgreSQL type picks one (C<CASE> on C<pg_typeof> of a constant, so
+the value is not evaluated for it): C<CAST(trim_scale(x) AS TEXT)> for
+C<numeric> (PostgreSQL 13 and newer; on 12 decimal fields stay in Perl), and
+C<TO_CHAR> for C<date>, C<timestamp> and C<timestamptz> (with C<TO_CHAR(x,
+'OF')> for the offset, and the offset's seconds, which C<OF> omits, for values
+before 1972). So a timestamptz declared C<naive_datetime>, a C<utc_datetime>
+localized by a query timezone or stored C<naive_utc> (or without the hint),
+and a C<date> column declared as a datetime come out as before. A column of
+any other type is its PostgreSQL text: exact for text columns (a date or
+decimal kept in a C<VARCHAR>); a C<timestamp> declared C<date> is its server
+text (C<2024-01-01 10:00:00>); a C<real> or C<double precision> column
+declared C<decimal> is the server's text (C<1e+20>, C<Infinity>) rather than
+its Perl string (C<1e+20>, C<Inf>), and an C<integer> column declared
+C<decimal> is a string (C<"7">) rather than a number. A date or datetime field
+must be a column PostgreSQL can cast to C<date>, C<timestamp> and
+C<timestamptz> (a date, timestamp or text type).
+
+The formatted statement is longer: PostgreSQL parses and plans each datetime
+column's formatter in roughly 30 to 50 microseconds, a date's or decimal's in
+about 10 to 20, every time the statement is prepared. That is paid on every
+call without the statement cache (see L</statement_cache>), and only once per
+connection and SQL text with it. Per row, C<TO_CHAR> costs PostgreSQL about
+0.2 (date) to 0.6 (timestamptz) microseconds.
+
+With C<< canonical_sql => 1 >>, Perl decodes every other column from its
+PostgreSQL result type: integers, booleans and floats (whose canonical form is
+Perl's own number formatting, which SQL cannot reproduce), aggregates and
+other expressions, computed fields, and every column of an ordered rollup, a
+set operation or a statement built outside C<compile>. ORDER BY, GROUP BY,
+window functions and pagination use the underlying values, never output names
+or positions. Streams, bounded streams and L<Selecto::BoundedQuery> format the
+same columns. With the default C<< canonical_sql => 0 >> every canonical value
+is decoded in Perl, from the result types, and compile records nothing for
+formatting.
+
+=head2 Moving from 0.2.2
+
+With DBD::Pg 3, a host that does not ask for canonical values sees these
+differences: C<numeric> keeps its scale (C<10.500>, not C<10.5>);
+C<real> and C<double precision> are Perl numbers, which encode as JSON
+numbers, instead of strings; C<timestamp> and C<timestamptz> are the server
+text (C<2024-01-01 10:00:00+00>, or another offset under the session
+C<TimeZone>), not C<2024-01-01T10:00:00>. Integers, booleans, text, dates
+and JSON text are the same either way.
+
+Versions up to 0.2.2 returned canonical values by default. To keep that
+behaviour for a whole host, construct the adapter with
+C<< canonical_values => 1 >>; to keep it for particular reads, pass
+C<< canonical_values => 1 >> to C<all>, C<stream> or C<projection_sum>.
+Code that already uses C<export_scalars> is unaffected. A subclass that
+overrides C<execute_query> is not sent C<canonical_values> unless its
+C<supports('canonical_values')> says so.
+
 =head1 EXPORT SCALARS
 
 C<< $engine->all($query, export_scalars => 1) >> returns canonical export
@@ -830,9 +1329,10 @@ which is plain notation at the column's scale (C<533.10>, C<7152.00>,
 C<-0.0001>, C<42> for C<NUMERIC(10,0)>); a boolean is C<JSON::PP::true> or
 C<JSON::PP::false>; C<json> and C<jsonb> are decoded JSON values. Integers,
 text, C<DATE> (C<YYYY-MM-DD>), C<TIMESTAMP> (C<YYYY-MM-DDTHH:MM:SS>) and
-floats are decoded as without the option. Without it, results are unchanged:
-decimals lose trailing zeros (C<533.1>), booleans are C<1> or C<0> and JSON
-columns are text.
+floats are canonical values (see L</RESULT VALUES>), whatever the adapter's
+C<canonical_values>. Export scalars are decoded in Perl. Canonical values
+without the option differ: decimals lose trailing zeros (C<533.1>), booleans
+are C<1> or C<0> and JSON columns are text.
 
 =head1 ATTRIBUTES
 
@@ -845,6 +1345,48 @@ need that ordering and pagination wrapped around a C<rollupfix> subquery.
 With C<auto> the adapter reads C<server_version_num> once and disables the
 wrapper on PostgreSQL 18 and newer; C<1> or C<0> force it on or off.
 
+=head2 canonical_values
+
+C<0> (the default): results hold the driver's values. C<1>: results hold
+canonical values unless a call passes C<< canonical_values => 0 >>. See
+L</RESULT VALUES>.
+
+=head2 canonical_sql
+
+C<0> (the default): every canonical value is decoded in Perl from the result
+types, and dates and timestamps follow the session C<DateStyle>. C<1>
+(opt-in): canonical decimal, date and timestamp fields are formatted by
+PostgreSQL, always in the ISO form (see L</Canonical values in SQL (opt-in)>).
+
+=head2 statement_cache
+
+Off (C<0>) by default, and then every query and write prepares a new DBI
+statement handle exactly as before: DBD::Pg sends it unnamed, so the server
+parses and plans each call.
+
+With C<< statement_cache => 1 >>, query execution (C<execute_query>, so
+C<all> and friends) and executed writes reuse one statement handle per
+distinct SQL text and database handle (L<Selecto::PostgreSQL::StatementCache>).
+DBD::Pg prepares a reused handle on the server as a named statement on its
+second execution, and later executions send only Bind/Execute. Streams,
+insert admission and bounded-write probes still prepare afresh. Results,
+types and errors are unchanged, including C<details.sqlstate>.
+
+The cache belongs to the database handle: it is kept in the handle's
+C<CachedKids> (under keys C<prepare_cached> never uses) and freed with it.
+It is keyed by the SQL text alone; parameter values are always bound. At
+most C<statement_cache_size> (default 256) handles are kept per connection,
+least recently used first out, and an evicted handle is deallocated. A
+statement the server lost (26000) or whose result type changed (0A000) is
+prepared again once outside a transaction; inside one the error stands, as
+it has aborted the transaction. After running C<DISCARD ALL> or
+C<DEALLOCATE ALL> yourself, call
+C<< Selecto::PostgreSQL::StatementCache->forget($dbh) >>.
+
+Leave it off behind a transaction-mode pooler: PgBouncer before 1.21 (or
+without C<max_prepared_statements>) cannot route named statements to the
+server connection that prepared them.
+
 =head1 ERRORS
 
 Constraint failures are reported with portable codes and without the
@@ -852,6 +1394,23 @@ driver's message: C<database_not_null_violation> (with the field when
 known), C<database_unique_violation> (with the key fields),
 C<database_foreign_key_violation> and C<database_check_violation>. Other
 failures become C<query_error>.
+
+=head1 TRANSACTION STATE
+
+Selecto opens a transaction or savepoint (a bounded stream, a savepoint
+query budget, a direct bounded read, a managed write) only on a connection
+whose state it can account for: idle (it then owns the transaction), or
+inside the host's healthy transaction (it then owns a uniquely named
+savepoint). A connection with the host's pending asynchronous result
+(C<pg_async>, before C<pg_result>), busy with another statement, inside an
+already aborted transaction, or in an unknown state is refused with
+C<transaction_state_unsafe> (details C<state>: C<active>, C<inerror> or
+C<unknown>) before anything is sent. Otherwise a rollback could discard the
+host's pending result and its transaction, and the host's next statement
+would autocommit. Checking costs one C<pg_ping> round trip where none was
+made before (a stream or a savepoint budget on an C<< AutoCommit => 0 >>
+handle). A bounded stream also refuses, after it opened, to roll back
+anything it cannot prove is its own; see L<Selecto::PostgreSQL::Stream>.
 
 =head1 SEE ALSO
 

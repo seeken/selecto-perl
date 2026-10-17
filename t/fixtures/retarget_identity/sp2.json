@@ -1,0 +1,99 @@
+{
+ "schema_version": 1,
+ "name": "Sp",
+ "source": {
+  "source_table": "sp_items",
+  "primary_key": "id",
+  "fields": [
+   "id",
+   "tenant_key",
+   "site",
+   "account_id"
+  ],
+  "columns": {
+   "id": {
+    "type": "integer"
+   },
+   "tenant_key": {
+    "type": "string"
+   },
+   "site": {
+    "type": "string"
+   },
+   "account_id": {
+    "type": "integer"
+   }
+  },
+  "associations": {
+   "a": {
+    "queryable": "acc",
+    "owner_key": "account_id",
+    "related_key": "id",
+    "cardinality": "one",
+    "source_scope_key": "site",
+    "target_scope_key": "site"
+   },
+   "as": {
+    "queryable": "acc",
+    "owner_key": "account_id",
+    "related_key": "id",
+    "cardinality": "many",
+    "source_scope_key": "site",
+    "target_scope_key": "site"
+   }
+  },
+  "tenant_field": "tenant_key"
+ },
+ "schemas": {
+  "acc": {
+   "source_table": "sp_acc",
+   "primary_key": "id",
+   "fields": [
+    "id",
+    "tenant_key",
+    "site",
+    "label"
+   ],
+   "columns": {
+    "id": {
+     "type": "integer"
+    },
+    "tenant_key": {
+     "type": "string"
+    },
+    "site": {
+     "type": "string"
+    },
+    "label": {
+     "type": "string"
+    }
+   },
+   "associations": {},
+   "tenant_field": "tenant_key"
+  }
+ },
+ "joins": {
+  "a": {
+   "type": "left"
+  },
+  "as": {
+   "type": "left"
+  }
+ },
+ "required_filters": [
+  [
+   "site",
+   "s1"
+  ]
+ ],
+ "writes": {
+  "scope": {
+   "tenant": {
+    "field": "site",
+    "satisfied_by": [
+     "trusted_context"
+    ]
+   }
+  }
+ }
+}
