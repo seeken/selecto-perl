@@ -3510,17 +3510,19 @@ sub _post_image_predicate {
 # update triggers and rules are refused on the relation and on every
 # partition or child below it. A relation with (non-partition) inheritance
 # children is refused: its key is not unique across the children, so the
-# re-read by key could find a decoy row in a child. SQL Server refuses
-# bound-scope updates outright: it never re-reads the rows, and a view or
-# synonym is not resolved to its base object.
+# re-read by key could find a decoy row in a child. Every other adapter
+# (SQL Server, DuckDB) refuses bound-scope updates outright: it never
+# re-reads the rows, so a generated column, a trigger or a view/synonym
+# could leave the scope unseen.
 sub _admit_post_image_target {
     my ($self, $command) = @_;
     my $table = Selecto::Identifier::checked($command->relation);
     my $refuse = sub { Selecto::Error->throw('query_rule_not_evaluable', $_[0], {relation => $table}) };
     my $name = $self->name;
     Selecto::Error->throw('write_capability_missing',
-        'SQL Server cannot verify that an update keeps its rows in their trusted scope', {relation => $table})
-        if $name eq 'mssql';
+        ({mssql => 'SQL Server', duckdb => 'DuckDB'}->{$name} // 'adapter')
+            . ' cannot verify that an update keeps its rows in their trusted scope', {relation => $table})
+        unless $name =~ /\A(?:postgresql|sqlite|mysql|mariadb)\z/;
     my $dbh = $self->dbh;
     my @row;
     my $ok = eval {
@@ -3544,7 +3546,7 @@ sub _admit_post_image_target {
         } elsif ($name eq 'sqlite') {
             @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
                 undef, $table);
-        } elsif ($name eq 'mysql' || $name eq 'mariadb') {
+        } else {
             # Read the table first, in the write's transaction: its shared
             # metadata lock holds until commit, so a concurrent CREATE
             # TRIGGER, ALTER or DROP INDEX cannot change what the
@@ -3552,16 +3554,13 @@ sub _admit_post_image_target {
             $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
             @row = $dbh->selectrow_array($self->_statement_sql(q{SELECT TABLE_TYPE, 0 FROM information_schema.TABLES
                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
-        } else {
-            @row = ('unknown', 0);
         }
         1;
     };
     die $self->normalize_error($@) unless $ok;
     my ($kind, $deferrable, $statement_trigger, $inheritance, $rules) = @row;
     $refuse->('a governed update through a view cannot verify the rows it leaves behind')
-        unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE'
-            || $kind eq 'unknown');
+        unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE');
     $refuse->('a deferrable constraint trigger could change the rows after their verification') if $deferrable;
     $refuse->('a governed update under a bound scope cannot verify a relation with inheritance children') if $inheritance;
     $refuse->('a rule on the relation could rewrite the update outside the verified scope') if $rules;
@@ -3571,7 +3570,6 @@ sub _admit_post_image_target {
     Selecto::Error->throw('write_capability_missing',
         'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
         if $statement_trigger;
-    return if $kind eq 'unknown';
     # information_schema describes the base table, not a session TEMPORARY
     # table shadowing it (MySQL).
     $self->_refuse_temporary_shadow($table) if $self->can('_refuse_temporary_shadow');
