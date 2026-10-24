@@ -3508,7 +3508,9 @@ sub _post_image_predicate {
 # and one on another table fires when a row trigger writes there (an audit
 # table) and can then rewrite the updated row at commit. Statement-level
 # update triggers and rules are refused on the relation and on every
-# partition or child below it.
+# partition or child below it. A relation with (non-partition) inheritance
+# children is refused: its key is not unique across the children, so the
+# re-read by key could find a decoy row in a child.
 sub _admit_post_image_target {
     my ($self, $command) = @_;
     my $table = Selecto::Identifier::checked($command->relation);
@@ -3530,6 +3532,7 @@ sub _admit_post_image_target {
                     AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
                   (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
                     AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & 16) <> 0))::integer,
+                  (EXISTS(SELECT 1 FROM tree WHERE NOT tree.partition))::integer,
                   (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
                     WHERE r.rulename <> '_RETURN'))::integer
                 FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, ($self->quote_identifier($table)) x 2);
@@ -3545,11 +3548,12 @@ sub _admit_post_image_target {
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    my ($kind, $deferrable, $statement_trigger, $rules) = @row;
+    my ($kind, $deferrable, $statement_trigger, $inheritance, $rules) = @row;
     $refuse->('a governed update through a view cannot verify the rows it leaves behind')
         unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE'
             || $kind eq 'unknown');
     $refuse->('a deferrable constraint trigger could change the rows after their verification') if $deferrable;
+    $refuse->('a governed update under a bound scope cannot verify a relation with inheritance children') if $inheritance;
     $refuse->('a rule on the relation could rewrite the update outside the verified scope') if $rules;
     # A statement-level UPDATE trigger can write rows the re-read does not
     # name (row-level triggers that modify OTHER rows are likewise outside

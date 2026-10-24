@@ -184,4 +184,44 @@ for my $mode (sort keys %modes) {
     $dbh->rollback;
 }
 
+# An inheritance parent's key is not unique across its children: a BEFORE
+# UPDATE trigger that rewrites the key (and the tenant) let the re-read by
+# the old key find a decoy row in a child. A bound-scope update of a
+# relation with (non-partition) inheritance children is refused; a child
+# without children of its own is updated as before.
+for my $mode ('engine tenant', 'host scope') {
+    for my $returning (0, 1) {
+        my $label = "inheritance decoy, $mode" . ($returning ? ', RETURNING' : '');
+        $dbh->begin_work;
+        $dbh->do('CREATE TABLE selecto_topo (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16))');
+        $dbh->do('CREATE TABLE selecto_topo_c () INHERITS (selecto_topo)');
+        $dbh->do(q{INSERT INTO selecto_topo VALUES (5, 't1', 'evil', 'n'), (6, 't2', 'other', 'n')});
+        $dbh->do(q{INSERT INTO selecto_topo_c VALUES (5, 't1', 'decoy', 'n')});
+        $dbh->do(q{CREATE OR REPLACE FUNCTION pg_temp.selecto_topo_rekey() RETURNS trigger LANGUAGE plpgsql AS
+            $$ BEGIN IF NEW.name = 'evil' THEN NEW.id := 1000; NEW.org_key := 't2'; END IF; RETURN NEW; END $$});
+        $dbh->do('CREATE TRIGGER selecto_topo_rekey BEFORE UPDATE ON selecto_topo FOR EACH ROW EXECUTE FUNCTION pg_temp.selecto_topo_rekey()');
+        my ($engine, $extra) = $modes{$mode}->();
+        my $rows = sub { join ' ', map { join ':', @$_ }
+            @{$dbh->selectall_arrayref('SELECT tableoid::regclass, id, org_key, name, note FROM selecto_topo ORDER BY 1, 2')} };
+        is(code_of(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_topo',
+            assignments => {note => 'changed'}, predicate => $x->eq('name', 'evil'), %$extra,
+            ($returning ? (metadata => {returning => ['id']}) : ()))) }), 'query_rule_not_evaluable',
+            "$label: an update of a relation with inheritance children is refused");
+        is($rows->(), 'selecto_topo:5:t1:evil:n selecto_topo:6:t2:other:n selecto_topo_c:5:t1:decoy:n', "$label: and nothing changed");
+        $dbh->rollback;
+    }
+}
+{
+    $dbh->begin_work;
+    $dbh->do('CREATE TABLE selecto_topo_base (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16))');
+    $dbh->do('CREATE TABLE selecto_topo (PRIMARY KEY (id)) INHERITS (selecto_topo_base)');
+    $dbh->do(q{INSERT INTO selecto_topo VALUES (1, 't1', 'x', 'n'), (2, 't2', 'x', 'n')});
+    my ($engine, $extra) = $modes{'host scope'}->();
+    is(code_of(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_topo',
+        assignments => {note => 'changed'}, predicate => $x->eq('name', 'x'), %$extra)) }), 'applied',
+        'an inheritance child without children of its own is updated');
+    is($state->(), '1:t1:changed 2:t2:n', 'inheritance child: to the scoped row only');
+    $dbh->rollback;
+}
+
 done_testing;
