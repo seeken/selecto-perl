@@ -1191,6 +1191,9 @@ sub _admit_upsert_conflict {
             && !grep { !$entry->{columns}{$_} } keys %target
     } sort keys %index;
     $refuse->('no_matching_unique_index') unless defined $matched;
+    # The index was read from information_schema, which describes the base
+    # table even when a session TEMPORARY table shadows it.
+    $self->_refuse_temporary_shadow($table);
     return lc $matched;
 }
 
@@ -1394,17 +1397,16 @@ sub _verify_inserted_row {
         unless @keys && @keys == (ref($declared) eq 'ARRAY' ? @$declared : 1);
     my $table = Selecto::Identifier::checked($command->relation);
     # The re-read finds the inserted row by its key only when the key is
-    # really unique: a declared primary key the table does not enforce
-    # (no PRIMARY/UNIQUE index of exactly those NOT NULL columns) could count
-    # another row instead. Read in this write's transaction, never cached.
-    unless ($self->_unique_key_columns($table, \@keys)) {
-        # Storage admission already decided every column it can cast; a
-        # CHAR(n) column was admitted on this re-check alone.
-        Selecto::Error->throw('query_rule_not_evaluable',
-            'guarded insert verification requires a unique primary key')
-            if $self->_predicate_reads_char($table, $predicate);
-        return 1;
-    }
+    # really unique: it must contain an enforced PRIMARY/UNIQUE index of NOT
+    # NULL, whole columns, or the count could find another row. Storage
+    # effects the candidate cast cannot see (CHAR(n) and TEXT-family
+    # trailing blanks) are decided here alone, so without such a key the
+    # insert is refused whatever the column type. Read in this write's
+    # transaction, never cached; a session TEMPORARY table shadowing the
+    # relation is refused (information_schema describes the base table).
+    $self->_refuse_temporary_shadow($table);
+    Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires a unique primary key')
+        unless $self->_unique_key_columns($table, \@keys);
     my $identity = @keys == 1 ? $self->_inserted_identity($command, $keys[0])
         : Selecto::Expression->all(map { $self->_inserted_identity($command, $_, 1) } @keys);
     # The identity must find exactly the inserted rows, and each must still
@@ -1423,8 +1425,9 @@ sub _verify_inserted_row {
     return 1;
 }
 
-# True when @$keys are exactly the columns of a PRIMARY or UNIQUE index (no
-# prefix part) and every one is NOT NULL.
+# True when @$keys contain every column of a PRIMARY or UNIQUE index whose
+# columns are whole (no prefix part) and NOT NULL: such keys identify at most
+# one row.
 sub _unique_key_columns {
     my ($self, $table, $keys) = @_;
     my ($indexes, $nullable);
@@ -1438,7 +1441,6 @@ sub _unique_key_columns {
     };
     die $self->normalize_error($@) unless $ok;
     my %null = map { (lc($_->[0]) => uc($_->[1] // 'YES')) } @$nullable;
-    return 0 if grep { ($null{lc $_} // 'YES') ne 'NO' } @$keys;
     my %want = map { (lc($_) => 1) } @$keys;
     my %index;
     for my $row (@$indexes) {
@@ -1449,25 +1451,23 @@ sub _unique_key_columns {
     }
     for my $entry (map { $index{$_} } sort keys %index) {
         my $columns = $entry->{columns};
-        return 1 if $entry->{usable} && keys(%$columns) == keys(%want) && !grep { !$columns->{$_} } keys %want;
+        next unless $entry->{usable} && keys %$columns;
+        return 1 unless grep { !$want{$_} || ($null{$_} // 'YES') ne 'NO' } keys %$columns;
     }
     return 0;
 }
 
-# True when a field the predicate reads is a fixed-width CHAR(n)/NCHAR(n)
-# column (or its type cannot be read).
-sub _predicate_reads_char {
-    my ($self, $table, $predicate) = @_;
-    my %fields = map { (lc($_) => 1) } Selecto::Expression->field_references($predicate);
-    my $columns;
-    my $ok = eval {
-        $columns = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE
-            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
-        1;
-    };
+# A session TEMPORARY table of the same name shadows the base table for this
+# connection's DML, while information_schema describes the base table: the
+# storage and key checks would read another table's definition.
+sub _refuse_temporary_shadow {
+    my ($self, $table) = @_;
+    my @row;
+    my $ok = eval { @row = $self->dbh->selectrow_array($self->_statement_sql('SHOW CREATE TABLE ' . $self->quote_identifier($table))); 1 };
     die $self->normalize_error($@) unless $ok;
-    my %type = map { (lc($_->[0]) => lc($_->[1] // '')) } @$columns;
-    return (grep { !defined($type{$_}) || $type{$_} eq 'char' } keys %fields) ? 1 : 0;
+    Selecto::Error->throw('query_rule_not_evaluable', 'a temporary table shadows the guarded relation')
+        unless defined($row[1]) && $row[1] =~ /\A\s*CREATE\s+TABLE\b/i;
+    return;
 }
 
 sub _write_predicate_expression {
@@ -1614,6 +1614,7 @@ sub insert_admission_storage {
     my $dbh = $self->dbh;
     $fail->() unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'MariaDB' };
     my $table = Selecto::Identifier::checked($command->relation);
+    $self->_refuse_temporary_shadow($table);
     my ($mode, $kind, $triggers, $rows);
     my $ok = eval {
         $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0'));
@@ -1658,7 +1659,10 @@ sub insert_admission_storage {
             # VARCHAR column's declared length is part of the cast: the
             # column drops excess trailing blanks ('t1 ' in VARCHAR(2) is
             # stored as 't1'), and so does CAST(... AS CHAR(n)).
-            $fail->() if $name eq 'char' && !_rechecks_stored_row($command);
+            # TEXT-family columns (TINYTEXT, TEXT, ...) silently drop excess
+            # trailing blanks past their octet capacity, which no cast
+            # reproduces either: without the re-check they are refused too.
+            $fail->() if ($name eq 'char' || $name =~ /text\z/) && !_rechecks_stored_row($command);
             my $length = $name eq 'char' || $name eq 'varchar' ? $column->{CHARACTER_MAXIMUM_LENGTH} : undef;
             $fail->() if ($name eq 'char' || $name eq 'varchar') && !(defined($length) && "$length" =~ /\A[1-9][0-9]{0,5}\z/);
             $storage{$field} = {cast => 'CHAR' . (defined($length) ? "($length)" : '')
