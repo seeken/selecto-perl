@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - SQL Server: a governed update under a bound scope (engine tenant,
+      writes.scope, host scope predicate, required tenant pin) is refused
+      with write_capability_missing before any DML. SQL Server never ran the
+      post-image re-read, and views and synonyms were not refused. Updates
+      without a bound scope are unchanged.
+    - SQL Server: a MERGE upsert carrying a write predicate or scope
+      predicate is refused with unsupported_scope_predicate, and one
+      carrying query enforcement with
+      query_enforcement_unsupported_operation, on the governed and the
+      *_unsafe paths. The MERGE compiler ignored all three and updated
+      whichever row held the conflicting key. Unscoped MERGE upserts (and
+      their foreign-key guards) are unchanged.
     - PostgreSQL: a governed update under a bound scope of a relation that
       has (non-partition) inheritance children is refused with
       query_rule_not_evaluable. The parent's key is not unique across its
