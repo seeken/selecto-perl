@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - DuckDB (and any adapter other than PostgreSQL, SQLite, MySQL and
+      MariaDB): a governed update under a bound scope (engine tenant,
+      writes.scope, host scope predicate, required tenant pin) is refused
+      with write_capability_missing before any DML. DuckDB never re-read the
+      updated row, so a generated scope column (gen = CASE WHEN note='evil'
+      THEN 't2' ...) moved the row out of its scope when only a source
+      column was assigned. Updates without a bound scope are unchanged.
     - MySQL/MariaDB: a bound-scope update reads its table (SELECT 1 ...
       LIMIT 0) in the write's transaction before the information_schema
       kind and unique-key checks, so the shared metadata lock it holds until
