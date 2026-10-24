@@ -72,6 +72,8 @@ my %cases = (
         . ' DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION selecto_iso_move()'],
     'a BEFORE INSERT upper() trigger' => ['insert', 'CREATE TRIGGER selecto_iso_upper BEFORE INSERT ON selecto_iso FOR EACH ROW'
         . ' EXECUTE FUNCTION selecto_iso_upper()'],
+    'a statement-level DELETE trigger' => ['delete', 'CREATE TRIGGER selecto_iso_pwn AFTER DELETE ON selecto_iso FOR EACH STATEMENT'
+        . ' EXECUTE FUNCTION selecto_iso_pwn()'],
 );
 sub outcome {
     my ($code) = @_;

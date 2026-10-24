@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: a bound-scope delete takes LOCK TABLE ... IN ROW EXCLUSIVE
+      MODE before its statement-trigger check, requires READ COMMITTED like
+      every guarded write (query_rule_not_evaluable, reason
+      isolation_level), and also refuses a DELETE rule on the relation
+      (write_capability_missing). A statement-level DELETE trigger created
+      by another session while the delete waited for a row lock used to
+      fire and rewrite the other tenant's row.
     - PostgreSQL: a guarded write (bound-scope update, guarded insert or
       upsert) is refused with query_rule_not_evaluable (reason
       isolation_level) unless its transaction runs READ COMMITTED
