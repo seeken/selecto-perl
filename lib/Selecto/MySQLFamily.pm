@@ -1378,6 +1378,12 @@ sub _execute_compiled_write_in_transaction {
     Selecto::Error->throw('write_capability_missing',
         'MySQL-family RETURNING cannot follow an update of the primary key', {field => $key})
         if $operation eq 'update' && exists $command->assignments->{$key};
+    # An insert or upsert re-reads its row by the assigned key or conflict
+    # target; a BEFORE INSERT trigger can rewrite them (NEW.id := 1000), so
+    # the re-read would return another row's values. Refused whatever the
+    # write's scope, after the table's metadata lock is taken.
+    $self->_refuse_before_insert_triggers(Selecto::Identifier::checked($command->relation))
+        if $operation eq 'insert' || $operation eq 'upsert';
     my ($keys, $before);
     if ($operation eq 'update' || $operation eq 'delete') {
         $keys = $self->_locked_write_keys($command, $key);
@@ -1482,6 +1488,30 @@ sub _unique_key_columns {
         return 1 unless grep { !$want{$_} || ($null{$_} // 'YES') ne 'NO' } keys %$columns;
     }
     return 0;
+}
+
+# Refuse a RETURNING insert or upsert on a table with any BEFORE INSERT
+# trigger. The table is read first in the write's transaction, so its shared
+# metadata lock keeps a concurrent CREATE TRIGGER out until commit; a
+# session TEMPORARY table shadowing it is refused (information_schema
+# describes the base table).
+sub _refuse_before_insert_triggers {
+    my ($self, $table) = @_;
+    my $dbh = $self->dbh;
+    my $triggers;
+    my $ok = eval {
+        $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
+        ($triggers) = $dbh->selectrow_array($self->_statement_sql(q{SELECT COUNT(*) FROM information_schema.TRIGGERS
+            WHERE EVENT_OBJECT_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = ?
+              AND EVENT_MANIPULATION = 'INSERT' AND ACTION_TIMING = 'BEFORE'}), undef, $table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    $self->_refuse_temporary_shadow($table);
+    Selecto::Error->throw('write_capability_missing',
+        'MySQL-family RETURNING cannot follow a row a BEFORE INSERT trigger may rewrite', {relation => $table})
+        if !defined($triggers) || $triggers;
+    return;
 }
 
 # A session TEMPORARY table of the same name shadows the base table for this
