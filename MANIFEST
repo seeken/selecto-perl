@@ -80,6 +80,7 @@ t/pg_bound_delete_lock_live.t
 t/host_transaction_refusal_live.t
 t/mysql_post_image_metadata_lock_live.t
 t/mysql_returning_insert_trigger_live.t
+t/mysql_host_savepoint_collision_live.t
 t/member_group_identity_live.t
 t/upsert_scope_live.t
 t/sqlite_upsert_candidate_native.t

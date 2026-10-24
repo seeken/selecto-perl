@@ -146,7 +146,7 @@ package RecordingDBH {
     sub events {
         my (%seen, $count);
         return [map {
-            (my $event = $_) =~ s{\bselecto_write_\d+_\d+\b}{$seen{$&} //= 'selecto_write_' . ++$count}ge;
+            (my $event = $_) =~ s{\bselecto_write_[0-9a-f]+_[0-9a-f]{8}\b}{$seen{$&} //= 'selecto_write_' . ++$count}ge;
             $event;
         } @{$_[0]{events}}];
     }
