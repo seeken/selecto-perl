@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: a governed delete bounded only by query enforcement is
+      now a bound-scope delete like one under the engine tenant or a host
+      scope (a plain required filter alone still is not): its table is locked, READ COMMITTED is
+      required, and statement-level DELETE triggers and DELETE rules are
+      refused with write_capability_missing. Such a delete used to run a
+      statement trigger that rewrote another tenant's row.
     - transaction_handler: work the handler runs outside a transaction on
       the adapter's connection (an autocommit handle) is refused before any
       statement with transaction_unavailable (reason autocommit). Any write
