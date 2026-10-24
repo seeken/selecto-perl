@@ -27,7 +27,7 @@ my $existing_transaction_adapter = Selecto::PostgreSQL->new(
 );
 $existing_transaction_adapter->execute_write_unsafe($command);
 my @savepoint_events = @{$existing_transaction_dbh->events};
-like $savepoint_events[0], qr/\ASAVEPOINT (selecto_write_\d+_\d+)\z/,
+like $savepoint_events[0], qr/\ASAVEPOINT (selecto_write_[0-9a-f]+_[0-9a-f]{8})\z/,
     'managed writes inside an open DBI transaction use a uniquely named savepoint';
 is_deeply \@savepoint_events, [$savepoint_events[0], 'RELEASE ' . $savepoint_events[0]],
     'and release it, never committing the host transaction';

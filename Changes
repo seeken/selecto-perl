@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - Savepoint names now carry a random nonce
+      (selecto_write_<hex serial>_<8 hex>, likewise for the upsert, insert
+      admission and bounded-probe savepoints) instead of
+      selecto_write_<pid>_<n>. On MySQL and MariaDB a SAVEPOINT reusing a
+      name replaces the older one, so a host savepoint of the old shape was
+      replaced by the write's own and deleted by its RELEASE; it now
+      survives a refused write and the host can still roll back to it.
     - DuckDB, transaction_mode => 'external': DuckDB has no savepoints, so a
       write Selecto could refuse after its statement changed rows is now
       refused before any DML with transaction_unavailable (reason

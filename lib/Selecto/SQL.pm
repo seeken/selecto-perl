@@ -3993,13 +3993,20 @@ sub _handler_transaction {
     return $value;
 }
 
-# A savepoint name no other savepoint in this process shares, so a cleanup
-# can only ever roll back to its own savepoint, never to one an earlier or
-# outer operation left behind. Short enough for SQL Server's 32 characters.
+# A savepoint name no other savepoint shares, so a cleanup can only ever
+# roll back to (or release) its own savepoint, never one an earlier or outer
+# operation, or the host, created. A process serial keeps names distinct
+# within the process; a random nonce (mixed with the pid, so forked children
+# differ) keeps a host savepoint from colliding with it: on MySQL and
+# MariaDB a SAVEPOINT reusing a name replaces the older one, and the
+# write's RELEASE would then delete the host's savepoint. The old
+# <prefix>_<pid>_<n> shape is never produced. Short enough for SQL Server's
+# 32 characters: selecto_write_<hex serial>_<8 hex>.
 my $SAVEPOINT_SERIAL = 0;
 sub _savepoint_name {
     my ($prefix) = @_;
-    return $prefix . '_' . $$ . '_' . ++$SAVEPOINT_SERIAL;
+    my $nonce = (int(rand(4294967296)) ^ (($$ * 2654435761) % 4294967296)) % 4294967296;
+    return sprintf('%s_%x_%08x', $prefix, ++$SAVEPOINT_SERIAL, $nonce);
 }
 
 # Whether the handle is inside a transaction the host opened: AutoCommit is
@@ -4227,10 +4234,11 @@ its own transaction: C<begin_work>, then C<commit>, or C<rollback> on
 failure. On a handle that is already inside a transaction (C<AutoCommit>
 off after C<begin_work>, an C<< AutoCommit => 0 >> handle, or a transaction
 the server reports although C<AutoCommit> is on) the write runs inside a
-savepoint instead: C<SAVEPOINT selecto_write_E<lt>pidE<gt>_E<lt>nE<gt>> ...
+savepoint instead: C<SAVEPOINT selecto_write_E<lt>serialE<gt>_E<lt>nonceE<gt>> ...
 C<RELEASE SAVEPOINT>, and C<ROLLBACK TO SAVEPOINT> then C<RELEASE> on
-failure. Each savepoint has a name no other savepoint in the process
-shares, so a cleanup can only roll back to its own. The write then
+failure. Each savepoint name carries a process serial and a random nonce,
+so no other savepoint (not one of the host's either) shares it, and a
+cleanup can only roll back to or release its own. The write then
 commits or rolls back with the host's transaction, a failed write undoes
 only itself, and on PostgreSQL the host's transaction stays usable. The
 host still commits; a managed write never commits an C<< AutoCommit => 0 >>
