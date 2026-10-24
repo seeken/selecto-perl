@@ -404,11 +404,15 @@ sub _compile_single {
     }
     Selecto::Error->throw('unsupported_feature', 'adapter does not support rollups')
         if $query->grouping_mode eq 'rollup' && !$self->supports('rollup');
+    # A member's group key joined to its root as identity groups exactly
+    # (dialect hook; plain elsewhere).
+    my $byte_groups = $self->{_selecto_group_bytes};
+    local $self->{_selecto_group_bytes};
     my $group_sql = join(', ', map {
         my $key = _expression_key($_);
         $self->_reuses_parameter_identity && exists($compiled_selections{$key})
             ? $compiled_selections{$key}
-            : $self->_compile_expression($domain, $_, \@params)
+            : $self->_compile_group_expression($domain, $_, \@params, $byte_groups)
     } @$groups);
     if (@$groups) {
         $sql .= $query->grouping_mode eq 'rollup'
@@ -492,6 +496,28 @@ sub _compile_single {
         items => \@projection)
         unless $query->grouping_mode eq 'rollup' && @$orders;
     return $statement;
+}
+
+sub _compile_group_expression {
+    my ($self, $domain, $expression, $params) = @_;
+    return $self->_compile_expression($domain, $expression, $params);
+}
+
+# The member query's group-by fields that produce @$columns (the columns its
+# join pairs with the root as identity), for _compile_group_expression.
+sub _member_group_bytes {
+    my ($self, $query, $columns, @paired) = @_;
+    return undef unless $self->_exact_identity_compare && @paired && blessed($query);
+    my $selections = $query->selections;
+    my %fields;
+    for my $index (0 .. $#$selections) {
+        my $selection = $selections->[$index];
+        my $name = ref($columns) eq 'ARRAY' ? $columns->[$index] : undef;
+        $name //= $self->_selection_name($selection);
+        next unless defined($name) && grep { $_ eq $name } @paired;
+        $fields{$selection->arguments->[0]} = 1 if $selection->kind eq 'field' && !ref($selection->arguments->[0]);
+    }
+    return %fields ? \%fields : undef;
 }
 
 # Dialect hooks for adapters that format result values in SQL.
@@ -877,6 +903,10 @@ sub _compile_cte_prefix {
             );
             push @statements, $anchor, $member;
         } else {
+            my $join = $spec->{join};
+            my $paired = defined($join) && $self->_member_pair_exact([$root, $join->{owner_key}],
+                [undef, $self->_cte_column_type($spec, $join->{related_key})]) ? [$join->{related_key}] : [];
+            local $self->{_selecto_group_bytes} = $self->_member_group_bytes($spec->{query}, $columns, @$paired);
             push @statements, $self->compile($spec->{domain}, $spec->{query});
         }
         for my $statement (@statements) {
@@ -1010,7 +1040,14 @@ sub _compile_subquery_joins {
     my @joins;
     for my $spec (@{$query->subqueries}) {
         $spec->{domain} = $self->_bounded_source_domain($domain, $spec->{domain}, "subquery $spec->{name}");
-        my $statement = $self->compile($spec->{domain}, $spec->{query});
+        my @paired = map { $_->{right} } grep {
+            $self->_member_pair_exact([$domain, $_->{left}], [undef, $self->_exact_identity_compare
+                ? $self->_cte_column_type($spec, $_->{right}) : undef])
+        } @{$spec->{on} // []};
+        my $statement = do {
+            local $self->{_selecto_group_bytes} = $self->_member_group_bytes($spec->{query}, $spec->{columns}, @paired);
+            $self->compile($spec->{domain}, $spec->{query});
+        };
         Selecto::Error->throw('invalid_query', 'subquery projection must match declared columns')
             unless @{$statement->columns} == @{$spec->{columns}}
                 && join("\0", @{$statement->columns}) eq join("\0", @{$spec->{columns}});
@@ -2818,7 +2855,10 @@ sub _member_pair_exact {
         my $resolved = eval { $domain->resolve("$path") };
         push @classes, ref($resolved) eq 'HASH' ? _identity_text_type($resolved->{type}) : 2;
         next unless ref($resolved) eq 'HASH' && defined $resolved->{field};
-        my %names = map { ($_ => 1) } $self->_identity_root_columns($domain);
+        # Tenant and scope columns, and every column the host's required or
+        # trusted predicates compare: those decide identity too.
+        my %names = map { ($_ => 1) } $self->_identity_root_columns($domain),
+            _comparison_fields(eval { $domain->required_predicate }, @{$self->{_selecto_trusted_predicates} // []});
         $identity = 1 if !$resolved->{association} && $names{$resolved->{field}};
     }
     return 0 unless $identity;
@@ -3403,7 +3443,7 @@ sub _execute_compiled_write_in_transaction {
     };
     die $self->normalize_error($@) unless $ok;
     $self->_check_write_cardinality($command, $affected, $bounds);
-    $self->_verify_post_image($command, $post_image, $identities) if $post_image;
+    $self->_verify_post_image($command, $post_image, $identities, $affected) if $post_image;
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
@@ -3461,7 +3501,66 @@ sub _admit_post_image_target {
         unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE'
             || $kind eq 'unknown');
     $refuse->('a deferrable constraint trigger could change the rows after their verification') if $deferrable;
+    return if $kind eq 'unknown';
+    # information_schema describes the base table, not a session TEMPORARY
+    # table shadowing it (MySQL).
+    $self->_refuse_temporary_shadow($table) if $self->can('_refuse_temporary_shadow');
+    # The re-read names the updated rows by their key: the key must be
+    # unique (contain an enforced PRIMARY/UNIQUE index of whole, NOT NULL
+    # columns) and must not change, or another row sharing the old key value
+    # could stand in for a row the update moved out of scope.
+    my $primary = $command->metadata->{__selecto_primary_key};
+    my @keys = map { Selecto::Identifier::checked($_) } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    my %key = map { (lc($_) => 1) } @keys;
+    $refuse->('a governed update under a bound scope cannot assign its key')
+        if grep { $key{lc $_} } keys %{$command->assignments};
+    $refuse->('a governed update under a bound scope requires an enforced unique key')
+        unless $self->_enforced_unique_key($table, \@keys);
     return;
+}
+
+# True when @$keys contain every column of an enforced unique index (or
+# primary key) whose columns are whole and NOT NULL, read from the catalog
+# in the write's transaction.
+sub _enforced_unique_key {
+    my ($self, $table, $keys) = @_;
+    # MySQL and MariaDB share the stored-row re-check's rule.
+    return $self->_unique_key_columns($table, $keys) if $self->can('_unique_key_columns');
+    my %want = map { (lc($_) => 1) } @$keys;
+    my $dbh = $self->dbh;
+    my @indexes;
+    my $ok = eval {
+        if ($self->name eq 'postgresql') {
+            my $rows = $dbh->selectall_arrayref(q{
+                SELECT i.indexrelid, a.attname, a.attnotnull::integer
+                FROM pg_catalog.pg_index i
+                JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON TRUE
+                LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                WHERE i.indrelid = ?::regclass AND i.indisunique AND i.indisvalid AND i.indimmediate
+                  AND i.indpred IS NULL AND i.indexprs IS NULL}, undef, $self->quote_identifier($table));
+            my %by;
+            push @{$by{$_->[0]}}, [$_->[1], $_->[2]] for @$rows;
+            @indexes = values %by;
+        } elsif ($self->name eq 'sqlite') {
+            my %info = map { (lc($_->{name}) => $_) }
+                @{$dbh->selectall_arrayref('PRAGMA table_info(' . $self->quote_identifier($table) . ')', {Slice => {}})};
+            my @pk = sort { $a->{pk} <=> $b->{pk} } grep { $_->{pk} } values %info;
+            # An INTEGER PRIMARY KEY is the rowid: unique and never NULL.
+            push @indexes, [[$pk[0]{name}, 1]] if @pk == 1 && uc($pk[0]{type} // '') eq 'INTEGER';
+            for my $index (@{$dbh->selectall_arrayref('PRAGMA index_list(' . $self->quote_identifier($table) . ')', {Slice => {}})}) {
+                next unless $index->{unique} && !$index->{partial};
+                my $columns = $dbh->selectall_arrayref('PRAGMA index_info(' . $self->quote_identifier($index->{name}) . ')', {Slice => {}});
+                push @indexes, [map { [$_->{name}, defined($_->{name}) && $info{lc $_->{name}}{notnull} ? 1 : 0] } @$columns];
+            }
+        }
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    for my $index (@indexes) {
+        next unless @$index;
+        return 1 unless grep { !defined($_->[0]) || !$want{lc $_->[0]} || !$_->[1] } @$index;
+    }
+    return 0;
 }
 
 # Every locked row the update could have changed must still satisfy the
@@ -3469,7 +3568,7 @@ sub _admit_post_image_target {
 # (host-exact) comparison; otherwise the write fails and rolls back. Rows the
 # update left unchanged satisfied it before and still do.
 sub _verify_post_image {
-    my ($self, $command, $predicate, $identities) = @_;
+    my ($self, $command, $predicate, $identities, $affected) = @_;
     return unless ref($identities) eq 'ARRAY' && @$identities;
     my $primary = $command->metadata->{__selecto_primary_key};
     my @keys = map { Selecto::Identifier::checked($_) } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
@@ -3487,7 +3586,8 @@ sub _verify_post_image {
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_violation', 'updated row no longer satisfies its trusted scope',
         {truth_value => 'false_or_unknown'})
-        unless defined($row[0]) && defined($row[1]) && $row[0] == @$identities && $row[1] == $row[0];
+        unless defined($row[0]) && defined($row[1]) && $row[0] == @$identities && $row[1] == $row[0]
+            && (!defined($affected) || $affected <= @$identities);
     return 1;
 }
 

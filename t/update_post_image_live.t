@@ -107,7 +107,9 @@ for my $backend (@backends) {
                 my $table = $plain_key ? 'KEY(id)' : 'primary key';
                 $reset->(plain_key => $plain_key);
                 if ($bound) {
-                    is($run->($mode, $path, {org_key => 'T1'}, %options), 'query_rule_violation',
+                    # Without an enforced unique key the rows cannot be named
+                    # for the re-read: the update is refused before it runs.
+                    is($run->($mode, $path, {org_key => 'T1'}, %options), $plain_key ? 'query_rule_not_evaluable' : 'query_rule_violation',
                         "$label, $table: assigning the scoped column out of scope is refused");
                     is($state->(), '1:t1:n 2:t2:n', "$label, $table: and nothing changed");
                 } else {
@@ -127,6 +129,41 @@ for my $backend (@backends) {
                 "$label: assigning the scoped column its own value applies");
             is($state->(), '1:t1:same 2:t2:n', "$label: as written");
         }
+    }
+
+    # A bound-scope update needs an enforced unique key and may not assign
+    # it: with only an index on id, a decoy sharing the old key would stand
+    # in for the row the update moved out of scope.
+    {
+        my $host = 'host scope predicate';
+        my $key_domain = Selecto::Domain->parse({%$document, writes => {%{$document->{writes}},
+            fields => {%{$document->{writes}{fields}}, id => {updatable => 1}}}});
+        my $key_run = sub {
+            my ($assignments) = @_;
+            my $command = Selecto::Write::Command->new(operation => 'update', relation => 'selecto_post_rows',
+                assignments => $assignments, predicate => $x->eq('name', 'x'), scope_predicate => $x->eq('org_key', 'T1'));
+            return eval { Selecto::Engine->new(adapter => $adapter, domain => $key_domain)->execute_write($command); 'applied' }
+                // (blessed($@) ? $@->code : "died: $@");
+        };
+        for my $plain_key (1, 0) {
+            $dbh->do('DROP TABLE IF EXISTS selecto_post_rows');
+            $dbh->do('CREATE TABLE selecto_post_rows (id INT NOT NULL' . ($plain_key ? '' : ' PRIMARY KEY')
+                . ', org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16), stamp VARCHAR(16) NULL)' . ($my ? ' ENGINE=InnoDB' : ''));
+            $dbh->do('CREATE INDEX selecto_post_rows_id ON selecto_post_rows (id)') if $plain_key;
+            $dbh->do($plain_key ? q{INSERT INTO selecto_post_rows (id, org_key, name, note) VALUES (1, 'T1', 'x', 'n'), (1, 'T1', 'y', 'n')}
+                : q{INSERT INTO selecto_post_rows (id, org_key, name, note) VALUES (1, 'T1', 'x', 'n'), (3, 'T1', 'y', 'n')});
+            my $table = $plain_key ? 'a non-unique key with a decoy' : 'a primary key';
+            is($key_run->({id => 2, org_key => 'T2'}), 'query_rule_not_evaluable', "$name $table: reassigning the key out of scope is refused");
+            is($key_run->({id => 2}), 'query_rule_not_evaluable', "$name $table: reassigning the key in scope is refused too");
+            is($key_run->({note => 'changed'}), $plain_key ? 'query_rule_not_evaluable' : 'applied',
+                "$name $table: an ordinary update " . ($plain_key ? 'is refused without a unique key' : 'applies'));
+            is_deeply($dbh->selectall_arrayref('SELECT id, org_key, name FROM selecto_post_rows ORDER BY name'),
+                [[1, 'T1', 'x'], [$plain_key ? 1 : 3, 'T1', 'y']], "$name $table: no row left its scope");
+        }
+        # A required-only update keeps its pre-image semantics (TW-09).
+        $reset->(plain_key => 1);
+        is($run->('required predicate', 'single', {org_key => 'T1'}), 'applied',
+            "$name: a required-only update on a non-unique key still applies");
     }
 
     # A trigger that rewrites the scoped column after a governed update of
