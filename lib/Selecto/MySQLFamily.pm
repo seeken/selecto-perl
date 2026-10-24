@@ -1225,7 +1225,8 @@ sub _admit_upsert_conflict {
 }
 
 # FOR UPDATE, savepoints and rollback need a transactional engine; a MyISAM
-# table would apply every statement immediately and ignore both.
+# table would apply every statement immediately and ignore both. A view has
+# no engine of its own and is refused too.
 sub _require_transactional_table {
     my ($self, $table) = @_;
     my ($engine) = $self->dbh->selectrow_array($self->_statement_sql(q{SELECT ENGINE FROM information_schema.TABLES
@@ -1354,6 +1355,24 @@ sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
     my $operation = $command->operation;
+    # An update or delete may be refused after its statement (cardinality,
+    # row ceiling, post-image and RETURNING checks), and in a batch or graph
+    # a later command's refusal undoes the earlier ones; only a transactional
+    # engine can roll that back: MEMORY, MyISAM and Aria apply each statement
+    # at once. (A lone insert or upsert affects at most one row, so its
+    # post-statement checks refuse only when it affected none; guarded ones
+    # check the engine in their storage admission.) The table is read first
+    # so its metadata lock holds the engine until commit.
+    my $ok = !($operation eq 'update' || $operation eq 'delete' || $self->{_selecto_multi_write}) || eval {
+        my $table = Selecto::Identifier::checked($command->relation);
+        $self->dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
+        $self->_require_transactional_table($table);
+        # information_schema describes the base table, not a session
+        # TEMPORARY table (perhaps MEMORY) shadowing it.
+        $self->_refuse_temporary_shadow($table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
     # Affected-row counts are matched rows only with CLIENT_FOUND_ROWS, the
     # DBD::MariaDB default; a handle that names it off in its DSN is refused.
     # (A connect-attribute override is not readable back; hosts must keep it.)
@@ -1951,13 +1970,18 @@ sub execute_write_unsafe {
     return $self->_with_verified_session(1, sub { $self->SUPER::execute_write_unsafe(@arguments) });
 }
 
+# Batches and graphs: every command's table must be transactional
+# (_execute_compiled_write_in_transaction), since a later command's refusal
+# must undo the earlier ones.
 sub execute_batch_unsafe {
     my ($self, @arguments) = @_;
+    local $self->{_selecto_multi_write} = 1;
     return $self->_with_verified_session(1, sub { $self->SUPER::execute_batch_unsafe(@arguments) });
 }
 
 sub execute_graph_unsafe {
     my ($self, @arguments) = @_;
+    local $self->{_selecto_multi_write} = 1;
     return $self->_with_verified_session(1, sub { $self->SUPER::execute_graph_unsafe(@arguments) });
 }
 

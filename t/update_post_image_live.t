@@ -270,7 +270,10 @@ for my $backend (@backends) {
         my $view_error = eval { Selecto::Engine->new(adapter => $adapter, domain => $view_domain)->execute_write(
             Selecto::Write::Command->new(operation => 'update', relation => 'selecto_post_view', assignments => {note => 'changed'},
                 predicate => $x->eq('name', 'x'), scope_predicate => $x->eq('org_key', 't1'))); 1 } ? undef : $@;
-        is(blessed($view_error) ? $view_error->code : 'applied', 'query_rule_not_evaluable', "$name: a guarded update through a view is refused");
+        # MySQL-family writes also need a transactional (InnoDB) base table,
+        # which a view does not show: refused before the post-image check.
+        is(blessed($view_error) ? $view_error->code : 'applied', $my ? 'write_capability_missing' : 'query_rule_not_evaluable',
+            "$name: a guarded update through a view is refused");
         is($state->(), '1:t1:n 2:t2:n', "$name: view, and nothing changed");
         $dbh->do('DROP VIEW IF EXISTS selecto_post_view');
     }
