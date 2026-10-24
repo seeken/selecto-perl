@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB: an insert or upsert with RETURNING on a table with any
+      BEFORE INSERT trigger is refused with write_capability_missing,
+      whatever its scope, on the engine path and on execute_write_unsafe
+      (after the table's metadata lock is taken). RETURNING is emulated by
+      re-reading the row by its assigned key or conflict target; a trigger
+      rewriting NEW.id made an unscoped insert return another row's values.
+      Inserts without RETURNING, and tables with only AFTER INSERT or UPDATE
+      triggers, are unchanged.
     - PostgreSQL: a bound-scope update takes LOCK TABLE ... IN ROW EXCLUSIVE
       MODE (the lock the UPDATE takes anyway) before reading the catalog, so
       a concurrent CREATE TRIGGER, ENABLE TRIGGER or CREATE RULE on the
