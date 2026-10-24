@@ -114,6 +114,49 @@ for my $backend (@backends) {
         is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_engine_rows ORDER BY id'), [[1, 'n']],
             "$name temporary MEMORY shadow: $case changes nothing");
     }
+    # Item 32: lone inserts and upserts too. An insert expecting 2 rows, a
+    # RETURNING insert with an unassigned non-AUTO_INCREMENT key, and an
+    # AFTER INSERT trigger that SIGNALs all fail after the row is stored; on
+    # MEMORY and MyISAM that row stayed. Every MySQL-family write now
+    # requires InnoDB.
+    my $plain = Selecto::Domain->parse({schema_version => 1, name => 'EnginesLone',
+        source => {source_table => 'selecto_engine_lone', primary_key => 'id', fields => [qw(id note org_key)],
+            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
+        schemas => {}, joins => {},
+        writes => {operations => {insert => {enabled => 1}, upsert => {enabled => 1, conflict_targets => [['id']]}},
+            fields => {id => {insertable => 1}, org_key => {insertable => 1}, note => {insertable => 1, updatable => 1}}}});
+    my $lone_engine = Selecto::Engine->new(adapter => $adapter, domain => $plain);
+    my %lone = (
+        'an insert expecting 2 rows' => ['', sub { Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_engine_lone',
+            assignments => {id => 3, org_key => 't1', note => 'i'}, expected_count => 2) }],
+        'a RETURNING insert with an unassigned plain key' => ['DEFAULT 9 ', sub { Selecto::Write::Command->new(operation => 'insert',
+            relation => 'selecto_engine_lone', assignments => {org_key => 't1', note => 'i'}, metadata => {returning => ['id']}) }],
+        'an insert an AFTER INSERT trigger refuses' => ['trigger', sub { Selecto::Write::Command->new(operation => 'insert',
+            relation => 'selecto_engine_lone', assignments => {id => 3, org_key => 't1', note => 'boom'}) }],
+        'an upsert expecting 2 rows' => ['', sub { Selecto::Write::Command->new(operation => 'upsert', relation => 'selecto_engine_lone',
+            assignments => {id => 4, org_key => 't1', note => 'up'}, expected_count => 2,
+            metadata => {conflict_target => ['id'], upsert_update_fields => ['note']}) }],
+    );
+    for my $storage (qw(InnoDB MEMORY MyISAM)) {
+        for my $case (sort keys %lone) {
+            my ($flag, $command) = @{$lone{$case}};
+            $dbh->do('DROP TABLE IF EXISTS selecto_engine_lone');
+            $dbh->do('CREATE TABLE selecto_engine_lone (id INT NOT NULL ' . ($flag =~ /DEFAULT/ ? $flag : '')
+                . "PRIMARY KEY, org_key VARCHAR(16), note VARCHAR(16)) ENGINE=$storage");
+            $dbh->do(q{INSERT INTO selecto_engine_lone VALUES (1, 't1', 'n'), (2, 't2', 'n')});
+            $dbh->do(q{CREATE TRIGGER selecto_engine_sig AFTER INSERT ON selecto_engine_lone FOR EACH ROW
+                BEGIN IF NEW.note = 'boom' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'boom'; END IF; END}) if $flag eq 'trigger';
+            my $code = eval { $lone_engine->execute_write($command->()); 'applied' } // (blessed($@) ? $@->code : "died: $@");
+            if ($storage eq 'InnoDB') {
+                isnt($code, 'applied', "$name InnoDB: $case is refused ($code)");
+            } else {
+                is($code, 'write_capability_missing', "$name $storage: $case is refused before any DML");
+            }
+            is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_engine_lone ORDER BY id'), [[1, 'n'], [2, 'n']],
+                "$name $storage: $case leaves no row behind");
+        }
+    }
+    $dbh->do('DROP TABLE IF EXISTS selecto_engine_lone');
     $dbh->do('DROP TEMPORARY TABLE IF EXISTS selecto_engine_rows');
     $dbh->do('DROP TABLE IF EXISTS selecto_engine_rows');
 }

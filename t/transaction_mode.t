@@ -167,6 +167,9 @@ package RecordingDBH {
     sub rollback { push @{$_[0]{events}}, 'rollback'; $_[0]{AutoCommit} = 1; return 1; }
     sub do {
         my ($self, $sql) = @_;
+        # The MySQL-family metadata-lock read is catalog, not transaction
+        # control: answered without an event.
+        return '0E0' if $sql =~ /\bLIMIT 0\z/;
         push @{$self->{events}}, $sql;
         if (defined($self->{fail_do}) && $sql =~ $self->{fail_do}) { $self->{errstr} = "$sql refused"; return undef; }
         return '0E0';
@@ -179,6 +182,9 @@ package RecordingDBH {
             return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'),
                 @{$self->{session}}[0 .. ($sql =~ /\@\@in_transaction\z/ ? 8 : 7)]);
         }
+        # The MySQL-family storage checks: an InnoDB base table, no shadow.
+        return ('items', 'CREATE TABLE `items` (`id` int)') if $sql =~ /SHOW CREATE TABLE/;
+        return ('InnoDB') if $sql =~ /SELECT ENGINE FROM information_schema\.TABLES/;
         push @{$self->{events}}, $sql;
         return exists $self->{answers}{$sql} ? ($self->{answers}{$sql}) : die "no answer for $sql\n";
     }
