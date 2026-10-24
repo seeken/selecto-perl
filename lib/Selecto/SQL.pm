@@ -3510,12 +3510,17 @@ sub _post_image_predicate {
 # update triggers and rules are refused on the relation and on every
 # partition or child below it. A relation with (non-partition) inheritance
 # children is refused: its key is not unique across the children, so the
-# re-read by key could find a decoy row in a child.
+# re-read by key could find a decoy row in a child. SQL Server refuses
+# bound-scope updates outright: it never re-reads the rows, and a view or
+# synonym is not resolved to its base object.
 sub _admit_post_image_target {
     my ($self, $command) = @_;
     my $table = Selecto::Identifier::checked($command->relation);
     my $refuse = sub { Selecto::Error->throw('query_rule_not_evaluable', $_[0], {relation => $table}) };
     my $name = $self->name;
+    Selecto::Error->throw('write_capability_missing',
+        'SQL Server cannot verify that an update keeps its rows in their trusted scope', {relation => $table})
+        if $name eq 'mssql';
     my $dbh = $self->dbh;
     my @row;
     my $ok = eval {
