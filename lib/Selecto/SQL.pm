@@ -503,21 +503,14 @@ sub _compile_group_expression {
     return $self->_compile_expression($domain, $expression, $params);
 }
 
-# The member query's group-by fields that produce @$columns (the columns its
-# join pairs with the root as identity), for _compile_group_expression.
+# Whether a member query's groups must group exactly: it has an output
+# paired with its root as identity (a join or correlation), however that
+# output is spelled (a field, an alias, a value expression). Every text or
+# unknown-type group key then groups exactly (dialect hook).
 sub _member_group_bytes {
     my ($self, $query, $columns, @paired) = @_;
-    return undef unless $self->_exact_identity_compare && @paired && blessed($query);
-    my $selections = $query->selections;
-    my %fields;
-    for my $index (0 .. $#$selections) {
-        my $selection = $selections->[$index];
-        my $name = ref($columns) eq 'ARRAY' ? $columns->[$index] : undef;
-        $name //= $self->_selection_name($selection);
-        next unless defined($name) && grep { $_ eq $name } @paired;
-        $fields{$selection->arguments->[0]} = 1 if $selection->kind eq 'field' && !ref($selection->arguments->[0]);
-    }
-    return %fields ? \%fields : undef;
+    return undef unless $self->_exact_identity_compare && @paired && blessed($query) && @{$query->groups};
+    return {all => 1};
 }
 
 # Dialect hooks for adapters that format result values in SQL.
@@ -989,7 +982,7 @@ sub _compile_cte_joins {
         push @joins,
             $keyword . ' ' . $self->quote_identifier($spec->{name}) .
             ' AS ' . $self->quote_identifier($spec->{name}) .
-            ' ON ' . $self->_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
+            ' ON ' . $self->_derived_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
                 $self->_qualified($spec->{name}, $join->{related_key}),
                 $self->_member_pair_exact([$domain, $join->{owner_key}], [undef, $self->_exact_identity_compare
                     ? $self->_cte_column_type($spec, $join->{related_key}) : undef]));
@@ -1016,7 +1009,7 @@ sub _compile_values_joins {
         if ($join) {
             my $owner = $domain->resolve($join->{owner_key});
             Selecto::Error->throw('invalid_query', 'VALUES owner key must be a root field') if $owner->{association};
-            $sql .= ' ON ' . $self->_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
+            $sql .= ' ON ' . $self->_derived_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
                 $self->_qualified($spec->{name}, $join->{related_key}),
                 $self->_member_pair_exact([$domain, $join->{owner_key}], [undef, undef]));
         }
@@ -1057,7 +1050,7 @@ sub _compile_subquery_joins {
         for my $condition (@{$spec->{on}}) {
             my $owner = $domain->resolve($condition->{left});
             Selecto::Error->throw('invalid_query', 'subquery owner key must be a root field') if $owner->{association};
-            push @on, $self->_identity_equal_sql($self->_qualified($self->_root_alias, $condition->{left}),
+            push @on, $self->_derived_identity_equal_sql($self->_qualified($self->_root_alias, $condition->{left}),
                 $self->_qualified($spec->{name}, $condition->{right}),
                 $self->_member_pair_exact([$domain, $condition->{left}], [undef, $self->_exact_identity_compare
                     ? $self->_cte_column_type($spec, $condition->{right}) : undef]));
@@ -1104,11 +1097,13 @@ sub _compile_lateral_joins {
                 $self->_qualified($self->_root_alias, $parent),
                 $self->_member_pair_exact([$domain, $parent], [$spec->{domain}, $child]));
         }
-        my $statement = $self->_compile_single(
-            $spec->{domain}, $spec->{query},
-            root_alias => $child_alias,
-            extra_predicates => \@correlations,
-        );
+        my $paired = grep {
+            $self->_member_pair_exact([$domain, $spec->{correlations}{$_}], [$spec->{domain}, $_])
+        } keys %{$spec->{correlations}};
+        my $statement = do {
+            local $self->{_selecto_group_bytes} = $self->_member_group_bytes($spec->{query}, undef, $paired ? ('lateral') : ());
+            $self->_compile_single($spec->{domain}, $spec->{query}, root_alias => $child_alias, extra_predicates => \@correlations);
+        };
         Selecto::Error->throw('invalid_query', 'lateral projection width does not match declared columns')
             unless @{$statement->columns} == @{$spec->{columns}};
         my $sql = $self->_shift_placeholders($statement->sql, scalar @$params);
@@ -2741,6 +2736,14 @@ sub _top_conjuncts {
 sub _identity_equal_sql {
     my ($self, $left, $right, $exact) = @_;
     return "$left = $right";
+}
+
+# A pair with a derived source's column (CTE, VALUES, subquery): such a
+# column has no index to keep, and may carry a collation of its own.
+sub _derived_identity_equal_sql {
+    my ($self, @arguments) = @_;
+    local $self->{_selecto_derived_pair} = 1;
+    return $self->_identity_equal_sql(@arguments);
 }
 
 # A NULL-safe identity comparison of an inner and an outer column (retarget

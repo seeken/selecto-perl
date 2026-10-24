@@ -341,7 +341,15 @@ sub _identity_equal_sql {
         return;
     };
     my $bytes = $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right);
-    if (($exact // 0) == 1 && !(_plain_column($left) && _plain_column($right))) {
+    if ($self->{_selecto_derived_pair} && ($exact // 0) == 2) {
+        # A derived column may carry another collation than the root's (a
+        # COALESCE with a literal): the collated equality is not used.
+        $paste->();
+        $paste->();
+        $paste->();
+        return "(CASE WHEN COLLATION($left) = 'binary' AND COLLATION($right) = 'binary' THEN $left = $right ELSE $bytes END)";
+    }
+    if (($exact // 0) == 1 && (!(_plain_column($left) && _plain_column($right)) || $self->{_selecto_derived_pair})) {
         # An expression operand has no index to keep: its bytes decide.
         $paste->();
         return "($bytes)";
@@ -437,10 +445,17 @@ sub _identity_operand_field {
 # GROUP BY, so selecting it remains valid).
 sub _compile_group_expression {
     my ($self, $domain, $expression, $params, $byte_groups) = @_;
-    my $sql = $self->SUPER::_compile_group_expression($domain, $expression, $params);
-    return $sql unless ref($byte_groups) eq 'HASH' && blessed($expression) && $expression->kind eq 'field'
-        && !ref($expression->arguments->[0]) && $byte_groups->{$expression->arguments->[0]};
-    return $self->_identity_bytes_sql($sql) . ", $sql";
+    my $plain = !(ref($byte_groups) eq 'HASH' && $byte_groups->{all} && blessed($expression));
+    # A declared non-text field groups as before; text and unknown types
+    # (and any other expression) group by their bytes as well.
+    if (!$plain && $expression->kind eq 'field' && !ref($expression->arguments->[0])) {
+        my $resolved = eval { $domain->resolve($expression->arguments->[0]) };
+        $plain = 1 if ref($resolved) eq 'HASH' && !Selecto::SQL::_identity_text_type($resolved->{type});
+    }
+    return $self->SUPER::_compile_group_expression($domain, $expression, $params) if $plain;
+    # Compiled once per paste, so any parameters repeat in SQL-text order.
+    my $bytes = $self->_identity_bytes_sql($self->SUPER::_compile_group_expression($domain, $expression, $params));
+    return "$bytes, " . $self->SUPER::_compile_group_expression($domain, $expression, $params);
 }
 
 # A computed field (a predicate body, a value expression's CASE condition, a

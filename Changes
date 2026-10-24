@@ -8,12 +8,17 @@ Unreleased
       only an index on id, a key reassignment plus a decoy sharing the old
       key passed the post-image re-read. Required-only and query-enforced
       updates are unchanged.
-    - MySQL/MariaDB: a query member grouped by a key it joins to the root as
-      identity (CTE, subquery) groups by the key's utf8mb4 bytes too, so
+    - MySQL/MariaDB: a query member with any output joined or correlated to
+      its root as identity (CTE, subquery, lateral; whether the output is a
+      field, an alias or a value expression) groups every text or
+      unknown-type key by its utf8mb4 bytes too, so
       'T1', 't1 ' and 'tı' rows are not merged into the root's 't1' group;
       member correlations treat every column the host's required or trusted
       predicates compare as identity (a required-only lateral or recursive
-      member matched 'T1' rows).
+      member matched 'T1' rows). Exact pairs with a derived column (CTE,
+      VALUES, subquery) compare bytes only, so a column of another collation
+      (COALESCE with a literal) no longer fails with an illegal collation
+      mix.
     - Governed updates keep their rows inside their bound scope (TW-09: the
       engine tenant, writes.scope and a host scope predicate) after the
       write, on every backend: the rows are locked and named by key in the

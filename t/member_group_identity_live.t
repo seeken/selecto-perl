@@ -63,6 +63,14 @@ for my $backend (@backends) {
             query_members => {
                 ctes => {
                     tot => {source => 'mem', query => $grouped, join => {owner_key => 'org_key', related_key => 'org_key', type => 'left'}},
+                    # The joined output spelled as an alias of the field, and
+                    # as a value expression over it.
+                    atot => {source => 'mem', query => {select => [{as => 'k', value => ['field', 'org_key']},
+                        {as => 'total', aggregate => 'sum', field => 'amount'}], group_by => ['org_key']},
+                        join => {owner_key => 'org_key', related_key => 'k', type => 'left'}},
+                    vtot => {source => 'mem', query => {select => [{as => 'k', value => ['coalesce', ['field', 'org_key'], ['literal', 'x']]},
+                        {as => 'total', aggregate => 'sum', field => 'amount'}], group_by => ['org_key']},
+                        join => {owner_key => 'org_key', related_key => 'k', type => 'left'}},
                     tree => {kind => 'recursive', source => 'mem',
                         base => {select => ['id', 'parent_id', 'org_key'], filter => ['is_null', 'parent_id']},
                         step => {select => ['id', 'parent_id', 'org_key']},
@@ -83,6 +91,8 @@ for my $backend (@backends) {
         };
         is($values->('tot', 'total'), '1', "$name $label: a grouped CTE member sums only the exact key");
         is($values->('stot', 'total'), '1', "$name $label: a grouped subquery member sums only the exact key");
+        is($values->('atot', 'total'), '1', "$name $label: an aliased joined key groups exactly");
+        is($values->('vtot', 'total'), '1', "$name $label: a value expression over the joined key groups exactly");
         is($values->('tree', 'id'), '1', "$name $label: a recursive member joins only the exact key");
         is($values->('lat', 'amount'), '1', "$name $label: a lateral member correlates only the exact key");
     }
