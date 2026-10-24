@@ -3550,7 +3550,12 @@ sub _enforced_unique_key {
             for my $index (@{$dbh->selectall_arrayref('PRAGMA index_list(' . $self->quote_identifier($table) . ')', {Slice => {}})}) {
                 next unless $index->{unique} && !$index->{partial};
                 my $columns = $dbh->selectall_arrayref('PRAGMA index_info(' . $self->quote_identifier($index->{name}) . ')', {Slice => {}});
-                push @indexes, [map { [$_->{name}, defined($_->{name}) && $info{lc $_->{name}}{notnull} ? 1 : 0] } @$columns];
+                # SQLite lets a non-INTEGER PRIMARY KEY column hold NULL
+                # unless declared NOT NULL. A NULL key is never named by the
+                # re-read (IN never matches it; a NULL locked key fails the
+                # count), and the index keeps every other value unique.
+                my $primary = ($index->{origin} // '') eq 'pk';
+                push @indexes, [map { [$_->{name}, defined($_->{name}) && ($primary || $info{lc $_->{name}}{notnull}) ? 1 : 0] } @$columns];
             }
         }
         1;
