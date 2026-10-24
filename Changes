@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 Unreleased
+    - transaction_handler: a failure the handler swallows (for example
+      eval { $work->() } followed by a commit) is raised again after the
+      handler returns, instead of execute_write returning undef as if it
+      had applied. The write's savepoint already kept its DML from being
+      committed.
     - DuckDB, external mode and transaction_handler: the primary-key reach
       bound now also requires every key column to be non-text and the
       schema search path to be the default. A VARCHAR key (COLLATE NOCASE,
