@@ -1549,7 +1549,7 @@ sub insert_admission_storage {
         ($triggers) = $dbh->selectrow_array($self->_statement_sql(q{SELECT COUNT(*) FROM information_schema.TRIGGERS
             WHERE EVENT_OBJECT_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = ?}), undef, $table);
         $rows = $dbh->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, EXTRA,
-            CHARACTER_SET_NAME, COLLATION_NAME FROM information_schema.COLUMNS
+            CHARACTER_SET_NAME, COLLATION_NAME, CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), {Slice => {}}, $table);
         1;
     };
@@ -1573,8 +1573,13 @@ sub insert_admission_storage {
             $fail->() unless $TEXT_TYPES{$name} && defined($column->{CHARACTER_SET_NAME})
                 && defined($column->{COLLATION_NAME})
                 && $column->{CHARACTER_SET_NAME} =~ /\A\w+\z/ && $column->{COLLATION_NAME} =~ /\A\w+\z/;
-            $storage{$field} = {cast => "CHAR CHARACTER SET $column->{CHARACTER_SET_NAME}",
-                collation => $column->{COLLATION_NAME}};
+            # A CHAR/VARCHAR column's declared length is part of the cast:
+            # the column drops excess trailing blanks ('t1 ' in VARCHAR(2)
+            # is stored as 't1'), and so does CAST(... AS CHAR(n)).
+            my $length = $name eq 'char' || $name eq 'varchar' ? $column->{CHARACTER_MAXIMUM_LENGTH} : undef;
+            $fail->() if ($name eq 'char' || $name eq 'varchar') && !(defined($length) && "$length" =~ /\A[1-9][0-9]{0,5}\z/);
+            $storage{$field} = {cast => 'CHAR' . (defined($length) ? "($length)" : '')
+                . " CHARACTER SET $column->{CHARACTER_SET_NAME}", collation => $column->{COLLATION_NAME}};
         }
     }
     return \%storage;

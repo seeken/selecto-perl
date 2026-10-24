@@ -1,6 +1,26 @@
 Revision history for Selecto
 
 Unreleased
+    - Candidate admission follows query_enforced_scalar v2 (specification
+      2.37): QueryEnforcement::evaluate decides by the declared column type
+      and metadata level. Text compares UTF-8 bytes (a text pin '10' no
+      longer admits '1e1', '010', ' 10', '+10' or '10.0'), text ranges are
+      refused, numbers compare exactly after a stored-unchanged check
+      (declared length, precision and scale), other types decide only
+      byte-identical eq/ne, an undeclared or unverified type decides
+      nothing, absent fields and column pairs are not evaluable. Both v2
+      corpora (704 + 532) pass; the v1 runner is removed (v1 fixtures kept).
+    - Declared domain types are unverified in process (Perl reads no catalog
+      at compile time and issues no DDL): portable insert validation and
+      explicit *_unsafe tooling defer every comparison to the verified-
+      storage check before DML. Untyped *_unsafe guarded inserts, which
+      admitted '1e1' under '10', 't1 ' into VARCHAR(2) under <> 't1' and
+      '0.004' into NUMERIC(10,2) under > 0, are refused with
+      query_rule_not_evaluable; with declared field_types they defer.
+    - MySQL/MariaDB storage admission casts CHAR/VARCHAR candidates with
+      the column's declared length, as the column stores them.
+    - Governed integer candidates may carry a sign or leading zeroes ('010'
+      under amount = 10 is admitted, as PostgreSQL stores it).
     - A retarget onto an association confined by a fixed where policy
       applies that policy to the target rows themselves (all backends,
       PostgreSQL and SQLite included): with keys repeating across sites the

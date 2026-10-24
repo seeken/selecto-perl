@@ -70,6 +70,7 @@ lib/Selecto/SQLite/UpsertCandidate.pm
 lib/Selecto/SQLite/UpsertIndependence.pm
 t/json_encoders_nonref.t
 t/limits_lookup.t
+t/scalar_admission_v2_live.t
 t/sqlite_upsert_candidate_native.t
 t/sqlite_rules_transaction_handler.t
 t/sqlite_upsert_plan_independence.t
@@ -149,7 +150,9 @@ t/fixtures/data_rules/baseline.contract.json
 t/fixtures/data_rules/invalid.cases.json
 t/fixtures/data_rules/README.md
 t/fixtures/query_enforced_scalar_edges_v1.json
+t/fixtures/query_enforced_scalar_edges_v2.json
 t/fixtures/query_enforced_scalar_v1.json
+t/fixtures/query_enforced_scalar_v2.json
 t/fixtures/Selecto-Adapter-FutureDB/lib/Selecto/Adapter/FutureDB.pm
 t/fixtures/Selecto-Adapter-FutureDB/Makefile.PL
 t/governance_hardening.t
@@ -180,7 +183,7 @@ t/postgresql.t
 t/postgresql_transaction.integration.t
 t/query.t
 t/query_enforcement.t
-t/query_enforcement_scalar.t
+t/query_enforcement_scalar_v2.t
 t/query_library.t
 t/query_member.t
 t/reference_tenant_agreement.t

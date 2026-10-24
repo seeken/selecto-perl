@@ -641,7 +641,8 @@ sub _compile_flat {
     my $backend = $opts->{storage_backend} // ($state->{query_enforcement} // {})->{storage_backend};
     _fail('query_enforcement_unsupported_operation', 'upsert cannot enforce required context predicates', {operation=>$type})
         if $type eq 'upsert' && defined $required;
-    Selecto::Write::QueryEnforcement->validate_insert($state, $values, $required, $backend);
+    Selecto::Write::QueryEnforcement->validate_insert($state, $values, $required, $backend,
+        {map { $_ => $contract->{source}{columns}{$_}{type} } keys %{$contract->{source}{columns} // {}}});
     if ($type eq 'insert' && ($backend // '') eq 'sqlite') {
         my @admission_filters = @$filters;
         push @admission_filters, [$tenant_field, 'eq', $tenant] if defined $tenant_field;
