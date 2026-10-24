@@ -3545,19 +3545,43 @@ Validates and executes a command in a transaction, returning a
 L<Selecto::Write::Result>. The affected-row count must equal
 C<expected_count> or the transaction rolls back with C<cardinality_mismatch>.
 
-An update under a bound scope (the engine tenant, C<writes.scope>, or a host
-scope predicate) keeps the rows it updates inside that scope: they are
-locked by an enforced unique key, which the update may not assign, and
-re-read after the statement, when every non-deferred row trigger has run.
-An update that moved a row out of scope rolls back with
-C<query_rule_violation>. Updates through views, on tables with deferrable
-constraint triggers (C<query_rule_not_evaluable>) or statement-level update
-triggers (C<write_capability_missing>) are refused, as are bound-scope
-deletes on tables with statement-level delete triggers. Row-level triggers that
-modify I<other> rows are outside this guarantee. A plain required predicate
-and query enforcement bound the rows an update finds, not the rows it
-leaves. An upsert keeps a scope only as equalities on its conflict-target
+An update under a bound scope (the engine tenant, C<writes.scope>, a host
+scope predicate, or a required filter that pins the declared tenant field)
+keeps the rows it updates inside that scope: they are locked by an enforced
+unique key, which the update may not assign, and re-read after the
+statement, when every non-deferred row trigger has run. An update that moved
+a row out of scope rolls back with C<query_rule_violation>. A plain required
+predicate and query enforcement bound the rows an update finds, not the rows
+it leaves. An upsert keeps a scope only as equalities on its conflict-target
 columns; otherwise it is refused with C<unsupported_scope_predicate>.
+
+Refused before any DML:
+
+=over 4
+
+=item * updates through views, or on PostgreSQL relations with rules,
+non-partition inheritance children, or statement-level update triggers on
+the relation or below it, and bound-scope deletes with statement-level
+delete triggers or delete rules;
+
+=item * on PostgreSQL, any bound-scope update while an enabled deferrable
+constraint trigger exists anywhere in the database (checked again after the
+statement), and any guarded write outside READ COMMITTED
+(C<query_rule_not_evaluable>, reason C<isolation_level>);
+
+=item * bound-scope updates on adapters that do not re-read the rows
+(DuckDB, SQL Server), and MySQL/MariaDB inserts or upserts with C<RETURNING>
+on tables with C<BEFORE INSERT> triggers (C<write_capability_missing>).
+
+=back
+
+B<Triggers that modify other rows are the schema owner's responsibility.>
+Row-level triggers stay allowed (an C<updated_at> or audit trigger keeps
+working), and Selecto verifies only the rows the write itself names: what a
+row-level trigger does to I<other> rows (another tenant's, another table's)
+is outside every scope guarantee above and is never checked. A schema owner
+who installs such triggers on governed tables must make them respect the
+tenant boundary themselves.
 
 =head2 execute_batch
 

@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 Unreleased
+    - Documentation: Selecto::Engine execute_write lists every pre-DML
+      refusal of governed writes and states plainly that row-level triggers
+      stay allowed and that what they do to other rows is the schema
+      owner's responsibility, outside every scope guarantee.
     - Savepoint names now carry a random nonce
       (selecto_write_<hex serial>_<8 hex>, likewise for the upsert, insert
       admission and bounded-probe savepoints) instead of
