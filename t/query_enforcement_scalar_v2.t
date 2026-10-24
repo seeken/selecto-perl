@@ -5,10 +5,11 @@ use Test::More;
 use JSON::PP ();
 use Selecto::Expression ();
 use Selecto::QueryEnforcement ();
+use Math::BigInt ();
 
 # The central query_enforced_scalar v2 corpora (specification 2.37, copied
-# byte for byte from selecto_backend_certification priv/fixtures at
-# 11d845a): every case runs through the public candidate evaluator with the
+# byte for byte from selecto_backend_certification priv/fixtures: the
+# main corpus at 2539564 (branch scalar-v2-domains), the edges at 11d845a): every case runs through the public candidate evaluator with the
 # case's declared column type, metadata level and backend.
 sub load {
     my ($path) = @_;
@@ -21,13 +22,13 @@ my $main = load('t/fixtures/query_enforced_scalar_v2.json');
 my $edges = load('t/fixtures/query_enforced_scalar_edges_v2.json');
 is($main->{format}, 'selecto.query-enforced-scalar.v2', 'main corpus format');
 is($edges->{format}, 'selecto.query-enforced-scalar-edges.v2', 'edge corpus format');
-is(scalar @{$main->{cases}}, 704, 'main corpus count');
+is(scalar @{$main->{cases}}, 714, 'main corpus count');
 is(scalar @{$edges->{cases}}, 532, 'edge corpus count');
 my %prefix;
 $prefix{substr($_->{id}, 0, 1)}++ for @{$main->{cases}};
-is_deeply(\%prefix, {S => 239, T => 212, N => 119, I => 103, U => 21, X => 10}, 'main corpus layout');
-is(scalar(grep { ($_->{metadata} // '') eq 'base_verified' } @{$main->{cases}}), 30, 'base_verified cases');
-is(scalar(grep { ($_->{metadata} // '') eq 'unverified' } @{$main->{cases}}), 13, 'unverified cases');
+is_deeply(\%prefix, {S => 239, T => 212, N => 119, I => 103, U => 31, X => 10}, 'main corpus layout');
+is(scalar(grep { ($_->{metadata} // '') eq 'base_verified' } @{$main->{cases}}), 34, 'base_verified cases');
+is(scalar(grep { ($_->{metadata} // '') eq 'unverified' } @{$main->{cases}}), 14, 'unverified cases');
 is(scalar(grep { ($_->{backend} // '') eq 'mysql_family' } @{$main->{cases}}), 11, 'mysql_family cases');
 
 my $x = 'Selecto::Expression';
@@ -63,5 +64,18 @@ for my $case (@{$main->{cases}}, @{$edges->{cases}}) {
     ok($ok, "$case->{id}: " . ($case->{column_type} // 'undeclared') . " $op")
         or diag("class $class (want $case->{type_class}), outcome $outcome (want $case->{outcome}) @warnings");
 }
-is($passed, $total, "all $total v2 cases match (704 main + 532 edges)");
+is($passed, $total, "all $total v2 cases match (714 main + 532 edges)");
+{
+    # Host Math::BigInt rounding defaults must not affect admission.
+    local $Math::BigInt::accuracy = 1;
+    local $Math::BigInt::precision = -1;
+    my $integer = {subject => {type => 'bigint', metadata => 'verified'}};
+    is(Selecto::QueryEnforcement::evaluate($x->gt('subject', '9007199254740992'), {subject => '9007199254740993'}, $integer),
+        'true', 'host BigInt accuracy and precision do not affect an exact integer comparison');
+    is(Selecto::QueryEnforcement::evaluate($x->eq('subject', '9007199254740992'), {subject => '9007199254740993'}, $integer),
+        'false', 'nor equality');
+    my $decimal = {subject => {type => 'numeric(20,3)', metadata => 'verified'}};
+    is(scalar(eval { Selecto::QueryEnforcement::evaluate($x->ne('subject', '1'), {subject => '1.0004'}, $decimal) } // $@->code),
+        'query_rule_not_evaluable', 'nor the stored-unchanged scale check');
+}
 done_testing;

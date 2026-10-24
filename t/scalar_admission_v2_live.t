@@ -84,6 +84,20 @@ push @cases, ["10 decimal/DECIMAL(12,2) < 16", 'DECIMAL(12,2)', 'DECIMAL(12,2)',
   ["10 string/varchar(2) <>", 'VARCHAR(2)', 'VARCHAR(2)', 'string', $x->ne('org_key', 't1'), 't1 ', 'refuse'],
   ["10 string/varchar(2) = own", 'VARCHAR(2)', 'VARCHAR(2)', 'string', $x->eq('org_key', 't1'), 't1', 'apply'];
 push @cases, ["11 integer over text", 'TEXT', 'VARCHAR(16)', 'integer', $x->eq('org_key', '10'), '010', 'refuse'];
+# Fixed-width CHAR(n) reads back with its trailing blanks stripped: no cast
+# reproduces it, so storage admission refuses the column (PostgreSQL bpchar,
+# MySQL-family CHAR/NCHAR) and nothing is admitted.
+for my $ddl (['CHAR(4)', 'CHAR(4)'], ['CHAR(4) COLLATE "C"', 'CHAR(4) COLLATE utf8mb4_bin']) {
+  push @cases, ["12 $ddl->[1] <> t1", @$ddl, 'string', $x->ne('org_key', 't1'), 't1 ', 'refuse'],
+    ["12 $ddl->[1] NOT IN t1", @$ddl, 'string', $x->not($x->in('org_key', ['t1'])), 't1 ', 'refuse'],
+    ["12 $ddl->[1] = 't1 '", @$ddl, 'string', $x->eq('org_key', 't1 '), 't1 ', 'refuse'];
+}
+# PostgreSQL domains (here over varchar(2) and numeric(10,0)) hide the
+# typmod from the declared name: storage admission refuses them, so neither
+# 't1 ' = 't1 ' (stored as 't1') nor 1.4 = 1.4 (stored as 1) is admitted.
+push @cases, ["13 domain over varchar(2) = 't1 '", 'selecto_v2_org_domain', 'n/a', 'string', $x->eq('org_key', 't1 '), 't1 ', 'refuse'],
+  ["13 domain over varchar(2) = own", 'selecto_v2_org_domain', 'n/a', 'string', $x->eq('org_key', 't1'), 't1', 'refuse'],
+  ["13 domain over numeric(10,0) = 1.4", 'selecto_v2_amount_domain', 'n/a', 'decimal', $x->eq('org_key', '1.4'), '1.4', 'refuse'];
 push @cases, ["N integer = 10 '010'", 'INTEGER', 'INT', 'integer', $x->eq('org_key', 10), '010', 'apply'],
   ["N numeric = 10 '10.0'", 'NUMERIC', 'DECIMAL(10,2)', 'decimal', $x->eq('org_key', 10), '10.0', 'apply'],
   ["R text range >= t", @$text, $x->gte('org_key', 't'), 'tz', 'refuse_or_defer'];
@@ -97,10 +111,15 @@ for my $backend (@backends) {
         if ($pg) {
             $dbh->do("CREATE COLLATION IF NOT EXISTS $_ (provider = icu, locale = 'und-u-ks-level2', deterministic = false)")
                 for qw(selecto_v2_ci ci_bin);
+            $dbh->do('DROP TABLE IF EXISTS selecto_v2_rows');
+            $dbh->do('DROP DOMAIN IF EXISTS selecto_v2_org_domain');
+            $dbh->do('DROP DOMAIN IF EXISTS selecto_v2_amount_domain');
+            $dbh->do('CREATE DOMAIN selecto_v2_org_domain AS varchar(2)');
+            $dbh->do('CREATE DOMAIN selecto_v2_amount_domain AS numeric(10,0)');
         }
         for my $case (@cases) {
             my ($label, $pg_ddl, $my_ddl, $declared, $predicate, $value, $expect) = @$case;
-            next if !$pg && $label =~ /\A9 /;
+            next if !$pg && $label =~ /\A(?:9|13) /;
             (my $ddl = $pg ? $pg_ddl : $my_ddl) =~ s/\bCOLLATE ci\b/COLLATE selecto_v2_ci/;
             my $qe = ref($predicate) eq 'ARRAY' ? $predicate->[1] : undef;
             for my $path (qw(engine typed_tooling untyped_tooling)) {
@@ -139,6 +158,7 @@ for my $backend (@backends) {
         }
         $dbh->do('DROP TABLE IF EXISTS selecto_v2_rows');
         $dbh->do("DROP COLLATION IF EXISTS $_") for $pg ? qw(selecto_v2_ci ci_bin) : ();
+        $dbh->do("DROP DOMAIN IF EXISTS $_") for $pg ? qw(selecto_v2_org_domain selecto_v2_amount_domain) : ();
     };
 }
 
