@@ -39,6 +39,8 @@ WriteMakefile(
     },
     META_MERGE => {
         'meta-spec' => { version => 2 },
+        # 4.80 reorders canonical keys outside the BMP (breaks ER005 and fingerprints).
+        prereqs => { runtime => { requires => { 'Cpanel::JSON::XS' => '>= 4.38, < 4.80' } } },
         resources => {
             repository => {
                 type => 'git',
@@ -55,7 +57,7 @@ WriteMakefile(
         optional_features => {
             postgresql => {
                 description => 'PostgreSQL execution and certification',
-                prereqs => { runtime => { requires => { 'DBD::Pg' => '3.016' } } },
+                prereqs => { runtime => { requires => { 'DBD::Pg' => '>= 3.21.2' } } },
             },
             mysql => {
                 description => 'MySQL execution and certification',
