@@ -162,4 +162,61 @@ for my $backend (@backends) {
     };
 }
 
+# A fixed-width CHAR(n) tenant column (the usual uuid tenant, CHAR(36)) keeps
+# governed inserts: their stored row is re-read under the enforced predicate,
+# so the own tenant's row is applied under writes.scope.tenant, a required
+# predicate or a host scope predicate, another tenant's (or a case variant of
+# the own) is refused, and 't1 ' (stored 't1') is refused by that re-check
+# (cases 12 above). Only commands without the re-check
+# (*_unsafe tooling) refuse CHAR(n) outright.
+for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
+    my ($name, $connect) = @$backend;
+    subtest "$name governed inserts on a CHAR(36) tenant column" => sub {
+        my $dbh = $connect->();
+        my $tenant = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+        my $base = {schema_version => 1, name => 'CharTenant',
+            source => {%{relation('selecto_v2_char_rows', id => 'integer', tenant_id => 'string', label => 'string')},
+                tenant_field => 'tenant_id'},
+            schemas => {}, joins => {},
+            writes => {operations => {insert => {enabled => 1}},
+                fields => {map { ($_ => {insertable => 1}) } qw(id tenant_id label)}}};
+        my %modes = (
+            'writes.scope.tenant' => sub {
+                my $document = {%$base, writes => {%{$base->{writes}},
+                    scope => {tenant => {field => 'tenant_id', satisfied_by => ['trusted_context']}}}};
+                return (Selecto::Engine->new(adapter => $_[0], domain => Selecto::Domain->parse($document),
+                    scope => {tenant => $tenant}), {});
+            },
+            'required predicate' => sub {
+                return (Selecto::Engine->new(adapter => $_[0], domain => Selecto::Domain->parse($base)
+                    ->with_required_predicate($x->eq('tenant_id', $tenant))), {});
+            },
+            'host scope predicate' => sub {
+                return (Selecto::Engine->new(adapter => $_[0], domain => Selecto::Domain->parse($base)),
+                    {scope_predicate => $x->eq('tenant_id', $tenant)});
+            },
+        );
+        for my $mode (sort keys %modes) {
+            for my $case (['own tenant', $tenant, 'apply'], ['another tenant', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'refuse'],
+                ['the own tenant in upper case', uc($tenant), 'refuse']) {
+                my ($label, $value, $expect) = @$case;
+                $dbh->do('DROP TABLE IF EXISTS selecto_v2_char_rows');
+                $dbh->do('CREATE TABLE selecto_v2_char_rows (id INT PRIMARY KEY, tenant_id CHAR(36) NOT NULL, label VARCHAR(16))');
+                my ($engine, $extra) = $modes{$mode}->(Selecto->adapter($name => (dbh => $dbh)));
+                my $error = eval {
+                    $engine->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_v2_char_rows',
+                        assignments => {id => 1, tenant_id => $value, label => 'x'}, %$extra));
+                    1;
+                } ? undef : $@;
+                my ($rows) = $dbh->selectrow_array('SELECT COUNT(*) FROM selecto_v2_char_rows');
+                is($rows ? 'apply' : 'refuse', $expect, "$mode: $label")
+                    or diag(blessed($error) ? $error->code : $error);
+                ok(blessed($error) && $error->isa('Selecto::Error'), "$mode: $label refused with a typed error")
+                    or diag($error) if $expect eq 'refuse';
+            }
+        }
+        $dbh->do('DROP TABLE IF EXISTS selecto_v2_char_rows');
+    };
+}
+
 done_testing;
