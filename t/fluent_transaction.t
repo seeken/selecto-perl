@@ -23,7 +23,8 @@ is($error->details->{commit_state}, 'unknown', 'never claims safe rollback after
 ok(!$error->details->{retryable}, 'commit ambiguity cannot authorize automatic retry');
 is($runs, 1, 'callback never retries');
 
-my $retry_adapter = Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new,
+# Host handlers own a transaction (AutoCommit off) while they run the work.
+my $retry_adapter = Selecto::PostgreSQL->new(dbh => do { my $d = TestSelecto::DBH->new; $d->{AutoCommit} = 0; $d },
     transaction_handler => sub { my ($work) = @_; $work->(); $work->() });
 my $retry_engine = Selecto::Engine->new(domain => $domain, adapter => $retry_adapter);
 $runs = 0;
@@ -31,7 +32,7 @@ $ok = eval { $retry_engine->transaction(sub { ++$runs; return 1 }); 1 };
 ok(!$ok, 'host handler cannot replay callback');
 is($@->code, 'invalid_transaction', 'stable callback replay refusal');
 is($runs, 1, 'second callback invocation prevented before user code');
-my $committed_adapter = Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new,
+my $committed_adapter = Selecto::PostgreSQL->new(dbh => do { my $d = TestSelecto::DBH->new; $d->{AutoCommit} = 0; $d },
     transaction_handler => sub {
         $_[0]->();
         Selecto::Error->throw('post_commit_failure', 'synthetic post-commit result failure',

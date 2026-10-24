@@ -1,6 +1,16 @@
 Revision history for Selecto
 
 Unreleased
+    - transaction_handler: work the handler runs outside a transaction on
+      the adapter's connection (an autocommit handle) is refused before any
+      statement with transaction_unavailable (reason autocommit). Any write
+      can be refused after its statement (an expected count matching more
+      rows, a post-image violation), and in autocommit its change was
+      already committed: an update expecting 1 row that matched 2 changed
+      both. Managed writes on an idle handle (their own transaction) and
+      managed or external writes inside a host transaction (a savepoint)
+      were already atomic on PostgreSQL, SQLite, MySQL and MariaDB and are
+      unchanged.
     - MySQL/MariaDB: every update and delete, guarded or not, and every
       command of a batch or graph, requires an InnoDB base table (checked
       after the table's metadata lock; a session TEMPORARY table shadowing
