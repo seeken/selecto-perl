@@ -531,9 +531,20 @@ sub _enforced_unique_key_duckdb {
                 OR (database_name = current_database() AND schema_name = current_schema()))
             ORDER BY CASE WHEN database_name = 'temp' THEN 0 ELSE 1 END LIMIT 1}, undef, "$relation");
         return 0 unless defined $table;
-        my %nullable = map { (lc($_->[0]) => ($_->[1] ? 1 : 0)) } @{$dbh->selectall_arrayref(q{
-            SELECT column_name, is_nullable FROM duckdb_columns()
-            WHERE database_name = ? AND schema_name = ? AND table_name = ?}, undef, $database, $schema, $table)};
+        # A schema search path other than the default can resolve the name
+        # elsewhere: not proven.
+        my ($search_path) = $dbh->selectrow_array(q{SELECT current_setting('search_path')});
+        return 0 if defined($search_path) && $search_path ne '';
+        my (%nullable, %text);
+        for my $row (@{$dbh->selectall_arrayref(q{
+            SELECT column_name, is_nullable, data_type FROM duckdb_columns()
+            WHERE database_name = ? AND schema_name = ? AND table_name = ?}, undef, $database, $schema, $table)}) {
+            $nullable{lc $row->[0]} = $row->[1] ? 1 : 0;
+            # DuckDB compares a text key under its collation (COLLATE NOCASE,
+            # default_collation) and casts it to a literal's type ('01' = 1),
+            # so a text key never identifies at most one row per value.
+            $text{lc $row->[0]} = ($row->[2] // '') =~ /CHAR|TEXT|STRING|BLOB|BYTEA|BINARY|BIT|JSON|ENUM/i ? 1 : 0;
+        }
         my %constraints;
         for my $row (@{$dbh->selectall_arrayref(q{
             SELECT constraint_index, constraint_type, unnest(constraint_column_names) FROM duckdb_constraints()
@@ -546,7 +557,7 @@ sub _enforced_unique_key_duckdb {
         for my $entry (values %constraints) {
             my @columns = @{$entry->{columns}};
             next unless @columns;
-            return 1 unless grep { !$want{$_} || (!$entry->{primary} && ($nullable{$_} // 1)) } @columns;
+            return 1 unless grep { !$want{$_} || ($text{$_} // 1) || (!$entry->{primary} && ($nullable{$_} // 1)) } @columns;
         }
         0;
     };
@@ -575,7 +586,7 @@ sub _refuse_unverifiable_external {
     my $refusable = @commands > 1 ? grep { _post_statement_checked($_) } @commands
         : grep { $self->_post_statement_refusable($_) } @commands;
     Selecto::Error->throw('transaction_unavailable',
-        'DuckDB has no savepoints: in external mode a write that could be refused after its statement cannot undo its DML',
+        'DuckDB has no savepoints: in external or handler mode a write that could be refused after its statement cannot undo its DML',
         {reason => 'no_savepoints'}) if $refusable;
     return;
 }
@@ -599,7 +610,7 @@ sub execute_graph_unsafe {
         my @nodes = @{$graph->nodes};
         # A later node's binding or check can fail after an earlier node ran.
         Selecto::Error->throw('transaction_unavailable',
-            'DuckDB has no savepoints: in external mode a multi-node graph cannot undo its own DML',
+            'DuckDB has no savepoints: in external or handler mode a multi-node graph cannot undo its own DML',
             {reason => 'no_savepoints'}) if @nodes > 1;
         $self->_refuse_unverifiable_external(map { $_->{command} } @nodes);
     }
@@ -655,7 +666,9 @@ count or declared C<expected_cardinality> (or the engine's row ceiling)
 could fail for some affected count from 1 up to the rows it can reach (one
 for an insert or upsert, the primary-key identity bound of an update's or
 delete's predicate when that key is an enforced PRIMARY KEY or NOT NULL
-UNIQUE constraint of the resolved table, unbounded otherwise), a batch of more than one
+UNIQUE constraint of the resolved table whose columns are all non-text
+(a text key is compared under its collation and cast to a literal's type)
+and the schema search path is the default; unbounded otherwise), a batch of more than one
 command when any carries an expected count, declared cardinality,
 foreign-key guards, RETURNING or engine governance, and any graph of more
 than one node. Foreign-key guard and RETURNING checks refuse only when
