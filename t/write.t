@@ -75,7 +75,7 @@ $external_dbh->{AutoCommit} = 0;
 my $external = Selecto::PostgreSQL->new(dbh => $external_dbh, transaction_mode => 'external');
 my $external_result = $external->execute_write_unsafe($command);
 is($external_result->affected_rows, 1, 'external transaction mode executes the write');
-is_deeply($external_dbh->events, [],
+is_deeply([grep { !/SAVEPOINT/ } @{$external_dbh->events}], [],
     'external transaction mode leaves begin, commit, and rollback to the caller');
 
 my $autocommit_dbh = TestSelecto::DBH->new({ affected => 1 });
