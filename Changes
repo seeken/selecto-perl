@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - DuckDB, external mode: the primary-key bound on what an update or
+      delete can reach now counts only when the declared key is an enforced
+      PRIMARY KEY or NOT NULL UNIQUE constraint of the table the write
+      resolves to (a session temporary table first, then the current
+      database's current schema; other schemas and ATTACHed databases never
+      match). On a table without one, an update of id = 1 with
+      expected_count 1 changed two duplicate rows, failed
+      cardinality_mismatch and the host's commit kept it; it is now refused
+      before any DML with transaction_unavailable.
     - Documentation: Selecto::Engine execute_write lists every pre-DML
       refusal of governed writes and states plainly that row-level triggers
       stay allowed and that what they do to other rows is the schema
