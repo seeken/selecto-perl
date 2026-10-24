@@ -1043,6 +1043,16 @@ sub write_command {
 # normalize assignments, apply the domain's tenant scope with the engine's
 # trusted tenant and the domain's required predicate, then validate against
 # the domain contract.
+# The bound scope an update's post-image must stay in (TW-09): the engine
+# tenant's conditions and a host scope predicate. A portable command's scope
+# predicate carries its context-required and captured query predicates,
+# which bound the pre-image only, so only the tenant conditions apply there.
+sub _post_image_scope {
+    my ($command, @tenant) = @_;
+    my $portable = ($command->metadata->{portable_foreign_key_guards} // 0) ? 1 : 0;
+    return Selecto::QueryEnforcement::combine(($portable ? () : $command->scope_predicate), @tenant);
+}
+
 sub governed_write {
     my ($self, $command, %details) = @_;
     $self->assert_domain_identity;
@@ -1068,6 +1078,10 @@ sub governed_write {
     my $required = $self->required_write_guard($command->operation, %details);
     my $trusted;
     ($command, $trusted) = $self->_apply_write_tenant($command, $required, %details);
+    # The engine tenant, writes.scope and the host's scope predicate bound
+    # the rows an update leaves behind too (TW-09: bound tenant-like scope);
+    # the required predicate and query enforcement bound its pre-image only.
+    my $post_image_scope = _post_image_scope($command, $self->_write_tenant_conditions);
     # The required predicate is host-authored, so it joins the scope after
     # writes.scope.tenant has checked the caller's own tenant references;
     # both boundaries then hold in the same statement.
@@ -1089,6 +1103,7 @@ sub governed_write {
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $self->{domain}->primary_key,
         $self->_tenant_fields_metadata,
+        (defined($post_image_scope) ? (__selecto_post_image_scope => $post_image_scope) : ()),
         __selecto_insert_types => $self->{domain}->fields,
         __selecto_limits => $self->{limits},
         __selecto_write_limit => $self->{limits}->get('max_action_targets')});
@@ -2935,10 +2950,17 @@ sub _validate_graph_node {
     my $required = $nested_engine->required_write_guard($command->operation, graph_node => $node->{id});
     my ($trusted, $filled);
     ($command, $trusted) = $nested_engine->_apply_write_tenant($command, $required, graph_node => $node->{id});
+    # As for the root: tenant and host scope (and the confinement below) bound
+    # the post-image of an update, the required predicate only its pre-image.
+    my $post_image_scope = _post_image_scope($command, $nested_engine->_write_tenant_conditions);
     $command = $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $required)) if defined $required;
+    my $before_confine = $command->scope_predicate;
     ($command, $filled) = $self->_confine_child_tenants($command, $tenants, $edge->{fields}, graph_node => $node->{id})
         unless $scope;
+    my %prior = map { (Scalar::Util::refaddr($_) => 1) } Selecto::SQL::_top_conjuncts($before_confine);
+    $post_image_scope = Selecto::QueryEnforcement::combine($post_image_scope,
+        grep { !$prior{Scalar::Util::refaddr($_)} } Selecto::SQL::_top_conjuncts($command->scope_predicate));
     $trusted = [@$trusted, @{$filled // []}];
     my %nested_fields = %{$edge->{fields} // {}};
     my %returning_fields = map { ($_ => $nested_domain->_field_metadata_view($_)) } keys %nested_fields;
@@ -2959,6 +2981,7 @@ sub _validate_graph_node {
     ));
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $edge->{primary_key},
+        (defined($post_image_scope) ? (__selecto_post_image_scope => $post_image_scope) : ()),
         $nested_engine->_tenant_fields_metadata(grep { exists $edge->{fields}{$_} }
             @{_root_tenant_fields($self->{domain}->tenant_field, $self->{domain}->write_tenant_scope)}),
         __selecto_insert_types => $edge->{field_types},

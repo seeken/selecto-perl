@@ -1552,7 +1552,11 @@ sub _inserted_identity {
 sub _tenant_conjuncts {
     my ($command) = @_;
     my %tenant = map { ($_ => 1) } @{$command->metadata->{__selecto_tenant_fields} // []};
-    my @pending = grep { defined } ($command->scope_predicate);
+    # An update's re-read follows its bound scope (TW-09): the required
+    # predicate bounds only the rows it found, which it may move out of.
+    my $metadata = $command->metadata;
+    my $governed_update = $command->operation eq 'update' && exists $metadata->{__selecto_primary_key};
+    my @pending = grep { blessed($_) } ($governed_update ? $metadata->{__selecto_post_image_scope} : $command->scope_predicate);
     my @kept;
     while (my $expression = shift @pending) {
         next unless blessed($expression) && $expression->isa('Selecto::Expression');
