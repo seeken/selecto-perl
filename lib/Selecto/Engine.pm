@@ -1053,6 +1053,26 @@ sub _post_image_scope {
     return Selecto::QueryEnforcement::combine(($portable ? () : $command->scope_predicate), @tenant);
 }
 
+# The tenant-pin rule (TW-09, bound tenant-like scope): a host required
+# conjunct that reads the domain's declared tenant field (source.tenant_field
+# or writes.scope.tenant.field) is tenant-like, so it bounds the post-image
+# of an update as well as its pre-image. Chosen by provenance (the conjuncts
+# of the host's own required predicate), never by comparing it with other
+# scope conjuncts. It fails closed: a conjunct that reads the tenant column
+# anywhere, whatever its spelling (an OR of one arm, NOT(<>), >= AND <=, a
+# one-value IN, nested ANDs), joins. The tenant columns are those the
+# tenant-assignment check guards. Every other required conjunct
+# (status = 'open') still bounds the pre-image only.
+sub _required_tenant_pins {
+    my ($domain, $required) = @_;
+    return () unless defined $required;
+    my %tenant = map { ($_ => 1) } @{_root_tenant_fields($domain->tenant_field, $domain->write_tenant_scope)};
+    return () unless %tenant;
+    return grep {
+        grep { defined($_) && !ref($_) && $tenant{$_} } Selecto::Expression->field_references($_)
+    } Selecto::SQL::_top_conjuncts($required);
+}
+
 sub governed_write {
     my ($self, $command, %details) = @_;
     $self->assert_domain_identity;
@@ -1080,8 +1100,10 @@ sub governed_write {
     ($command, $trusted) = $self->_apply_write_tenant($command, $required, %details);
     # The engine tenant, writes.scope and the host's scope predicate bound
     # the rows an update leaves behind too (TW-09: bound tenant-like scope);
-    # the required predicate and query enforcement bound its pre-image only.
-    my $post_image_scope = _post_image_scope($command, $self->_write_tenant_conditions);
+    # the required predicate and query enforcement bound its pre-image only,
+    # except for its conjuncts that pin the declared tenant field.
+    my $post_image_scope = _post_image_scope($command, $self->_write_tenant_conditions,
+        _required_tenant_pins($self->{domain}, $required));
     # The required predicate is host-authored, so it joins the scope after
     # writes.scope.tenant has checked the caller's own tenant references;
     # both boundaries then hold in the same statement.
@@ -2951,8 +2973,10 @@ sub _validate_graph_node {
     my ($trusted, $filled);
     ($command, $trusted) = $nested_engine->_apply_write_tenant($command, $required, graph_node => $node->{id});
     # As for the root: tenant and host scope (and the confinement below) bound
-    # the post-image of an update, the required predicate only its pre-image.
-    my $post_image_scope = _post_image_scope($command, $nested_engine->_write_tenant_conditions);
+    # the post-image of an update, the required predicate only its pre-image
+    # (apart from its tenant-field pins).
+    my $post_image_scope = _post_image_scope($command, $nested_engine->_write_tenant_conditions,
+        _required_tenant_pins($nested_engine->{domain}, $required));
     $command = $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $required)) if defined $required;
     my $before_confine = $command->scope_predicate;

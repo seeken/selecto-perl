@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - Tenant-pin rule (TW-09): a required filter that pins the domain's
+      declared tenant field (source.tenant_field or writes.scope.tenant
+      field), whether it comes from contract required_filters, write_context
+      required_filters or with_required_predicate, now bounds the post-image
+      of a governed update as well as its pre-image, on every backend and in
+      nested graph children. A BEFORE UPDATE trigger that moved the row to
+      another tenant was applied; it is now refused with
+      query_rule_violation and rolled back. The pin is chosen by provenance
+      (the host's required predicate), never by structural equality, and
+      fails closed: any required conjunct that reads the tenant column
+      joins, whatever its spelling (an OR of one arm, NOT(<>), >= AND <=,
+      a one-value IN, nested ANDs). Every other required filter still
+      bounds the pre-image only (status 'open' -> 'closed' applies).
     - PostgreSQL and SQLite refuse an upsert whose scope predicate (host,
       trusted or engine tenant) is not an equality on its conflict-target
       columns, with unsupported_scope_predicate, as MySQL and MariaDB refuse
