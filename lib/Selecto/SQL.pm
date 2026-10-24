@@ -2956,6 +2956,30 @@ sub _qualified {
     return $self->quote_identifier($alias) . '.' . $self->quote_identifier($field);
 }
 
+# ON CONFLICT ... DO UPDATE updates the conflicting row whatever its scope.
+# A scope predicate (host, trusted or engine tenant) is kept only when each
+# of its conjuncts is an equality on a conflict-target column: the
+# conflicting row then holds the candidate's value there, and the candidate
+# was admitted under that scope. Any other scope is refused, as MySQL and
+# MariaDB refuse every scoped upsert.
+sub _refuse_unbounded_scoped_upsert {
+    my ($command, $conflict) = @_;
+    my $scope = $command->scope_predicate;
+    return unless defined $scope;
+    my %target = map { ($_ => 1) } @$conflict;
+    my $assignments = $command->assignments;
+    for my $conjunct (_top_conjuncts($scope)) {
+        my ($field, $value) = @{$conjunct->arguments};
+        next if $conjunct->kind eq 'eq' && blessed($field) && $field->kind eq 'field' && !ref($field->arguments->[0])
+            && $target{$field->arguments->[0]} && blessed($value) && $value->kind eq 'literal'
+            && exists $assignments->{$field->arguments->[0]};
+        Selecto::Error->throw('unsupported_scope_predicate',
+            'an upsert can keep a write scope only on its conflict-target columns',
+            {upsert_strategy => 'on_conflict'});
+    }
+    return;
+}
+
 sub _compile_write {
     my ($self, $command) = @_;
     $self->_validate_write_cardinality($command);
@@ -3024,6 +3048,7 @@ sub _compile_write {
             Selecto::Error->throw('invalid_write', 'upsert update fields must be a non-empty string array')
                 unless ref($updates) eq 'ARRAY' && !(grep { ref($_) } @$updates)
                     && (@$updates || $self->_admits_empty_upsert_mask($command));
+            _refuse_unbounded_scoped_upsert($command, $conflict);
             $sql .= $self->_compile_upsert_clause($conflict, $updates);
         }
         return $self->_append_returning($sql, \@params, $command);
@@ -3485,7 +3510,9 @@ sub _admit_post_image_target {
             @row = $dbh->selectrow_array(q{
                 SELECT c.relkind,
                   (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal
-                    AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer
+                    AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal
+                    AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & 16) <> 0))::integer
                 FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, $self->quote_identifier($table));
         } elsif ($name eq 'sqlite') {
             @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
@@ -3499,11 +3526,17 @@ sub _admit_post_image_target {
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    my ($kind, $deferrable) = @row;
+    my ($kind, $deferrable, $statement_trigger) = @row;
     $refuse->('a governed update through a view cannot verify the rows it leaves behind')
         unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE'
             || $kind eq 'unknown');
     $refuse->('a deferrable constraint trigger could change the rows after their verification') if $deferrable;
+    # A statement-level UPDATE trigger can write rows the re-read does not
+    # name (row-level triggers that modify OTHER rows are likewise outside
+    # this guarantee; the re-read covers the updated rows only).
+    Selecto::Error->throw('write_capability_missing',
+        'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
+        if $statement_trigger;
     return if $kind eq 'unknown';
     # information_schema describes the base table, not a session TEMPORARY
     # table shadowing it (MySQL).

@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL and SQLite refuse an upsert whose scope predicate (host,
+      trusted or engine tenant) is not an equality on its conflict-target
+      columns, with unsupported_scope_predicate, as MySQL and MariaDB refuse
+      scoped upserts: ON CONFLICT ... DO UPDATE updated whichever row held
+      the conflicting key, so an upsert under org_key = 't1' took over or
+      overwrote another tenant's row. An engine-tenant upsert with the
+      tenant in its conflict target is unchanged.
+    - PostgreSQL: a bound-scope update on a table with an enabled
+      statement-level UPDATE trigger is refused with
+      write_capability_missing: such a trigger can write rows the post-image
+      re-read does not name. Row-level triggers that modify OTHER rows are
+      likewise outside the bound-scope guarantee, which covers the updated
+      rows.
     - A governed update under a bound scope (engine tenant, writes.scope,
       host scope predicate) requires an enforced unique key (containing a
       PRIMARY/UNIQUE index of whole, NOT NULL columns) and may not assign
