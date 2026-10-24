@@ -99,6 +99,41 @@ for my $case (sort keys %harmless) {
     $dbh->commit;
     is($rows->($dbh), $expected, "external: $case, and the host commits it");
 }
+# The primary-key bound counts only when the declared key is enforced on the
+# table the write resolves to. Without it, an update or delete of id = 1
+# with expected_count 1 changed both duplicate id = 1 rows, failed
+# cardinality_mismatch, and the host's commit kept the change.
+for my $table (
+    ['no key, duplicate ids', 'CREATE TABLE selecto_duck_ext (id INTEGER, org_key VARCHAR, note VARCHAR)', 1, 'refused'],
+    ['a nullable UNIQUE id', 'CREATE TABLE selecto_duck_ext (id INTEGER UNIQUE, org_key VARCHAR, note VARCHAR)', 0, 'refused'],
+    ['a NOT NULL UNIQUE id', 'CREATE TABLE selecto_duck_ext (id INTEGER NOT NULL UNIQUE, org_key VARCHAR, note VARCHAR)', 0, 'applied'],
+    ['a keyed table in another schema only', 'CREATE TABLE selecto_duck_ext (id INTEGER, org_key VARCHAR, note VARCHAR)', 1, 'refused',
+        'CREATE SCHEMA other; CREATE TABLE other.selecto_duck_ext (id INTEGER PRIMARY KEY, org_key VARCHAR, note VARCHAR)'],
+    ['a keyless temp table shadowing a keyed one', 'CREATE TABLE selecto_duck_ext (id INTEGER PRIMARY KEY, org_key VARCHAR, note VARCHAR)', 0,
+        'refused', 'CREATE TEMP TABLE selecto_duck_ext (id INTEGER, org_key VARCHAR, note VARCHAR)'],
+) {
+    my ($label, $ddl, $duplicate, $expected, $extra) = @$table;
+    for my $operation (qw(update delete)) {
+        my $dbh = DBI->connect('dbi:DuckDB:dbname=:memory:', '', '', {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+        $dbh->do($ddl);
+        $dbh->do($_) for grep { /\S/ } split /;\s*/, $extra // '';
+        $dbh->do(q{INSERT INTO selecto_duck_ext VALUES (1, 't1', 'n'), (2, 't2', 'n')});
+        $dbh->do(q{INSERT INTO selecto_duck_ext VALUES (1, 't1', 'dup')}) if $duplicate;
+        my $before = $rows->($dbh);
+        my $engine = Selecto::Engine->new(adapter => Selecto->adapter(duckdb => (dbh => $dbh, transaction_mode => 'external')), domain => $domain);
+        $dbh->begin_work;
+        my $code = $outcome->(sub { $engine->execute_write(Selecto::Write::Command->new(operation => $operation, relation => 'selecto_duck_ext',
+            ($operation eq 'update' ? (assignments => {note => 'x'}) : ()), predicate => $x->eq('id', 1), expected_count => 1)) });
+        $dbh->commit;
+        if ($expected eq 'refused') {
+            is($code, 'transaction_unavailable/no_savepoints', "external, $label: the $operation by the declared key is refused");
+            is($rows->($dbh), $before, "external, $label: $operation, and the host's commit keeps nothing");
+        } else {
+            is($code, 'applied', "external, $label: the $operation by the enforced key runs directly");
+        }
+    }
+}
+
 for my $case (sort keys %checked) {
     my $dbh = $setup->();
     my $engine = Selecto::Engine->new(adapter => Selecto->adapter(duckdb => (dbh => $dbh)), domain => $domain);

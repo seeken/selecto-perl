@@ -492,7 +492,8 @@ sub _post_statement_refusable {
     my $reach;
     if ($operation eq 'insert' || $operation eq 'upsert') {
         $reach = 1;
-    } elsif (exists $command->metadata->{__selecto_primary_key}) {
+    } elsif (exists $command->metadata->{__selecto_primary_key}
+        && $self->_enforced_unique_key_duckdb($command->relation, $command->metadata->{__selecto_primary_key})) {
         my $primary = $command->metadata->{__selecto_primary_key};
         my @keys = ref($primary) eq 'ARRAY' ? @$primary : ($primary);
         my $predicate = Selecto::QueryEnforcement::combine($command->predicate, $command->scope_predicate,
@@ -507,6 +508,49 @@ sub _post_statement_refusable {
     return 1 if $minimum > 1 && (!defined($reach) || $reach >= 1);
     return 1 if defined($maximum) && (!defined($reach) || $reach > $maximum);
     return 0;
+}
+
+# True when the declared key contains every column of an enforced PRIMARY
+# KEY, or of a UNIQUE constraint whose columns are all NOT NULL, on the
+# relation the write resolves to: a session temporary table shadows first,
+# then the current database's current schema; other schemas and ATTACHed
+# databases never match, and a view or unknown relation is not keyed. Any
+# catalog failure counts as not enforced (the write's reach is then
+# unbounded).
+sub _enforced_unique_key_duckdb {
+    my ($self, $relation, $primary) = @_;
+    my @keys = grep { defined && !ref } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    return 0 unless @keys && defined($relation) && !ref($relation);
+    my %want = map { (lc($_) => 1) } @keys;
+    my $dbh = $self->dbh;
+    my $enforced = eval {
+        my ($database, $schema, $table) = $dbh->selectrow_array(q{
+            SELECT database_name, schema_name, table_name FROM duckdb_tables()
+            WHERE lower(table_name) = lower(?)
+              AND ((database_name = 'temp' AND schema_name = 'main')
+                OR (database_name = current_database() AND schema_name = current_schema()))
+            ORDER BY CASE WHEN database_name = 'temp' THEN 0 ELSE 1 END LIMIT 1}, undef, "$relation");
+        return 0 unless defined $table;
+        my %nullable = map { (lc($_->[0]) => ($_->[1] ? 1 : 0)) } @{$dbh->selectall_arrayref(q{
+            SELECT column_name, is_nullable FROM duckdb_columns()
+            WHERE database_name = ? AND schema_name = ? AND table_name = ?}, undef, $database, $schema, $table)};
+        my %constraints;
+        for my $row (@{$dbh->selectall_arrayref(q{
+            SELECT constraint_index, constraint_type, unnest(constraint_column_names) FROM duckdb_constraints()
+            WHERE database_name = ? AND schema_name = ? AND table_name = ?
+              AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')}, undef, $database, $schema, $table)}) {
+            my ($index, $type, $column) = @$row;
+            my $entry = $constraints{$index} //= {primary => $type eq 'PRIMARY KEY', columns => []};
+            push @{$entry->{columns}}, lc($column // '');
+        }
+        for my $entry (values %constraints) {
+            my @columns = @{$entry->{columns}};
+            next unless @columns;
+            return 1 unless grep { !$want{$_} || (!$entry->{primary} && ($nullable{$_} // 1)) } @columns;
+        }
+        0;
+    };
+    return $enforced ? 1 : 0;
 }
 
 # Any check at all: in a batch or graph a later command's refusal, even one
@@ -597,7 +641,8 @@ changed rows is refused before any DML with C<transaction_unavailable>
 count or declared C<expected_cardinality> (or the engine's row ceiling)
 could fail for some affected count from 1 up to the rows it can reach (one
 for an insert or upsert, the primary-key identity bound of an update's or
-delete's predicate, unbounded without one), a batch of more than one
+delete's predicate when that key is an enforced PRIMARY KEY or NOT NULL
+UNIQUE constraint of the resolved table, unbounded otherwise), a batch of more than one
 command when any carries an expected count, declared cardinality,
 foreign-key guards, RETURNING or engine governance, and any graph of more
 than one node. Foreign-key guard and RETURNING checks refuse only when
