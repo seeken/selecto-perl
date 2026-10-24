@@ -4,6 +4,7 @@ use Mojo::Base 'Selecto::SQL';
 use DBI qw(SQL_VARCHAR);
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
+use Selecto::QueryEnforcement ();
 
 sub name    { return 'duckdb'; }
 sub dialect { return __PACKAGE__; }
@@ -465,10 +466,93 @@ sub _transaction_statement {
 # DuckDB has no savepoints, so a managed write cannot run inside a
 # transaction the host holds open without committing or discarding the
 # host's work. It is refused instead.
-# External mode runs the write directly: DuckDB has no savepoints.
+# External mode runs the write directly: DuckDB has no savepoints, so a
+# write that Selecto could refuse after its statement changed rows would
+# leave that DML for the host to commit. Such writes are refused before any
+# DML (_refuse_unverifiable_external); the rest run directly.
 sub _external_transaction {
     my ($self, $operation) = @_;
     return $operation->();
+}
+
+# Whether a refusal could follow DML that changed rows. Selecto's
+# post-statement checks on this adapter are the cardinality check (an
+# expected count or declared cardinality, and the engine's row ceiling), the
+# foreign-key guard check and the RETURNING row check; the last two refuse
+# only when nothing was affected. A count check is harmless only when no
+# affected row count from 1 up to the most the write can reach could fail
+# it: an insert or upsert reaches one row, an update or delete the identity
+# bound of its predicate on the governing primary key (unbounded without
+# one).
+sub _post_statement_refusable {
+    my ($self, $command) = @_;
+    my $bounds = $self->_validate_write_cardinality($command);
+    my ($minimum, $maximum) = ($bounds->{minimum} // 0, $bounds->{maximum});
+    my $operation = $command->operation;
+    my $reach;
+    if ($operation eq 'insert' || $operation eq 'upsert') {
+        $reach = 1;
+    } elsif (exists $command->metadata->{__selecto_primary_key}) {
+        my $primary = $command->metadata->{__selecto_primary_key};
+        my @keys = ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+        my $predicate = Selecto::QueryEnforcement::combine($command->predicate, $command->scope_predicate,
+            defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef);
+        $reach = 1;
+        for my $key (@keys) {
+            my $bound = Selecto::SQL::_write_identity_bound($predicate, $key);
+            if (!defined $bound) { $reach = undef; last }
+            $reach *= $bound;
+        }
+    }
+    return 1 if $minimum > 1 && (!defined($reach) || $reach >= 1);
+    return 1 if defined($maximum) && (!defined($reach) || $reach > $maximum);
+    return 0;
+}
+
+# Any check at all: in a batch or graph a later command's refusal, even one
+# that changes nothing itself, leaves the earlier commands' DML behind.
+sub _post_statement_checked {
+    my ($command) = @_;
+    return defined($command->expected_count) || exists($command->metadata->{expected_cardinality})
+        || @{$command->foreign_key_guards} || exists($command->metadata->{__selecto_primary_key})
+        || @{$command->metadata->{returning} // []};
+}
+
+sub _refuse_unverifiable_external {
+    my ($self, @commands) = @_;
+    return unless ($self->transaction_mode // '') eq 'external';
+    my $refusable = @commands > 1 ? grep { _post_statement_checked($_) } @commands
+        : grep { $self->_post_statement_refusable($_) } @commands;
+    Selecto::Error->throw('transaction_unavailable',
+        'DuckDB has no savepoints: in external mode a write that could be refused after its statement cannot undo its DML',
+        {reason => 'no_savepoints'}) if $refusable;
+    return;
+}
+
+sub execute_write_unsafe {
+    my ($self, $command) = @_;
+    $self->_refuse_unverifiable_external($command)
+        if blessed($command) && $command->isa('Selecto::Write::Command');
+    return $self->SUPER::execute_write_unsafe($command);
+}
+
+sub execute_batch_unsafe {
+    my ($self, $batch) = @_;
+    $self->_refuse_unverifiable_external(@{$batch->commands}) if blessed($batch) && $batch->can('commands');
+    return $self->SUPER::execute_batch_unsafe($batch);
+}
+
+sub execute_graph_unsafe {
+    my ($self, $graph) = @_;
+    if (blessed($graph) && $graph->can('nodes') && ($self->transaction_mode // '') eq 'external') {
+        my @nodes = @{$graph->nodes};
+        # A later node's binding or check can fail after an earlier node ran.
+        Selecto::Error->throw('transaction_unavailable',
+            'DuckDB has no savepoints: in external mode a multi-node graph cannot undo its own DML',
+            {reason => 'no_savepoints'}) if @nodes > 1;
+        $self->_refuse_unverifiable_external(map { $_->{command} } @nodes);
+    }
+    return $self->SUPER::execute_graph_unsafe($graph);
 }
 
 sub _savepoint_transaction {
@@ -506,7 +590,20 @@ closed.
 DuckDB has no savepoints. A managed write on a handle with C<AutoCommit> off
 fails with C<invalid_adapter> instead of committing or discarding the host's
 work; use C<< transaction_mode => 'external' >> there (see
-L<Selecto::SQL/transaction_mode>).
+L<Selecto::SQL/transaction_mode>). In external mode a write runs directly in
+the host's transaction, so one that Selecto could refuse after its statement
+changed rows is refused before any DML with C<transaction_unavailable>
+(details C<< {reason => 'no_savepoints'} >>): a single write whose expected
+count or declared C<expected_cardinality> (or the engine's row ceiling)
+could fail for some affected count from 1 up to the rows it can reach (one
+for an insert or upsert, the primary-key identity bound of an update's or
+delete's predicate, unbounded without one), a batch of more than one
+command when any carries an expected count, declared cardinality,
+foreign-key guards, RETURNING or engine governance, and any graph of more
+than one node. Foreign-key guard and RETURNING checks refuse only when
+nothing was affected, so a single guarded write still runs. Writes that
+cannot be refused after their statement run directly as before; for
+example C<expected_count => 1> on an update by primary key.
 
 DBD::DuckDB 0.16 decodes some timestamps and decimals inexactly and infers
 numeric-looking strings as floating point. The adapter works around this
