@@ -3702,26 +3702,37 @@ sub _enforced_unique_key {
 }
 
 # PostgreSQL: a bound-scope write refuses enabled statement-level triggers
-# for its event ($mask: pg_trigger.tgtype bit, 8 DELETE, 16 UPDATE); they can
-# write rows outside the write's scope. (TRUNCATE triggers never fire for a
-# governed write; inserts and upserts on trigger tables are refused by their
-# storage admission.)
+# for its event ($mask: pg_trigger.tgtype bit, 8 DELETE, 16 UPDATE) and rules
+# on it (pg_rewrite.ev_type: '4' DELETE, '2' UPDATE); they can write rows
+# outside the write's scope. The relation is locked IN ROW EXCLUSIVE MODE (the
+# write's own lock) first, so a trigger or rule cannot be created or enabled
+# after this check while the write waits for its rows, and the check needs
+# READ COMMITTED (_require_read_committed). (TRUNCATE triggers never fire for
+# a governed write; inserts and upserts on trigger tables are refused by
+# their storage admission.)
 sub _refuse_statement_triggers {
     my ($self, $command, $mask, $event) = @_;
     return unless $self->name eq 'postgresql';
     my $table = Selecto::Identifier::checked($command->relation);
-    my ($found);
+    my $rule_event = {8 => '4', 16 => '2'}->{$mask};
+    my ($found, $rules);
     my $ok = eval {
-        ($found) = $self->dbh->selectrow_array(q{
+        $self->dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
+        $self->_require_read_committed($table);
+        ($found, $rules) = $self->dbh->selectrow_array(q{
             SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = ?::regclass AND NOT t.tgisinternal
-              AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0)::integer},
-            undef, $self->quote_identifier($table), $mask);
+              AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0)::integer,
+              EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r WHERE r.ev_class = ?::regclass AND r.ev_type = ?)::integer},
+            undef, $self->quote_identifier($table), $mask, $self->quote_identifier($table), $rule_event // '');
         1;
     };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('write_capability_missing',
         "a statement-level $event trigger can write rows outside the write's scope", {relation => $table})
         if $found;
+    Selecto::Error->throw('write_capability_missing',
+        "a rule on the relation can rewrite the $event outside the write's scope", {relation => $table})
+        if $rules;
     return;
 }
 

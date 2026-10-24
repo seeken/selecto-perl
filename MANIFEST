@@ -76,6 +76,7 @@ t/update_post_image_tenant_pin_live.t
 t/update_post_image_pg_topology_live.t
 t/update_post_image_pg_race_live.t
 t/pg_guarded_write_isolation_live.t
+t/pg_bound_delete_lock_live.t
 t/mysql_post_image_metadata_lock_live.t
 t/mysql_returning_insert_trigger_live.t
 t/member_group_identity_live.t
