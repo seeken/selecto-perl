@@ -3535,6 +3535,7 @@ sub _admit_post_image_target {
             # ENABLE TRIGGER and CREATE RULE on them: the catalog read below
             # stays true for these relations until commit.
             $dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
+            $self->_require_read_committed($table);
             @row = $self->_pg_post_image_catalog($table);
         } elsif ($name eq 'sqlite') {
             @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
@@ -3577,6 +3578,26 @@ sub _admit_post_image_target {
         if grep { $key{lc $_} } keys %{$command->assignments};
     $refuse->('a governed update under a bound scope requires an enforced unique key')
         unless $self->_enforced_unique_key($table, \@keys);
+    return;
+}
+
+# PostgreSQL: a guarded write's catalog checks (triggers, rules,
+# inheritance) are only meaningful under READ COMMITTED. Under REPEATABLE
+# READ or SERIALIZABLE, catalog queries read the transaction snapshot while
+# trigger firing uses the latest catalog, so a trigger committed after the
+# snapshot passes every check and still fires. Read in the write's
+# transaction (a host's transaction, or a managed one, which begins READ
+# COMMITTED explicitly); anything else is refused.
+sub _require_read_committed {
+    my ($self, $table) = @_;
+    return unless $self->name eq 'postgresql';
+    my $level;
+    my $ok = eval { ($level) = $self->dbh->selectrow_array(q{SELECT current_setting('transaction_isolation')}); 1 };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a guarded PostgreSQL write requires READ COMMITTED isolation',
+        {reason => 'isolation_level', relation => $table, isolation => $level})
+        unless defined($level) && $level eq 'read committed';
     return;
 }
 

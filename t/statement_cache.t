@@ -230,7 +230,7 @@ subtest 'writes reuse handles inside their own transactions' => sub {
     };
     is $pg->execute_write_unsafe($command->("n$_"))->affected_rows, 1, "write $_" for 1 .. 3;
     is scalar(@{$dbh->{prepared}}), 1, 'one prepare for three writes';
-    is_deeply $events->($dbh, 'BEGIN|COMMIT|ROLLBACK'), [('BEGIN', 'COMMIT') x 3], 'each write commits on its own';
+    is_deeply $events->($dbh, '\A(?:BEGIN|COMMIT|ROLLBACK)\z'), [('BEGIN', 'COMMIT') x 3], 'each write commits on its own';
     my ($sql) = @{$dbh->{prepared}};
     $dbh->fail_next($sql, '23503', 'violates foreign key constraint');
     my $error = $error_of->(sub { $pg->execute_write_unsafe($command->('x')) });
