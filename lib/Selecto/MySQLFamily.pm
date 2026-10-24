@@ -1573,11 +1573,15 @@ sub insert_admission_storage {
             $fail->() unless $TEXT_TYPES{$name} && defined($column->{CHARACTER_SET_NAME})
                 && defined($column->{COLLATION_NAME})
                 && $column->{CHARACTER_SET_NAME} =~ /\A\w+\z/ && $column->{COLLATION_NAME} =~ /\A\w+\z/;
-            # A CHAR/VARCHAR column's declared length is part of the cast:
-            # the column drops excess trailing blanks ('t1 ' in VARCHAR(2)
-            # is stored as 't1'), and so does CAST(... AS CHAR(n)).
-            my $length = $name eq 'char' || $name eq 'varchar' ? $column->{CHARACTER_MAXIMUM_LENGTH} : undef;
-            $fail->() if ($name eq 'char' || $name eq 'varchar') && !(defined($length) && "$length" =~ /\A[1-9][0-9]{0,5}\z/);
+            # A fixed-width CHAR(n)/NCHAR(n) column reads back with its
+            # trailing blanks stripped, which no CAST reproduces ('t1 ' is
+            # stored and compared as 't1'): it is refused, as PostgreSQL
+            # refuses bpchar. A VARCHAR column's declared length is part of
+            # the cast: the column drops excess trailing blanks ('t1 ' in
+            # VARCHAR(2) is stored as 't1'), and so does CAST(... AS CHAR(n)).
+            $fail->() if $name eq 'char';
+            my $length = $name eq 'varchar' ? $column->{CHARACTER_MAXIMUM_LENGTH} : undef;
+            $fail->() if $name eq 'varchar' && !(defined($length) && "$length" =~ /\A[1-9][0-9]{0,5}\z/);
             $storage{$field} = {cast => 'CHAR' . (defined($length) ? "($length)" : '')
                 . " CHARACTER SET $column->{CHARACTER_SET_NAME}", collation => $column->{COLLATION_NAME}};
         }

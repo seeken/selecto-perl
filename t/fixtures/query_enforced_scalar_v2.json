@@ -6768,6 +6768,101 @@
       "actual": "t1",
       "expected": "t1",
       "outcome": "true"
+    },
+    {
+      "id": "U115",
+      "column_type": "org_key_domain",
+      "type_class": "identity",
+      "metadata": "base_verified",
+      "op": "eq",
+      "actual": "t1 ",
+      "expected": "t1 ",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "U116",
+      "column_type": "amount_domain",
+      "type_class": "identity",
+      "metadata": "base_verified",
+      "op": "eq",
+      "actual": "1.4",
+      "expected": "1.4",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "U117",
+      "column_type": "org_key_domain",
+      "type_class": "identity",
+      "metadata": "base_verified",
+      "op": "eq",
+      "actual": "t1",
+      "expected": "t1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "U118",
+      "column_type": "org_key_domain",
+      "type_class": "identity",
+      "metadata": "base_verified",
+      "op": "ne",
+      "actual": "t1",
+      "expected": "t1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "U119",
+      "column_type": "amount_domain",
+      "type_class": "identity",
+      "metadata": "unverified",
+      "op": "eq",
+      "actual": "1",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "U120",
+      "column_type": "varchar(2)",
+      "type_class": "text",
+      "op": "eq",
+      "actual": "t1 ",
+      "expected": "t1 ",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "U121",
+      "column_type": "varchar(2)",
+      "type_class": "text",
+      "op": "eq",
+      "actual": "t1",
+      "expected": "t1",
+      "outcome": "true"
+    },
+    {
+      "id": "U122",
+      "column_type": "numeric(10,0)",
+      "type_class": "numeric",
+      "op": "eq",
+      "actual": "1.4",
+      "expected": "1.4",
+      "outcome": "query_rule_not_evaluable"
+    },
+    {
+      "id": "U123",
+      "column_type": "numeric(10,0)",
+      "type_class": "numeric",
+      "op": "eq",
+      "actual": "1",
+      "expected": "1",
+      "outcome": "true"
+    },
+    {
+      "id": "U124",
+      "column_type": "numeric(10,0)",
+      "type_class": "numeric",
+      "op": "ne",
+      "actual": "1.4",
+      "expected": "1",
+      "outcome": "query_rule_not_evaluable"
     }
   ]
 }
