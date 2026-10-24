@@ -72,6 +72,7 @@ t/json_encoders_nonref.t
 t/limits_lookup.t
 t/scalar_admission_v2_live.t
 t/update_post_image_live.t
+t/member_group_identity_live.t
 t/sqlite_upsert_candidate_native.t
 t/sqlite_rules_transaction_handler.t
 t/sqlite_upsert_plan_independence.t

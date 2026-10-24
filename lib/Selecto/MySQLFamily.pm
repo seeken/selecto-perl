@@ -431,6 +431,18 @@ sub _identity_operand_field {
     return ref($resolved) eq 'HASH' ? Selecto::SQL::_identity_text_type($resolved->{type}) : 0;
 }
 
+# A member's group key joined to its root as identity groups by its utf8mb4
+# bytes as well as the value, so collation-equal keys of other tenants ('T1',
+# 't1 ' for 't1') are not merged into the root's group (the value stays in
+# GROUP BY, so selecting it remains valid).
+sub _compile_group_expression {
+    my ($self, $domain, $expression, $params, $byte_groups) = @_;
+    my $sql = $self->SUPER::_compile_group_expression($domain, $expression, $params);
+    return $sql unless ref($byte_groups) eq 'HASH' && blessed($expression) && $expression->kind eq 'field'
+        && !ref($expression->arguments->[0]) && $byte_groups->{$expression->arguments->[0]};
+    return $self->_identity_bytes_sql($sql) . ", $sql";
+}
+
 # A computed field (a predicate body, a value expression's CASE condition, a
 # nested computed field) referenced by a host-trusted predicate is host scope
 # as well: its eq/ne/IN comparisons compare as identity by declared type, as
