@@ -229,19 +229,25 @@ for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
     subtest "$name the stored-row re-check needs a unique key" => sub {
         my $dbh = $connect->();
         my $insert = sub {
-            my ($ddl, $key, $seed, $assignments, $predicate) = @_;
+            my ($ddl, $key, $seed, $assignments, $predicate, %options) = @_;
+            $dbh->do('DROP TEMPORARY TABLE IF EXISTS selecto_v2_key_rows');
             $dbh->do('DROP TABLE IF EXISTS selecto_v2_key_rows');
             $dbh->do("CREATE TABLE selecto_v2_key_rows ($ddl)");
             $dbh->do($_) for @$seed;
+            $dbh->do("CREATE TEMPORARY TABLE selecto_v2_key_rows ($options{temporary})") if $options{temporary};
             my @fields = sort keys %$assignments;
-            my $source = relation('selecto_v2_key_rows', map { ($_ => $_ eq 'org_key' ? 'string' : 'integer') } @fields);
+            my $source = relation('selecto_v2_key_rows', map { ($_ => $_ =~ /\A(?:org_key|code)\z/ ? 'string' : 'integer') } @fields);
             $source->{primary_key} = $key;
             my $engine = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)),
                 domain => Selecto::Domain->parse({schema_version => 1, name => 'Keys', source => $source, schemas => {}, joins => {},
                     writes => {operations => {insert => {enabled => 1}}, fields => {map { ($_ => {insertable => 1}) } @fields}}}));
-            my $error = eval { $engine->execute_write(Selecto::Write::Command->new(operation => 'insert',
-                relation => 'selecto_v2_key_rows', assignments => $assignments, scope_predicate => $predicate)); 1 } ? undef : $@;
+            my $command = Selecto::Write::Command->new(operation => 'insert',
+                relation => 'selecto_v2_key_rows', assignments => $assignments, scope_predicate => $predicate,
+                ($options{tooling} ? (metadata => {field_types => {map { ($_ => $_ =~ /\A(?:org_key|code)\z/ ? 'string' : 'integer') } @fields}}) : ()));
+            my $error = eval { $options{tooling} ? $engine->adapter->execute_write_unsafe($command) : $engine->execute_write($command); 1 }
+                ? undef : $@;
             my $rows = $dbh->selectall_arrayref('SELECT org_key FROM selecto_v2_key_rows ORDER BY org_key');
+            $dbh->do('DROP TEMPORARY TABLE IF EXISTS selecto_v2_key_rows') if $options{temporary};
             return (blessed($error) ? $error->code : defined($error) ? "died: $error" : 'applied', [map { $_->[0] } @$rows]);
         };
         my @outcome = $insert->('id INT NOT NULL, org_key CHAR(4)', 'id', [q{INSERT INTO selecto_v2_key_rows VALUES (1, 'zz')}],
@@ -262,7 +268,41 @@ for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
         is_deeply(\@outcome, ['query_rule_violation', ['zz']], 'a composite primary key: the stored t1 is refused');
         @outcome = $insert->('a INT NOT NULL, b INT NOT NULL, org_key CHAR(4), PRIMARY KEY (a)', ['a', 'b'],
             [], {a => 1, b => 2, org_key => 't1 '}, $x->ne('org_key', 't1'));
-        is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a declared key wider than the enforced one is not unique as declared');
+        is_deeply(\@outcome, ['query_rule_violation', []], 'a declared key containing the enforced one is unique: the stored t1 is refused');
+        @outcome = $insert->('a INT NOT NULL, b INT NOT NULL, org_key CHAR(4), PRIMARY KEY (a)', ['a', 'b'],
+            [], {a => 1, b => 2, org_key => 't1'}, $x->eq('org_key', 't1'));
+        is_deeply(\@outcome, ['applied', ['t1']], 'and the own CHAR(n) row is applied');
+        # Without a usable unique key nothing decides what storage did: every
+        # column type is refused, not only CHAR(n).
+        my $pad = 't1' . (' ' x 300);
+        @outcome = $insert->('id INT NOT NULL, org_key TINYTEXT', 'id', [], {id => 1, org_key => $pad},
+            $x->ne('org_key', 't1' . (' ' x 253)));
+        is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'TINYTEXT without a key: refused');
+        @outcome = $insert->('id INT NOT NULL PRIMARY KEY, org_key TINYTEXT', 'id', [], {id => 1, org_key => $pad},
+            $x->ne('org_key', 't1' . (' ' x 253)));
+        is_deeply(\@outcome, ['query_rule_violation', []], 'TINYTEXT with a key: the re-check refuses the truncated row');
+        @outcome = $insert->('id INT NOT NULL PRIMARY KEY, org_key TINYTEXT', 'id', [], {id => 1, org_key => $pad},
+            $x->ne('org_key', 't1' . (' ' x 253)), tooling => 1);
+        is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'TINYTEXT tooling (no re-check) with a key: refused');
+        @outcome = $insert->('a INT NOT NULL, b INT NULL, org_key VARCHAR(16), UNIQUE KEY (a, b)', ['a', 'b'], [],
+            {a => 1, b => 2, org_key => 't1'}, $x->eq('org_key', 't1'));
+        is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a unique key with a nullable column does not count');
+        @outcome = $insert->('a INT NOT NULL, b INT NOT NULL, org_key VARCHAR(16), PRIMARY KEY (a, b)', ['a'], [],
+            {a => 1, b => 2, org_key => 't1'}, $x->eq('org_key', 't1'));
+        is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a declared key narrower than the enforced one does not count');
+        @outcome = $insert->('code VARCHAR(16) NOT NULL, org_key VARCHAR(16), UNIQUE KEY (code(3))', 'code', [],
+            {code => 'abcdef', org_key => 't1'}, $x->eq('org_key', 't1'));
+        is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a prefix unique index does not count');
+        if ($name eq 'mysql') {
+            # A session TEMPORARY table shadows the base table for the DML,
+            # while information_schema describes the base table.
+            @outcome = $insert->('id INT NOT NULL, org_key VARCHAR(16)', 'id', [], {id => 1, org_key => '010'},
+                $x->ne('org_key', '10'), temporary => 'id INT NOT NULL PRIMARY KEY, org_key INT');
+            is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a shadowing temporary INT table is refused');
+            @outcome = $insert->('id INT NOT NULL, org_key VARCHAR(16)', 'id', [], {id => 1, org_key => 't1 '},
+                $x->ne('org_key', 't1'), temporary => 'id INT NOT NULL PRIMARY KEY, org_key VARCHAR(2)');
+            is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a shadowing temporary VARCHAR(2) table is refused');
+        }
         $dbh->do('DROP TABLE IF EXISTS selecto_v2_key_rows');
     };
 }

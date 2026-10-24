@@ -1,14 +1,21 @@
 Revision history for Selecto
 
 Unreleased
-    - MySQL/MariaDB: the guarded-insert stored-row re-check decides only
-      when the table enforces the declared key (a PRIMARY or UNIQUE index of
-      exactly those NOT NULL columns, read in the write's transaction). On a
-      table without one a decoy row satisfied the count and a CHAR(n) 't1 '
-      was stored under <> 't1'; such an insert is now refused with
-      query_rule_not_evaluable (other columns were decided by storage
-      admission). The re-check also requires the key to find exactly the
+    - MySQL/MariaDB: the guarded-insert stored-row re-check runs only when
+      the declared key contains an enforced PRIMARY or UNIQUE index of whole,
+      NOT NULL columns (read in the write's transaction); otherwise a decoy
+      row could satisfy the count, and a CHAR(n) 't1 ' or a TINYTEXT value
+      past its octet capacity was stored under a predicate it violates. Such
+      an insert is now refused with query_rule_not_evaluable for every
+      column type. The re-check also requires the key to find exactly the
       inserted rows, and accepts composite primary keys.
+    - MySQL/MariaDB: a session TEMPORARY table shadowing the guarded
+      relation (information_schema describes the base table) is refused by
+      insert admission, the re-check and upsert conflict proof.
+    - MySQL/MariaDB: commands without the re-check (*_unsafe tooling with
+      declared field_types) refuse TEXT-family columns as they refuse
+      CHAR(n): excess trailing blanks are dropped without a cast that can
+      reproduce it.
     - MySQL/MariaDB storage admission refuses fixed-width CHAR(n)/NCHAR(n)
       columns with query_rule_not_evaluable on commands without a stored-
       row re-check (*_unsafe tooling with declared field_types), as
