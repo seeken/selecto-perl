@@ -2,10 +2,13 @@ Revision history for Selecto
 
 Unreleased
     - MySQL/MariaDB storage admission refuses fixed-width CHAR(n)/NCHAR(n)
-      columns with query_rule_not_evaluable, as PostgreSQL refuses bpchar:
-      the column reads back without trailing blanks, which no cast
-      reproduces, so typed *_unsafe tooling applied 't1 ' (stored 't1')
-      under <> 't1', NOT IN ('t1') and = 't1 '.
+      columns with query_rule_not_evaluable on commands without a stored-
+      row re-check (*_unsafe tooling with declared field_types), as
+      PostgreSQL refuses bpchar: the column reads back without trailing
+      blanks, which no cast reproduces, so such tooling applied 't1 '
+      (stored 't1') under <> 't1', NOT IN ('t1') and = 't1 '. Governed
+      inserts keep CHAR(n) (a CHAR(36) uuid tenant): their stored row is
+      re-read under the enforced predicate, which refuses those cases.
     - The v2 main corpus is the harness's 714-case revision (an unresolved
       PostgreSQL domain is at most base_verified, U115-U124); PostgreSQL
       domains are refused by storage admission (live).

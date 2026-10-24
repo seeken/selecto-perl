@@ -1527,6 +1527,13 @@ sub _returning_rows {
 my %INTEGER_TYPES = map { $_ => 1 } qw(tinyint smallint mediumint int bigint);
 my %TEXT_TYPES = map { $_ => 1 } qw(char varchar tinytext text mediumtext longtext);
 
+# True when the insert re-reads its stored row under the enforced predicate
+# (_verify_inserted_row): governed commands, which carry the domain's types.
+sub _rechecks_stored_row {
+    my ($command) = @_;
+    return $command->operation eq 'insert' && exists $command->metadata->{__selecto_insert_types} ? 1 : 0;
+}
+
 # The storage contract for a guarded insert's candidate check, read in the
 # write transaction after a read of the table: its shared metadata lock keeps
 # the column definitions and triggers (CREATE TRIGGER needs an exclusive
@@ -1575,13 +1582,17 @@ sub insert_admission_storage {
                 && $column->{CHARACTER_SET_NAME} =~ /\A\w+\z/ && $column->{COLLATION_NAME} =~ /\A\w+\z/;
             # A fixed-width CHAR(n)/NCHAR(n) column reads back with its
             # trailing blanks stripped, which no CAST reproduces ('t1 ' is
-            # stored and compared as 't1'): it is refused, as PostgreSQL
-            # refuses bpchar. A VARCHAR column's declared length is part of
-            # the cast: the column drops excess trailing blanks ('t1 ' in
-            # VARCHAR(2) is stored as 't1'), and so does CAST(... AS CHAR(n)).
-            $fail->() if $name eq 'char';
-            my $length = $name eq 'varchar' ? $column->{CHARACTER_MAXIMUM_LENGTH} : undef;
-            $fail->() if $name eq 'varchar' && !(defined($length) && "$length" =~ /\A[1-9][0-9]{0,5}\z/);
+            # stored and compared as 't1'). A governed insert re-reads its
+            # stored row under the enforced predicate in the same
+            # transaction (_verify_inserted_row), which catches that; a
+            # command without that re-check (*_unsafe tooling with declared
+            # field_types) is refused, as PostgreSQL refuses bpchar. A
+            # VARCHAR column's declared length is part of the cast: the
+            # column drops excess trailing blanks ('t1 ' in VARCHAR(2) is
+            # stored as 't1'), and so does CAST(... AS CHAR(n)).
+            $fail->() if $name eq 'char' && !_rechecks_stored_row($command);
+            my $length = $name eq 'char' || $name eq 'varchar' ? $column->{CHARACTER_MAXIMUM_LENGTH} : undef;
+            $fail->() if ($name eq 'char' || $name eq 'varchar') && !(defined($length) && "$length" =~ /\A[1-9][0-9]{0,5}\z/);
             $storage{$field} = {cast => 'CHAR' . (defined($length) ? "($length)" : '')
                 . " CHARACTER SET $column->{CHARACTER_SET_NAME}", collation => $column->{COLLATION_NAME}};
         }
