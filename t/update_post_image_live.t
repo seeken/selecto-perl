@@ -247,7 +247,9 @@ for my $backend (@backends) {
                 $dbh->do(q{CREATE OR REPLACE FUNCTION selecto_post_after() RETURNS trigger LANGUAGE plpgsql AS
                     $$ BEGIN UPDATE selecto_post_rows SET org_key = upper(org_key) WHERE org_key <> upper(org_key); RETURN NULL; END $$});
                 $dbh->do("CREATE TRIGGER selecto_post_after AFTER UPDATE OF note ON selecto_post_rows FOR EACH $level EXECUTE FUNCTION selecto_post_after()");
-                is($run->($host, 'single', {note => 'changed'}), 'query_rule_violation',
+                # A statement-level trigger is refused before the update: it
+                # can write rows the re-read does not name.
+                is($run->($host, 'single', {note => 'changed'}), $level eq 'ROW' ? 'query_rule_violation' : 'write_capability_missing',
                     "$name: an AFTER $level trigger moving the row out of scope is refused");
                 is($state->(), '1:t1:n 2:t2:n', "$name: AFTER $level, and nothing changed");
             }

@@ -3521,6 +3521,19 @@ Validates and executes a command in a transaction, returning a
 L<Selecto::Write::Result>. The affected-row count must equal
 C<expected_count> or the transaction rolls back with C<cardinality_mismatch>.
 
+An update under a bound scope (the engine tenant, C<writes.scope>, or a host
+scope predicate) keeps the rows it updates inside that scope: they are
+locked by an enforced unique key, which the update may not assign, and
+re-read after the statement, when every non-deferred row trigger has run.
+An update that moved a row out of scope rolls back with
+C<query_rule_violation>. Updates through views, on tables with deferrable
+constraint triggers (C<query_rule_not_evaluable>) or statement-level update
+triggers (C<write_capability_missing>) are refused. Row-level triggers that
+modify I<other> rows are outside this guarantee. A plain required predicate
+and query enforcement bound the rows an update finds, not the rows it
+leaves. An upsert keeps a scope only as equalities on its conflict-target
+columns; otherwise it is refused with C<unsupported_scope_predicate>.
+
 =head2 execute_batch
 
   my $results = $engine->execute_batch(Selecto::Write::Batch->new(@commands));
