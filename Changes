@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL graphs: when any node of a graph is bound (engine tenant,
+      trusted tenant pin, host scope, query enforcement), every node and
+      owned-sync cleanup is marked bound, and each descendant delete and
+      update runs the bound-scope target contract even on tables without a
+      tenant column (child delta deletes, join-table unlinks, depth-2
+      grandchild deletes, child updates): LOCK TABLE ... IN ROW EXCLUSIVE
+      MODE, READ COMMITTED, and no deferrable trigger, statement-level
+      trigger or rule for the event, checked before and after the
+      statement (write_capability_missing / query_rule_not_evaluable). A
+      statement trigger or DO ALSO rule on such a table used to rewrite
+      another tenant's rows. Bound-scope deletes now also refuse
+      deferrable triggers and recheck after the statement.
     - transaction_handler: inside the handler's transaction each write now
       runs in its own savepoint, as managed and external writes do, so a
       write refused after its statement undoes itself even when the handler

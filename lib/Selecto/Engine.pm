@@ -922,6 +922,7 @@ sub _prepare_graph {
     }
     my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets,metadata=>$graph->metadata);
     my $sets = $self->_govern_owned_sets($graph->owned_sets, $prepared->{nodes}, \%contexts,$relationship_work,$tenants);
+    _mark_graph_bound($prepared->{nodes}, $sets);
     $prepared->{_governed_owned_sets} = $sets;
     $prepared->{_reference_domains} = {map { ($_ => $contexts{$_}{domain}) } keys %contexts};
     $prepared->{_requires_rules} = scalar(grep {
@@ -932,6 +933,34 @@ sub _prepare_graph {
         $prepared->{_requires_rules} ||= Selecto::WriteRules->has_stored_rules(_native_relationship_domain($edge->{domain}), 'delete');
     }
     return ($prepared, \%contexts);
+}
+
+# Items 33/33a: when any node of a graph is under a bound scope (engine
+# tenant, trusted pin, host scope: a post-image scope; or query
+# enforcement), every node and every owned-set cleanup is marked bound, so a
+# descendant delete or update runs the bound-scope target contract even when
+# its own table has no tenant column (child rows, join tables, depth-2
+# grandchildren). Marking all nodes, not only the bound node's descendants,
+# fails closed. Set only here, after governance; never taken from a caller.
+sub _mark_graph_bound {
+    my ($nodes, $sets) = @_;
+    my $bound = grep {
+        blessed($_->{command}->metadata->{__selecto_post_image_scope}) || defined($_->{command}->query_enforcement)
+    } @$nodes;
+    for my $node (@$nodes) {
+        my %metadata = %{$node->{command}->metadata};
+        delete $metadata{__selecto_graph_bound};
+        $metadata{__selecto_graph_bound} = 1 if $bound;
+        $node->{command} = $node->{command}->with_metadata(\%metadata);
+    }
+    for my $set (@{$sets // []}) {
+        next unless blessed($set->{cleanup});
+        my %metadata = %{$set->{cleanup}->metadata};
+        delete $metadata{__selecto_graph_bound};
+        $metadata{__selecto_graph_bound} = 1 if $bound;
+        $set->{cleanup} = $set->{cleanup}->with_metadata(\%metadata);
+    }
+    return;
 }
 
 sub _govern_owned_sets {

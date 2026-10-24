@@ -3434,13 +3434,12 @@ sub _execute_compiled_write_in_transaction {
     # Its rows are locked and named by key first, and re-read afterwards.
     my $post_image = _post_image_predicate($command);
     $self->_admit_post_image_target($command) if $post_image;
-    # A governed delete under a bound scope (engine tenant, writes.scope, host
-    # scope, a required tenant pin) or under query enforcement alone is a
-    # bound-scope delete: a statement-level DELETE trigger could write rows
-    # outside that bound. A plain required filter alone is not (TW-09).
-    $self->_refuse_statement_triggers($command, 8, 'delete')
-        if $command->operation eq 'delete' && exists $command->metadata->{__selecto_primary_key}
-            && (blessed($command->metadata->{__selecto_post_image_scope}) || defined($command->query_enforcement));
+    # The bound-scope target contract for deletes and for graph descendants
+    # (see _bound_target_event): table lock, READ COMMITTED, and no
+    # deferrable trigger, statement-level trigger or rule for the event,
+    # checked before the statement and again after it.
+    my $bound_event = _bound_target_event($command);
+    $self->_bound_target_check($command, $bound_event, 'before') if $bound_event;
     my ($bounded, $identities) = $self->_bounded_write_command($command, $post_image ? (force => 1) : ());
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;
@@ -3478,6 +3477,7 @@ sub _execute_compiled_write_in_transaction {
     };
     die $self->normalize_error($@) unless $ok;
     $self->_check_write_cardinality($command, $affected, $bounds);
+    $self->_bound_target_check($command, $bound_event, 'after') if $bound_event;
     if ($post_image) {
         $self->_recheck_post_image_target($command);
         $self->_verify_post_image($command, $post_image, $identities, $affected);
@@ -3706,35 +3706,68 @@ sub _enforced_unique_key {
     return 0;
 }
 
-# PostgreSQL: a bound-scope write refuses enabled statement-level triggers
-# for its event ($mask: pg_trigger.tgtype bit, 8 DELETE, 16 UPDATE) and rules
-# on it (pg_rewrite.ev_type: '4' DELETE, '2' UPDATE); they can write rows
-# outside the write's scope. The relation is locked IN ROW EXCLUSIVE MODE (the
-# write's own lock) first, so a trigger or rule cannot be created or enabled
-# after this check while the write waits for its rows, and the check needs
-# READ COMMITTED (_require_read_committed). (TRUNCATE triggers never fire for
-# a governed write; inserts and upserts on trigger tables are refused by
-# their storage admission.)
-sub _refuse_statement_triggers {
-    my ($self, $command, $mask, $event) = @_;
+# Which bound-scope target contract a write runs (PostgreSQL), if any:
+# - a governed delete under a bound scope (engine tenant, writes.scope, host
+#   scope, a required tenant pin) or under query enforcement alone (a plain
+#   required filter alone is not bound, TW-09);
+# - a delete or update of any node of a graph whose root (or any node) is
+#   bound (__selecto_graph_bound, set by the engine), even when its own table
+#   has no tenant column. A graph update that carries its own post-image
+#   scope already runs the post-image contract.
+sub _bound_target_event {
+    my ($command) = @_;
+    my $metadata = $command->metadata;
+    return undef unless exists $metadata->{__selecto_primary_key};
+    my $operation = $command->operation;
+    return 'delete' if $operation eq 'delete'
+        && (blessed($metadata->{__selecto_post_image_scope}) || defined($command->query_enforcement)
+            || $metadata->{__selecto_graph_bound});
+    return 'update' if $operation eq 'update' && $metadata->{__selecto_graph_bound} && !_post_image_predicate($command);
+    return undef;
+}
+
+# PostgreSQL bound-scope target contract. Before the statement: LOCK TABLE
+# ... IN ROW EXCLUSIVE MODE (the write's own lock, recursing to partitions
+# and children), so triggers and rules on these relations cannot change
+# until commit, and READ COMMITTED. Before and after it: no enabled
+# deferrable constraint trigger anywhere in the database (it fires at
+# commit), and no statement-level trigger or rule for the event on the
+# relation or below it (they can write rows outside the write's scope).
+# Row-level triggers that modify other rows are the schema owner's
+# responsibility (item 19).
+sub _bound_target_check {
+    my ($self, $command, $event, $phase) = @_;
     return unless $self->name eq 'postgresql';
     my $table = Selecto::Identifier::checked($command->relation);
-    my $rule_event = {8 => '4', 16 => '2'}->{$mask};
-    my ($found, $rules);
+    my ($mask, $rule_event) = $event eq 'delete' ? (8, '4') : (16, '2');
+    my ($deferrable, $statement, $rules);
     my $ok = eval {
-        $self->dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
-        $self->_require_read_committed($table);
-        ($found, $rules) = $self->dbh->selectrow_array(q{
-            SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = ?::regclass AND NOT t.tgisinternal
-              AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0)::integer,
-              EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r WHERE r.ev_class = ?::regclass AND r.ev_type = ?)::integer},
-            undef, $self->quote_identifier($table), $mask, $self->quote_identifier($table), $rule_event // '');
+        if ($phase eq 'before') {
+            $self->dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
+            $self->_require_read_committed($table);
+        }
+        ($deferrable, $statement, $rules) = $self->dbh->selectrow_array(q{
+            WITH RECURSIVE tree(oid) AS (
+              SELECT ?::regclass::oid
+              UNION ALL
+              SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree ON i.inhparent = tree.oid)
+            SELECT
+              (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
+                AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
+              (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
+                AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0))::integer,
+              (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
+                WHERE r.ev_type = ? AND r.rulename <> '_RETURN'))::integer},
+            undef, $self->quote_identifier($table), $mask, $rule_event);
         1;
     };
     die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a deferrable constraint trigger could change the rows after their verification', {relation => $table})
+        if $deferrable;
     Selecto::Error->throw('write_capability_missing',
         "a statement-level $event trigger can write rows outside the write's scope", {relation => $table})
-        if $found;
+        if $statement;
     Selecto::Error->throw('write_capability_missing',
         "a rule on the relation can rewrite the $event outside the write's scope", {relation => $table})
         if $rules;
