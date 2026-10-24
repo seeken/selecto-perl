@@ -103,8 +103,15 @@ $guarded_domain->{required_filters}=[['and', [['gte','quantity',2], ['name', ['n
 my $guarded=Selecto::Write::Operation->new($guarded_domain)->with_tenant({tenant_id=>'tenant-a'});
 my $guarded_insert=compile($guarded->insert({name=>'allowed',quantity=>2}));
 ok defined($guarded_insert->{command}->scope_predicate),'domain query guard is retained on the actual native command';
-refuses('query_rule_violation',sub {compile($guarded->insert({name=>'blocked',quantity=>2}))},'insert candidate must satisfy required boolean query guard');
-refuses('query_rule_violation',sub {compile($guarded->insert({name=>'allowed',quantity=>1}))},'insert candidate must satisfy required numeric boundary');
+# query_enforced_scalar v2: the contract's declared types are unverified at
+# compile time, so the in-process admission decides nothing here; the
+# comparison is deferred to the verified-storage check before DML (live in
+# t/scalar_admission_v2_live.t). The command keeps the guard for it.
+for my $candidate ({name=>'blocked',quantity=>2}, {name=>'allowed',quantity=>1}) {
+    my $deferred_guard = compile($guarded->insert($candidate));
+    ok defined($deferred_guard->{command}->scope_predicate), 'an undecided candidate keeps its guard for the storage check';
+    is $deferred_guard->{command}->metadata->{field_types}{name}, 'string', 'with its declared field types';
+}
 refuses('query_rule_not_evaluable',sub {compile($guarded->insert({name=>'allowed'}))},'missing candidate fields cannot silently bypass query guard');
 refuses('query_enforcement_unsupported_operation',sub {compile($guarded->upsert({name=>'allowed',quantity=>2}))},'upsert refuses a required predicate its conflict branch cannot enforce');
 my $null_domain=domain();$null_domain->{required_filters}=[['quantity',undef]];
@@ -123,7 +130,8 @@ ok defined($ordinary->compile(context=>{account_id=>42},storage_backend=>'sqlite
 my $literal_domain=domain();$literal_domain->{required_filters}=[['name','not_null']];
 my $literal_op=Selecto::Write::Operation->new($literal_domain)->with_tenant({tenant_id=>'tenant-a'});
 isa_ok compile($literal_op->insert({name=>'not_null'}))->{command},'Selecto::Write::Command','literal null-operator spelling remains an equality value';
-refuses('query_rule_violation',sub {compile($literal_op->insert({name=>'other'}))},'literal not_null cannot widen a required guard to every non-null name');
+ok defined(compile($literal_op->insert({name=>'other'}))->{command}->scope_predicate),
+    'literal not_null stays an equality value for the deferred storage check';
 
 my $collision_domain=domain();push @{$collision_domain->{source}{fields}},'is_null';
 $collision_domain->{source}{columns}{is_null}={type=>'string'};

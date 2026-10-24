@@ -2934,18 +2934,29 @@ sub _compile_write {
                 Selecto::InsertAdmission->prepare($insert_predicate, $assignments,
                     $command->metadata->{__selecto_insert_types});
             } else {
-                # Explicit *_unsafe adapter tooling retains the standalone
-                # untyped evaluator. Engine-authorized writes always carry
-                # domain types and use the storage check before DML instead.
-                my $truth = Selecto::QueryEnforcement::evaluate(
-                $insert_predicate,
-                $self->_insert_candidate($assignments),
-                );
+                # Explicit *_unsafe adapter tooling: the in-process v2
+                # evaluator decides by declared type. A command's declared
+                # field_types (a portable command carries them) are names
+                # only, never checked against the column, so they are
+                # unverified: the evaluator decides nothing but NULL, and the
+                # comparison is deferred to the verified-storage check before
+                # DML (_check_typed_insert_admission). Without declared types
+                # there is no such check and the insert is refused.
+                my $types = _declared_admission_types($command);
+                my $truth = eval {
+                    Selecto::QueryEnforcement::evaluate($insert_predicate, $self->_insert_candidate($assignments),
+                        $types // {}, metadata => 'unverified', backend => $self->_exact_identity_compare ? 'mysql_family' : 'other');
+                };
+                unless (defined $truth) {
+                    my $error = $@;
+                    die $error unless defined($types) && blessed($error) && $error->isa('Selecto::Error')
+                        && $error->code eq 'query_rule_not_evaluable' && !$error->details->{missing_fields};
+                }
                 Selecto::Error->throw(
                 'query_rule_violation',
                 'insert candidate does not satisfy the enforced query',
                 { truth_value => $truth },
-                ) unless $truth eq 'true';
+                ) if defined($truth) && $truth ne 'true';
             }
         }
         my @params;
@@ -3209,11 +3220,21 @@ sub insert_admission_storage {
         'adapter cannot establish typed insert storage semantics');
 }
 
+# The declared field types an untyped (*_unsafe) command carries for its
+# deferred verified-storage check, or undef.
+sub _declared_admission_types {
+    my ($command) = @_;
+    my $types = $command->metadata->{field_types};
+    return ref($types) eq 'HASH' && keys(%$types) ? $types : undef;
+}
+
 sub _check_typed_insert_admission {
     my ($self, $command) = @_;
     return unless $command->operation eq 'insert' || $command->operation eq 'upsert';
-    my $types = $command->metadata->{__selecto_insert_types};
-    return unless defined $types; # Explicit, trusted *_unsafe adapter tooling.
+    # Engine-governed commands carry the domain's types; explicit *_unsafe
+    # tooling defers to this check through its declared field_types.
+    my $types = $command->metadata->{__selecto_insert_types} // _declared_admission_types($command);
+    return unless defined $types; # Untyped tooling was refused at compile.
     my $predicate = Selecto::QueryEnforcement::combine(
         $command->predicate, $command->scope_predicate,
         defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,

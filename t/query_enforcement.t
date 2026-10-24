@@ -47,10 +47,18 @@ is($error->code, 'cardinality_mismatch', 'intervening eligibility change is reje
 is($dbh->selectrow_array(q{SELECT status FROM items WHERE id = 1}), 'changed', 'stale write changed nothing');
 
 my $candidate = { id => 2, tenant_id => 7, status => 'active', total => 10.5 };
-is(Selecto::QueryEnforcement::evaluate(Selecto::Expression->ne('status', 'blocked'), $candidate), 'true', 'neq evaluates');
-is(Selecto::QueryEnforcement::evaluate(Selecto::Expression->lte('id', 2), $candidate), 'true', 'lte evaluates');
+# The candidate evaluator decides by declared type (query_enforced_scalar v2).
+my $verified = {map { ($_ => {type => $domain->fields->{$_}, metadata => 'verified'}) } keys %{$domain->fields}};
+is(Selecto::QueryEnforcement::evaluate(Selecto::Expression->ne('status', 'blocked'), $candidate, $verified), 'true', 'neq evaluates');
+is(Selecto::QueryEnforcement::evaluate(Selecto::Expression->lte('id', 2), $candidate, $verified), 'true', 'lte evaluates');
 is(Selecto::QueryEnforcement::evaluate(Selecto::Expression->not(Selecto::Expression->eq('status', 'blocked')),
-    { %$candidate, status => undef }), 'unknown', 'NOT preserves SQL unknown');
+    { %$candidate, status => undef }, $verified), 'unknown', 'NOT preserves SQL unknown');
+is(exception { Selecto::QueryEnforcement::evaluate(Selecto::Expression->ne('status', 'blocked'), $candidate) }->code,
+    'query_rule_not_evaluable', 'an undeclared field decides nothing');
+is(exception { Selecto::QueryEnforcement::evaluate(Selecto::Expression->ne('status', 'blocked'), $candidate,
+    $domain->fields) }->code, 'query_rule_not_evaluable', 'nor does a declared name alone (unverified)');
+is(exception { Selecto::QueryEnforcement::evaluate(Selecto::Expression->gt('status', 'a'), $candidate, $verified) }->code,
+    'query_rule_not_evaluable', 'a text range is never decided in process');
 
 my $empty = Selecto::Engine->new(
     domain => Selecto::Domain->new(name => 'Empty', table => 'items', fields => $domain->fields),

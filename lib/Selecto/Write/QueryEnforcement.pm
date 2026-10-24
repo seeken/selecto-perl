@@ -224,10 +224,25 @@ sub compile {
         if defined($predicate) && ($state->{type}//'') eq 'upsert';
     return $predicate;
 }
+# In-process admission of a portable insert candidate (query_enforced_scalar
+# v2). The contract's declared column types are names only, never checked
+# against the real column at compile time, so they are unverified: the
+# evaluator decides only NULL candidates (unknown, refused) and an absent
+# field (refused before any DML). Every other comparison is not decidable in
+# process and is deferred to the verified-storage check that runs before the
+# compiled command's DML (Selecto::SQL::_check_typed_insert_admission, which
+# compares under the catalog's real type, typmod and collation, or refuses).
 sub validate_insert {
-    my ($class, $state, $values, $predicate, $backend) = @_;
+    my ($class, $state, $values, $predicate, $backend, $types) = @_;
     return unless ($state->{type}//'') eq 'insert' && defined($predicate) && ($backend//'') ne 'sqlite';
-    my $result = Selecto::QueryEnforcement::evaluate($predicate, $values);
+    my $result = eval { Selecto::QueryEnforcement::evaluate($predicate, $values, $types // {}, metadata => 'unverified',
+        backend => ($backend // '') =~ /\A(?:mysql|mariadb)\z/ ? 'mysql_family' : 'other') };
+    unless (defined $result) {
+        my $error = $@;
+        die $error unless Scalar::Util::blessed($error) && $error->isa('Selecto::Error')
+            && $error->code eq 'query_rule_not_evaluable' && !$error->details->{missing_fields};
+        return;
+    }
     _fail('query_rule_violation', 'insert candidate does not satisfy required query predicates', {operation=>'insert'}) unless $result eq 'true';
 }
 
