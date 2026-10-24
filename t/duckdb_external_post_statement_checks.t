@@ -89,6 +89,19 @@ for my $case (sort keys %checked) {
     is($code, 'transaction_unavailable/no_savepoints', 'external: a multi-node graph is refused before any DML');
     is($rows->($dbh), '1:t1:n 2:t2:n', 'external: graph, nothing kept');
 }
+# A transaction_handler runs the work directly too (no savepoints): the same
+# refusal applies.
+for my $case (sort keys %checked) {
+    my $dbh = $setup->();
+    my $engine = Selecto::Engine->new(adapter => Selecto->adapter(duckdb => (dbh => $dbh, transaction_handler => sub { $_[0]->() })),
+        domain => $domain);
+    $dbh->begin_work;
+    my $code = $outcome->(sub { $engine->execute_write($checked{$case}->()) });
+    $dbh->commit;
+    is($code, 'transaction_unavailable/no_savepoints', "handler: $case is refused before any DML");
+    is($rows->($dbh), '1:t1:n 2:t2:n', "handler: $case, and the host's commit keeps nothing");
+}
+
 # Writes that cannot be refused after changing rows run directly.
 for my $case (sort keys %harmless) {
     my ($command, $expected) = @{$harmless{$case}};
