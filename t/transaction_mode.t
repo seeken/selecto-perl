@@ -224,7 +224,7 @@ my $write = sub {
 subtest 'standalone and failed begin' => sub {
     my $idle = RecordingDBH->new;
     ok(!$write->(Selecto->adapter(postgresql => (dbh => $idle))), 'standalone write succeeds');
-    is_deeply($idle->events, ['begin_work', 'write', 'commit'], 'an idle handle begins and commits');
+    is_deeply($idle->events, ['begin_work', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'write', 'commit'], 'an idle handle begins and commits');
 
     my $refused = RecordingDBH->new(fail_begin => 1);
     my $error = $write->(Selecto->adapter(postgresql => (dbh => $refused)));
@@ -235,13 +235,13 @@ subtest 'standalone and failed begin' => sub {
     my $uncommitted = RecordingDBH->new(fail_commit => 1);
     $error = $write->(Selecto->adapter(postgresql => (dbh => $uncommitted)));
     is($error->code, 'query_error', 'a failed commit is a Selecto error');
-    is_deeply($uncommitted->events, ['begin_work', 'write', 'commit', 'rollback'],
+    is_deeply($uncommitted->events, ['begin_work', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'write', 'commit', 'rollback'],
         'a failed commit rolls back the write\'s own transaction');
 
     my $mismatch = RecordingDBH->new(affected => [0]);
     is($write->(Selecto->adapter(postgresql => (dbh => $mismatch)))->code, 'cardinality_mismatch',
         'a cardinality mismatch is reported unchanged');
-    is_deeply($mismatch->events, ['begin_work', 'write', 'rollback'], 'and rolls back its own transaction');
+    is_deeply($mismatch->events, ['begin_work', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'write', 'rollback'], 'and rolls back its own transaction');
 };
 
 subtest 'savepoints inside an open DBI transaction' => sub {
@@ -356,7 +356,7 @@ subtest 'PostgreSQL detects a raw BEGIN' => sub {
         'idle in a transaction means a savepoint');
     my $idle = RecordingDBH->new(ping => 1);
     $write->(Selecto->adapter(postgresql => (dbh => $idle)));
-    is_deeply($idle->events, ['pg_ping', 'begin_work', 'write', 'commit'], 'idle means begin and commit');
+    is_deeply($idle->events, ['pg_ping', 'begin_work', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'write', 'commit'], 'idle means begin and commit');
 };
 
 subtest 'DuckDB' => sub {

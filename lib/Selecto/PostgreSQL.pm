@@ -170,6 +170,22 @@ sub normalize_type {
     return { int4 => 'integer', numeric => 'decimal', timestamptz => 'utc_datetime' }->{"$name"} // 'unknown';
 }
 
+# A managed transaction begins READ COMMITTED explicitly, so a session or
+# database default (default_transaction_isolation) cannot weaken the
+# guarded-write catalog checks; DBD::Pg sends BEGIN with the first
+# statement, so this is the transaction's first statement.
+sub _begin_transaction {
+    my ($self) = @_;
+    $self->SUPER::_begin_transaction;
+    my $ok = eval { $self->dbh->do('SET TRANSACTION ISOLATION LEVEL READ COMMITTED'); 1 };
+    unless ($ok) {
+        my $error = $@;
+        eval { $self->dbh->rollback };
+        die $error;
+    }
+    return;
+}
+
 sub insert_admission_storage {
     my ($self, $command, $types) = @_;
     my $dbh = $self->dbh;
@@ -179,6 +195,9 @@ sub insert_admission_storage {
     my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
     # Keep the inspected table and trigger/type definitions stable until DML.
     $dbh->do("LOCK TABLE ONLY $table IN ROW EXCLUSIVE MODE");
+    # The trigger and rule checks below need READ COMMITTED (see
+    # Selecto::SQL::_require_read_committed).
+    $self->_require_read_committed(Selecto::Identifier::checked($command->relation));
     my $relation = $dbh->selectrow_hashref(q{
         SELECT c.oid, c.relkind, c.relispartition::integer AS relispartition,
           (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid=c.oid AND NOT t.tgisinternal AND t.tgenabled <> 'D'))::integer AS triggers,

@@ -75,7 +75,7 @@ subtest 'originating cardinality errors never serialize match counts' => sub {
         is $error->code, 'cardinality_mismatch', 'typed mismatch';
         ok !exists($error->details->{actual}), 'details exclude actual';
         unlike(JSON::PP->new->encode($error->to_hash), qr/"actual"/, 'JSON excludes actual');
-        is_deeply $dbh->events, ['BEGIN', 'ROLLBACK'], 'refusal rolls back';
+        is_deeply $dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'ROLLBACK'], 'refusal rolls back';
     }
 };
 subtest 'parameterized IN operands retain SQL occurrence order' => sub {
