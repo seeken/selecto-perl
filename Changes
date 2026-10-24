@@ -8,8 +8,8 @@ Unreleased
       the conflicting key, so an upsert under org_key = 't1' took over or
       overwrote another tenant's row. An engine-tenant upsert with the
       tenant in its conflict target is unchanged.
-    - PostgreSQL: a bound-scope update on a table with an enabled
-      statement-level UPDATE trigger is refused with
+    - PostgreSQL: a bound-scope update or delete on a table with an enabled
+      statement-level UPDATE (respectively DELETE) trigger is refused with
       write_capability_missing: such a trigger can write rows the post-image
       re-read does not name. Row-level triggers that modify OTHER rows are
       likewise outside the bound-scope guarantee, which covers the updated

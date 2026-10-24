@@ -3528,7 +3528,8 @@ re-read after the statement, when every non-deferred row trigger has run.
 An update that moved a row out of scope rolls back with
 C<query_rule_violation>. Updates through views, on tables with deferrable
 constraint triggers (C<query_rule_not_evaluable>) or statement-level update
-triggers (C<write_capability_missing>) are refused. Row-level triggers that
+triggers (C<write_capability_missing>) are refused, as are bound-scope
+deletes on tables with statement-level delete triggers. Row-level triggers that
 modify I<other> rows are outside this guarantee. A plain required predicate
 and query enforcement bound the rows an update finds, not the rows it
 leaves. An upsert keeps a scope only as equalities on its conflict-target

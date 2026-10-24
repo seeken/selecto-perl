@@ -90,7 +90,7 @@ for my $backend (@backends) {
 # re-read does not name: a bound-scope update on such a table is refused.
 SKIP: {
     my ($pg) = grep { $_->[0] eq 'postgresql' } @backends;
-    skip 'SELECTO_PERL_TEST_POSTGRES_URL is not configured', 4 unless $pg;
+    skip 'SELECTO_PERL_TEST_POSTGRES_URL is not configured', 10 unless $pg;
     my $dbh = $pg->[1]->();
     $dbh->do('DROP TABLE IF EXISTS selecto_up_rows');
     $dbh->do('CREATE TABLE selecto_up_rows (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16) NOT NULL, code VARCHAR(16) NOT NULL, note VARCHAR(16))');
@@ -118,6 +118,43 @@ SKIP: {
         'applied', 'a required-only update (pre-image bound) is not affected');
     is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_up_rows ORDER BY id'), [[1, 'changed'], [2, 'other']],
         'its trigger ran as usual');
+
+    # The same holds for a statement-level DELETE trigger under a bound scope
+    # (engine tenant or host scope); a required-only delete is not bound.
+    my $delete_domain = sub {
+        my ($tenant) = @_;
+        return Selecto::Domain->parse({schema_version => 1, name => 'StatementDelete',
+            source => {source_table => 'selecto_up_rows', primary_key => 'id', fields => [qw(id org_key code note)],
+                columns => {id => {type => 'integer'}, org_key => {type => 'string'}, code => {type => 'string'}, note => {type => 'string'}},
+                associations => {}, ($tenant ? (tenant_field => 'org_key') : ())},
+            schemas => {}, joins => {},
+            writes => {operations => {delete => {enabled => 1, bulk => 1, expected_cardinality => 'many'}}}});
+    };
+    my $reset = sub {
+        $dbh->do('DROP TABLE IF EXISTS selecto_up_rows');
+        $dbh->do('CREATE TABLE selecto_up_rows (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16) NOT NULL, code VARCHAR(16) NOT NULL, note VARCHAR(16))');
+        $dbh->do(q{INSERT INTO selecto_up_rows VALUES (5, 't1', 'a', 'n'), (6, 't2', 'b', 'n')});
+        $dbh->do('CREATE TRIGGER selecto_up_other AFTER DELETE ON selecto_up_rows FOR EACH STATEMENT EXECUTE FUNCTION selecto_up_other()');
+    };
+    my $state = sub { $dbh->selectall_arrayref('SELECT id, note FROM selecto_up_rows ORDER BY id') };
+    my $delete = sub {
+        my ($engine, %extra) = @_;
+        return eval { $engine->execute_write(Selecto::Write::Command->new(operation => 'delete', relation => 'selecto_up_rows',
+            predicate => $x->eq('id', 5), %extra)); 'applied' } // (blessed($@) ? $@->code : "died: $@");
+    };
+    my $pg_adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    $reset->();
+    is($delete->(Selecto::Engine->new(adapter => $pg_adapter, domain => $delete_domain->(1), scope => {tenant => 't1'})),
+        'write_capability_missing', 'an engine-tenant delete on a table with a statement-level DELETE trigger is refused');
+    is_deeply($state->(), [[5, 'n'], [6, 'n']], 'and nothing changed');
+    $reset->();
+    is($delete->(Selecto::Engine->new(adapter => $pg_adapter, domain => $delete_domain->(0)), scope_predicate => $x->eq('org_key', 't1')),
+        'write_capability_missing', 'a host-scoped delete on such a table is refused');
+    is_deeply($state->(), [[5, 'n'], [6, 'n']], 'and nothing changed');
+    $reset->();
+    is($delete->(Selecto::Engine->new(adapter => $pg_adapter, domain => $delete_domain->(0)->with_required_predicate($x->eq('org_key', 't1')))),
+        'applied', 'a required-only delete is not bound and applies');
+    is_deeply($state->(), [[6, 'other']], 'with its trigger');
     $dbh->do('DROP TABLE IF EXISTS selecto_up_rows');
     $dbh->do('DROP FUNCTION IF EXISTS selecto_up_other()');
 }
