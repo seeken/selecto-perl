@@ -1,6 +1,16 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB: every update and delete, guarded or not, and every
+      command of a batch or graph, requires an InnoDB base table (checked
+      after the table's metadata lock; a session TEMPORARY table shadowing
+      it and writes through views are refused too) with
+      write_capability_missing. MEMORY, MyISAM and Aria tables apply each
+      statement at once, so a write refused after its statement (an
+      expected count or ceiling mismatch, a post-image violation, a later
+      batch or graph command) kept its changes. A lone insert or upsert
+      (at most one row, refused afterwards only when it affected none) is
+      unchanged; guarded ones already required InnoDB.
     - DuckDB, external mode: the primary-key bound on what an update or
       delete can reach now counts only when the declared key is an enforced
       PRIMARY KEY or NOT NULL UNIQUE constraint of the table the write
