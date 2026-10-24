@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - transaction_mode => 'external': each write now runs inside its own
+      savepoint (SAVEPOINT ... RELEASE, ROLLBACK TO SAVEPOINT on failure),
+      as a managed write inside a host transaction already did. A guarded
+      write refused after its DML ran (a post-image violation, the post-DML
+      catalog recheck, a cardinality mismatch) used to leave that DML in the
+      host's transaction, so a host that committed after the error
+      persisted the out-of-scope row. The adapter still never begins,
+      commits or rolls back the host's transaction. DuckDB, which has no
+      savepoints, runs external writes directly as before.
     - PostgreSQL: a bound-scope delete takes LOCK TABLE ... IN ROW EXCLUSIVE
       MODE before its statement-trigger check, requires READ COMMITTED like
       every guarded write (query_rule_not_evaluable, reason

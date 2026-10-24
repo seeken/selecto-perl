@@ -8,7 +8,8 @@ use TestSelecto;
 use Selecto;
 
 # How a write's transaction meets the host's: begin/commit on an idle handle,
-# a savepoint inside an open transaction, nothing at all in external mode,
+# a savepoint inside an open transaction and in external mode (which never
+# begins or commits; DuckDB has no savepoints and runs the write directly),
 # and the host's own transaction API through transaction_handler.
 
 my $domain = TestSelecto::writable_domain(
@@ -275,7 +276,13 @@ subtest 'savepoints inside an open DBI transaction' => sub {
     my $external = RecordingDBH->new(AutoCommit => 0);
     ok(!$write->(Selecto->adapter(postgresql => (dbh => $external, transaction_mode => 'external'))),
         'external write succeeds');
-    is_deeply($external->events, ['write'], 'external mode issues no transaction control at all');
+    is_deeply($external->events, ['SAVEPOINT selecto_write_1', 'write', 'RELEASE SAVEPOINT selecto_write_1'],
+        'external mode never begins or commits, and runs the write in its own savepoint');
+    my $external_failed = RecordingDBH->new(AutoCommit => 0, affected => [0]);
+    is($write->(Selecto->adapter(postgresql => (dbh => $external_failed, transaction_mode => 'external')))->code,
+        'cardinality_mismatch', 'an external write refused after its statement');
+    is_deeply($external_failed->events, ['SAVEPOINT selecto_write_1', 'write', 'ROLLBACK TO SAVEPOINT selecto_write_1',
+        'RELEASE SAVEPOINT selecto_write_1'], 'rolls back to its own savepoint, never the host transaction');
 };
 
 subtest 'MySQL and MariaDB' => sub {

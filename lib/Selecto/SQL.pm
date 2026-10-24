@@ -3914,11 +3914,22 @@ sub _transaction {
             'invalid_adapter',
             'external transaction mode requires AutoCommit to be disabled',
         ) unless defined($auto_commit) && !$auto_commit;
-        return $operation->();
+        return $self->_external_transaction($operation);
     }
     return $self->_handler_transaction($handler, $operation) if defined $handler;
     return $self->_savepoint_transaction($operation) if $self->_transaction_open;
     return $self->_own_transaction($operation);
+}
+
+# External mode: the host owns the transaction, but a write refused after its
+# DML ran (a post-image violation, a post-DML catalog recheck, a cardinality
+# mismatch) must not leave that DML for the host to commit. The write runs in
+# its own savepoint and rolls back to it on failure; the host's earlier work
+# and its transaction are kept, and nothing is ever committed. (DuckDB has no
+# savepoints and overrides this.)
+sub _external_transaction {
+    my ($self, $operation) = @_;
+    return $self->_savepoint_transaction($operation);
 }
 
 # Managed mode on an idle handle: the write's own transaction.
@@ -4258,9 +4269,13 @@ the original error is still raised and the host must roll back.
 
 C<external>: for hosts that already own a unit-of-work transaction. The
 handle must have C<AutoCommit> disabled (otherwise C<invalid_adapter>) and
-the adapter never begins, commits, rolls back or creates savepoints. The
-host must commit on success and roll back on every exception, including a
-failed write. Use this mode, or C<managed> inside the host's transaction,
+the adapter never begins, commits or rolls back the transaction. Each write
+runs inside its own savepoint (as a managed write inside a host transaction
+does), so a write refused after its statements ran (for example a post-image
+violation) undoes only itself and a host that commits afterwards never
+persists it; DuckDB, which has no savepoints, runs the write directly. The
+host must still commit on success and should roll back on an exception it
+cannot handle. Use this mode, or C<managed> inside the host's transaction,
 with L<Selecto::Query/for_share> to keep an eligibility read valid until the
 write commits.
 

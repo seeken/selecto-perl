@@ -465,6 +465,12 @@ sub _transaction_statement {
 # DuckDB has no savepoints, so a managed write cannot run inside a
 # transaction the host holds open without committing or discarding the
 # host's work. It is refused instead.
+# External mode runs the write directly: DuckDB has no savepoints.
+sub _external_transaction {
+    my ($self, $operation) = @_;
+    return $operation->();
+}
+
 sub _savepoint_transaction {
     Selecto::Error->throw(
         'invalid_adapter',
