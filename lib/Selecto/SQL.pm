@@ -4024,20 +4024,27 @@ sub _savepoint_transaction {
 # transaction is refused before any DML.
 sub _handler_transaction {
     my ($self, $handler, $operation) = @_;
-    my ($ran, $value) = (0);
+    my ($ran, $value, $failure) = (0);
     $handler->(sub {
         $ran = 1;
-        Selecto::Error->throw('transaction_unavailable',
-            'transaction_handler ran the write outside a transaction', {reason => 'autocommit'})
-            unless $self->_transaction_open;
-        # The write's own savepoint inside the handler's transaction: a write
-        # refused after its statement undoes itself even when the handler
-        # (or the host around it) goes on to commit.
-        $value = $self->_handler_unit($operation);
+        my $ok = eval {
+            Selecto::Error->throw('transaction_unavailable',
+                'transaction_handler ran the write outside a transaction', {reason => 'autocommit'})
+                unless $self->_transaction_open;
+            # The write's own savepoint inside the handler's transaction: a
+            # write refused after its statement undoes itself even when the
+            # handler (or the host around it) goes on to commit.
+            $value = $self->_handler_unit($operation);
+            1;
+        };
+        unless ($ok) { $failure = $@; die $failure }
         return $value;
     });
     Selecto::Error->throw('invalid_adapter', 'transaction handler did not run the write')
         unless $ran;
+    # A handler that swallowed the write's failure (and perhaps committed)
+    # never turns it into a success: the original error is raised again.
+    die $failure if defined $failure;
     return $value;
 }
 
@@ -4367,7 +4374,8 @@ work run in autocommit is refused with C<transaction_unavailable> (details
 C<< {reason => 'autocommit'} >>) before any statement. Inside the handler's
 transaction the write runs in its own savepoint (DuckDB, which has none,
 runs it directly), so a refused write undoes itself even if the handler
-commits. On SQLite, writes
+commits, and a failure the handler swallows is raised again after it
+returns. On SQLite, writes
 governed by stored-stage data rules additionally require the handler's
 transaction (C<required_data_rule_pending> otherwise). The handler may
 be called again for the write inside its own transaction, so it should run

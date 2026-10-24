@@ -67,6 +67,8 @@ for my $backend (@backends) {
         'external, host transaction' => [{transaction_mode => 'external'}, 1],
         'transactional handler' => [{transaction_handler => $transactional}, 0],
         'autocommit handler' => [{transaction_handler => sub { $_[0]->() }}, 0],
+        # Item 31: a handler that swallows the write's error and commits.
+        'swallowing handler' => [{transaction_handler => sub { $dbh->begin_work; eval { $_[0]->() }; $dbh->commit; 1 }}, 0],
     );
     my %writes = (
         'an unguarded update expecting 1 that matches 2' => sub { $_[0]->execute_write_unsafe(Selecto::Write::Command->new(
@@ -88,7 +90,9 @@ for my $backend (@backends) {
             my $code = eval { $writes{$write}->($adapter); 'applied' } // do {
                 my $e = $@; blessed($e) ? $e->code . (($e->details // {})->{reason} ? '/' . $e->details->{reason} : '') : "died: $e" };
             $dbh->commit if $host;
-            if ($mode eq 'autocommit handler') {
+            if ($mode eq 'swallowing handler') {
+                ok($code ne 'applied' && $code !~ /\Adied/, "$name $mode: $write still raises its typed error ($code)");
+            } elsif ($mode eq 'autocommit handler') {
                 is($code, 'transaction_unavailable/autocommit', "$name $mode: $write is refused before any DML");
             } else {
                 isnt($code, 'applied', "$name $mode: $write is refused ($code)");
