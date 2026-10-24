@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB: a bound-scope update reads its table (SELECT 1 ...
+      LIMIT 0) in the write's transaction before the information_schema
+      kind and unique-key checks, so the shared metadata lock it holds until
+      commit keeps a concurrent CREATE TRIGGER, ALTER or DROP INDEX from
+      changing the table between those checks and commit. A trigger created
+      in that window used to rewrite the updated row after the checks.
     - SQL Server: a governed update under a bound scope (engine tenant,
       writes.scope, host scope predicate, required tenant pin) is refused
       with write_capability_missing before any DML. SQL Server never ran the

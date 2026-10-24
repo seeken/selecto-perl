@@ -3545,6 +3545,11 @@ sub _admit_post_image_target {
             @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
                 undef, $table);
         } elsif ($name eq 'mysql' || $name eq 'mariadb') {
+            # Read the table first, in the write's transaction: its shared
+            # metadata lock holds until commit, so a concurrent CREATE
+            # TRIGGER, ALTER or DROP INDEX cannot change what the
+            # information_schema checks below (kind, unique key) describe.
+            $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
             @row = $dbh->selectrow_array($self->_statement_sql(q{SELECT TABLE_TYPE, 0 FROM information_schema.TABLES
                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
         } else {
