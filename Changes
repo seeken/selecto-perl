@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: a bound-scope update takes LOCK TABLE ... IN ROW EXCLUSIVE
+      MODE (the lock the UPDATE takes anyway) before reading the catalog, so
+      a concurrent CREATE TRIGGER, ENABLE TRIGGER or CREATE RULE on the
+      relation or its partitions waits until commit, and it re-reads the
+      catalog after the UPDATE and before the post-image re-read: a
+      deferrable trigger created or enabled elsewhere (an audit table) while
+      the update waited for its rows is refused with query_rule_not_evaluable
+      and the write rolls back. A session that created such a trigger during
+      a row-lock wait previously let the row commit in another tenant.
     - DuckDB (and any adapter other than PostgreSQL, SQLite, MySQL and
       MariaDB): a governed update under a bound scope (engine tenant,
       writes.scope, host scope predicate, required tenant pin) is refused

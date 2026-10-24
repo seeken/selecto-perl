@@ -3474,7 +3474,10 @@ sub _execute_compiled_write_in_transaction {
     };
     die $self->normalize_error($@) unless $ok;
     $self->_check_write_cardinality($command, $affected, $bounds);
-    $self->_verify_post_image($command, $post_image, $identities, $affected) if $post_image;
+    if ($post_image) {
+        $self->_recheck_post_image_target($command);
+        $self->_verify_post_image($command, $post_image, $identities, $affected);
+    }
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
@@ -3527,22 +3530,12 @@ sub _admit_post_image_target {
     my @row;
     my $ok = eval {
         if ($name eq 'postgresql') {
-            @row = $dbh->selectrow_array(q{
-                WITH RECURSIVE tree(oid, partition) AS (
-                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass
-                  UNION ALL
-                  SELECT i.inhrelid, child.relispartition FROM pg_catalog.pg_inherits i
-                  JOIN tree ON i.inhparent = tree.oid
-                  JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid)
-                SELECT c.relkind,
-                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
-                    AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
-                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
-                    AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & 16) <> 0))::integer,
-                  (EXISTS(SELECT 1 FROM tree WHERE NOT tree.partition))::integer,
-                  (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
-                    WHERE r.rulename <> '_RETURN'))::integer
-                FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, ($self->quote_identifier($table)) x 2);
+            # ROW EXCLUSIVE (what the UPDATE takes anyway, on every partition
+            # and child too) conflicts with CREATE TRIGGER, ALTER TABLE ...
+            # ENABLE TRIGGER and CREATE RULE on them: the catalog read below
+            # stays true for these relations until commit.
+            $dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
+            @row = $self->_pg_post_image_catalog($table);
         } elsif ($name eq 'sqlite') {
             @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
                 undef, $table);
@@ -3584,6 +3577,57 @@ sub _admit_post_image_target {
         if grep { $key{lc $_} } keys %{$command->assignments};
     $refuse->('a governed update under a bound scope requires an enforced unique key')
         unless $self->_enforced_unique_key($table, \@keys);
+    return;
+}
+
+# PostgreSQL catalog facts the post-image check depends on: the relation's
+# kind; whether any enabled non-internal deferrable trigger exists in the
+# database; statement-level UPDATE triggers, (non-partition) inheritance
+# children and rules on the relation or any partition or child below it.
+sub _pg_post_image_catalog {
+    my ($self, $table) = @_;
+    return $self->dbh->selectrow_array(q{
+                WITH RECURSIVE tree(oid, partition) AS (
+                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass
+                  UNION ALL
+                  SELECT i.inhrelid, child.relispartition FROM pg_catalog.pg_inherits i
+                  JOIN tree ON i.inhparent = tree.oid
+                  JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid)
+                SELECT c.relkind,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
+                    AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
+                    AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & 16) <> 0))::integer,
+                  (EXISTS(SELECT 1 FROM tree WHERE NOT tree.partition))::integer,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
+                    WHERE r.rulename <> '_RETURN'))::integer
+                FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, ($self->quote_identifier($table)) x 2);
+}
+
+# After the UPDATE and before the re-read (PostgreSQL): the table lock keeps
+# the written relations' triggers and rules fixed, but a deferrable trigger
+# on another table (an audit table a row trigger writes to) could have been
+# created or enabled while the update waited for its rows. A deferred event
+# is queued only for a trigger that existed when the row trigger fired, so a
+# clean check now closes that window; otherwise the write is refused and
+# rolled back.
+sub _recheck_post_image_target {
+    my ($self, $command) = @_;
+    return unless $self->name eq 'postgresql';
+    my $table = Selecto::Identifier::checked($command->relation);
+    my @row;
+    my $ok = eval { @row = $self->_pg_post_image_catalog($table); 1 };
+    die $self->normalize_error($@) unless $ok;
+    my ($kind, $deferrable, $statement_trigger, $inheritance, $rules) = @row;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a deferrable constraint trigger could change the rows after their verification', {relation => $table})
+        if $deferrable;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'the relation gained inheritance children or rules while the update ran', {relation => $table})
+        if $inheritance || $rules;
+    Selecto::Error->throw('write_capability_missing',
+        'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
+        if $statement_trigger;
     return;
 }
 
