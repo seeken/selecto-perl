@@ -219,4 +219,52 @@ for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
     };
 }
 
+# The stored-row re-check finds the inserted row by its declared key, so it
+# decides only when the table really enforces that key (a PRIMARY or UNIQUE
+# index of exactly those NOT NULL columns). Without one a decoy row could be
+# counted instead: a CHAR(n) candidate, which only the re-check decides, is
+# then refused.
+for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
+    my ($name, $connect) = @$backend;
+    subtest "$name the stored-row re-check needs a unique key" => sub {
+        my $dbh = $connect->();
+        my $insert = sub {
+            my ($ddl, $key, $seed, $assignments, $predicate) = @_;
+            $dbh->do('DROP TABLE IF EXISTS selecto_v2_key_rows');
+            $dbh->do("CREATE TABLE selecto_v2_key_rows ($ddl)");
+            $dbh->do($_) for @$seed;
+            my @fields = sort keys %$assignments;
+            my $source = relation('selecto_v2_key_rows', map { ($_ => $_ eq 'org_key' ? 'string' : 'integer') } @fields);
+            $source->{primary_key} = $key;
+            my $engine = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)),
+                domain => Selecto::Domain->parse({schema_version => 1, name => 'Keys', source => $source, schemas => {}, joins => {},
+                    writes => {operations => {insert => {enabled => 1}}, fields => {map { ($_ => {insertable => 1}) } @fields}}}));
+            my $error = eval { $engine->execute_write(Selecto::Write::Command->new(operation => 'insert',
+                relation => 'selecto_v2_key_rows', assignments => $assignments, scope_predicate => $predicate)); 1 } ? undef : $@;
+            my $rows = $dbh->selectall_arrayref('SELECT org_key FROM selecto_v2_key_rows ORDER BY org_key');
+            return (blessed($error) ? $error->code : defined($error) ? "died: $error" : 'applied', [map { $_->[0] } @$rows]);
+        };
+        my @outcome = $insert->('id INT NOT NULL, org_key CHAR(4)', 'id', [q{INSERT INTO selecto_v2_key_rows VALUES (1, 'zz')}],
+            {id => 1, org_key => 't1 '}, $x->ne('org_key', 't1'));
+        is_deeply(\@outcome, ['query_rule_not_evaluable', ['zz']],
+            'no unique key: a decoy row cannot satisfy the re-check, the CHAR(n) insert is refused');
+        @outcome = $insert->('id INT NOT NULL, org_key CHAR(4), UNIQUE KEY (id)', 'id', [],
+            {id => 1, org_key => 't1 '}, $x->ne('org_key', 't1'));
+        is_deeply(\@outcome, ['query_rule_violation', []], 'a unique key: the re-check refuses the stored t1');
+        @outcome = $insert->('id INT NOT NULL PRIMARY KEY, org_key CHAR(4)', 'id', [], {id => 1, org_key => 't1'},
+            $x->eq('org_key', 't1'));
+        is_deeply(\@outcome, ['applied', ['t1']], 'a real primary key: the own CHAR(n) row is applied');
+        @outcome = $insert->('a INT NOT NULL, b INT NOT NULL, org_key CHAR(4), PRIMARY KEY (a, b)', ['a', 'b'],
+            [q{INSERT INTO selecto_v2_key_rows VALUES (1, 1, 'zz')}], {a => 1, b => 2, org_key => 't1'}, $x->eq('org_key', 't1'));
+        is_deeply(\@outcome, ['applied', ['t1', 'zz']], 'a composite primary key: the own CHAR(n) row is applied');
+        @outcome = $insert->('a INT NOT NULL, b INT NOT NULL, org_key CHAR(4), PRIMARY KEY (a, b)', ['a', 'b'],
+            [q{INSERT INTO selecto_v2_key_rows VALUES (1, 1, 'zz')}], {a => 1, b => 2, org_key => 't1 '}, $x->ne('org_key', 't1'));
+        is_deeply(\@outcome, ['query_rule_violation', ['zz']], 'a composite primary key: the stored t1 is refused');
+        @outcome = $insert->('a INT NOT NULL, b INT NOT NULL, org_key CHAR(4), PRIMARY KEY (a)', ['a', 'b'],
+            [], {a => 1, b => 2, org_key => 't1 '}, $x->ne('org_key', 't1'));
+        is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a declared key wider than the enforced one is not unique as declared');
+        $dbh->do('DROP TABLE IF EXISTS selecto_v2_key_rows');
+    };
+}
+
 done_testing;

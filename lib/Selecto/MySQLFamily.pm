@@ -1388,21 +1388,86 @@ sub _verify_inserted_row {
     return unless $result->affected_rows;
     my $predicate = _write_predicate_expression($command);
     return unless defined($predicate) && exists $command->metadata->{__selecto_insert_types};
-    my $key = $command->metadata->{__selecto_primary_key};
+    my $declared = $command->metadata->{__selecto_primary_key};
+    my @keys = map { Selecto::Identifier::checked($_) } grep { defined && !ref } ref($declared) eq 'ARRAY' ? @$declared : ($declared);
     Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires the primary key')
-        unless defined($key) && !ref($key);
-    $key = Selecto::Identifier::checked($key);
+        unless @keys && @keys == (ref($declared) eq 'ARRAY' ? @$declared : 1);
+    my $table = Selecto::Identifier::checked($command->relation);
+    # The re-read finds the inserted row by its key only when the key is
+    # really unique: a declared primary key the table does not enforce
+    # (no PRIMARY/UNIQUE index of exactly those NOT NULL columns) could count
+    # another row instead. Read in this write's transaction, never cached.
+    unless ($self->_unique_key_columns($table, \@keys)) {
+        # Storage admission already decided every column it can cast; a
+        # CHAR(n) column was admitted on this re-check alone.
+        Selecto::Error->throw('query_rule_not_evaluable',
+            'guarded insert verification requires a unique primary key')
+            if $self->_predicate_reads_char($table, $predicate);
+        return 1;
+    }
+    my $identity = @keys == 1 ? $self->_inserted_identity($command, $keys[0])
+        : Selecto::Expression->all(map { $self->_inserted_identity($command, $_, 1) } @keys);
+    # The identity must find exactly the inserted rows, and each must still
+    # satisfy the enforced predicate.
     my @params;
-    my $where = $self->_compile_write_predicate(
-        Selecto::QueryEnforcement::combine($self->_inserted_identity($command, $key), $predicate), \@params);
-    my $sql = 'SELECT COUNT(*) FROM ' . $self->quote_identifier(Selecto::Identifier::checked($command->relation))
-        . " WHERE $where";
-    my ($count);
-    my $ok = eval { ($count) = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
+    my $satisfied = $self->_compile_write_predicate($predicate, \@params);
+    my $where = $self->_compile_write_predicate($identity, \@params);
+    my $sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN ($satisfied) THEN 1 ELSE 0 END), 0) FROM "
+        . $self->quote_identifier($table) . " WHERE $where";
+    my ($count, $matched);
+    my $ok = eval { ($count, $matched) = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_violation', 'stored row does not satisfy the enforced query',
-        {truth_value => 'false_or_unknown'}) unless defined($count) && $count == $result->affected_rows;
+        {truth_value => 'false_or_unknown'})
+        unless defined($count) && defined($matched) && $count == $result->affected_rows && $matched == $count;
     return 1;
+}
+
+# True when @$keys are exactly the columns of a PRIMARY or UNIQUE index (no
+# prefix part) and every one is NOT NULL.
+sub _unique_key_columns {
+    my ($self, $table, $keys) = @_;
+    my ($indexes, $nullable);
+    my $ok = eval {
+        $indexes = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT INDEX_NAME, COLUMN_NAME, SUB_PART
+            FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND NON_UNIQUE = 0
+            ORDER BY INDEX_NAME, SEQ_IN_INDEX}), undef, $table);
+        $nullable = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, IS_NULLABLE
+            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my %null = map { (lc($_->[0]) => uc($_->[1] // 'YES')) } @$nullable;
+    return 0 if grep { ($null{lc $_} // 'YES') ne 'NO' } @$keys;
+    my %want = map { (lc($_) => 1) } @$keys;
+    my %index;
+    for my $row (@$indexes) {
+        my ($name, $column, $prefix) = @$row;
+        my $entry = $index{$name} //= {columns => {}, usable => 1};
+        $entry->{usable} = 0 if !defined($column) || defined($prefix);
+        $entry->{columns}{lc $column} = 1 if defined $column;
+    }
+    for my $entry (map { $index{$_} } sort keys %index) {
+        my $columns = $entry->{columns};
+        return 1 if $entry->{usable} && keys(%$columns) == keys(%want) && !grep { !$columns->{$_} } keys %want;
+    }
+    return 0;
+}
+
+# True when a field the predicate reads is a fixed-width CHAR(n)/NCHAR(n)
+# column (or its type cannot be read).
+sub _predicate_reads_char {
+    my ($self, $table, $predicate) = @_;
+    my %fields = map { (lc($_) => 1) } Selecto::Expression->field_references($predicate);
+    my $columns;
+    my $ok = eval {
+        $columns = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE
+            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my %type = map { (lc($_->[0]) => lc($_->[1] // '')) } @$columns;
+    return (grep { !defined($type{$_}) || $type{$_} eq 'char' } keys %fields) ? 1 : 0;
 }
 
 sub _write_predicate_expression {
@@ -1439,7 +1504,7 @@ sub _locked_write_keys {
 # generated the key: the key column is AUTO_INCREMENT and the insert omitted
 # it or assigned NULL/DEFAULT. Any other assigned key must be a literal.
 sub _inserted_identity {
-    my ($self, $command, $key) = @_;
+    my ($self, $command, $key, $assigned_only) = @_;
     my $assignments = $command->assignments;
     my $literal = sub {
         my ($field) = @_;
@@ -1462,6 +1527,9 @@ sub _inserted_identity {
                 && ($value->kind eq 'default' || ($value->kind eq 'literal' && !defined($value->arguments->[0]))));
         return Selecto::Expression->eq($key, $literal->($key)) unless $generated;
     }
+    # A column of a composite key must be assigned.
+    Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires every key column',
+        {field => $key}) if $assigned_only;
     my $table = Selecto::Identifier::checked($command->relation);
     my ($extra, $id);
     my $ok = eval {

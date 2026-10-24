@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB: the guarded-insert stored-row re-check decides only
+      when the table enforces the declared key (a PRIMARY or UNIQUE index of
+      exactly those NOT NULL columns, read in the write's transaction). On a
+      table without one a decoy row satisfied the count and a CHAR(n) 't1 '
+      was stored under <> 't1'; such an insert is now refused with
+      query_rule_not_evaluable (other columns were decided by storage
+      admission). The re-check also requires the key to find exactly the
+      inserted rows, and accepts composite primary keys.
     - MySQL/MariaDB storage admission refuses fixed-width CHAR(n)/NCHAR(n)
       columns with query_rule_not_evaluable on commands without a stored-
       row re-check (*_unsafe tooling with declared field_types), as
