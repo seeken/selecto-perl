@@ -3360,7 +3360,12 @@ sub _execute_compiled_write_in_transaction {
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
-    my $bounded = $self->_bounded_write_command($command);
+    # A governed update's trusted scope (required predicate, host scope,
+    # query enforcement) must hold for the rows it leaves behind too: an
+    # assignment, or a BEFORE UPDATE trigger, could move a row out of scope.
+    # Its rows are locked and named by key first, and re-read afterwards.
+    my $post_image = _post_image_predicate($command);
+    my ($bounded, $identities) = $self->_bounded_write_command($command, $post_image ? (force => 1) : ());
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;
     my ($sth, $affected, %values);
@@ -3397,14 +3402,56 @@ sub _execute_compiled_write_in_transaction {
     };
     die $self->normalize_error($@) unless $ok;
     $self->_check_write_cardinality($command, $affected, $bounds);
+    $self->_verify_post_image($command, $post_image, $identities) if $post_image;
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
     return Selecto::Write::Result->new(operation => $command->operation, affected_rows => $affected, values => \%values);
 }
 
+# The bound part of a governed update's predicate, which its post-image must
+# still satisfy (TW-09, bound tenant-like scope): the engine tenant,
+# writes.scope and the host's scope predicate, as the engine recorded them.
+# The required predicate, query enforcement and the caller's filter bound
+# the pre-image only: an update may change the column it was found by.
+# The engine tenant's columns are immutable, but a BEFORE UPDATE trigger
+# could still rewrite them: they are re-read like any bound scope.
+sub _post_image_predicate {
+    my ($command) = @_;
+    return undef unless $command->operation eq 'update' && exists $command->metadata->{__selecto_primary_key};
+    my $predicate = $command->metadata->{__selecto_post_image_scope};
+    return blessed($predicate) && $predicate->isa('Selecto::Expression') ? $predicate : undef;
+}
+
+# Every locked row the update could have changed must still satisfy the
+# trusted predicate, re-read in the write's transaction under the same
+# (host-exact) comparison; otherwise the write fails and rolls back. Rows the
+# update left unchanged satisfied it before and still do.
+sub _verify_post_image {
+    my ($self, $command, $predicate, $identities) = @_;
+    return unless ref($identities) eq 'ARRAY' && @$identities;
+    my $primary = $command->metadata->{__selecto_primary_key};
+    my @keys = map { Selecto::Identifier::checked($_) } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    my $locked = @keys == 1 ? Selecto::Expression->in($keys[0], [map { $_->[0] } @$identities])
+        : Selecto::Expression->any(map {
+            my $identity = $_;
+            Selecto::Expression->all(map { Selecto::Expression->eq($keys[$_], $identity->[$_]) } 0 .. $#keys)
+        } @$identities);
+    my @params;
+    my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
+    my $sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN (" . $self->_compile_write_predicate($predicate, \@params)
+        . ") THEN 1 ELSE 0 END), 0) FROM $table WHERE " . $self->_compile_write_predicate($locked, \@params);
+    my @row;
+    my $ok = eval { @row = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_violation', 'updated row no longer satisfies its trusted scope',
+        {truth_value => 'false_or_unknown'})
+        unless defined($row[0]) && defined($row[1]) && $row[0] == @$identities && $row[1] == $row[0];
+    return 1;
+}
+
 sub _bounded_write_command {
-    my ($self, $command) = @_;
+    my ($self, $command, %options) = @_;
     return $command unless $command->operation eq 'update' || $command->operation eq 'delete';
     my $metadata = $command->metadata;
     # Only the engine supplies this key before sealing the exact command in its
@@ -3430,10 +3477,23 @@ sub _bounded_write_command {
     }
     # A predicate selecting at most N distinct primary keys already bounds
     # mutation work without a second query or a check/use interval.
-    return $command if defined($identity_bound) && $identity_bound <= $limit;
     my $name = $self->name;
+    my $lockable = $name =~ /\A(?:postgresql|sqlite|mysql|mariadb)\z/;
+    if (defined($identity_bound) && $identity_bound <= $limit) {
+        return $command unless $options{force};
+        # An adapter that cannot lock and re-read the rows keeps an identity-
+        # bounded update only when it assigns no column its trusted scope
+        # reads (the post-image then cannot leave the scope by assignment).
+        if (!$lockable) {
+            my %scoped = map { ($_ => 1) } Selecto::Expression->field_references(_post_image_predicate($command));
+            Selecto::Error->throw('write_capability_missing',
+                'adapter cannot verify that an update keeps its rows in their trusted scope')
+                if grep { $scoped{$_} } keys %{$command->assignments};
+            return $command;
+        }
+    }
     Selecto::Error->throw('write_capability_missing', 'adapter cannot safely bound a broad write')
-        unless $name =~ /\A(?:postgresql|sqlite|mysql|mariadb)\z/;
+        unless $lockable;
     my @params;
     my $where = $self->_compile_write_predicate($predicate, \@params);
     my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
@@ -3488,8 +3548,9 @@ sub _bounded_write_command {
             my $identity = $_;
             Selecto::Expression->all(map { Selecto::Expression->eq($keys[$_], $identity->[$_]) } 0 .. $#keys)
         } @identities);
-    return $command->with_scope_predicate(
+    my $bounded = $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $keys));
+    return wantarray ? ($bounded, \@identities) : $bounded;
 }
 
 sub _write_identity_bound {

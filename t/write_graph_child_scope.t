@@ -87,6 +87,13 @@ sub engine {
     return ($dbh, $engine);
 }
 
+# The recording handle answers no locking probe or re-read: the governed
+# post-image re-read is exercised live (t/update_post_image_live.t).
+{
+    no warnings 'redefine';
+    *Selecto::SQL::_post_image_predicate = sub { undef };
+}
+
 sub graph_with_child {
     my ($child, %binding) = @_;
     return Selecto::Write::Graph->new(nodes => [
