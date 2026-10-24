@@ -3434,9 +3434,13 @@ sub _execute_compiled_write_in_transaction {
     # Its rows are locked and named by key first, and re-read afterwards.
     my $post_image = _post_image_predicate($command);
     $self->_admit_post_image_target($command) if $post_image;
+    # A governed delete under a bound scope (engine tenant, writes.scope, host
+    # scope, a required tenant pin) or under query enforcement alone is a
+    # bound-scope delete: a statement-level DELETE trigger could write rows
+    # outside that bound. A plain required filter alone is not (TW-09).
     $self->_refuse_statement_triggers($command, 8, 'delete')
         if $command->operation eq 'delete' && exists $command->metadata->{__selecto_primary_key}
-            && blessed($command->metadata->{__selecto_post_image_scope});
+            && (blessed($command->metadata->{__selecto_post_image_scope}) || defined($command->query_enforcement));
     my ($bounded, $identities) = $self->_bounded_write_command($command, $post_image ? (force => 1) : ());
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;

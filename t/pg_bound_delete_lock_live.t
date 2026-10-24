@@ -11,6 +11,7 @@ use Selecto::Engine;
 use Selecto::Domain;
 use Selecto::Expression;
 use Selecto::Write ();
+use Selecto::QueryEnforcement ();
 
 # PostgreSQL bound-scope deletes: the statement-trigger check runs after
 # LOCK TABLE ... IN ROW EXCLUSIVE MODE, so a statement-level DELETE trigger
@@ -76,6 +77,33 @@ my $other_row = sub { $dbh->selectall_arrayref('SELECT id, org_key, note FROM se
     $dbh->do(q{CREATE RULE selecto_del_rule AS ON DELETE TO selecto_del DO ALSO UPDATE selecto_del SET note = 'pwned' WHERE org_key = 't2'});
     is($delete->(), 'write_capability_missing', 'a DELETE rule on the relation is refused');
     is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_del ORDER BY id'), [[1, 'n'], [2, 'n']], 'and nothing changed');
+}
+# A delete bounded only by query enforcement is a bound-scope delete too: a
+# statement-level DELETE trigger is refused. (A plain required filter alone
+# is not a bound scope; t/upsert_scope_live.t keeps that.)
+{
+    my $plain = Selecto::Domain->parse({schema_version => 1, name => 'DelLockPlain',
+        source => {source_table => 'selecto_del', primary_key => 'id', fields => [qw(id name note org_key)],
+            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, name => {type => 'string'}, note => {type => 'string'}},
+            associations => {}},
+        schemas => {}, joins => {},
+        writes => {operations => {delete => {enabled => 1, bulk => 1, expected_cardinality => 'many'}}, fields => {}}});
+    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    my %bounds = (
+        'query enforcement only' => sub {
+            my $e = Selecto::Engine->new(adapter => $adapter, domain => $plain);
+            return ($e, query_enforcement => Selecto::QueryEnforcement->capture($plain, $e->query->where($x->eq('org_key', 't1'))));
+        },
+    );
+    for my $bound (sort keys %bounds) {
+        $reset->();
+        $dbh->do('CREATE TRIGGER selecto_del_pwn AFTER DELETE ON selecto_del FOR EACH STATEMENT EXECUTE FUNCTION selecto_del_pwn()');
+        my ($e, %extra) = $bounds{$bound}->();
+        my $code = eval { $e->execute_write(Selecto::Write::Command->new(operation => 'delete', relation => 'selecto_del',
+            predicate => $x->eq('name', 'x'), %extra)); 'applied' } // (blessed($@) ? $@->code : "died: $@");
+        is($code, 'write_capability_missing', "a delete bounded by $bound refuses a statement-level DELETE trigger");
+        is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_del ORDER BY id'), [[1, 'n'], [2, 'n']], "$bound: and nothing changed");
+    }
 }
 {
     $reset->();
