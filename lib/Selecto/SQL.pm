@@ -3434,6 +3434,9 @@ sub _execute_compiled_write_in_transaction {
     # Its rows are locked and named by key first, and re-read afterwards.
     my $post_image = _post_image_predicate($command);
     $self->_admit_post_image_target($command) if $post_image;
+    $self->_refuse_statement_triggers($command, 8, 'delete')
+        if $command->operation eq 'delete' && exists $command->metadata->{__selecto_primary_key}
+            && blessed($command->metadata->{__selecto_post_image_scope});
     my ($bounded, $identities) = $self->_bounded_write_command($command, $post_image ? (force => 1) : ());
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;
@@ -3602,6 +3605,30 @@ sub _enforced_unique_key {
         return 1 unless grep { !defined($_->[0]) || !$want{lc $_->[0]} || !$_->[1] } @$index;
     }
     return 0;
+}
+
+# PostgreSQL: a bound-scope write refuses enabled statement-level triggers
+# for its event ($mask: pg_trigger.tgtype bit, 8 DELETE, 16 UPDATE); they can
+# write rows outside the write's scope. (TRUNCATE triggers never fire for a
+# governed write; inserts and upserts on trigger tables are refused by their
+# storage admission.)
+sub _refuse_statement_triggers {
+    my ($self, $command, $mask, $event) = @_;
+    return unless $self->name eq 'postgresql';
+    my $table = Selecto::Identifier::checked($command->relation);
+    my ($found);
+    my $ok = eval {
+        ($found) = $self->dbh->selectrow_array(q{
+            SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = ?::regclass AND NOT t.tgisinternal
+              AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0)::integer},
+            undef, $self->quote_identifier($table), $mask);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('write_capability_missing',
+        "a statement-level $event trigger can write rows outside the write's scope", {relation => $table})
+        if $found;
+    return;
 }
 
 # Every locked row the update could have changed must still satisfy the
