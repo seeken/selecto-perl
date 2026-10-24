@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - DuckDB, external mode and transaction_handler: the primary-key reach
+      bound now also requires every key column to be non-text and the
+      schema search path to be the default. A VARCHAR key (COLLATE NOCASE,
+      default_collation, or a literal cast such as '01' = 1) could match
+      more rows than one per value, and a non-default search_path could
+      resolve the table elsewhere; such writes are refused before any DML
+      with transaction_unavailable.
     - MySQL/MariaDB: every write, lone inserts and upserts included, now
       requires an InnoDB base table, checked after the metadata lock and
       the temporary-table shadow check (write_capability_missing). On

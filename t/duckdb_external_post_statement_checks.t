@@ -124,6 +124,13 @@ for my $table (
         'CREATE SCHEMA other; CREATE TABLE other.selecto_duck_ext (id INTEGER PRIMARY KEY, org_key VARCHAR, note VARCHAR)'],
     ['a keyless temp table shadowing a keyed one', 'CREATE TABLE selecto_duck_ext (id INTEGER PRIMARY KEY, org_key VARCHAR, note VARCHAR)', 0,
         'refused', 'CREATE TEMP TABLE selecto_duck_ext (id INTEGER, org_key VARCHAR, note VARCHAR)'],
+    # Item 30: a text key is compared under its collation and cast to the
+    # literal's type ('01' = 1, 'K' = 'k' under NOCASE): never an exact key.
+    ['a VARCHAR primary key', 'CREATE TABLE selecto_duck_ext (id VARCHAR PRIMARY KEY, org_key VARCHAR, note VARCHAR)', 0, 'refused'],
+    ['a VARCHAR COLLATE NOCASE primary key', 'CREATE TABLE selecto_duck_ext (id VARCHAR COLLATE NOCASE PRIMARY KEY, org_key VARCHAR, note VARCHAR)', 0, 'refused'],
+    # A non-default search path could resolve the name to another schema.
+    ['a non-default search_path', 'CREATE TABLE selecto_duck_ext (id INTEGER PRIMARY KEY, org_key VARCHAR, note VARCHAR)', 0, 'refused',
+        "SET search_path = 'main'"],
 ) {
     my ($label, $ddl, $duplicate, $expected, $extra) = @$table;
     for my $operation (qw(update delete)) {
