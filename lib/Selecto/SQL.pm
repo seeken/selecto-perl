@@ -3501,6 +3501,14 @@ sub _post_image_predicate {
 # what runs later, or through another relation: a deferrable constraint
 # trigger (PostgreSQL) fires at commit, and a view's rules or INSTEAD OF
 # triggers write elsewhere. Those are refused before the update.
+#
+# PostgreSQL: a deferrable constraint trigger anywhere in the database is
+# refused, not only one on the written relation: a leaf partition's or an
+# inheritance child's fires for rows the update reaches through the parent,
+# and one on another table fires when a row trigger writes there (an audit
+# table) and can then rewrite the updated row at commit. Statement-level
+# update triggers and rules are refused on the relation and on every
+# partition or child below it.
 sub _admit_post_image_target {
     my ($self, $command) = @_;
     my $table = Selecto::Identifier::checked($command->relation);
@@ -3511,12 +3519,20 @@ sub _admit_post_image_target {
     my $ok = eval {
         if ($name eq 'postgresql') {
             @row = $dbh->selectrow_array(q{
+                WITH RECURSIVE tree(oid, partition) AS (
+                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass
+                  UNION ALL
+                  SELECT i.inhrelid, child.relispartition FROM pg_catalog.pg_inherits i
+                  JOIN tree ON i.inhparent = tree.oid
+                  JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid)
                 SELECT c.relkind,
-                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
                     AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
-                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal
-                    AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & 16) <> 0))::integer
-                FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, $self->quote_identifier($table));
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
+                    AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & 16) <> 0))::integer,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
+                    WHERE r.rulename <> '_RETURN'))::integer
+                FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, ($self->quote_identifier($table)) x 2);
         } elsif ($name eq 'sqlite') {
             @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
                 undef, $table);
@@ -3529,11 +3545,12 @@ sub _admit_post_image_target {
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    my ($kind, $deferrable, $statement_trigger) = @row;
+    my ($kind, $deferrable, $statement_trigger, $rules) = @row;
     $refuse->('a governed update through a view cannot verify the rows it leaves behind')
         unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE'
             || $kind eq 'unknown');
     $refuse->('a deferrable constraint trigger could change the rows after their verification') if $deferrable;
+    $refuse->('a rule on the relation could rewrite the update outside the verified scope') if $rules;
     # A statement-level UPDATE trigger can write rows the re-read does not
     # name (row-level triggers that modify OTHER rows are likewise outside
     # this guarantee; the re-read covers the updated rows only).

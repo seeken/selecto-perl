@@ -1,6 +1,17 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: a governed update under a bound scope (engine tenant,
+      writes.scope, host scope predicate) is refused with
+      query_rule_not_evaluable when any enabled, non-internal deferrable
+      constraint trigger exists in the database, not only on the written
+      relation: a deferred trigger on a leaf partition, on an inheritance
+      child, or on an audit table that a row trigger inserts into fired at
+      commit, after the post-image re-read, and moved the updated row to
+      another tenant. Deferrable foreign keys (internal triggers) are
+      unaffected. Rules (query_rule_not_evaluable) and statement-level
+      UPDATE triggers (write_capability_missing) are now refused on the
+      relation and on every partition or inheritance child below it.
     - Tenant-pin rule (TW-09): a required filter that pins the domain's
       declared tenant field (source.tenant_field or writes.scope.tenant
       field), whether it comes from contract required_filters, write_context
