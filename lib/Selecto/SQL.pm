@@ -3365,6 +3365,7 @@ sub _execute_compiled_write_in_transaction {
     # assignment, or a BEFORE UPDATE trigger, could move a row out of scope.
     # Its rows are locked and named by key first, and re-read afterwards.
     my $post_image = _post_image_predicate($command);
+    $self->_admit_post_image_target($command) if $post_image;
     my ($bounded, $identities) = $self->_bounded_write_command($command, $post_image ? (force => 1) : ());
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;
@@ -3421,6 +3422,46 @@ sub _post_image_predicate {
     return undef unless $command->operation eq 'update' && exists $command->metadata->{__selecto_primary_key};
     my $predicate = $command->metadata->{__selecto_post_image_scope};
     return blessed($predicate) && $predicate->isa('Selecto::Expression') ? $predicate : undef;
+}
+
+# The re-read runs after the statement, when every BEFORE and AFTER trigger
+# (row or statement level) has run, so ordinary triggers (updated_at, audit)
+# keep working and one that moves a row out of scope is caught. It cannot see
+# what runs later, or through another relation: a deferrable constraint
+# trigger (PostgreSQL) fires at commit, and a view's rules or INSTEAD OF
+# triggers write elsewhere. Those are refused before the update.
+sub _admit_post_image_target {
+    my ($self, $command) = @_;
+    my $table = Selecto::Identifier::checked($command->relation);
+    my $refuse = sub { Selecto::Error->throw('query_rule_not_evaluable', $_[0], {relation => $table}) };
+    my $name = $self->name;
+    my $dbh = $self->dbh;
+    my @row;
+    my $ok = eval {
+        if ($name eq 'postgresql') {
+            @row = $dbh->selectrow_array(q{
+                SELECT c.relkind,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal
+                    AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer
+                FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, $self->quote_identifier($table));
+        } elsif ($name eq 'sqlite') {
+            @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
+                undef, $table);
+        } elsif ($name eq 'mysql' || $name eq 'mariadb') {
+            @row = $dbh->selectrow_array($self->_statement_sql(q{SELECT TABLE_TYPE, 0 FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
+        } else {
+            @row = ('unknown', 0);
+        }
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my ($kind, $deferrable) = @row;
+    $refuse->('a governed update through a view cannot verify the rows it leaves behind')
+        unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE'
+            || $kind eq 'unknown');
+    $refuse->('a deferrable constraint trigger could change the rows after their verification') if $deferrable;
+    return;
 }
 
 # Every locked row the update could have changed must still satisfy the

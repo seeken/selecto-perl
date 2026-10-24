@@ -11,6 +11,12 @@ Unreleased
       enforcement and portable commands' context-required and captured
       predicates bound the pre-image only: such an update may leave them,
       also through MySQL-family RETURNING re-reads, which refused it before.
+      The re-read runs after the statement, when BEFORE and AFTER triggers
+      (row and statement level) have run: updated_at-style and audit
+      triggers keep working, and one that moves a row out of scope is
+      caught. Such an update is refused (query_rule_not_evaluable) through
+      a view or on a table with a deferrable constraint trigger, which act
+      after or outside the re-read.
     - MySQL/MariaDB: the guarded-insert stored-row re-check runs only when
       the declared key contains an enforced PRIMARY or UNIQUE index of whole,
       NOT NULL columns (read in the write's transaction); otherwise a decoy

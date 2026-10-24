@@ -62,9 +62,9 @@ for my $backend (@backends) {
         my (%options) = @_;
         $dbh->do('DROP TABLE IF EXISTS selecto_post_rows');
         $dbh->do('CREATE TABLE selecto_post_rows (id INT NOT NULL' . ($options{plain_key} ? '' : ' PRIMARY KEY')
-            . ', org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16))' . ($my ? ' ENGINE=InnoDB' : ''));
+            . ', org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16), stamp VARCHAR(16) NULL)' . ($my ? ' ENGINE=InnoDB' : ''));
         $dbh->do('CREATE INDEX selecto_post_rows_id ON selecto_post_rows (id)') if $options{plain_key};
-        $dbh->do(q{INSERT INTO selecto_post_rows VALUES (1, 't1', 'x', 'n'), (2, 't2', 'x', 'n')});
+        $dbh->do(q{INSERT INTO selecto_post_rows (id, org_key, name, note) VALUES (1, 't1', 'x', 'n'), (2, 't2', 'x', 'n')});
     };
     my $state = sub { join ' ', map { "$_->[0]:$_->[1]:$_->[2]" }
         @{$dbh->selectall_arrayref('SELECT id, org_key, note FROM selecto_post_rows ORDER BY id')} };
@@ -171,8 +171,73 @@ for my $backend (@backends) {
         relation => 'selecto_post_rows', assignments => {note => 'changed'}, predicate => $x->eq('name', 'x'))); 'applied' }
         // (blessed($@) ? $@->code : "died: $@"), 'applied', "$name engine tenant: an ordinary update applies");
     is($state->(), '1:t1:changed 2:t2:n', "$name engine tenant: to the tenant's row only");
+
+    # Ordinary triggers keep working under a host scope: the re-read runs
+    # after the statement and their effects stay in scope (SQLite refuses
+    # governed writes on tables with triggers, as before).
+    if ($name ne 'sqlite') {
+        my $host = 'host scope predicate';
+        $reset->();
+        $dbh->do('DROP TABLE IF EXISTS selecto_post_audit');
+        $dbh->do('CREATE TABLE selecto_post_audit (row_id INT)');
+        if ($name eq 'postgresql') {
+            $dbh->do(q{CREATE OR REPLACE FUNCTION selecto_post_stamp() RETURNS trigger LANGUAGE plpgsql AS
+                $$ BEGIN NEW.stamp := NEW.note; RETURN NEW; END $$});
+            $dbh->do('CREATE TRIGGER selecto_post_stamp BEFORE UPDATE ON selecto_post_rows FOR EACH ROW EXECUTE FUNCTION selecto_post_stamp()');
+            $dbh->do(q{CREATE OR REPLACE FUNCTION selecto_post_audit() RETURNS trigger LANGUAGE plpgsql AS
+                $$ BEGIN INSERT INTO selecto_post_audit VALUES (NEW.id); RETURN NULL; END $$});
+            $dbh->do('CREATE TRIGGER selecto_post_audit AFTER UPDATE ON selecto_post_rows FOR EACH ROW EXECUTE FUNCTION selecto_post_audit()');
+        } else {
+            $dbh->do(q{CREATE TRIGGER selecto_post_stamp BEFORE UPDATE ON selecto_post_rows FOR EACH ROW SET NEW.stamp = NEW.note});
+            $dbh->do('CREATE TRIGGER selecto_post_audit AFTER UPDATE ON selecto_post_rows FOR EACH ROW INSERT INTO selecto_post_audit VALUES (NEW.id)');
+        }
+        for my $path (qw(single batch graph returning)) {
+            $dbh->do('DELETE FROM selecto_post_audit');
+            $dbh->do(q{UPDATE selecto_post_rows SET note = 'n'});
+            $dbh->do('DELETE FROM selecto_post_audit');
+            is($run->($host, $path, {note => 'changed'}, returning => $path eq 'returning'), 'applied',
+                "$name $path: an update with an updated_at-style and an audit trigger applies");
+            is_deeply($dbh->selectall_arrayref('SELECT id, note, stamp FROM selecto_post_rows ORDER BY id'),
+                [[1, 'changed', 'changed'], [2, 'n', 'n']], "$name $path: the BEFORE trigger's change is kept");
+            is_deeply($dbh->selectall_arrayref('SELECT row_id FROM selecto_post_audit'), [[1]], "$name $path: and the AFTER trigger ran");
+        }
+        $dbh->do('DROP TABLE IF EXISTS selecto_post_audit');
+        if ($name eq 'postgresql') {
+            # An AFTER trigger (row or statement level) that rewrites the
+            # scoped column runs before the re-read and is caught.
+            for my $level ('ROW', 'STATEMENT') {
+                $reset->();
+                $dbh->do(q{CREATE OR REPLACE FUNCTION selecto_post_after() RETURNS trigger LANGUAGE plpgsql AS
+                    $$ BEGIN UPDATE selecto_post_rows SET org_key = upper(org_key) WHERE org_key <> upper(org_key); RETURN NULL; END $$});
+                $dbh->do("CREATE TRIGGER selecto_post_after AFTER UPDATE OF note ON selecto_post_rows FOR EACH $level EXECUTE FUNCTION selecto_post_after()");
+                is($run->($host, 'single', {note => 'changed'}), 'query_rule_violation',
+                    "$name: an AFTER $level trigger moving the row out of scope is refused");
+                is($state->(), '1:t1:n 2:t2:n', "$name: AFTER $level, and nothing changed");
+            }
+            # A deferrable constraint trigger fires at commit, after any
+            # re-read: the update is refused before it runs.
+            $reset->();
+            $dbh->do(q{CREATE OR REPLACE FUNCTION selecto_post_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$});
+            $dbh->do('CREATE CONSTRAINT TRIGGER selecto_post_deferred AFTER UPDATE ON selecto_post_rows DEFERRABLE INITIALLY DEFERRED'
+                . ' FOR EACH ROW EXECUTE FUNCTION selecto_post_noop()');
+            is($run->($host, 'single', {note => 'changed'}), 'query_rule_not_evaluable', "$name: a deferrable constraint trigger is refused");
+            is($state->(), '1:t1:n 2:t2:n', "$name: deferrable, and nothing changed");
+        }
+        # A guarded update through a view cannot be verified.
+        $reset->();
+        $dbh->do('DROP VIEW IF EXISTS selecto_post_view');
+        $dbh->do('CREATE VIEW selecto_post_view AS SELECT id, org_key, name, note, stamp FROM selecto_post_rows');
+        my $view_domain = Selecto::Domain->parse({%$document, source => {%{$document->{source}}, source_table => 'selecto_post_view'}});
+        my $view_error = eval { Selecto::Engine->new(adapter => $adapter, domain => $view_domain)->execute_write(
+            Selecto::Write::Command->new(operation => 'update', relation => 'selecto_post_view', assignments => {note => 'changed'},
+                predicate => $x->eq('name', 'x'), scope_predicate => $x->eq('org_key', 't1'))); 1 } ? undef : $@;
+        is(blessed($view_error) ? $view_error->code : 'applied', 'query_rule_not_evaluable', "$name: a guarded update through a view is refused");
+        is($state->(), '1:t1:n 2:t2:n', "$name: view, and nothing changed");
+        $dbh->do('DROP VIEW IF EXISTS selecto_post_view');
+    }
     $dbh->do('DROP TABLE IF EXISTS selecto_post_rows');
-    $dbh->do('DROP FUNCTION IF EXISTS selecto_post_upper()') if $name eq 'postgresql';
+    $dbh->do("DROP FUNCTION IF EXISTS $_()") for $name eq 'postgresql'
+        ? qw(selecto_post_upper selecto_post_stamp selecto_post_audit selecto_post_after selecto_post_noop) : ();
 }
 
 done_testing;
