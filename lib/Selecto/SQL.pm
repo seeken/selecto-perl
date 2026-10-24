@@ -4273,7 +4273,9 @@ the adapter never begins, commits or rolls back the transaction. Each write
 runs inside its own savepoint (as a managed write inside a host transaction
 does), so a write refused after its statements ran (for example a post-image
 violation) undoes only itself and a host that commits afterwards never
-persists it; DuckDB, which has no savepoints, runs the write directly. The
+persists it. DuckDB, which has no savepoints, runs the write directly and
+refuses (C<transaction_unavailable>, before any DML) a write that could be
+refused after its statement ran; see L<Selecto::DuckDB>. The
 host must still commit on success and should roll back on an exception it
 cannot handle. Use this mode, or C<managed> inside the host's transaction,
 with L<Selecto::Query/for_share> to keep an eligibility read valid until the

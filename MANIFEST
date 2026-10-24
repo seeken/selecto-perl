@@ -178,6 +178,7 @@ t/mssql.t
 t/mssql_decimal_scale.t
 t/mssql_bound_scope_refusals.t
 t/duckdb_bound_scope_refusals.t
+t/duckdb_external_post_statement_checks.t
 t/mutation_expression.t
 t/host_identity_paths_live.t
 t/host_scope_identity_live.t

@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - DuckDB, transaction_mode => 'external': DuckDB has no savepoints, so a
+      write Selecto could refuse after its statement changed rows is now
+      refused before any DML with transaction_unavailable (reason
+      no_savepoints): a write whose expected count or declared cardinality
+      could fail for some affected count it can reach (e.g. a delete of
+      id IN (1, 2) with expected_count 2, or an update by a non-key
+      predicate), a multi-command batch carrying any check, and any
+      multi-node graph. A bound-scope delete that failed
+      cardinality_mismatch after deleting used to leave the delete for the
+      host's COMMIT. Writes that cannot be refused after changing rows (an
+      update or delete by primary key with expected_count 1, an insert) run
+      directly as before; managed mode is unchanged.
     - transaction_mode => 'external': each write now runs inside its own
       savepoint (SAVEPOINT ... RELEASE, ROLLBACK TO SAVEPOINT on failure),
       as a managed write inside a host transaction already did. A guarded
