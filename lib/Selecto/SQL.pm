@@ -3559,8 +3559,9 @@ sub _admit_post_image_target {
     $refuse->('a governed update under a bound scope cannot verify a relation with inheritance children') if $inheritance;
     $refuse->('a rule on the relation could rewrite the update outside the verified scope') if $rules;
     # A statement-level UPDATE trigger can write rows the re-read does not
-    # name (row-level triggers that modify OTHER rows are likewise outside
-    # this guarantee; the re-read covers the updated rows only).
+    # name. Row-level triggers that modify OTHER rows stay allowed (user
+    # decision, TW item 19): their effects are the schema owner's
+    # responsibility, and the re-read covers the updated rows only.
     Selecto::Error->throw('write_capability_missing',
         'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
         if $statement_trigger;
