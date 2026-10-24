@@ -562,9 +562,16 @@ sub _post_statement_checked {
         || @{$command->metadata->{returning} // []};
 }
 
+# External mode and a transaction_handler run the write directly in a
+# transaction Selecto does not own, with no savepoint to undo it.
+sub _writes_without_savepoint {
+    my ($self) = @_;
+    return ($self->transaction_mode // '') eq 'external' || defined($self->transaction_handler);
+}
+
 sub _refuse_unverifiable_external {
     my ($self, @commands) = @_;
-    return unless ($self->transaction_mode // '') eq 'external';
+    return unless $self->_writes_without_savepoint;
     my $refusable = @commands > 1 ? grep { _post_statement_checked($_) } @commands
         : grep { $self->_post_statement_refusable($_) } @commands;
     Selecto::Error->throw('transaction_unavailable',
@@ -588,7 +595,7 @@ sub execute_batch_unsafe {
 
 sub execute_graph_unsafe {
     my ($self, $graph) = @_;
-    if (blessed($graph) && $graph->can('nodes') && ($self->transaction_mode // '') eq 'external') {
+    if (blessed($graph) && $graph->can('nodes') && $self->_writes_without_savepoint) {
         my @nodes = @{$graph->nodes};
         # A later node's binding or check can fail after an earlier node ran.
         Selecto::Error->throw('transaction_unavailable',
@@ -597,6 +604,12 @@ sub execute_graph_unsafe {
         $self->_refuse_unverifiable_external(map { $_->{command} } @nodes);
     }
     return $self->SUPER::execute_graph_unsafe($graph);
+}
+
+# A transaction_handler's work runs directly: DuckDB has no savepoints.
+sub _handler_unit {
+    my ($self, $operation) = @_;
+    return $operation->();
 }
 
 sub _savepoint_transaction {
@@ -634,8 +647,8 @@ closed.
 DuckDB has no savepoints. A managed write on a handle with C<AutoCommit> off
 fails with C<invalid_adapter> instead of committing or discarding the host's
 work; use C<< transaction_mode => 'external' >> there (see
-L<Selecto::SQL/transaction_mode>). In external mode a write runs directly in
-the host's transaction, so one that Selecto could refuse after its statement
+L<Selecto::SQL/transaction_mode>). In external mode, and under a
+C<transaction_handler>, a write runs directly in the host's transaction, so one that Selecto could refuse after its statement
 changed rows is refused before any DML with C<transaction_unavailable>
 (details C<< {reason => 'no_savepoints'} >>): a single write whose expected
 count or declared C<expected_cardinality> (or the engine's row ceiling)

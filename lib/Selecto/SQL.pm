@@ -3997,12 +3997,20 @@ sub _handler_transaction {
         Selecto::Error->throw('transaction_unavailable',
             'transaction_handler ran the write outside a transaction', {reason => 'autocommit'})
             unless $self->_transaction_open;
-        $value = $operation->();
+        # The write's own savepoint inside the handler's transaction: a write
+        # refused after its statement undoes itself even when the handler
+        # (or the host around it) goes on to commit.
+        $value = $self->_handler_unit($operation);
         return $value;
     });
     Selecto::Error->throw('invalid_adapter', 'transaction handler did not run the write')
         unless $ran;
     return $value;
+}
+
+sub _handler_unit {
+    my ($self, $operation) = @_;
+    return $self->_savepoint_transaction($operation);
 }
 
 # A savepoint name no other savepoint shares, so a cleanup can only ever
@@ -4323,7 +4331,10 @@ The transaction must be open on the adapter's own connection when the work
 starts (C<AutoCommit> off, or a transaction the server reports): a write can
 be refused after its statement (an expected count, a post-image check), so
 work run in autocommit is refused with C<transaction_unavailable> (details
-C<< {reason => 'autocommit'} >>) before any statement. On SQLite, writes
+C<< {reason => 'autocommit'} >>) before any statement. Inside the handler's
+transaction the write runs in its own savepoint (DuckDB, which has none,
+runs it directly), so a refused write undoes itself even if the handler
+commits. On SQLite, writes
 governed by stored-stage data rules additionally require the handler's
 transaction (C<required_data_rule_pending> otherwise). The handler may
 be called again for the write inside its own transaction, so it should run
