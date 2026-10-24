@@ -3980,12 +3980,19 @@ sub _savepoint_transaction {
     return $value;
 }
 
-# The host's transaction API runs the write; it must call the work once.
+# The host's transaction API runs the write; it must call the work once,
+# inside a transaction. A write can be refused after its statement (an
+# expected count, a post-image check), and on an autocommit handle its DML
+# would already be committed, so work the handler runs outside a
+# transaction is refused before any DML.
 sub _handler_transaction {
     my ($self, $handler, $operation) = @_;
     my ($ran, $value) = (0);
     $handler->(sub {
         $ran = 1;
+        Selecto::Error->throw('transaction_unavailable',
+            'transaction_handler ran the write outside a transaction', {reason => 'autocommit'})
+            unless $self->_transaction_open;
         $value = $operation->();
         return $value;
     });
@@ -4308,10 +4315,13 @@ write, must call it exactly once inside a transaction it controls, and
 should return its value and let its exceptions propagate. A handler that
 never calls the work fails with C<invalid_adapter>, as do a handler that is
 not a code reference and a handler combined with C<external> mode.
-On SQLite, writes governed by stored-stage data rules additionally require
-the handler's transaction to be open on the adapter's own connection; a
-handler that runs the work in autocommit is refused with
-C<required_data_rule_pending> before any business statement. The handler may
+The transaction must be open on the adapter's own connection when the work
+starts (C<AutoCommit> off, or a transaction the server reports): a write can
+be refused after its statement (an expected count, a post-image check), so
+work run in autocommit is refused with C<transaction_unavailable> (details
+C<< {reason => 'autocommit'} >>) before any statement. On SQLite, writes
+governed by stored-stage data rules additionally require the handler's
+transaction (C<required_data_rule_pending> otherwise). The handler may
 be called again for the write inside its own transaction, so it should run
 nested work directly.
 

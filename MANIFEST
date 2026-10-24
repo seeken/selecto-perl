@@ -78,6 +78,7 @@ t/update_post_image_pg_race_live.t
 t/pg_guarded_write_isolation_live.t
 t/pg_bound_delete_lock_live.t
 t/host_transaction_refusal_live.t
+t/write_atomicity_modes_live.t
 t/mysql_post_image_metadata_lock_live.t
 t/mysql_returning_insert_trigger_live.t
 t/mysql_host_savepoint_collision_live.t
