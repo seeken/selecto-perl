@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL/MariaDB: every write, lone inserts and upserts included, now
+      requires an InnoDB base table, checked after the metadata lock and
+      the temporary-table shadow check (write_capability_missing). On
+      MEMORY or MyISAM an insert expecting 2 rows, a RETURNING insert with
+      an unassigned non-AUTO_INCREMENT key, and an insert an AFTER INSERT
+      trigger SIGNALs on each failed after storing the row, which stayed.
     - PostgreSQL graphs: when any node of a graph is bound (engine tenant,
       trusted tenant pin, host scope, query enforcement), every node and
       owned-sync cleanup is marked bound, and each descendant delete and
