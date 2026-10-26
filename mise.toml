@@ -1,5 +1,6 @@
 [tools]
-perl = "5.40.2"
+# Perl 5.40.5 (security fixes); relocatable-perl stops at 5.40.2.1, so build it from source.
+"asdf:ouest/asdf-perl" = "5.40.5"
 
 [tasks.test]
 description = "Run the native Perl unit suite"

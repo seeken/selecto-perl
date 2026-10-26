@@ -43,7 +43,7 @@ subtest 'SQLite: write savepoints are uniquely named' => sub {
     }
     is(scalar(@savepoints), 2, 'each write inside the host transaction takes a savepoint');
     isnt($savepoints[0], $savepoints[1], 'no two guards share a savepoint name');
-    like($_, qr/\Aselecto_write_\d+_\d+\z/, 'savepoint names stay recognizable') for @savepoints;
+    like($_, qr/\Aselecto_write_[0-9a-f]+_[0-9a-f]{8}\z/, 'savepoint names stay recognizable') for @savepoints;
     $dbh->rollback;
     is($dbh->selectrow_array('SELECT COUNT(*) FROM guard_items'), 0, 'the host still owns the outcome');
 };

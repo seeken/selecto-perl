@@ -60,7 +60,9 @@ my $upsert = sub { Selecto::Write::Command->new(operation => 'upsert', relation 
 subtest 'an autocommit handler cannot carry stored-rule writes' => sub {
     my $e = $engine->(1, $autocommit);
     for my $case (['insert', $insert->(2)], ['update', $update->(1)], ['upsert', $upsert->(1)]) {
-        is(code_of(sub { $e->execute_write($case->[1]) }), 'required_data_rule_pending/native_transaction_required',
+        # A handler that runs the work outside a transaction is refused
+        # before the stored-rule check is reached.
+        is(code_of(sub { $e->execute_write($case->[1]) }), 'transaction_unavailable/autocommit',
             "$case->[0] with stored rules refuses before DML");
     }
     is(scalar @hooks, 0, 'no business row was mutated');
@@ -68,10 +70,15 @@ subtest 'an autocommit handler cannot carry stored-rule writes' => sub {
     ok($db->{AutoCommit}, 'the handle is left in autocommit');
 };
 
-subtest 'writes without stored rules and transactional handlers are unaffected' => sub {
+subtest 'autocommit handlers are refused; transactional handlers carry every write' => sub {
+    # A write can be refused after its statement, which an autocommit
+    # handler could not undo: every write it runs is refused before DML.
     my $plain = $engine->(0, $autocommit);
-    is(code_of(sub { $plain->execute_write($insert->(3)) }), 'ok', 'autocommit handler still carries a rule-free insert');
-    is(code_of(sub { $plain->execute_write($update->(3)) }), 'ok', 'autocommit handler still carries a rule-free update');
+    is(code_of(sub { $plain->execute_write($insert->(3)) }), 'transaction_unavailable/autocommit', 'autocommit handler refuses a rule-free insert');
+    is(code_of(sub { $plain->execute_write($update->(3)) }), 'transaction_unavailable/autocommit', 'autocommit handler refuses a rule-free update');
+    my $rule_free = $engine->(0, $transactional);
+    is(code_of(sub { $rule_free->execute_write($insert->(3)) }), 'ok', 'transactional handler carries a rule-free insert');
+    is(code_of(sub { $rule_free->execute_write($update->(3)) }), 'ok', 'transactional handler carries a rule-free update');
     my $e = $engine->(1, $transactional);
     is(code_of(sub { $e->execute_write($insert->(4)) }), 'ok', 'transactional handler carries a stored-rule insert');
     is(code_of(sub { $e->execute_write($update->(4)) }), 'ok', 'transactional handler carries a stored-rule update');

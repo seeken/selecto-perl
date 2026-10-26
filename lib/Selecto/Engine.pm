@@ -922,6 +922,7 @@ sub _prepare_graph {
     }
     my $prepared = Selecto::Write::Graph->new(nodes => \@nodes, owned_sets => $graph->owned_sets,metadata=>$graph->metadata);
     my $sets = $self->_govern_owned_sets($graph->owned_sets, $prepared->{nodes}, \%contexts,$relationship_work,$tenants);
+    _mark_graph_bound($prepared->{nodes}, $sets);
     $prepared->{_governed_owned_sets} = $sets;
     $prepared->{_reference_domains} = {map { ($_ => $contexts{$_}{domain}) } keys %contexts};
     $prepared->{_requires_rules} = scalar(grep {
@@ -932,6 +933,34 @@ sub _prepare_graph {
         $prepared->{_requires_rules} ||= Selecto::WriteRules->has_stored_rules(_native_relationship_domain($edge->{domain}), 'delete');
     }
     return ($prepared, \%contexts);
+}
+
+# Items 33/33a: when any node of a graph is under a bound scope (engine
+# tenant, trusted pin, host scope: a post-image scope; or query
+# enforcement), every node and every owned-set cleanup is marked bound, so a
+# descendant delete or update runs the bound-scope target contract even when
+# its own table has no tenant column (child rows, join tables, depth-2
+# grandchildren). Marking all nodes, not only the bound node's descendants,
+# fails closed. Set only here, after governance; never taken from a caller.
+sub _mark_graph_bound {
+    my ($nodes, $sets) = @_;
+    my $bound = grep {
+        blessed($_->{command}->metadata->{__selecto_post_image_scope}) || defined($_->{command}->query_enforcement)
+    } @$nodes;
+    for my $node (@$nodes) {
+        my %metadata = %{$node->{command}->metadata};
+        delete $metadata{__selecto_graph_bound};
+        $metadata{__selecto_graph_bound} = 1 if $bound;
+        $node->{command} = $node->{command}->with_metadata(\%metadata);
+    }
+    for my $set (@{$sets // []}) {
+        next unless blessed($set->{cleanup});
+        my %metadata = %{$set->{cleanup}->metadata};
+        delete $metadata{__selecto_graph_bound};
+        $metadata{__selecto_graph_bound} = 1 if $bound;
+        $set->{cleanup} = $set->{cleanup}->with_metadata(\%metadata);
+    }
+    return;
 }
 
 sub _govern_owned_sets {
@@ -1043,6 +1072,36 @@ sub write_command {
 # normalize assignments, apply the domain's tenant scope with the engine's
 # trusted tenant and the domain's required predicate, then validate against
 # the domain contract.
+# The bound scope an update's post-image must stay in (TW-09): the engine
+# tenant's conditions and a host scope predicate. A portable command's scope
+# predicate carries its context-required and captured query predicates,
+# which bound the pre-image only, so only the tenant conditions apply there.
+sub _post_image_scope {
+    my ($command, @tenant) = @_;
+    my $portable = ($command->metadata->{portable_foreign_key_guards} // 0) ? 1 : 0;
+    return Selecto::QueryEnforcement::combine(($portable ? () : $command->scope_predicate), @tenant);
+}
+
+# The tenant-pin rule (TW-09, bound tenant-like scope): a host required
+# conjunct that reads the domain's declared tenant field (source.tenant_field
+# or writes.scope.tenant.field) is tenant-like, so it bounds the post-image
+# of an update as well as its pre-image. Chosen by provenance (the conjuncts
+# of the host's own required predicate), never by comparing it with other
+# scope conjuncts. It fails closed: a conjunct that reads the tenant column
+# anywhere, whatever its spelling (an OR of one arm, NOT(<>), >= AND <=, a
+# one-value IN, nested ANDs), joins. The tenant columns are those the
+# tenant-assignment check guards. Every other required conjunct
+# (status = 'open') still bounds the pre-image only.
+sub _required_tenant_pins {
+    my ($domain, $required) = @_;
+    return () unless defined $required;
+    my %tenant = map { ($_ => 1) } @{_root_tenant_fields($domain->tenant_field, $domain->write_tenant_scope)};
+    return () unless %tenant;
+    return grep {
+        grep { defined($_) && !ref($_) && $tenant{$_} } Selecto::Expression->field_references($_)
+    } Selecto::SQL::_top_conjuncts($required);
+}
+
 sub governed_write {
     my ($self, $command, %details) = @_;
     $self->assert_domain_identity;
@@ -1068,6 +1127,12 @@ sub governed_write {
     my $required = $self->required_write_guard($command->operation, %details);
     my $trusted;
     ($command, $trusted) = $self->_apply_write_tenant($command, $required, %details);
+    # The engine tenant, writes.scope and the host's scope predicate bound
+    # the rows an update leaves behind too (TW-09: bound tenant-like scope);
+    # the required predicate and query enforcement bound its pre-image only,
+    # except for its conjuncts that pin the declared tenant field.
+    my $post_image_scope = _post_image_scope($command, $self->_write_tenant_conditions,
+        _required_tenant_pins($self->{domain}, $required));
     # The required predicate is host-authored, so it joins the scope after
     # writes.scope.tenant has checked the caller's own tenant references;
     # both boundaries then hold in the same statement.
@@ -1089,6 +1154,7 @@ sub governed_write {
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $self->{domain}->primary_key,
         $self->_tenant_fields_metadata,
+        (defined($post_image_scope) ? (__selecto_post_image_scope => $post_image_scope) : ()),
         __selecto_insert_types => $self->{domain}->fields,
         __selecto_limits => $self->{limits},
         __selecto_write_limit => $self->{limits}->get('max_action_targets')});
@@ -2939,10 +3005,19 @@ sub _validate_graph_node {
     my $required = $nested_engine->required_write_guard($command->operation, graph_node => $node->{id});
     my ($trusted, $filled);
     ($command, $trusted) = $nested_engine->_apply_write_tenant($command, $required, graph_node => $node->{id});
+    # As for the root: tenant and host scope (and the confinement below) bound
+    # the post-image of an update, the required predicate only its pre-image
+    # (apart from its tenant-field pins).
+    my $post_image_scope = _post_image_scope($command, $nested_engine->_write_tenant_conditions,
+        _required_tenant_pins($nested_engine->{domain}, $required));
     $command = $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $required)) if defined $required;
+    my $before_confine = $command->scope_predicate;
     ($command, $filled) = $self->_confine_child_tenants($command, $tenants, $edge->{fields}, graph_node => $node->{id})
         unless $scope;
+    my %prior = map { (Scalar::Util::refaddr($_) => 1) } Selecto::SQL::_top_conjuncts($before_confine);
+    $post_image_scope = Selecto::QueryEnforcement::combine($post_image_scope,
+        grep { !$prior{Scalar::Util::refaddr($_)} } Selecto::SQL::_top_conjuncts($command->scope_predicate));
     $trusted = [@$trusted, @{$filled // []}];
     my %nested_fields = %{$edge->{fields} // {}};
     my %returning_fields = map { ($_ => $nested_domain->_field_metadata_view($_)) } keys %nested_fields;
@@ -2963,6 +3038,7 @@ sub _validate_graph_node {
     ));
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $edge->{primary_key},
+        (defined($post_image_scope) ? (__selecto_post_image_scope => $post_image_scope) : ()),
         $nested_engine->_tenant_fields_metadata(grep { exists $edge->{fields}{$_} }
             @{_root_tenant_fields($self->{domain}->tenant_field, $self->{domain}->write_tenant_scope)}),
         __selecto_insert_types => $edge->{field_types},
@@ -3501,6 +3577,44 @@ guarantee this identity when another unique key collides.
 Validates and executes a command in a transaction, returning a
 L<Selecto::Write::Result>. The affected-row count must equal
 C<expected_count> or the transaction rolls back with C<cardinality_mismatch>.
+
+An update under a bound scope (the engine tenant, C<writes.scope>, a host
+scope predicate, or a required filter that pins the declared tenant field)
+keeps the rows it updates inside that scope: they are locked by an enforced
+unique key, which the update may not assign, and re-read after the
+statement, when every non-deferred row trigger has run. An update that moved
+a row out of scope rolls back with C<query_rule_violation>. A plain required
+predicate and query enforcement bound the rows an update finds, not the rows
+it leaves. An upsert keeps a scope only as equalities on its conflict-target
+columns; otherwise it is refused with C<unsupported_scope_predicate>.
+
+Refused before any DML:
+
+=over 4
+
+=item * updates through views, or on PostgreSQL relations with rules,
+non-partition inheritance children, or statement-level update triggers on
+the relation or below it, and bound-scope deletes with statement-level
+delete triggers or delete rules;
+
+=item * on PostgreSQL, any bound-scope update while an enabled deferrable
+constraint trigger exists anywhere in the database (checked again after the
+statement), and any guarded write outside READ COMMITTED
+(C<query_rule_not_evaluable>, reason C<isolation_level>);
+
+=item * bound-scope updates on adapters that do not re-read the rows
+(DuckDB, SQL Server), and MySQL/MariaDB inserts or upserts with C<RETURNING>
+on tables with C<BEFORE INSERT> triggers (C<write_capability_missing>).
+
+=back
+
+B<Triggers that modify other rows are the schema owner's responsibility.>
+Row-level triggers stay allowed (an C<updated_at> or audit trigger keeps
+working), and Selecto verifies only the rows the write itself names: what a
+row-level trigger does to I<other> rows (another tenant's, another table's)
+is outside every scope guarantee above and is never checked. A schema owner
+who installs such triggers on governed tables must make them respect the
+tenant boundary themselves.
 
 =head2 execute_batch
 

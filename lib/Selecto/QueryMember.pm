@@ -164,6 +164,7 @@ sub _source {
     if ($group eq 'subqueries') {
         _keys($spec, [qw(source query columns on type join_id kind capability)], $label);
         my $child = build_query($member_domain, $spec->{query}, "$label query");
+        _authored($member_domain, $child);
         my $base = $query // Selecto::Query->new;
         my $result = $base->subquery_join($spec->{join_id} // $name, $member_domain, $child,
             on => $spec->{on}, type => $spec->{type} // 'left',
@@ -173,6 +174,7 @@ sub _source {
     if ($group eq 'laterals') {
         _keys($spec, [qw(source query correlations join_type columns)], $label);
         my $member = build_query($member_domain, $spec->{query}, "$label query");
+        _authored($member_domain, $member);
         my $correlations = $spec->{correlations};
         _fail("$label correlations must be a non-empty object")
             unless ref($correlations) eq 'HASH' && keys %$correlations;
@@ -199,6 +201,7 @@ sub _source {
         # until the database gives up.
         my $base = build_query($member_domain, $spec->{base}, "$label base");
         my $step = build_query($member_domain, $spec->{step}, "$label step", allow_previous => 1);
+        _authored($member_domain, $base, $step);
         my $step_join = $spec->{step_join};
         _fail("$label step_join requires owner_key and related_key")
             unless ref($step_join) eq 'HASH' && defined($step_join->{owner_key})
@@ -218,11 +221,22 @@ sub _source {
     _fail("$label kind must be plain or recursive") unless $kind eq 'plain';
     _keys($spec, [qw(kind source query columns join)], $label);
     my $member = build_query($member_domain, $spec->{query}, "$label query");
+    _authored($member_domain, $member);
     return 1 unless $query;
     return $query->with_cte($name, $member_domain, $member,
         (defined($spec->{columns}) ? (columns => [@{$spec->{columns}}]) : ()),
         join => $join,
     );
+}
+
+# A member's filters are authored by the domain, not by a caller: they are
+# host scope of the member's own relation (on dialects whose collations fold
+# text their eq/ne/IN comparisons compare exactly). The member domain is
+# built for this expansion alone.
+sub _authored {
+    my ($member_domain, @queries) = @_;
+    push @{$member_domain->{_selecto_authored_predicates}}, grep { defined } map { $_->predicate } @queries;
+    return;
 }
 
 # A member's root relation: a relation in the domain's own schemas section.

@@ -54,7 +54,7 @@ for my $adapter ($mysql, $mariadb) {
     sub selectrow_array {
         my ($self, $sql) = @_;
         my @row = TestSelecto::DBH::session_row($sql);
-        @row[0, 1] = @{$self->{zone}};
+        @row[1, 2] = @{$self->{zone}};
         return @row;
     }
 }

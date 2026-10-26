@@ -51,7 +51,7 @@ my ($lock, $lock_dbh) = write_error('55P03');
 is $lock->code, 'query_error', 'a lock timeout stays a query_error';
 is_deeply $lock->details, {cause => 'database_error', sqlstate => '55P03', category => 'database_error'},
     'a lock timeout keeps its SQLSTATE through the rollback';
-is_deeply $lock_dbh->events, ['BEGIN', 'ROLLBACK'], 'the failed write was rolled back';
+is_deeply $lock_dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'ROLLBACK'], 'the failed write was rolled back';
 is $lock_dbh->state, '', 'the rollback cleared the handle state';
 
 my ($deadlock) = write_error('40P01');

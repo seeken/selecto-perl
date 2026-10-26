@@ -100,7 +100,7 @@ sub _construct {
         rules        => undef,
         primary_key  => undef,
         fts5_index   => _normalize_fts5_index($args{fts5_index}),
-        required_predicate => $args{required_predicate},
+        required_predicate => _check_predicate_depth($args{required_predicate}),
         tenant_field => $args{tenant_field},
         tenant_required => $tenant_required,
     }, $class;
@@ -212,8 +212,30 @@ sub _refresh_fingerprint {
     return $self;
 }
 
+# A host predicate nested deeper than the expression depth limit (counted as
+# the configured-domain identity walk counts it, below the domain) is refused
+# with a typed error before it is fingerprinted, compiled or sent anywhere.
+sub _check_predicate_depth {
+    my ($predicate) = @_;
+    return $predicate unless ref $predicate;
+    require Selecto::Limits;
+    my $limit = Selecto::Limits->new->get('max_expression_depth') - 2;
+    my @stack = ([$predicate, 0]);
+    my %active;
+    while (my $entry = pop @stack) {
+        my ($value, $depth) = @$entry;
+        Selecto::Error->throw('invalid_query', 'required predicate is nested too deeply',
+            {reason => 'expression_depth'}) if $depth > $limit;
+        my $type = Scalar::Util::reftype($value) // next;
+        next if $active{refaddr($value)}++;
+        push @stack, map { [$_, $depth + 1] } $type eq 'HASH' ? values(%$value) : $type eq 'ARRAY' ? @$value : ();
+    }
+    return $predicate;
+}
+
 sub with_required_predicate {
     my ($self, $predicate) = @_;
+    _check_predicate_depth($predicate);
     my $copy = bless {%$self}, ref($self);
     $copy->{required_predicate} = $predicate;
     return $copy->_refresh_fingerprint;

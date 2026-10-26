@@ -3,8 +3,21 @@
 Governed insert candidates are checked using actual database storage semantics
 before INSERT. This closes differences between the standalone portable scalar
 comparator and a typed database column, including numeric-looking text and
-decimal scale rounding. The pure `QueryEnforcement::evaluate` contract and its
-239/489 scalar fixtures remain unchanged.
+decimal scale rounding.
+
+`QueryEnforcement::evaluate`, the in-process candidate evaluator, follows
+query_enforced_scalar v2 (specification 2.37, 704 + 532 cases): it decides by
+the compared column's declared type and metadata level. Text compares UTF-8
+bytes (no locale or collation), text ranges are refused, numbers compare as
+exact decimals after a stored-unchanged check (length, precision/scale), and
+every other type decides only byte-identical eq/ne. Perl issues no DDL and
+reads no catalog at compile time, so a declared domain type is `unverified`
+in process: the evaluator decides only NULL candidates and absent fields, and
+defers every comparison to this verified-storage check, which compares under
+the catalog's real type, typmod and collation. MySQL/MariaDB casts carry a
+CHAR/VARCHAR column's declared length. Explicit `*_unsafe` tooling defers the
+same way when its command declares `field_types`; an untyped guarded insert
+is refused with `query_rule_not_evaluable`.
 
 The engine replaces internal field-type metadata from its trusted domain (or
 declared graph relationship). The SQL adapter validates every referenced policy
@@ -15,7 +28,7 @@ explicit scalar or literal-expression values checked by admission. A policy
 field cannot rely on an unevaluated DEFAULT, generated value, or missing input.
 
 The initial supported domain types are integer, decimal, string/text, and boolean.
-Integers use canonical signed decimal syntax within signed 64-bit range; decimals
+Integers use signed decimal syntax (a sign and leading zeroes are allowed) within signed 64-bit range; decimals
 use canonical finite decimal/exponent syntax without whitespace, leading `+`,
 hexadecimal notation, or leading zeroes. Boolean values are 0/1. SQL NULL retains
 three-valued predicate semantics. Existing non-finite scalar refusal is retained.

@@ -206,9 +206,14 @@ sub _compile_single {
         $domain->required_predicate, $query->predicate);
     # The top-level eq/IN conjuncts of the host-trusted required predicate
     # decide tenant or scope identity even without a declared tenant_field.
+    my @host_trees = $self->_exact_identity_compare ? (grep { defined } $domain->required_predicate,
+        @{$self->{_selecto_trusted_predicates} // []}, @{$domain->{_selecto_authored_predicates} // []}) : ();
     local $self->{_selecto_host_conjuncts} = $self->_exact_identity_compare
-        ? {map { (refaddr($_) => 1) } _comparison_nodes($domain->required_predicate,
-            @{$self->{_selecto_trusted_predicates} // []})} : undef;
+        ? {map { (refaddr($_) => 1) } _comparison_nodes(@host_trees)} : undef;
+    # Every node of those trees: a computed field they reference compiles its
+    # own comparisons as host identity too.
+    local $self->{_selecto_host_nodes} = $self->_exact_identity_compare
+        ? {map { (refaddr($_) => 1) } _expression_nodes(@host_trees)} : undef;
     my @association_paths = $self->_referenced_associations($query, $predicate, $domain);
     my ($join_aliases, $through_aliases) = _association_alias_maps(@association_paths);
     local $self->{_join_aliases} = $join_aliases;
@@ -289,7 +294,7 @@ sub _compile_single {
             # The target ON occurs inside the nested join, before the bridge ON.
             # Accumulate anonymous parameters in that emitted SQL order.
             push @target_on, $self->_constant_join_predicates(
-                $target_alias, $association->where, \@params
+                $target_alias, $association->where, \@params, $association->fields
             );
             push @target_on, $self->_tenant_bound_sql($association, $target_alias, \@params);
             push @bridge_on, $self->_constant_join_predicates(
@@ -337,7 +342,7 @@ sub _compile_single {
                     $self->_qualified($lookup_alias, $association->related_key),
             );
             push @target_on, $self->_constant_join_predicates(
-                $lookup_alias, $association->where, \@params
+                $lookup_alias, $association->where, \@params, $association->fields
             );
             if (defined $association->source_scope_key) {
                 push @target_on, $self->_identity_equal_sql(
@@ -399,11 +404,15 @@ sub _compile_single {
     }
     Selecto::Error->throw('unsupported_feature', 'adapter does not support rollups')
         if $query->grouping_mode eq 'rollup' && !$self->supports('rollup');
+    # A member's group key joined to its root as identity groups exactly
+    # (dialect hook; plain elsewhere).
+    my $byte_groups = $self->{_selecto_group_bytes};
+    local $self->{_selecto_group_bytes};
     my $group_sql = join(', ', map {
         my $key = _expression_key($_);
         $self->_reuses_parameter_identity && exists($compiled_selections{$key})
             ? $compiled_selections{$key}
-            : $self->_compile_expression($domain, $_, \@params)
+            : $self->_compile_group_expression($domain, $_, \@params, $byte_groups)
     } @$groups);
     if (@$groups) {
         $sql .= $query->grouping_mode eq 'rollup'
@@ -489,6 +498,21 @@ sub _compile_single {
     return $statement;
 }
 
+sub _compile_group_expression {
+    my ($self, $domain, $expression, $params) = @_;
+    return $self->_compile_expression($domain, $expression, $params);
+}
+
+# Whether a member query's groups must group exactly: it has an output
+# paired with its root as identity (a join or correlation), however that
+# output is spelled (a field, an alias, a value expression). Every text or
+# unknown-type group key then groups exactly (dialect hook).
+sub _member_group_bytes {
+    my ($self, $query, $columns, @paired) = @_;
+    return undef unless $self->_exact_identity_compare && @paired && blessed($query) && @{$query->groups};
+    return {all => 1};
+}
+
 # Dialect hooks for adapters that format result values in SQL.
 # _note_projection records where each top-level selection sits in a statement
 # compile just built (start offset; per selection, the expression length, the
@@ -565,10 +589,19 @@ sub _compile_retargeted {
         push @$params, @{$statement->params};
         return $exists ? "EXISTS ($sql)" : "$outer_key IN ($sql)";
     };
+    # The last hop's fixed where policy confines which of the target's rows
+    # the association reaches, and the key alone does not identify them
+    # either: it is applied to the target rows themselves, as on the join
+    # (byte-exact on dialects whose collations fold text).
+    my $where = $association->where;
+    my @policy = ref($where) eq 'HASH' && keys(%$where) ? (sub {
+        my ($params) = @_;
+        return join(' AND ', $self->_constant_join_predicates($outer_alias, $where, $params, $association->fields));
+    }) : ();
     return $self->_compile_single(
         $target_domain, $query->_copy(retarget => undef),
         %options,
-        extra_predicates => [@{$options{extra_predicates} // []}, $context_predicate],
+        extra_predicates => [@{$options{extra_predicates} // []}, @policy, $context_predicate],
     );
 }
 
@@ -839,7 +872,8 @@ sub _compile_cte_prefix {
                 ' AS ' . $self->quote_identifier('p_' . $spec->{name}) .
                 ' ON ' . $self->_identity_equal_sql($self->_qualified($root_alias, $join->{owner_key}),
                     $self->_qualified('p_' . $spec->{name}, $join->{related_key}),
-                    $self->_identity_field_exact($spec->{domain}, $join->{owner_key}));
+                    $self->_member_pair_exact([$spec->{domain}, $join->{owner_key}],
+                        [undef, $self->_exact_identity_compare ? $self->_cte_column_type($spec, $join->{related_key}) : undef]));
             if (defined $spec->{max_depth}) {
                 my $max_depth = "$spec->{max_depth}";
                 Selecto::Error->throw('invalid_query', 'recursive CTE max_depth must be a positive integer')
@@ -862,6 +896,10 @@ sub _compile_cte_prefix {
             );
             push @statements, $anchor, $member;
         } else {
+            my $join = $spec->{join};
+            my $paired = defined($join) && $self->_member_pair_exact([$root, $join->{owner_key}],
+                [undef, $self->_cte_column_type($spec, $join->{related_key})]) ? [$join->{related_key}] : [];
+            local $self->{_selecto_group_bytes} = $self->_member_group_bytes($spec->{query}, $columns, @$paired);
             push @statements, $self->compile($spec->{domain}, $spec->{query});
         }
         for my $statement (@statements) {
@@ -944,11 +982,21 @@ sub _compile_cte_joins {
         push @joins,
             $keyword . ' ' . $self->quote_identifier($spec->{name}) .
             ' AS ' . $self->quote_identifier($spec->{name}) .
-            ' ON ' . $self->_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
+            ' ON ' . $self->_derived_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
                 $self->_qualified($spec->{name}, $join->{related_key}),
-                $self->_identity_field_exact($domain, $join->{owner_key}));
+                $self->_member_pair_exact([$domain, $join->{owner_key}], [undef, $self->_exact_identity_compare
+                    ? $self->_cte_column_type($spec, $join->{related_key}) : undef]));
     }
     return \@joins;
+}
+
+# The declared type of a CTE's column, from the selection that produces it
+# (a recursive CTE's anchor), or undef.
+sub _cte_column_type {
+    my ($self, $spec, $column) = @_;
+    my $query = $spec->{recursive} ? $spec->{anchor} : $spec->{query};
+    return undef unless blessed($query) && blessed($spec->{domain});
+    return eval { $self->_selection_types($spec->{domain}, $query, $spec->{columns})->{$column} };
 }
 
 sub _compile_values_joins {
@@ -961,9 +1009,9 @@ sub _compile_values_joins {
         if ($join) {
             my $owner = $domain->resolve($join->{owner_key});
             Selecto::Error->throw('invalid_query', 'VALUES owner key must be a root field') if $owner->{association};
-            $sql .= ' ON ' . $self->_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
+            $sql .= ' ON ' . $self->_derived_identity_equal_sql($self->_qualified($self->_root_alias, $join->{owner_key}),
                 $self->_qualified($spec->{name}, $join->{related_key}),
-                $self->_identity_field_exact($domain, $join->{owner_key}));
+                $self->_member_pair_exact([$domain, $join->{owner_key}], [undef, undef]));
         }
         push @joins, $sql;
     }
@@ -985,7 +1033,14 @@ sub _compile_subquery_joins {
     my @joins;
     for my $spec (@{$query->subqueries}) {
         $spec->{domain} = $self->_bounded_source_domain($domain, $spec->{domain}, "subquery $spec->{name}");
-        my $statement = $self->compile($spec->{domain}, $spec->{query});
+        my @paired = map { $_->{right} } grep {
+            $self->_member_pair_exact([$domain, $_->{left}], [undef, $self->_exact_identity_compare
+                ? $self->_cte_column_type($spec, $_->{right}) : undef])
+        } @{$spec->{on} // []};
+        my $statement = do {
+            local $self->{_selecto_group_bytes} = $self->_member_group_bytes($spec->{query}, $spec->{columns}, @paired);
+            $self->compile($spec->{domain}, $spec->{query});
+        };
         Selecto::Error->throw('invalid_query', 'subquery projection must match declared columns')
             unless @{$statement->columns} == @{$spec->{columns}}
                 && join("\0", @{$statement->columns}) eq join("\0", @{$spec->{columns}});
@@ -995,9 +1050,10 @@ sub _compile_subquery_joins {
         for my $condition (@{$spec->{on}}) {
             my $owner = $domain->resolve($condition->{left});
             Selecto::Error->throw('invalid_query', 'subquery owner key must be a root field') if $owner->{association};
-            push @on, $self->_identity_equal_sql($self->_qualified($self->_root_alias, $condition->{left}),
+            push @on, $self->_derived_identity_equal_sql($self->_qualified($self->_root_alias, $condition->{left}),
                 $self->_qualified($spec->{name}, $condition->{right}),
-                $self->_identity_field_exact($domain, $condition->{left}));
+                $self->_member_pair_exact([$domain, $condition->{left}], [undef, $self->_exact_identity_compare
+                    ? $self->_cte_column_type($spec, $condition->{right}) : undef]));
         }
         push @joins, uc($spec->{type}) . ' JOIN (' . $body . ') AS ' . $self->quote_identifier($spec->{name})
             . ' ON ' . join(' AND ', @on);
@@ -1039,13 +1095,15 @@ sub _compile_lateral_joins {
                 if $child_field->{association} || $parent_field->{association};
             push @correlations, $self->_identity_equal_sql($self->_qualified($child_alias, $child),
                 $self->_qualified($self->_root_alias, $parent),
-                $self->_identity_field_exact($domain, $parent) || $self->_identity_field_exact($spec->{domain}, $child));
+                $self->_member_pair_exact([$domain, $parent], [$spec->{domain}, $child]));
         }
-        my $statement = $self->_compile_single(
-            $spec->{domain}, $spec->{query},
-            root_alias => $child_alias,
-            extra_predicates => \@correlations,
-        );
+        my $paired = grep {
+            $self->_member_pair_exact([$domain, $spec->{correlations}{$_}], [$spec->{domain}, $_])
+        } keys %{$spec->{correlations}};
+        my $statement = do {
+            local $self->{_selecto_group_bytes} = $self->_member_group_bytes($spec->{query}, undef, $paired ? ('lateral') : ());
+            $self->_compile_single($spec->{domain}, $spec->{query}, root_alias => $child_alias, extra_predicates => \@correlations);
+        };
         Selecto::Error->throw('invalid_query', 'lateral projection width does not match declared columns')
             unless @{$statement->columns} == @{$spec->{columns}};
         my $sql = $self->_shift_placeholders($statement->sql, scalar @$params);
@@ -1970,7 +2028,7 @@ sub _compile_related_collection_at {
         # ON precedes WHERE in the emitted SQL, so bind target predicates first.
         # Do not bind the discarded direct-association predicate for this path.
         push @target_on, $self->_constant_join_predicates(
-            $alias, $association->where, $params
+            $alias, $association->where, $params, $association_fields
         );
         push @target_on, $self->_tenant_bound_sql($association, $alias, $params);
         push @predicates, $self->_constant_join_predicates(
@@ -1981,7 +2039,7 @@ sub _compile_related_collection_at {
             join(' AND ', @target_on);
     } else {
         push @predicates, $self->_constant_join_predicates(
-            $alias, $association->where, $params
+            $alias, $association->where, $params, $association_fields
         );
         push @predicates, $self->_tenant_pair_sql($association, $parent_alias, $alias),
             $self->_tenant_bound_sql($association, $alias, $params);
@@ -2216,9 +2274,36 @@ sub _field_sql {
     if (!$resolved->{association}) {
         my $metadata = $domain->field_metadata($path);
         if (ref($metadata->{computed}) eq 'HASH') {
+            local $self->{_selecto_field_prefix};
             return $self->_compile_computed_field(
                 $domain, $path, $metadata->{computed}, $params
             );
+        }
+    } else {
+        # A joined relation's computed field compiles over that join: the
+        # fields its body names are the relation's own.
+        my $metadata = eval { $domain->_field_metadata_view("$path") };
+        if (ref($metadata) eq 'HASH' && ref($metadata->{computed}) eq 'HASH') {
+            my $computed = $metadata->{computed};
+            my $kind = $computed->{kind} // '';
+            Selecto::Error->throw('unsupported_feature',
+                'a joined relation\'s association_exists computed field is not available through the join', {field => "$path"})
+                if $kind eq 'association_exists';
+            # A joined schema's computed columns are not checked when the
+            # domain is parsed: a reference cycle is refused here, and a value
+            # expression is parsed (typed) as the root's are.
+            Selecto::Error->throw('invalid_domain', 'computed column references itself', {field => "$path"})
+                if $self->{_selecto_computed_stack}{"$path"};
+            local $self->{_selecto_computed_stack} = {%{$self->{_selecto_computed_stack} // {}}, "$path" => 1};
+            if ($kind eq 'expression') {
+                require Selecto::ValueExpression;
+                my $ast = eval { Selecto::ValueExpression->parse($computed->{expression}) };
+                Selecto::Error->throw('invalid_domain', 'computed value expression is invalid', {field => "$path"})
+                    unless defined $ast;
+                $computed = {%$computed, expression => $ast};
+            }
+            local $self->{_selecto_field_prefix} = "$resolved->{association_path}.";
+            return $self->_compile_computed_field($domain, $path, $computed, $params);
         }
     }
     my $table_alias = $resolved->{association}
@@ -2304,12 +2389,11 @@ sub _compile_computed_field {
     }
     if ($computed->{kind} eq 'coalesce_fields') {
         return 'COALESCE(' . join(', ', map {
-            $self->_field_sql($domain, $_, $params)
+            $self->_field_sql($domain, ($self->{_selecto_field_prefix} // '') . $_, $params)
         } @{$computed->{fields}}) . ')';
     }
     if ($computed->{kind} eq 'predicate') {
-        my $expression = Selecto::Expression->from_filter_ast($computed->{expression});
-        return '(' . $self->_compile_expression($domain, $expression, $params) . ')';
+        return '(' . $self->_compile_authored_condition($domain, $computed->{expression}, $params) . ')';
     }
     my $association_name = $computed->{association};
     my $association = $domain->associations->{$association_name};
@@ -2330,13 +2414,42 @@ sub _compile_computed_field {
                 $association->source_scope_key));
     }
     push @predicates, $self->_constant_join_predicates(
-        $alias, $association->where, $params
+        $alias, $association->where, $params, $association->fields
     );
     push @predicates, $self->_tenant_pair_sql($association, $self->_root_alias, $alias),
         $self->_tenant_bound_sql($association, $alias, $params);
     return 'EXISTS (SELECT 1 FROM ' . $self->_association_source_sql($association) .
         ' AS ' . $self->quote_identifier($alias) . ' WHERE ' .
         join(' AND ', @predicates) . ')';
+}
+
+# A condition authored in the domain (a computed predicate's body, a value
+# expression's CASE condition), as a filter AST.
+sub _compile_authored_condition {
+    my ($self, $domain, $ast, $params) = @_;
+    return $self->_compile_expression($domain, $self->_authored_condition($ast), $params);
+}
+
+# The condition as an expression, its fields qualified by the joined
+# relation it belongs to (_selecto_field_prefix), if any.
+sub _authored_condition {
+    my ($self, $ast) = @_;
+    my $expression = Selecto::Expression->from_filter_ast($ast);
+    my $prefix = $self->{_selecto_field_prefix};
+    return defined($prefix) && length($prefix) ? _prefix_fields($expression, $prefix) : $expression;
+}
+
+sub _prefix_fields {
+    my ($value, $prefix) = @_;
+    if (blessed($value) && $value->isa('Selecto::Expression')) {
+        return Selecto::Expression->field($prefix . $value->arguments->[0])
+            if $value->kind eq 'field' && defined($value->arguments->[0]) && !ref($value->arguments->[0]);
+        my $copy = Selecto::Expression->new($value->kind, map { _prefix_fields($_, $prefix) } @{$value->arguments});
+        return defined($value->alias_name) ? $copy->as($value->alias_name) : $copy;
+    }
+    return [map { _prefix_fields($_, $prefix) } @$value] if ref($value) eq 'ARRAY';
+    return {map { ($_ => _prefix_fields($value->{$_}, $prefix)) } keys %$value} if ref($value) eq 'HASH';
+    return $value;
 }
 
 # Compiles a governed value expression (see Selecto::ValueExpression). Every
@@ -2346,7 +2459,8 @@ sub _compile_value_expression {
     Selecto::Error->throw('unsupported_feature', 'adapter does not support value expressions')
         unless $self->supports('value_expressions');
     my ($operator, @arguments) = @$node;
-    return $self->_field_sql($domain, $arguments[0], $params) if $operator eq 'field';
+    return $self->_field_sql($domain, ($self->{_selecto_field_prefix} // '') . $arguments[0], $params)
+        if $operator eq 'field';
     if ($operator eq 'previous') {
         Selecto::Error->throw('invalid_value_expression', 'previous is available only in a recursive member step')
             unless ref($self->{_previous}) eq 'HASH'
@@ -2391,7 +2505,7 @@ sub _compile_value_expression {
             . ' AS ' . $self->_value_type_sql($arguments[1]) . ')';
     }
     if ($operator eq 'json_text') {
-        my $field_sql = $self->_field_sql($domain, $arguments[0], $params);
+        my $field_sql = $self->_field_sql($domain, ($self->{_selecto_field_prefix} // '') . $arguments[0], $params);
         return $self->_compile_json_text($field_sql, $arguments[1], $params);
     }
     if ($operator eq 'case') {
@@ -2401,8 +2515,7 @@ sub _compile_value_expression {
                 push @parts, 'ELSE ' . $self->_compile_value_expression($domain, $branch->[1], $params);
                 next;
             }
-            my $condition = Selecto::Expression->from_filter_ast($branch->[0]);
-            push @parts, 'WHEN ' . $self->_compile_expression($domain, $condition, $params)
+            push @parts, 'WHEN ' . $self->_compile_authored_condition($domain, $branch->[0], $params)
                 . ' THEN ' . $self->_compile_value_expression($domain, $branch->[1], $params);
         }
         return 'CASE ' . join(' ', @parts) . ' END';
@@ -2579,6 +2692,24 @@ sub _comparison_nodes {
     return @nodes;
 }
 
+# Every expression node of expression trees.
+sub _expression_nodes {
+    my @pending = grep { defined } @_;
+    my @nodes;
+    while (@pending) {
+        my $value = shift @pending;
+        if (blessed($value) && $value->isa('Selecto::Expression')) {
+            push @nodes, $value;
+            push @pending, @{$value->arguments};
+        } elsif (ref($value) eq 'ARRAY') {
+            push @pending, @$value;
+        } elsif (ref($value) eq 'HASH' && !blessed($value)) {
+            push @pending, map { $value->{$_} } sort keys %$value;
+        }
+    }
+    return @nodes;
+}
+
 # The fields compared by those nodes (plain root fields only).
 sub _comparison_fields {
     return map {
@@ -2605,6 +2736,14 @@ sub _top_conjuncts {
 sub _identity_equal_sql {
     my ($self, $left, $right, $exact) = @_;
     return "$left = $right";
+}
+
+# A pair with a derived source's column (CTE, VALUES, subquery): such a
+# column has no index to keep, and may carry a collation of its own.
+sub _derived_identity_equal_sql {
+    my ($self, @arguments) = @_;
+    local $self->{_selecto_derived_pair} = 1;
+    return $self->_identity_equal_sql(@arguments);
 }
 
 # A NULL-safe identity comparison of an inner and an outer column (retarget
@@ -2699,6 +2838,38 @@ sub _identity_field_exact {
     return _identity_text_type($resolved->{type});
 }
 
+# Exactness of a member correlation pair (CTE, VALUES, subquery, lateral and
+# recursive joins). Each side is [$domain, $path] (a field of a relation) or
+# [undef, $type] (a source column of known or unknown declared type). The
+# pair decides identity when either side is a tenant or scope column of its
+# relation; it is then classified from both sides' declared types: exact when
+# either is known text, plain only when both are known non-text, otherwise
+# decided by the server (an INT tenant must not match text '07' or ' 7').
+sub _member_pair_exact {
+    my ($self, @sides) = @_;
+    return 0 unless $self->_exact_identity_compare;
+    my ($identity, @classes) = (0);
+    for my $side (@sides) {
+        my ($domain, $path) = @$side;
+        unless (defined $domain) {
+            push @classes, _identity_text_type($path);
+            next;
+        }
+        my $resolved = eval { $domain->resolve("$path") };
+        push @classes, ref($resolved) eq 'HASH' ? _identity_text_type($resolved->{type}) : 2;
+        next unless ref($resolved) eq 'HASH' && defined $resolved->{field};
+        # Tenant and scope columns, and every column the host's required or
+        # trusted predicates compare: those decide identity too.
+        my %names = map { ($_ => 1) } $self->_identity_root_columns($domain),
+            _comparison_fields(eval { $domain->required_predicate }, @{$self->{_selecto_trusted_predicates} // []});
+        $identity = 1 if !$resolved->{association} && $names{$resolved->{field}};
+    }
+    return 0 unless $identity;
+    return 1 if grep { $_ == 1 } @classes;
+    return 0 unless grep { $_ != 0 } @classes;
+    return 2;
+}
+
 sub _identity_root_columns {
     my ($self, $domain) = @_;
     my $scope = eval { $domain->write_tenant_scope };
@@ -2755,14 +2926,24 @@ sub _tenant_bound_sql {
     $refuse->('a tenant-scoped relation past an untenanted hop has no tenant boundary of the root to carry');
 }
 
+# An association's fixed where policy (on its target, or on a through
+# bridge) is domain-authored scope: on dialects whose collations fold text
+# each pin compares as identity, classified by the column's declared type
+# ($types: the target relation's field types; a bridge column has none, so
+# the server decides).
 sub _constant_join_predicates {
-    my ($self, $alias, $where, $params) = @_;
+    my ($self, $alias, $where, $params, $types) = @_;
     return () unless ref($where) eq 'HASH' && keys %$where;
     my @predicates;
     for my $field (sort keys %$where) {
         my $column = $self->_qualified($alias, $field);
         if (!defined($where->{$field})) {
             push @predicates, "$column IS NULL";
+            next;
+        }
+        if ($self->_exact_identity_compare) {
+            push @predicates, $self->_identity_values_sql($column, [$where->{$field}], $params,
+                _identity_text_type(ref($types) eq 'HASH' ? $types->{$field} : undef));
             next;
         }
         push @$params, $where->{$field};
@@ -2773,6 +2954,30 @@ sub _constant_join_predicates {
 sub _qualified {
     my ($self, $alias, $field) = @_;
     return $self->quote_identifier($alias) . '.' . $self->quote_identifier($field);
+}
+
+# ON CONFLICT ... DO UPDATE updates the conflicting row whatever its scope.
+# A scope predicate (host, trusted or engine tenant) is kept only when each
+# of its conjuncts is an equality on a conflict-target column: the
+# conflicting row then holds the candidate's value there, and the candidate
+# was admitted under that scope. Any other scope is refused, as MySQL and
+# MariaDB refuse every scoped upsert.
+sub _refuse_unbounded_scoped_upsert {
+    my ($command, $conflict) = @_;
+    my $scope = $command->scope_predicate;
+    return unless defined $scope;
+    my %target = map { ($_ => 1) } @$conflict;
+    my $assignments = $command->assignments;
+    for my $conjunct (_top_conjuncts($scope)) {
+        my ($field, $value) = @{$conjunct->arguments};
+        next if $conjunct->kind eq 'eq' && blessed($field) && $field->kind eq 'field' && !ref($field->arguments->[0])
+            && $target{$field->arguments->[0]} && blessed($value) && $value->kind eq 'literal'
+            && exists $assignments->{$field->arguments->[0]};
+        Selecto::Error->throw('unsupported_scope_predicate',
+            'an upsert can keep a write scope only on its conflict-target columns',
+            {upsert_strategy => 'on_conflict'});
+    }
+    return;
 }
 
 sub _compile_write {
@@ -2796,18 +3001,29 @@ sub _compile_write {
                 Selecto::InsertAdmission->prepare($insert_predicate, $assignments,
                     $command->metadata->{__selecto_insert_types});
             } else {
-                # Explicit *_unsafe adapter tooling retains the standalone
-                # untyped evaluator. Engine-authorized writes always carry
-                # domain types and use the storage check before DML instead.
-                my $truth = Selecto::QueryEnforcement::evaluate(
-                $insert_predicate,
-                $self->_insert_candidate($assignments),
-                );
+                # Explicit *_unsafe adapter tooling: the in-process v2
+                # evaluator decides by declared type. A command's declared
+                # field_types (a portable command carries them) are names
+                # only, never checked against the column, so they are
+                # unverified: the evaluator decides nothing but NULL, and the
+                # comparison is deferred to the verified-storage check before
+                # DML (_check_typed_insert_admission). Without declared types
+                # there is no such check and the insert is refused.
+                my $types = _declared_admission_types($command);
+                my $truth = eval {
+                    Selecto::QueryEnforcement::evaluate($insert_predicate, $self->_insert_candidate($assignments),
+                        $types // {}, metadata => 'unverified', backend => $self->_exact_identity_compare ? 'mysql_family' : 'other');
+                };
+                unless (defined $truth) {
+                    my $error = $@;
+                    die $error unless defined($types) && blessed($error) && $error->isa('Selecto::Error')
+                        && $error->code eq 'query_rule_not_evaluable' && !$error->details->{missing_fields};
+                }
                 Selecto::Error->throw(
                 'query_rule_violation',
                 'insert candidate does not satisfy the enforced query',
                 { truth_value => $truth },
-                ) unless $truth eq 'true';
+                ) if defined($truth) && $truth ne 'true';
             }
         }
         my @params;
@@ -2832,6 +3048,7 @@ sub _compile_write {
             Selecto::Error->throw('invalid_write', 'upsert update fields must be a non-empty string array')
                 unless ref($updates) eq 'ARRAY' && !(grep { ref($_) } @$updates)
                     && (@$updates || $self->_admits_empty_upsert_mask($command));
+            _refuse_unbounded_scoped_upsert($command, $conflict);
             $sql .= $self->_compile_upsert_clause($conflict, $updates);
         }
         return $self->_append_returning($sql, \@params, $command);
@@ -3071,11 +3288,21 @@ sub insert_admission_storage {
         'adapter cannot establish typed insert storage semantics');
 }
 
+# The declared field types an untyped (*_unsafe) command carries for its
+# deferred verified-storage check, or undef.
+sub _declared_admission_types {
+    my ($command) = @_;
+    my $types = $command->metadata->{field_types};
+    return ref($types) eq 'HASH' && keys(%$types) ? $types : undef;
+}
+
 sub _check_typed_insert_admission {
     my ($self, $command) = @_;
     return unless $command->operation eq 'insert' || $command->operation eq 'upsert';
-    my $types = $command->metadata->{__selecto_insert_types};
-    return unless defined $types; # Explicit, trusted *_unsafe adapter tooling.
+    # Engine-governed commands carry the domain's types; explicit *_unsafe
+    # tooling defers to this check through its declared field_types.
+    my $types = $command->metadata->{__selecto_insert_types} // _declared_admission_types($command);
+    return unless defined $types; # Untyped tooling was refused at compile.
     my $predicate = Selecto::QueryEnforcement::combine(
         $command->predicate, $command->scope_predicate,
         defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
@@ -3201,7 +3428,19 @@ sub _execute_compiled_write_in_transaction {
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
-    my $bounded = $self->_bounded_write_command($command);
+    # A governed update's trusted scope (required predicate, host scope,
+    # query enforcement) must hold for the rows it leaves behind too: an
+    # assignment, or a BEFORE UPDATE trigger, could move a row out of scope.
+    # Its rows are locked and named by key first, and re-read afterwards.
+    my $post_image = _post_image_predicate($command);
+    $self->_admit_post_image_target($command) if $post_image;
+    # The bound-scope target contract for deletes and for graph descendants
+    # (see _bound_target_event): table lock, READ COMMITTED, and no
+    # deferrable trigger, statement-level trigger or rule for the event,
+    # checked before the statement and again after it.
+    my $bound_event = _bound_target_event($command);
+    $self->_bound_target_check($command, $bound_event, 'before') if $bound_event;
+    my ($bounded, $identities) = $self->_bounded_write_command($command, $post_image ? (force => 1) : ());
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;
     my ($sth, $affected, %values);
@@ -3238,14 +3477,341 @@ sub _execute_compiled_write_in_transaction {
     };
     die $self->normalize_error($@) unless $ok;
     $self->_check_write_cardinality($command, $affected, $bounds);
+    $self->_bound_target_check($command, $bound_event, 'after') if $bound_event;
+    if ($post_image) {
+        $self->_recheck_post_image_target($command);
+        $self->_verify_post_image($command, $post_image, $identities, $affected);
+    }
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
     return Selecto::Write::Result->new(operation => $command->operation, affected_rows => $affected, values => \%values);
 }
 
-sub _bounded_write_command {
+# The bound part of a governed update's predicate, which its post-image must
+# still satisfy (TW-09, bound tenant-like scope): the engine tenant,
+# writes.scope and the host's scope predicate, as the engine recorded them.
+# The required predicate, query enforcement and the caller's filter bound
+# the pre-image only: an update may change the column it was found by.
+# The engine tenant's columns are immutable, but a BEFORE UPDATE trigger
+# could still rewrite them: they are re-read like any bound scope.
+sub _post_image_predicate {
+    my ($command) = @_;
+    return undef unless $command->operation eq 'update' && exists $command->metadata->{__selecto_primary_key};
+    my $predicate = $command->metadata->{__selecto_post_image_scope};
+    return blessed($predicate) && $predicate->isa('Selecto::Expression') ? $predicate : undef;
+}
+
+# The re-read runs after the statement, when every BEFORE and AFTER trigger
+# (row or statement level) has run, so ordinary triggers (updated_at, audit)
+# keep working and one that moves a row out of scope is caught. It cannot see
+# what runs later, or through another relation: a deferrable constraint
+# trigger (PostgreSQL) fires at commit, and a view's rules or INSTEAD OF
+# triggers write elsewhere. Those are refused before the update.
+#
+# PostgreSQL: a deferrable constraint trigger anywhere in the database is
+# refused, not only one on the written relation: a leaf partition's or an
+# inheritance child's fires for rows the update reaches through the parent,
+# and one on another table fires when a row trigger writes there (an audit
+# table) and can then rewrite the updated row at commit. Statement-level
+# update triggers and rules are refused on the relation and on every
+# partition or child below it. A relation with (non-partition) inheritance
+# children is refused: its key is not unique across the children, so the
+# re-read by key could find a decoy row in a child. Every other adapter
+# (SQL Server, DuckDB) refuses bound-scope updates outright: it never
+# re-reads the rows, so a generated column, a trigger or a view/synonym
+# could leave the scope unseen.
+sub _admit_post_image_target {
     my ($self, $command) = @_;
+    my $table = Selecto::Identifier::checked($command->relation);
+    my $refuse = sub { Selecto::Error->throw('query_rule_not_evaluable', $_[0], {relation => $table}) };
+    my $name = $self->name;
+    Selecto::Error->throw('write_capability_missing',
+        ({mssql => 'SQL Server', duckdb => 'DuckDB'}->{$name} // 'adapter')
+            . ' cannot verify that an update keeps its rows in their trusted scope', {relation => $table})
+        unless $name =~ /\A(?:postgresql|sqlite|mysql|mariadb)\z/;
+    my $dbh = $self->dbh;
+    my @row;
+    my $ok = eval {
+        if ($name eq 'postgresql') {
+            # ROW EXCLUSIVE (what the UPDATE takes anyway, on every partition
+            # and child too) conflicts with CREATE TRIGGER, ALTER TABLE ...
+            # ENABLE TRIGGER and CREATE RULE on them: the catalog read below
+            # stays true for these relations until commit.
+            $dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
+            $self->_require_read_committed($table);
+            @row = $self->_pg_post_image_catalog($table);
+        } elsif ($name eq 'sqlite') {
+            @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
+                undef, $table);
+        } else {
+            # Read the table first, in the write's transaction: its shared
+            # metadata lock holds until commit, so a concurrent CREATE
+            # TRIGGER, ALTER or DROP INDEX cannot change what the
+            # information_schema checks below (kind, unique key) describe.
+            $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
+            @row = $dbh->selectrow_array($self->_statement_sql(q{SELECT TABLE_TYPE, 0 FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
+        }
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my ($kind, $deferrable, $statement_trigger, $inheritance, $rules) = @row;
+    $refuse->('a governed update through a view cannot verify the rows it leaves behind')
+        unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE');
+    $refuse->('a deferrable constraint trigger could change the rows after their verification') if $deferrable;
+    $refuse->('a governed update under a bound scope cannot verify a relation with inheritance children') if $inheritance;
+    $refuse->('a rule on the relation could rewrite the update outside the verified scope') if $rules;
+    # A statement-level UPDATE trigger can write rows the re-read does not
+    # name. Row-level triggers that modify OTHER rows stay allowed (user
+    # decision, TW item 19): their effects are the schema owner's
+    # responsibility, and the re-read covers the updated rows only.
+    Selecto::Error->throw('write_capability_missing',
+        'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
+        if $statement_trigger;
+    # information_schema describes the base table, not a session TEMPORARY
+    # table shadowing it (MySQL).
+    $self->_refuse_temporary_shadow($table) if $self->can('_refuse_temporary_shadow');
+    # The re-read names the updated rows by their key: the key must be
+    # unique (contain an enforced PRIMARY/UNIQUE index of whole, NOT NULL
+    # columns) and must not change, or another row sharing the old key value
+    # could stand in for a row the update moved out of scope.
+    my $primary = $command->metadata->{__selecto_primary_key};
+    my @keys = map { Selecto::Identifier::checked($_) } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    my %key = map { (lc($_) => 1) } @keys;
+    $refuse->('a governed update under a bound scope cannot assign its key')
+        if grep { $key{lc $_} } keys %{$command->assignments};
+    $refuse->('a governed update under a bound scope requires an enforced unique key')
+        unless $self->_enforced_unique_key($table, \@keys);
+    return;
+}
+
+# PostgreSQL: a guarded write's catalog checks (triggers, rules,
+# inheritance) are only meaningful under READ COMMITTED. Under REPEATABLE
+# READ or SERIALIZABLE, catalog queries read the transaction snapshot while
+# trigger firing uses the latest catalog, so a trigger committed after the
+# snapshot passes every check and still fires. Read in the write's
+# transaction (a host's transaction, or a managed one, which begins READ
+# COMMITTED explicitly); anything else is refused.
+sub _require_read_committed {
+    my ($self, $table) = @_;
+    return unless $self->name eq 'postgresql';
+    my $level;
+    my $ok = eval { ($level) = $self->dbh->selectrow_array(q{SELECT current_setting('transaction_isolation')}); 1 };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a guarded PostgreSQL write requires READ COMMITTED isolation',
+        {reason => 'isolation_level', relation => $table, isolation => $level})
+        unless defined($level) && $level eq 'read committed';
+    return;
+}
+
+# PostgreSQL catalog facts the post-image check depends on: the relation's
+# kind; whether any enabled non-internal deferrable trigger exists in the
+# database; statement-level UPDATE triggers, (non-partition) inheritance
+# children and rules on the relation or any partition or child below it.
+sub _pg_post_image_catalog {
+    my ($self, $table) = @_;
+    return $self->dbh->selectrow_array(q{
+                WITH RECURSIVE tree(oid, partition) AS (
+                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass
+                  UNION ALL
+                  SELECT i.inhrelid, child.relispartition FROM pg_catalog.pg_inherits i
+                  JOIN tree ON i.inhparent = tree.oid
+                  JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid)
+                SELECT c.relkind,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
+                    AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
+                    AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & 16) <> 0))::integer,
+                  (EXISTS(SELECT 1 FROM tree WHERE NOT tree.partition))::integer,
+                  (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
+                    WHERE r.rulename <> '_RETURN'))::integer
+                FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, ($self->quote_identifier($table)) x 2);
+}
+
+# After the UPDATE and before the re-read (PostgreSQL): the table lock keeps
+# the written relations' triggers and rules fixed, but a deferrable trigger
+# on another table (an audit table a row trigger writes to) could have been
+# created or enabled while the update waited for its rows. A deferred event
+# is queued only for a trigger that existed when the row trigger fired, so a
+# clean check now closes that window; otherwise the write is refused and
+# rolled back.
+sub _recheck_post_image_target {
+    my ($self, $command) = @_;
+    return unless $self->name eq 'postgresql';
+    my $table = Selecto::Identifier::checked($command->relation);
+    my @row;
+    my $ok = eval { @row = $self->_pg_post_image_catalog($table); 1 };
+    die $self->normalize_error($@) unless $ok;
+    my ($kind, $deferrable, $statement_trigger, $inheritance, $rules) = @row;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a deferrable constraint trigger could change the rows after their verification', {relation => $table})
+        if $deferrable;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'the relation gained inheritance children or rules while the update ran', {relation => $table})
+        if $inheritance || $rules;
+    Selecto::Error->throw('write_capability_missing',
+        'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
+        if $statement_trigger;
+    return;
+}
+
+# True when @$keys contain every column of an enforced unique index (or
+# primary key) whose columns are whole and NOT NULL, read from the catalog
+# in the write's transaction.
+sub _enforced_unique_key {
+    my ($self, $table, $keys) = @_;
+    # MySQL and MariaDB share the stored-row re-check's rule.
+    return $self->_unique_key_columns($table, $keys) if $self->can('_unique_key_columns');
+    my %want = map { (lc($_) => 1) } @$keys;
+    my $dbh = $self->dbh;
+    my @indexes;
+    my $ok = eval {
+        if ($self->name eq 'postgresql') {
+            my $rows = $dbh->selectall_arrayref(q{
+                SELECT i.indexrelid, a.attname, a.attnotnull::integer
+                FROM pg_catalog.pg_index i
+                JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON TRUE
+                LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                WHERE i.indrelid = ?::regclass AND i.indisunique AND i.indisvalid AND i.indimmediate
+                  AND i.indpred IS NULL AND i.indexprs IS NULL}, undef, $self->quote_identifier($table));
+            my %by;
+            push @{$by{$_->[0]}}, [$_->[1], $_->[2]] for @$rows;
+            @indexes = values %by;
+        } elsif ($self->name eq 'sqlite') {
+            my %info = map { (lc($_->{name}) => $_) }
+                @{$dbh->selectall_arrayref('PRAGMA table_info(' . $self->quote_identifier($table) . ')', {Slice => {}})};
+            my @pk = sort { $a->{pk} <=> $b->{pk} } grep { $_->{pk} } values %info;
+            # An INTEGER PRIMARY KEY is the rowid: unique and never NULL.
+            push @indexes, [[$pk[0]{name}, 1]] if @pk == 1 && uc($pk[0]{type} // '') eq 'INTEGER';
+            for my $index (@{$dbh->selectall_arrayref('PRAGMA index_list(' . $self->quote_identifier($table) . ')', {Slice => {}})}) {
+                next unless $index->{unique} && !$index->{partial};
+                my $columns = $dbh->selectall_arrayref('PRAGMA index_info(' . $self->quote_identifier($index->{name}) . ')', {Slice => {}});
+                # SQLite lets a non-INTEGER PRIMARY KEY column hold NULL
+                # unless declared NOT NULL. A NULL key is never named by the
+                # re-read (IN never matches it; a NULL locked key fails the
+                # count), and the index keeps every other value unique.
+                my $primary = ($index->{origin} // '') eq 'pk';
+                push @indexes, [map { [$_->{name}, defined($_->{name}) && ($primary || $info{lc $_->{name}}{notnull}) ? 1 : 0] } @$columns];
+            }
+        }
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    for my $index (@indexes) {
+        next unless @$index;
+        return 1 unless grep { !defined($_->[0]) || !$want{lc $_->[0]} || !$_->[1] } @$index;
+    }
+    return 0;
+}
+
+# Which bound-scope target contract a write runs (PostgreSQL), if any:
+# - a governed delete under a bound scope (engine tenant, writes.scope, host
+#   scope, a required tenant pin) or under query enforcement alone (a plain
+#   required filter alone is not bound, TW-09);
+# - a delete or update of any node of a graph whose root (or any node) is
+#   bound (__selecto_graph_bound, set by the engine), even when its own table
+#   has no tenant column. A graph update that carries its own post-image
+#   scope already runs the post-image contract.
+sub _bound_target_event {
+    my ($command) = @_;
+    my $metadata = $command->metadata;
+    return undef unless exists $metadata->{__selecto_primary_key};
+    my $operation = $command->operation;
+    return 'delete' if $operation eq 'delete'
+        && (blessed($metadata->{__selecto_post_image_scope}) || defined($command->query_enforcement)
+            || $metadata->{__selecto_graph_bound});
+    return 'update' if $operation eq 'update' && $metadata->{__selecto_graph_bound} && !_post_image_predicate($command);
+    # A graph-bound insert or upsert (a child, join-table or deeper row under a
+    # bound root) may carry no predicate of its own, so no insert admission
+    # runs; it still gets the target contract for its events.
+    return $operation if ($operation eq 'insert' || $operation eq 'upsert') && $metadata->{__selecto_graph_bound};
+    return undef;
+}
+
+# PostgreSQL bound-scope target contract. Before the statement: LOCK TABLE
+# ... IN ROW EXCLUSIVE MODE (the write's own lock, recursing to partitions
+# and children), so triggers and rules on these relations cannot change
+# until commit, and READ COMMITTED. Before and after it: no enabled
+# deferrable constraint trigger anywhere in the database (it fires at
+# commit), and no statement-level trigger or rule for the event on the
+# relation or below it (they can write rows outside the write's scope).
+# Row-level triggers that modify other rows are the schema owner's
+# responsibility (item 19).
+sub _bound_target_check {
+    my ($self, $command, $event, $phase) = @_;
+    return unless $self->name eq 'postgresql';
+    my $table = Selecto::Identifier::checked($command->relation);
+    # pg_trigger.tgtype bits (4 INSERT, 8 DELETE, 16 UPDATE) and
+    # pg_rewrite.ev_type ('3' INSERT, '4' DELETE, '2' UPDATE) for the events
+    # the write can fire; an upsert can insert or update.
+    my ($mask, @rule_events) = @{{delete => [8, '4'], update => [16, '2'], insert => [4, '3'], upsert => [4 | 16, '3', '2']}->{$event}};
+    my ($first_rule, $second_rule) = (@rule_events, @rule_events)[0, 1];
+    my ($deferrable, $statement, $rules);
+    my $ok = eval {
+        if ($phase eq 'before') {
+            $self->dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
+            $self->_require_read_committed($table);
+        }
+        ($deferrable, $statement, $rules) = $self->dbh->selectrow_array(q{
+            WITH RECURSIVE tree(oid) AS (
+              SELECT ?::regclass::oid
+              UNION ALL
+              SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree ON i.inhparent = tree.oid)
+            SELECT
+              (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
+                AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
+              (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
+                AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0))::integer,
+              (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
+                WHERE r.ev_type IN (?, ?) AND r.rulename <> '_RETURN'))::integer},
+            undef, $self->quote_identifier($table), $mask, $first_rule, $second_rule);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a deferrable constraint trigger could change the rows after their verification', {relation => $table})
+        if $deferrable;
+    Selecto::Error->throw('write_capability_missing',
+        "a statement-level $event trigger can write rows outside the write's scope", {relation => $table})
+        if $statement;
+    Selecto::Error->throw('write_capability_missing',
+        "a rule on the relation can rewrite the $event outside the write's scope", {relation => $table})
+        if $rules;
+    return;
+}
+
+# Every locked row the update could have changed must still satisfy the
+# trusted predicate, re-read in the write's transaction under the same
+# (host-exact) comparison; otherwise the write fails and rolls back. Rows the
+# update left unchanged satisfied it before and still do.
+sub _verify_post_image {
+    my ($self, $command, $predicate, $identities, $affected) = @_;
+    return unless ref($identities) eq 'ARRAY' && @$identities;
+    my $primary = $command->metadata->{__selecto_primary_key};
+    my @keys = map { Selecto::Identifier::checked($_) } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    my $locked = @keys == 1 ? Selecto::Expression->in($keys[0], [map { $_->[0] } @$identities])
+        : Selecto::Expression->any(map {
+            my $identity = $_;
+            Selecto::Expression->all(map { Selecto::Expression->eq($keys[$_], $identity->[$_]) } 0 .. $#keys)
+        } @$identities);
+    my @params;
+    my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
+    my $sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN (" . $self->_compile_write_predicate($predicate, \@params)
+        . ") THEN 1 ELSE 0 END), 0) FROM $table WHERE " . $self->_compile_write_predicate($locked, \@params);
+    my @row;
+    my $ok = eval { @row = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_violation', 'updated row no longer satisfies its trusted scope',
+        {truth_value => 'false_or_unknown'})
+        unless defined($row[0]) && defined($row[1]) && $row[0] == @$identities && $row[1] == $row[0]
+            && (!defined($affected) || $affected <= @$identities);
+    return 1;
+}
+
+sub _bounded_write_command {
+    my ($self, $command, %options) = @_;
     return $command unless $command->operation eq 'update' || $command->operation eq 'delete';
     my $metadata = $command->metadata;
     # Only the engine supplies this key before sealing the exact command in its
@@ -3271,10 +3837,23 @@ sub _bounded_write_command {
     }
     # A predicate selecting at most N distinct primary keys already bounds
     # mutation work without a second query or a check/use interval.
-    return $command if defined($identity_bound) && $identity_bound <= $limit;
     my $name = $self->name;
+    my $lockable = $name =~ /\A(?:postgresql|sqlite|mysql|mariadb)\z/;
+    if (defined($identity_bound) && $identity_bound <= $limit) {
+        return $command unless $options{force};
+        # An adapter that cannot lock and re-read the rows keeps an identity-
+        # bounded update only when it assigns no column its trusted scope
+        # reads (the post-image then cannot leave the scope by assignment).
+        if (!$lockable) {
+            my %scoped = map { ($_ => 1) } Selecto::Expression->field_references(_post_image_predicate($command));
+            Selecto::Error->throw('write_capability_missing',
+                'adapter cannot verify that an update keeps its rows in their trusted scope')
+                if grep { $scoped{$_} } keys %{$command->assignments};
+            return $command;
+        }
+    }
     Selecto::Error->throw('write_capability_missing', 'adapter cannot safely bound a broad write')
-        unless $name =~ /\A(?:postgresql|sqlite|mysql|mariadb)\z/;
+        unless $lockable;
     my @params;
     my $where = $self->_compile_write_predicate($predicate, \@params);
     my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
@@ -3329,8 +3908,9 @@ sub _bounded_write_command {
             my $identity = $_;
             Selecto::Expression->all(map { Selecto::Expression->eq($keys[$_], $identity->[$_]) } 0 .. $#keys)
         } @identities);
-    return $command->with_scope_predicate(
+    my $bounded = $command->with_scope_predicate(
         Selecto::QueryEnforcement::combine($command->scope_predicate, $keys));
+    return wantarray ? ($bounded, \@identities) : $bounded;
 }
 
 sub _write_identity_bound {
@@ -3380,11 +3960,22 @@ sub _transaction {
             'invalid_adapter',
             'external transaction mode requires AutoCommit to be disabled',
         ) unless defined($auto_commit) && !$auto_commit;
-        return $operation->();
+        return $self->_external_transaction($operation);
     }
     return $self->_handler_transaction($handler, $operation) if defined $handler;
     return $self->_savepoint_transaction($operation) if $self->_transaction_open;
     return $self->_own_transaction($operation);
+}
+
+# External mode: the host owns the transaction, but a write refused after its
+# DML ran (a post-image violation, a post-DML catalog recheck, a cardinality
+# mismatch) must not leave that DML for the host to commit. The write runs in
+# its own savepoint and rolls back to it on failure; the host's earlier work
+# and its transaction are kept, and nothing is ever committed. (DuckDB has no
+# savepoints and overrides this.)
+sub _external_transaction {
+    my ($self, $operation) = @_;
+    return $self->_savepoint_transaction($operation);
 }
 
 # Managed mode on an idle handle: the write's own transaction.
@@ -3434,27 +4025,56 @@ sub _savepoint_transaction {
     return $value;
 }
 
-# The host's transaction API runs the write; it must call the work once.
+# The host's transaction API runs the write; it must call the work once,
+# inside a transaction. A write can be refused after its statement (an
+# expected count, a post-image check), and on an autocommit handle its DML
+# would already be committed, so work the handler runs outside a
+# transaction is refused before any DML.
 sub _handler_transaction {
     my ($self, $handler, $operation) = @_;
-    my ($ran, $value) = (0);
+    my ($ran, $value, $failure) = (0);
     $handler->(sub {
         $ran = 1;
-        $value = $operation->();
+        my $ok = eval {
+            Selecto::Error->throw('transaction_unavailable',
+                'transaction_handler ran the write outside a transaction', {reason => 'autocommit'})
+                unless $self->_transaction_open;
+            # The write's own savepoint inside the handler's transaction: a
+            # write refused after its statement undoes itself even when the
+            # handler (or the host around it) goes on to commit.
+            $value = $self->_handler_unit($operation);
+            1;
+        };
+        unless ($ok) { $failure = $@; die $failure }
         return $value;
     });
     Selecto::Error->throw('invalid_adapter', 'transaction handler did not run the write')
         unless $ran;
+    # A handler that swallowed the write's failure (and perhaps committed)
+    # never turns it into a success: the original error is raised again.
+    die $failure if defined $failure;
     return $value;
 }
 
-# A savepoint name no other savepoint in this process shares, so a cleanup
-# can only ever roll back to its own savepoint, never to one an earlier or
-# outer operation left behind. Short enough for SQL Server's 32 characters.
+sub _handler_unit {
+    my ($self, $operation) = @_;
+    return $self->_savepoint_transaction($operation);
+}
+
+# A savepoint name no other savepoint shares, so a cleanup can only ever
+# roll back to (or release) its own savepoint, never one an earlier or outer
+# operation, or the host, created. A process serial keeps names distinct
+# within the process; a random nonce (mixed with the pid, so forked children
+# differ) keeps a host savepoint from colliding with it: on MySQL and
+# MariaDB a SAVEPOINT reusing a name replaces the older one, and the
+# write's RELEASE would then delete the host's savepoint. The old
+# <prefix>_<pid>_<n> shape is never produced. Short enough for SQL Server's
+# 32 characters: selecto_write_<hex serial>_<8 hex>.
 my $SAVEPOINT_SERIAL = 0;
 sub _savepoint_name {
     my ($prefix) = @_;
-    return $prefix . '_' . $$ . '_' . ++$SAVEPOINT_SERIAL;
+    my $nonce = (int(rand(4294967296)) ^ (($$ * 2654435761) % 4294967296)) % 4294967296;
+    return sprintf('%s_%x_%08x', $prefix, ++$SAVEPOINT_SERIAL, $nonce);
 }
 
 # Whether the handle is inside a transaction the host opened: AutoCommit is
@@ -3682,10 +4302,11 @@ its own transaction: C<begin_work>, then C<commit>, or C<rollback> on
 failure. On a handle that is already inside a transaction (C<AutoCommit>
 off after C<begin_work>, an C<< AutoCommit => 0 >> handle, or a transaction
 the server reports although C<AutoCommit> is on) the write runs inside a
-savepoint instead: C<SAVEPOINT selecto_write_E<lt>pidE<gt>_E<lt>nE<gt>> ...
+savepoint instead: C<SAVEPOINT selecto_write_E<lt>serialE<gt>_E<lt>nonceE<gt>> ...
 C<RELEASE SAVEPOINT>, and C<ROLLBACK TO SAVEPOINT> then C<RELEASE> on
-failure. Each savepoint has a name no other savepoint in the process
-shares, so a cleanup can only roll back to its own. The write then
+failure. Each savepoint name carries a process serial and a random nonce,
+so no other savepoint (not one of the host's either) shares it, and a
+cleanup can only roll back to or release its own. The write then
 commits or rolls back with the host's transaction, a failed write undoes
 only itself, and on PostgreSQL the host's transaction stays usable. The
 host still commits; a managed write never commits an C<< AutoCommit => 0 >>
@@ -3724,9 +4345,15 @@ the original error is still raised and the host must roll back.
 
 C<external>: for hosts that already own a unit-of-work transaction. The
 handle must have C<AutoCommit> disabled (otherwise C<invalid_adapter>) and
-the adapter never begins, commits, rolls back or creates savepoints. The
-host must commit on success and roll back on every exception, including a
-failed write. Use this mode, or C<managed> inside the host's transaction,
+the adapter never begins, commits or rolls back the transaction. Each write
+runs inside its own savepoint (as a managed write inside a host transaction
+does), so a write refused after its statements ran (for example a post-image
+violation) undoes only itself and a host that commits afterwards never
+persists it. DuckDB, which has no savepoints, runs the write directly and
+refuses (C<transaction_unavailable>, before any DML) a write that could be
+refused after its statement ran; see L<Selecto::DuckDB>. The
+host must still commit on success and should roll back on an exception it
+cannot handle. Use this mode, or C<managed> inside the host's transaction,
 with L<Selecto::Query/for_share> to keep an eligibility read valid until the
 write commits.
 
@@ -3748,10 +4375,17 @@ write, must call it exactly once inside a transaction it controls, and
 should return its value and let its exceptions propagate. A handler that
 never calls the work fails with C<invalid_adapter>, as do a handler that is
 not a code reference and a handler combined with C<external> mode.
-On SQLite, writes governed by stored-stage data rules additionally require
-the handler's transaction to be open on the adapter's own connection; a
-handler that runs the work in autocommit is refused with
-C<required_data_rule_pending> before any business statement. The handler may
+The transaction must be open on the adapter's own connection when the work
+starts (C<AutoCommit> off, or a transaction the server reports): a write can
+be refused after its statement (an expected count, a post-image check), so
+work run in autocommit is refused with C<transaction_unavailable> (details
+C<< {reason => 'autocommit'} >>) before any statement. Inside the handler's
+transaction the write runs in its own savepoint (DuckDB, which has none,
+runs it directly), so a refused write undoes itself even if the handler
+commits, and a failure the handler swallows is raised again after it
+returns. On SQLite, writes
+governed by stored-stage data rules additionally require the handler's
+transaction (C<required_data_rule_pending> otherwise). The handler may
 be called again for the write inside its own transaction, so it should run
 nested work directly.
 

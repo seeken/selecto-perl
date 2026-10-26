@@ -8,7 +8,8 @@ use TestSelecto;
 use Selecto;
 
 # How a write's transaction meets the host's: begin/commit on an idle handle,
-# a savepoint inside an open transaction, nothing at all in external mode,
+# a savepoint inside an open transaction and in external mode (which never
+# begins or commits; DuckDB has no savepoints and runs the write directly),
 # and the host's own transaction API through transaction_handler.
 
 my $domain = TestSelecto::writable_domain(
@@ -145,7 +146,7 @@ package RecordingDBH {
     sub events {
         my (%seen, $count);
         return [map {
-            (my $event = $_) =~ s{\bselecto_write_\d+_\d+\b}{$seen{$&} //= 'selecto_write_' . ++$count}ge;
+            (my $event = $_) =~ s{\bselecto_write_[0-9a-f]+_[0-9a-f]{8}\b}{$seen{$&} //= 'selecto_write_' . ++$count}ge;
             $event;
         } @{$_[0]{events}}];
     }
@@ -166,16 +167,24 @@ package RecordingDBH {
     sub rollback { push @{$_[0]{events}}, 'rollback'; $_[0]{AutoCommit} = 1; return 1; }
     sub do {
         my ($self, $sql) = @_;
+        # The MySQL-family metadata-lock read is catalog, not transaction
+        # control: answered without an event.
+        return '0E0' if $sql =~ /\bLIMIT 0\z/;
         push @{$self->{events}}, $sql;
         if (defined($self->{fail_do}) && $sql =~ $self->{fail_do}) { $self->{errstr} = "$sql refused"; return undef; }
         return '0E0';
     }
     sub selectrow_array {
         my ($self, $sql) = @_;
-        if (defined($self->{session}) && $sql =~ /SELECT \@\@SESSION\.time_zone\b/) {
+        if (defined($self->{session}) && $sql =~ /SELECT VERSION\(\), \@\@SESSION\.time_zone\b/) {
             push @{$self->{events}}, 'SESSION';
-            return @{$self->{session}}[0 .. ($sql =~ /\@\@in_transaction\z/ ? 8 : 7)];
+            # VERSION() of the adapter's own server family comes first.
+            return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'),
+                @{$self->{session}}[0 .. ($sql =~ /\@\@in_transaction\z/ ? 8 : 7)]);
         }
+        # The MySQL-family storage checks: an InnoDB base table, no shadow.
+        return ('items', 'CREATE TABLE `items` (`id` int)') if $sql =~ /SHOW CREATE TABLE/;
+        return ('InnoDB') if $sql =~ /SELECT ENGINE FROM information_schema\.TABLES/;
         push @{$self->{events}}, $sql;
         return exists $self->{answers}{$sql} ? ($self->{answers}{$sql}) : die "no answer for $sql\n";
     }
@@ -222,7 +231,7 @@ my $write = sub {
 subtest 'standalone and failed begin' => sub {
     my $idle = RecordingDBH->new;
     ok(!$write->(Selecto->adapter(postgresql => (dbh => $idle))), 'standalone write succeeds');
-    is_deeply($idle->events, ['begin_work', 'write', 'commit'], 'an idle handle begins and commits');
+    is_deeply($idle->events, ['begin_work', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'write', 'commit'], 'an idle handle begins and commits');
 
     my $refused = RecordingDBH->new(fail_begin => 1);
     my $error = $write->(Selecto->adapter(postgresql => (dbh => $refused)));
@@ -233,13 +242,13 @@ subtest 'standalone and failed begin' => sub {
     my $uncommitted = RecordingDBH->new(fail_commit => 1);
     $error = $write->(Selecto->adapter(postgresql => (dbh => $uncommitted)));
     is($error->code, 'query_error', 'a failed commit is a Selecto error');
-    is_deeply($uncommitted->events, ['begin_work', 'write', 'commit', 'rollback'],
+    is_deeply($uncommitted->events, ['begin_work', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'write', 'commit', 'rollback'],
         'a failed commit rolls back the write\'s own transaction');
 
     my $mismatch = RecordingDBH->new(affected => [0]);
     is($write->(Selecto->adapter(postgresql => (dbh => $mismatch)))->code, 'cardinality_mismatch',
         'a cardinality mismatch is reported unchanged');
-    is_deeply($mismatch->events, ['begin_work', 'write', 'rollback'], 'and rolls back its own transaction');
+    is_deeply($mismatch->events, ['begin_work', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'write', 'rollback'], 'and rolls back its own transaction');
 };
 
 subtest 'savepoints inside an open DBI transaction' => sub {
@@ -273,7 +282,13 @@ subtest 'savepoints inside an open DBI transaction' => sub {
     my $external = RecordingDBH->new(AutoCommit => 0);
     ok(!$write->(Selecto->adapter(postgresql => (dbh => $external, transaction_mode => 'external'))),
         'external write succeeds');
-    is_deeply($external->events, ['write'], 'external mode issues no transaction control at all');
+    is_deeply($external->events, ['SAVEPOINT selecto_write_1', 'write', 'RELEASE SAVEPOINT selecto_write_1'],
+        'external mode never begins or commits, and runs the write in its own savepoint');
+    my $external_failed = RecordingDBH->new(AutoCommit => 0, affected => [0]);
+    is($write->(Selecto->adapter(postgresql => (dbh => $external_failed, transaction_mode => 'external')))->code,
+        'cardinality_mismatch', 'an external write refused after its statement');
+    is_deeply($external_failed->events, ['SAVEPOINT selecto_write_1', 'write', 'ROLLBACK TO SAVEPOINT selecto_write_1',
+        'RELEASE SAVEPOINT selecto_write_1'], 'rolls back to its own savepoint, never the host transaction');
 };
 
 subtest 'MySQL and MariaDB' => sub {
@@ -354,7 +369,7 @@ subtest 'PostgreSQL detects a raw BEGIN' => sub {
         'idle in a transaction means a savepoint');
     my $idle = RecordingDBH->new(ping => 1);
     $write->(Selecto->adapter(postgresql => (dbh => $idle)));
-    is_deeply($idle->events, ['pg_ping', 'begin_work', 'write', 'commit'], 'idle means begin and commit');
+    is_deeply($idle->events, ['pg_ping', 'begin_work', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'write', 'commit'], 'idle means begin and commit');
 };
 
 subtest 'DuckDB' => sub {
