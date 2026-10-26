@@ -135,7 +135,9 @@ is_deeply $guard_error->details, {
         metadata => {returning => ['id']},
     )); };
     is $@->code, 'cardinality_mismatch', 'zero RETURNING rows obey the expected count';
-    is_deeply $empty_dbh->events, ['BEGIN', 'ROLLBACK'], 'empty counted RETURNING rolls back';
+    is_deeply $empty_dbh->events,
+        ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'ROLLBACK'],
+        'empty counted RETURNING uses the required isolation and rolls back';
 }
 
 for my $expected (2, 1) {
