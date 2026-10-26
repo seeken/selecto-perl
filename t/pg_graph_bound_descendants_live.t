@@ -17,7 +17,7 @@ use Selecto::Write ();
 # deferrable trigger, statement-level trigger or rule for the event, checked
 # before and after the statement), even on tables without a tenant column:
 # child delta deletes, join-table unlinks, depth-2 grandchild deletes and
-# child updates. A statement trigger or DO ALSO rule on such a table used to
+# child updates and child inserts. A statement trigger or DO ALSO rule on such a table used to
 # rewrite the other tenant's parent row ('pwned').
 my $url = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless defined($url) && $url ne '';
@@ -36,7 +36,8 @@ sub relation {
 my $grandchild = {schema_version => 1, name => 'GC', source => relation('selecto_gb_gc', id => 'integer', child_id => 'integer', note => 'string'),
     schemas => {}, joins => {}, writes => {operations => {delete => {enabled => 1}}, fields => {}}};
 my $child = {schema_version => 1, name => 'C', source => relation('selecto_gb_c', id => 'integer', parent_id => 'integer', note => 'string'),
-    schemas => {}, joins => {}, writes => {operations => {delete => {enabled => 1}, update => {enabled => 1}}, fields => {note => {updatable => 1}},
+    schemas => {}, joins => {}, writes => {operations => {delete => {enabled => 1}, update => {enabled => 1}, insert => {enabled => 1}},
+        fields => {id => {insertable => 1}, note => {updatable => 1, insertable => 1}},
         relationships => {gcs => {writable => 1, table => 'selecto_gb_gc', parent_key => 'id', child_key => 'child_id', allowed_ops => ['delete'],
             domain => $grandchild}}}};
 my $link = {schema_version => 1, name => 'L', source => relation('selecto_gb_link', id => 'integer', parent_id => 'integer', tag_id => 'integer'),
@@ -48,7 +49,7 @@ my $root = sub {
         schemas => {}, joins => {},
         writes => {operations => {update => {enabled => 1}}, fields => {title => {updatable => 1}},
             relationships => {
-                cs => {writable => 1, table => 'selecto_gb_c', parent_key => 'id', child_key => 'parent_id', allowed_ops => ['delete', 'update'], domain => $child},
+                cs => {writable => 1, table => 'selecto_gb_c', parent_key => 'id', child_key => 'parent_id', allowed_ops => ['delete', 'update', 'insert'], domain => $child},
                 links => {writable => 1, table => 'selecto_gb_link', parent_key => 'id', child_key => 'parent_id', allowed_ops => ['delete'], domain => $link}}},
         ($o{required} ? (required_filters => $o{required}) : ())};
 };
@@ -72,6 +73,10 @@ my %shapes = (
             bindings => [{field => 'parent_id', from => 'root', key => 'id'}]},
         {id => 'g', command => Selecto::Write::Command->new(operation => 'delete', relation => 'selecto_gb_gc', predicate => $x->eq('id', 20)),
             bindings => [{field => 'child_id', from => 'c', key => 'id'}]}] }],
+    # A child insert has no predicate of its own (no insert admission runs),
+    # but under a bound root it gets the same target contract.
+    'a child insert' => ['selecto_gb_c', 'INSERT', sub { [{id => 'c', command => Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_gb_c',
+        assignments => {id => 12, note => 'new'}), bindings => [{field => 'parent_id', from => 'root', key => 'id'}]}] }],
     'a child update' => ['selecto_gb_c', 'UPDATE', sub { [{id => 'c', command => Selecto::Write::Command->new(operation => 'update', relation => 'selecto_gb_c',
         assignments => {note => 'u'}, predicate => $x->eq('id', 10)), bindings => [{field => 'parent_id', from => 'root', key => 'id'}]}] }],
 );
@@ -123,6 +128,21 @@ for my $shape (sort keys %shapes) {
     $dbh->do('CREATE TRIGGER selecto_gb_pwn AFTER DELETE ON selecto_gb_c FOR EACH STATEMENT EXECUTE FUNCTION selecto_gb_pwn()');
     my $engine = Selecto::Engine->new(adapter => $adapter, domain => Selecto::Domain->parse($root->()));
     is($run->($engine, {}, $shapes{'a child delta delete'}[2]->()), 'applied', 'an unbound root: its child delete is not bound');
+}
+# A graph-bound upsert can insert or update: INSERT and UPDATE statement
+# triggers and rules are both refused (the adapter-level contract, as the
+# engine marks a graph node).
+for my $case (['an INSERT statement trigger', 'CREATE TRIGGER selecto_gb_pwn AFTER INSERT ON selecto_gb_c FOR EACH STATEMENT EXECUTE FUNCTION selecto_gb_pwn()'],
+              ['an UPDATE statement trigger', 'CREATE TRIGGER selecto_gb_pwn AFTER UPDATE ON selecto_gb_c FOR EACH STATEMENT EXECUTE FUNCTION selecto_gb_pwn()'],
+              ['an UPDATE rule', q{CREATE RULE selecto_gb_pwn AS ON UPDATE TO selecto_gb_c DO ALSO UPDATE selecto_gb_p SET title = 'pwned' WHERE org_key = 't2'}]) {
+    $reset->();
+    $dbh->do($case->[1]);
+    my $code = eval { $adapter->execute_write_unsafe(Selecto::Write::Command->new(operation => 'upsert', relation => 'selecto_gb_c',
+        assignments => {id => 10, parent_id => 1, note => 'up'},
+        metadata => {conflict_target => ['id'], upsert_update_fields => ['note'], __selecto_primary_key => 'id', __selecto_graph_bound => 1})); 'applied' }
+        // (blessed($@) ? $@->code : "died: $@");
+    is($code, 'write_capability_missing', "a graph-bound upsert refuses $case->[0]");
+    is_deeply($parents->(), [[1, 'a'], [2, 'theirs']], "graph-bound upsert, $case->[0]: nothing changed");
 }
 $dbh->do('DROP TABLE IF EXISTS selecto_gb_p, selecto_gb_c, selecto_gb_gc, selecto_gb_link CASCADE');
 $dbh->do('DROP FUNCTION IF EXISTS selecto_gb_pwn()');

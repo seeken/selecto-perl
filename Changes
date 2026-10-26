@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL graphs: a descendant insert or upsert under a bound root
+      now runs the bound-scope target contract too (lock, READ COMMITTED,
+      no deferrable trigger, and no INSERT statement trigger or INSERT rule,
+      plus UPDATE ones for an upsert, on the relation or below it, checked
+      before and after the statement). A child insert carries no predicate
+      of its own, so no insert admission ran, and an AFTER INSERT FOR EACH
+      STATEMENT trigger on the child rewrote another tenant's row.
     - transaction_handler: a failure the handler swallows (for example
       eval { $work->() } followed by a commit) is raised again after the
       handler returns, instead of execute_write returning undef as if it
