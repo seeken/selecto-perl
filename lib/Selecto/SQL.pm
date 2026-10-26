@@ -3723,6 +3723,10 @@ sub _bound_target_event {
         && (blessed($metadata->{__selecto_post_image_scope}) || defined($command->query_enforcement)
             || $metadata->{__selecto_graph_bound});
     return 'update' if $operation eq 'update' && $metadata->{__selecto_graph_bound} && !_post_image_predicate($command);
+    # A graph-bound insert or upsert (a child, join-table or deeper row under a
+    # bound root) may carry no predicate of its own, so no insert admission
+    # runs; it still gets the target contract for its events.
+    return $operation if ($operation eq 'insert' || $operation eq 'upsert') && $metadata->{__selecto_graph_bound};
     return undef;
 }
 
@@ -3739,7 +3743,11 @@ sub _bound_target_check {
     my ($self, $command, $event, $phase) = @_;
     return unless $self->name eq 'postgresql';
     my $table = Selecto::Identifier::checked($command->relation);
-    my ($mask, $rule_event) = $event eq 'delete' ? (8, '4') : (16, '2');
+    # pg_trigger.tgtype bits (4 INSERT, 8 DELETE, 16 UPDATE) and
+    # pg_rewrite.ev_type ('3' INSERT, '4' DELETE, '2' UPDATE) for the events
+    # the write can fire; an upsert can insert or update.
+    my ($mask, @rule_events) = @{{delete => [8, '4'], update => [16, '2'], insert => [4, '3'], upsert => [4 | 16, '3', '2']}->{$event}};
+    my ($first_rule, $second_rule) = (@rule_events, @rule_events)[0, 1];
     my ($deferrable, $statement, $rules);
     my $ok = eval {
         if ($phase eq 'before') {
@@ -3757,8 +3765,8 @@ sub _bound_target_check {
               (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
                 AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0))::integer,
               (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
-                WHERE r.ev_type = ? AND r.rulename <> '_RETURN'))::integer},
-            undef, $self->quote_identifier($table), $mask, $rule_event);
+                WHERE r.ev_type IN (?, ?) AND r.rulename <> '_RETURN'))::integer},
+            undef, $self->quote_identifier($table), $mask, $first_rule, $second_rule);
         1;
     };
     die $self->normalize_error($@) unless $ok;
