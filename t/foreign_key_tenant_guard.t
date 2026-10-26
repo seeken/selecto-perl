@@ -332,7 +332,14 @@ subtest 'TW-05 guard SQL shapes' => sub {
         like($shape->($name => $update)->{sql}, qr/AND EXISTS \(SELECT 1 FROM \(SELECT 1 FROM `customers`/,
             "$name guards an update through a derived table");
     }
-    my $mssql = $shape->(mssql => $upsert);
+    # A scoped SQL Server MERGE upsert is refused (it cannot carry the
+    # scope); the MERGE compiler still guards both branches of an unscoped
+    # one.
+    is(code_of(sub { $shape->(mssql => $upsert) }), 'unsupported_scope_predicate', 'SQL Server refuses a scoped MERGE upsert');
+    my $mssql_adapter = Selecto->adapter(mssql => (dbh => TestSelecto::DBH->new));
+    my $governed = Selecto::Engine->new(domain => $domain, adapter => $mssql_adapter, scope => {tenant => 10})
+        ->governed_write($upsert)->with_scope_predicate(undef);
+    my $mssql = $mssql_adapter->_compile_write($governed);
     like($mssql->{sql}, qr/WHEN MATCHED AND EXISTS \(SELECT 1 FROM \[customers\] AS \[selecto_fk_parent\].*WHEN NOT MATCHED AND EXISTS \(SELECT 1 FROM \[customers\]/s,
         'SQL Server guards both MERGE branches');
     is_deeply($mssql->{params}, ['B', 2, 3, 10, 2, 10, 2, 10], 'and binds the reference and tenant for each branch');

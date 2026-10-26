@@ -37,7 +37,7 @@ sub prepare {
             _not_evaluable($field) unless $value->kind eq 'literal';
             $value = $value->arguments->[0];
         }
-        $values{$field} = _value($type, $value, $field);
+        $values{$field} = _candidate_value($type, $value, $field);
         $used{$field} = $type;
         next if $kind eq 'is_null' || $kind eq 'not_null';
         my @expected;
@@ -51,6 +51,19 @@ sub prepare {
         _value($type, $_, $field) for @expected;
     }
     return {values => \%values, types => \%used};
+}
+
+# A candidate is bound to the storage check exactly as given. An integer
+# candidate may carry a sign or leading zeros ('010', '+10'): it is the same
+# integer (query_enforced_scalar v2), checked for range in its plain form.
+sub _candidate_value {
+    my ($type, $value, $field) = @_;
+    if ($type eq 'integer' && defined($value) && !ref($value) && "$value" =~ /\A([+-]?)0*([0-9]+)\z/) {
+        my $plain = ($1 eq '-' && $2 ne '0' ? '-' : '') . $2;
+        _value($type, $plain, $field);
+        return $value;
+    }
+    return _value($type, $value, $field);
 }
 
 sub _value {

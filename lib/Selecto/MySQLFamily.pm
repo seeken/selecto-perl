@@ -165,6 +165,8 @@ sub compile {
 
 sub _compile_single {
     my ($self, $domain, $query, %options) = @_;
+    # A nested statement decides its own host predicates.
+    local $self->{_selecto_in_host};
     my $scope = $self->{_selecto_format_scope};
     # A retargeted query compiles its selections in the inner call.
     return $self->SUPER::_compile_single($domain, $query, %options)
@@ -271,9 +273,19 @@ sub _compile_window {
 
 sub _compile_expression {
     my ($self, $domain, $expression, $params, $compiled_selections) = @_;
+    # Below a node of a host-trusted predicate, a referenced computed field
+    # compiles its comparisons as host identity too.
+    my $host_nodes = $self->{_selecto_host_nodes};
+    local $self->{_selecto_in_host} = $self->{_selecto_in_host}
+        || ($host_nodes && blessed($expression) && $host_nodes->{refaddr($expression)} ? 1 : 0);
     my $inline = $self->{_selecto_inline_integers};
     return '' . $inline->{refaddr($expression)}
         if $inline && blessed($expression) && exists $inline->{refaddr($expression)};
+    my $partition = $self->{_selecto_partition_bytes};
+    if ($partition && blessed($expression) && $partition->{refaddr($expression)}) {
+        local $self->{_selecto_partition_bytes};
+        return $self->_identity_bytes_sql($self->_compile_expression($domain, $expression, $params, $compiled_selections));
+    }
     my $sql = Selecto::SQL::RollupEmulation::branch_expression(
         $self, $domain, $expression, $params, $compiled_selections,
         sub { return $self->SUPER::_compile_expression(@_); },
@@ -320,12 +332,37 @@ sub _identity_pair_guard {
     return "((COLLATION($left) = 'binary' AND COLLATION($right) = 'binary') OR $bytes)";
 }
 
+# With $params, the operands' own parameters ($left_params, $right_params)
+# are appended once per paste, in SQL-text order.
 sub _identity_equal_sql {
-    my ($self, $left, $right, $exact) = @_;
+    my ($self, $left, $right, $exact, $params, $left_params, $right_params) = @_;
+    my $paste = sub {
+        push @$params, @{$left_params // []}, @{$right_params // []} if $params;
+        return;
+    };
+    my $bytes = $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right);
+    if ($self->{_selecto_derived_pair} && ($exact // 0) == 2) {
+        # A derived column may carry another collation than the root's (a
+        # COALESCE with a literal): the collated equality is not used.
+        $paste->();
+        $paste->();
+        $paste->();
+        return "(CASE WHEN COLLATION($left) = 'binary' AND COLLATION($right) = 'binary' THEN $left = $right ELSE $bytes END)";
+    }
+    if (($exact // 0) == 1 && (!(_plain_column($left) && _plain_column($right)) || $self->{_selecto_derived_pair})) {
+        # An expression operand has no index to keep: its bytes decide.
+        $paste->();
+        return "($bytes)";
+    }
+    $paste->();
     return "$left = $right" unless $exact;
-    return "($left = $right AND " . $self->_identity_pair_guard($left, $right, $exact,
-        $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right)) . ')';
+    $paste->() if ($exact // 0) == 2;
+    $paste->();
+    return "($left = $right AND " . $self->_identity_pair_guard($left, $right, $exact, $bytes) . ')';
 }
+
+# A quoted (optionally alias-qualified) column reference.
+sub _plain_column { return defined($_[0]) && "$_[0]" =~ /\A`(?:``|[^`])*`(?:\.`(?:``|[^`])*`)?\z/ ? 1 : 0; }
 
 # NULL-safe (<=>), and byte-exact for text identity columns.
 sub _identity_correlation_sql {
@@ -335,11 +372,33 @@ sub _identity_correlation_sql {
         $self->_identity_bytes_sql($inner) . ' <=> ' . $self->_identity_bytes_sql($outer)) . ')';
 }
 
+# $column_params are the column expression's own parameters (a computed
+# field): appended once per paste of $column, in SQL-text order.
 sub _identity_values_sql {
-    my ($self, $column, $values, $params, $exact) = @_;
-    return $self->SUPER::_identity_values_sql($column, $values, $params) unless $exact;
+    my ($self, $column, $values, $params, $exact, $column_params) = @_;
+    my @own = @{$column_params // []};
+    unless ($exact) {
+        push @$params, @own;
+        return $self->SUPER::_identity_values_sql($column, $values, $params);
+    }
     _refuse_inexact_identity() unless _identity_scalars($values);
+    # A compiled write reports its logical parameters by dropping each
+    # value's repeated copy; its identity columns are plain columns.
+    Selecto::Error->throw('unsupported_feature', 'MySQL-family write identity comparisons must name a stored column',
+        {reason => 'inexact_tenant_comparison'})
+        if @own && ref($self->{_selecto_bind_copies}) eq 'ARRAY';
+    if (($exact // 0) == 1 && !_plain_column($column)) {
+        # An expression (a computed field) has no index to keep: its bytes
+        # decide, which also leaves its collation out of the comparison.
+        push @$params, @own;
+        my @binary = map { push @$params, $_; 'CAST(' . $self->placeholder(scalar @$params) . ' AS BINARY)' } @$values;
+        my $bytes = $self->_identity_bytes_sql($column);
+        return @$values == 1 ? "($bytes = $binary[0])" : "($bytes IN (" . join(', ', @binary) . '))';
+    }
+    push @$params, @own;
     my @collated = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
+    push @$params, @own if ($exact // 0) == 2;
+    push @$params, @own;
     # The repeated values are recorded so a compiled write can report its
     # logical parameter sequence (each value once).
     push @{$self->{_selecto_bind_copies}}, [refaddr($params), scalar(@$params), scalar(@$values)]
@@ -380,6 +439,38 @@ sub _identity_operand_field {
     return ref($resolved) eq 'HASH' ? Selecto::SQL::_identity_text_type($resolved->{type}) : 0;
 }
 
+# A member's group key joined to its root as identity groups by its utf8mb4
+# bytes as well as the value, so collation-equal keys of other tenants ('T1',
+# 't1 ' for 't1') are not merged into the root's group (the value stays in
+# GROUP BY, so selecting it remains valid).
+sub _compile_group_expression {
+    my ($self, $domain, $expression, $params, $byte_groups) = @_;
+    my $plain = !(ref($byte_groups) eq 'HASH' && $byte_groups->{all} && blessed($expression));
+    # A declared non-text field groups as before; text and unknown types
+    # (and any other expression) group by their bytes as well.
+    if (!$plain && $expression->kind eq 'field' && !ref($expression->arguments->[0])) {
+        my $resolved = eval { $domain->resolve($expression->arguments->[0]) };
+        $plain = 1 if ref($resolved) eq 'HASH' && !Selecto::SQL::_identity_text_type($resolved->{type});
+    }
+    return $self->SUPER::_compile_group_expression($domain, $expression, $params) if $plain;
+    # Compiled once per paste, so any parameters repeat in SQL-text order.
+    my $bytes = $self->_identity_bytes_sql($self->SUPER::_compile_group_expression($domain, $expression, $params));
+    return "$bytes, " . $self->SUPER::_compile_group_expression($domain, $expression, $params);
+}
+
+# A computed field (a predicate body, a value expression's CASE condition, a
+# nested computed field) referenced by a host-trusted predicate is host scope
+# as well: its eq/ne/IN comparisons compare as identity by declared type, as
+# PostgreSQL compares them. Referenced by a caller filter it stays plain.
+sub _compile_authored_condition {
+    my ($self, $domain, $ast, $params) = @_;
+    return $self->SUPER::_compile_authored_condition($domain, $ast, $params) unless $self->{_selecto_in_host};
+    my $expression = $self->_authored_condition($ast);
+    local $self->{_selecto_host_conjuncts} = {%{$self->{_selecto_host_conjuncts} // {}},
+        map { (refaddr($_) => 1) } Selecto::SQL::_comparison_nodes($expression)};
+    return $self->_compile_expression($domain, $expression, $params);
+}
+
 # A read predicate (eq or IN) on a text tenant or site column: the root's,
 # a joined relation's, a member's or a retarget hop's, wherever it came from
 # (engine tenant, required predicate, carried tenant set, caller filter), in
@@ -403,11 +494,19 @@ sub _identity_predicate_sql {
     # undeclared column is tenant or scope identity too.
     my $host = $self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{refaddr($expression)};
     local $self->{_selecto_host_identity} = $host ? 1 : 0;
+    # An operand is compiled with its own parameters: the exact form pastes
+    # it two or three times, and anonymous parameters bind by occurrence, so
+    # each paste repeats them in SQL-text order (a computed field's literals).
+    my $operand = sub {
+        my @own;
+        my $sql = $self->_compile_expression($domain, $_[0], \@own);
+        return ($sql, \@own);
+    };
     if ($kind eq 'in') {
         my $exact = $self->_identity_operand_field($domain, $left) or return undef;
         _refuse_inexact_identity() unless _identity_scalars($right);
-        my $column = $self->_compile_expression($domain, $left, $params);
-        return $self->_identity_values_sql($column, [@$right], $params, $exact);
+        my ($column, $column_params) = $operand->($left);
+        return $self->_identity_values_sql($column, [@$right], $params, $exact, $column_params);
     }
     my $left_exact = $self->_identity_operand_field($domain, $left);
     my $right_exact = $self->_identity_operand_field($domain, $right);
@@ -415,13 +514,15 @@ sub _identity_predicate_sql {
     my ($field, $other) = $left_exact ? ($left, $right) : ($right, $left);
     my $is = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq $_[1] };
     if ($is->($other, 'field')) {
-        my $left_sql = $self->_compile_expression($domain, $left, $params);
-        return $self->_identity_equal_sql($left_sql, $self->_compile_expression($domain, $right, $params),
-            $left_exact == 1 || $right_exact == 1 ? 1 : 2);
+        my ($left_sql, $left_params) = $operand->($left);
+        my ($right_sql, $right_params) = $operand->($right);
+        return $self->_identity_equal_sql($left_sql, $right_sql, $left_exact == 1 || $right_exact == 1 ? 1 : 2,
+            $params, $left_params, $right_params);
     }
     _refuse_inexact_identity() unless $is->($other, 'literal') && _identity_scalars([$other->arguments->[0]]);
-    my $column = $self->_compile_expression($domain, $field, $params);
-    return $self->_identity_values_sql($column, [$other->arguments->[0]], $params, $left_exact || $right_exact);
+    my ($column, $column_params) = $operand->($field);
+    return $self->_identity_values_sql($column, [$other->arguments->[0]], $params, $left_exact || $right_exact,
+        $column_params);
 }
 
 # Write predicates, storage re-reads and guarded-insert probes of a governed
@@ -476,7 +577,7 @@ sub _compile_write_predicate {
 # Server errors by MySQL/MariaDB errno, typed like PostgreSQL's constraint
 # errors. A deadlock or lock-wait timeout is retryable (the host reruns the
 # whole transaction); neither is a client error. The violated key's name is
-# kept on the adapter, never in the public details.
+# never reported.
 sub normalize_error {
     my ($self, $error) = @_;
     return $error if blessed($error) && $error->isa('Selecto::Error');
@@ -487,14 +588,8 @@ sub normalize_error {
     my $errstr = eval { blessed($dbh) && $dbh->can('errstr') ? $dbh->errstr : undef };
     my $errno = defined($errstr) && length($errstr) && index($text, $errstr) >= 0
         ? eval { $dbh->err } : undef;
-    delete $self->{_selecto_unique_key};
     return $self->SUPER::normalize_error($error) unless defined($errno) && "$errno" =~ /\A\d+\z/;
     if ($errno == 1062) {
-        my ($key) = $text =~ /.*for key '([^']+)'(?: at |\s*\z)/s;
-        if (defined $key) {
-            $key =~ s/\A.*\.//s;
-            $self->{_selecto_unique_key} = lc $key;
-        }
         return Selecto::Error->new(code => 'database_unique_violation',
             message => 'A value conflicts with an existing record.', details => {constraint => 'unique'});
     }
@@ -935,21 +1030,30 @@ sub _compile_lateral_joins {
         push @selections, map { Selecto::Expression->field($keys[$_])->as("__selecto_lateral_key$_") } 0 .. $#keys;
         my ($limit, $offset) = ($child->limit_value, $child->offset_value);
         my $ranked = defined($limit) || defined($offset);
+        my @exact = map {
+            $self->_member_pair_exact([$domain, $spec->{correlations}{$_}], [$spec->{domain}, $_])
+        } @keys;
+        # An exact correlation partitions the ranking by the key's utf8mb4
+        # bytes, so a collation-equal key of another tenant ('7 ' for '7')
+        # shares no partition (and no row numbers) with it.
+        my @partitions = map { Selecto::Expression->field($_) } @keys;
+        my %bytes = map { (refaddr($partitions[$_]) => 1) } grep { $exact[$_] } 0 .. $#keys;
         push @selections, Selecto::Expression->row_number(
-            partition_by => [map { Selecto::Expression->field($_) } @keys],
+            partition_by => \@partitions,
             order_by => [map { [$_->[0], $_->[1]] } @{$child->orders}],
         )->as('__selecto_lateral_row') if $ranked;
         my $lowered = $child->_copy(selections => \@selections, orders => [],
             limit_value => undef, offset_value => undef);
-        my $statement = $self->_compile_single($spec->{domain}, $lowered, root_alias => 'l_' . $spec->{name});
+        my $statement = do {
+            local $self->{_selecto_partition_bytes} = \%bytes;
+            $self->_compile_single($spec->{domain}, $lowered, root_alias => 'l_' . $spec->{name});
+        };
         my $sql = $self->_shift_placeholders($statement->sql, scalar @$params);
         push @$params, @{$statement->params};
         my $name = $self->quote_identifier($spec->{name});
         my @on = map {
             $self->_identity_equal_sql("$name." . $self->quote_identifier("__selecto_lateral_key$_"),
-                $self->_qualified($self->_root_alias, $spec->{correlations}{$keys[$_]}),
-                $self->_identity_field_exact($domain, $spec->{correlations}{$keys[$_]})
-                    || $self->_identity_field_exact($spec->{domain}, $keys[$_]))
+                $self->_qualified($self->_root_alias, $spec->{correlations}{$keys[$_]}), $exact[$_])
         } 0 .. $#keys;
         if ($ranked) {
             my $row = "$name." . $self->quote_identifier('__selecto_lateral_row');
@@ -1114,11 +1218,15 @@ sub _admit_upsert_conflict {
             && !grep { !$entry->{columns}{$_} } keys %target
     } sort keys %index;
     $refuse->('no_matching_unique_index') unless defined $matched;
+    # The index was read from information_schema, which describes the base
+    # table even when a session TEMPORARY table shadows it.
+    $self->_refuse_temporary_shadow($table);
     return lc $matched;
 }
 
 # FOR UPDATE, savepoints and rollback need a transactional engine; a MyISAM
-# table would apply every statement immediately and ignore both.
+# table would apply every statement immediately and ignore both. A view has
+# no engine of its own and is refused too.
 sub _require_transactional_table {
     my ($self, $table) = @_;
     my ($engine) = $self->dbh->selectrow_array($self->_statement_sql(q{SELECT ENGINE FROM information_schema.TABLES
@@ -1247,6 +1355,23 @@ sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
     my $operation = $command->operation;
+    # Every write may be refused after its statement (cardinality, row
+    # ceiling, post-image, RETURNING and stored-row checks, an AFTER trigger
+    # that SIGNALs), and in a batch or graph a later command's refusal must
+    # undo the earlier ones; only a transactional engine can roll that back:
+    # MEMORY, MyISAM and Aria apply each statement at once. The table is read
+    # first so its metadata lock holds until commit, a session TEMPORARY
+    # table shadowing it is refused (information_schema describes only the
+    # base table, and MySQL 8.4 does not list temporary tables), then the
+    # base table must be InnoDB. A catalog that cannot answer is refused too.
+    my $ok = eval {
+        my $table = Selecto::Identifier::checked($command->relation);
+        $self->dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
+        $self->_refuse_temporary_shadow($table);
+        $self->_require_transactional_table($table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
     # Affected-row counts are matched rows only with CLIENT_FOUND_ROWS, the
     # DBD::MariaDB default; a handle that names it off in its DSN is refused.
     # (A connect-attribute override is not readable back; hosts must keep it.)
@@ -1271,6 +1396,12 @@ sub _execute_compiled_write_in_transaction {
     Selecto::Error->throw('write_capability_missing',
         'MySQL-family RETURNING cannot follow an update of the primary key', {field => $key})
         if $operation eq 'update' && exists $command->assignments->{$key};
+    # An insert or upsert re-reads its row by the assigned key or conflict
+    # target; a BEFORE INSERT trigger can rewrite them (NEW.id := 1000), so
+    # the re-read would return another row's values. Refused whatever the
+    # write's scope, after the table's metadata lock is taken.
+    $self->_refuse_before_insert_triggers(Selecto::Identifier::checked($command->relation))
+        if $operation eq 'insert' || $operation eq 'upsert';
     my ($keys, $before);
     if ($operation eq 'update' || $operation eq 'delete') {
         $keys = $self->_locked_write_keys($command, $key);
@@ -1311,21 +1442,107 @@ sub _verify_inserted_row {
     return unless $result->affected_rows;
     my $predicate = _write_predicate_expression($command);
     return unless defined($predicate) && exists $command->metadata->{__selecto_insert_types};
-    my $key = $command->metadata->{__selecto_primary_key};
+    my $declared = $command->metadata->{__selecto_primary_key};
+    my @keys = map { Selecto::Identifier::checked($_) } grep { defined && !ref } ref($declared) eq 'ARRAY' ? @$declared : ($declared);
     Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires the primary key')
-        unless defined($key) && !ref($key);
-    $key = Selecto::Identifier::checked($key);
+        unless @keys && @keys == (ref($declared) eq 'ARRAY' ? @$declared : 1);
+    my $table = Selecto::Identifier::checked($command->relation);
+    # The re-read finds the inserted row by its key only when the key is
+    # really unique: it must contain an enforced PRIMARY/UNIQUE index of NOT
+    # NULL, whole columns, or the count could find another row. Storage
+    # effects the candidate cast cannot see (CHAR(n) and TEXT-family
+    # trailing blanks) are decided here alone, so without such a key the
+    # insert is refused whatever the column type. Read in this write's
+    # transaction, never cached; a session TEMPORARY table shadowing the
+    # relation is refused (information_schema describes the base table).
+    $self->_refuse_temporary_shadow($table);
+    Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires a unique primary key')
+        unless $self->_unique_key_columns($table, \@keys);
+    my $identity = @keys == 1 ? $self->_inserted_identity($command, $keys[0])
+        : Selecto::Expression->all(map { $self->_inserted_identity($command, $_, 1) } @keys);
+    # The identity must find exactly the inserted rows, and each must still
+    # satisfy the enforced predicate.
     my @params;
-    my $where = $self->_compile_write_predicate(
-        Selecto::QueryEnforcement::combine($self->_inserted_identity($command, $key), $predicate), \@params);
-    my $sql = 'SELECT COUNT(*) FROM ' . $self->quote_identifier(Selecto::Identifier::checked($command->relation))
-        . " WHERE $where";
-    my ($count);
-    my $ok = eval { ($count) = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
+    my $satisfied = $self->_compile_write_predicate($predicate, \@params);
+    my $where = $self->_compile_write_predicate($identity, \@params);
+    my $sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN ($satisfied) THEN 1 ELSE 0 END), 0) FROM "
+        . $self->quote_identifier($table) . " WHERE $where";
+    my ($count, $matched);
+    my $ok = eval { ($count, $matched) = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_violation', 'stored row does not satisfy the enforced query',
-        {truth_value => 'false_or_unknown'}) unless defined($count) && $count == $result->affected_rows;
+        {truth_value => 'false_or_unknown'})
+        unless defined($count) && defined($matched) && $count == $result->affected_rows && $matched == $count;
     return 1;
+}
+
+# True when @$keys contain every column of a PRIMARY or UNIQUE index whose
+# columns are whole (no prefix part) and NOT NULL: such keys identify at most
+# one row.
+sub _unique_key_columns {
+    my ($self, $table, $keys) = @_;
+    my ($indexes, $nullable);
+    my $ok = eval {
+        $indexes = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT INDEX_NAME, COLUMN_NAME, SUB_PART
+            FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND NON_UNIQUE = 0
+            ORDER BY INDEX_NAME, SEQ_IN_INDEX}), undef, $table);
+        $nullable = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, IS_NULLABLE
+            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my %null = map { (lc($_->[0]) => uc($_->[1] // 'YES')) } @$nullable;
+    my %want = map { (lc($_) => 1) } @$keys;
+    my %index;
+    for my $row (@$indexes) {
+        my ($name, $column, $prefix) = @$row;
+        my $entry = $index{$name} //= {columns => {}, usable => 1};
+        $entry->{usable} = 0 if !defined($column) || defined($prefix);
+        $entry->{columns}{lc $column} = 1 if defined $column;
+    }
+    for my $entry (map { $index{$_} } sort keys %index) {
+        my $columns = $entry->{columns};
+        next unless $entry->{usable} && keys %$columns;
+        return 1 unless grep { !$want{$_} || ($null{$_} // 'YES') ne 'NO' } keys %$columns;
+    }
+    return 0;
+}
+
+# Refuse a RETURNING insert or upsert on a table with any BEFORE INSERT
+# trigger. The table is read first in the write's transaction, so its shared
+# metadata lock keeps a concurrent CREATE TRIGGER out until commit; a
+# session TEMPORARY table shadowing it is refused (information_schema
+# describes the base table).
+sub _refuse_before_insert_triggers {
+    my ($self, $table) = @_;
+    my $dbh = $self->dbh;
+    my $triggers;
+    my $ok = eval {
+        $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
+        ($triggers) = $dbh->selectrow_array($self->_statement_sql(q{SELECT COUNT(*) FROM information_schema.TRIGGERS
+            WHERE EVENT_OBJECT_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = ?
+              AND EVENT_MANIPULATION = 'INSERT' AND ACTION_TIMING = 'BEFORE'}), undef, $table);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    $self->_refuse_temporary_shadow($table);
+    Selecto::Error->throw('write_capability_missing',
+        'MySQL-family RETURNING cannot follow a row a BEFORE INSERT trigger may rewrite', {relation => $table})
+        if !defined($triggers) || $triggers;
+    return;
+}
+
+# A session TEMPORARY table of the same name shadows the base table for this
+# connection's DML, while information_schema describes the base table: the
+# storage and key checks would read another table's definition.
+sub _refuse_temporary_shadow {
+    my ($self, $table) = @_;
+    my @row;
+    my $ok = eval { @row = $self->dbh->selectrow_array($self->_statement_sql('SHOW CREATE TABLE ' . $self->quote_identifier($table))); 1 };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_not_evaluable', 'a temporary table shadows the guarded relation')
+        unless defined($row[1]) && $row[1] =~ /\A\s*CREATE\s+TABLE\b/i;
+    return;
 }
 
 sub _write_predicate_expression {
@@ -1362,7 +1579,7 @@ sub _locked_write_keys {
 # generated the key: the key column is AUTO_INCREMENT and the insert omitted
 # it or assigned NULL/DEFAULT. Any other assigned key must be a literal.
 sub _inserted_identity {
-    my ($self, $command, $key) = @_;
+    my ($self, $command, $key, $assigned_only) = @_;
     my $assignments = $command->assignments;
     my $literal = sub {
         my ($field) = @_;
@@ -1385,6 +1602,9 @@ sub _inserted_identity {
                 && ($value->kind eq 'default' || ($value->kind eq 'literal' && !defined($value->arguments->[0]))));
         return Selecto::Expression->eq($key, $literal->($key)) unless $generated;
     }
+    # A column of a composite key must be assigned.
+    Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires every key column',
+        {field => $key}) if $assigned_only;
     my $table = Selecto::Identifier::checked($command->relation);
     my ($extra, $id);
     my $ok = eval {
@@ -1407,7 +1627,11 @@ sub _inserted_identity {
 sub _tenant_conjuncts {
     my ($command) = @_;
     my %tenant = map { ($_ => 1) } @{$command->metadata->{__selecto_tenant_fields} // []};
-    my @pending = grep { defined } ($command->scope_predicate);
+    # An update's re-read follows its bound scope (TW-09): the required
+    # predicate bounds only the rows it found, which it may move out of.
+    my $metadata = $command->metadata;
+    my $governed_update = $command->operation eq 'update' && exists $metadata->{__selecto_primary_key};
+    my @pending = grep { blessed($_) } ($governed_update ? $metadata->{__selecto_post_image_scope} : $command->scope_predicate);
     my @kept;
     while (my $expression = shift @pending) {
         next unless blessed($expression) && $expression->isa('Selecto::Expression');
@@ -1450,6 +1674,13 @@ sub _returning_rows {
 my %INTEGER_TYPES = map { $_ => 1 } qw(tinyint smallint mediumint int bigint);
 my %TEXT_TYPES = map { $_ => 1 } qw(char varchar tinytext text mediumtext longtext);
 
+# True when the insert re-reads its stored row under the enforced predicate
+# (_verify_inserted_row): governed commands, which carry the domain's types.
+sub _rechecks_stored_row {
+    my ($command) = @_;
+    return $command->operation eq 'insert' && exists $command->metadata->{__selecto_insert_types} ? 1 : 0;
+}
+
 # The storage contract for a guarded insert's candidate check, read in the
 # write transaction after a read of the table: its shared metadata lock keeps
 # the column definitions and triggers (CREATE TRIGGER needs an exclusive
@@ -1462,6 +1693,7 @@ sub insert_admission_storage {
     my $dbh = $self->dbh;
     $fail->() unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'MariaDB' };
     my $table = Selecto::Identifier::checked($command->relation);
+    $self->_refuse_temporary_shadow($table);
     my ($mode, $kind, $triggers, $rows);
     my $ok = eval {
         $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0'));
@@ -1472,7 +1704,7 @@ sub insert_admission_storage {
         ($triggers) = $dbh->selectrow_array($self->_statement_sql(q{SELECT COUNT(*) FROM information_schema.TRIGGERS
             WHERE EVENT_OBJECT_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = ?}), undef, $table);
         $rows = $dbh->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, EXTRA,
-            CHARACTER_SET_NAME, COLLATION_NAME FROM information_schema.COLUMNS
+            CHARACTER_SET_NAME, COLLATION_NAME, CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), {Slice => {}}, $table);
         1;
     };
@@ -1496,8 +1728,24 @@ sub insert_admission_storage {
             $fail->() unless $TEXT_TYPES{$name} && defined($column->{CHARACTER_SET_NAME})
                 && defined($column->{COLLATION_NAME})
                 && $column->{CHARACTER_SET_NAME} =~ /\A\w+\z/ && $column->{COLLATION_NAME} =~ /\A\w+\z/;
-            $storage{$field} = {cast => "CHAR CHARACTER SET $column->{CHARACTER_SET_NAME}",
-                collation => $column->{COLLATION_NAME}};
+            # A fixed-width CHAR(n)/NCHAR(n) column reads back with its
+            # trailing blanks stripped, which no CAST reproduces ('t1 ' is
+            # stored and compared as 't1'). A governed insert re-reads its
+            # stored row under the enforced predicate in the same
+            # transaction (_verify_inserted_row), which catches that; a
+            # command without that re-check (*_unsafe tooling with declared
+            # field_types) is refused, as PostgreSQL refuses bpchar. A
+            # VARCHAR column's declared length is part of the cast: the
+            # column drops excess trailing blanks ('t1 ' in VARCHAR(2) is
+            # stored as 't1'), and so does CAST(... AS CHAR(n)).
+            # TEXT-family columns (TINYTEXT, TEXT, ...) silently drop excess
+            # trailing blanks past their octet capacity, which no cast
+            # reproduces either: without the re-check they are refused too.
+            $fail->() if ($name eq 'char' || $name =~ /text\z/) && !_rechecks_stored_row($command);
+            my $length = $name eq 'char' || $name eq 'varchar' ? $column->{CHARACTER_MAXIMUM_LENGTH} : undef;
+            $fail->() if ($name eq 'char' || $name eq 'varchar') && !(defined($length) && "$length" =~ /\A[1-9][0-9]{0,5}\z/);
+            $storage{$field} = {cast => 'CHAR' . (defined($length) ? "($length)" : '')
+                . " CHARACTER SET $column->{CHARACTER_SET_NAME}", collation => $column->{COLLATION_NAME}};
         }
     }
     return \%storage;
@@ -1653,22 +1901,40 @@ sub _require_session {
     my ($self, %options) = @_;
     return if $self->{_selecto_session_verified};
     my $dbh = $self->{dbh};
-    my $open_check = $options{write} && $self->name eq 'mariadb';
+    my $mariadb = $self->name eq 'mariadb';
+    my $open_check = $options{write} && $mariadb;
+    my $refuse = sub {
+        my ($reason, $message) = @_;
+        Selecto::Error->throw('invalid_connection', $message, {reason => $reason});
+    };
+    my $family = sub {
+        $refuse->('server_family', $mariadb ? 'the MariaDB adapter requires a MariaDB server'
+            : 'the MySQL adapter requires a MySQL server');
+    };
     my @row;
     my $ok = eval {
         local $dbh->{PrintError} = 0;
-        @row = $dbh->selectrow_array($self->_statement_sql('SELECT @@SESSION.time_zone, @@system_time_zone, '
+        @row = $dbh->selectrow_array($self->_statement_sql('SELECT VERSION(), @@SESSION.time_zone, @@system_time_zone, '
             . '@@SESSION.character_set_client, @@SESSION.character_set_connection, @@SESSION.character_set_results, '
             . q{@@SESSION.sql_mode, CONVERT(X'F09F9880' USING utf8mb4), CAST('2024-03-10 02:30:00.5' AS DATETIME(6))}
             . ($open_check ? ', @@in_transaction' : '')));
         1;
     };
-    die $self->normalize_error($@) unless $ok;
-    my ($zone, $system, $client, $connection, $results, $mode, $text, $datetime, $open) = @row;
-    my $refuse = sub {
-        my ($reason, $message) = @_;
-        Selecto::Error->throw('invalid_connection', $message, {reason => $reason});
-    };
+    unless ($ok) {
+        my $error = $@;
+        # MySQL rejects MariaDB's SET STATEMENT prefix (and @@in_transaction)
+        # as a syntax error: the MariaDB adapter is then on another server.
+        if ($mariadb) {
+            my ($version) = eval { local $dbh->{PrintError} = 0; $dbh->selectrow_array('SELECT VERSION()') };
+            $family->() if defined($version) && "$version" !~ /mariadb/i;
+        }
+        die $self->normalize_error($error);
+    }
+    my ($version, $zone, $system, $client, $connection, $results, $mode, $text, $datetime, $open) = @row;
+    # A MySQL adapter on a MariaDB server (or the reverse) would compile the
+    # other server's dialect: MariaDB statements without the subquery-cache
+    # prefix, MySQL statements with MariaDB-only syntax.
+    $family->() unless defined($version) && (("$version" =~ /mariadb/i ? 1 : 0) == ($mariadb ? 1 : 0));
     $refuse->('session_time_zone', 'MySQL-family sessions must use the UTC time zone')
         unless defined($zone) && ($UTC_ZONES{$zone}
             || ($zone eq 'SYSTEM' && defined($system) && ($system eq 'UTC' || $system eq '+00:00')));

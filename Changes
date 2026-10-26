@@ -8,6 +8,341 @@ Unreleased
       Portable rule identifiers, exact versions and normalized conditions
       follow the common contract. No engine tenant grants writes without
       explicit writes.scope.tenant or the existing authored host predicate.
+    - PostgreSQL graphs: a descendant insert or upsert under a bound root
+      now runs the bound-scope target contract too (lock, READ COMMITTED,
+      no deferrable trigger, and no INSERT statement trigger or INSERT rule,
+      plus UPDATE ones for an upsert, on the relation or below it, checked
+      before and after the statement). A child insert carries no predicate
+      of its own, so no insert admission ran, and an AFTER INSERT FOR EACH
+      STATEMENT trigger on the child rewrote another tenant's row.
+    - transaction_handler: a failure the handler swallows (for example
+      eval { $work->() } followed by a commit) is raised again after the
+      handler returns, instead of execute_write returning undef as if it
+      had applied. The write's savepoint already kept its DML from being
+      committed.
+    - DuckDB, external mode and transaction_handler: the primary-key reach
+      bound now also requires every key column to be non-text and the
+      schema search path to be the default. A VARCHAR key (COLLATE NOCASE,
+      default_collation, or a literal cast such as '01' = 1) could match
+      more rows than one per value, and a non-default search_path could
+      resolve the table elsewhere; such writes are refused before any DML
+      with transaction_unavailable.
+    - MySQL/MariaDB: every write, lone inserts and upserts included, now
+      requires an InnoDB base table, checked after the metadata lock and
+      the temporary-table shadow check (write_capability_missing). On
+      MEMORY or MyISAM an insert expecting 2 rows, a RETURNING insert with
+      an unassigned non-AUTO_INCREMENT key, and an insert an AFTER INSERT
+      trigger SIGNALs on each failed after storing the row, which stayed.
+    - PostgreSQL graphs: when any node of a graph is bound (engine tenant,
+      trusted tenant pin, host scope, query enforcement), every node and
+      owned-sync cleanup is marked bound, and each descendant delete and
+      update runs the bound-scope target contract even on tables without a
+      tenant column (child delta deletes, join-table unlinks, depth-2
+      grandchild deletes, child updates): LOCK TABLE ... IN ROW EXCLUSIVE
+      MODE, READ COMMITTED, and no deferrable trigger, statement-level
+      trigger or rule for the event, checked before and after the
+      statement (write_capability_missing / query_rule_not_evaluable). A
+      statement trigger or DO ALSO rule on such a table used to rewrite
+      another tenant's rows. Bound-scope deletes now also refuse
+      deferrable triggers and recheck after the statement.
+    - transaction_handler: inside the handler's transaction each write now
+      runs in its own savepoint, as managed and external writes do, so a
+      write refused after its statement undoes itself even when the handler
+      (or the host around it) commits; before, a pass-through handler on a
+      host or implicit (AutoCommit off) transaction kept the refused row.
+      DuckDB, which has no savepoints, runs handler work directly and
+      applies its external-mode refusal (transaction_unavailable, reason
+      no_savepoints) to handler writes too. External-mode graphs already
+      ran as one savepoint, and implicit transactions already counted as
+      host transactions; both are now covered by tests.
+    - PostgreSQL: a governed delete bounded only by query enforcement is
+      now a bound-scope delete like one under the engine tenant or a host
+      scope (a plain required filter alone still is not): its table is locked, READ COMMITTED is
+      required, and statement-level DELETE triggers and DELETE rules are
+      refused with write_capability_missing. Such a delete used to run a
+      statement trigger that rewrote another tenant's row.
+    - transaction_handler: work the handler runs outside a transaction on
+      the adapter's connection (an autocommit handle) is refused before any
+      statement with transaction_unavailable (reason autocommit). Any write
+      can be refused after its statement (an expected count matching more
+      rows, a post-image violation), and in autocommit its change was
+      already committed: an update expecting 1 row that matched 2 changed
+      both. Managed writes on an idle handle (their own transaction) and
+      managed or external writes inside a host transaction (a savepoint)
+      were already atomic on PostgreSQL, SQLite, MySQL and MariaDB and are
+      unchanged.
+    - MySQL/MariaDB: every update and delete, guarded or not, and every
+      command of a batch or graph, requires an InnoDB base table (checked
+      after the table's metadata lock; a session TEMPORARY table shadowing
+      it and writes through views are refused too) with
+      write_capability_missing. MEMORY, MyISAM and Aria tables apply each
+      statement at once, so a write refused after its statement (an
+      expected count or ceiling mismatch, a post-image violation, a later
+      batch or graph command) kept its changes. A lone insert or upsert
+      (at most one row, refused afterwards only when it affected none) is
+      unchanged; guarded ones already required InnoDB.
+    - DuckDB, external mode: the primary-key bound on what an update or
+      delete can reach now counts only when the declared key is an enforced
+      PRIMARY KEY or NOT NULL UNIQUE constraint of the table the write
+      resolves to (a session temporary table first, then the current
+      database's current schema; other schemas and ATTACHed databases never
+      match). On a table without one, an update of id = 1 with
+      expected_count 1 changed two duplicate rows, failed
+      cardinality_mismatch and the host's commit kept it; it is now refused
+      before any DML with transaction_unavailable.
+    - Documentation: Selecto::Engine execute_write lists every pre-DML
+      refusal of governed writes and states plainly that row-level triggers
+      stay allowed and that what they do to other rows is the schema
+      owner's responsibility, outside every scope guarantee.
+    - Savepoint names now carry a random nonce
+      (selecto_write_<hex serial>_<8 hex>, likewise for the upsert, insert
+      admission and bounded-probe savepoints) instead of
+      selecto_write_<pid>_<n>. On MySQL and MariaDB a SAVEPOINT reusing a
+      name replaces the older one, so a host savepoint of the old shape was
+      replaced by the write's own and deleted by its RELEASE; it now
+      survives a refused write and the host can still roll back to it.
+    - DuckDB, transaction_mode => 'external': DuckDB has no savepoints, so a
+      write Selecto could refuse after its statement changed rows is now
+      refused before any DML with transaction_unavailable (reason
+      no_savepoints): a write whose expected count or declared cardinality
+      could fail for some affected count it can reach (e.g. a delete of
+      id IN (1, 2) with expected_count 2, or an update by a non-key
+      predicate), a multi-command batch carrying any check, and any
+      multi-node graph. A bound-scope delete that failed
+      cardinality_mismatch after deleting used to leave the delete for the
+      host's COMMIT. Writes that cannot be refused after changing rows (an
+      update or delete by primary key with expected_count 1, an insert) run
+      directly as before; managed mode is unchanged.
+    - transaction_mode => 'external': each write now runs inside its own
+      savepoint (SAVEPOINT ... RELEASE, ROLLBACK TO SAVEPOINT on failure),
+      as a managed write inside a host transaction already did. A guarded
+      write refused after its DML ran (a post-image violation, the post-DML
+      catalog recheck, a cardinality mismatch) used to leave that DML in the
+      host's transaction, so a host that committed after the error
+      persisted the out-of-scope row. The adapter still never begins,
+      commits or rolls back the host's transaction. DuckDB, which has no
+      savepoints, runs external writes directly as before.
+    - PostgreSQL: a bound-scope delete takes LOCK TABLE ... IN ROW EXCLUSIVE
+      MODE before its statement-trigger check, requires READ COMMITTED like
+      every guarded write (query_rule_not_evaluable, reason
+      isolation_level), and also refuses a DELETE rule on the relation
+      (write_capability_missing). A statement-level DELETE trigger created
+      by another session while the delete waited for a row lock used to
+      fire and rewrite the other tenant's row.
+    - PostgreSQL: a guarded write (bound-scope update, guarded insert or
+      upsert) is refused with query_rule_not_evaluable (reason
+      isolation_level) unless its transaction runs READ COMMITTED
+      (current_setting('transaction_isolation'), read in the write's
+      transaction). Under REPEATABLE READ or SERIALIZABLE the trigger, rule
+      and inheritance checks read the transaction snapshot while triggers
+      fire from the latest catalog, so a trigger committed after the
+      snapshot passed every check: a deferred trigger moved an updated row
+      to another tenant, a BEFORE INSERT upper() trigger stored 'T1'.
+      Managed transactions now begin with SET TRANSACTION ISOLATION LEVEL
+      READ COMMITTED, so a default_transaction_isolation of 'repeatable
+      read' no longer weakens them; host transactions must run READ
+      COMMITTED for guarded writes.
+    - MySQL/MariaDB: an insert or upsert with RETURNING on a table with any
+      BEFORE INSERT trigger is refused with write_capability_missing,
+      whatever its scope, on the engine path and on execute_write_unsafe
+      (after the table's metadata lock is taken). RETURNING is emulated by
+      re-reading the row by its assigned key or conflict target; a trigger
+      rewriting NEW.id made an unscoped insert return another row's values.
+      Inserts without RETURNING, and tables with only AFTER INSERT or UPDATE
+      triggers, are unchanged.
+    - PostgreSQL: a bound-scope update takes LOCK TABLE ... IN ROW EXCLUSIVE
+      MODE (the lock the UPDATE takes anyway) before reading the catalog, so
+      a concurrent CREATE TRIGGER, ENABLE TRIGGER or CREATE RULE on the
+      relation or its partitions waits until commit, and it re-reads the
+      catalog after the UPDATE and before the post-image re-read: a
+      deferrable trigger created or enabled elsewhere (an audit table) while
+      the update waited for its rows is refused with query_rule_not_evaluable
+      and the write rolls back. A session that created such a trigger during
+      a row-lock wait previously let the row commit in another tenant.
+    - DuckDB (and any adapter other than PostgreSQL, SQLite, MySQL and
+      MariaDB): a governed update under a bound scope (engine tenant,
+      writes.scope, host scope predicate, required tenant pin) is refused
+      with write_capability_missing before any DML. DuckDB never re-read the
+      updated row, so a generated scope column (gen = CASE WHEN note='evil'
+      THEN 't2' ...) moved the row out of its scope when only a source
+      column was assigned. Updates without a bound scope are unchanged.
+    - MySQL/MariaDB: a bound-scope update reads its table (SELECT 1 ...
+      LIMIT 0) in the write's transaction before the information_schema
+      kind and unique-key checks, so the shared metadata lock it holds until
+      commit keeps a concurrent CREATE TRIGGER, ALTER or DROP INDEX from
+      changing the table between those checks and commit. A trigger created
+      in that window used to rewrite the updated row after the checks.
+    - SQL Server: a governed update under a bound scope (engine tenant,
+      writes.scope, host scope predicate, required tenant pin) is refused
+      with write_capability_missing before any DML. SQL Server never ran the
+      post-image re-read, and views and synonyms were not refused. Updates
+      without a bound scope are unchanged.
+    - SQL Server: a MERGE upsert carrying a write predicate or scope
+      predicate is refused with unsupported_scope_predicate, and one
+      carrying query enforcement with
+      query_enforcement_unsupported_operation, on the governed and the
+      *_unsafe paths. The MERGE compiler ignored all three and updated
+      whichever row held the conflicting key. Unscoped MERGE upserts (and
+      their foreign-key guards) are unchanged.
+    - PostgreSQL: a governed update under a bound scope of a relation that
+      has (non-partition) inheritance children is refused with
+      query_rule_not_evaluable. The parent's key is not unique across its
+      children, so when a BEFORE UPDATE trigger rewrote the key and the
+      tenant, the post-image re-read by the old key found a decoy row in a
+      child and the moved row committed. Partitioned tables, and inheritance
+      children without children of their own, are unchanged.
+    - PostgreSQL: a governed update under a bound scope (engine tenant,
+      writes.scope, host scope predicate) is refused with
+      query_rule_not_evaluable when any enabled, non-internal deferrable
+      constraint trigger exists in the database, not only on the written
+      relation: a deferred trigger on a leaf partition, on an inheritance
+      child, or on an audit table that a row trigger inserts into fired at
+      commit, after the post-image re-read, and moved the updated row to
+      another tenant. Deferrable foreign keys (internal triggers) are
+      unaffected. Rules (query_rule_not_evaluable) and statement-level
+      UPDATE triggers (write_capability_missing) are now refused on the
+      relation and on every partition or inheritance child below it.
+    - Tenant-pin rule (TW-09): a required filter that pins the domain's
+      declared tenant field (source.tenant_field or writes.scope.tenant
+      field), whether it comes from contract required_filters, write_context
+      required_filters or with_required_predicate, now bounds the post-image
+      of a governed update as well as its pre-image, on every backend and in
+      nested graph children. A BEFORE UPDATE trigger that moved the row to
+      another tenant was applied; it is now refused with
+      query_rule_violation and rolled back. The pin is chosen by provenance
+      (the host's required predicate), never by structural equality, and
+      fails closed: any required conjunct that reads the tenant column
+      joins, whatever its spelling (an OR of one arm, NOT(<>), >= AND <=,
+      a one-value IN, nested ANDs). Every other required filter still
+      bounds the pre-image only (status 'open' -> 'closed' applies).
+    - PostgreSQL and SQLite refuse an upsert whose scope predicate (host,
+      trusted or engine tenant) is not an equality on its conflict-target
+      columns, with unsupported_scope_predicate, as MySQL and MariaDB refuse
+      scoped upserts: ON CONFLICT ... DO UPDATE updated whichever row held
+      the conflicting key, so an upsert under org_key = 't1' took over or
+      overwrote another tenant's row. An engine-tenant upsert with the
+      tenant in its conflict target is unchanged.
+    - PostgreSQL: a bound-scope update or delete on a table with an enabled
+      statement-level UPDATE (respectively DELETE) trigger is refused with
+      write_capability_missing: such a trigger can write rows the post-image
+      re-read does not name. Row-level triggers that modify OTHER rows are
+      likewise outside the bound-scope guarantee, which covers the updated
+      rows.
+    - A governed update under a bound scope (engine tenant, writes.scope,
+      host scope predicate) requires an enforced unique key (containing a
+      PRIMARY/UNIQUE index of whole, NOT NULL columns) and may not assign
+      its key; otherwise it is refused with query_rule_not_evaluable. With
+      only an index on id, a key reassignment plus a decoy sharing the old
+      key passed the post-image re-read. Required-only and query-enforced
+      updates are unchanged.
+    - MySQL/MariaDB: a query member with any output joined or correlated to
+      its root as identity (CTE, subquery, lateral; whether the output is a
+      field, an alias or a value expression) groups every text or
+      unknown-type key by its utf8mb4 bytes too, so
+      'T1', 't1 ' and 'tı' rows are not merged into the root's 't1' group;
+      member correlations treat every column the host's required or trusted
+      predicates compare as identity (a required-only lateral or recursive
+      member matched 'T1' rows). Exact pairs with a derived column (CTE,
+      VALUES, subquery) compare bytes only, so a column of another collation
+      (COALESCE with a literal) no longer fails with an illegal collation
+      mix.
+    - Governed updates keep their rows inside their bound scope (TW-09: the
+      engine tenant, writes.scope and a host scope predicate) after the
+      write, on every backend: the rows are locked and named by key in the
+      write's transaction and re-read under the same (host-exact) predicate;
+      an assignment or a BEFORE UPDATE trigger that moved a row out of that
+      scope fails with query_rule_violation and rolls back (single, batch,
+      graph and RETURNING writes). A plain required predicate, query
+      enforcement and portable commands' context-required and captured
+      predicates bound the pre-image only: such an update may leave them,
+      also through MySQL-family RETURNING re-reads, which refused it before.
+      The re-read runs after the statement, when BEFORE and AFTER triggers
+      (row and statement level) have run: updated_at-style and audit
+      triggers keep working, and one that moves a row out of scope is
+      caught. Such an update is refused (query_rule_not_evaluable) through
+      a view or on a table with a deferrable constraint trigger, which act
+      after or outside the re-read.
+    - MySQL/MariaDB: the guarded-insert stored-row re-check runs only when
+      the declared key contains an enforced PRIMARY or UNIQUE index of whole,
+      NOT NULL columns (read in the write's transaction); otherwise a decoy
+      row could satisfy the count, and a CHAR(n) 't1 ' or a TINYTEXT value
+      past its octet capacity was stored under a predicate it violates. Such
+      an insert is now refused with query_rule_not_evaluable for every
+      column type. The re-check also requires the key to find exactly the
+      inserted rows, and accepts composite primary keys.
+    - MySQL/MariaDB: a session TEMPORARY table shadowing the guarded
+      relation (information_schema describes the base table) is refused by
+      insert admission, the re-check and upsert conflict proof.
+    - MySQL/MariaDB: commands without the re-check (*_unsafe tooling with
+      declared field_types) refuse TEXT-family columns as they refuse
+      CHAR(n): excess trailing blanks are dropped without a cast that can
+      reproduce it.
+    - MySQL/MariaDB storage admission refuses fixed-width CHAR(n)/NCHAR(n)
+      columns with query_rule_not_evaluable on commands without a stored-
+      row re-check (*_unsafe tooling with declared field_types), as
+      PostgreSQL refuses bpchar: the column reads back without trailing
+      blanks, which no cast reproduces, so such tooling applied 't1 '
+      (stored 't1') under <> 't1', NOT IN ('t1') and = 't1 '. Governed
+      inserts keep CHAR(n) (a CHAR(36) uuid tenant): their stored row is
+      re-read under the enforced predicate, which refuses those cases.
+    - The v2 main corpus is the harness's 714-case revision (an unresolved
+      PostgreSQL domain is at most base_verified, U115-U124); PostgreSQL
+      domains are refused by storage admission (live).
+    - Candidate admission follows query_enforced_scalar v2 (specification
+      2.37): QueryEnforcement::evaluate decides by the declared column type
+      and metadata level. Text compares UTF-8 bytes (a text pin '10' no
+      longer admits '1e1', '010', ' 10', '+10' or '10.0'), text ranges are
+      refused, numbers compare exactly after a stored-unchanged check
+      (declared length, precision and scale), other types decide only
+      byte-identical eq/ne, an undeclared or unverified type decides
+      nothing, absent fields and column pairs are not evaluable. Both v2
+      corpora (704 + 532) pass; the v1 runner is removed (v1 fixtures kept).
+    - Declared domain types are unverified in process (Perl reads no catalog
+      at compile time and issues no DDL): portable insert validation and
+      explicit *_unsafe tooling defer every comparison to the verified-
+      storage check before DML. Untyped *_unsafe guarded inserts, which
+      admitted '1e1' under '10', 't1 ' into VARCHAR(2) under <> 't1' and
+      '0.004' into NUMERIC(10,2) under > 0, are refused with
+      query_rule_not_evaluable; with declared field_types they defer.
+    - MySQL/MariaDB storage admission casts CHAR/VARCHAR candidates with
+      the column's declared length, as the column stores them.
+    - Governed integer candidates may carry a sign or leading zeroes ('010'
+      under amount = 10 is admitted, as PostgreSQL stores it).
+    - A retarget onto an association confined by a fixed where policy
+      applies that policy to the target rows themselves (all backends,
+      PostgreSQL and SQLite included): with keys repeating across sites the
+      key-only correlation returned rows the join excludes. The policy's
+      parameters precede the context's.
+    - MySQL/MariaDB: association where policies (on joins, collections,
+      association_exists, through bridges and retarget targets) compare as
+      identity by the column's declared type (a bridge column is decided by
+      the server); a string, custom-named or CHAR(36) uuid pin reached 'S1'
+      and 's1 ' rows.
+    - MySQL/MariaDB: a computed field referenced by a host-trusted predicate
+      (a computed predicate's body, a value expression's CASE/IN conditions,
+      nested computed fields) compares its own eq/ne/IN leaves as identity.
+      An exact comparison over an expression compares its bytes and repeats
+      the expression's parameters for every paste (8 markers with 5 values
+      raised query_error). Caller filters stay plain.
+    - A joined relation's computed predicate or value expression compiles
+      over the join (it was read as a physical column); its
+      association_exists kind is refused with unsupported_feature, and a
+      self-reference with invalid_domain.
+    - Co-domain lookups compile the request scope and the definition's own
+      view or segment filters, and canned pages the dataset predicate and
+      request scope (page, total and facet queries), as host scope.
+    - Query members' authored filters are host scope of the member's
+      relation; member correlations (lateral, MariaDB lowered lateral and
+      its ROW_NUMBER partition, CTE, recursive, VALUES, subquery) that touch
+      a tenant or scope column classify both sides, so an INT tenant 7
+      never matches a text '07', '7 ' or ' 7'.
+    - MySQL/MariaDB: the per-call session check also reads VERSION() and
+      refuses an adapter on the other server family with invalid_connection
+      (reason server_family); a MariaDB adapter on MySQL is recognised from
+      its rejected statement prefix instead of an untyped query_error.
+    - A required predicate nested past the expression depth limit is
+      refused with invalid_query (reason expression_depth) instead of
+      domain_modified_after_configuration or a serializer failure.
     - Known text type names are listed explicitly (string, text, tinytext,
       mediumtext, longtext, ntext, char, character, nchar, national char,
       varchar, char varying, character varying, nvarchar, national varchar,

@@ -3,7 +3,7 @@ package Selecto::CannedPage;
 use 5.034;
 use strict;
 use warnings;
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed reftype);
 use Time::HiRes qw(time);
 use Selecto::Domain ();
 use Selecto::Error ();
@@ -403,6 +403,13 @@ sub run {
             {tenant_field => "$field"});
     }
     my $plan = $self->plan($input, $scope);
+    # The dataset's authored predicate and the run's request scope are host
+    # scope (asserted as the tenant boundary above), never caller filters:
+    # the page, total and facet queries compile them as host identity.
+    my $host_adapter = $engine->can('adapter') ? $engine->adapter : undef;
+    local $host_adapter->{_selecto_trusted_predicates} = [@{$host_adapter->{_selecto_trusted_predicates} // []},
+        grep { defined } $self->{dataset}{query}->predicate, $scope]
+        if blessed($host_adapter) && reftype($host_adapter) eq 'HASH';
     my $query_started = time;
     _fail('execution options must be an object') if defined($execution_options) && ref($execution_options) ne 'HASH';
     my $run = sub {

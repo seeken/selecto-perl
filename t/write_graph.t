@@ -34,7 +34,7 @@ my $graph = Selecto::Write::Graph->new(nodes => [
 my $result = $adapter->execute_graph_unsafe($graph);
 is($result->root->values->{id}, 41, 'graph exposes root returned values');
 is($result->nodes->{line_item}->values->{id}, 99, 'graph exposes child returned values');
-is_deeply($dbh->events, ['BEGIN', 'COMMIT'], 'graph executes in one transaction');
+is_deeply($dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'COMMIT'], 'graph executes in one transaction');
 
 my $prepared = $dbh->prepared;
 is($prepared->[0]->sql, 'INSERT INTO "orders" ("order_no") VALUES ($1) RETURNING "id"', 'root graph node requests its generated key');
@@ -53,7 +53,7 @@ is($failed->code, 'query_error',
     'a child database failure retains its normalized public code');
 is($failed->details->{graph_node}, 'line_item',
     'a child database failure identifies its stable graph node');
-is_deeply($failed_dbh->events, ['BEGIN', 'ROLLBACK'],
+is_deeply($failed_dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'ROLLBACK'],
     'a node-attributed graph failure still rolls back the managed transaction');
 
 my $unsupported = Selecto::MSSQL->new(dbh => TestSelecto::DBH->new);

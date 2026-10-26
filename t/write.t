@@ -18,7 +18,7 @@ is_deeply($adapter->preview_write($command), {
 }, 'portable update preview separates SQL and params');
 my $result = $adapter->execute_write_unsafe($command);
 is_deeply($result->to_hash, { operation => 'update', affected_rows => 1 }, 'write result reports logical affected rows');
-is_deeply($dbh->events, ['BEGIN', 'COMMIT'], 'single write is transactional');
+is_deeply($dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'COMMIT'], 'single write is transactional');
 
 my $existing_transaction_dbh = TestSelecto::DBH->new({affected => 1});
 $existing_transaction_dbh->{AutoCommit} = 0;
@@ -27,7 +27,7 @@ my $existing_transaction_adapter = Selecto::PostgreSQL->new(
 );
 $existing_transaction_adapter->execute_write_unsafe($command);
 my @savepoint_events = @{$existing_transaction_dbh->events};
-like $savepoint_events[0], qr/\ASAVEPOINT (selecto_write_\d+_\d+)\z/,
+like $savepoint_events[0], qr/\ASAVEPOINT (selecto_write_[0-9a-f]+_[0-9a-f]{8})\z/,
     'managed writes inside an open DBI transaction use a uniquely named savepoint';
 is_deeply \@savepoint_events, [$savepoint_events[0], 'RELEASE ' . $savepoint_events[0]],
     'and release it, never committing the host transaction';
@@ -47,7 +47,7 @@ is $execution_error->code, 'query_error',
     'a false DBI execute result is reported as an execution error';
 isnt $execution_error->code, 'write_returning_missing',
     'a failed write is not masked as a missing RETURNING row';
-is_deeply $failed_write_dbh->events, ['BEGIN', 'ROLLBACK'],
+is_deeply $failed_write_dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'ROLLBACK'],
     'a false DBI execute result rolls back the managed transaction';
 
 my $constraint_error = $failed_write_adapter->normalize_error(
@@ -75,7 +75,7 @@ $external_dbh->{AutoCommit} = 0;
 my $external = Selecto::PostgreSQL->new(dbh => $external_dbh, transaction_mode => 'external');
 my $external_result = $external->execute_write_unsafe($command);
 is($external_result->affected_rows, 1, 'external transaction mode executes the write');
-is_deeply($external_dbh->events, [],
+is_deeply([grep { !/SAVEPOINT/ } @{$external_dbh->events}], [],
     'external transaction mode leaves begin, commit, and rollback to the caller');
 
 my $autocommit_dbh = TestSelecto::DBH->new({ affected => 1 });
@@ -102,7 +102,7 @@ my $missing = Selecto::Write::Command->new(
 );
 eval { $rollback_adapter->execute_batch_unsafe(Selecto::Write::Batch->new($insert, $missing)) };
 is($@->code, 'cardinality_mismatch', 'batch rejects an unexpected row count');
-is_deeply($rollback_dbh->events, ['BEGIN', 'ROLLBACK'], 'failed batch rolls back atomically');
+is_deeply($rollback_dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'ROLLBACK'], 'failed batch rolls back atomically');
 
 eval {
     $adapter->preview_write(Selecto::Write::Command->new(
@@ -150,10 +150,10 @@ for my $expected (2, 1) {
     if ($expected == 2) {
         is_deeply($returned->to_hash, {operation => 'update', affected_rows => 2, values => {id => 7}},
             'returning counts all returned rows rather than a provisional driver count');
-        is_deeply($returning_dbh->events, ['BEGIN', 'COMMIT'], 'exhausted returning write commits');
+        is_deeply($returning_dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'COMMIT'], 'exhausted returning write commits');
     } else {
         is($@->code, 'cardinality_mismatch', 'returning detects a multi-row cardinality mismatch');
-        is_deeply($returning_dbh->events, ['BEGIN', 'ROLLBACK'], 'returning mismatch rolls back');
+        is_deeply($returning_dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'ROLLBACK'], 'returning mismatch rolls back');
     }
     is($returning_dbh->prepared->[0]{index}, 2, 'entire returning result is consumed');
 }

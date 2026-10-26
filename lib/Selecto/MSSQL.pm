@@ -133,6 +133,15 @@ sub _compile_write {
     my ($self, $command) = @_;
     return $self->SUPER::_compile_write($command) unless $command->operation eq 'upsert';
 
+    # MERGE ... WHEN MATCHED updates whichever row holds the conflicting
+    # key, and this compiler carries no write predicate, scope or query
+    # enforcement into either branch. A scoped or predicated upsert is
+    # refused rather than run unscoped.
+    Selecto::Error->throw('query_enforcement_unsupported_operation', 'query-enforced upsert is not supported')
+        if defined $command->query_enforcement;
+    Selecto::Error->throw('unsupported_scope_predicate',
+        'SQL Server MERGE upserts cannot apply a write predicate or scope', {upsert_strategy => 'merge'})
+        if defined($command->predicate) || defined($command->scope_predicate);
     my $relation = Selecto::Identifier::checked($command->relation);
     my $assignments = $command->assignments;
     my @fields = sort keys %$assignments;

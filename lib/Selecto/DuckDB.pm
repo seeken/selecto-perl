@@ -4,6 +4,7 @@ use Mojo::Base 'Selecto::SQL';
 use DBI qw(SQL_VARCHAR);
 use Scalar::Util qw(blessed);
 use Selecto::Error ();
+use Selecto::QueryEnforcement ();
 
 sub name    { return 'duckdb'; }
 sub dialect { return __PACKAGE__; }
@@ -465,6 +466,163 @@ sub _transaction_statement {
 # DuckDB has no savepoints, so a managed write cannot run inside a
 # transaction the host holds open without committing or discarding the
 # host's work. It is refused instead.
+# External mode runs the write directly: DuckDB has no savepoints, so a
+# write that Selecto could refuse after its statement changed rows would
+# leave that DML for the host to commit. Such writes are refused before any
+# DML (_refuse_unverifiable_external); the rest run directly.
+sub _external_transaction {
+    my ($self, $operation) = @_;
+    return $operation->();
+}
+
+# Whether a refusal could follow DML that changed rows. Selecto's
+# post-statement checks on this adapter are the cardinality check (an
+# expected count or declared cardinality, and the engine's row ceiling), the
+# foreign-key guard check and the RETURNING row check; the last two refuse
+# only when nothing was affected. A count check is harmless only when no
+# affected row count from 1 up to the most the write can reach could fail
+# it: an insert or upsert reaches one row, an update or delete the identity
+# bound of its predicate on the governing primary key (unbounded without
+# one).
+sub _post_statement_refusable {
+    my ($self, $command) = @_;
+    my $bounds = $self->_validate_write_cardinality($command);
+    my ($minimum, $maximum) = ($bounds->{minimum} // 0, $bounds->{maximum});
+    my $operation = $command->operation;
+    my $reach;
+    if ($operation eq 'insert' || $operation eq 'upsert') {
+        $reach = 1;
+    } elsif (exists $command->metadata->{__selecto_primary_key}
+        && $self->_enforced_unique_key_duckdb($command->relation, $command->metadata->{__selecto_primary_key})) {
+        my $primary = $command->metadata->{__selecto_primary_key};
+        my @keys = ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+        my $predicate = Selecto::QueryEnforcement::combine($command->predicate, $command->scope_predicate,
+            defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef);
+        $reach = 1;
+        for my $key (@keys) {
+            my $bound = Selecto::SQL::_write_identity_bound($predicate, $key);
+            if (!defined $bound) { $reach = undef; last }
+            $reach *= $bound;
+        }
+    }
+    return 1 if $minimum > 1 && (!defined($reach) || $reach >= 1);
+    return 1 if defined($maximum) && (!defined($reach) || $reach > $maximum);
+    return 0;
+}
+
+# True when the declared key contains every column of an enforced PRIMARY
+# KEY, or of a UNIQUE constraint whose columns are all NOT NULL, on the
+# relation the write resolves to: a session temporary table shadows first,
+# then the current database's current schema; other schemas and ATTACHed
+# databases never match, and a view or unknown relation is not keyed. Any
+# catalog failure counts as not enforced (the write's reach is then
+# unbounded).
+sub _enforced_unique_key_duckdb {
+    my ($self, $relation, $primary) = @_;
+    my @keys = grep { defined && !ref } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
+    return 0 unless @keys && defined($relation) && !ref($relation);
+    my %want = map { (lc($_) => 1) } @keys;
+    my $dbh = $self->dbh;
+    my $enforced = eval {
+        my ($database, $schema, $table) = $dbh->selectrow_array(q{
+            SELECT database_name, schema_name, table_name FROM duckdb_tables()
+            WHERE lower(table_name) = lower(?)
+              AND ((database_name = 'temp' AND schema_name = 'main')
+                OR (database_name = current_database() AND schema_name = current_schema()))
+            ORDER BY CASE WHEN database_name = 'temp' THEN 0 ELSE 1 END LIMIT 1}, undef, "$relation");
+        return 0 unless defined $table;
+        # A schema search path other than the default can resolve the name
+        # elsewhere: not proven.
+        my ($search_path) = $dbh->selectrow_array(q{SELECT current_setting('search_path')});
+        return 0 if defined($search_path) && $search_path ne '';
+        my (%nullable, %text);
+        for my $row (@{$dbh->selectall_arrayref(q{
+            SELECT column_name, is_nullable, data_type FROM duckdb_columns()
+            WHERE database_name = ? AND schema_name = ? AND table_name = ?}, undef, $database, $schema, $table)}) {
+            $nullable{lc $row->[0]} = $row->[1] ? 1 : 0;
+            # DuckDB compares a text key under its collation (COLLATE NOCASE,
+            # default_collation) and casts it to a literal's type ('01' = 1),
+            # so a text key never identifies at most one row per value.
+            $text{lc $row->[0]} = ($row->[2] // '') =~ /CHAR|TEXT|STRING|BLOB|BYTEA|BINARY|BIT|JSON|ENUM/i ? 1 : 0;
+        }
+        my %constraints;
+        for my $row (@{$dbh->selectall_arrayref(q{
+            SELECT constraint_index, constraint_type, unnest(constraint_column_names) FROM duckdb_constraints()
+            WHERE database_name = ? AND schema_name = ? AND table_name = ?
+              AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')}, undef, $database, $schema, $table)}) {
+            my ($index, $type, $column) = @$row;
+            my $entry = $constraints{$index} //= {primary => $type eq 'PRIMARY KEY', columns => []};
+            push @{$entry->{columns}}, lc($column // '');
+        }
+        for my $entry (values %constraints) {
+            my @columns = @{$entry->{columns}};
+            next unless @columns;
+            return 1 unless grep { !$want{$_} || ($text{$_} // 1) || (!$entry->{primary} && ($nullable{$_} // 1)) } @columns;
+        }
+        0;
+    };
+    return $enforced ? 1 : 0;
+}
+
+# Any check at all: in a batch or graph a later command's refusal, even one
+# that changes nothing itself, leaves the earlier commands' DML behind.
+sub _post_statement_checked {
+    my ($command) = @_;
+    return defined($command->expected_count) || exists($command->metadata->{expected_cardinality})
+        || @{$command->foreign_key_guards} || exists($command->metadata->{__selecto_primary_key})
+        || @{$command->metadata->{returning} // []};
+}
+
+# External mode and a transaction_handler run the write directly in a
+# transaction Selecto does not own, with no savepoint to undo it.
+sub _writes_without_savepoint {
+    my ($self) = @_;
+    return ($self->transaction_mode // '') eq 'external' || defined($self->transaction_handler);
+}
+
+sub _refuse_unverifiable_external {
+    my ($self, @commands) = @_;
+    return unless $self->_writes_without_savepoint;
+    my $refusable = @commands > 1 ? grep { _post_statement_checked($_) } @commands
+        : grep { $self->_post_statement_refusable($_) } @commands;
+    Selecto::Error->throw('transaction_unavailable',
+        'DuckDB has no savepoints: in external or handler mode a write that could be refused after its statement cannot undo its DML',
+        {reason => 'no_savepoints'}) if $refusable;
+    return;
+}
+
+sub execute_write_unsafe {
+    my ($self, $command) = @_;
+    $self->_refuse_unverifiable_external($command)
+        if blessed($command) && $command->isa('Selecto::Write::Command');
+    return $self->SUPER::execute_write_unsafe($command);
+}
+
+sub execute_batch_unsafe {
+    my ($self, $batch) = @_;
+    $self->_refuse_unverifiable_external(@{$batch->commands}) if blessed($batch) && $batch->can('commands');
+    return $self->SUPER::execute_batch_unsafe($batch);
+}
+
+sub execute_graph_unsafe {
+    my ($self, $graph) = @_;
+    if (blessed($graph) && $graph->can('nodes') && $self->_writes_without_savepoint) {
+        my @nodes = @{$graph->nodes};
+        # A later node's binding or check can fail after an earlier node ran.
+        Selecto::Error->throw('transaction_unavailable',
+            'DuckDB has no savepoints: in external or handler mode a multi-node graph cannot undo its own DML',
+            {reason => 'no_savepoints'}) if @nodes > 1;
+        $self->_refuse_unverifiable_external(map { $_->{command} } @nodes);
+    }
+    return $self->SUPER::execute_graph_unsafe($graph);
+}
+
+# A transaction_handler's work runs directly: DuckDB has no savepoints.
+sub _handler_unit {
+    my ($self, $operation) = @_;
+    return $operation->();
+}
+
 sub _savepoint_transaction {
     Selecto::Error->throw(
         'invalid_adapter',
@@ -500,7 +658,23 @@ closed.
 DuckDB has no savepoints. A managed write on a handle with C<AutoCommit> off
 fails with C<invalid_adapter> instead of committing or discarding the host's
 work; use C<< transaction_mode => 'external' >> there (see
-L<Selecto::SQL/transaction_mode>).
+L<Selecto::SQL/transaction_mode>). In external mode, and under a
+C<transaction_handler>, a write runs directly in the host's transaction, so one that Selecto could refuse after its statement
+changed rows is refused before any DML with C<transaction_unavailable>
+(details C<< {reason => 'no_savepoints'} >>): a single write whose expected
+count or declared C<expected_cardinality> (or the engine's row ceiling)
+could fail for some affected count from 1 up to the rows it can reach (one
+for an insert or upsert, the primary-key identity bound of an update's or
+delete's predicate when that key is an enforced PRIMARY KEY or NOT NULL
+UNIQUE constraint of the resolved table whose columns are all non-text
+(a text key is compared under its collation and cast to a literal's type)
+and the schema search path is the default; unbounded otherwise), a batch of more than one
+command when any carries an expected count, declared cardinality,
+foreign-key guards, RETURNING or engine governance, and any graph of more
+than one node. Foreign-key guard and RETURNING checks refuse only when
+nothing was affected, so a single guarded write still runs. Writes that
+cannot be refused after their statement run directly as before; for
+example C<expected_count => 1> on an update by primary key.
 
 DBD::DuckDB 0.16 decodes some timestamps and decimals inexactly and infers
 numeric-looking strings as floating point. The adapter works around this

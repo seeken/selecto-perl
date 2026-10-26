@@ -168,7 +168,13 @@ my $guarded_insert = Selecto::Write::Command->new(
         updated_at => Selecto::Write::Expression->current_timestamp,
     },
     predicate => Selecto::Expression->eq('tenant_id', 7),
+    # Declared types let the undecided comparison defer to storage
+    # admission (query_enforced_scalar v2); untyped tooling is refused.
+    metadata => {field_types => {id => 'integer', tenant_id => 'integer'}},
 );
+is(exception { $sqlite->preview_write(Selecto::Write::Command->new(operation => 'insert', relation => 'items',
+    assignments => {id => 1, tenant_id => 7}, predicate => Selecto::Expression->eq('tenant_id', 7))) }->code,
+    'query_rule_not_evaluable', 'an untyped guarded insert decides nothing in process and is refused');
 is_deeply(
     $sqlite->preview_write($guarded_insert)->{params},
     [1, 7],
