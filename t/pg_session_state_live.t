@@ -118,6 +118,26 @@ subtest 'item 54/54a/51: a trigger switching search_path cannot steer the post-i
     $host->disconnect;
 };
 
+subtest 'item 54: a batch and a graph are refused as a unit in a host transaction' => sub {
+    $reset->();
+    $trigger->('selecto_ss', 'AFTER', q{IF NEW.id = 2 THEN PERFORM set_config('search_path', 'selecto_ss_evil, public', true); END IF;});
+    my $host = $connect->(host => 1);
+    $host->do('SELECT 1');
+    my $engine = $engine->($host, external => 1);
+    my $command = sub {
+        my ($id) = @_;
+        return Selecto::Write::Command->new(operation => 'update', relation => 'selecto_ss',
+            assignments => {note => "b$id"}, predicate => $x->eq('id', $id));
+    };
+    is($code->(sub { $engine->execute_batch(Selecto::Write::Batch->new($command->(1), $command->(2))) }),
+        'query_rule_violation/session_state_changed', 'batch: the second node is refused');
+    is($code->(sub { $engine->execute_graph(Selecto::Write::Graph->new(nodes => [{id => 'a', command => $command->(1)},
+        {id => 'b', command => $command->(2)}])) }), 'query_rule_violation/session_state_changed', 'graph: the second node is refused');
+    $host->commit;
+    is($state->(), '1:t1:n 2:t2:n', 'the host committed: neither node persisted');
+    $host->disconnect;
+};
+
 subtest 'item 54b: an unscoped write in a host transaction cannot hijack the next read' => sub {
     $reset->();
     $trigger->('selecto_ss', 'AFTER', q{PERFORM set_config('search_path', 'selecto_ss_evil, public', true);});
