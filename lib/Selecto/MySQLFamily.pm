@@ -303,6 +303,9 @@ sub _compile_expression {
         local $self->{_selecto_partition_bytes};
         return $self->_identity_bytes_sql($self->_compile_expression($domain, $expression, $params, $compiled_selections));
     }
+    local $self->{_selecto_timestamp_nullness} = 1
+        if blessed($expression) && $expression->isa('Selecto::Expression')
+            && ($expression->kind eq 'is_null' || $expression->kind eq 'not_null');
     my $sql = Selecto::SQL::RollupEmulation::branch_expression(
         $self, $domain, $expression, $params, $compiled_selections,
         sub { return $self->SUPER::_compile_expression(@_); },
@@ -861,6 +864,20 @@ sub _compile_write_predicate {
     my $timestamps = $self->{_selecto_write_timestamps};
     my $scoped = blessed($expression) && $self->{_selecto_write_scope_nodes}
         && $self->{_selecto_write_scope_nodes}{refaddr($expression)} ? 1 : 0;
+    if ($scoped && $timestamps && %$timestamps && blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind !~ /\A(?:and|or|not|field|literal)\z/) {
+        # R15: a TIMESTAMP column in write scope is only compared or tested
+        # for NULL, as a direct operand; any expression built on it is
+        # zone dependent.
+        my $plain = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind =~ /\A(?:field|literal)\z/ };
+        my @operands = grep { blessed($_) && $_->isa('Selecto::Expression') } @{$expression->arguments};
+        my $direct = $expression->kind =~ /\A(?:eq|ne|gt|gte|lt|lte|in|between|is_null|not_null)\z/
+            && !grep { !$plain->($_) } @operands;
+        Selecto::Error->throw('query_rule_not_evaluable',
+            'a TIMESTAMP scope column can only be compared with =, <>, ranges or IN, or tested for NULL',
+            {reason => 'timestamp_operator'})
+            if !$direct && grep { !ref($_) && $timestamps->{lc $_} } Selecto::Expression->field_references($expression);
+    }
     if ($scoped && blessed($expression) && $expression->isa('Selecto::Expression')
         && $expression->kind =~ $TEXT_RANGE_KINDS) {
         my $sql = $self->_write_text_range_sql($expression, $params, $timestamps);
@@ -1039,7 +1056,33 @@ sub _field_sql {
         && exists($self->{_query_sources}{$alias}) ? $self->{_query_sources}{$alias}{$field} : undef;
     return $self->_json_typed_value_sql($self->_qualified($alias, $field), $spec->{mysql_json_type})
         if ref($spec) eq 'HASH' && defined $spec->{mysql_json_type};
+    $self->_refuse_scope_timestamp_value($domain, $path) if $self->{_selecto_in_host} && !$self->{_selecto_timestamp_nullness};
     return $self->SUPER::_field_sql($domain, $path, $params);
+}
+
+# R15: inside host, trusted, required or tenant scope a TIMESTAMP column may
+# only be compared (by epoch, see _timestamp_scope_sql) or tested for NULL.
+# Any other use (a cast, a CASE result, concat, lower, a computed value
+# built on it) renders or converts it in the session zone, which a function
+# can switch within one statement: refused. A stored field only; computed
+# fields are checked through the fields they read.
+sub _refuse_scope_timestamp_value {
+    my ($self, $domain, $path) = @_;
+    return if "$path" =~ /\./ && ref($self->{_query_sources}) eq 'HASH'
+        && exists $self->{_query_sources}{(split /\./, "$path")[0]};
+    my $resolved = eval { $domain->resolve("$path") };
+    return unless ref($resolved) eq 'HASH' && defined $resolved->{field};
+    my $metadata = $resolved->{association} ? eval { $domain->_field_metadata_view("$path") } : eval { $domain->field_metadata("$path") };
+    return if ref($metadata) eq 'HASH' && ref($metadata->{computed}) eq 'HASH';
+    my $association = $resolved->{association};
+    return if $association && $association->join_mode eq 'star_dimension';
+    my $table = $association ? $association->table : $domain->table;
+    return if ref($table) || !defined($table);
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a TIMESTAMP scope column can only be compared with =, <>, ranges or IN, or tested for NULL',
+        {reason => 'timestamp_operator', field => "$path"})
+        if $self->_timestamp_column($table, $resolved->{field}, $resolved->{type});
+    return;
 }
 
 # JSON_TABLE takes its row path as a string literal, so only a plain member
@@ -2543,7 +2586,9 @@ statement cannot widen them. The literal must be C<YYYY-MM-DD>, optionally
 with C< HH:MM[:SS[.ffffff]]> (or C<T>) and C<Z> or C<+HH:MM>; any other
 spelling, a number or a NULL comparison is refused (reason
 C<timestamp_literal>), and a prefix, substring or suffix match is refused
-(reason C<timestamp_operator>). A zero date (C<0000-00-00 00:00:00>)
+(reason C<timestamp_operator>), as is any other use of the column there (a
+cast, a CASE result, a computed value built on it); a NULL test works. A
+zero date (C<0000-00-00 00:00:00>)
 satisfies no scope comparison, like NULL. C<DATETIME> columns compare as the
 server does.
 

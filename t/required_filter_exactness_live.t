@@ -16,6 +16,8 @@ use Selecto::Expression;
 # too. Required filters on non-text columns compare natively and are never
 # refused as identity columns (item 49 is not extended to them). Caller
 # filters keep the collation (item 55). Expected values are PostgreSQL's.
+# The same holds when the column's declared type is a name Selecto does not
+# know (R16): the stored type decides.
 my $x = 'Selecto::Expression';
 sub outcome {
     my ($code) = @_;
@@ -36,23 +38,28 @@ my @other = (
     ['lt double', $x->lt('f', 3), '1,2'], ['eq date', $x->eq('dt', '2024-06-02'), '2'], ['gte date', $x->gte('dt', '2024-06-03'), '3,4'],
 );
 sub domain {
-    my ($table, $required) = @_;
+    my ($table, $required, $type) = @_;
     my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Required',
         source => {source_table => $table, primary_key => 'id', fields => [qw(id k d f dt)],
-            columns => {id => {type => 'integer'}, k => {type => 'string'}, d => {type => 'decimal'}, f => {type => 'float'},
+            columns => {id => {type => 'integer'}, k => {type => $type // 'string'}, d => {type => 'decimal'}, f => {type => 'float'},
                 dt => {type => 'date'}}, associations => {}}, schemas => {}, joins => {}});
     return defined($required) ? $domain->with_required_predicate($required) : $domain;
 }
 sub run_cases {
     my ($label, $adapter, $table, $caller_want) = @_;
     my $ids = sub {
-        my ($required, $filter) = @_;
-        my $engine = Selecto::Engine->new(domain => domain($table, $required), adapter => $adapter);
+        my ($required, $filter, $type) = @_;
+        my $engine = Selecto::Engine->new(domain => domain($table, $required, $type), adapter => $adapter);
         my $query = $engine->query->select('id')->order_by('id');
         $query = $query->where($filter) if $filter;
         return outcome(sub { [map { $_->[0] } @{$engine->all($query)->{rows}}] });
     };
     is($ids->($_->[1]), "ok $_->[2]", "$label: required $_->[0] on VARCHAR compares bytes") for @text;
+    # R16: a declared type Selecto does not know (email, tenant_code) on a
+    # VARCHAR column never falls back to the collated compare.
+    for my $type (qw(email tenant_code)) {
+        is($ids->($_->[1], undef, $type), "ok $_->[2]", "$label: required $_->[0] on a VARCHAR declared $type compares bytes") for @text;
+    }
     is($ids->($_->[1]), "ok $_->[2]", "$label: required $_->[0] compares natively") for @other;
     is($ids->(undef, $x->starts_with('k', 't1')), "ok $caller_want", "$label: a caller prefix keeps the collation");
 }

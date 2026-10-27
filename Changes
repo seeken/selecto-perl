@@ -52,6 +52,16 @@ Unreleased
       their base type) and whose index uses the column's own collation and
       the default operator class; date, timestamp, float, network and other
       keys are refused (query_rule_not_evaluable).
+    - Review R3 clarification, R15, R16: a plain required filter on a
+      VARCHAR column compares bytes on DuckDB, MySQL and MariaDB even on a
+      domain with no tenant, and DuckDB no longer refuses required filters
+      on DECIMAL, DOUBLE, DATE or other non-text columns as identity
+      columns (they compare natively); a declared type Selecto does not
+      know (email, tenant_code) is decided by the stored column type. On
+      MySQL-family, any use of a TIMESTAMP column in host, trusted,
+      required or tenant scope other than a comparison or a NULL test (a
+      cast or a computed value built on it) is refused
+      (timestamp_operator), on reads and in write scope.
     - MySQL and MariaDB scope exactness (review R2 R3 R4 R5 R11 R12): a
       TEMPORARY table shadowing any relation a read names, including a
       through-association bridge inside a parenthesised join, is refused
