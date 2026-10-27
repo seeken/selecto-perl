@@ -244,16 +244,19 @@ sub stream_query {
         if blessed($statement) && $statement->{_selecto_formatters};
     my $state = $self->_require_session;
     $self->_refuse_read_temporary_shadows($statement);
-    my $stream = $self->SUPER::stream_query($statement, %options);
-    # A stored result (the DBD::MariaDB default) was produced in full by the
-    # statement, so the session is compared once now; a use_result stream is
-    # compared again at every fetch batch and at its end.
+    # No row may reach the caller before the session check that covers it
+    # (items 61, 62): a view's stored function can SET time_zone while the
+    # server produces the rows. The stream therefore always uses a stored
+    # result, produced in full by the statement, and compares the session
+    # once before any row is handed out, whatever the handle's
+    # mariadb_use_result says (a use_result result would also block the
+    # check itself until it is drained).
+    my $stream = do {
+        local $self->{dbh}{mariadb_use_result} = 0;
+        $self->SUPER::stream_query($statement, %options);
+    };
     my $ok = eval { $self->_check_session_state($state); 1 };
     unless ($ok) { my $error = $@; $stream->close; die $error }
-    if (eval { $stream->{sth}{mariadb_use_result} }) {
-        bless $stream, 'Selecto::MySQLFamily::Stream';
-        @{$stream}{qw(_selecto_adapter _selecto_state _selecto_batch _selecto_seen)} = ($self, $state, $options{fetch_size} // 500, 0);
-    }
     return $stream;
 }
 
@@ -1719,16 +1722,35 @@ sub _refuse_before_insert_triggers {
 # catalog lookup (column types, keys, engines) describes the base table or
 # view of that name. A temporary table that is itself the domain relation
 # (no base table or view of its name) is the host's own and stays readable.
-# The relations are those the generated SQL reads (every FROM or JOIN of a
-# quoted name: root, joins, bridges, members, correlated subqueries). MariaDB
-# lists the session's temporary tables in information_schema.TABLES; MySQL
-# 8.4 does not, so each base name is checked with SHOW CREATE TABLE.
+# The relations checked are a superset of those the statement names: every
+# quoted identifier in it (the generated SQL quotes every relation, so the
+# root, joins, parenthesised through-bridge joins, members, retargets,
+# collections and correlated subqueries are all among them; a column or
+# alias name is looked up too and matches no relation, or the same-named
+# relation is checked harmlessly), plus every unquoted name after FROM or
+# JOIN (a host's authored SQL). A statement without SQL fails closed.
+# MariaDB lists the session's temporary tables in information_schema.TABLES;
+# MySQL 8.4 does not, so each base name is checked with SHOW CREATE TABLE.
+sub _read_relation_names {
+    my ($sql) = @_;
+    Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
+        {reason => 'relations_unknown'}) unless defined($sql) && !ref($sql) && length($sql);
+    my %names;
+    $names{$1 =~ s/``/`/gr} = 1 while $sql =~ /`((?:``|[^`])+)`/g;
+    my $text = $sql =~ s/`(?:``|[^`])*`//gr;
+    $text =~ s/'(?:''|\\.|[^'\\])*'//g;
+    while ($text =~ /\b(?:FROM|JOIN)[\s(]+([A-Za-z_][A-Za-z0-9_\$]*)\b(?!\s*\()/gi) {
+        my $name = $1;
+        $names{$name} = 1 unless $name =~ /\A(?:SELECT|LATERAL|DUAL|JSON_TABLE|VALUES|WITH|UNNEST)\z/i;
+    }
+    return \%names;
+}
+
 sub _refuse_read_temporary_shadows {
     my ($self, $statement) = @_;
-    my $sql = blessed($statement) && $statement->can('sql') ? $statement->sql : undef;
-    return unless defined $sql;
-    my %names;
-    $names{$1 =~ s/``/`/gr} = 1 while $sql =~ /\b(?:FROM|JOIN)\s+`((?:``|[^`])+)`(?!\s*\.)/gi;
+    Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
+        {reason => 'relations_unknown'}) unless blessed($statement) && $statement->can('sql');
+    my %names = %{_read_relation_names($statement->sql)};
     return unless %names;
     my $dbh = $self->{dbh};
     my @names = sort keys %names;
@@ -2300,31 +2322,6 @@ sub execute_graph_unsafe {
 sub execute_transaction {
     my ($self, @arguments) = @_;
     return $self->_with_verified_session(1, sub { $self->SUPER::execute_transaction(@arguments) });
-}
-
-package Selecto::MySQLFamily::Stream;
-
-use parent -norequire, 'Selecto::Stream';
-
-# A use_result stream: the server evaluates rows as they are fetched, so the
-# session is compared after every fetch batch and at the end. A stream that
-# saw a change is refused from then on, whatever the session later says.
-sub next {
-    my ($self) = @_;
-    Selecto::Error->throw('query_rule_violation', 'the session changed while the stream was read',
-        {reason => 'session_state_changed'}) if $self->{_selecto_changed};
-    my $row = $self->SUPER::next;
-    my $seen = ++$self->{_selecto_seen};
-    if (!defined($row) || $seen % $self->{_selecto_batch} == 0) {
-        my $ok = eval { $self->{_selecto_adapter}->_check_session_state($self->{_selecto_state}); 1 };
-        unless ($ok) {
-            my $error = $@;
-            $self->{_selecto_changed} = 1;
-            $self->close;
-            die $error;
-        }
-    }
-    return $row;
 }
 
 1;
