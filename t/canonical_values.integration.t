@@ -177,6 +177,20 @@ my @settings = (
     ['Africa/Monrovia', 'German, DMY', 1],
 );
 
+# Selecto pins the result-affecting settings for each of its statements
+# (R35: TimeZone UTC, DateStyle ISO, MDY, extra_float_digits 3, ...), so
+# its default rows are the driver's values under those pins, whatever the
+# host session says. The host session is restored afterwards.
+sub pinned {
+    my ($handle, $work) = @_;
+    my @names = qw(TimeZone DateStyle IntervalStyle extra_float_digits);
+    my %host = map { ($_ => scalar $handle->selectrow_array("SELECT pg_catalog.current_setting('$_')")) } @names;
+    $handle->do(q{SELECT pg_catalog.set_config('TimeZone', 'UTC', false), pg_catalog.set_config('DateStyle', 'ISO, MDY', false),
+        pg_catalog.set_config('IntervalStyle', 'postgres', false), pg_catalog.set_config('extra_float_digits', '3', false)});
+    my @result = $work->();
+    $handle->do('SELECT pg_catalog.set_config(?, ?, false)', undef, $_, $host{$_}) for @names;
+    return wantarray ? @result : $result[0];
+}
 sub session {
     my ($handle, $zone, $style, $digits) = @_;
     $handle->do('SET TimeZone = ' . $handle->quote($zone));
@@ -209,14 +223,17 @@ for my $setting (@settings) {
                 "$name " . ($unformatted{$name} ? 'decoded in Perl' : 'ran formatted SQL'));
             same_rows($got, $expected, "$name: SQL canonical values equal the Perl decode"
                 . ($iso ? '' : ' (ISO in the formatted columns)'));
-            my $driver = $dbh->selectall_arrayref($statement->sql, undef, @{$statement->params});
+            my $driver = pinned($dbh, sub { $dbh->selectall_arrayref($statement->sql, undef, @{$statement->params}) });
             same_rows($raw_engine->all($query)->{rows}, $driver, "$name: default rows are the driver values");
             next unless $iso;
-            my $decoded = $dbh->selectall_arrayref($statement->sql, undef, @{$statement->params});
-            my $sth = $dbh->prepare($statement->sql);
-            $sth->execute(@{$statement->params});
-            my @types = @{$sth->{pg_type}};
-            $sth->finish;
+            my ($decoded, @types) = pinned($dbh, sub {
+                my $rows = $dbh->selectall_arrayref($statement->sql, undef, @{$statement->params});
+                my $sth = $dbh->prepare($statement->sql);
+                $sth->execute(@{$statement->params});
+                my @pg_types = @{$sth->{pg_type}};
+                $sth->finish;
+                return ($rows, @pg_types);
+            });
             $perl_engine->adapter->_decode_rows($decoded, \@types);
             same_rows($got, $decoded, "$name: equal to _decode_rows over the driver values");
         }
@@ -281,12 +298,12 @@ subtest 'streams' => sub {
     require Selecto::BoundedQuery;
     same_rows(Selecto::BoundedQuery->all($raw_engine, $query, max_rows => 1000, max_cell_bytes => 1000,
         canonical_values => 1)->{rows}, $expected, 'and BoundedQuery');
-    # Under a non-ISO DateStyle the Perl decode shows the session style, as it
-    # always has; only SQL formatting gives ISO dates.
+    # Selecto pins DateStyle to ISO for its statements (R35), so a host's
+    # German DateStyle no longer changes the dates it returns.
     $dbh->do(q{SET DateStyle = 'German, DMY'});
     my $german = $perl_engine->all($query)->{rows};
-    ok((grep { defined($_->[9]) && $_->[9] =~ /\A\d\d\.\d\d\.\d{4}/ } @$german),
-        'the default canonical dates follow a German DateStyle');
+    ok(!(grep { defined($_->[9]) && $_->[9] =~ /\A\d\d\.\d\d\.\d{4}/ } @$german),
+        'a German host DateStyle does not change the dates Selecto returns');
     same_rows($collect->($raw_engine->stream($query, canonical_values => 1)), $german,
         'a canonical stream decoded in Perl follows the session DateStyle');
     same_rows($collect->($raw_sql_engine->stream($query, canonical_values => 1)), $expected,

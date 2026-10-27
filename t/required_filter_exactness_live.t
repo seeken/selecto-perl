@@ -43,7 +43,11 @@ my @lossy = (
     ['gt id 1.4 (integer)', $x->gt('id', '1.4'), 'query_rule_not_evaluable/inexact_literal'],
     ['eq id 1 (integer, exact)', $x->eq('id', '1'), 'ok 1'],
     ['eq d 2.505 (DECIMAL(10,2))', $x->eq('d', '2.505'), 'query_rule_not_evaluable/inexact_literal'],
-    ['eq d 2.500 (DECIMAL(10,2), exact)', $x->eq('d', '2.500'), 'ok 2'],
+    ['eq d 2.50 (DECIMAL(10,2), canonical)', $x->eq('d', '2.50'), 'ok 2'],
+    ['eq d 2.500 (DECIMAL(10,2), more digits than the scale)', $x->eq('d', '2.500'), 'query_rule_not_evaluable/inexact_literal'],
+    ['eq d 1.01e0 (DECIMAL(10,2))', $x->eq('d', '1.01e0'), 'query_rule_not_evaluable/inexact_literal'],
+    ['eq id 1.0 (integer)', $x->eq('id', '1.0'), 'query_rule_not_evaluable/inexact_literal'],
+    ['eq id 01 (integer)', $x->eq('id', '01'), 'query_rule_not_evaluable/inexact_literal'],
     ['eq d 1e1 (DECIMAL(10,2))', $x->eq('d', '1e1'), 'query_rule_not_evaluable/inexact_literal'],
     ['eq f 2.5 (DOUBLE, exact)', $x->eq('f', '2.5'), 'ok 2'],
 );
@@ -128,6 +132,8 @@ for my $spec (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_PER
     is($wide->($x->eq('wide', '1234567890123456789012345678.905')), 'query_rule_not_evaluable/inexact_literal',
         "$kind: a literal with more digits than the scale is refused");
     is($wide->($x->eq('u', '18446744073709551615')), 'ok 1', "$kind: an unsigned BIGINT matches exactly");
+    is($wide->($x->eq('big', '9007199254740992.0')), 'query_rule_not_evaluable/inexact_literal',
+        "$kind: a non-canonical BIGINT literal is refused even where the server compares it exactly");
     is($wide->($x->eq('u', '-1')), 'query_rule_not_evaluable/inexact_literal', "$kind: a negative unsigned literal is refused");
     $dbh->do('DROP TABLE IF EXISTS selecto_rfe_wide');
     $dbh->disconnect;

@@ -616,7 +616,7 @@ sub _integer_text_storage {
 #   - an integer column takes a canonical integer (optional sign, digits),
 #     bound CAST(? AS SIGNED) or UNSIGNED;
 #   - DECIMAL(p,s) takes a plain decimal with at most s fractional digits
-#     (trailing zeros aside) and at most p-s integer digits, bound
+#     (written out, at most s digits) and at most p-s integer digits, bound
 #     CAST(? AS DECIMAL(p,s));
 #   - FLOAT and DOUBLE take a plain or exponent number, compared natively.
 # Anything else is refused (query_rule_not_evaluable, reason
@@ -682,16 +682,20 @@ sub _exact_numeric_marker {
     $refuse->() if !defined($value) || ref($value);
     my $text = "$value";
     if ($spec->{kind} eq 'integer') {
-        $refuse->() unless $text =~ /\A[+-]?\d{1,20}\z/a;
-        $refuse->() if $spec->{unsigned} && $text =~ /\A-/ && $text !~ /\A-0+\z/;
+        # Canonical text only (R3 clarification 2 note): no sign but a minus,
+        # no leading zeros, no fraction or exponent ('01', '+1', '1.0', '1e0').
+        $refuse->() unless $text =~ /\A(?:0|-?[1-9][0-9]{0,19})\z/a;
+        $refuse->() if $spec->{unsigned} && $text =~ /\A-/;
         push @$params, $value;
         return 'CAST(' . $self->placeholder(scalar @$params) . ($spec->{unsigned} ? ' AS UNSIGNED)' : ' AS SIGNED)');
     }
     if ($spec->{kind} eq 'decimal') {
-        my ($integer, $fraction) = $text =~ /\A[+-]?(\d*)(?:\.(\d*))?\z/a or $refuse->();
-        $refuse->() unless length($integer // '') || length($fraction // '');
-        $integer =~ s/\A0+//;
-        ($fraction //= '') =~ s/0+\z//;
+        # Canonical decimal text: an optional minus, no leading zeros, a
+        # fraction of at most the column's scale; never an exponent.
+        my ($sign, $integer, $fraction) = $text =~ /\A(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?\z/a or $refuse->();
+        $fraction //= '';
+        $refuse->() if $sign && "$integer$fraction" !~ /[1-9]/;
+        $integer = '' if $integer eq '0';
         my ($precision, $scale) = (0 + ($spec->{precision} // 0), 0 + ($spec->{scale} // 0));
         $refuse->() if !$precision || length($fraction) > $scale || length($integer) > $precision - $scale;
         push @$params, $value;
