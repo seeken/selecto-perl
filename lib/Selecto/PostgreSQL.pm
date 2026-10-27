@@ -1224,7 +1224,7 @@ sub _refuse_connection_state {
 # What a trigger does beyond this (other settings, role changes, writes to
 # unrelated tables, DDL outside the temp schema) is the schema owner's
 # responsibility, like a trigger's effects on other rows (item 56a).
-my @SESSION_SETTINGS = qw(search_path TimeZone DateStyle IntervalStyle extra_float_digits);
+my @SESSION_SETTINGS = qw(search_path TimeZone DateStyle IntervalStyle extra_float_digits timezone_abbreviations);
 my $TEMP_SCHEMA = 'pg_catalog.pg_my_temp_schema()';
 # The count of enabled deferrable triggers that can run user code at COMMIT
 # (R23, R32, R32a, R37): every user-defined one, and an internal foreign-key
@@ -1406,43 +1406,98 @@ sub _pg_reset_schemas {
     return @schemas;
 }
 
-# R38/R39 for a statement Selecto did not compile (a host's hand-built
-# Statement, run through execute_query or a stream): it carries no recorded,
-# schema-qualified relations and runs under the pinned search_path, so every
-# unqualified name its SQL places in a relation position must resolve under
-# the host's current search_path to the relation the pinned (reset) path
-# gives it: otherwise relation_ambiguous. One found only as an undeclared
-# TEMP relation is refused. Checked before the pin; a name that resolves to
-# nothing on either path is not a relation and is ignored.
-sub _pg_check_unrecorded {
+# R38, R39, R41, R42: run before every statement's pin, never cached. A
+# compiled statement names schema-qualified relations: each must still be
+# what the reset search_path resolves its name to now (a SET ROLE, or a
+# reset value changed since the statement was compiled, refuses), and the
+# host's current search_path must not name another non-temp relation by it.
+# A hand-built statement (no recorded list) fails closed: every unqualified
+# name in a relation position must resolve as above, and no undeclared TEMP
+# relation of the session may be named anywhere in its SQL.
+my $CHECK_SQL = 'SELECT r.ord, CAST(CASE WHEN r.s IS NULL THEN NULL ELSE pg_catalog.to_regclass(pg_catalog.concat(pg_catalog.quote_ident(r.s), \'.\', pg_catalog.quote_ident(r.t))) END AS pg_catalog.oid), '
+    . '(SELECT c.oid FROM pg_catalog.unnest(CAST($3 AS pg_catalog.text[])) WITH ORDINALITY AS p(name, o) '
+    . 'JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) p.name '
+    . 'JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid AND c.relname OPERATOR(pg_catalog.=) r.t ORDER BY p.o LIMIT 1), '
+    . "(SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA AND c.relname OPERATOR(pg_catalog.=) r.t), "
+    . 'CAST(pg_catalog.to_regclass(pg_catalog.quote_ident(r.t)) AS pg_catalog.oid), '
+    . "(r.s IS NOT NULL AND pg_catalog.starts_with(r.s, 'pg_temp'))::pg_catalog.int4 "
+    . 'FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) WITH ORDINALITY AS r(s, t, ord) ORDER BY r.ord';
+my $TEMP_NAMES_SQL = "SELECT CAST(c.relname AS pg_catalog.text) FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA";
+my $IDENT = q{(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_\$]*)};
+sub _unquote_identifier {
+    my ($text) = @_;
+    if ($text =~ /\A"((?:[^"]|"")+)"\z/) { (my $name = $1) =~ s/""/"/g; return $name }
+    return lc $text;
+}
+
+sub _pg_check_relations {
     my ($self, $source) = @_;
-    return if blessed($source) && $source->can('relations') && ref($source->relations) eq 'ARRAY';
-    return if ref($source) eq 'HASH' && ref($source->{relations}) eq 'ARRAY';
-    my @names = grep { !/\A(?:"(?:[^"]|"")+"|[^".]+)\./ } @{_pg_statement_relations($source)};
-    return unless @names;
-    local $self->{_selecto_relation_schemas} = {};
-    my @schemas = $self->_pg_reset_schemas;
-    for my $quoted (@names) {
-        my $bare = $quoted;
-        if ($bare =~ s/\A"((?:[^"]|"")+)"\z/$1/) {
-            $bare =~ s/""/"/g;
-        } else {
-            $bare = lc $bare;
+    my $recorded = blessed($source) && $source->can('relations') ? $source->relations
+        : ref($source) eq 'HASH' ? $source->{relations} : undef;
+    my (@schemas, @tables);
+    if (ref($recorded) eq 'ARRAY') {
+        for my $name (@$recorded) {
+            next unless defined($name) && !ref($name);
+            if ($name =~ /\A($IDENT)\.($IDENT)\z/) {
+                push @schemas, _unquote_identifier($1);
+                push @tables, _unquote_identifier($2);
+            } else {
+                push @schemas, undef;
+                push @tables, _unquote_identifier($name);
+            }
         }
-        my ($pinned, $temp, $current);
-        my $ok = eval {
-            ($pinned, $temp, $current) = $self->{dbh}->selectrow_array($QUALIFY_SQL, undef, \@schemas, $bare, $quoted);
-            1;
-        };
-        die $self->normalize_error($@) unless $ok;
-        Selecto::Error->throw('query_rule_not_evaluable',
-            "the host's search_path resolves the relation differently from Selecto's pinned resolution",
-            {reason => 'relation_ambiguous', relation => $bare})
-            if defined($current) && defined($pinned) && "$current" ne "$pinned" && !(defined($temp) && "$current" eq "$temp");
-        Selecto::Error->throw('query_rule_not_evaluable',
-            'the relation exists only as a temporary relation of the session, which the adapter does not declare',
-            {reason => 'relation_unresolved', relation => $bare})
-            if !defined($pinned) && defined($temp) && !$self->temporary_relations;
+    } else {
+        my $sql = blessed($source) && $source->can('sql') ? $source->sql : ref($source) eq 'HASH' ? $source->{sql} : $source;
+        for my $name (@{_pg_statement_relations($source)}) {
+            next if $name =~ /\A$IDENT\./;
+            push @schemas, undef;
+            push @tables, _unquote_identifier($name);
+        }
+        # R42: no undeclared TEMP relation may be named anywhere in it.
+        unless ($self->temporary_relations) {
+            my $temps;
+            my $ok = eval { $temps = $self->{dbh}->selectcol_arrayref($TEMP_NAMES_SQL); 1 };
+            die $self->normalize_error($@) unless $ok;
+            for my $temp (@{$temps // []}) {
+                (my $quoted = $temp) =~ s/"/""/g;
+                my $named = $sql =~ /"\Q$quoted\E"/ || ($temp =~ /\A[a-z_][a-z0-9_\$]*\z/ && $sql =~ /(?<![A-Za-z0-9_\$"])\Q$temp\E(?![A-Za-z0-9_\$"])/i);
+                Selecto::Error->throw('query_rule_not_evaluable',
+                    'a hand-built statement names a temporary relation of the session, which the adapter does not declare',
+                    {reason => 'temporary_shadow', relation => $temp}) if $named;
+            }
+        }
+    }
+    return unless @tables;
+    local $self->{_selecto_relation_schemas} = {};
+    my @reset = $self->_pg_reset_schemas;
+    my $rows;
+    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($CHECK_SQL, undef, \@schemas, \@tables, \@reset); 1 };
+    die $self->normalize_error($@) unless $ok && ref($rows) eq 'ARRAY';
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable', $_[1], {reason => $_[0], relation => $_[2]});
+    };
+    for my $row (@$rows) {
+        my ($ord, $fixed, $pinned, $temp, $current, $temp_schema) = @$row;
+        my $table = $tables[$ord - 1];
+        if (defined $schemas[$ord - 1]) {
+            # A compiled relation: still the pinned resolution (or a declared
+            # TEMP relation with no reset-path namesake).
+            if ($temp_schema) {
+                $refuse->('relation_unresolved', 'the relation exists only as a temporary relation of the session, which the adapter does not declare', $table)
+                    unless $self->temporary_relations && !defined($pinned) && defined($temp) && defined($fixed) && "$fixed" eq "$temp";
+            } else {
+                $refuse->('relation_ambiguous', 'the relation no longer resolves where the statement was compiled to read it', $table)
+                    unless defined($fixed) && defined($pinned) && "$fixed" eq "$pinned";
+            }
+            my $target = $fixed;
+            $refuse->('relation_ambiguous', "the host's search_path resolves the relation differently from Selecto's pinned resolution", $table)
+                if defined($current) && defined($target) && "$current" ne "$target" && !(defined($temp) && "$current" eq "$temp");
+        } else {
+            $refuse->('relation_ambiguous', "the host's search_path resolves the relation differently from Selecto's pinned resolution", $table)
+                if defined($current) && defined($pinned) && "$current" ne "$pinned" && !(defined($temp) && "$current" eq "$temp");
+            $refuse->('relation_unresolved', 'the relation exists only as a temporary relation of the session, which the adapter does not declare', $table)
+                if !defined($pinned) && defined($temp) && !$self->temporary_relations;
+        }
     }
     return;
 }
@@ -1501,7 +1556,7 @@ sub _relation_sql {
 # rollback reverts them too); on an idle autocommit handle a read sets them
 # for the session and restores them right after.
 my @PINNED_SETTINGS = map { [$_ => undef] }
-    qw(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings);
+    qw(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings timezone_abbreviations);
 sub _pg_pin_search_path {
     my ($self, $session) = @_;
     my $local = $session ? 'false' : 'true';
@@ -1612,8 +1667,10 @@ sub _session_changed {
 sub _write_session_open {
     my ($self, $command, $compiled) = @_;
     return undef unless $self->_pg_session_checked;
-    # The write runs inside its own transaction or savepoint: pin
-    # search_path for it first (R30), then snapshot under the pin.
+    # The write runs inside its own transaction or savepoint: check its
+    # relations (R41), pin search_path for it (R30), then snapshot under the
+    # pin.
+    $self->_pg_check_relations(ref($compiled) eq 'HASH' ? $compiled : undef) if ref($compiled) eq 'HASH';
     my $pin = $self->_pg_pin_search_path;
     my $state = $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled : undef);
     $state->{pin} = $pin;
@@ -1678,7 +1735,7 @@ sub _guarded_read {
     }
     my ($pin, $before, $result);
     my $ok = eval {
-        $self->_pg_check_unrecorded($source);
+        $self->_pg_check_relations($source);
         $pin = $self->_pg_pin_search_path(!$savepoint);
         $before = $self->_pg_admit_session($source);
         $result = $work->();

@@ -31,6 +31,16 @@ Unreleased
       writes. Deferrable internal rechecks count too unless they are
       foreign-key triggers or unique/exclusion rechecks whose operator
       classes and operators are all pg_catalog's (R32).
+    - PostgreSQL per-statement relation checks (R41, R42): before every
+      statement's pin, each recorded relation must still be what the reset
+      search_path resolves its name to (a SET ROLE or changed reset value
+      since compile refuses a long-lived statement, relation_ambiguous), and
+      the host's search_path must not name another non-temp relation. A
+      hand-built statement fails closed: its unqualified names get the same
+      check, and naming an undeclared TEMP relation anywhere in its SQL is
+      refused. Nothing is cached across statements. timezone_abbreviations
+      is pinned and snapshotted too (R35); unique rechecks over range or
+      composite keys count as user code (R37b).
     - PostgreSQL relation resolution (R36-R39). Behaviour change: PostgreSQL
       itself parses the reset search_path (applied with set_config(...,
       true), read back with current_schemas(false)). A relation that the
