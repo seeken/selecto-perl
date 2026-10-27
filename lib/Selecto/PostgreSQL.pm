@@ -1448,10 +1448,21 @@ sub _pg_check_relations {
         }
     } else {
         my $sql = blessed($source) && $source->can('sql') ? $source->sql : ref($source) eq 'HASH' ? $source->{sql} : $source;
-        for my $name (@{_pg_statement_relations($source)}) {
-            next if $name =~ /\A$IDENT\./;
+        # Every identifier the SQL holds is checked, whatever its position
+        # (comma FROM lists, USING lists, subqueries: R42); one that names no
+        # relation on either path is ignored. A name written qualified binds
+        # its schema and is not looked up by the search path.
+        my %seen;
+        my $scan = $sql;
+        $scan =~ s/'(?:[^']|'')*'//g;
+        while ($scan =~ /((?:$IDENT\s*\.\s*)*)($IDENT)/g) {
+            my ($qualifier, $name) = ($1, $2);
+            next if length $qualifier;
+            next if pos($scan) < length($scan) && substr($scan, pos($scan)) =~ /\A\s*\./;
+            my $bare = _unquote_identifier($name);
+            next if $seen{$bare}++;
             push @schemas, undef;
-            push @tables, _unquote_identifier($name);
+            push @tables, $bare;
         }
         # R42: no undeclared TEMP relation may be named anywhere in it.
         unless ($self->temporary_relations) {
