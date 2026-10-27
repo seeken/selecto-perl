@@ -52,6 +52,25 @@ Unreleased
       their base type) and whose index uses the column's own collation and
       the default operator class; date, timestamp, float, network and other
       keys are refused (query_rule_not_evaluable).
+    - MySQL and MariaDB scope exactness (review R2 R3 R4 R5 R11 R12): a
+      TEMPORARY table shadowing any relation a read names, including a
+      through-association bridge inside a parenthesised join, is refused
+      (every quoted name in the SQL is checked; a statement without SQL
+      fails closed). Host, trusted, required and tenant ranges, BETWEEN and
+      prefix/substring/suffix matches on a text column compare utf8mb4
+      bytes (case-insensitive matches there are refused, inexact_text); a
+      text match on a TIMESTAMP scope column is refused
+      (timestamp_operator); a zero date satisfies no TIMESTAMP scope
+      compare. Caller write predicates on TIMESTAMP columns compile as the
+      server compares them again (the epoch form and its strict literal
+      rule apply to scope only). Streams on a mariadb_use_result handle
+      work again: the statement always runs as a stored result and the
+      session is compared before any row is handed out. A one-shot SET
+      TRANSACTION left pending before a write is consumed (documented).
+    - DuckDB: prefix, substring and suffix matches in host, trusted or
+      required scope on an identity column match the VARCHAR's bytes
+      (COLLATE posix) whatever the column or session collation; case-
+      insensitive matches there are refused (inexact_text).
     - MySQL and MariaDB session and transaction state: every write and read
       compares @@SESSION.time_zone and sql_mode with the verified session
       after each statement (streams per batch); a change is restored and

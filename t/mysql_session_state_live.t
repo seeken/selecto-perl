@@ -119,11 +119,11 @@ for my $backend (@backends) {
         $dbh->do('SET @selecto_arm = 0');
         is($session->(), $verified, "$name $kind: and the session ends verified");
     }
-    like($reader->compile($query)->sql, qr/UNIX_TIMESTAMP\(`s0`\.`ts`\) < CAST\(\? AS DECIMAL/,
+    like($reader->compile($query)->sql, qr/NULLIF\(UNIX_TIMESTAMP\(`s0`\.`ts`\), 0\) < CAST\(\? AS DECIMAL/,
         "$name: the host TIMESTAMP compare is zone independent");
     like($engine->adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_session_items',
         assignments => {note => 'x'}, predicate => $x->eq('id', 1), scope_predicate => $x->lt('ts', '2024-01-01 00:00:00')))->{sql},
-        qr/UNIX_TIMESTAMP\(`ts`\) < CAST\(\? AS DECIMAL/, "$name: so is a write's TIMESTAMP scope");
+        qr/NULLIF\(UNIX_TIMESTAMP\(`ts`\), 0\) < CAST\(\? AS DECIMAL/, "$name: so is a write's TIMESTAMP scope");
     # DATETIME is zone independent and compiles as before; caller filters keep the server's compare.
     $dbh->do('ALTER TABLE selecto_session_base MODIFY ts DATETIME NULL');
     my $plain = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)),

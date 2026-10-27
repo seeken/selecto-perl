@@ -490,6 +490,10 @@ sub _compile_authored_condition {
     return $self->_compile_expression($domain, $expression, $params);
 }
 
+my $TEXT_RANGE_KINDS = qr/\A(?:gt|gte|lt|lte|between|starts_with|text_contains|ends_with)(?:_ci)?\z/;
+my %RANGE_SQL = (gt => '>', gte => '>=', lt => '<', lte => '<=');
+my %RANGE_FLIP = (gt => 'lt', gte => 'lte', lt => 'gt', lte => 'gte');
+
 # A read predicate (eq or IN) on a text tenant or site column: the root's,
 # a joined relation's, a member's or a retarget hop's, wherever it came from
 # (engine tenant, required predicate, carried tenant set, caller filter), in
@@ -498,6 +502,7 @@ sub _identity_predicate_sql {
     my ($self, $domain, $expression, $params) = @_;
     return undef unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $kind = $expression->kind;
+    return $self->_identity_text_range_sql($domain, $expression, $params) if $kind =~ $TEXT_RANGE_KINDS;
     return undef unless $kind eq 'eq' || $kind eq 'ne' || $kind eq 'in';
     if ($kind eq 'ne') {
         # <> on an identity column is the negated exact equality.
@@ -544,6 +549,69 @@ sub _identity_predicate_sql {
         $column_params);
 }
 
+# Ranges, BETWEEN and the prefix, substring and suffix matches of a host,
+# trusted, required or tenant predicate on a text identity column (brief
+# item R3) compare the utf8mb4 bytes, as PostgreSQL's oracle does for the
+# fixture ('t1' never matches 'T1', 't1 ' or 'tı' by collation): a
+# collated range or LIKE would fold case, accents and trailing spaces. An
+# undeclared column compares plainly only when it holds no text (binary
+# collation). The case-insensitive matches cannot be made exact and are
+# refused there. Ordinary caller filters keep the server's comparison.
+
+sub _identity_text_range_sql {
+    my ($self, $domain, $expression, $params) = @_;
+    my $kind = $expression->kind;
+    return undef if $kind =~ /\A(?:gt|gte|lt|lte|between)_ci\z/;
+    my $address = refaddr($expression);
+    my $host = $self->{_selecto_in_host}
+        || ($self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{$address})
+        || ($self->{_selecto_host_nodes} && $self->{_selecto_host_nodes}{$address});
+    return undef unless $host;
+    local $self->{_selecto_host_identity} = 1;
+    my $is = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq $_[1] };
+    my ($operand, @rest) = @{$expression->arguments};
+    if ($kind =~ /\A(?:gt|gte|lt|lte)\z/ && !$is->($operand, 'field') && $is->($rest[0], 'field')) {
+        ($operand, @rest) = ($rest[0], $operand);
+        $kind = $RANGE_FLIP{$kind};
+    }
+    my $exact = $self->_identity_operand_field($domain, $operand) or return undef;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a case-insensitive match on a tenant or scope text column cannot be compared exactly',
+        {reason => 'inexact_text'}) if $kind =~ /_ci\z/;
+    my @values = map {
+        $is->($_, 'literal') && defined($_->arguments->[0]) && !ref($_->arguments->[0])
+            ? $_->arguments->[0] : _refuse_inexact_identity()
+    } @rest;
+    _refuse_inexact_identity() unless @values;
+    my @terms;
+    if ($kind eq 'between') {
+        @terms = (['>=', $values[0]], ['<=', $values[1]]);
+    } elsif ($RANGE_SQL{$kind}) {
+        @terms = ([$RANGE_SQL{$kind}, $values[0]]);
+    } else {
+        my $text = $self->_escape_like("$values[0]");
+        @terms = (['LIKE', $kind eq 'text_contains' ? "%$text%" : $kind eq 'ends_with' ? "%$text" : "$text%"]);
+    }
+    # The operand is compiled once per paste, so its own parameters (a
+    # computed field's literals) repeat in SQL-text order.
+    my $form = sub {
+        my ($bytes) = @_;
+        return join(' AND ', map {
+            my ($operator, $value) = @$_;
+            my $column = $self->_compile_expression($domain, $operand, $params);
+            push @$params, "$value";
+            my $marker = $self->placeholder(scalar @$params);
+            my $escape = $operator eq 'LIKE' ? q{ ESCAPE '!'} : '';
+            $bytes ? $self->_identity_bytes_sql($column) . " $operator CAST($marker AS BINARY)$escape"
+                : "$column $operator $marker$escape";
+        } @terms);
+    };
+    return '(' . $form->(1) . ')' if $exact == 1;
+    my $column = $self->_compile_expression($domain, $operand, $params);
+    my $plain = $form->(0);
+    return "(CASE WHEN COLLATION($column) = 'binary' THEN $plain ELSE " . $form->(1) . ' END)';
+}
+
 # Item 62a: a stored function can switch time_zone and back within one MySQL
 # statement, so a TIMESTAMP compared with a datetime literal is evaluated
 # under whatever zone is current for that row, and no before/after check
@@ -557,7 +625,8 @@ sub _timestamp_scope_sql {
     my ($self, $domain, $expression, $params) = @_;
     return undef unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $kind = $expression->kind;
-    return undef unless $kind =~ /\A(?:eq|ne|gt|gte|lt|lte|in|between)\z/;
+    my $text = $kind =~ /\A(?:starts_with|text_contains|ends_with)(?:_ci)?\z/ ? 1 : 0;
+    return undef unless $text || $kind =~ /\A(?:eq|ne|gt|gte|lt|lte|in|between)\z/;
     my $address = refaddr($expression);
     return undef unless $self->{_selecto_in_host}
         || ($self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{$address})
@@ -581,6 +650,11 @@ sub _timestamp_scope_sql {
     return undef if $association && $association->join_mode eq 'star_dimension';
     my $table = $association ? $association->table : $domain->table;
     return undef unless $self->_timestamp_column($table, $resolved->{field}, $resolved->{type});
+    # A prefix, substring or suffix match reads the TIMESTAMP's text in the
+    # session zone, which a function can switch mid-statement (item R4).
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a TIMESTAMP scope column can only be compared with =, <>, ranges or IN',
+        {reason => 'timestamp_operator', field => "$path"}) if $text;
     my @values = $kind eq 'in' ? (ref($rest[0]) eq 'ARRAY' ? @{$rest[0]} : ())
         : map { $is->($_, 'literal') ? $_->arguments->[0] : return undef } @rest;
     return undef unless @values;
@@ -657,7 +731,11 @@ sub _epoch_compare_sql {
         push @$params, _timestamp_epoch($_);
         'CAST(' . $self->placeholder(scalar @$params) . ' AS DECIMAL(24,6))'
     } @$values;
-    my $left = "UNIX_TIMESTAMP($column)";
+    # A zero date ('0000-00-00 00:00:00', UNIX_TIMESTAMP 0; no valid
+    # TIMESTAMP has epoch 0) compares like NULL under every operator and any
+    # negation: the native comparisons disagree about it between MySQL and
+    # MariaDB, and PostgreSQL has no such value (item R5).
+    my $left = "NULLIF(UNIX_TIMESTAMP($column), 0)";
     return "$left IN (" . join(', ', @markers) . ')' if $kind eq 'in';
     return "$left BETWEEN $markers[0] AND $markers[1]" if $kind eq 'between';
     return "$left " . {eq => '=', ne => '<>', gt => '>', gte => '>=', lt => '<', lte => '<='}->{$kind} . " $markers[0]";
@@ -705,10 +783,90 @@ sub _write_identity_columns {
         grep { defined($_) && !ref($_) && Selecto::SQL::_identity_text_type($types->{$_}) } @$fields, @host};
 }
 
+# Every expression node of a write's scope: its scope predicate (engine
+# tenant, writes.scope, host scope, the required predicate), its query
+# enforcement and its post-image scope. Only these get the scope-side
+# compare forms (epoch TIMESTAMP compares with their strict literals, exact
+# text ranges); the caller's own predicate keeps the server's semantics
+# (item 55, R12).
+sub _write_scope_nodes {
+    my ($command) = @_;
+    return {} unless blessed($command) && $command->can('scope_predicate');
+    my $metadata = $command->can('metadata') ? $command->metadata : {};
+    return {map { (refaddr($_) => 1) } Selecto::SQL::_expression_nodes($command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
+        ref($metadata) eq 'HASH' ? $metadata->{__selecto_post_image_scope} : undef)};
+}
+
+# A scope range, BETWEEN or text match in a write predicate on a text
+# column compares bytes, as reads do (_identity_text_range_sql); on a
+# TIMESTAMP column a text match is refused (R4).
+sub _write_text_range_sql {
+    my ($self, $expression, $params, $timestamps) = @_;
+    my $kind = $expression->kind;
+    my ($left, @rest) = @{$expression->arguments};
+    my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
+        ? $left->arguments->[0] : undef;
+    return undef unless defined($field) && !ref($field);
+    my $text = $kind =~ /\A(?:starts_with|text_contains|ends_with)/ ? 1 : 0;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a TIMESTAMP scope column can only be compared with =, <>, ranges or IN',
+        {reason => 'timestamp_operator', field => "$field"}) if $text && $timestamps && $timestamps->{lc $field};
+    # A TIMESTAMP range compares by epoch (below).
+    return undef if $timestamps && $timestamps->{lc $field};
+    my $command_types = $self->{_selecto_write_types} // {};
+    my $exact = Selecto::SQL::_identity_text_type($command_types->{$field});
+    return undef unless $exact;
+    return undef if $kind =~ /\A(?:gt|gte|lt|lte|between)_ci\z/;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a case-insensitive match on a tenant or scope text column cannot be compared exactly',
+        {reason => 'inexact_text'}) if $kind =~ /_ci\z/;
+    my @values = map {
+        blessed($_) && $_->isa('Selecto::Expression') && $_->kind eq 'literal'
+            && defined($_->arguments->[0]) && !ref($_->arguments->[0]) ? $_->arguments->[0] : _refuse_inexact_identity()
+    } @rest;
+    _refuse_inexact_identity() unless @values;
+    my @terms = $kind eq 'between' ? (['>=', $values[0]], ['<=', $values[1]])
+        : $RANGE_SQL{$kind} ? ([$RANGE_SQL{$kind}, $values[0]])
+        : do {
+            my $escaped = $self->_escape_like("$values[0]");
+            (['LIKE', $kind eq 'text_contains' ? "%$escaped%" : $kind eq 'ends_with' ? "%$escaped" : "$escaped%"]);
+        };
+    my $column = $self->quote_identifier(Selecto::Identifier::checked($field));
+    my $form = sub {
+        my ($bytes) = @_;
+        return join(' AND ', map {
+            my ($operator, $value) = @$_;
+            push @$params, "$value";
+            my $marker = $self->placeholder(scalar @$params);
+            my $escape = $operator eq 'LIKE' ? q{ ESCAPE '!'} : '';
+            $bytes ? $self->_identity_bytes_sql($column) . " $operator CAST($marker AS BINARY)$escape"
+                : "$column $operator $marker$escape";
+        } @terms);
+    };
+    return '(' . $form->(1) . ')' if $exact == 1;
+    my $plain = $form->(0);
+    return "(CASE WHEN COLLATION($column) = 'binary' THEN $plain ELSE " . $form->(1) . ' END)';
+}
+
+sub _write_field_types {
+    my ($command) = @_;
+    my $metadata = blessed($command) && $command->can('metadata') ? $command->metadata : {};
+    return ref($metadata->{__selecto_insert_types}) eq 'HASH' ? $metadata->{__selecto_insert_types}
+        : ref($metadata->{field_types}) eq 'HASH' ? $metadata->{field_types} : {};
+}
+
 sub _compile_write_predicate {
     my ($self, $expression, $params) = @_;
     my $timestamps = $self->{_selecto_write_timestamps};
-    if ($timestamps && %$timestamps && blessed($expression) && $expression->isa('Selecto::Expression')
+    my $scoped = blessed($expression) && $self->{_selecto_write_scope_nodes}
+        && $self->{_selecto_write_scope_nodes}{refaddr($expression)} ? 1 : 0;
+    if ($scoped && blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind =~ $TEXT_RANGE_KINDS) {
+        my $sql = $self->_write_text_range_sql($expression, $params, $timestamps);
+        return $sql if defined $sql;
+    }
+    if ($scoped && $timestamps && %$timestamps && blessed($expression) && $expression->isa('Selecto::Expression')
         && $expression->kind =~ /\A(?:eq|ne|gt|gte|lt|lte|in)\z/) {
         my ($left, $right) = @{$expression->arguments};
         my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
@@ -1312,6 +1470,8 @@ sub _compile_write {
     _refuse_scoped_upsert($command) if $command->operation eq 'upsert';
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
     local $self->{_selecto_write_timestamps} = $self->_write_timestamp_columns($command);
+    local $self->{_selecto_write_scope_nodes} = _write_scope_nodes($command);
+    local $self->{_selecto_write_types} = _write_field_types($command);
     local $self->{_selecto_bind_copies} = [];
     my $compiled = $self->SUPER::_compile_write($command);
     # The logical parameter sequence: the bound values with each exact
@@ -1539,6 +1699,8 @@ sub _execute_compiled_write_unchecked {
     my ($self, $command, $compiled) = @_;
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
     local $self->{_selecto_write_timestamps} = $self->_write_timestamp_columns($command);
+    local $self->{_selecto_write_scope_nodes} = _write_scope_nodes($command);
+    local $self->{_selecto_write_types} = _write_field_types($command);
     my $operation = $command->operation;
     # Every write may be refused after its statement (cardinality, row
     # ceiling, post-image, RETURNING and stored-row checks, an AFTER trigger
@@ -2177,8 +2339,13 @@ sub _related_collection_text_sql {
 # nothing. Hosts open transactions with begin_work (the adapter then runs
 # the write in a savepoint). An open transaction is detected on both
 # servers by SET TRANSACTION, which the server refuses (1568) while one is
-# in progress; it names the session's own access mode, so the next
-# transaction is unchanged.
+# in progress; it names the session's own access mode. Outside a
+# transaction it also discards a one-shot SET TRANSACTION (isolation level
+# or access mode for the next transaction) that the host left pending, and
+# so does the adapter's own transaction, which a pending one-shot setting
+# would otherwise apply to: hosts that need particular characteristics set
+# them inside their own begin_work transaction (or with SET SESSION
+# TRANSACTION), never as a one-shot setting before a Selecto write.
 my %UTC_ZONES = map { ($_ => 1) } ('UTC', '+00:00', 'Etc/UTC');
 
 sub _require_session {
@@ -2353,6 +2520,43 @@ Writes need InnoDB tables and a connection with C<mariadb_client_found_rows>
 on (the DBD::MariaDB default, which this module cannot read back from a
 handle): a DSN that sets it to 0 is refused for updates and upserts, but one
 passed as a connect attribute is a host requirement.
+
+Scope comparisons (the engine tenant, writes.scope, host and trusted scope,
+the required predicate, query enforcement, and association and bridge
+C<where> pins) are exact where the server's own comparison is not:
+
+=over 4
+
+=item *
+
+On a text column, C<=>, C<< <> >>, C<IN>, ranges, C<BETWEEN> and prefix,
+substring and suffix matches compare the utf8mb4 bytes, so C<t1> never
+matches C<T1>, C<tE<0x131>> or (except as a prefix) C<'t1 '>. The
+case-insensitive matches are refused there (C<query_rule_not_evaluable>,
+reason C<inexact_text>).
+
+=item *
+
+On a C<TIMESTAMP> column, comparisons use C<UNIX_TIMESTAMP(col)> against the
+literal's UTC epoch, so a function that switches C<time_zone> during a
+statement cannot widen them. The literal must be C<YYYY-MM-DD>, optionally
+with C< HH:MM[:SS[.ffffff]]> (or C<T>) and C<Z> or C<+HH:MM>; any other
+spelling, a number or a NULL comparison is refused (reason
+C<timestamp_literal>), and a prefix, substring or suffix match is refused
+(reason C<timestamp_operator>). A zero date (C<0000-00-00 00:00:00>)
+satisfies no scope comparison, like NULL. C<DATETIME> columns compare as the
+server does.
+
+=back
+
+The caller's own filters and write predicates keep the server's comparison:
+its collation, its literal forms and its zero-date handling.
+
+A one-shot C<SET TRANSACTION> (without C<SESSION>) that a host leaves
+pending before a write on an idle handle is consumed by the write: by the
+open-transaction probe, and otherwise by the adapter's own transaction, to
+which it would apply. Set transaction characteristics inside the host's own
+C<begin_work> transaction, or with C<SET SESSION TRANSACTION>.
 
 This module is an internal part of the L<Selecto> distribution. Its interface
 may change without notice; applications should use the public entry points
