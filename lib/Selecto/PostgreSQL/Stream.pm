@@ -44,7 +44,7 @@ sub new {
         }
         # Temp shadows refused and the session snapshot taken before the
         # cursor; every FETCH is compared with it (items 56, 61).
-        $self->{session} = $adapter->_pg_admit_session($args{statement}->sql)
+        $self->{session} = $adapter->_pg_admit_session($args{statement})
             if $adapter->_pg_session_checked;
         my $declaration = $dbh->prepare('DECLARE ' . $name . ' NO SCROLL CURSOR WITHOUT HOLD FOR '
             . $adapter->_query_transport_sql($args{statement}));
