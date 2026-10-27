@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 Unreleased
+    - DuckDB: a column deciding tenant, trusted or host-scope identity (the
+      engine tenant, writes.scope tenants, required tenant pins, host scope
+      and trusted predicates, association and bridge where pins, scope keys,
+      tenant pairs and member correlations) must be an integer, VARCHAR,
+      UUID or BOOLEAN column, checked by the catalog type the statement
+      binds; anything else is refused (query_rule_not_evaluable,
+      identity_column_type). VARCHAR compares by bytes, so a COLLATE NOCASE
+      column or default_collation 'nocase' no longer let tenant t1 read or
+      delete T1's rows; an integer column takes only canonical integer
+      literals, so tenant '1.4' or '1e0' no longer matched tenant 1. Ranges
+      in that scope compare exactly by bytes or value or are refused.
+      Ordinary caller filters keep DuckDB's collation.
     - Align native certification reads with declared tenant joins and hidden,
       filterable, sortable and groupable field policy. Public query pages
       share a one-row lookahead and has_more, including bounded JSON reads.

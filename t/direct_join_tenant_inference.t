@@ -167,8 +167,11 @@ subtest 'six native dialect compilers retain inferred joins and bound parameters
             'account.name','account.region.name')->where(Selecto::Expression->eq('id', 1)));
         my $sql = $statement->sql;
         $sql =~ s/[\"`\[\]]//g;
-        like($sql, qr/s0\.tenant_id = j_account\.organization_id/, "$backend direct join has column equality");
-        like($sql, qr/j_account\.organization_id = j_account__region\.company_id/, "$backend nested join uses immediate parent tenancy");
+        # DuckDB compares identity pairs by catalog type (exact value or bytes).
+        my $pair = sub { $backend eq 'duckdb'
+            ? qr/TRY_CAST\($_[0] AS DECIMAL\(38,0\)\) = TRY_CAST\($_[1] AS DECIMAL\(38,0\)\)/ : qr/$_[0] = $_[1]/ };
+        like($sql, $pair->('s0\.tenant_id', 'j_account\.organization_id'), "$backend direct join has column equality");
+        like($sql, $pair->('j_account\.organization_id', 'j_account__region\.company_id'), "$backend nested join uses immediate parent tenancy");
         is_deeply($statement->params, [99,7,1], "$backend inferred keys add no binds or reorder native binds");
     }
 };

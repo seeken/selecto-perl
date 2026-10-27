@@ -3012,7 +3012,7 @@ sub _compile_write {
                 my $types = _declared_admission_types($command);
                 my $truth = eval {
                     Selecto::QueryEnforcement::evaluate($insert_predicate, $self->_insert_candidate($assignments),
-                        $types // {}, metadata => 'unverified', backend => $self->_exact_identity_compare ? 'mysql_family' : 'other');
+                        $types // {}, metadata => 'unverified', backend => $self->name =~ /\A(?:mysql|mariadb)\z/ ? 'mysql_family' : 'other');
                 };
                 unless (defined $truth) {
                     my $error = $@;
