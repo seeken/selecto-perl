@@ -335,7 +335,8 @@ sub _identity_value_term {
     my $varchar_sql = !$self->{_selecto_declared_integer}
         ? $self->_identity_bytes_sql($column) . ' = ' . $self->_identity_bytes_sql($marker)
         : defined($integer) ? $self->_identity_bytes_sql($column) . " = encode('$integer')" : $REFUSED_NUMBER;
-    return "(CASE WHEN $type = 'VARCHAR' THEN $varchar_sql ELSE $column = $marker END)" if $self->{_selecto_required_only};
+    return "(CASE WHEN $type = 'VARCHAR' THEN $varchar_sql ELSE " . $self->_required_native_sql($column, '=', $text, $marker) . ' END)'
+        if $self->{_selecto_required_only};
     my $integer_sql = defined($integer)
         ? "TRY_CAST($column AS DECIMAL(38,0)) = CAST('$integer' AS DECIMAL(38,0))" : $REFUSED_NUMBER;
     my $boolean_sql = defined($boolean) ? "TRY_CAST($column AS BOOLEAN) = $boolean" : $REFUSED_BOOLEAN;
@@ -432,6 +433,52 @@ sub _known_cast_type {
     return lc("$type") =~ /\A(?:date|time|datetime|timestamp|naive_datetime|utc_datetime|boolean|bool)\z/ ? 1 : 0;
 }
 
+# A plain required filter on a non-VARCHAR column compares natively (R3
+# clarification 2), but DuckDB casts the bound text to the column's type with
+# rounding or truncation: '1.4' and '1e0' equal INTEGER 1, '1.005' equals
+# DECIMAL(10,2) 1.01, '2024-06-02 10:00' equals DATE '2024-06-02'. The
+# native compare runs only for a literal the stored type holds exactly;
+# any other literal is refused (query_rule_not_evaluable, reason
+# inexact_literal), decided per row type in the statement so it follows
+# the column the statement binds:
+#   - integer types: a canonical integer ('-12'; never '01', '+1', '1.0');
+#   - DECIMAL(p,s): a plain decimal with at most s fractional digits
+#     (trailing zeros aside) and at most p - s integer digits;
+#   - DOUBLE, FLOAT: a plain or exponent number (text to binary floating
+#     point is correctly rounded, as PostgreSQL does it);
+#   - DATE: a value with no time of day beyond midnight;
+#   - TIMESTAMP: a value with no digits beyond microseconds;
+#   - any other type (BOOLEAN, UUID, TIME, ...) casts without loss.
+my $REFUSED_LITERAL = _refusal_sql('inexact_literal', 'this literal is not exactly representable in the column type');
+sub _required_native_sql {
+    my ($self, $column, $operator, $text, $marker) = @_;
+    my $type = "typeof($column)";
+    my $native = "$column $operator $marker";
+    $text = defined($text) ? "$text" : undef;
+    my $integer_sql = defined($text) && $text =~ /\A-?(?:0|[1-9][0-9]*)\z/ ? $native : $REFUSED_LITERAL;
+    my $float_sql = defined($text) && $text =~ /\A-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/ ? $native : $REFUSED_LITERAL;
+    my $decimal_sql = $REFUSED_LITERAL;
+    if (defined($text) && $text =~ /\A-?(0|[1-9][0-9]*)(?:\.([0-9]+))?\z/) {
+        my ($whole, $fraction) = ($1, $2 // '');
+        $fraction =~ s/0+\z//;
+        my ($digits, $scale) = ($whole eq '0' ? 0 : length($whole), length($fraction));
+        my $declared_scale = "CAST(regexp_extract($type, ',([0-9]+)\\)', 1) AS INTEGER)";
+        my $declared_precision = "CAST(regexp_extract($type, '\\(([0-9]+),', 1) AS INTEGER)";
+        $decimal_sql = "(CASE WHEN $declared_scale >= $scale AND $declared_precision - $declared_scale >= $digits"
+            . " THEN $native ELSE $REFUSED_LITERAL END)";
+    }
+    my $date_sql = "(CASE WHEN TRY_CAST(CAST($marker AS VARCHAR) AS TIMESTAMP_NS) IS NOT DISTINCT FROM"
+        . " CAST(TRY_CAST(CAST($marker AS VARCHAR) AS DATE) AS TIMESTAMP_NS) THEN $native ELSE $REFUSED_LITERAL END)";
+    my $timestamp_sql = "(CASE WHEN TRY_CAST(CAST($marker AS VARCHAR) AS TIMESTAMP_NS) IS NOT DISTINCT FROM"
+        . " CAST(TRY_CAST(CAST($marker AS VARCHAR) AS TIMESTAMP) AS TIMESTAMP_NS) THEN $native ELSE $REFUSED_LITERAL END)";
+    return "(CASE WHEN $type IN $INTEGER_TYPES THEN $integer_sql"
+        . " WHEN $type LIKE 'DECIMAL(%' THEN $decimal_sql"
+        . " WHEN $type IN ('DOUBLE', 'FLOAT') THEN $float_sql"
+        . " WHEN $type = 'DATE' THEN $date_sql"
+        . " WHEN $type = 'TIMESTAMP' THEN $timestamp_sql"
+        . " ELSE $native END)";
+}
+
 sub _identity_range_sql {
     my ($self, $column, $operator, $value, $type, $params) = @_;
     my $kind = "typeof($column)";
@@ -440,7 +487,7 @@ sub _identity_range_sql {
         my $marker = $self->placeholder(scalar @$params);
         my $varchar = $self->{_selecto_declared_integer} ? $REFUSED_TEXT
             : $self->_identity_bytes_sql($column) . " $operator " . $self->_identity_bytes_sql($marker);
-        return "(CASE WHEN $kind = 'VARCHAR' THEN $varchar ELSE $column $operator $marker END)";
+        return "(CASE WHEN $kind = 'VARCHAR' THEN $varchar ELSE " . $self->_required_native_sql($column, $operator, "$value", $marker) . ' END)';
     }
     my ($text_sql, $number_sql, $other_sql) = ($REFUSED_TEXT, $REFUSED_TEXT, $REFUSED_TEXT);
     if (defined($value) && !ref($value)) {
