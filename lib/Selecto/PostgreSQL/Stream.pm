@@ -42,10 +42,15 @@ sub new {
             $self->{transaction} = $adapter->_virtual_transaction_id;
             die 'stream transaction identity is unavailable' unless defined $self->{transaction};
         }
-        # Temp shadows refused and the session snapshot taken before the
-        # cursor; every FETCH is compared with it (items 56, 61).
-        $self->{session} = $adapter->_pg_admit_session($args{statement})
-            if $adapter->_pg_session_checked;
+        # search_path and the result-affecting settings pinned for the
+        # stream (R30, R35) until it closes; then temp shadows refused and
+        # the session snapshot taken before the cursor; every FETCH is
+        # compared with it (items 56, 61). While a stream is open inside a
+        # host transaction, the host's own statements see the pinned values.
+        if ($adapter->_pg_session_checked) {
+            $self->{pin} = $adapter->_pg_pin_search_path(0);
+            $self->{session} = $adapter->_pg_admit_session($args{statement});
+        }
         my $declaration = $dbh->prepare('DECLARE ' . $name . ' NO SCROLL CURSOR WITHOUT HOLD FOR '
             . $adapter->_query_transport_sql($args{statement}));
         die 'cursor declaration could not be prepared' unless $declaration;
@@ -179,6 +184,7 @@ sub _close {
                         $adapter->_savepoint_command(rollback => $name) unless $unsafe;
                     }
                 }
+                $adapter->_pg_restore_search_path($self->{pin}) if !$unsafe && $self->{pin};
                 $adapter->_savepoint_command(release => $name) unless $unsafe;
             }
         }

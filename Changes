@@ -23,6 +23,24 @@ Unreleased
       writes. Deferrable internal rechecks count too unless they are
       foreign-key triggers or unique/exclusion rechecks whose operator
       classes and operators are all pg_catalog's (R32).
+    - PostgreSQL session pins (R35). Behaviour change: alongside search_path,
+      every Selecto statement runs with TimeZone 'UTC', DateStyle 'ISO, MDY',
+      IntervalStyle 'postgres', extra_float_digits 3, bytea_output 'hex' and
+      standard_conforming_strings on, pinned in its transaction or savepoint
+      and restored to the host's values afterwards (a bounded stream keeps
+      them until it closes, so the host's own SQL between its fetches sees
+      them). Default rows (driver values) therefore render timestamptz in
+      UTC and dates in ISO whatever the host session says, and a setting a
+      trigger persisted (even masked by a local set_config) cannot change
+      what a scope literal means. "$user" in the reset search_path is the
+      current user. Deferrable unique/exclusion rechecks count as user code
+      unless their index has no expressions or predicate and only default or
+      pg_catalog collations, operator classes and operators (R32a).
+    - Required and scope filters on numeric columns accept only canonical
+      literal text (R3 clarification 2): '1e0', '1.0', '01', '-0',
+      '9007199254740992.0' and decimals with more fractional digits than the
+      column's scale are refused (query_rule_not_evaluable, inexact_literal)
+      on DuckDB, MySQL and MariaDB.
     - PostgreSQL search_path (R29, R30). Behaviour change: generated reads
       and writes name every relation by its schema, resolved at compile
       time from the engine's tenant prefix or else the session's search_path

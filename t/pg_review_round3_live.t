@@ -349,6 +349,20 @@ subtest 'R32: internal deferrable rechecks count unless they run only pg_catalog
     is($outcome->(sub { $update->('b') }), 'query_rule_not_evaluable/deferred_triggers',
         'a deferrable exclusion recheck under a user operator class refuses writes');
     is($rows->($admin, 'SELECT note FROM r3u_w'), 'a', 'and the refused write left nothing');
+    # R32a: an expression index, or a user collation, in a pg_catalog opclass
+    # recheck can run user code too.
+    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP FUNCTION IF EXISTS r3u_f(int)',
+        q{CREATE FUNCTION r3u_f(int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN $1; END $$},
+        'CREATE TABLE r3u_x (k INT, CONSTRAINT r3u_x_k EXCLUDE USING btree ((r3u_f(k)) WITH =) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('c') }), 'query_rule_not_evaluable/deferred_triggers',
+        'a deferrable exclusion recheck over a user function expression refuses writes');
+    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP COLLATION IF EXISTS r3u_c',
+        q{CREATE COLLATION r3u_c (provider = icu, locale = 'und')},
+        'CREATE TABLE r3u_x (k TEXT, CONSTRAINT r3u_x_k EXCLUDE USING btree ((k COLLATE r3u_c) WITH =) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('d') }), 'query_rule_not_evaluable/deferred_triggers',
+        'and so does one under a user collation');
+    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP COLLATION r3u_c', 'DROP FUNCTION r3u_f(int)',
+        'CREATE TABLE r3u_x (k INT)';
     $admin->do($_) for 'DROP TABLE r3u_w, r3u_parent, r3u_child, r3u_x CASCADE', 'DROP OPERATOR CLASS r3u_ops USING btree CASCADE';
 };
 
@@ -377,6 +391,32 @@ subtest 'R33: a CTE named like a real relation never hides it' => sub {
     # either way the root never reads the CTE's rows.
     is($result, 'invalid_query', 'a CTE named like the root relation is refused, never read in its place');
     $admin->do('DROP TABLE r3c, r3c_other CASCADE');
+};
+
+subtest 'R35: result-affecting settings are pinned for every statement' => sub {
+    $admin->do($_) for 'DROP TABLE IF EXISTS r3z CASCADE',
+        'CREATE TABLE r3z (id INT PRIMARY KEY, ts TIMESTAMPTZ NOT NULL, d DATE NOT NULL)',
+        q{INSERT INTO r3z VALUES (1, '2024-01-02 00:00:00+00', '2024-03-01'), (2, '2023-12-31 12:00:00+00', '2024-01-02')};
+    my $dbh = $connect->();
+    my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Z',
+        source => {source_table => 'r3z', primary_key => 'id', fields => [qw(id ts d)],
+            columns => {id => {type => 'integer'}, ts => {type => 'utc_datetime'}, d => {type => 'date'}}, associations => {}},
+        schemas => {}, joins => {}});
+    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    my $ids = sub {
+        my ($required) = @_;
+        my $engine = Selecto::Engine->new(domain => $domain->with_required_predicate($required), adapter => $adapter);
+        return join ',', map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}};
+    };
+    # A setting that persisted before Selecto's call (a masked set_config in
+    # an earlier trigger, say) cannot change what a scope literal means.
+    $dbh->do(q{SET TimeZone = 'Pacific/Kiritimati'});
+    is($outcome->(sub { $ids->($x->gte('ts', '2024-01-01 00:00:00')) }), 'applied 1', 'a timestamptz scope literal is read in UTC');
+    $dbh->do(q{SET DateStyle = 'SQL, DMY'});
+    is($outcome->(sub { $ids->($x->gte('d', '02/01/2024')) }), 'applied 1', 'a date scope literal is read MDY');
+    is($rows->($dbh, 'SHOW TimeZone'), 'Pacific/Kiritimati', "the host's TimeZone is restored");
+    is($rows->($dbh, 'SHOW DateStyle'), 'SQL, DMY', "and its DateStyle");
+    $admin->do('DROP TABLE r3z CASCADE');
 };
 
 done_testing;

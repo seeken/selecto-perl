@@ -1243,6 +1243,17 @@ my $SESSION_COLUMNS = join(', ',
         . q{AND f.pronamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace) AND (}
         . q{pg_catalog.starts_with(CAST(f.proname AS pg_catalog.text), 'RI_FKey_') }
         . q{OR (f.proname OPERATOR(pg_catalog.=) CAST('unique_key_recheck' AS pg_catalog.name) }
+        # R32a: no expression or predicate index (it can call a user
+        # function), and only default or pg_catalog collations.
+        . q{AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid OPERATOR(pg_catalog.=) c.conindid }
+        . q{WHERE c.oid OPERATOR(pg_catalog.=) t.tgconstraint AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL OR EXISTS (}
+        . q{SELECT 1 FROM pg_catalog.unnest(CAST(i.indcollation AS pg_catalog.oid[])) AS l(coll) }
+        . q{LEFT JOIN pg_catalog.pg_collation co ON co.oid OPERATOR(pg_catalog.=) l.coll }
+        . q{WHERE l.coll OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid) AND (co.oid IS NULL }
+        . q{OR co.collnamespace OPERATOR(pg_catalog.<>) CAST('pg_catalog' AS pg_catalog.regnamespace))))) }
+        . q{AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.unnest(c.conexclop) AS e(op) ON TRUE }
+        . q{JOIN pg_catalog.pg_operator p ON p.oid OPERATOR(pg_catalog.=) e.op JOIN pg_catalog.pg_proc pf ON pf.oid OPERATOR(pg_catalog.=) p.oprcode }
+        . q{WHERE c.oid OPERATOR(pg_catalog.=) t.tgconstraint AND pf.pronamespace OPERATOR(pg_catalog.<>) CAST('pg_catalog' AS pg_catalog.regnamespace)) }
         . q{AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid OPERATOR(pg_catalog.=) c.conindid }
         . q{JOIN pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])) AS k(opclass) ON TRUE }
         . q{JOIN pg_catalog.pg_opclass o ON o.oid OPERATOR(pg_catalog.=) k.opclass }
@@ -1316,7 +1327,7 @@ sub _pg_statement_relations {
 # the session cannot hijack with set_config: the host-pinned read prefix
 # when there is one, otherwise the session's search_path reset value
 # (pg_settings.reset_val, from server, database, role or connection
-# configuration; "$user" is the session user, pg_temp and pg_catalog are
+# configuration; "$user" is the current user, pg_temp and pg_catalog are
 # skipped). The current search_path is never consulted. A TEMP relation
 # named like one found there shadows it and is refused (temporary_shadow);
 # a TEMP relation with no such namesake is the host's own and is named by
@@ -1328,7 +1339,7 @@ sub _pg_statement_relations {
 # must pin the schema (the engine's tenant prefix). Resolved once per
 # relation per compile, with pg_catalog-only SQL.
 my $RESET_PATH_SQL = q{SELECT (SELECT s.reset_val FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'search_path'), }
-    . q{CAST(SESSION_USER AS pg_catalog.text)};
+    . q{CAST(CURRENT_USER AS pg_catalog.text)};
 my $QUALIFY_SQL = 'SELECT pg_catalog.quote_ident(n.nspname), pg_catalog.quote_ident(c.relname) '
     . 'FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) WITH ORDINALITY AS p(name, ord) '
     . 'JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) p.name '
@@ -1406,33 +1417,48 @@ sub _relation_sql {
     return $qualified;
 }
 
-# R30: Selecto pins search_path for each of its statements, inside its own
-# transaction or savepoint: pg_catalog first (operators, functions and types
-# resolve there before anything else), then the reset search path's schemas,
-# pg_temp last. A switch that persisted before the call cannot redirect an
-# operator, function or relation. The host's value is restored with
-# set_config(..., true) before control returns (a rollback reverts it too).
+# R30, R35: Selecto pins search_path, and every setting that changes how
+# its SQL parses literals or renders results, for each of its statements,
+# inside its own transaction or savepoint: search_path is pg_catalog first
+# (operators, functions and types resolve there before anything else), then
+# the reset search path's schemas, pg_temp last; TimeZone, DateStyle,
+# IntervalStyle, extra_float_digits, bytea_output and
+# standard_conforming_strings take fixed values. A switch that persisted
+# before the call (including one masked by a local set_config) cannot
+# redirect a name or change a scope literal's meaning. The host's values
+# are restored with set_config(..., true) before control returns (a
+# rollback reverts them too); on an idle autocommit handle a read sets them
+# for the session and restores them right after.
+my @PINNED_SETTINGS = (
+    [TimeZone => 'UTC'], [DateStyle => 'ISO, MDY'], [IntervalStyle => 'postgres'],
+    [extra_float_digits => '3'], [bytea_output => 'hex'], [standard_conforming_strings => 'on'],
+);
 sub _pg_pin_search_path {
     my ($self, $session) = @_;
     my $local = $session ? 'false' : 'true';
     local $self->{_selecto_relation_schemas} = {};
     my @schemas = $self->_pg_reset_schemas;
     my $pinned = join(', ', 'pg_catalog', (map { _quote_path_schema($_) } @schemas), 'pg_temp');
-    my ($host);
+    my @pins = (['search_path' => $pinned], @PINNED_SETTINGS);
+    my @set = map { "pg_catalog.set_config('$pins[$_][0]', \$" . ($_ + 1) . ", $local)" } 0 .. $#pins;
+    my $current = join ', ', map { "pg_catalog.current_setting('$pins[$_][0]') AS s$_" } 0 .. $#pins;
+    my @host;
     my $ok = eval {
-        ($host) = $self->{dbh}->selectrow_array(q{WITH h AS MATERIALIZED (SELECT pg_catalog.current_setting('search_path') AS v) }
-            . qq{SELECT h.v, pg_catalog.set_config('search_path', \$1, $local) FROM h}, undef, $pinned);
+        @host = $self->{dbh}->selectrow_array("WITH h AS MATERIALIZED (SELECT $current) SELECT "
+            . join(', ', (map { "h.s$_" } 0 .. $#pins), @set) . ' FROM h', undef, map { $_->[1] } @pins);
         1;
     };
-    die $self->normalize_error($@) unless $ok && defined $host;
-    return {host => $host, pinned => $pinned, session => $session ? 1 : 0};
+    die $self->normalize_error($@) unless $ok && @host >= @pins && !grep { !defined } @host[0 .. $#pins];
+    return {host => [map { [$pins[$_][0], $host[$_]] } 0 .. $#pins], pinned => $pinned, session => $session ? 1 : 0};
 }
 
 sub _pg_restore_search_path {
     my ($self, $pin) = @_;
     return unless ref($pin) eq 'HASH';
     my $local = $pin->{session} ? 'false' : 'true';
-    my $ok = eval { $self->{dbh}->selectrow_array(qq{SELECT pg_catalog.set_config('search_path', \$1, $local)}, undef, $pin->{host}); 1 };
+    my @host = @{$pin->{host}};
+    my $sql = 'SELECT ' . join(', ', map { "pg_catalog.set_config('$host[$_][0]', \$" . ($_ + 1) . ", $local)" } 0 .. $#host);
+    my $ok = eval { $self->{dbh}->selectrow_array($sql, undef, map { $_->[1] } @host); 1 };
     die $self->normalize_error($@) unless $ok;
     return;
 }
