@@ -39,7 +39,7 @@ sub edit_transaction_identity {
         unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' };
     Selecto::Error->throw('edit_handle_expired', 'editable rows require an active PostgreSQL transaction')
         unless $dbh->{Active} && (!$dbh->{AutoCommit} || $dbh->pg_ping == 3);
-    my $identity = eval { $dbh->selectrow_array("SELECT pg_backend_pid()::text || ':' || txid_current()::text") };
+    my $identity = eval { $dbh->selectrow_array("SELECT CAST(pg_catalog.pg_backend_pid() AS pg_catalog.text) OPERATOR(pg_catalog.||) ':' OPERATOR(pg_catalog.||) CAST(pg_catalog.txid_current() AS pg_catalog.text)") };
     die $self->normalize_error($@) if $@;
     Selecto::Error->throw('edit_handle_expired', 'transaction identity is unavailable') unless defined $identity;
     Selecto::Error->throw('edit_handle_expired', 'editable rows require a pinned PostgreSQL transaction')
