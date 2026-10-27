@@ -14,7 +14,7 @@ use Selecto::Expression;
 # DATETIME but may still be converted in the session zone, which a view
 # function can switch within one statement. A scope compare on a temporal
 # view column is trusted only when the view definition maps it directly to a
-# base DATETIME column; otherwise it is refused (view_temporal_column).
+# base DATETIME column; otherwise it is refused (view_column_unproven).
 # Columns that report TIMESTAMP keep the epoch compare.
 my $x = 'Selecto::Expression';
 my @backends;
@@ -46,9 +46,13 @@ for my $backend (@backends) {
         schemas => {}, joins => {}})->with_required_predicate($x->lt('ts', '2024-01-01 00:00:00'));
     my %views = (
         'a TIMESTAMP column' => ['ts', 'ok 1,3,4'],
-        'a TIMESTAMP shifted by INTERVAL 0 SECOND' => ['ts + INTERVAL 0 SECOND', 'query_rule_not_evaluable/view_temporal_column'],
-        'a COALESCE over a DATETIME' => ['COALESCE(dt)', 'query_rule_not_evaluable/view_temporal_column'],
+        'a TIMESTAMP shifted by INTERVAL 0 SECOND' => ['ts + INTERVAL 0 SECOND', 'query_rule_not_evaluable/view_column_unproven'],
+        'a COALESCE over a DATETIME' => ['COALESCE(dt)', 'query_rule_not_evaluable/view_column_unproven'],
         'a direct DATETIME column' => ['dt', 'ok 1,3,4'],
+        # R40b: the reported type decides nothing; DATE_FORMAT(ts) reports
+        # VARCHAR and still reads the session zone.
+        'a DATE_FORMAT over a TIMESTAMP' => ["DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s')", 'query_rule_not_evaluable/view_column_unproven'],
+        'a CAST of a TIMESTAMP to DATETIME' => ['CAST(ts AS DATETIME)', 'query_rule_not_evaluable/view_column_unproven'],
     );
     for my $label (sort keys %views) {
         my ($expression, $want) = @{$views{$label}};

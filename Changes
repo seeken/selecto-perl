@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 Unreleased
+    - Review R40b (MySQL family): a scope comparison on ANY view column,
+      whatever type the view reports, is trusted only for a proven direct
+      passthrough of a base column (the view definition's select item is
+      exactly that column, and on MySQL VIEW_TABLE_USAGE lists its
+      relation); the base column's type then applies (TIMESTAMP by epoch,
+      DATETIME natively, VARCHAR by the text rules). Any other view column
+      (DATE_FORMAT(ts) reports VARCHAR; CAST(ts AS DATETIME), DATE(ts),
+      ts + INTERVAL 0 SECOND) is refused (query_rule_not_evaluable, reason
+      view_column_unproven, which replaces view_temporal_column).
     - Review R40 (MySQL family): a scope comparison on a DATETIME, DATE or
       TIME column of a VIEW is trusted as zone independent only when the
       view definition maps the column directly to a base column of this
