@@ -441,11 +441,11 @@ sub _known_cast_type {
 # any other literal is refused (query_rule_not_evaluable, reason
 # inexact_literal), decided per row type in the statement so it follows
 # the column the statement binds:
-#   - integer types: a canonical integer ('-12'; never '01', '+1', '-0',
-#     '1.0', '1e0');
-#   - DECIMAL(p,s): a canonical plain decimal (no leading zeros, no
-#     exponent) with at most s written fractional digits and at most p - s
-#     integer digits;
+#   - every literal in plain notation (optional '-', digits, optional '.'
+#     and digits; no exponent, whitespace, '+' or negative zero);
+#   - integer types: an integer ('9007199254740992.0' is refused);
+#   - DECIMAL(p,s): no non-zero digit beyond the scale and at most p - s
+#     integer digits ('1.010' is accepted for DECIMAL(10,2), '1.005' not);
 #   - DOUBLE, FLOAT: a plain or exponent number (text to binary floating
 #     point is correctly rounded, as PostgreSQL does it);
 #   - DATE: a value with no time of day beyond midnight;
@@ -457,11 +457,13 @@ sub _required_native_sql {
     my $type = "typeof($column)";
     my $native = "$column $operator $marker";
     $text = defined($text) ? "$text" : undef;
-    my $integer_sql = defined($text) && $text =~ /\A(?:0|-?[1-9][0-9]*)\z/ ? $native : $REFUSED_LITERAL;
+    my $integer_sql = defined($text) && $text =~ /\A-?[0-9]+\z/ && $text !~ /\A-0+\z/ ? $native : $REFUSED_LITERAL;
     my $float_sql = defined($text) && $text =~ /\A-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/ ? $native : $REFUSED_LITERAL;
     my $decimal_sql = $REFUSED_LITERAL;
-    if (defined($text) && $text =~ /\A(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?\z/ && !($1 && "$2" . ($3 // '') !~ /[1-9]/)) {
+    if (defined($text) && $text =~ /\A(-?)([0-9]+)(?:\.([0-9]+))?\z/ && !($1 && "$2" . ($3 // '') !~ /[1-9]/)) {
         my ($whole, $fraction) = ($2, $3 // '');
+        $whole =~ s/\A0+(?=[0-9])//;
+        $fraction =~ s/0+\z//;
         my ($digits, $scale) = ($whole eq '0' ? 0 : length($whole), length($fraction));
         my $declared_scale = "CAST(regexp_extract($type, ',([0-9]+)\\)', 1) AS INTEGER)";
         my $declared_precision = "CAST(regexp_extract($type, '\\(([0-9]+),', 1) AS INTEGER)";
