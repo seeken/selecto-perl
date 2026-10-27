@@ -1413,24 +1413,26 @@ sub _relation_sql {
 # operator, function or relation. The host's value is restored with
 # set_config(..., true) before control returns (a rollback reverts it too).
 sub _pg_pin_search_path {
-    my ($self) = @_;
+    my ($self, $session) = @_;
+    my $local = $session ? 'false' : 'true';
     local $self->{_selecto_relation_schemas} = {};
     my @schemas = $self->_pg_reset_schemas;
     my $pinned = join(', ', 'pg_catalog', (map { _quote_path_schema($_) } @schemas), 'pg_temp');
     my ($host);
     my $ok = eval {
         ($host) = $self->{dbh}->selectrow_array(q{WITH h AS MATERIALIZED (SELECT pg_catalog.current_setting('search_path') AS v) }
-            . q{SELECT h.v, pg_catalog.set_config('search_path', $1, true) FROM h}, undef, $pinned);
+            . qq{SELECT h.v, pg_catalog.set_config('search_path', \$1, $local) FROM h}, undef, $pinned);
         1;
     };
     die $self->normalize_error($@) unless $ok && defined $host;
-    return {host => $host, pinned => $pinned};
+    return {host => $host, pinned => $pinned, session => $session ? 1 : 0};
 }
 
 sub _pg_restore_search_path {
     my ($self, $pin) = @_;
     return unless ref($pin) eq 'HASH';
-    my $ok = eval { $self->{dbh}->selectrow_array(q{SELECT pg_catalog.set_config('search_path', $1, true)}, undef, $pin->{host}); 1 };
+    my $local = $pin->{session} ? 'false' : 'true';
+    my $ok = eval { $self->{dbh}->selectrow_array(qq{SELECT pg_catalog.set_config('search_path', \$1, $local)}, undef, $pin->{host}); 1 };
     die $self->normalize_error($@) unless $ok;
     return;
 }
@@ -1559,20 +1561,20 @@ sub _guarded_read {
     return $work->() if !$self->_pg_session_checked || $self->{_selecto_pg_read_guard};
     local $self->{_selecto_pg_read_guard} = 1;
     my $scope = $self->_read_guard_scope;
-    # The read runs under its own savepoint in the host's transaction, or in
-    # its own transaction on an idle handle, so search_path can be pinned for
-    # it (R30) and any change it makes is undone by a rollback.
+    # In the host's transaction the read runs under its own savepoint, with
+    # search_path pinned for it locally (R30); a rollback to the savepoint
+    # undoes the pin and anything the statement changed. On an idle
+    # (autocommit) handle the pin is set for the session and restored right
+    # after, with every setting the statement changed.
     my $savepoint;
     if ($scope eq 'host') {
         $savepoint = Selecto::SQL::_savepoint_name('selecto_read');
         eval { $self->_savepoint_command(create => $savepoint); 1 }
             or die $self->_transaction_control_error($@);
-    } else {
-        eval { $self->_begin_transaction; 1 } or die $self->_transaction_control_error($@);
     }
     my ($pin, $before, $result);
     my $ok = eval {
-        $pin = $self->_pg_pin_search_path;
+        $pin = $self->_pg_pin_search_path(!$savepoint);
         $before = $self->_pg_admit_session($source);
         $result = $work->();
         1;
@@ -1580,27 +1582,26 @@ sub _guarded_read {
     my $error = $ok ? undef : $@;
     my $after = $ok && $before ? eval { $self->_pg_session_state } : undef;
     my $changed = $ok && $before && !($after && $after->{snapshot} eq $before->{snapshot});
-    my $undo = !$ok || $changed;
     my $finished = eval {
         if ($savepoint) {
-            if ($undo) {
+            if (!$ok || $changed) {
                 $self->_savepoint_command(rollback => $savepoint);
             } else {
                 $self->_pg_restore_search_path($pin);
             }
             $self->_savepoint_command(release => $savepoint);
-        } elsif ($undo) {
-            $self->_rollback_transaction;
         } else {
-            $self->_commit_transaction;
+            if ($changed) {
+                for my $name (@SESSION_SETTINGS) {
+                    eval { $self->{dbh}->selectrow_array('SELECT pg_catalog.set_config($1, $2, false)', undef,
+                        $name, $before->{settings}{$name}) };
+                }
+            }
+            $self->_pg_restore_search_path($pin) if $pin;
         }
         1;
     };
-    unless ($finished) {
-        my $control = $@;
-        eval { $self->_rollback_transaction } unless $savepoint;
-        die $self->_transaction_control_error($control) if $ok && !$changed;
-    }
+    die $self->_transaction_control_error($@) if !$finished && $ok && !$changed;
     _session_changed() if $changed;
     die $error unless $ok;
     return $result;
@@ -1966,7 +1967,8 @@ relation found in neither (nor, as a host's own TEMP table, in the session's
 temporary schema) is refused (C<query_rule_not_evaluable>, reason
 C<relation_unresolved>). Each Selecto statement runs with C<search_path>
 pinned to C<pg_catalog>, the reset path's schemas and C<pg_temp> (last),
-inside its own transaction or savepoint, and the host's value is restored
+inside its own transaction or savepoint (on an idle autocommit handle, a
+read sets it for the session), and the host's value is restored
 afterwards; so a C<search_path> switch that persisted before the call
 redirects neither relations nor operators. Hosts that C<SET search_path> to
 reach other schemas must pin the schema instead. Row triggers fired by

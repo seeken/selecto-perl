@@ -35,8 +35,9 @@ Unreleased
       transaction or savepoint; the host's value is restored afterwards),
       so a search_path switch that persisted before the call redirects
       neither relations nor operators. Hosts that SET search_path to reach
-      other schemas must pin the schema instead. Reads on an idle handle now
-      run in their own short transaction. Row triggers fired by Selecto
+      other schemas must pin the schema instead. On an idle (autocommit)
+      handle a read sets the pin for the session and restores it right
+      after. Row triggers fired by Selecto
       writes run under the pinned search_path. The REPEATABLE READ refusal
       for unscoped writes is gone (guarded writes still require READ
       COMMITTED, item 16).
