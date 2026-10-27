@@ -526,6 +526,25 @@ sub _compile_authored_condition {
     return $self->_compile_expression($domain, $expression, $params);
 }
 
+# A member's group keys, when one of its outputs is joined or correlated
+# with its root as identity, group by their UTF-8 bytes as well as their
+# value, so collation-equal keys of other tenants ('T1' under NOCASE or
+# default_collation) are not merged into the root's group; the value stays
+# in GROUP BY, so selecting it remains valid. Numbered parameters let both
+# copies share one binding.
+sub _compile_group_expression {
+    my ($self, $domain, $expression, $params, $byte_groups) = @_;
+    my $sql = $self->SUPER::_compile_group_expression($domain, $expression, $params);
+    return $sql unless ref($byte_groups) eq 'HASH' && $byte_groups->{all} && blessed($expression);
+    return $self->_identity_bytes_sql($sql) . ", $sql";
+}
+
+sub _reused_group_sql {
+    my ($self, $sql, $expression, $byte_groups) = @_;
+    return $sql unless ref($byte_groups) eq 'HASH' && $byte_groups->{all} && blessed($expression);
+    return $self->_identity_bytes_sql($sql) . ", $sql";
+}
+
 # Write predicates, foreign-key guards and stored-row checks compare the
 # command's identity columns (the engine's __selecto_tenant_fields, and
 # every field its scope predicate or query enforcement reads) the same way.
@@ -1089,7 +1108,9 @@ scope keys, tenant pairs and member correlations, for reads and writes,
 under C<=>, C<< <> >>, C<IN> and C<NOT IN>. Ranges in that scope compare
 VARCHAR by bytes and integer or DECIMAL (scale up to 18) columns by exact
 value; a floating column, a wider DECIMAL or a non-numeric literal is
-refused (C<inexact_text>, C<decimal_scale>). Ordinary caller filters on other columns keep DuckDB's own
+refused (C<inexact_text>, C<decimal_scale>). A query member whose output is
+joined or correlated with its root as identity groups its keys by their
+bytes too. Ordinary caller filters on other columns keep DuckDB's own
 semantics, collation included.
 
 DBD::DuckDB 0.16 decodes some timestamps and decimals inexactly and infers
