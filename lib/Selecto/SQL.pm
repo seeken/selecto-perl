@@ -3615,7 +3615,7 @@ sub _require_read_committed {
     my ($self, $table) = @_;
     return unless $self->name eq 'postgresql';
     my $level;
-    my $ok = eval { ($level) = $self->dbh->selectrow_array(q{SELECT current_setting('transaction_isolation')}); 1 };
+    my $ok = eval { ($level) = $self->dbh->selectrow_array(q{SELECT pg_catalog.current_setting('transaction_isolation')}); 1 };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_not_evaluable',
         'a guarded PostgreSQL write requires READ COMMITTED isolation',

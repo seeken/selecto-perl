@@ -17,11 +17,12 @@ sub _now { clock_gettime(CLOCK_MONOTONIC) }
 # so it reads the setting in force before this statement changes it.
 sub _transaction_timeout_sql {
     my ($limit) = @_;
-    return q{SELECT current_ceiling.prior, set_config('statement_timeout', }
-        . qq{CAST(CASE WHEN current_ceiling.ms > 0 AND current_ceiling.ms < CAST($limit AS bigint) }
-        . qq{THEN current_ceiling.ms ELSE CAST($limit AS bigint) END AS text) || 'ms', true) }
-        . q{FROM (SELECT current_setting('statement_timeout') AS prior, CAST(setting AS bigint) AS ms }
-        . q{FROM pg_settings WHERE name = 'statement_timeout' OFFSET 0) AS current_ceiling};
+    return q{SELECT current_ceiling.prior, pg_catalog.set_config('statement_timeout', }
+        . q{CAST(CASE WHEN current_ceiling.ms OPERATOR(pg_catalog.>) 0 AND current_ceiling.ms OPERATOR(pg_catalog.<) }
+        . qq{CAST($limit AS pg_catalog.int8) THEN current_ceiling.ms ELSE CAST($limit AS pg_catalog.int8) END AS pg_catalog.text) }
+        . q{OPERATOR(pg_catalog.||) 'ms', true) }
+        . q{FROM (SELECT pg_catalog.current_setting('statement_timeout') AS prior, CAST(setting AS pg_catalog.int8) AS ms }
+        . q{FROM pg_catalog.pg_settings WHERE name OPERATOR(pg_catalog.=) 'statement_timeout' OFFSET 0) AS current_ceiling};
 }
 use constant TRANSACTION_TIMEOUT_SQL => _transaction_timeout_sql('$1');
 
@@ -125,26 +126,26 @@ sub begin {
             my ($prior) = $dbh->selectrow_array(TRANSACTION_TIMEOUT_SQL, undef, $ms);
             die 'query timeout configuration failed' unless defined $prior;
             $self->{restore} = sub {
-                defined($dbh->do(q{SELECT set_config('statement_timeout', ?, true)}, undef, $prior))
+                defined($dbh->do(q{SELECT pg_catalog.set_config('statement_timeout', ?, true)}, undef, $prior))
                     or die 'query timeout restoration failed';
             };
             $self->{rearm} = _transaction_rearm($dbh);
         } elsif ($name eq 'postgresql') {
-            my ($prior) = $dbh->selectrow_array(q{SELECT current_setting('statement_timeout')});
+            my ($prior) = $dbh->selectrow_array(q{SELECT pg_catalog.current_setting('statement_timeout')});
             $self->{restore} = sub {
-                defined($dbh->do(q{SELECT set_config('statement_timeout', ?, false)}, undef, $prior))
+                defined($dbh->do(q{SELECT pg_catalog.set_config('statement_timeout', ?, false)}, undef, $prior))
                     or die 'query timeout restoration failed';
             };
             # PostgreSQL exposes a typed millisecond conversion independent of
             # display units. Never replace a stricter existing host ceiling.
-            my ($prior_ms) = $dbh->selectrow_array(q{SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout'});
+            my ($prior_ms) = $dbh->selectrow_array(q{SELECT CAST(setting AS pg_catalog.int8) FROM pg_catalog.pg_settings WHERE name OPERATOR(pg_catalog.=) 'statement_timeout'});
             my $effective = $prior_ms && $prior_ms < $ms ? $prior_ms : $ms;
-            defined($dbh->do(q{SELECT set_config('statement_timeout', ?, false)}, undef, $effective . 'ms'))
+            defined($dbh->do(q{SELECT pg_catalog.set_config('statement_timeout', ?, false)}, undef, $effective . 'ms'))
                 or die 'query timeout configuration failed';
             $self->{rearm} = sub {
                 my ($remaining) = @_;
                 $remaining = $prior_ms if $prior_ms && $prior_ms < $remaining;
-                defined($dbh->do(q{SELECT set_config('statement_timeout', ?, false)}, undef, $remaining . 'ms'))
+                defined($dbh->do(q{SELECT pg_catalog.set_config('statement_timeout', ?, false)}, undef, $remaining . 'ms'))
                     or die 'query timeout configuration failed';
             };
         } elsif ($name eq 'mysql' || $name eq 'mariadb') {
