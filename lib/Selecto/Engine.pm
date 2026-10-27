@@ -3616,6 +3616,15 @@ is outside every scope guarantee above and is never checked. A schema owner
 who installs such triggers on governed tables must make them respect the
 tenant boundary themselves.
 
+The same holds for a trigger's (or a domain view function's) other side
+effects: settings other than those below, role changes, writes to unrelated
+tables, and DDL. They are host-owned schema behaviour and the schema owner's
+responsibility. On PostgreSQL, Selecto does refuse (and roll back) a write
+or read whose statement changed C<search_path>, C<TimeZone>, C<DateStyle>,
+C<IntervalStyle>, C<extra_float_digits> or the session's temporary
+relations, rules or types, since those would steer Selecto's own later SQL;
+see L<Selecto::PostgreSQL/SESSION STATE>.
+
 =head2 execute_batch
 
   my $results = $engine->execute_batch(Selecto::Write::Batch->new(@commands));
