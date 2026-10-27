@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 Unreleased
+    - Review R40 (MySQL family): a scope comparison on a DATETIME, DATE or
+      TIME column of a VIEW is trusted as zone independent only when the
+      view definition maps the column directly to a base column of this
+      database (confirmed by VIEW_TABLE_USAGE on MySQL) that is DATETIME,
+      DATE or TIME (a direct TIMESTAMP reference compares by epoch). A
+      column derived from a TIMESTAMP (ts + INTERVAL 0 SECOND reports
+      DATETIME) or any other expression is refused
+      (query_rule_not_evaluable, view_temporal_column).
     - PostgreSQL review fixes (round 3): the temp-shadow check covers every
       relation a statement names, recorded while compiling (through-
       association bridges inside parenthesised joins, INSERT and upsert

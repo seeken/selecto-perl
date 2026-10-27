@@ -915,12 +915,76 @@ sub _timestamp_column {
     my $catalog = $self->{_selecto_column_catalog} // {};
     my $types = $catalog->{$self->_table_key($table)} //= $self->_column_data_types($table);
     my $type = $types->{lc $column};
-    return $type eq 'timestamp' ? 1 : 0 if defined $type;
+    return 1 if defined($type) && $type eq 'timestamp';
+    return $self->_view_temporal_source($table, $column, 0) if defined($type) && $type =~ /\A(?:datetime|date|time)\z/;
+    return 0 if defined $type;
     Selecto::Error->throw('query_rule_not_evaluable',
         'a host comparison names a datetime column the catalog does not describe',
         {reason => 'column_unresolved', field => "$column"})
         if defined($declared) && $declared =~ /\A(?:utc_datetime|naive_datetime|datetime|timestamp)\z/;
     return 0;
+}
+
+# R40: a VIEW column derived from a TIMESTAMP (COALESCE(ts), ts + INTERVAL
+# 0 SECOND, a CASE over it) reports DATETIME (or DATE, TIME) but is still
+# converted in the session zone, which a function can switch within one
+# statement. A temporal view column a scope compares is therefore trusted
+# as zone independent only with proof that it is a direct reference to a
+# base column: its select item in the view definition is exactly
+# `[db.]table.column AS name` (no UNION), the referenced relation is in
+# this database, MySQL's VIEW_TABLE_USAGE lists that relation for the view
+# (MariaDB has no such table and relies on the definition alone; MySQL has
+# no per-column usage table), and the column itself
+# is DATETIME/DATE/TIME (a direct TIMESTAMP reference compares by epoch; a
+# view over a view is followed). Without the proof the comparison is
+# refused (query_rule_not_evaluable, reason view_temporal_column). Returns 1
+# for a TIMESTAMP source, 0 for a zone-independent one.
+sub _view_temporal_source {
+    my ($self, $table, $column, $depth) = @_;
+    my $dbh = $self->{dbh};
+    my $sensitive = $self->_table_names_case_sensitive;
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable',
+            'a scope comparison names a temporal view column that may be derived from a TIMESTAMP',
+            {reason => 'view_temporal_column', relation => "$table", field => "$column"});
+    };
+    my $views;
+    my $ok = eval {
+        $views = $dbh->selectall_arrayref($self->_statement_sql(q{SELECT VIEW_DEFINITION, TABLE_NAME FROM information_schema.VIEWS
+            WHERE TABLE_SCHEMA = DATABASE() AND } . ($sensitive ? 'BINARY TABLE_NAME = BINARY ?' : 'TABLE_NAME = ?')), undef, "$table");
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return 0 unless @$views;    # a base table's own DATETIME/DATE/TIME column
+    $refuse->() if @$views > 1 || $depth > 8;
+    my $definition = $views->[0][0];
+    $refuse->() unless defined($definition) && $definition !~ /\bunion\b/i;
+    my ($database) = $dbh->selectrow_array($self->_statement_sql('SELECT DATABASE()'));
+    my $name = qr/`((?:``|[^`])+)`/;
+    my $alias = quotemeta($column);
+    my @parts;
+    while ($definition =~ /(?:\bselect\s+(?:distinct\s+)?|,)\s*((?:$name\.){1,2}$name)\s+AS\s+`$alias`(?=\s*(?:,|\bfrom\b|\z))/gi) {
+        my $reference = $1;
+        @parts = map { s/``/`/gr } $reference =~ /$name/g;
+        last;
+    }
+    $refuse->() unless @parts == 2 || @parts == 3;
+    my ($base_database, $base_table, $base_column) = @parts == 3 ? @parts : (undef, @parts);
+    $refuse->() if defined($base_database) && (!defined($database) || $base_database ne $database);
+    if ($self->name eq 'mysql') {
+        # MySQL 8.0.13+ records the relations a view reads.
+        my ($used) = eval { $dbh->selectrow_array($self->_statement_sql(q{SELECT COUNT(*) FROM information_schema.VIEW_TABLE_USAGE
+            WHERE VIEW_SCHEMA = DATABASE() AND TABLE_SCHEMA = DATABASE() AND }
+            . ($sensitive ? 'BINARY VIEW_NAME = BINARY ? AND BINARY TABLE_NAME = BINARY ?' : 'VIEW_NAME = ? AND TABLE_NAME = ?')),
+            undef, "$table", $base_table) };
+        $refuse->() unless $used;
+    }
+    my $types = $self->_column_data_types($base_table);
+    my $type = $types->{lc $base_column};
+    $refuse->() unless defined $type;
+    return 1 if $type eq 'timestamp';
+    $refuse->() unless $type =~ /\A(?:datetime|date|time)\z/;
+    return $self->_view_temporal_source($base_table, $base_column, $depth + 1);
 }
 
 # R31: relation names are matched as the server resolves them. With

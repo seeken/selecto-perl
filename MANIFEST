@@ -90,6 +90,7 @@ t/mysql_returning_insert_trigger_live.t
 t/mysql_host_savepoint_collision_live.t
 t/mysql_association_timestamp_pin_live.t
 t/mysql_auto_increment_zero_live.t
+t/mysql_view_temporal_live.t
 t/mysql_transaction_outside_driver_live.t
 t/mysql_scope_provenance_live.t
 t/mysql_scope_exactness_live.t
