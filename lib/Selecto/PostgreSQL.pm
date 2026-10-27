@@ -1324,6 +1324,11 @@ sub _relation_sql {
     return $plain if ref($sources) eq 'HASH' && grep { lc($_) eq lc("$table") } keys %$sources;
     my $cache = $self->{_selecto_relation_schemas};
     return $cache->{$plain} if ref($cache) eq 'HASH' && exists $cache->{$plain};
+    # Nothing is sent on a busy, failed or unknown connection: the statement
+    # keeps its spelling, and the guard that runs it refuses with
+    # transaction_state_unsafe before anything reaches the server.
+    my $state = ref($cache) eq 'HASH' ? ($cache->{"\0state"} //= $self->_connection_state) : $self->_connection_state;
+    return $plain unless $state =~ /\A(?:idle|intrans)\z/;
     my @row;
     my $ok = eval { @row = $self->{dbh}->selectrow_array($QUALIFY_SQL, undef, $plain); 1 };
     die $self->normalize_error($@) unless $ok;
