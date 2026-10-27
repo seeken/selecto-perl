@@ -646,7 +646,19 @@ sub _column_numeric_specs {
         $specs{lc $row->[0]} = {kind => $kind, precision => $row->[2], scale => $row->[3],
             unsigned => (($row->[4] // '') =~ /\bunsigned\b/i ? 1 : 0)};
     }
-    return \%specs;
+    # A view column takes its proven base column's spec (R40b); any other
+    # view column has none here (its scope compares are refused upstream).
+    my $sources = $self->_view_column_sources($table);
+    return \%specs unless $sources;
+    Selecto::Error->throw('query_rule_not_evaluable', 'views nest too deeply to resolve their columns',
+        {reason => 'view_column_unproven', relation => "$table"}) if ($_[2] // 0) > 8;
+    my %resolved;
+    for my $column (keys %$sources) {
+        my ($base_table, $base_column) = @{$sources->{$column}};
+        my $base = $self->_column_numeric_specs($base_table, ($_[2] // 0) + 1)->{lc $base_column};
+        $resolved{$column} = $base if $base;
+    }
+    return \%resolved;
 }
 
 # The numeric spec of a stored field's own column, or undef.
@@ -761,6 +773,7 @@ sub _stored_column_type {
     my $catalog = $self->{_selecto_column_catalog} // {};
     my $types = $catalog->{$self->_table_key($table)} //= $self->_column_data_types($table);
     my $stored = $types->{lc $resolved->{field}};
+    _refuse_unproven_view_column($table, $resolved->{field}) if defined($stored) && $stored eq 'unproven';
     return defined($stored) && length($stored) ? $stored : undef;
 }
 
@@ -918,75 +931,13 @@ sub _timestamp_column {
     my $types = $catalog->{$self->_table_key($table)} //= $self->_column_data_types($table);
     my $type = $types->{lc $column};
     return 1 if defined($type) && $type eq 'timestamp';
-    return $self->_view_temporal_source($table, $column, 0) if defined($type) && $type =~ /\A(?:datetime|date|time)\z/;
+    _refuse_unproven_view_column($table, $column) if defined($type) && $type eq 'unproven';
     return 0 if defined $type;
     Selecto::Error->throw('query_rule_not_evaluable',
         'a host comparison names a datetime column the catalog does not describe',
         {reason => 'column_unresolved', field => "$column"})
         if defined($declared) && $declared =~ /\A(?:utc_datetime|naive_datetime|datetime|timestamp)\z/;
     return 0;
-}
-
-# R40: a VIEW column derived from a TIMESTAMP (COALESCE(ts), ts + INTERVAL
-# 0 SECOND, a CASE over it) reports DATETIME (or DATE, TIME) but is still
-# converted in the session zone, which a function can switch within one
-# statement. A temporal view column a scope compares is therefore trusted
-# as zone independent only with proof that it is a direct reference to a
-# base column: its select item in the view definition is exactly
-# `[db.]table.column AS name` (no UNION), the referenced relation is in
-# this database, MySQL's VIEW_TABLE_USAGE lists that relation for the view
-# (MariaDB has no such table and relies on the definition alone; MySQL has
-# no per-column usage table), and the column itself
-# is DATETIME/DATE/TIME (a direct TIMESTAMP reference compares by epoch; a
-# view over a view is followed). Without the proof the comparison is
-# refused (query_rule_not_evaluable, reason view_temporal_column). Returns 1
-# for a TIMESTAMP source, 0 for a zone-independent one.
-sub _view_temporal_source {
-    my ($self, $table, $column, $depth) = @_;
-    my $dbh = $self->{dbh};
-    my $sensitive = $self->_table_names_case_sensitive;
-    my $refuse = sub {
-        Selecto::Error->throw('query_rule_not_evaluable',
-            'a scope comparison names a temporal view column that may be derived from a TIMESTAMP',
-            {reason => 'view_temporal_column', relation => "$table", field => "$column"});
-    };
-    my $views;
-    my $ok = eval {
-        $views = $dbh->selectall_arrayref($self->_statement_sql(q{SELECT VIEW_DEFINITION, TABLE_NAME FROM information_schema.VIEWS
-            WHERE TABLE_SCHEMA = DATABASE() AND } . ($sensitive ? 'BINARY TABLE_NAME = BINARY ?' : 'TABLE_NAME = ?')), undef, "$table");
-        1;
-    };
-    die $self->normalize_error($@) unless $ok;
-    return 0 unless @$views;    # a base table's own DATETIME/DATE/TIME column
-    $refuse->() if @$views > 1 || $depth > 8;
-    my $definition = $views->[0][0];
-    $refuse->() unless defined($definition) && $definition !~ /\bunion\b/i;
-    my ($database) = $dbh->selectrow_array($self->_statement_sql('SELECT DATABASE()'));
-    my $name = qr/`((?:``|[^`])+)`/;
-    my $alias = quotemeta($column);
-    my @parts;
-    while ($definition =~ /(?:\bselect\s+(?:distinct\s+)?|,)\s*((?:$name\.){1,2}$name)\s+AS\s+`$alias`(?=\s*(?:,|\bfrom\b|\z))/gi) {
-        my $reference = $1;
-        @parts = map { s/``/`/gr } $reference =~ /$name/g;
-        last;
-    }
-    $refuse->() unless @parts == 2 || @parts == 3;
-    my ($base_database, $base_table, $base_column) = @parts == 3 ? @parts : (undef, @parts);
-    $refuse->() if defined($base_database) && (!defined($database) || $base_database ne $database);
-    if ($self->name eq 'mysql') {
-        # MySQL 8.0.13+ records the relations a view reads.
-        my ($used) = eval { $dbh->selectrow_array($self->_statement_sql(q{SELECT COUNT(*) FROM information_schema.VIEW_TABLE_USAGE
-            WHERE VIEW_SCHEMA = DATABASE() AND TABLE_SCHEMA = DATABASE() AND }
-            . ($sensitive ? 'BINARY VIEW_NAME = BINARY ? AND BINARY TABLE_NAME = BINARY ?' : 'VIEW_NAME = ? AND TABLE_NAME = ?')),
-            undef, "$table", $base_table) };
-        $refuse->() unless $used;
-    }
-    my $types = $self->_column_data_types($base_table);
-    my $type = $types->{lc $base_column};
-    $refuse->() unless defined $type;
-    return 1 if $type eq 'timestamp';
-    $refuse->() unless $type =~ /\A(?:datetime|date|time)\z/;
-    return $self->_view_temporal_source($base_table, $base_column, $depth + 1);
 }
 
 # R31: relation names are matched as the server resolves them. With
@@ -1015,7 +966,79 @@ sub _table_key {
 # The catalog column types of exactly the relation $table names in the
 # current database (column names fold, as MySQL's do). Rows of more than one
 # relation (an ambiguous match) fail closed.
+# R40, R40b: a VIEW column is trusted only as a direct passthrough of a base
+# column, proven from the view definition: its select item is exactly
+# `[db.]table.column AS name` of this database (no UNION; MySQL also lists
+# the relation in VIEW_TABLE_USAGE), and it then takes that column's type
+# (a TIMESTAMP compares by epoch, VARCHAR by the text rules, a view over a
+# view is followed). The type the view reports decides nothing: a
+# DATE_FORMAT(ts) column reports VARCHAR and ts + INTERVAL 0 SECOND
+# DATETIME, yet both read the session zone. Any other view column is
+# 'unproven', and a scope compare on it is refused (query_rule_not_evaluable,
+# reason view_column_unproven).
 sub _column_data_types {
+    my ($self, $table, $depth) = @_;
+    my $types = $self->_relation_column_types($table);
+    my $sources = $self->_view_column_sources($table);
+    return $types unless $sources;
+    Selecto::Error->throw('query_rule_not_evaluable', 'views nest too deeply to resolve their columns',
+        {reason => 'view_column_unproven', relation => "$table"}) if ($depth // 0) > 8;
+    my %resolved;
+    for my $column (keys %$types) {
+        my $source = $sources->{$column};
+        my $base = $source ? $self->_column_data_types($source->[0], ($depth // 0) + 1)->{lc $source->[1]} : undef;
+        $resolved{$column} = defined($base) ? $base : 'unproven';
+    }
+    return \%resolved;
+}
+
+# {lower-case view column => [base relation, base column]} for the direct
+# passthrough columns of a view, or undef when $table is no view.
+sub _view_column_sources {
+    my ($self, $table) = @_;
+    my $dbh = $self->{dbh};
+    my $sensitive = $self->_table_names_case_sensitive;
+    my $views;
+    my $ok = eval {
+        $views = $dbh->selectall_arrayref($self->_statement_sql(q{SELECT VIEW_DEFINITION FROM information_schema.VIEWS
+            WHERE TABLE_SCHEMA = DATABASE() AND } . ($sensitive ? 'BINARY TABLE_NAME = BINARY ?' : 'TABLE_NAME = ?')), undef, "$table");
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return undef unless @$views;
+    my %sources;
+    return \%sources if @$views > 1;
+    my $definition = $views->[0][0];
+    return \%sources unless defined($definition) && $definition !~ /\bunion\b/i;
+    my ($database) = $dbh->selectrow_array($self->_statement_sql('SELECT DATABASE()'));
+    my $name = qr/`(?:``|[^`])+`/;
+    my %used;
+    if ($self->name eq 'mysql') {
+        # MySQL 8.0.13+ records the relations a view reads.
+        my $rows = eval { $dbh->selectall_arrayref($self->_statement_sql(q{SELECT TABLE_NAME FROM information_schema.VIEW_TABLE_USAGE
+            WHERE VIEW_SCHEMA = DATABASE() AND TABLE_SCHEMA = DATABASE() AND }
+            . ($sensitive ? 'BINARY VIEW_NAME = BINARY ?' : 'VIEW_NAME = ?')), undef, "$table") } // [];
+        %used = map { ($self->_table_key($_->[0]) => 1) } @$rows;
+    }
+    while ($definition =~ /(?:\bselect\s+(?:distinct\s+)?|,)\s*((?:$name\.){1,2}$name)\s+AS\s+($name)(?=\s*(?:,|\bfrom\b|\z))/gi) {
+        my ($reference, $alias) = ($1, $2);
+        my @parts = map { substr($_, 1, -1) =~ s/``/`/gr } $reference =~ /($name)/g;
+        my ($base_database, $base_table, $base_column) = @parts == 3 ? @parts : (undef, @parts);
+        next if defined($base_database) && (!defined($database) || $base_database ne $database);
+        next if $self->name eq 'mysql' && !$used{$self->_table_key($base_table)};
+        $sources{lc(substr($alias, 1, -1) =~ s/``/`/gr)} = [$base_table, $base_column];
+    }
+    return \%sources;
+}
+
+sub _refuse_unproven_view_column {
+    my ($table, $column) = @_;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a scope comparison names a view column that is not a proven passthrough of a base column',
+        {reason => 'view_column_unproven', relation => "$table", field => "$column"});
+}
+
+sub _relation_column_types {
     my ($self, $table) = @_;
     my $sensitive = $self->_table_names_case_sensitive;
     my $rows;
