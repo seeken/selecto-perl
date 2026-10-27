@@ -30,7 +30,19 @@ plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not configured' unless defin
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
 
 my ($dsn, $username, $password) = Selecto::Certification::_connection_parts($url);
+# The statement a read ran: the adapter's session-state checks (pg_catalog
+# snapshots before and after each read) run around it.
+sub last_query {
+    my ($handle) = @_;
+    return (grep { !/\ASELECT (?:pg_catalog\.concat_ws|\(SELECT pg_catalog\.count)/ } @{$handle->{private_prepared} // []})[-1] // '';
+}
 sub connect_db {
+    my $handle = _connect_db();
+    $handle->{private_prepared} = [];
+    $handle->{Callbacks} = {prepare => sub { my $seen = $_[0]{private_prepared}; push @$seen, $_[1]; splice(@$seen, 0, -20); return; }};
+    return $handle;
+}
+sub _connect_db {
     return DBI->connect($dsn, $username, $password, {
         RaiseError => 1, PrintError => 0, AutoCommit => 1, pg_enable_utf8 => 1,
     });
@@ -192,7 +204,7 @@ for my $setting (@settings) {
                 [map { $formatted{$_} ? $iso_rows->[$r][$_] : $same_rows->[$r][$_] } 0 .. $#{$same_rows->[$r]}]
             } 0 .. $#$same_rows];
             my $got = $sql_engine->all($query)->{rows};
-            my $ran_formatted = $dbh->{Statement} =~ $FORMATTED ? 1 : 0;
+            my $ran_formatted = last_query($dbh) =~ $FORMATTED ? 1 : 0;
             is($ran_formatted, $unformatted{$name} ? 0 : 1,
                 "$name " . ($unformatted{$name} ? 'decoded in Perl' : 'ran formatted SQL'));
             same_rows($got, $expected, "$name: SQL canonical values equal the Perl decode"
@@ -230,8 +242,8 @@ subtest 'the formatted SQL sorts and groups the underlying values' => sub {
     my $query = $sql_engine->query->select('n', 'id')->where($x->in('id', [map { $_ } 1 .. $rows]))
         ->order_by('n')->order_by('id');
     my $got = [map { $_->[0] } @{$sql_engine->all($query)->{rows}}];
-    like($dbh->{Statement}, $FORMATTED, 'formatted');
-    unlike($dbh->{Statement}, qr/ORDER BY (?:\d|"n")/, 'ordered by the expression, never by position or name');
+    like(last_query($dbh), $FORMATTED, 'formatted');
+    unlike(last_query($dbh), qr/ORDER BY (?:\d|"n")/, 'ordered by the expression, never by position or name');
     my $perl = [map { $_->[0] } @{$perl_engine->all($query)->{rows}}];
     is_deeply($got, $perl, 'same order as the unformatted statement');
     my @defined = grep { defined && $_ =~ /\A-?\d/ } @$got;
@@ -239,7 +251,7 @@ subtest 'the formatted SQL sorts and groups the underlying values' => sub {
     $dbh->do(q{SET DateStyle = 'SQL, DMY'});
     my $days = $sql_engine->query->select('d', $x->count('id')->as('count'))->group_by('d')->order_by('d');
     my $grouped = $sql_engine->all($days)->{rows};
-    like($dbh->{Statement}, qr/GROUP BY "s0"\."d" ORDER BY "s0"\."d"/, 'grouped and ordered by the column');
+    like(last_query($dbh), qr/GROUP BY "s0"\."d" ORDER BY "s0"\."d"/, 'grouped and ordered by the column');
     $dbh->do('RESET DateStyle');
     my @dates = map { $_->[0] } @$grouped;
     is_deeply(\@dates, [map { $_->[0] } @{$perl_engine->all($days)->{rows}}], 'dates in date order');
@@ -251,7 +263,7 @@ subtest 'every result is formatted, whatever its size' => sub {
     my $few = $sql_engine->query->select('id', 'n', 'ts')->where($x->lte('id', 3))->order_by('id');
     same_rows($sql_engine->all($few)->{rows}, $perl_engine->all($few)->{rows}, 'three rows');
     $sql_engine->all($few);
-    like($dbh->{Statement}, $FORMATTED, 'formatted on the first run');
+    like(last_query($dbh), $FORMATTED, 'formatted on the first run');
 };
 
 subtest 'streams' => sub {
@@ -263,7 +275,7 @@ subtest 'streams' => sub {
         $raw_engine->all($query)->{rows}, 'a bounded stream holds driver values by default');
     same_rows($collect->($raw_engine->stream($query, canonical_values => 1)), $expected,
         'canonical_values => 1 streams canonical values, decoded in Perl by default');
-    unlike($dbh->{Statement}, $FORMATTED, 'from the unformatted statement');
+    unlike(last_query($dbh), $FORMATTED, 'from the unformatted statement');
     same_rows($collect->($raw_engine->stream($query, bounded => 1, fetch_size => 7, canonical_values => 1)),
         $expected, 'and so does a bounded stream');
     require Selecto::BoundedQuery;
@@ -326,7 +338,7 @@ subtest 'declared types' => sub {
     my ($engine, $perl) = ($make->(), $make->(canonical_sql => 0));
     my $query = $engine->query->select(qw(id money naive naive_utc aware day text_day text_amount))->order_by('id');
     my $got = $engine->all($query)->{rows};
-    like($handle->{Statement}, $FORMATTED, 'formatted in SQL');
+    like(last_query($handle), $FORMATTED, 'formatted in SQL');
     same_rows($got, $perl->all($query)->{rows}, 'the column type picks the formatter: a domain over NUMERIC, '
         . 'timestamps declared as the other kind or as a date, and text declared date or decimal');
     my $zoned = $query->use_timezone('Asia/Kolkata');
@@ -351,14 +363,14 @@ subtest 'declared types' => sub {
 subtest 'formatting is opt-in and version-gated' => sub {
     my $query = $queries{numeric_order};
     $perl_engine->all($query);
-    unlike($dbh->{Statement}, $FORMATTED, 'by default canonical values are decoded in Perl');
+    unlike(last_query($dbh), $FORMATTED, 'by default canonical values are decoded in Perl');
     is($perl_engine->adapter->canonical_sql, 0, 'canonical_sql is 0 by default');
     is_deeply([$perl_engine->adapter->_canonical_columns($perl_engine->compile($queries{all_columns}))], [],
         'and nothing is formatted');
     $raw_sql_engine->all($query, canonical_values => 1);
-    like($dbh->{Statement}, $FORMATTED, 'canonical_sql => 1 formats in SQL');
+    like(last_query($dbh), $FORMATTED, 'canonical_sql => 1 formats in SQL');
     $raw_sql_engine->all($query);
-    unlike($dbh->{Statement}, $FORMATTED, 'only when canonical values are asked for');
+    unlike(last_query($dbh), $FORMATTED, 'only when canonical values are asked for');
     my $statement = $sql_engine->compile($queries{all_columns});
     is_deeply([$sql_engine->adapter->_canonical_columns($statement)], [2, 3, 4, 7, 8, 9],
         'numeric, timestamp, timestamptz and date columns are formatted');

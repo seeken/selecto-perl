@@ -35,10 +35,17 @@ sub new {
         } else {
             $adapter->_begin_transaction;
             $self->{scope} = 'own';
-            # The marker proves at close that the transaction is still this
-            # stream's own before it is rolled back.
-            _do($dbh, "SET TRANSACTION READ ONLY; SET LOCAL selecto.guard = '$name'");
+            _do($dbh, 'SET TRANSACTION READ ONLY');
+            # The transaction's virtual id proves at close that it is still
+            # this stream's own before it is rolled back. No statement can
+            # forge it, unlike a GUC marker (item 57).
+            $self->{transaction} = $adapter->_virtual_transaction_id;
+            die 'stream transaction identity is unavailable' unless defined $self->{transaction};
         }
+        # Temp shadows refused and the session snapshot taken before the
+        # cursor; every FETCH is compared with it (items 56, 61).
+        $self->{session} = $adapter->_pg_admit_session($args{statement}->sql)
+            if $adapter->_pg_session_checked;
         my $declaration = $dbh->prepare('DECLARE ' . $name . ' NO SCROLL CURSOR WITHOUT HOLD FOR '
             . $adapter->_query_transport_sql($args{statement}));
         die 'cursor declaration could not be prepared' unless $declaration;
@@ -76,14 +83,27 @@ sub next {
         $self->{types} //= [$self->{adapter}->_column_types($sth)];
         $rows = $sth->fetchall_arrayref;
         die 'cursor row fetch failed' if !$rows || $sth->err;
-        $self->{adapter}->_decode_rows($rows, $self->{types}) if $self->{canonical_values};
         $sth->finish;
+        # Nothing of a batch is handed out before its session check: a
+        # function the statement calls may have switched search_path or made
+        # a temp relation while the server produced it.
+        if ($self->{session}) {
+            my $after = eval { $self->{adapter}->_pg_session_state };
+            unless ($after && $after->{snapshot} eq $self->{session}{snapshot}) {
+                $self->{session_changed} = 1;
+                die 'session state changed';
+            }
+        }
+        $self->{adapter}->_decode_rows($rows, $self->{types}) if $self->{canonical_values};
         1;
     };
     if (!$ok) {
         # Capture PostgreSQL's error state before transaction recovery clears it.
         my $error = $self->{adapter}->normalize_error($@);
-        my $origin = $self->_failure_origin;
+        # A changed session is the stream's own work to undo: its savepoint
+        # or its own transaction is rolled back, which reverts the change.
+        my $origin = $self->{session_changed} ? 'own' : $self->_failure_origin;
+        $error = eval { Selecto::PostgreSQL::_session_changed(); 1 } ? $error : $@ if $self->{session_changed};
         my $cleanup = eval { $self->_close($origin); 1 } ? undef : $@;
         die _cleanup_error($cleanup) // $error;
     }
@@ -189,9 +209,9 @@ sub _own_transaction_unproven {
     my $marker = eval {
         local $dbh->{RaiseError} = 1;
         local $dbh->{PrintError} = 0;
-        ($dbh->selectrow_array(q{SELECT current_setting('selecto.guard', true)}))[0];
+        $self->{adapter}->_virtual_transaction_id;
     };
-    return undef if defined($marker) && $marker eq $self->{name};
+    return undef if defined($marker) && defined($self->{transaction}) && $marker eq $self->{transaction};
     return 'the host took over the connection while the stream was open';
 }
 
@@ -255,8 +275,8 @@ host result, an aborted transaction or an unknown state
 (C<transaction_state_unsafe>; see L<Selecto::PostgreSQL/TRANSACTION STATE>).
 
 A stream rolls back only what it can prove is its own. Its own transaction
-carries a marker (C<SET LOCAL selecto.guard>) that must still be in force at
-close; its own savepoint is rolled back only after its own statement failed.
+is identified by its virtual transaction id (C<pg_locks.virtualxid>), which
+must still be the open transaction's at close; its own savepoint is rolled back only after its own statement failed.
 When the host aborted the transaction while the stream was open (a failing
 statement, or a failing asynchronous query whose result is still pending),
 or took the connection over (C<ROLLBACK>, C<BEGIN>, its own writes), the
