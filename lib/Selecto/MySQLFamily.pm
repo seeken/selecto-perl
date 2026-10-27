@@ -1912,12 +1912,17 @@ sub _related_collection_text_sql {
 # - the driver returns utf8mb4 text and DATETIME values unchanged (a handle
 #   of another driver, or without utf8mb4 decoding, is refused).
 # A connection that breaks it is refused with invalid_connection before
-# anything else runs. On MariaDB a write also refuses a handle whose server
-# transaction was opened outside the driver (a raw START TRANSACTION while
-# AutoCommit is on): whether a host transaction is open is decided only by
-# the driver's AutoCommit, never by server introspection, and a write must
-# neither commit nor discard such work. Hosts open transactions with
-# begin_work (MySQL has no @@in_transaction to check this with).
+# anything else runs. A write on a handle whose driver AutoCommit is on also
+# refuses a server transaction the driver did not open: a raw BEGIN or
+# START TRANSACTION, a session autocommit=0 (an implicit transaction is open
+# from it, even before its first statement), or a pooled handle returned
+# with one left open. The adapter's own BEGIN would implicitly commit that
+# work (or its COMMIT would commit it), so a later host ROLLBACK would undo
+# nothing. Hosts open transactions with begin_work (the adapter then runs
+# the write in a savepoint). An open transaction is detected on both
+# servers by SET TRANSACTION, which the server refuses (1568) while one is
+# in progress; it names the session's own access mode, so the next
+# transaction is unchanged.
 my %UTC_ZONES = map { ($_ => 1) } ('UTC', '+00:00', 'Etc/UTC');
 
 sub _require_session {
@@ -1925,7 +1930,7 @@ sub _require_session {
     return if $self->{_selecto_session_verified};
     my $dbh = $self->{dbh};
     my $mariadb = $self->name eq 'mariadb';
-    my $open_check = $options{write} && $mariadb;
+    my $open_check = $options{write} && eval { $dbh->{AutoCommit} };
     my $refuse = sub {
         my ($reason, $message) = @_;
         Selecto::Error->throw('invalid_connection', $message, {reason => $reason});
@@ -1940,7 +1945,7 @@ sub _require_session {
         @row = $dbh->selectrow_array($self->_statement_sql('SELECT VERSION(), @@SESSION.time_zone, @@system_time_zone, '
             . '@@SESSION.character_set_client, @@SESSION.character_set_connection, @@SESSION.character_set_results, '
             . q{@@SESSION.sql_mode, CONVERT(X'F09F9880' USING utf8mb4), CAST('2024-03-10 02:30:00.5' AS DATETIME(6))}
-            . ($open_check ? ', @@in_transaction' : '')));
+            . ($open_check ? ', @@SESSION.autocommit, @@SESSION.transaction_read_only' : '')));
         1;
     };
     unless ($ok) {
@@ -1953,7 +1958,7 @@ sub _require_session {
         }
         die $self->normalize_error($error);
     }
-    my ($version, $zone, $system, $client, $connection, $results, $mode, $text, $datetime, $open) = @row;
+    my ($version, $zone, $system, $client, $connection, $results, $mode, $text, $datetime, $autocommit, $read_only) = @row;
     # A MySQL adapter on a MariaDB server (or the reverse) would compile the
     # other server's dialect: MariaDB statements without the subquery-cache
     # prefix, MySQL statements with MariaDB-only syntax.
@@ -1970,10 +1975,21 @@ sub _require_session {
     $refuse->('client_decoding', 'MySQL-family connections must return utf8mb4 text and DATETIME values unchanged')
         unless defined($text) && $text eq "\x{1F600}"
             && defined($datetime) && "$datetime" eq '2024-03-10 02:30:00.500000';
-    Selecto::Error->throw('invalid_adapter',
-        'the connection is inside a transaction its driver did not open; open host transactions with begin_work',
-        {reason => 'transaction_outside_driver'})
-        if $open_check && defined($open) && "$open" eq '1' && eval { $dbh->{AutoCommit} };
+    if ($open_check) {
+        my $outside = sub {
+            Selecto::Error->throw('invalid_adapter',
+                'the connection is inside a transaction its driver did not open; open host transactions with begin_work',
+                {reason => 'transaction_outside_driver'});
+        };
+        $outside->() unless defined($autocommit) && "$autocommit" eq '1';
+        my $probe = 'SET TRANSACTION ' . (defined($read_only) && "$read_only" eq '1' ? 'READ ONLY' : 'READ WRITE');
+        my $ok = eval { local $dbh->{PrintError} = 0; $dbh->do($probe); 1 };
+        unless ($ok) {
+            my $errno = eval { $dbh->err };
+            $outside->() if defined($errno) && "$errno" eq '1568';
+            die $self->normalize_error($@);
+        }
+    }
     return 1;
 }
 
