@@ -86,7 +86,10 @@ subtest 'a tenant range pin and BOOLEAN trusted scope' => sub {
     my $flags = Selecto::Domain->parse({schema_version => 1, name => 'Flags', schemas => {}, joins => {},
         source => {source_table => 'selecto_duck_flags', primary_key => 'id', fields => [qw(active id)],
             columns => {id => {type => 'integer'}, active => {type => 'boolean'}}, associations => {}}});
-    for my $case ([JSON::PP::true, '1'], ['false', '2'], ['maybe', 'query_rule_not_evaluable/identity_column_type']) {
+    # A plain required filter (R3 clarification) compares a non-text column
+    # natively: 'maybe' is no boolean, so the statement fails as it does on
+    # PostgreSQL rather than being refused as an identity column.
+    for my $case ([JSON::PP::true, '1'], ['false', '2'], ['maybe', 'query_error']) {
         my $scoped = Selecto::Engine->new(adapter => Selecto->adapter(duckdb => (dbh => $dbh)),
             domain => $flags->with_required_predicate($x->eq('active', $case->[0])));
         is($rows->($outcome->(sub { $scoped->all($scoped->query->select('id')) })), $case->[1], "BOOLEAN scope active = $case->[0]");

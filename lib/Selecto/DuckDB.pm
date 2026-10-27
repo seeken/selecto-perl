@@ -328,6 +328,8 @@ sub _identity_value_term {
     push @$params, $value;
     my $marker = $self->placeholder(scalar @$params);
     my $type = "typeof($column)";
+    return "(CASE WHEN $type = 'VARCHAR' THEN " . $self->_identity_bytes_sql($column) . ' = '
+        . $self->_identity_bytes_sql($marker) . " ELSE $column = $marker END)" if $self->{_selecto_required_only};
     my $integer = _canonical_integer($text);
     my $integer_sql = defined($integer)
         ? "TRY_CAST($column AS DECIMAL(38,0)) = CAST('$integer' AS DECIMAL(38,0))" : $REFUSED_NUMBER;
@@ -429,6 +431,12 @@ sub _known_cast_type {
 sub _identity_range_sql {
     my ($self, $column, $operator, $value, $type, $params) = @_;
     my $kind = "typeof($column)";
+    if ($self->{_selecto_required_only} && defined($value) && !ref($value)) {
+        push @$params, "$value";
+        my $marker = $self->placeholder(scalar @$params);
+        return "(CASE WHEN $kind = 'VARCHAR' THEN " . $self->_identity_bytes_sql($column) . " $operator "
+            . $self->_identity_bytes_sql($marker) . " ELSE $column $operator $marker END)";
+    }
     my ($text_sql, $number_sql, $other_sql) = ($REFUSED_TEXT, $REFUSED_TEXT, $REFUSED_TEXT);
     if (defined($value) && !ref($value)) {
         push @$params, "$value";
@@ -464,6 +472,21 @@ sub _declared_type {
     return ref($resolved) eq 'HASH' ? $resolved->{type} : undef;
 }
 
+# Whether $expression decides tenant, trusted or host-scope identity in the
+# strict sense of item 49: it compares a tenant or scope column, or it is a
+# node of a trusted predicate (host scope, canned page or co-domain scope,
+# write scope) or of an authored member query.
+sub _strict_identity_node {
+    my ($self, $domain, $expression) = @_;
+    for my $operand (grep { blessed($_) && $_->isa('Selecto::Expression') } @{$expression->arguments}) {
+        return 1 if $operand->kind eq 'field' && !ref($operand->arguments->[0])
+            && $self->_identity_field_exact($domain, $operand->arguments->[0]);
+    }
+    my %strict = map { (refaddr($_) => 1) } Selecto::SQL::_expression_nodes(@{$self->{_selecto_trusted_predicates} // []},
+        @{(blessed($domain) ? $domain->{_selecto_authored_predicates} : undef) // []});
+    return $strict{refaddr($expression)} ? 1 : 0;
+}
+
 # A comparison (eq, ne, IN, a range or BETWEEN) that decides identity, as
 # SQL, or undef for an ordinary one.
 sub _identity_predicate_sql {
@@ -475,6 +498,11 @@ sub _identity_predicate_sql {
         || ($self->{_selecto_host_nodes} && $self->{_selecto_host_nodes}{refaddr($expression)})
         || $self->{_selecto_in_host} ? 1 : 0;
     my $arguments = $expression->arguments;
+    # A plain required filter (R3 clarification) on a column that is not a
+    # tenant or scope column, outside the trusted and authored predicates,
+    # compares a VARCHAR by its bytes but every other type natively: the
+    # identity-type refusal (item 49) is not extended to it.
+    local $self->{_selecto_required_only} = $host && !$self->_strict_identity_node($domain, $expression) ? 1 : 0;
     return $self->_identity_text_match_sql($domain, $expression, $params, $host) if $text_match;
     my $literal = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq 'literal' };
     my $field = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind ne 'literal' };
@@ -536,8 +564,9 @@ sub _identity_text_match_sql {
     $text = $self->_escape_like("$text");
     push @$params, $kind eq 'text_contains' ? "%$text%" : $kind eq 'ends_with' ? "%$text" : "$text%";
     my $marker = $self->placeholder(scalar @$params);
+    my $other = $self->{_selecto_required_only} ? "CAST($column AS VARCHAR) LIKE $marker ESCAPE '!'" : $REFUSED_TEXT;
     return "(CASE WHEN typeof($column) = 'VARCHAR' THEN (CAST($column AS VARCHAR) COLLATE posix) LIKE $marker ESCAPE '!'"
-        . " ELSE $REFUSED_TEXT END)";
+        . " ELSE $other END)";
 }
 
 # A computed field (a predicate body, a value expression's condition, a
