@@ -102,6 +102,20 @@ for my $backend (@backends) {
             "$name $mode: only the in-scope 'B' row changed");
     }
 
+    # A scope range on a non-text column (decided by the catalog) compiles
+    # natively with its original value, once (QEW004).
+    {
+        my $engine = Selecto::Engine->new(adapter => $adapter->(), domain => $writes);
+        my $preview = $engine->adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'ssp_w',
+            assignments => {note => 'u'}, predicate => $x->eq('note', 'n'), scope_predicate => $x->gt('id', 0)));
+        unlike($preview->{sql}, qr/COLLATION|BINARY\) >/, "$name: a scope range on an INT column compiles natively");
+        is_deeply($preview->{params}, ['u', 'n', 0], "$name: with its original value, once");
+        $preview = $engine->adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'ssp_w',
+            assignments => {note => 'u'}, predicate => $x->eq('id', 1), scope_predicate => $x->gte('k', 'a')));
+        like($preview->{sql}, qr/CAST\(CONVERT\(`k` USING utf8mb4\) AS BINARY\) >= CAST/, "$name: on a VARCHAR column by bytes");
+        unlike($preview->{sql}, qr/COLLATION/, "$name: decided by the catalog, not COLLATION()");
+    }
+
     # R26 and R18
     $dbh->do('DROP TABLE IF EXISTS ' . join(', ', qw(ssp_codes ssp_ints)));
     $dbh->do('CREATE TABLE ssp_codes (id INT PRIMARY KEY, code VARCHAR(8), note VARCHAR(8)) ENGINE=InnoDB');

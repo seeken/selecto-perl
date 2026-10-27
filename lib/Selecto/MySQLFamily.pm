@@ -603,6 +603,31 @@ sub _integer_text_storage {
     return defined($stored) && $stored =~ $TEXT_STORAGE ? 1 : 0;
 }
 
+# The catalog DATA_TYPE of a stored field's own column (R18: its own
+# relation), or undef when the catalog cannot describe it (a member or CTE
+# source, a computed field, no live handle).
+sub _stored_column_type {
+    my ($self, $domain, $operand) = @_;
+    return undef unless blessed($operand) && $operand->isa('Selecto::Expression') && $operand->kind eq 'field'
+        && !ref($operand->arguments->[0]);
+    my $path = $operand->arguments->[0];
+    return undef if "$path" =~ /\./ && ref($self->{_query_sources}) eq 'HASH'
+        && exists $self->{_query_sources}{(split /\./, "$path")[0]};
+    my $resolved = eval { $domain->resolve("$path") };
+    return undef unless ref($resolved) eq 'HASH' && defined $resolved->{field};
+    my $metadata = $resolved->{association} ? eval { $domain->_field_metadata_view("$path") } : eval { $domain->field_metadata("$path") };
+    return undef if ref($metadata) eq 'HASH' && ref($metadata->{computed}) eq 'HASH';
+    my $association = $resolved->{association};
+    my $table = $association ? $association->table : $domain->table;
+    return undef if !defined($table) || ref($table) || ($association && $association->join_mode eq 'star_dimension');
+    my $dbh = $self->{dbh};
+    return undef unless eval { $dbh->isa('DBI::db') && $dbh->{Active} };
+    my $catalog = $self->{_selecto_column_catalog} // {};
+    my $types = $catalog->{lc $table} //= $self->_column_data_types($table);
+    my $stored = $types->{lc $resolved->{field}};
+    return defined($stored) && length($stored) ? $stored : undef;
+}
+
 sub _canonical_integer_text {
     my ($value) = @_;
     Selecto::Error->throw('query_rule_not_evaluable',
@@ -635,6 +660,8 @@ sub _identity_text_range_sql {
     }
     _refuse_integer_text_storage() if $self->_integer_text_storage($domain, $operand);
     my $exact = $self->_identity_operand_field($domain, $operand) or return undef;
+    my $stored = $self->_stored_column_type($domain, $operand);
+    $exact = $stored =~ $TEXT_STORAGE ? 1 : return undef if defined $stored;
     Selecto::Error->throw('query_rule_not_evaluable',
         'a case-insensitive match on a tenant or scope text column cannot be compared exactly',
         {reason => 'inexact_text'}) if $kind =~ /_ci\z/;
@@ -874,8 +901,14 @@ sub _write_text_range_sql {
         {reason => 'timestamp_operator', field => "$field"}) if $text && $timestamps && $timestamps->{lc $field};
     # A TIMESTAMP range compares by epoch (below).
     return undef if $timestamps && $timestamps->{lc $field};
+    # The stored type decides when the catalog describes the column: text is
+    # compared by bytes, anything else natively with the original value;
+    # only a column the catalog cannot describe falls back to the declared
+    # type and the server's COLLATION().
+    my $storage = $self->{_selecto_write_storage};
+    my $stored = ref($storage) eq 'HASH' ? $storage->{lc $field} : undef;
     my $command_types = $self->{_selecto_write_types} // {};
-    my $exact = Selecto::SQL::_identity_text_type($command_types->{$field});
+    my $exact = defined($stored) ? ($stored =~ $TEXT_STORAGE ? 1 : 0) : Selecto::SQL::_identity_text_type($command_types->{$field});
     return undef unless $exact;
     return undef if $kind =~ /\A(?:gt|gte|lt|lte|between)_ci\z/;
     Selecto::Error->throw('query_rule_not_evaluable',
@@ -934,6 +967,15 @@ sub _scope_alias {
     $self->{_selecto_write_scope_nodes}{refaddr($to)} = 1
         if $self->{_selecto_write_scope_nodes} && $self->{_selecto_write_scope_nodes}{refaddr($from)};
     return $to;
+}
+
+# The write relation's catalog column types (lower-case names), or undef
+# when the catalog cannot be read for it.
+sub _write_storage_types {
+    my ($self, $command) = @_;
+    my $dbh = $self->{dbh};
+    return undef unless blessed($command) && $command->can('relation') && eval { $dbh->isa('DBI::db') && $dbh->{Active} };
+    return $self->_column_data_types(Selecto::Identifier::checked($command->relation));
 }
 
 sub _write_field_types {
@@ -1619,6 +1661,7 @@ sub _compile_write {
     local $self->{_selecto_write_types} = _write_field_types($command);
     local $self->{_selecto_write_tenant_fields} = _write_tenant_fields($command);
     local $self->{_selecto_write_integer_text} = $self->_write_integer_text_columns($command);
+    local $self->{_selecto_write_storage} = $self->_write_storage_types($command);
     local $self->{_selecto_bind_copies} = [];
     my $compiled = $self->SUPER::_compile_write($command);
     # The logical parameter sequence: the bound values with each exact
@@ -1850,6 +1893,7 @@ sub _execute_compiled_write_unchecked {
     local $self->{_selecto_write_types} = _write_field_types($command);
     local $self->{_selecto_write_tenant_fields} = _write_tenant_fields($command);
     local $self->{_selecto_write_integer_text} = $self->_write_integer_text_columns($command);
+    local $self->{_selecto_write_storage} = $self->_write_storage_types($command);
     my $operation = $command->operation;
     # Every write may be refused after its statement (cardinality, row
     # ceiling, post-image, RETURNING and stored-row checks, an AFTER trigger
