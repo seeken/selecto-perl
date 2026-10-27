@@ -411,7 +411,7 @@ sub _compile_single {
     my $group_sql = join(', ', map {
         my $key = _expression_key($_);
         $self->_reuses_parameter_identity && exists($compiled_selections{$key})
-            ? $compiled_selections{$key}
+            ? $self->_reused_group_sql($compiled_selections{$key}, $_, $byte_groups)
             : $self->_compile_group_expression($domain, $_, \@params, $byte_groups)
     } @$groups);
     if (@$groups) {
@@ -502,6 +502,10 @@ sub _compile_group_expression {
     my ($self, $domain, $expression, $params) = @_;
     return $self->_compile_expression($domain, $expression, $params);
 }
+
+# A group key reusing a selection's compiled SQL (dialects with numbered
+# parameters); a dialect that groups member keys exactly wraps it.
+sub _reused_group_sql { return $_[1]; }
 
 # Whether a member query's groups must group exactly: it has an output
 # paired with its root as identity (a join or correlation), however that
