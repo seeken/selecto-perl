@@ -243,6 +243,7 @@ sub stream_query {
     Selecto::Error->throw('unsupported_feature', 'MySQL-family date formats cannot be streamed')
         if blessed($statement) && $statement->{_selecto_formatters};
     my $state = $self->_require_session;
+    $self->_refuse_read_temporary_shadows($statement);
     my $stream = $self->SUPER::stream_query($statement, %options);
     # A stored result (the DBD::MariaDB default) was produced in full by the
     # statement, so the session is compared once now; a use_result stream is
@@ -1693,6 +1694,53 @@ sub _refuse_before_insert_triggers {
     return;
 }
 
+# Reads refuse a relation a session TEMPORARY table shadows, as writes do
+# (item 27): the statement would read the temporary table while every
+# catalog lookup (column types, keys, engines) describes the base table or
+# view of that name. A temporary table that is itself the domain relation
+# (no base table or view of its name) is the host's own and stays readable.
+# The relations are those the generated SQL reads (every FROM or JOIN of a
+# quoted name: root, joins, bridges, members, correlated subqueries). MariaDB
+# lists the session's temporary tables in information_schema.TABLES; MySQL
+# 8.4 does not, so each base name is checked with SHOW CREATE TABLE.
+sub _refuse_read_temporary_shadows {
+    my ($self, $statement) = @_;
+    my $sql = blessed($statement) && $statement->can('sql') ? $statement->sql : undef;
+    return unless defined $sql;
+    my %names;
+    $names{$1 =~ s/``/`/gr} = 1 while $sql =~ /\b(?:FROM|JOIN)\s+`((?:``|[^`])+)`(?!\s*\.)/gi;
+    return unless %names;
+    my $dbh = $self->{dbh};
+    my @names = sort keys %names;
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable', 'a temporary table shadows a relation the read uses',
+            {reason => 'temporary_shadow', relation => $_[0]});
+    };
+    my $rows;
+    my $ok = eval {
+        $rows = $dbh->selectall_arrayref($self->_statement_sql('SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES'
+            . ' WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (' . join(', ', ('?') x @names) . ')'), undef, @names);
+        defined($rows) or die Selecto::SQL::_dbi_error($dbh, 'catalog read failed');
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my (%base, %temporary);
+    for my $row (@$rows) {
+        my ($name, $type) = @$row;
+        next unless defined $name;
+        if (uc($type // '') eq 'TEMPORARY') { $temporary{lc $name} = $name } else { $base{lc $name} = $name }
+    }
+    for my $key (sort keys %base) {
+        $refuse->($base{$key}) if $temporary{$key};
+        next if $self->name eq 'mariadb';
+        my @shown;
+        $ok = eval { @shown = $dbh->selectrow_array($self->_statement_sql('SHOW CREATE TABLE ' . $self->quote_identifier($base{$key}))); 1 };
+        die $self->normalize_error($@) unless $ok;
+        $refuse->($base{$key}) if !defined($shown[1]) || $shown[1] =~ /\A\s*CREATE\s+TEMPORARY\b/i;
+    }
+    return;
+}
+
 # A session TEMPORARY table of the same name shadows the base table for this
 # connection's DML, while information_schema describes the base table: the
 # storage and key checks would read another table's definition.
@@ -1958,6 +2006,7 @@ sub _column_types {
 sub execute_query {
     my ($self, $statement, %options) = @_;
     my $state = $self->_require_session;
+    $self->_refuse_read_temporary_shadows($statement);
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
     my $result = $self->SUPER::execute_query($statement);
     # A view's stored function can SET time_zone or sql_mode mid-statement;
