@@ -34,7 +34,7 @@ my ($dsn, $username, $password) = Selecto::Certification::_connection_parts($url
 # snapshots before and after each read) run around it.
 sub last_query {
     my ($handle) = @_;
-    return (grep { !/\ASELECT (?:pg_catalog\.concat_ws|\(SELECT pg_catalog\.count)/ } @{$handle->{private_prepared} // []})[-1] // '';
+    return (grep { !/\ASELECT (?:pg_catalog\.concat_ws|\(SELECT pg_catalog\.count|pg_catalog\.set_config|\(SELECT s\.reset_val|pg_catalog\.quote_ident)|\AWITH h AS MATERIALIZED/ } @{$handle->{private_prepared} // []})[-1] // '';
 }
 sub connect_db {
     my $handle = _connect_db();
@@ -355,7 +355,7 @@ subtest 'declared types' => sub {
     ok($error && $perl_error, 'a missing table fails both ways');
     is($error->code, $perl_error->code, 'with the same code');
     is_deeply($error->details, $perl_error->details, 'and the same details, SQLSTATE included');
-    is($error->details->{sqlstate}, '42P01', 'undefined_table');
+    is($error->details->{reason}, 'relation_unresolved', 'a relation that no longer resolves is refused before any SQL runs (R29)');
     $handle->do("DROP DOMAIN selecto_perl_test_amount");
     $handle->disconnect;
 };
