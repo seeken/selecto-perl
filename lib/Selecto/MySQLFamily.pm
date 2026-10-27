@@ -1591,8 +1591,23 @@ sub _inserted_identity {
             if !defined($value) || ref($value);
         return $value;
     };
+    my $table = Selecto::Identifier::checked($command->relation);
+    # An AUTO_INCREMENT column assigned a value the server reads as zero
+    # ('0', '00', ' 0', '0.0', '-0', FALSE: anything it converts to 0)
+    # gets a generated value unless NO_AUTO_VALUE_ON_ZERO is set, so a
+    # re-read by the assigned value would find another row (id 0's). Such
+    # a column re-reads only by a canonical nonzero integer; any other
+    # spelling is refused rather than guessed.
+    my $exact_auto = sub {
+        my ($field, $value) = @_;
+        return $value unless $self->_auto_increment_column($table, $field);
+        Selecto::Error->throw('write_capability_missing',
+            'MySQL-family RETURNING requires a canonical nonzero value for an AUTO_INCREMENT key', {field => $field})
+            unless "$value" =~ /\A-?[1-9]\d{0,19}\z/;
+        return $value;
+    };
     if ($command->operation eq 'upsert') {
-        my @terms = map { Selecto::Expression->eq($_, $literal->($_)) } @{$command->metadata->{conflict_target}};
+        my @terms = map { Selecto::Expression->eq($_, $exact_auto->($_, $literal->($_))) } @{$command->metadata->{conflict_target}};
         return @terms == 1 ? $terms[0] : Selecto::Expression->all(@terms);
     }
     if (exists $assignments->{$key}) {
@@ -1600,24 +1615,32 @@ sub _inserted_identity {
         my $generated = !defined($value)
             || (blessed($value) && $value->isa('Selecto::Write::Expression')
                 && ($value->kind eq 'default' || ($value->kind eq 'literal' && !defined($value->arguments->[0]))));
-        return Selecto::Expression->eq($key, $literal->($key)) unless $generated;
+        return Selecto::Expression->eq($key, $exact_auto->($key, $literal->($key))) unless $generated;
     }
     # A column of a composite key must be assigned.
     Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires every key column',
         {field => $key}) if $assigned_only;
-    my $table = Selecto::Identifier::checked($command->relation);
-    my ($extra, $id);
-    my $ok = eval {
-        ($extra) = $self->dbh->selectrow_array($self->_statement_sql(q{SELECT EXTRA FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?}), undef, $table, $key);
-        $id = $self->dbh->{mariadb_insertid};
-        1;
-    };
+    my $id;
+    my $ok = eval { $id = $self->dbh->{mariadb_insertid}; 1 };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('write_capability_missing',
         'MySQL-family RETURNING requires an assigned or AUTO_INCREMENT primary key')
-        unless defined($extra) && $extra =~ /\bauto_increment\b/i && defined($id) && "$id" =~ /\A[1-9]\d*\z/;
+        unless $self->_auto_increment_column($table, $key) && defined($id) && "$id" =~ /\A[1-9]\d*\z/;
     return Selecto::Expression->eq($key, "$id");
+}
+
+# Whether $column of $table (in the current database) is AUTO_INCREMENT,
+# read from the catalog in the write's transaction.
+sub _auto_increment_column {
+    my ($self, $table, $column) = @_;
+    my $extra;
+    my $ok = eval {
+        ($extra) = $self->dbh->selectrow_array($self->_statement_sql(q{SELECT EXTRA FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?}), undef, $table, $column);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return defined($extra) && $extra =~ /\bauto_increment\b/i ? 1 : 0;
 }
 
 # The top-level eq/IN conjuncts of the write scope on its tenant columns
