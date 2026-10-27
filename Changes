@@ -54,6 +54,19 @@ Unreleased
       their base type) and whose index uses the column's own collation and
       the default operator class; date, timestamp, float, network and other
       keys are refused (query_rule_not_evaluable).
+    - Review R18 R24 R25 R26 R28 (MySQL family and DuckDB): a write's scope
+      is its scope predicate and query enforcement only, so a caller's own
+      predicate on a column the scope compares keeps the server's
+      collation (tenant columns stay exact everywhere). A column declared
+      integer but stored as text (decided by the catalog of its own
+      relation) compares the canonical integer text by bytes in scope
+      ('01', ' 1', '1 ' and '1x' never stand for 1); other scope compares
+      on it are refused (integer_text_storage on MySQL-family,
+      inexact_text on DuckDB). The MySQL-family read temporary-shadow
+      check looks only at relations: those the compile recorded and every
+      name in a relation position, so a temporary table named like a
+      column no longer refuses a read. Query-member filters were already
+      host scope (tests added).
     - Review R3 clarification, R15, R16: a plain required filter on a
       VARCHAR column compares bytes on DuckDB, MySQL and MariaDB even on a
       domain with no tenant, and DuckDB no longer refuses required filters

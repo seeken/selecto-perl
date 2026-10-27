@@ -91,6 +91,7 @@ t/mysql_host_savepoint_collision_live.t
 t/mysql_association_timestamp_pin_live.t
 t/mysql_auto_increment_zero_live.t
 t/mysql_transaction_outside_driver_live.t
+t/mysql_scope_provenance_live.t
 t/mysql_scope_exactness_live.t
 t/mysql_session_state_live.t
 t/mysql_read_temporary_shadow_live.t
@@ -194,6 +195,7 @@ t/mssql_decimal_scale.t
 t/mssql_bound_scope_refusals.t
 t/duckdb_bound_scope_refusals.t
 t/duckdb_external_post_statement_checks.t
+t/duckdb_scope_provenance.t
 t/duckdb_identity_text_match.t
 t/duckdb_identity_exactness.t
 t/duckdb_member_group_identity.t

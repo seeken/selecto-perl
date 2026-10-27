@@ -328,14 +328,18 @@ sub _identity_value_term {
     push @$params, $value;
     my $marker = $self->placeholder(scalar @$params);
     my $type = "typeof($column)";
-    return "(CASE WHEN $type = 'VARCHAR' THEN " . $self->_identity_bytes_sql($column) . ' = '
-        . $self->_identity_bytes_sql($marker) . " ELSE $column = $marker END)" if $self->{_selecto_required_only};
     my $integer = _canonical_integer($text);
+    # R26: a column declared integer over VARCHAR storage compares the
+    # canonical integer text by bytes (so '01', ' 1' and '1x' never equal 1);
+    # a value that is no integer is refused.
+    my $varchar_sql = !$self->{_selecto_declared_integer}
+        ? $self->_identity_bytes_sql($column) . ' = ' . $self->_identity_bytes_sql($marker)
+        : defined($integer) ? $self->_identity_bytes_sql($column) . " = encode('$integer')" : $REFUSED_NUMBER;
+    return "(CASE WHEN $type = 'VARCHAR' THEN $varchar_sql ELSE $column = $marker END)" if $self->{_selecto_required_only};
     my $integer_sql = defined($integer)
         ? "TRY_CAST($column AS DECIMAL(38,0)) = CAST('$integer' AS DECIMAL(38,0))" : $REFUSED_NUMBER;
     my $boolean_sql = defined($boolean) ? "TRY_CAST($column AS BOOLEAN) = $boolean" : $REFUSED_BOOLEAN;
-    return "(CASE WHEN $type = 'VARCHAR' THEN " . $self->_identity_bytes_sql($column) . ' = '
-        . $self->_identity_bytes_sql($marker)
+    return "(CASE WHEN $type = 'VARCHAR' THEN $varchar_sql"
         . " WHEN $type IN $INTEGER_TYPES THEN $integer_sql"
         . " WHEN $type = 'UUID' THEN CAST($column AS VARCHAR) = CAST(TRY_CAST(CAST($marker AS VARCHAR) AS UUID) AS VARCHAR)"
         . " WHEN $type = 'BOOLEAN' THEN $boolean_sql"
@@ -434,14 +438,16 @@ sub _identity_range_sql {
     if ($self->{_selecto_required_only} && defined($value) && !ref($value)) {
         push @$params, "$value";
         my $marker = $self->placeholder(scalar @$params);
-        return "(CASE WHEN $kind = 'VARCHAR' THEN " . $self->_identity_bytes_sql($column) . " $operator "
-            . $self->_identity_bytes_sql($marker) . " ELSE $column $operator $marker END)";
+        my $varchar = $self->{_selecto_declared_integer} ? $REFUSED_TEXT
+            : $self->_identity_bytes_sql($column) . " $operator " . $self->_identity_bytes_sql($marker);
+        return "(CASE WHEN $kind = 'VARCHAR' THEN $varchar ELSE $column $operator $marker END)";
     }
     my ($text_sql, $number_sql, $other_sql) = ($REFUSED_TEXT, $REFUSED_TEXT, $REFUSED_TEXT);
     if (defined($value) && !ref($value)) {
         push @$params, "$value";
         my $marker = $self->placeholder(scalar @$params);
-        $text_sql = $self->_identity_bytes_sql($column) . " $operator " . $self->_identity_bytes_sql($marker);
+        $text_sql = $self->_identity_bytes_sql($column) . " $operator " . $self->_identity_bytes_sql($marker)
+            unless $self->{_selecto_declared_integer};
         my $number = _exact_decimal("$value");
         $number_sql = "TRY_CAST($column AS DECIMAL(38,18)) $operator CAST('$number' AS DECIMAL(38,18))" if defined $number;
         $other_sql = "$column $operator $marker" if _known_cast_type($type);
@@ -503,6 +509,12 @@ sub _identity_predicate_sql {
     # compares a VARCHAR by its bytes but every other type natively: the
     # identity-type refusal (item 49) is not extended to it.
     local $self->{_selecto_required_only} = $host && !$self->_strict_identity_node($domain, $expression) ? 1 : 0;
+    my ($subject) = @$arguments;
+    $subject = $arguments->[1] if !(blessed($subject) && $subject->isa('Selecto::Expression') && $subject->kind eq 'field')
+        && blessed($arguments->[1]) && $arguments->[1]->isa('Selecto::Expression') && $arguments->[1]->kind eq 'field';
+    my $declared = $self->_declared_type($domain, $subject);
+    local $self->{_selecto_declared_integer} = defined($declared) && !ref($declared)
+        && "$declared" =~ /\A(?:integer|int|bigint|smallint|tinyint|mediumint|serial|bigserial)\z/i ? 1 : 0;
     return $self->_identity_text_match_sql($domain, $expression, $params, $host) if $text_match;
     my $literal = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq 'literal' };
     my $field = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind ne 'literal' };
@@ -565,7 +577,8 @@ sub _identity_text_match_sql {
     push @$params, $kind eq 'text_contains' ? "%$text%" : $kind eq 'ends_with' ? "%$text" : "$text%";
     my $marker = $self->placeholder(scalar @$params);
     my $other = $self->{_selecto_required_only} ? "CAST($column AS VARCHAR) LIKE $marker ESCAPE '!'" : $REFUSED_TEXT;
-    return "(CASE WHEN typeof($column) = 'VARCHAR' THEN (CAST($column AS VARCHAR) COLLATE posix) LIKE $marker ESCAPE '!'"
+    my $varchar = $self->{_selecto_declared_integer} ? $REFUSED_TEXT : "(CAST($column AS VARCHAR) COLLATE posix) LIKE $marker ESCAPE '!'";
+    return "(CASE WHEN typeof($column) = 'VARCHAR' THEN $varchar"
         . " ELSE $other END)";
 }
 
@@ -613,18 +626,34 @@ sub _write_identity_columns {
         ? map { Selecto::Expression->field_references($_) } grep { defined } $command->scope_predicate,
             defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef
         : ();
-    return {map { ($_ => {type => $types->{$_}}) } grep { defined($_) && !ref($_) && !/\./ } @$fields, @host};
+    my %tenant = map { ($_ => 1) } grep { defined($_) && !ref($_) } @$fields;
+    return {map { ($_ => {type => $types->{$_}, tenant => $tenant{$_} ? 1 : 0}) } grep { defined($_) && !ref($_) && !/\./ } @$fields, @host};
+}
+
+# Every expression node of a write's scope (scope predicate, query
+# enforcement, post-image scope): only these, and the tenant columns, take
+# the identity compare; the caller's own predicate keeps DuckDB's semantics
+# (item 55, R25).
+sub _write_scope_nodes {
+    my ($command) = @_;
+    return {} unless blessed($command) && $command->can('scope_predicate');
+    my $metadata = $command->can('metadata') ? $command->metadata : {};
+    return {map { (refaddr($_) => 1) } Selecto::SQL::_expression_nodes($command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
+        ref($metadata) eq 'HASH' ? $metadata->{__selecto_post_image_scope} : undef)};
 }
 
 sub _compile_write {
     my ($self, $command) = @_;
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
+    local $self->{_selecto_write_scope_nodes} = _write_scope_nodes($command);
     return $self->SUPER::_compile_write($command);
 }
 
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, @rest) = @_;
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
+    local $self->{_selecto_write_scope_nodes} = _write_scope_nodes($command);
     return $self->SUPER::_execute_compiled_write_in_transaction($command, @rest);
 }
 
@@ -637,7 +666,8 @@ sub _compile_write_predicate {
         my ($left, $right) = @{$expression->arguments};
         my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
             ? $left->arguments->[0] : undef;
-        if (defined($field) && !ref($field) && $columns->{$field}) {
+        my $scoped = $self->{_selecto_write_scope_nodes} && $self->{_selecto_write_scope_nodes}{refaddr($expression)};
+        if (defined($field) && !ref($field) && $columns->{$field} && ($scoped || $columns->{$field}{tenant})) {
             my $column = $self->quote_identifier(Selecto::Identifier::checked($field));
             if ($kind eq 'in') {
                 Selecto::Error->throw('query_rule_unsupported_predicate', 'query-enforced IN requires values')
