@@ -1232,7 +1232,15 @@ my $SESSION_COLUMNS = join(', ',
         . qq{WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), }
         . q{COALESCE((SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', t.oid, t.xmin, t.typname), ',' ORDER BY t.oid) }
         . qq{FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), 'end')},
-    map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS);
+    (map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS),
+    # User-defined deferrable triggers in the database (R23): a write is
+    # refused while any exists. Not part of the compared snapshot.
+    q{(SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal }
+        . q{AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable)},
+    # Under REPEATABLE READ or SERIALIZABLE that count reads the transaction
+    # snapshot and cannot see a trigger committed since (R19): writes are
+    # refused outside READ COMMITTED.
+    q{pg_catalog.current_setting('transaction_isolation')});
 
 # A relation the statement names that resolves into this session's temp
 # schema while a same-named relation exists in a schema of the search path
@@ -1290,6 +1298,42 @@ sub _pg_statement_relations {
     return [sort keys %names];
 }
 
+# R23b (item 58): generated reads and writes name every relation by the
+# schema it resolves to now, when the statement is compiled, so a
+# search_path switch that persists by any route (a deferred trigger, a
+# REPEATABLE READ race no catalog count can see) cannot redirect a later
+# statement to another schema's relation. The lookup is pg_catalog-only. A
+# name that resolves into the session's temp schema while a namesake exists
+# on the search path is refused (temporary_shadow); a TEMP relation without
+# one is the host's own and is named by its temp schema. A host-pinned read
+# prefix, a query source (CTE or VALUES) and a name that resolves to nothing
+# keep their spelling. Resolved once per relation per compile.
+my $QUALIFY_SQL = 'SELECT pg_catalog.quote_ident(n.nspname), pg_catalog.quote_ident(c.relname), '
+    . "(c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA AND EXISTS (SELECT 1 FROM pg_catalog.pg_class o "
+    . 'JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) o.relnamespace '
+    . 'WHERE o.relname OPERATOR(pg_catalog.=) c.relname AND o.relnamespace OPERATOR(pg_catalog.<>) c.relnamespace '
+    . 'AND s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false))))::pg_catalog.int4 '
+    . 'FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace '
+    . 'WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)';
+
+sub _relation_sql {
+    my ($self, $prefix, $table) = @_;
+    my $plain = $self->SUPER::_relation_sql($prefix, $table);
+    return $plain if defined($prefix) || !defined($table) || ref($table) || !$self->_pg_session_checked;
+    my $sources = $self->{_query_sources};
+    return $plain if ref($sources) eq 'HASH' && grep { lc($_) eq lc("$table") } keys %$sources;
+    my $cache = $self->{_selecto_relation_schemas};
+    return $cache->{$plain} if ref($cache) eq 'HASH' && exists $cache->{$plain};
+    my @row;
+    my $ok = eval { @row = $self->{dbh}->selectrow_array($QUALIFY_SQL, undef, $plain); 1 };
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_not_evaluable', 'a temporary relation of the session shadows a relation the statement names',
+        {reason => 'temporary_shadow'}) if @row && $row[2];
+    my $qualified = @row && defined($row[0]) ? "$row[0].$row[1]" : $plain;
+    $cache->{$plain} = $qualified if ref($cache) eq 'HASH';
+    return $qualified;
+}
+
 # True when the handle is a live DBD::Pg handle (the session checks need
 # one; adapter tests with other handles run unchecked).
 sub _pg_session_checked {
@@ -1301,7 +1345,9 @@ sub _pg_session_checked {
 sub _pg_state_row {
     my ($row) = @_;
     my ($snapshot, @settings) = @$row;
-    return {snapshot => $snapshot, settings => {map { ($SESSION_SETTINGS[$_] => $settings[$_]) } 0 .. $#SESSION_SETTINGS}};
+    my ($deferrable, $isolation) = @settings[scalar(@SESSION_SETTINGS), @SESSION_SETTINGS + 1];
+    return {snapshot => $snapshot, deferrable => (defined($deferrable) && $deferrable ? 1 : 0), isolation => $isolation,
+        settings => {map { ($SESSION_SETTINGS[$_] => $settings[$_]) } 0 .. $#SESSION_SETTINGS}};
 }
 
 # The session snapshot, or a typed refusal when it cannot be read.
@@ -1322,7 +1368,7 @@ sub _pg_admit_session {
     my @row;
     my $ok = eval { @row = $self->{dbh}->selectrow_array($SHADOW_SQL, undef, $names); 1 };
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
-        {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS && defined $row[2];
+        {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS + 2 && defined $row[2];
     my ($relations, $types, @state) = @row;
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary relation of the session shadows a relation the statement names',
         {reason => 'temporary_shadow'}) if $relations;
@@ -1341,25 +1387,24 @@ sub _session_changed {
 # the DML, refuse temp shadows and snapshot; the first statement after the
 # DML compares. The transaction wrapper rolls the write back on refusal.
 #
-# Deferrable constraint triggers (R8) fire at COMMIT, after that check, and
-# can change the session for every later statement. In the write's own
-# transaction they are made to fire before it commits (SET CONSTRAINTS ...
-# IMMEDIATE, see _before_own_commit) and checked there. In a transaction
-# the host owns they would fire at the host's COMMIT, out of Selecto's
-# sight, so a write is refused while any enabled non-internal deferrable
-# trigger exists in the database (checked before the DML and again as the
-# second statement after it).
+# Deferrable constraint triggers (R8, R14, R23) fire at COMMIT, after that
+# check, and can change the session for every later statement; one can
+# even be created by the write's own row trigger, or committed by another
+# session while the write waits for a lock. Every PostgreSQL write (own or
+# host transaction, guarded or not) is therefore refused while any enabled
+# user-defined (non-internal) deferrable trigger exists in the database,
+# checked before the DML and again in the first statement after it.
+# Internal foreign-key triggers are not counted: deferred foreign keys keep
+# working. Selecto never runs SET CONSTRAINTS.
 sub _write_session_open {
     my ($self, $command, $compiled) = @_;
     return undef unless $self->_pg_session_checked;
     my $state = $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled : undef);
-    my $unit = $self->{_selecto_write_unit};
-    if (ref($unit) eq 'HASH' && $unit->{owned}) {
-        $unit->{snapshot} //= $state;
-    } else {
-        _refuse_deferred_triggers() if @{$self->_pg_deferrable_constraints};
-        $state->{host_owned} = 1;
-    }
+    _refuse_deferred_triggers() if $state->{deferrable};
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a PostgreSQL write requires READ COMMITTED isolation (its deferrable-trigger check reads the latest catalog)',
+        {reason => 'isolation_level', isolation => $state->{isolation}})
+        unless defined($state->{isolation}) && $state->{isolation} eq 'read committed';
     return $state;
 }
 
@@ -1368,50 +1413,15 @@ sub _write_session_check {
     return unless defined $before;
     my $after = eval { $self->_pg_session_state };
     _session_changed() unless $after && $after->{snapshot} eq $before->{snapshot};
-    _refuse_deferred_triggers() if $before->{host_owned} && @{$self->_pg_deferrable_constraints};
+    _refuse_deferred_triggers() if $after->{deferrable};
     return;
-}
-
-sub _before_own_commit {
-    my ($self) = @_;
-    my $unit = $self->{_selecto_write_unit};
-    return unless ref($unit) eq 'HASH' && $unit->{owned} && $unit->{snapshot} && $self->_pg_session_checked;
-    my $names = $self->_pg_deferrable_constraints;
-    return unless @$names;
-    # Fires every queued event of those triggers now (their mode change is
-    # retroactive), inside the transaction that is about to commit.
-    my $ok = eval { $self->{dbh}->do('SET CONSTRAINTS ' . join(', ', @$names) . ' IMMEDIATE'); 1 };
-    die $self->normalize_error($@) unless $ok;
-    my $after = eval { $self->_pg_session_state };
-    _session_changed() unless $after && $after->{snapshot} eq $unit->{snapshot}{snapshot};
-    return;
-}
-
-# The schema-qualified names of every enabled non-internal deferrable
-# trigger's constraint in the database (internal foreign-key triggers are
-# not user code and are left alone).
-sub _pg_deferrable_constraints {
-    my ($self) = @_;
-    my $names;
-    my $ok = eval {
-        $names = $self->{dbh}->selectcol_arrayref(q{SELECT DISTINCT pg_catalog.quote_ident(n.nspname)
-              OPERATOR(pg_catalog.||) '.' OPERATOR(pg_catalog.||) pg_catalog.quote_ident(c.conname)
-            FROM pg_catalog.pg_trigger t
-            JOIN pg_catalog.pg_constraint c ON c.oid OPERATOR(pg_catalog.=) t.tgconstraint
-            JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.connamespace
-            WHERE NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable});
-        1;
-    };
-    Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
-        {reason => 'session_state_unknown'}) unless $ok && ref($names) eq 'ARRAY';
-    return $names;
 }
 
 sub _refuse_deferred_triggers {
     Selecto::Error->throw('query_rule_not_evaluable',
-        "a deferrable constraint trigger would fire at the host's COMMIT, after Selecto's session check; "
-            . 'write in a transaction Selecto owns, or make the trigger NOT DEFERRABLE',
-        {reason => 'deferred_trigger'});
+        'a user-defined deferrable constraint trigger exists in the database; it would fire at COMMIT, '
+            . "after Selecto's session check (make it NOT DEFERRABLE)",
+        {reason => 'deferred_triggers'});
 }
 
 # Post-statement re-reads name the written rows by (tableoid, ctid) (R9).
@@ -1809,15 +1819,25 @@ makes every write to its table refuse.
 
 =item *
 
-A deferrable constraint trigger fires at COMMIT, after that check. In a
-transaction Selecto owns, the deferrable non-internal constraint triggers of
-the database are set C<IMMEDIATE> just before COMMIT (their queued events
-fire then) and the snapshot is compared again; a change rolls the write
-back. In a transaction the host owns they would fire at the host's COMMIT,
-out of Selecto's sight, so while any enabled non-internal deferrable
-trigger exists in the database a write there is refused
-(C<query_rule_not_evaluable>, reason C<deferred_trigger>). Internal
-foreign-key triggers are not affected.
+A deferrable constraint trigger fires at COMMIT, after that check, and one
+can even be created during the write (by its own row trigger, or by another
+session while the write waits for a lock). So every write (own or host
+transaction, guarded or not) is refused while any enabled user-defined
+(non-internal) deferrable trigger exists in the database, checked before
+the DML and in the first statement after it (C<query_rule_not_evaluable>,
+reason C<deferred_triggers>). Selecto never runs C<SET CONSTRAINTS>.
+Internal foreign-key triggers are not counted: deferred foreign keys keep
+working. A database with user-defined deferrable triggers cannot take
+Selecto writes.
+
+=item *
+
+Every relation a generated read or write names is schema-qualified with the
+schema it resolves to when the statement is compiled (a host-pinned read
+prefix, a query source and an unresolved name keep their spelling), so a
+C<search_path> switch that outlives a statement by any route cannot
+redirect a later one. Functions, operators and types in Selecto's own
+catalog and guard SQL are C<pg_catalog>-qualified.
 
 =item *
 
