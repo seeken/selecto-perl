@@ -23,6 +23,19 @@ Unreleased
       writes. Deferrable internal rechecks count too unless they are
       foreign-key triggers or unique/exclusion rechecks whose operator
       classes and operators are all pg_catalog's (R32).
+    - PostgreSQL relation resolution (R36-R39). Behaviour change: PostgreSQL
+      itself parses the reset search_path (applied with set_config(...,
+      true), read back with current_schemas(false)). A relation that the
+      host's current search_path resolves differently from that pinned
+      resolution is refused (query_rule_not_evaluable, relation_ambiguous),
+      for compiled statements and for a host's hand-built statements alike.
+      A relation found only in the session's temp schema is refused
+      (relation_unresolved) unless the adapter declares temp relations with
+      the new temporary_relations => 1 option. Deferred foreign keys and
+      unique/exclusion rechecks count as user code unless their operators,
+      index (no expressions, predicate, user collation or opclass) and key
+      column types (pg_catalog base types or domains over them) are all
+      pg_catalog's (R37).
     - PostgreSQL session pins (R35). Behaviour change: alongside search_path,
       every Selecto statement runs with TimeZone 'UTC', DateStyle 'ISO, MDY',
       IntervalStyle 'postgres', extra_float_digits 3, bytea_output 'hex' and

@@ -131,7 +131,7 @@ for my $backend (@backends) {
                     schemas => {}, joins => {},
                     writes => {operations => {insert => {enabled => 1}},
                         fields => {map { ($_ => {insertable => 1}) } qw(id org_key alias)}}});
-                my $adapter = Selecto->adapter($name => (dbh => $dbh));
+                my $adapter = Selecto->adapter($name => (temporary_relations => 1,dbh => $dbh));
                 my $engine = Selecto::Engine->new(adapter => $adapter, domain => $domain);
                 my $command = Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_v2_rows',
                     assignments => {id => 1, alias => 't1', defined($value) ? (org_key => $value) : ()},
@@ -202,7 +202,7 @@ for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
                 my ($label, $value, $expect) = @$case;
                 $dbh->do('DROP TABLE IF EXISTS selecto_v2_char_rows');
                 $dbh->do('CREATE TABLE selecto_v2_char_rows (id INT PRIMARY KEY, tenant_id CHAR(36) NOT NULL, label VARCHAR(16))');
-                my ($engine, $extra) = $modes{$mode}->(Selecto->adapter($name => (dbh => $dbh)));
+                my ($engine, $extra) = $modes{$mode}->(Selecto->adapter($name => (temporary_relations => 1,dbh => $dbh)));
                 my $error = eval {
                     $engine->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_v2_char_rows',
                         assignments => {id => 1, tenant_id => $value, label => 'x'}, %$extra));
@@ -238,7 +238,7 @@ for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
             my @fields = sort keys %$assignments;
             my $source = relation('selecto_v2_key_rows', map { ($_ => $_ =~ /\A(?:org_key|code)\z/ ? 'string' : 'integer') } @fields);
             $source->{primary_key} = $key;
-            my $engine = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)),
+            my $engine = Selecto::Engine->new(adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => $dbh)),
                 domain => Selecto::Domain->parse({schema_version => 1, name => 'Keys', source => $source, schemas => {}, joins => {},
                     writes => {operations => {insert => {enabled => 1}}, fields => {map { ($_ => {insertable => 1}) } @fields}}}));
             my $command = Selecto::Write::Command->new(operation => 'insert',

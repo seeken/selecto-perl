@@ -29,7 +29,7 @@ sub temporal_domain {
 for my $name (qw(postgresql duckdb)) {
     subtest "$name compiled storage-to-instant boundary" => sub {
         my $engine = Selecto::Engine->new(domain => temporal_domain(),
-            adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)));
+            adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => TestSelecto::DBH->new)));
         my $raw = $engine->compile($engine->query->select('epoch')->use_timezone('America/New_York'));
         like $raw->sql, qr/TO_TIMESTAMP\("s0"\."epoch"\) AT TIME ZONE /,
             'raw numeric storage becomes an instant before timezone conversion';
@@ -53,7 +53,7 @@ sub live_cases {
         (1,-0.000001,true),(2,1710055800,true),(3,1730611800,true),
         (4,1730615400,true),(5,NULL,true),(6,1710055800,false)});
     $dbh->do('UPDATE selecto_epoch_timezone_fixture SET instant=TO_TIMESTAMP(epoch)');
-    my $engine = Selecto::Engine->new(domain => temporal_domain(), adapter => Selecto->adapter($name => (dbh => $dbh)));
+    my $engine = Selecto::Engine->new(domain => temporal_domain(), adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => $dbh)));
     my $handler = Selecto::API::EngineHandler->new;
     my $request = {select => ['instant','epoch'], order_by => [{field => 'id'}], timezone => 'America/New_York'};
     my @expected = ('1969-12-31T18:59:59.999999','2024-03-10T03:30:00',

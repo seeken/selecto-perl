@@ -33,7 +33,7 @@ sub exercise {
             columns => {map { $_ => {type => $types{$_}, nullable => $_ eq 'note' ? 1 : 0,
                 ($_ eq 'tenant_id' || $_ eq 'secret' ? (internal => 1) : ())} } @fields},
             associations => {}}, schemas => {}, joins => {}}, strict => 1);
-    my $adapter = Selecto->adapter($driver => dbh => $dbh);
+    my $adapter = Selecto->adapter($driver => temporary_relations => 1, dbh => $dbh);
     my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter, scope => {tenant => 1});
     my $host = Selecto::API::RemoteQuery->new(base_path => '/api/items',
         max_limit => 10, default_limit => 2, field_encodings => {large_integer => 'decimal-string'});

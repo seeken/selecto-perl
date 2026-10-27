@@ -12,7 +12,7 @@ sub scalar_domain {
     Selecto::Domain->new(name=>'Bounded rows',table=>'bounded_rows',primary_key=>'id',
         fields=>{id=>'integer',label=>'string'});
 }
-sub engine { Selecto::Engine->new(domain=>$_[1],adapter=>Selecto->adapter($_[0]=>dbh=>$_[2])) }
+sub engine { Selecto::Engine->new(domain=>$_[1],adapter=>Selecto->adapter($_[0]=>temporary_relations=>1,dbh=>$_[2])) }
 sub assert_rejected {
     my ($callback,$label)=@_;
     my $ok=eval {$callback->();1};my $error=$@;
@@ -142,7 +142,7 @@ subtest 'PostgreSQL per-parent bounded aggregation and transfer' => sub {
     $dbh->do('CREATE TEMP TABLE bounded_page(id integer primary key,label text,amount numeric(10,2))');
     $dbh->do(q{INSERT INTO bounded_page SELECT n,'row'||n,n/4.0 FROM generate_series(1,250) n});
     my $page_engine=Selecto::Engine->new(domain=>Selecto::Domain->new(name=>'Page',table=>'bounded_page',
-        fields=>{id=>'integer',label=>'string',amount=>'decimal'}),adapter=>Selecto->adapter(postgresql=>(dbh=>$dbh)));
+        fields=>{id=>'integer',label=>'string',amount=>'decimal'}),adapter=>Selecto->adapter(postgresql=>(temporary_relations => 1,dbh=>$dbh)));
     my $page=$page_engine->query->select('id','label','amount')->order_by('id');
     my @fetch_sizes;
     {

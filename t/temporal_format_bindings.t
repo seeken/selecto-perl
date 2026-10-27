@@ -36,7 +36,7 @@ sub selection {
 
 subtest 'numbered placeholder occurrence accounting' => sub {
     my $engine = Selecto::Engine->new(domain => $domain,
-        adapter => Selecto->adapter(duckdb => (dbh => TestSelecto::DBH->new)));
+        adapter => Selecto->adapter(duckdb => (temporary_relations => 1,dbh => TestSelecto::DBH->new)));
     for my $field (qw(naive day instant epoch)) {
         for my $zone (@zones) {
             my $statement = $engine->compile($engine->query->select(selection($field))->use_timezone($zone));
@@ -61,7 +61,7 @@ subtest 'PostgreSQL DATE midnight follows the requested timezone, not the sessio
     $dbh->do(q{INSERT INTO selecto_temporal_bindings(id,naive,active) VALUES
         (2,'2024-03-10 02:30:00',true),(3,'2024-11-03 01:30:00',true)});
     my $engine = Selecto::Engine->new(domain => $domain,
-        adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+        adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
     my $handler = Selecto::API::EngineHandler->new;
     for my $case (
         ['America/New_York', '1969-12-31T00:00:00.000-05:00', -68400, '-05:00'],
@@ -155,7 +155,7 @@ subtest 'all temporal formats execute equivalently on PostgreSQL and DuckDB' => 
             (5,NULL,NULL,true),(6,'2024-01-01 00:00:00',1704067200,false)});
         $dbh->do('UPDATE selecto_temporal_bindings SET day=CAST(naive AS DATE), instant=TO_TIMESTAMP(epoch)');
         push @engines, Selecto::Engine->new(domain => $domain,
-            adapter => Selecto->adapter(($index ? 'duckdb' : 'postgresql') => (dbh => $dbh)));
+            adapter => Selecto->adapter(($index ? 'duckdb' : 'postgresql') => (temporary_relations => 1, dbh => $dbh)));
     }
     my $handler = Selecto::API::EngineHandler->new;
     for my $case (

@@ -82,7 +82,7 @@ my $document = sub {
 };
 my $engine = sub {
     my ($dbh, %options) = @_;
-    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh,
+    my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh,
         ($options{external} ? (transaction_mode => 'external') : ())));
     return Selecto::Engine->new(adapter => $adapter, domain => $document->($options{table} // 'selecto_ss'));
 };
@@ -164,7 +164,7 @@ subtest 'items 56/56b: trigger-created TEMP views and host TEMP shadows' => sub 
     # The host's own TEMP relation with no namesake is the host's domain (item 19).
     $dbh->do(q{CREATE TEMP TABLE selecto_ss_own (id INTEGER PRIMARY KEY, org_key TEXT NOT NULL, name TEXT, note TEXT, ts TIMESTAMPTZ)});
     $dbh->do(q{INSERT INTO selecto_ss_own VALUES (1, 't1', 'x', 'n', NULL)});
-    my $own = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+    my $own = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)),
         domain => Selecto::Domain->parse({schema_version => 1, name => 'Own',
             source => relation('selecto_ss_own', id => 'integer', org_key => 'string', name => 'string', note => 'string', ts => 'utc_datetime'),
             schemas => {}, joins => {}, writes => {operations => {update => {enabled => 1, bulk => 1, expected_cardinality => 'many'}},
@@ -224,7 +224,7 @@ subtest 'item 57: a bounded stream proves its own transaction without a forgeabl
         $$ BEGIN PERFORM set_config('selecto.guard', 'forged', true); RETURN true; END $$});
     $admin->do('CREATE VIEW selecto_ss_v AS SELECT * FROM selecto_ss WHERE selecto_ss_flip(id)');
     my $dbh = $connect->();
-    my $flip = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $dbh)), domain => Selecto::Domain->parse({schema_version => 1, name => 'View',
+    my $flip = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)), domain => Selecto::Domain->parse({schema_version => 1, name => 'View',
         source => relation('selecto_ss_v', id => 'integer', org_key => 'string', name => 'string', note => 'string', ts => 'utc_datetime'),
         schemas => {}, joins => {}}));
     my $stream = $flip->stream(Selecto::Query->new->select('id')->order_by('id'), bounded => 1, fetch_size => 1);
