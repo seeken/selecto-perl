@@ -294,11 +294,11 @@ sub _compile_single {
             # The target ON occurs inside the nested join, before the bridge ON.
             # Accumulate anonymous parameters in that emitted SQL order.
             push @target_on, $self->_constant_join_predicates(
-                $target_alias, $association->where, \@params, $association->fields
+                $target_alias, $association->where, \@params, $association->fields, $association->table
             );
             push @target_on, $self->_tenant_bound_sql($association, $target_alias, \@params);
             push @bridge_on, $self->_constant_join_predicates(
-                $bridge_alias, $through->{where}, \@params
+                $bridge_alias, $through->{where}, \@params, undef, $through->{table}
             );
             if (defined $through->{source_scope_key}) {
                 my $exact = $self->_association_identity_exact($association, $through->{target_scope_key}, undef);
@@ -342,7 +342,7 @@ sub _compile_single {
                     $self->_qualified($lookup_alias, $association->related_key),
             );
             push @target_on, $self->_constant_join_predicates(
-                $lookup_alias, $association->where, \@params, $association->fields
+                $lookup_alias, $association->where, \@params, $association->fields, $association->table
             );
             if (defined $association->source_scope_key) {
                 push @target_on, $self->_identity_equal_sql(
@@ -600,7 +600,7 @@ sub _compile_retargeted {
     my $where = $association->where;
     my @policy = ref($where) eq 'HASH' && keys(%$where) ? (sub {
         my ($params) = @_;
-        return join(' AND ', $self->_constant_join_predicates($outer_alias, $where, $params, $association->fields));
+        return join(' AND ', $self->_constant_join_predicates($outer_alias, $where, $params, $association->fields, $association->table));
     }) : ();
     return $self->_compile_single(
         $target_domain, $query->_copy(retarget => undef),
@@ -2037,18 +2037,18 @@ sub _compile_related_collection_at {
         # ON precedes WHERE in the emitted SQL, so bind target predicates first.
         # Do not bind the discarded direct-association predicate for this path.
         push @target_on, $self->_constant_join_predicates(
-            $alias, $association->where, $params, $association_fields
+            $alias, $association->where, $params, $association_fields, $association->table
         );
         push @target_on, $self->_tenant_bound_sql($association, $alias, $params);
         push @predicates, $self->_constant_join_predicates(
-            $bridge_alias, $through->{where}, $params
+            $bridge_alias, $through->{where}, $params, undef, $through->{table}
         );
         push @predicates, $self->_tenant_pair_sql($association, $parent_alias, $alias);
         $from = "$bridge_table AS $quoted_bridge_alias INNER JOIN $table AS $quoted_alias ON " .
             join(' AND ', @target_on);
     } else {
         push @predicates, $self->_constant_join_predicates(
-            $alias, $association->where, $params, $association_fields
+            $alias, $association->where, $params, $association_fields, $association->table
         );
         push @predicates, $self->_tenant_pair_sql($association, $parent_alias, $alias),
             $self->_tenant_bound_sql($association, $alias, $params);
@@ -2423,7 +2423,7 @@ sub _compile_computed_field {
                 $association->source_scope_key));
     }
     push @predicates, $self->_constant_join_predicates(
-        $alias, $association->where, $params, $association->fields
+        $alias, $association->where, $params, $association->fields, $association->table
     );
     push @predicates, $self->_tenant_pair_sql($association, $self->_root_alias, $alias),
         $self->_tenant_bound_sql($association, $alias, $params);

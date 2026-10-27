@@ -586,6 +586,26 @@ sub _timestamp_scope_sql {
     return $self->_epoch_compare_sql($column, $kind, \@values, $params);
 }
 
+# An association's or bridge's fixed where pins are domain-authored scope
+# too (item 62a): a pin on a TIMESTAMP column of the joined relation compares
+# by epoch like a host comparison; every other pin compiles as identity.
+sub _constant_join_predicates {
+    my ($self, $alias, $where, $params, $types, $table) = @_;
+    return () unless ref($where) eq 'HASH' && keys %$where;
+    return $self->SUPER::_constant_join_predicates($alias, $where, $params, $types)
+        unless defined($table) && !ref($table);
+    my @predicates;
+    for my $field (sort keys %$where) {
+        my $declared = ref($types) eq 'HASH' ? $types->{$field} : undef;
+        if (defined($where->{$field}) && $self->_timestamp_column($table, $field, $declared)) {
+            push @predicates, $self->_epoch_compare_sql($self->_qualified($alias, $field), 'eq', [$where->{$field}], $params);
+        } else {
+            push @predicates, $self->SUPER::_constant_join_predicates($alias, {$field => $where->{$field}}, $params, $types);
+        }
+    }
+    return @predicates;
+}
+
 # Whether $table.$column is a TIMESTAMP column, from the catalog (once per
 # relation per compile). A relation or column the catalog does not describe
 # (a temporary table, a view's derived column) is refused for a declared
@@ -594,7 +614,7 @@ sub _timestamp_column {
     my ($self, $table, $column, $declared) = @_;
     my $dbh = $self->{dbh};
     return 0 unless eval { $dbh->isa('DBI::db') && $dbh->{Active} };
-    my $catalog = $self->{_selecto_column_catalog} //= {};
+    my $catalog = $self->{_selecto_column_catalog} // {};
     my $types = $catalog->{lc $table} //= $self->_column_data_types($table);
     my $type = $types->{lc $column};
     return $type eq 'timestamp' ? 1 : 0 if defined $type;
