@@ -598,7 +598,7 @@ sub _integer_text_storage {
     my $dbh = $self->{dbh};
     return 0 unless eval { $dbh->isa('DBI::db') && $dbh->{Active} };
     my $catalog = $self->{_selecto_column_catalog} // {};
-    my $types = $catalog->{lc $table} //= $self->_column_data_types($table);
+    my $types = $catalog->{$self->_table_key($table)} //= $self->_column_data_types($table);
     my $stored = $types->{lc $resolved->{field}};
     return defined($stored) && $stored =~ $TEXT_STORAGE ? 1 : 0;
 }
@@ -623,7 +623,7 @@ sub _stored_column_type {
     my $dbh = $self->{dbh};
     return undef unless eval { $dbh->isa('DBI::db') && $dbh->{Active} };
     my $catalog = $self->{_selecto_column_catalog} // {};
-    my $types = $catalog->{lc $table} //= $self->_column_data_types($table);
+    my $types = $catalog->{$self->_table_key($table)} //= $self->_column_data_types($table);
     my $stored = $types->{lc $resolved->{field}};
     return defined($stored) && length($stored) ? $stored : undef;
 }
@@ -779,7 +779,7 @@ sub _timestamp_column {
     my $dbh = $self->{dbh};
     return 0 unless eval { $dbh->isa('DBI::db') && $dbh->{Active} };
     my $catalog = $self->{_selecto_column_catalog} // {};
-    my $types = $catalog->{lc $table} //= $self->_column_data_types($table);
+    my $types = $catalog->{$self->_table_key($table)} //= $self->_column_data_types($table);
     my $type = $types->{lc $column};
     return $type eq 'timestamp' ? 1 : 0 if defined $type;
     Selecto::Error->throw('query_rule_not_evaluable',
@@ -789,15 +789,46 @@ sub _timestamp_column {
     return 0;
 }
 
+# R31: relation names are matched as the server resolves them. With
+# lower_case_table_names = 0 they are case-sensitive (rv_v and rv_V are two
+# tables), so catalog lookups compare them in binary and key them exactly;
+# otherwise the server folds them and so does the key. Read once per handle.
+sub _table_names_case_sensitive {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    my $cached = eval { $dbh->{private_selecto_lower_case_table_names} };
+    unless (defined $cached) {
+        my $ok = eval { ($cached) = $dbh->selectrow_array($self->_statement_sql('SELECT @@lower_case_table_names')); 1 };
+        die $self->normalize_error($@) unless $ok;
+        Selecto::Error->throw('query_rule_not_evaluable', 'the server did not report lower_case_table_names',
+            {reason => 'relation_unresolved'}) unless defined($cached) && "$cached" =~ /\A[012]\z/;
+        eval { $dbh->{private_selecto_lower_case_table_names} = "$cached" };
+    }
+    return "$cached" eq '0' ? 1 : 0;
+}
+
+sub _table_key {
+    my ($self, $table) = @_;
+    return $self->_table_names_case_sensitive ? "$table" : lc("$table");
+}
+
+# The catalog column types of exactly the relation $table names in the
+# current database (column names fold, as MySQL's do). Rows of more than one
+# relation (an ambiguous match) fail closed.
 sub _column_data_types {
     my ($self, $table) = @_;
+    my $sensitive = $self->_table_names_case_sensitive;
     my $rows;
     my $ok = eval {
-        $rows = $self->{dbh}->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE
-            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, "$table");
+        $rows = $self->{dbh}->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE, TABLE_NAME
+            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND }
+            . ($sensitive ? 'BINARY TABLE_NAME = BINARY ?' : 'TABLE_NAME = ?')), undef, "$table");
         1;
     };
     die $self->normalize_error($@) unless $ok;
+    my %relations = map { ($_->[2] // '' => 1) } @$rows;
+    Selecto::Error->throw('query_rule_not_evaluable', 'the catalog describes more than one relation of this name',
+        {reason => 'relation_ambiguous', relation => "$table"}) if keys(%relations) > 1;
     return {map { (lc($_->[0]) => lc($_->[1] // '')) } @$rows};
 }
 
@@ -2123,7 +2154,8 @@ sub _refuse_read_temporary_shadows {
     my $rows;
     my $ok = eval {
         $rows = $dbh->selectall_arrayref($self->_statement_sql('SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES'
-            . ' WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (' . join(', ', ('?') x @names) . ')'), undef, @names);
+            . ' WHERE TABLE_SCHEMA = DATABASE() AND ' . ($self->_table_names_case_sensitive ? 'BINARY TABLE_NAME' : 'TABLE_NAME')
+            . ' IN (' . join(', ', ($self->_table_names_case_sensitive ? 'BINARY ?' : '?') x @names) . ')'), undef, @names);
         defined($rows) or die Selecto::SQL::_dbi_error($dbh, 'catalog read failed');
         1;
     };
@@ -2132,7 +2164,8 @@ sub _refuse_read_temporary_shadows {
     for my $row (@$rows) {
         my ($name, $type) = @$row;
         next unless defined $name;
-        if (uc($type // '') eq 'TEMPORARY') { $temporary{lc $name} = $name } else { $base{lc $name} = $name }
+        my $key = $self->_table_key($name);
+        if (uc($type // '') eq 'TEMPORARY') { $temporary{$key} = $name } else { $base{$key} = $name }
     }
     for my $key (sort keys %base) {
         $refuse->($base{$key}) if $temporary{$key};
