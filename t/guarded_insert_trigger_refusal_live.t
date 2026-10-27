@@ -12,10 +12,13 @@ use Selecto::QueryEnforcement ();
 use Selecto::Write ();
 
 # An insert has no pre-image: its post-image must satisfy its full guard
-# (query enforcement, required filters, host scope, engine tenant). Every
-# backend refuses a guarded insert on a table with insert triggers before
-# any DML, so a trigger that moves the new row out of its guard
-# (org_key t1 -> t2) cannot commit it.
+# (query enforcement, required filters, host scope, engine tenant). A
+# trigger that moves the new row out of its guard (org_key t1 -> t2) must
+# never commit it: PostgreSQL re-reads the inserted row by (tableoid, ctid)
+# under the full guard after the statement and rolls it back
+# (query_rule_violation), so ordinary row triggers stay allowed (R13); the
+# other backends refuse a guarded insert on a table with insert triggers
+# before any DML.
 my $x = 'Selecto::Expression';
 my @backends = (['sqlite', sub {
     DBI->connect('dbi:SQLite:dbname=:memory:', '', '', {RaiseError => 1, PrintError => 0, AutoCommit => 1})
@@ -76,7 +79,8 @@ for my $backend (@backends) {
         my ($engine, %extra) = $guards{$guard}->();
         my $code = eval { $engine->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_ins_guard',
             assignments => {id => 3, org_key => 't1', name => 'y', note => 'i'}, %extra)); 'applied' } // (blessed($@) ? $@->code : "died: $@");
-        is($code, 'query_rule_not_evaluable', "$name: an insert guarded by $guard on a trigger table is refused");
+        is($code, $pg ? 'query_rule_violation' : 'query_rule_not_evaluable',
+            "$name: an insert guarded by $guard on a trigger table is refused");
         is_deeply($dbh->selectall_arrayref('SELECT COUNT(*) FROM selecto_ins_guard'), [[0]], "$name: $guard, and nothing was inserted");
     }
     $dbh->do('DROP TABLE IF EXISTS selecto_ins_guard');

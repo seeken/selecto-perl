@@ -14,9 +14,10 @@ use Selecto::Write ();
 # 43, 47, 51, 51a). The re-read and the post-statement trigger/rule checks
 # address the relation by the oid and schema-qualified name resolved under
 # the write's lock before the DML (a trigger's DDL or search_path switch
-# cannot substitute another relation), and name rows only by an enforced
-# unique key whose text round-trips exactly whatever the session settings,
-# with the index enforcing the column's own collation and default opclass.
+# cannot substitute another relation), and name the written rows by the
+# (tableoid, ctid) the statement returned (R9), so no key type, collation or
+# session setting can let a decoy row stand in for a moved one, and keys of
+# any type (dates, floats, collated text) work again.
 my $url = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless defined($url) && $url ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; require Selecto::Certification; 1 };
@@ -73,16 +74,20 @@ subtest 'item 47: a date key re-read never depends on DateStyle' => sub {
     $setup->('DATE PRIMARY KEY', '2024-02-03', '2024-03-02', q{PERFORM set_config('DateStyle', 'SQL, MDY', true);});
     my $dbh = $connect->();
     $dbh->do(q{SET DateStyle TO 'SQL, DMY'});
-    is($update->($dbh, 'date', 'move'), 'query_rule_not_evaluable', 'a date key cannot name rows for the re-read');
+    is($update->($dbh, 'date', 'move'), 'query_rule_violation', 'the moved row is caught whatever DateStyle says');
     is($state->(), 'x:t1 y:t1', 'nothing changed');
 };
 
-subtest 'item 34: a float key is refused whatever extra_float_digits says' => sub {
+subtest 'item 34: a float key never lets a decoy answer the re-read' => sub {
     $setup->('DOUBLE PRECISION PRIMARY KEY', '0.10000000000000002', '0.1', '');
     my $dbh = $connect->();
     $dbh->do('SET extra_float_digits TO 0');
-    is($update->($dbh, 'float', 'move'), 'query_rule_not_evaluable', 'refused');
+    isnt($update->($dbh, 'float', 'move'), 'applied', 'not applied');
     is($state->(), 'x:t1 y:t1', 'nothing changed');
+    my $exact = $connect->();
+    is($update->($exact, 'float', 'move'), 'query_rule_violation', 'refused under the default extra_float_digits too')
+        ;
+    is($update->($exact, 'float', 'kept'), 'applied', 'an ordinary update on a float key applies');
 };
 
 subtest 'item 40: a unique index under another collation does not name rows' => sub {
@@ -91,14 +96,19 @@ subtest 'item 40: a unique index under another collation does not name rows' => 
     $setup->('TEXT COLLATE selecto_rr_ci NOT NULL', 'a', 'A', '');
     $admin->do('CREATE UNIQUE INDEX selecto_rr_k ON selecto_rr (k COLLATE "C")');
     my $dbh = $connect->();
-    is($update->($dbh, 'string', 'move'), 'query_rule_not_evaluable', 'refused');
+    is($update->($dbh, 'string', 'move'), 'query_rule_violation', 'refused');
     is($state->(), 'x:t1 y:t1', 'nothing changed');
+    is($update->($dbh, 'string', 'kept'), 'applied', 'an ordinary update applies');
     $clean->();
     $admin->do('DROP COLLATION selecto_rr_ci');
 };
 
-subtest 'exact keys still work' => sub {
+subtest 'keys of every type work' => sub {
     for my $case (['INTEGER PRIMARY KEY', 'integer', 1, 2], ['BIGINT PRIMARY KEY', 'integer', 1, 2],
+        ['DATE PRIMARY KEY', 'date', '2024-02-03', '2024-03-02'],
+        ['TIMESTAMPTZ PRIMARY KEY', 'utc_datetime', '2024-05-01 10:00:00.123456+00', '2024-05-01 10:00:00.123457+00'],
+        ['DOUBLE PRECISION PRIMARY KEY', 'float', '0.10000000000000002', '0.1'],
+        ['INET PRIMARY KEY', 'string', '10.0.0.1/24', '10.0.0.1/32'],
         ['TEXT PRIMARY KEY', 'string', 'a', 'b'], ['NUMERIC(10,2) PRIMARY KEY', 'decimal', '1.50', '2.50'],
         ['UUID PRIMARY KEY', 'string', '6f1c1d2e-0000-4000-8000-000000000001', '6f1c1d2e-0000-4000-8000-000000000002']) {
         my ($sql, $type, $one, $two) = @$case;

@@ -108,8 +108,10 @@ for my $backend (@backends) {
                 $reset->(plain_key => $plain_key);
                 if ($bound) {
                     # Without an enforced unique key the rows cannot be named
-                    # for the re-read: the update is refused before it runs.
-                    is($run->($mode, $path, {org_key => 'T1'}, %options), $plain_key ? 'query_rule_not_evaluable' : 'query_rule_violation',
+                    # for a re-read by key: the update is refused before it
+                    # runs. PostgreSQL re-reads by row id and needs no key.
+                    is($run->($mode, $path, {org_key => 'T1'}, %options),
+                        $plain_key && $name ne 'postgresql' ? 'query_rule_not_evaluable' : 'query_rule_violation',
                         "$label, $table: assigning the scoped column out of scope is refused");
                     is($state->(), '1:t1:n 2:t2:n', "$label, $table: and nothing changed");
                 } else {
@@ -153,6 +155,17 @@ for my $backend (@backends) {
             $dbh->do($plain_key ? q{INSERT INTO selecto_post_rows (id, org_key, name, note) VALUES (1, 'T1', 'x', 'n'), (1, 'T1', 'y', 'n')}
                 : q{INSERT INTO selecto_post_rows (id, org_key, name, note) VALUES (1, 'T1', 'x', 'n'), (3, 'T1', 'y', 'n')});
             my $table = $plain_key ? 'a non-unique key with a decoy' : 'a primary key';
+            if ($name eq 'postgresql') {
+                # PostgreSQL re-reads the written rows by (tableoid, ctid)
+                # (R9): a key reassigned, or not unique, cannot let a decoy
+                # stand in, so only leaving the scope is refused.
+                is($key_run->({id => 2, org_key => 'T2'}), 'query_rule_violation', "$name $table: reassigning the key out of scope is refused");
+                is($key_run->({id => 2}), 'applied', "$name $table: reassigning the key in scope applies");
+                is($key_run->({note => 'changed'}), 'applied', "$name $table: an ordinary update applies");
+                is_deeply($dbh->selectall_arrayref('SELECT id, org_key, name FROM selecto_post_rows ORDER BY name'),
+                    [[2, 'T1', 'x'], [$plain_key ? 1 : 3, 'T1', 'y']], "$name $table: no row left its scope");
+                next;
+            }
             is($key_run->({id => 2, org_key => 'T2'}), 'query_rule_not_evaluable', "$name $table: reassigning the key out of scope is refused");
             is($key_run->({id => 2}), 'query_rule_not_evaluable', "$name $table: reassigning the key in scope is refused too");
             is($key_run->({note => 'changed'}), $plain_key ? 'query_rule_not_evaluable' : 'applied',

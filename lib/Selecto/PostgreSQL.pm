@@ -76,13 +76,27 @@ sub scalar_column_statement {
         unless defined($alias) && $alias =~ /\A[a-z][a-z0-9_]*\z/
             && !grep { defined($_) && $_ eq $alias } @{$statement->columns};
     my $scalar_sql = $self->_renumber_dollar_placeholders($scalar->sql, scalar @{$statement->params});
-    return Selecto::Statement->new(
+    return _with_relations(Selecto::Statement->new(
         sql => 'SELECT selecto_rows.*, (' . $scalar_sql . ') AS ' . $self->quote_identifier($alias)
             . ' FROM (' . $statement->sql . ') AS selecto_rows',
         params => [@{$statement->params}, @{$scalar->params}],
         columns => [@{$statement->columns}, $alias],
         adapter_name => $self->name,
-    );
+    ), $statement, $scalar);
+}
+
+# A statement derived from compiled ones names their relations: it keeps
+# their lists (undef if any source has none, as a hand-built one).
+sub _with_relations {
+    my ($derived, @sources) = @_;
+    my %names;
+    for my $source (@sources) {
+        my $list = blessed($source) && $source->can('relations') ? $source->relations : undef;
+        return $derived unless ref($list) eq 'ARRAY';
+        $names{$_} = 1 for @$list;
+    }
+    $derived->{_selecto_relations} = [sort keys %names];
+    return $derived;
 }
 
 sub stream_query {
@@ -90,10 +104,10 @@ sub stream_query {
     unless ($options{bounded}) {
         # DBD::Pg runs the whole statement and buffers its rows at execute,
         # so the session check right after it covers every row.
-        my $sql = blessed($statement) && $statement->can('sql') ? $statement->sql : undef;
+        my $source = $statement;
         $statement = $self->_canonical_statement($statement)
             if blessed($statement) && !$options{export_scalars} && $self->_canonical_requested(%options);
-        return $self->_guarded_read($sql, sub { return $self->SUPER::stream_query($statement, %options) });
+        return $self->_guarded_read($source, sub { return $self->SUPER::stream_query($statement, %options) });
     }
     Selecto::Error->throw('unsupported_feature', 'bounded streaming requires a real PostgreSQL DBI handle')
         unless $self->supports('stream') && $self->bounded_stream_supported;
@@ -153,6 +167,7 @@ sub bounded_result_statement {
         . join(', ', @values) . ' FROM selecto_bounded LIMIT ' . int($rows),
         params => $statement->params, columns => [@{$statement->columns}, 'selecto_transfer_overflow'],
         adapter_name => $self->name);
+    _with_relations($guarded, $statement);
     # Canonical values are formatted in the wrapped statement's SELECT list,
     # so the size guard measures the canonical text.
     my $plan = $PROJECTION{$statement};
@@ -202,24 +217,32 @@ sub insert_admission_storage {
     # Selecto::SQL::_require_read_committed).
     $self->_require_read_committed(Selecto::Identifier::checked($command->relation));
     my $relation = $dbh->selectrow_hashref(q{
-        SELECT c.oid, c.relkind, c.relispartition::integer AS relispartition,
-          (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid=c.oid AND NOT t.tgisinternal AND t.tgenabled <> 'D'))::integer AS triggers,
-          (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r WHERE r.ev_class=c.oid))::integer AS rules,
-          (EXISTS(SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid))::integer AS inheritance
-        FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass
+        SELECT c.oid, CAST(c.relkind AS pg_catalog.text) AS relkind, CAST(c.relispartition AS pg_catalog.int4) AS relispartition,
+          CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) c.oid AND NOT t.tgisinternal
+            AND t.tgenabled OPERATOR(pg_catalog.<>) 'D') AS pg_catalog.int4) AS triggers,
+          CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r WHERE r.ev_class OPERATOR(pg_catalog.=) c.oid) AS pg_catalog.int4) AS rules,
+          CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid OPERATOR(pg_catalog.=) c.oid
+            OR i.inhparent OPERATOR(pg_catalog.=) c.oid) AS pg_catalog.int4) AS inheritance
+        FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(CAST(? AS pg_catalog.text))
     }, undef, $table);
+    # A guarded insert is re-read by row id under its full guard after the
+    # statement (R13), so ordinary row triggers (updated_at, audit) stay
+    # allowed; statement-level and deferrable triggers are refused by its
+    # target contract. An upsert has no such re-read.
+    my $triggers_checked = $command->operation eq 'insert' && $self->_rereads_by_row_id;
     $fail->() unless $relation && $relation->{relkind} eq 'r'
-        && !$relation->{relispartition} && !$relation->{triggers} && !$relation->{rules} && !$relation->{inheritance};
+        && !$relation->{relispartition} && ($triggers_checked || !$relation->{triggers}) && !$relation->{rules}
+        && !$relation->{inheritance};
     my $rows = $dbh->selectall_arrayref(q{
         SELECT a.attname, t.typname, n.nspname AS type_schema,
           pg_catalog.format_type(a.atttypid,a.atttypmod) AS declaration,
           a.attgenerated, col.collname, cn.nspname AS collation_schema
         FROM pg_catalog.pg_attribute a
-        JOIN pg_catalog.pg_type t ON t.oid=a.atttypid
-        JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace
-        LEFT JOIN pg_catalog.pg_collation col ON col.oid=a.attcollation
-        LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid=col.collnamespace
-        WHERE a.attrelid=? AND a.attnum>0 AND NOT a.attisdropped
+        JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) a.atttypid
+        JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace
+        LEFT JOIN pg_catalog.pg_collation col ON col.oid OPERATOR(pg_catalog.=) a.attcollation
+        LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid OPERATOR(pg_catalog.=) col.collnamespace
+        WHERE a.attrelid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid) AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
     }, {Slice => {}}, $relation->{oid});
     my %columns = map { $_->{attname} => $_ } @$rows;
     my %storage;
@@ -322,7 +345,7 @@ sub supports {
 sub execute_query {
     my ($self, $statement, %options) = @_;
     # Session state around the read (items 56, 61): see Session state.
-    return $self->_guarded_read(blessed($statement) && $statement->can('sql') ? $statement->sql : undef,
+    return $self->_guarded_read($statement,
         sub { return $self->_execute_query_unguarded($statement, %options) });
 }
 
@@ -409,8 +432,8 @@ sub _canonical_statement {
     my $numeric = $version >= 130000 ? 1 : 0;
     my $sql = $plan->{formatted}[$numeric] //= $self->_canonical_sql($plan, $numeric) // '';
     return $statement if $sql eq '';
-    return Selecto::Statement->new(sql => $sql, params => $statement->params,
-        columns => $statement->columns, adapter_name => $statement->adapter_name);
+    return _with_relations(Selecto::Statement->new(sql => $sql, params => $statement->params,
+        columns => $statement->columns, adapter_name => $statement->adapter_name), $statement);
 }
 
 # The result columns _canonical_statement formats (for tests and diagnostics).
@@ -578,12 +601,12 @@ sub projection_sum_statement {
     my $quoted_column = $self->quote_identifier($column);
     my $sql = 'SELECT COALESCE(SUM(' . $source . '.' . $quoted_column .
         '), 0) AS "selecto_projection_sum" FROM (' . $statement->sql . ') AS ' . $source;
-    return Selecto::Statement->new(
+    return _with_relations(Selecto::Statement->new(
         sql => $sql,
         params => $statement->params,
         columns => ['selecto_projection_sum'],
         adapter_name => $self->name,
-    );
+    ), $statement);
 }
 
 sub _rollup_sort_fix_enabled {
@@ -1232,19 +1255,37 @@ my $SHADOW_SQL = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST
     . "AND (s.nspname OPERATOR(pg_catalog.=) 'pg_catalog' OR s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false))))), "
     . $SESSION_COLUMNS;
 
-# The relation names a generated statement reads or writes, as the
-# statement spells them (quoted identifiers, or a host's own unquoted SQL),
-# for the shadow check: every name after FROM, JOIN, INTO, UPDATE or USING
-# that is not a function call. A name that is not a relation (a column after
-# EXTRACT(... FROM, say) resolves to nothing and is ignored by the check.
+# The relation names a statement reads or writes, as its SQL spells them,
+# for the shadow check (items 56b, R2, R10). A statement Selecto compiled
+# (or derived from compiled ones) and a compiled write carry the list their
+# compile recorded: the root, joined and through-bridge relations, member,
+# retarget and co-domain sources, collection and association_exists
+# subqueries, the write target and reference-guard parents. The SQL text is
+# scanned as well, and is all a host's hand-built statement has: every name
+# after FROM, JOIN, INTO, UPDATE or USING, including inside parenthesised
+# joins and an INSERT target followed by its column list. A name that is not
+# a relation resolves to nothing and is ignored by the check.
 sub _pg_statement_relations {
-    my ($sql) = @_;
+    my ($source) = @_;
+    my ($sql, $recorded);
+    if (blessed($source) && $source->can('sql')) {
+        ($sql, $recorded) = ($source->sql, $source->can('relations') ? $source->relations : undef);
+    } elsif (ref($source) eq 'HASH') {
+        ($sql, $recorded) = ($source->{sql}, ref($source->{relations}) eq 'ARRAY' ? $source->{relations} : undef);
+    } else {
+        $sql = $source;
+    }
     Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
         {reason => 'relations_unknown'}) unless defined($sql) && !ref($sql) && length($sql);
     my $part = q{(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_\$]*+)};
-    my %names;
-    while ($sql =~ /\b(?:FROM|JOIN|INTO|UPDATE|USING)\s+(?:ONLY\s+)?($part(?:\.$part)?)(?![A-Za-z0-9_\$".])(?!\s*\()/gi) {
-        $names{$1} = 1;
+    my %names = map { ($_ => 1) } grep { defined && !ref } @{$recorded // []};
+    while ($sql =~ /\b(FROM|JOIN|INTO|UPDATE|USING)\s+(?:ONLY\s+)?(?:\(\s*)*($part(?:\.$part)?)(?![A-Za-z0-9_\$".])(\s*\()?/gi) {
+        my ($keyword, $name, $call) = ($1, $2, $3);
+        # A function call (FROM unnest(...)), except an INSERT target's
+        # column list; SQL keywords opening a subquery are not names.
+        next if defined($call) && uc($keyword) ne 'INTO';
+        next if $name =~ /\A(?:SELECT|LATERAL|VALUES|WITH|ROWS)\z/i;
+        $names{$name} = 1;
     }
     return [sort keys %names];
 }
@@ -1276,8 +1317,8 @@ sub _pg_session_state {
 # Refuses temp shadows of the statement's relations and of type names, and
 # returns the session snapshot, in one round trip.
 sub _pg_admit_session {
-    my ($self, $sql) = @_;
-    my $names = _pg_statement_relations($sql);
+    my ($self, $source) = @_;
+    my $names = _pg_statement_relations($source);
     my @row;
     my $ok = eval { @row = $self->{dbh}->selectrow_array($SHADOW_SQL, undef, $names); 1 };
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
@@ -1299,10 +1340,27 @@ sub _session_changed {
 # Writes (see Selecto::SQL::_execute_compiled_write_in_transaction): before
 # the DML, refuse temp shadows and snapshot; the first statement after the
 # DML compares. The transaction wrapper rolls the write back on refusal.
+#
+# Deferrable constraint triggers (R8) fire at COMMIT, after that check, and
+# can change the session for every later statement. In the write's own
+# transaction they are made to fire before it commits (SET CONSTRAINTS ...
+# IMMEDIATE, see _before_own_commit) and checked there. In a transaction
+# the host owns they would fire at the host's COMMIT, out of Selecto's
+# sight, so a write is refused while any enabled non-internal deferrable
+# trigger exists in the database (checked before the DML and again as the
+# second statement after it).
 sub _write_session_open {
     my ($self, $command, $compiled) = @_;
     return undef unless $self->_pg_session_checked;
-    return $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled->{sql} : undef);
+    my $state = $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled : undef);
+    my $unit = $self->{_selecto_write_unit};
+    if (ref($unit) eq 'HASH' && $unit->{owned}) {
+        $unit->{snapshot} //= $state;
+    } else {
+        _refuse_deferred_triggers() if @{$self->_pg_deferrable_constraints};
+        $state->{host_owned} = 1;
+    }
+    return $state;
 }
 
 sub _write_session_check {
@@ -1310,7 +1368,61 @@ sub _write_session_check {
     return unless defined $before;
     my $after = eval { $self->_pg_session_state };
     _session_changed() unless $after && $after->{snapshot} eq $before->{snapshot};
+    _refuse_deferred_triggers() if $before->{host_owned} && @{$self->_pg_deferrable_constraints};
     return;
+}
+
+sub _before_own_commit {
+    my ($self) = @_;
+    my $unit = $self->{_selecto_write_unit};
+    return unless ref($unit) eq 'HASH' && $unit->{owned} && $unit->{snapshot} && $self->_pg_session_checked;
+    my $names = $self->_pg_deferrable_constraints;
+    return unless @$names;
+    # Fires every queued event of those triggers now (their mode change is
+    # retroactive), inside the transaction that is about to commit.
+    my $ok = eval { $self->{dbh}->do('SET CONSTRAINTS ' . join(', ', @$names) . ' IMMEDIATE'); 1 };
+    die $self->normalize_error($@) unless $ok;
+    my $after = eval { $self->_pg_session_state };
+    _session_changed() unless $after && $after->{snapshot} eq $unit->{snapshot}{snapshot};
+    return;
+}
+
+# The schema-qualified names of every enabled non-internal deferrable
+# trigger's constraint in the database (internal foreign-key triggers are
+# not user code and are left alone).
+sub _pg_deferrable_constraints {
+    my ($self) = @_;
+    my $names;
+    my $ok = eval {
+        $names = $self->{dbh}->selectcol_arrayref(q{SELECT DISTINCT pg_catalog.quote_ident(n.nspname)
+              OPERATOR(pg_catalog.||) '.' OPERATOR(pg_catalog.||) pg_catalog.quote_ident(c.conname)
+            FROM pg_catalog.pg_trigger t
+            JOIN pg_catalog.pg_constraint c ON c.oid OPERATOR(pg_catalog.=) t.tgconstraint
+            JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.connamespace
+            WHERE NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable});
+        1;
+    };
+    Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
+        {reason => 'session_state_unknown'}) unless $ok && ref($names) eq 'ARRAY';
+    return $names;
+}
+
+sub _refuse_deferred_triggers {
+    Selecto::Error->throw('query_rule_not_evaluable',
+        "a deferrable constraint trigger would fire at the host's COMMIT, after Selecto's session check; "
+            . 'write in a transaction Selecto owns, or make the trigger NOT DEFERRABLE',
+        {reason => 'deferred_trigger'});
+}
+
+# Post-statement re-reads name the written rows by (tableoid, ctid) (R9).
+sub _rereads_by_row_id { return $_[0]->_pg_session_checked; }
+
+sub _with_row_ids {
+    my ($self, $compiled) = @_;
+    return $compiled unless ref($compiled) eq 'HASH';
+    my $columns = 'CAST(tableoid AS pg_catalog.text), CAST(ctid AS pg_catalog.text)';
+    return {%$compiled, row_ids => 1,
+        sql => $compiled->{sql} . (@{$compiled->{returning} // []} ? ', ' : ' RETURNING ') . $columns};
 }
 
 # Reads: the statement runs under its own savepoint in a host transaction
@@ -1319,7 +1431,7 @@ sub _write_session_check {
 # it saw before. Nested guarded reads (a read inside a guarded read) run
 # under the outer guard.
 sub _guarded_read {
-    my ($self, $sql, $work) = @_;
+    my ($self, $source, $work) = @_;
     return $work->() if !$self->_pg_session_checked || $self->{_selecto_pg_read_guard};
     local $self->{_selecto_pg_read_guard} = 1;
     my $scope = $self->_read_guard_scope;
@@ -1331,7 +1443,7 @@ sub _guarded_read {
     }
     my ($before, $result);
     my $ok = eval {
-        $before = $self->_pg_admit_session($sql);
+        $before = $self->_pg_admit_session($source);
         $result = $work->();
         1;
     };
@@ -1689,7 +1801,23 @@ and type of the temporary schema. The first statement after each DML reads
 it again. Any change rolls the write back (its own transaction, or its
 savepoint in a host's transaction) and refuses it with
 C<query_rule_violation>, reason C<session_state_changed>. Both reads name
-only C<pg_catalog> objects.
+only C<pg_catalog> objects. Behaviour change: a row trigger that creates or
+alters any temporary relation or type (including
+C<CREATE TEMP TABLE IF NOT EXISTS>, on every call, since the table it
+creates is dropped with the refused write) or changes any of those settings
+makes every write to its table refuse.
+
+=item *
+
+A deferrable constraint trigger fires at COMMIT, after that check. In a
+transaction Selecto owns, the deferrable non-internal constraint triggers of
+the database are set C<IMMEDIATE> just before COMMIT (their queued events
+fire then) and the snapshot is compared again; a change rolls the write
+back. In a transaction the host owns they would fire at the host's COMMIT,
+out of Selecto's sight, so while any enabled non-internal deferrable
+trigger exists in the database a write there is refused
+(C<query_rule_not_evaluable>, reason C<deferred_trigger>). Internal
+foreign-key triggers are not affected.
 
 =item *
 
@@ -1701,7 +1829,12 @@ after every C<FETCH> before it hands out the batch.
 
 =item *
 
-A relation a statement names that resolves into the temporary schema while
+The relations a statement names are recorded while it is compiled (the
+root, joined and through-association bridge relations, member, retarget
+and co-domain sources, collection and C<association_exists> subqueries, a
+write's target and reference-guard parents; see
+L<Selecto::Statement/relations>), and its SQL text is scanned as well. A
+relation a statement names that resolves into the temporary schema while
 a same-named relation exists in a schema of C<search_path> is refused
 (C<query_rule_not_evaluable>, reason C<temporary_shadow>), on reads and
 writes; so is a temporary type named like a type of C<pg_catalog> or of the
@@ -1713,11 +1846,16 @@ is the host's own and works.
 Post-statement SQL of a governed write (the post-image re-read and the
 trigger, rule and deferrable rechecks) addresses the relation by the oid
 and schema-qualified name resolved under its lock before the DML, with
-C<tableoid = ANY(...)>. The re-read names rows by an enforced unique key
-whose every column round-trips exactly whatever the session settings
-(integers, numeric, uuid, and text types under a deterministic collation
-matching the index's, with the default operator class); a table without
-one is refused for bound-scope updates.
+C<tableoid = ANY(...)>. A bound-scope update locks its rows and names
+them by (tableoid, ctid), and both a bound-scope update and a guarded
+insert return the (tableoid, ctid) of every row they wrote and re-read
+exactly those rows after every trigger has run, under the update's trusted
+scope or the insert's full guard. No key is needed, so keys of any type
+(composite, temporal, float, citext, partitioned) work, and a trigger that
+renumbers a row behind a decoy cannot pass; a row a later trigger updates
+again has a new row id and is refused. A guarded insert therefore keeps
+ordinary row triggers (C<updated_at>, audit); statement-level triggers,
+rules and deferrable triggers for the event stay refused.
 
 =back
 

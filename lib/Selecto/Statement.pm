@@ -15,6 +15,12 @@ sub sql ($self) { return $self->{sql}; }
 sub params ($self) { return [@{$self->{params}}]; }
 sub columns ($self) { return [@{$self->{columns}}]; }
 sub adapter_name ($self) { return $self->{adapter_name}; }
+# The relations the statement names, as its SQL spells them (dialect-quoted,
+# schema-prefixed when the SQL is), recorded by the adapter's compile; undef
+# for a statement a host built by hand.
+sub relations ($self) {
+    return ref($self->{_selecto_relations}) eq 'ARRAY' ? [@{$self->{_selecto_relations}}] : undef;
+}
 sub to_hash ($self) {
     return {
         sql => $self->{sql},
@@ -56,6 +62,16 @@ them in C<execute_query> and C<stream_query>.
   );
 
 For adapter authors.
+
+=head2 relations
+
+The relations the statement names, as an array reference of the names its
+SQL spells (dialect-quoted, schema-prefixed where the SQL is), recorded by
+C<compile>: the root, joined and bridge relations, member, retarget and
+co-domain sources, collection and C<association_exists> subqueries. Undef
+for a statement built by hand. Statements an adapter derives from a
+compiled one (bounded wrappers, scalar columns, canonical formatting) keep
+the list.
 
 =head2 sql, params, columns, adapter_name
 

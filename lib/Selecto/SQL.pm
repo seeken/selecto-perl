@@ -74,7 +74,13 @@ sub compile {
     local $self->{_source_expansions} = $self->{_source_expansions} // {};
     local $self->{_source_budget} = $self->{_source_budget}
         // Selecto::OperationBudget->new(limits => $self->{_selecto_compile_limits}, code => 'invalid_query');
+    # Every relation the statement names, as its SQL spells it, collected
+    # while compiling (see _note_relation and Selecto::Statement relations).
+    my $top = ref($self->{_selecto_relation_sink}) ne 'HASH';
+    local $self->{_selecto_relation_sink} = $top ? {} : $self->{_selecto_relation_sink};
     my $statement = $self->_compile_query($domain, $query);
+    $statement->{_selecto_relations} = [sort keys %{$self->{_selecto_relation_sink}}]
+        if $top && blessed($statement) && $statement->isa('Selecto::Statement');
     # Selecto::Engine::compile admits these parameters itself, with the same
     # limits, code and label, as soon as this returns.
     $self->admit_parameters(
@@ -380,9 +386,10 @@ sub _compile_single {
     push @joins, @{$self->_compile_json_rowsets($domain, $query, \@params)};
     push @joins, @{$self->_compile_array_rowsets($domain, $query, \@params)};
     push @joins, @{$options{extra_joins} // []};
+    my $root_sql = $self->_note_relation((defined($domain->{_read_prefix}) ? $self->quote_identifier($domain->{_read_prefix}) . '.' : '')
+        . $self->quote_identifier($domain->table));
     my $sql = 'SELECT ' . join(', ', @selection_sql) .
-        ' FROM ' . (defined($domain->{_read_prefix}) ? $self->quote_identifier($domain->{_read_prefix}) . '.' : '')
-            . $self->quote_identifier($domain->table) . ' AS ' . $self->quote_identifier($self->_root_alias);
+        ' FROM ' . $root_sql . ' AS ' . $self->quote_identifier($self->_root_alias);
     $sql .= ' ' . join(' ', @joins) if @joins;
     my @predicates;
     push @predicates, $self->_compile_expression($domain, $predicate, \@params) if $predicate;
@@ -614,10 +621,18 @@ sub _association_source_sql {
     return defined($association->values) ? $self->quote_identifier($association->table)
         : $self->_physical_source_sql($association->table);
 }
+# Records a relation as the compiled SQL names it (dialect-quoted, with any
+# schema prefix) in the current compile's relation list, and returns it.
+sub _note_relation {
+    my ($self, $sql) = @_;
+    my $sink = $self->{_selecto_relation_sink};
+    $sink->{$sql} = 1 if ref($sink) eq 'HASH' && defined($sql) && !ref($sql);
+    return $sql;
+}
 sub _physical_source_sql {
     my ($self, $table) = @_;
-    return (defined($self->{_read_prefix}) ? $self->quote_identifier($self->{_read_prefix}) . '.' : '')
-        . $self->quote_identifier($table);
+    return $self->_note_relation((defined($self->{_read_prefix}) ? $self->quote_identifier($self->{_read_prefix}) . '.' : '')
+        . $self->quote_identifier($table));
 }
 
 sub _append_values_ctes {
@@ -1295,6 +1310,14 @@ sub _admit_plan_storage { return; }
 # (undef: nothing to compare), and its comparison after the DML.
 sub _write_session_open { return undef; }
 sub _write_session_check { return; }
+# Dialect hook run in a managed write's own transaction just before COMMIT
+# (PostgreSQL fires deferred constraint triggers there and checks them).
+sub _before_own_commit { return; }
+# Dialect hook: true when post-statement re-reads name the written rows by
+# their physical row id (PostgreSQL: RETURNING tableoid, ctid) instead of
+# their key value. _with_row_ids appends the row ids to a compiled write.
+sub _rereads_by_row_id { return 0; }
+sub _with_row_ids { return $_[1]; }
 
 # Execution requires the engine's authorization for the exact object; see
 # Selecto::Write::Authorization. The *_unsafe variants skip domain governance
@@ -2991,8 +3014,19 @@ sub _refuse_unbounded_scoped_upsert {
 
 sub _compile_write {
     my ($self, $command) = @_;
+    # The relations the write's SQL names: its target and every reference
+    # guard's parent (the session checks refuse temp shadows of them).
+    local $self->{_selecto_relation_sink} = {};
+    my $compiled = $self->_compile_write_sql($command);
+    $compiled->{relations} = [sort keys %{$self->{_selecto_relation_sink}}] if ref($compiled) eq 'HASH';
+    return $compiled;
+}
+
+sub _compile_write_sql {
+    my ($self, $command) = @_;
     $self->_validate_write_cardinality($command);
     my $relation = Selecto::Identifier::checked($command->relation);
+    $self->_note_relation($self->quote_identifier($relation));
     my $operation = $command->operation;
     my $assignments = $command->assignments;
     if ($operation eq 'insert' || $operation eq 'upsert') {
@@ -3130,7 +3164,7 @@ sub _compile_foreign_key_guards {
                 $condition->{tenants}, $params, $self->_guard_identity_exact($condition));
         } (exists($guard->{tenant_field}) ? ($guard) : ()), @{$guard->{more_tenant_fields} // []};
         $self->_foreign_key_exists_sql(
-            'SELECT 1 FROM ' . $self->quote_identifier(Selecto::Identifier::checked($guard->{relation})) . " AS $alias"
+            'SELECT 1 FROM ' . $self->_note_relation($self->quote_identifier(Selecto::Identifier::checked($guard->{relation}))) . " AS $alias"
             . " WHERE $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{target_field})) . " = $value"
             . $tenant_sql,
         );
@@ -3449,15 +3483,24 @@ sub _execute_compiled_write_in_transaction {
     # Its rows are locked and named by key first, and re-read afterwards.
     my $post_image = _post_image_predicate($command);
     $self->_admit_post_image_target($command) if $post_image;
+    # A guarded insert's stored rows are re-read under its full guard after
+    # the statement, where the dialect re-reads by row id (PostgreSQL, items
+    # 24, 65, R13): ordinary row triggers (updated_at, audit) then stay
+    # allowed, and one that rewrites the row out of the guard is caught.
+    my $insert_guard = $self->_rereads_by_row_id ? _insert_post_image_predicate($command) : undef;
     # The bound-scope target contract for deletes and for graph descendants
-    # (see _bound_target_event): table lock, READ COMMITTED, and no
-    # deferrable trigger, statement-level trigger or rule for the event,
-    # checked before the statement and again after it.
-    my $bound_event = _bound_target_event($command);
+    # (see _bound_target_event), and for re-read guarded inserts: table
+    # lock, READ COMMITTED, and no deferrable trigger, statement-level
+    # trigger or rule for the event, checked before the statement and again
+    # after it.
+    my $bound_event = _bound_target_event($command) // ($insert_guard ? 'insert' : undef);
     $self->_bound_target_check($command, $bound_event, 'before') if $bound_event;
     my ($bounded, $identities) = $self->_bounded_write_command($command, $post_image ? (force => 1) : ());
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;
+    my $row_ids = ($post_image || $insert_guard) && $self->_rereads_by_row_id;
+    $compiled = $self->_with_row_ids($compiled) if $row_ids;
+    my @row_ids;
     my ($sth, $affected, %values);
     my $ok = eval {
         if ($self->_statement_cache_enabled) {
@@ -3468,7 +3511,28 @@ sub _execute_compiled_write_in_transaction {
             my $executed = $self->_execute_statement($sth, $compiled->{params});
             die _dbi_error($sth, 'database write failed') unless defined $executed;
         }
-        if (@{$compiled->{returning} // []}) {
+        if ($compiled->{row_ids}) {
+            # Every row's (tableoid, ctid) follows the requested RETURNING
+            # columns; the first row's leading columns are the values.
+            my @wanted = @{$compiled->{returning} // []};
+            my ($first, $returned);
+            while (my @row = $sth->fetchrow_array) {
+                Selecto::Error->throw('query_error', 'write row identity is unavailable')
+                    unless @row == @wanted + 2 && defined($row[-1]) && defined($row[-2]);
+                push @row_ids, [@row[-2, -1]];
+                $first //= [@row[0 .. $#wanted]];
+                ++$returned;
+            }
+            die _dbi_error($sth, 'database returning fetch failed') if eval { $sth->err };
+            if (@wanted) {
+                _guarded_cardinality($command, 0) if !$returned && @{$command->foreign_key_guards};
+                $self->_check_write_cardinality($command, 0, $bounds) unless $returned;
+                Selecto::Error->throw('write_returning_missing', 'write did not return the requested row')
+                    if !$returned && !$bounds->{declared};
+                @values{@wanted} = $self->_decode_returning_values($sth, @$first) if $returned;
+            }
+            $affected = $self->_logical_affected_rows($command->operation, $returned // 0);
+        } elsif (@{$compiled->{returning} // []}) {
             my @row = $sth->fetchrow_array;
             die _dbi_error($sth, 'database returning fetch failed')
                 if !@row && eval { $sth->err };
@@ -3497,8 +3561,10 @@ sub _execute_compiled_write_in_transaction {
     $self->_bound_target_check($command, $bound_event, 'after') if $bound_event;
     if ($post_image) {
         $self->_recheck_post_image_target($command);
-        $self->_verify_post_image($command, $post_image, $identities, $affected);
+        $row_ids ? $self->_verify_row_post_image($command, $post_image, \@row_ids, $affected)
+            : $self->_verify_post_image($command, $post_image, $identities, $affected);
     }
+    $self->_verify_row_post_image($command, $insert_guard, \@row_ids, $affected, 'insert') if $insert_guard;
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
@@ -3512,6 +3578,61 @@ sub _execute_compiled_write_in_transaction {
 # the pre-image only: an update may change the column it was found by.
 # The engine tenant's columns are immutable, but a BEFORE UPDATE trigger
 # could still rewrite them: they are re-read like any bound scope.
+# A guarded insert's full guard (its predicate, scope and query
+# enforcement: an insert has no pre-image, items 24, 65), when it has one and
+# the typed storage admission runs for it.
+sub _insert_post_image_predicate {
+    my ($command) = @_;
+    return undef unless $command->operation eq 'insert';
+    return undef unless defined($command->metadata->{__selecto_insert_types} // _declared_admission_types($command));
+    return Selecto::QueryEnforcement::combine(
+        $command->predicate, $command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef,
+    );
+}
+
+# The post-image re-read by row id (PostgreSQL, R9): the rows the statement
+# reported (RETURNING tableoid, ctid) are read again after every trigger has
+# run, FROM the schema-qualified relation resolved before the statement and
+# only among its own oids; each must still exist at that row id (a row a
+# later trigger moved again has a new one) and satisfy $predicate under the
+# write's host-exact comparison. A key-renumbering trigger or a decoy row
+# sharing the old key value cannot stand in for a moved row.
+sub _verify_row_post_image {
+    my ($self, $command, $predicate, $row_ids, $affected, $kind) = @_;
+    return 1 unless $affected;
+    my %wanted = map { (join(':', @$_) => 1) } @$row_ids;
+    Selecto::Error->throw('query_rule_violation', 'the written rows could not be identified',
+        {truth_value => 'false_or_unknown'}) unless keys(%wanted) == @$row_ids && @$row_ids == $affected;
+    my $relation = Selecto::Identifier::checked($command->relation);
+    my $target = $self->_pg_write_target($relation);
+    my @params;
+    my $condition = $self->_compile_write_predicate($predicate, \@params);
+    push @params, $target->{oids};
+    my $oids = $self->placeholder(scalar @params);
+    push @params, [map { $_->[1] } @$row_ids];
+    my $tids = $self->placeholder(scalar @params);
+    my $sql = 'SELECT CAST(tableoid AS pg_catalog.text), CAST(ctid AS pg_catalog.text), '
+        . "CASE WHEN ($condition) THEN 1 ELSE 0 END FROM $target->{qualified}"
+        . " WHERE tableoid OPERATOR(pg_catalog.=) ANY (CAST($oids AS pg_catalog.oid[]))"
+        . " AND ctid OPERATOR(pg_catalog.=) ANY (CAST($tids AS pg_catalog.tid[]))";
+    my $rows;
+    my $ok = eval { $rows = $self->dbh->selectall_arrayref($self->_statement_sql($sql), undef, @params); 1 };
+    die $self->normalize_error($@) unless $ok;
+    my %seen;
+    for my $row (@$rows) {
+        my $id = "$row->[0]:$row->[1]";
+        next unless $wanted{$id};
+        $seen{$id} = defined($row->[2]) && "$row->[2]" eq '1' ? 1 : 0;
+    }
+    Selecto::Error->throw('query_rule_violation',
+        ($kind // '') eq 'insert' ? 'inserted row does not satisfy its guard after the statement'
+            : 'updated row no longer satisfies its trusted scope',
+        {truth_value => 'false_or_unknown'})
+        unless keys(%seen) == keys(%wanted) && !grep { !$_ } values %seen;
+    return 1;
+}
+
 sub _post_image_predicate {
     my ($command) = @_;
     return undef unless $command->operation eq 'update' && exists $command->metadata->{__selecto_primary_key};
@@ -3594,6 +3715,9 @@ sub _admit_post_image_target {
     # unique (contain an enforced PRIMARY/UNIQUE index of whole, NOT NULL
     # columns) and must not change, or another row sharing the old key value
     # could stand in for a row the update moved out of scope.
+    # A re-read by row id (PostgreSQL) needs no key: any key, assigned or
+    # not, unique or not, only bounds which rows are locked.
+    return if $self->_rereads_by_row_id;
     my $primary = $command->metadata->{__selecto_primary_key};
     my @keys = map { Selecto::Identifier::checked($_) } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
     my %key = map { (lc($_) => 1) } @keys;
@@ -3633,20 +3757,22 @@ sub _pg_post_image_catalog {
     my ($self, $oid) = @_;
     return $self->dbh->selectrow_array(q{
                 WITH RECURSIVE tree(oid, partition) AS (
-                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid = CAST(? AS pg_catalog.oid)
+                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid)
                   UNION ALL
                   SELECT i.inhrelid, child.relispartition FROM pg_catalog.pg_inherits i
-                  JOIN tree ON i.inhparent = tree.oid
-                  JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid)
-                SELECT c.relkind,
-                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
-                    AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
-                  (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
-                    AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & 16) <> 0))::integer,
-                  (EXISTS(SELECT 1 FROM tree WHERE NOT tree.partition))::integer,
-                  (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
-                    WHERE r.rulename <> '_RETURN'))::integer
-                FROM pg_catalog.pg_class c WHERE c.oid = CAST(? AS pg_catalog.oid)}, undef, $oid, $oid);
+                  JOIN tree ON i.inhparent OPERATOR(pg_catalog.=) tree.oid
+                  JOIN pg_catalog.pg_class child ON child.oid OPERATOR(pg_catalog.=) i.inhrelid)
+                SELECT CAST(c.relkind AS pg_catalog.text),
+                  CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
+                    AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable) AS pg_catalog.int4),
+                  CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid OPERATOR(pg_catalog.=) tree.oid
+                    WHERE NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
+                    AND (t.tgtype OPERATOR(pg_catalog.&) CAST(1 AS pg_catalog.int2)) OPERATOR(pg_catalog.=) CAST(0 AS pg_catalog.int2)
+                    AND (t.tgtype OPERATOR(pg_catalog.&) CAST(16 AS pg_catalog.int2)) OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.int2)) AS pg_catalog.int4),
+                  CAST(EXISTS(SELECT 1 FROM tree WHERE NOT tree.partition) AS pg_catalog.int4),
+                  CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class OPERATOR(pg_catalog.=) tree.oid
+                    WHERE r.rulename OPERATOR(pg_catalog.<>) CAST('_RETURN' AS pg_catalog.name)) AS pg_catalog.int4)
+                FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid)}, undef, $oid, $oid);
 }
 
 # After the UPDATE and before the re-read (PostgreSQL): the table lock keeps
@@ -3688,37 +3814,7 @@ sub _enforced_unique_key {
     my $dbh = $self->dbh;
     my @indexes;
     my $ok = eval {
-        if ($self->name eq 'postgresql') {
-            # Items 34, 40, 43, 47: the re-read rebinds the keys it locked as
-            # text, so every column of the index must round-trip exactly and
-            # independently of session settings (integers, numeric, uuid, and
-            # text types under a deterministic collation; domains resolve to
-            # their base type), and the index must enforce uniqueness with
-            # the semantics the re-read's `=` uses: the column's own
-            # collation and the default operator class. A float, temporal,
-            # network or other key is never trusted to name rows.
-            my $rows = $dbh->selectall_arrayref(q{
-                SELECT i.indexrelid, a.attname,
-                  (a.attnotnull AND k.coll = a.attcollation
-                    AND EXISTS (SELECT 1 FROM pg_catalog.pg_opclass o WHERE o.oid = k.opclass AND o.opcdefault)
-                    AND (WITH RECURSIVE b(oid, base) AS (
-                           SELECT t.oid, t.typbasetype FROM pg_catalog.pg_type t WHERE t.oid = a.atttypid
-                           UNION ALL
-                           SELECT t.oid, t.typbasetype FROM pg_catalog.pg_type t JOIN b ON t.oid = b.base WHERE b.base <> 0)
-                         SELECT pg_catalog.bool_and(b.oid IN (20, 21, 23, 1700, 2950, 25, 1042, 1043)) FROM b WHERE b.base = 0)
-                    AND (a.attcollation = 0 OR COALESCE((SELECT co.collisdeterministic FROM pg_catalog.pg_collation co
-                         WHERE co.oid = a.attcollation), FALSE)))::pg_catalog.int4
-                FROM pg_catalog.pg_index i
-                JOIN LATERAL ROWS FROM (pg_catalog.unnest(CAST(i.indkey AS pg_catalog.int2[])),
-                  pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])),
-                  pg_catalog.unnest(CAST(i.indcollation AS pg_catalog.oid[]))) AS k(attnum, opclass, coll) ON TRUE
-                LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-                WHERE i.indrelid = CAST(? AS pg_catalog.oid) AND i.indisunique AND i.indisvalid AND i.indimmediate
-                  AND i.indpred IS NULL AND i.indexprs IS NULL}, undef, $self->_pg_resolve_write_target($table)->{oid});
-            my %by;
-            push @{$by{$_->[0]}}, [$_->[1], $_->[2]] for @$rows;
-            @indexes = values %by;
-        } elsif ($self->name eq 'sqlite') {
+        if ($self->name eq 'sqlite') {
             my %info = map { (lc($_->{name}) => $_) }
                 @{$dbh->selectall_arrayref('PRAGMA table_info(' . $self->quote_identifier($table) . ')', {Slice => {}})};
             my @pk = sort { $a->{pk} <=> $b->{pk} } grep { $_->{pk} } values %info;
@@ -3802,14 +3898,17 @@ sub _bound_target_check {
             WITH RECURSIVE tree(oid) AS (
               SELECT CAST(? AS pg_catalog.oid)
               UNION ALL
-              SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree ON i.inhparent = tree.oid)
+              SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree ON i.inhparent OPERATOR(pg_catalog.=) tree.oid)
             SELECT
-              (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
-                AND t.tgenabled <> 'D' AND t.tgdeferrable))::integer,
-              (EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid = tree.oid WHERE NOT t.tgisinternal
-                AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0))::integer,
-              (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
-                WHERE r.ev_type IN (?, ?) AND r.rulename <> '_RETURN'))::integer},
+              CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
+                AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable) AS pg_catalog.int4),
+              CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid OPERATOR(pg_catalog.=) tree.oid
+                WHERE NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
+                AND (t.tgtype OPERATOR(pg_catalog.&) CAST(1 AS pg_catalog.int2)) OPERATOR(pg_catalog.=) CAST(0 AS pg_catalog.int2)
+                AND (t.tgtype OPERATOR(pg_catalog.&) CAST(? AS pg_catalog.int2)) OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.int2)) AS pg_catalog.int4),
+              CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class OPERATOR(pg_catalog.=) tree.oid
+                WHERE (r.ev_type OPERATOR(pg_catalog.=) CAST(? AS pg_catalog."char") OR r.ev_type OPERATOR(pg_catalog.=) CAST(? AS pg_catalog."char"))
+                  AND r.rulename OPERATOR(pg_catalog.<>) CAST('_RETURN' AS pg_catalog.name)) AS pg_catalog.int4)},
             undef, $oid, $mask, $first_rule, $second_rule);
         1;
     };
@@ -3916,7 +4015,13 @@ sub _bounded_write_command {
     my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
     my $columns = join(', ', map { $self->quote_identifier($_) } @keys);
     my $probe_limit = $limit + 1;
-    my $sql = "SELECT $columns FROM $table WHERE $where ORDER BY $columns LIMIT $probe_limit";
+    # PostgreSQL locks and then names the rows by (tableoid, ctid): exact
+    # whatever the key's type or the session's settings (a float or
+    # timestamp key rebound as text could miss its row), and stable while
+    # the row lock is held.
+    my $by_row = $self->_rereads_by_row_id;
+    my $selected = $by_row ? 'CAST(tableoid AS pg_catalog.text), CAST(ctid AS pg_catalog.text)' : $columns;
+    my $sql = "SELECT $selected FROM $table WHERE $where ORDER BY $columns LIMIT $probe_limit";
     # InnoDB locking reads hold the selected keys until the write commits.
     $sql .= ' FOR UPDATE' if $name =~ /\A(?:postgresql|mysql|mariadb)\z/;
     # Recover a timed-out PostgreSQL statement before restoring session
@@ -3958,8 +4063,13 @@ sub _bounded_write_command {
     $self->_check_write_cardinality($command, scalar(@identities), $bounds);
     # Keep every original scope and precondition, then constrain DML to the
     # exact locked keys. New matching rows can never join this mutation.
+    my %by_oid;
+    push @{$by_oid{$_->[0]}}, $_->[1] for $by_row ? @identities : ();
     my $keys = !@identities
         ? Selecto::Expression->all(Selecto::Expression->is_null($keys[0]), Selecto::Expression->not_null($keys[0]))
+        : $by_row ? Selecto::Expression->any(map {
+            Selecto::Expression->all(Selecto::Expression->eq('tableoid', $_), Selecto::Expression->in('ctid', $by_oid{$_}))
+        } sort keys %by_oid)
         : @keys == 1 ? Selecto::Expression->in($keys[0], [map { $_->[0] } @identities])
         : Selecto::Expression->any(map {
             my $identity = $_;
@@ -4043,7 +4153,9 @@ sub _own_transaction {
     eval { $self->_begin_transaction; 1 }
         or die $self->_transaction_control_error($@);
     my ($value, $error);
-    my $ok = eval { $value = $operation->(); 1 };
+    # The write unit this transaction owns (see _savepoint_transaction).
+    local $self->{_selecto_write_unit} = {owned => 1};
+    my $ok = eval { $value = $operation->(); $self->_before_own_commit; 1 };
     if ($ok) {
         $ok = eval { $self->_commit_transaction; 1 };
         $error = $self->_transaction_control_error($@) unless $ok;
@@ -4064,6 +4176,9 @@ sub _savepoint_transaction {
     my $name = _savepoint_name('selecto_write');
     eval { $self->_savepoint_command(create => $name); 1 }
         or die $self->_transaction_control_error($@);
+    # Inside a transaction the host owns (or an outer unit's), the host's
+    # COMMIT, not Selecto's, ends it.
+    local $self->{_selecto_write_unit} = $self->{_selecto_write_unit} // {owned => 0};
     my ($value, $error);
     my $ok = eval { $value = $operation->(); 1 };
     if ($ok) {
