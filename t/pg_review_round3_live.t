@@ -279,44 +279,104 @@ subtest 'R17: deferred foreign keys keep their deferral around Selecto writes' =
     is($rows->($admin, 'SELECT note FROM r3f_w'), 'own', 'both writes applied');
     $admin->do('DROP TABLE r3f_child, r3f_parent, r3f_w CASCADE');
 };
-subtest 'R19/R23b: writes need READ COMMITTED; generated SQL names relations by their schema' => sub {
+subtest 'R29/R30: relations resolve by the reset search_path; search_path is pinned for every statement' => sub {
     $admin->do($_) for 'DROP SCHEMA IF EXISTS r3q_evil CASCADE', 'DROP TABLE IF EXISTS r3q CASCADE',
         'CREATE TABLE r3q (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
         q{INSERT INTO r3q VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
-        'CREATE SCHEMA r3q_evil', q{CREATE VIEW r3q_evil.r3q AS SELECT id, 't1'::text AS org_key, note FROM public.r3q};
+        'CREATE SCHEMA r3q_evil', q{CREATE VIEW r3q_evil.r3q AS SELECT id, 't1'::text AS org_key, note FROM public.r3q},
+        q{CREATE FUNCTION r3q_evil.yes(text, text) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
+        'CREATE OPERATOR r3q_evil.= (LEFTARG = text, RIGHTARG = text, FUNCTION = r3q_evil.yes)';
     my $dbh = $connect->();
     my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
-    my $writer = Selecto::Engine->new(domain => $writable->('r3q', 'id', id => 'integer', org_key => 'string', note => 'string'),
-        adapter => $adapter);
+    my $tenanted = Selecto::Domain->parse({schema_version => 1, name => 'R3T',
+        source => {source_table => 'r3q', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
+            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
+        schemas => {}, joins => {},
+        writes => {operations => {update => {enabled => 1}}, fields => {note => {updatable => 1}}}});
+    my $writer = Selecto::Engine->new(domain => $tenanted, adapter => $adapter)->with_scope(tenant => 't1');
     my $update = sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
-        assignments => {note => $_[0]}, predicate => $x->eq('id', 1)))->affected_rows };
-    for my $level ('REPEATABLE READ', 'SERIALIZABLE') {
-        $dbh->begin_work;
-        $dbh->do("SET TRANSACTION ISOLATION LEVEL $level");
-        is($outcome->(sub { $update->('rr') }), 'query_rule_not_evaluable/isolation_level',
-            "an unscoped write in a host $level transaction is refused");
-        $dbh->rollback;
-    }
-    $dbh->begin_work;
-    is($outcome->(sub { $update->('rc') }), 'applied 1', 'an unscoped write in a host READ COMMITTED transaction applies');
-    $dbh->commit;
-    like($adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
-        assignments => {note => 'x'}, predicate => $x->eq('id', 1)))->{sql}, qr/\AUPDATE public\.r3q SET /,
-        'a write names its target by schema');
+        assignments => {note => $_[0]}, predicate => $x->eq('id', $_[1] // 1)))->affected_rows };
     my $reads = Selecto::Domain->parse({schema_version => 1, name => 'R',
         source => {source_table => 'r3q', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
             columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
         schemas => {}, joins => {}});
     my $reader = Selecto::Engine->new(domain => $reads, adapter => $adapter)->with_scope(tenant => 't1');
     my $query = $reader->query->select('id', 'note')->order_by('id');
-    my $statement = $reader->compile($query);
-    like($statement->sql, qr/ FROM public\.r3q AS /, 'a read names its relation by schema');
-    # A statement compiled before a search_path switch keeps reading the
-    # relation it resolved, not the evil namesake.
-    $dbh->do('SET search_path TO r3q_evil, public');
-    is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($statement)->{rows}} }), 'applied 1',
-        'a compiled read is not redirected by a later search_path switch');
+    my $ids = sub { join ',', map { $_->[0] } @{$reader->all($query)->{rows}} };
+    like($reader->compile($query)->sql, qr/ FROM public\.r3q AS /, 'a read names its relation by schema');
+    like($adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
+        assignments => {note => 'x'}, predicate => $x->eq('id', 1)))->{sql}, qr/\AUPDATE public\.r3q SET /,
+        'a write names its target by schema');
+    is($outcome->($ids), 'applied 1', 'control: the tenant read');
+    # A session-level switch made before Selecto's call: the relation still
+    # resolves through the reset search_path, and the evil = operator ahead
+    # of pg_catalog cannot answer the tenant compare.
+    $dbh->do('SET search_path TO r3q_evil, pg_catalog, public');
+    is($outcome->($ids), 'applied 1', 'a persisted search_path switch redirects neither relation nor operator');
+    like($outcome->(sub { $update->('t2-row', 2) }), qr/\A(?:applied 0|cardinality_mismatch)/, 'nor lets the tenant write reach another tenant');
+    is($rows->($admin, 'SELECT note FROM r3q WHERE id = 2'), 'SECRET', "the other tenant's row is unchanged");
+    is($rows->($dbh, 'SHOW search_path'), 'r3q_evil, pg_catalog, public', "and the host's search_path is restored after each call");
     $dbh->do('RESET search_path');
+    for my $level ('REPEATABLE READ', 'SERIALIZABLE') {
+        $dbh->begin_work;
+        $dbh->do("SET TRANSACTION ISOLATION LEVEL $level");
+        my $plain = Selecto::Engine->new(domain => $writable->('r3q', 'id', id => 'integer', org_key => 'string', note => 'string'),
+            adapter => $adapter);
+        is($outcome->(sub { $plain->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
+            assignments => {note => 'rr'}, predicate => $x->eq('id', 1)))->affected_rows }), 'applied 1',
+            "an unscoped write in a host $level transaction applies (no R19 isolation refusal)");
+        $dbh->rollback;
+    }
     $admin->do($_) for 'DROP SCHEMA r3q_evil CASCADE', 'DROP TABLE r3q CASCADE';
 };
+
+subtest 'R32: internal deferrable rechecks count unless they run only pg_catalog code' => sub {
+    $admin->do($_) for 'DROP TABLE IF EXISTS r3u_w, r3u_parent, r3u_child, r3u_x CASCADE',
+        'DROP OPERATOR CLASS IF EXISTS r3u_ops USING btree CASCADE',
+        'CREATE TABLE r3u_w (id INT PRIMARY KEY, note TEXT)', q{INSERT INTO r3u_w VALUES (1, 'n')},
+        'CREATE TABLE r3u_parent (id INT PRIMARY KEY)',
+        'CREATE TABLE r3u_child (id INT PRIMARY KEY, p INT REFERENCES r3u_parent (id) DEFERRABLE INITIALLY DEFERRED,'
+            . ' k INT, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
+    my $dbh = $connect->();
+    my $writer = Selecto::Engine->new(domain => $writable->('r3u_w', 'id', id => 'integer', note => 'string'),
+        adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+    my $update = sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3u_w',
+        assignments => {note => $_[0]}, predicate => $x->eq('id', 1)))->affected_rows };
+    is($outcome->(sub { $update->('a') }), 'applied 1', 'deferred foreign keys and pg_catalog unique rechecks do not block writes');
+    $admin->do($_) for q{CREATE OPERATOR CLASS r3u_ops FOR TYPE int4 USING btree AS OPERATOR 1 <, OPERATOR 2 <=,
+            OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >, FUNCTION 1 btint4cmp(int4, int4)},
+        'CREATE TABLE r3u_x (k INT, CONSTRAINT r3u_x_k EXCLUDE USING btree (k r3u_ops WITH =) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('b') }), 'query_rule_not_evaluable/deferred_triggers',
+        'a deferrable exclusion recheck under a user operator class refuses writes');
+    is($rows->($admin, 'SELECT note FROM r3u_w'), 'a', 'and the refused write left nothing');
+    $admin->do($_) for 'DROP TABLE r3u_w, r3u_parent, r3u_child, r3u_x CASCADE', 'DROP OPERATOR CLASS r3u_ops USING btree CASCADE';
+};
+
+subtest 'R33: a CTE named like a real relation never hides it' => sub {
+    $admin->do($_) for 'DROP TABLE IF EXISTS r3c, r3c_other CASCADE',
+        'CREATE TABLE r3c (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)', q{INSERT INTO r3c VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
+        'CREATE TABLE r3c_other (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)', q{INSERT INTO r3c_other VALUES (2, 't1', 'decoy')};
+    my $dbh = $connect->();
+    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    my $parse = sub {
+        my ($table) = @_;
+        Selecto::Domain->parse({schema_version => 1, name => "D$table",
+            source => {source_table => $table, primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
+                columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
+            schemas => {}, joins => {}});
+    };
+    my $engine = Selecto::Engine->new(domain => $parse->('r3c'), adapter => $adapter)->with_scope(tenant => 't1');
+    my $query = eval { $engine->query->with_cte('r3c', $parse->('r3c_other'), Selecto::Query->new->select('id', 'org_key', 'note'),
+        columns => [qw(id org_key note)])->select('id', 'note')->order_by('id') };
+    if (!$query) {
+        pass('a CTE may not take the root relation\'s name: ' . (blessed($@) ? $@->code : $@));
+        return;
+    }
+    my $result = $outcome->(sub { join ',', map { "$_->[0]:$_->[1]" } @{$engine->all($query)->{rows}} });
+    # Selecto refuses a query source named like a relation the domain reads;
+    # either way the root never reads the CTE's rows.
+    is($result, 'invalid_query', 'a CTE named like the root relation is refused, never read in its place');
+    $admin->do('DROP TABLE r3c, r3c_other CASCADE');
+};
+
 done_testing;
