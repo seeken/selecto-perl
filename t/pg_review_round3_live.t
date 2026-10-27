@@ -218,4 +218,65 @@ subtest 'item 58: catalog checks resolve operators in pg_catalog only' => sub {
     $admin->do($_) for 'DROP TABLE r3o CASCADE', 'DROP FUNCTION r3o_stmt() CASCADE', 'DROP SCHEMA r3o_evil CASCADE';
 };
 
+subtest 'R14: a deferrable trigger created during the write cannot fire after the check' => sub {
+    $admin->do($_) for 'DROP SCHEMA IF EXISTS r3m_evil CASCADE', 'DROP TABLE IF EXISTS r3m_w, r3m_audit, r3m_items CASCADE',
+        'DROP FUNCTION IF EXISTS r3m_mk() CASCADE', 'DROP FUNCTION IF EXISTS r3m_evilf() CASCADE',
+        'CREATE TABLE r3m_items (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
+        q{INSERT INTO r3m_items VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
+        'CREATE SCHEMA r3m_evil', q{CREATE VIEW r3m_evil.r3m_items AS SELECT id, 't1'::text AS org_key, note FROM public.r3m_items},
+        'CREATE TABLE r3m_audit (id SERIAL PRIMARY KEY, item INT)',
+        'CREATE TABLE r3m_w (id INT PRIMARY KEY, note TEXT)', q{INSERT INTO r3m_w VALUES (1, 'n')},
+        q{CREATE FUNCTION r3m_evilf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+            PERFORM set_config('search_path', 'r3m_evil,public', false); RETURN NULL; END $$},
+        q{CREATE FUNCTION r3m_mk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgname = 'r3m_def') THEN
+              EXECUTE 'CREATE CONSTRAINT TRIGGER r3m_def AFTER INSERT ON public.r3m_audit DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION r3m_evilf()';
+            END IF;
+            INSERT INTO public.r3m_audit (item) VALUES (NEW.id); RETURN NEW; END $$},
+        'CREATE TRIGGER r3m_a AFTER UPDATE ON r3m_w FOR EACH ROW EXECUTE FUNCTION r3m_mk()';
+    my $reads = Selecto::Domain->parse({schema_version => 1, name => 'R',
+        source => {source_table => 'r3m_items', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
+            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
+        schemas => {}, joins => {}});
+    for my $mode (qw(own host)) {
+        my $dbh = $connect->();
+        my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+        my $writer = Selecto::Engine->new(domain => $writable->('r3m_w', 'id', id => 'integer', note => 'string'), adapter => $adapter);
+        my $reader = Selecto::Engine->new(domain => $reads, adapter => $adapter)->with_scope(tenant => 't1');
+        my $read = sub { join ',', map { $_->[1] } @{$reader->all($reader->query->select('id', 'note')->order_by('id'))->{rows}} };
+        $dbh->begin_work if $mode eq 'host';
+        my $result = $outcome->(sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3m_w',
+            assignments => {note => 'u'}, predicate => $x->eq('id', 1)))->affected_rows });
+        like($result, qr{\Aquery_rule_(?:violation/session_state_changed|not_evaluable/deferred_trigger)\z},
+            "$mode transaction: the write is refused ($result)");
+        $dbh->commit if $mode eq 'host';
+        is($rows->($dbh, 'SHOW search_path'), '"$user", public', "$mode transaction: the session keeps its search_path");
+        is($outcome->($read), 'applied mine', "$mode transaction: the next tenant read sees only its own rows");
+        is($rows->($admin, 'SELECT note FROM r3m_w'), 'n', "$mode transaction: and the write was rolled back");
+        is($rows->($admin, q{SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgname = 'r3m_def'}), '0',
+            "$mode transaction: the trigger the write created was rolled back with it");
+    }
+    $admin->do($_) for 'DROP TABLE r3m_w, r3m_audit, r3m_items CASCADE', 'DROP SCHEMA r3m_evil CASCADE',
+        'DROP FUNCTION r3m_mk() CASCADE', 'DROP FUNCTION r3m_evilf() CASCADE';
+};
+
+subtest 'R17: deferred foreign keys keep their deferral around Selecto writes' => sub {
+    $admin->do($_) for 'DROP TABLE IF EXISTS r3f_child, r3f_parent, r3f_w CASCADE',
+        'CREATE TABLE r3f_parent (id INT PRIMARY KEY)',
+        'CREATE TABLE r3f_child (id INT PRIMARY KEY, parent_id INT REFERENCES r3f_parent (id) DEFERRABLE INITIALLY DEFERRED)',
+        'CREATE TABLE r3f_w (id INT PRIMARY KEY, note TEXT)', q{INSERT INTO r3f_w VALUES (1, 'n')};
+    my $dbh = $connect->();
+    my $writer = Selecto::Engine->new(domain => $writable->('r3f_w', 'id', id => 'integer', note => 'string'),
+        adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+    my $update = sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3f_w',
+        assignments => {note => $_[0]}, predicate => $x->eq('id', 1)))->affected_rows };
+    $dbh->begin_work;
+    $dbh->do('INSERT INTO r3f_child VALUES (1, 7)');
+    is($outcome->(sub { $update->('host') }), 'applied 1', 'a write in a host transaction with a pending deferred FK applies');
+    $dbh->do('INSERT INTO r3f_parent VALUES (7)');
+    ok(eval { $dbh->commit; 1 }, 'and the host commits once the parent exists');
+    is($outcome->(sub { $update->('own') }), 'applied 1', 'a write in its own transaction applies with deferred FKs present');
+    is($rows->($admin, 'SELECT note FROM r3f_w'), 'own', 'both writes applied');
+    $admin->do('DROP TABLE r3f_child, r3f_parent, r3f_w CASCADE');
+};
 done_testing;
