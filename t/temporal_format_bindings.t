@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use JSON::PP ();
 use lib 't/lib';
+use TestPostgreSQL ();
 use TestSelecto;
 use Selecto;
 use Selecto::API::EngineHandler ();
@@ -50,10 +51,10 @@ subtest 'numbered placeholder occurrence accounting' => sub {
 };
 
 subtest 'PostgreSQL DATE midnight follows the requested timezone, not the session' => sub {
-    my $database = $ENV{SELECTO_API_TEST_DATABASE};
+    my $database = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all => 'disposable API PostgreSQL database is not configured' unless defined $database && length $database;
     plan skip_all => 'DBD::Pg is required' unless eval {require DBI; require DBD::Pg; 1};
-    my $dbh = DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,
+    my $dbh = DBI->connect(TestPostgreSQL->connection,
         {RaiseError=>1,PrintError=>0,AutoCommit=>1});
     $dbh->do('CREATE TEMP TABLE selecto_temporal_bindings(id INTEGER,day DATE,naive TIMESTAMP,instant TIMESTAMPTZ,epoch NUMERIC(20,6),active BOOLEAN)');
     $dbh->do(q{INSERT INTO selecto_temporal_bindings VALUES(1,'1969-12-31','2024-01-01 10:00:00','2024-01-01 10:00:00+00',1704103200,true)});
@@ -134,11 +135,11 @@ subtest 'PostgreSQL DATE midnight follows the requested timezone, not the sessio
 };
 
 subtest 'all temporal formats execute equivalently on PostgreSQL and DuckDB' => sub {
-    my $database = $ENV{SELECTO_API_TEST_DATABASE};
+    my $database = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all => 'disposable API PostgreSQL database is not configured' unless defined $database && length $database;
     plan skip_all => 'both DBI drivers are required' unless eval {require DBI; require DBD::Pg; require DBD::DuckDB; 1};
     my @handles = (
-        DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,{RaiseError=>1,PrintError=>0,AutoCommit=>1}),
+        DBI->connect(TestPostgreSQL->connection,{RaiseError=>1,PrintError=>0,AutoCommit=>1}),
         DBI->connect('dbi:DuckDB:dbname=:memory:',undef,undef,{RaiseError=>1,PrintError=>0,AutoCommit=>1}),
     );
     my @engines;
