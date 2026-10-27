@@ -94,12 +94,9 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
         $dbh->do('INSERT INTO selecto_session_rows VALUES (2, ?)', undef, 'host');
         my $outcome = failure($write);
         $dbh->do('ROLLBACK');
-        if ($backend eq 'mariadb') {
-            is($outcome, 'invalid_adapter/transaction_outside_driver',
-                'a write on a server transaction opened outside the driver is refused');
-            is($dbh->selectrow_array('SELECT COUNT(*) FROM selecto_session_rows'), 1, 'the host work was not committed');
-        }
-        # MySQL has no way to report it: hosts open transactions with begin_work.
+        is($outcome, 'invalid_adapter/transaction_outside_driver',
+            'a write on a server transaction opened outside the driver is refused');
+        is($dbh->selectrow_array('SELECT COUNT(*) FROM selecto_session_rows'), 1, 'the host work was not committed');
 
         $dbh->do('DROP TABLE selecto_session_rows');
         $dbh->disconnect;
