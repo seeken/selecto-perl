@@ -3630,12 +3630,36 @@ sub _verify_row_post_image {
         next unless $wanted{$id};
         $seen{$id} = defined($row->[2]) && "$row->[2]" eq '1' ? 1 : 0;
     }
+    return 1 if keys(%seen) == keys(%wanted) && !grep { !$_ } values %seen;
+    # A guarded insert the typed admission accepted, rewritten by a BEFORE
+    # INSERT row trigger so it no longer satisfies its guard: the trigger
+    # made the admission unevaluable (typed_insert_admission TA005), and the
+    # insert is refused and rolled back as before the re-read existed.
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a BEFORE INSERT trigger rewrote the guarded row; the insert admission cannot be evaluated',
+        {reason => 'transforming_trigger', relation => $relation})
+        if ($kind // '') eq 'insert' && $self->_pg_before_insert_triggers($target->{oid});
     Selecto::Error->throw('query_rule_violation',
         ($kind // '') eq 'insert' ? 'inserted row does not satisfy its guard after the statement'
             : 'updated row no longer satisfies its trusted scope',
-        {truth_value => 'false_or_unknown'})
-        unless keys(%seen) == keys(%wanted) && !grep { !$_ } values %seen;
-    return 1;
+        {truth_value => 'false_or_unknown'});
+}
+
+# Whether the relation (by oid) has an enabled user-defined BEFORE INSERT
+# row trigger (tgtype bits: ROW 1, BEFORE 2, INSERT 4).
+sub _pg_before_insert_triggers {
+    my ($self, $oid) = @_;
+    my ($count);
+    my $ok = eval {
+        ($count) = $self->dbh->selectrow_array(q{SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
+            WHERE t.tgrelid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid) AND NOT t.tgisinternal
+              AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
+              AND (t.tgtype OPERATOR(pg_catalog.&) CAST(7 AS pg_catalog.int2)) OPERATOR(pg_catalog.=) CAST(7 AS pg_catalog.int2)},
+            undef, $oid);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return $count ? 1 : 0;
 }
 
 sub _post_image_predicate {
