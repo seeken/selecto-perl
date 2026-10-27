@@ -101,7 +101,7 @@ sub compile_pair {
 for my $name (qw(postgresql duckdb)) {
     subtest "$name compiles naive_utc as an instant" => sub {
         my $engine = Selecto::Engine->new(domain => storage_domain(),
-            adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)));
+            adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => TestSelecto::DBH->new)));
         my $plain = $engine->compile($engine->query->select('naive')->where(
             Selecto::Expression->gte('naive', '2024-01-01')));
         unlike $plain->sql, qr/AT TIME ZONE/, 'without a zone the stored value is read and compared as is';
@@ -140,7 +140,7 @@ for my $name (qw(postgresql duckdb)) {
             'association columns honour their storage';
 
         my $legacy = Selecto::Engine->new(domain => storage_domain(without_hint => 1),
-            adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)));
+            adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => TestSelecto::DBH->new)));
         for my $case (@cases) {
             my ($label, $build) = @$case;
             my $naive_compiled = $legacy->compile($build->('naive'));
@@ -154,9 +154,9 @@ for my $name (qw(postgresql duckdb)) {
 for my $name (qw(sqlite mysql mariadb mssql)) {
     subtest "$name accepts the hint and compiles as before" => sub {
         my $hinted = Selecto::Engine->new(domain => storage_domain(),
-            adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)));
+            adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => TestSelecto::DBH->new)));
         my $legacy = Selecto::Engine->new(domain => storage_domain(without_hint => 1),
-            adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)));
+            adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => TestSelecto::DBH->new)));
         my $query = sub {
             $_[0]->query->select('naive', 'event.naive')
                 ->where(Selecto::Expression->between('naive', '2024-01-01', '2024-12-31'))
@@ -181,7 +181,7 @@ my @INSTANTS = (
 sub live_cases {
     my ($name, $dbh) = @_;
     my $domain = storage_domain();
-    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($name => (dbh => $dbh)));
+    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => $dbh)));
     my $handler = Selecto::API::EngineHandler->new;
     for my $zone ('America/Denver', 'Asia/Kolkata', 'UTC') {
         my $raw = $handler->query($engine, {select => [qw(naive aware)], timezone => $zone,

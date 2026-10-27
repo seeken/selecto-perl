@@ -32,7 +32,7 @@ my $domain = Selecto::Domain->parse({
         fields => {id => {insertable => 1}, name => {insertable => 1, updatable => 1},
             tenant_id => {insertable => 1}}},
 });
-my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
+my $adapter = Selecto::PostgreSQL->new(temporary_relations => 1,dbh => $dbh);
 my $unscoped = Selecto::Engine->new(domain => $domain, adapter => $adapter);
 my $engine = Selecto::Engine->new(
     domain => $domain->with_required_predicate(Selecto::Expression->eq('tenant_id',7)),

@@ -18,7 +18,7 @@ sub exercise {
     my ($name,$dbh,$trigger_count) = @_;
     my $engine=Selecto::Engine->new(domain=>TestSelecto::writable_domain(
         name=>'Bounded items',table=>'bounded_items',fields=>{id=>'integer',name=>'string'}),
-        adapter=>Selecto->adapter($name=>(dbh=>$dbh)));
+        adapter=>Selecto->adapter($name=>(temporary_relations => 1,dbh=>$dbh)));
     for my $op(qw(update delete)) {
         my $ok=eval{$engine->execute_write(command(1,$op));1};
         my $e=$@;
@@ -51,7 +51,7 @@ subtest 'SQLite preflight refuses before triggers' => sub {
         for my $expected(1,2) {
             my $engine=Selecto::Engine->new(domain=>TestSelecto::writable_domain(
                 name=>'Bounded items',table=>'bounded_items',fields=>{id=>'integer',name=>'string'}),
-                adapter=>Selecto->adapter(sqlite=>(dbh=>$dbh)));
+                adapter=>Selecto->adapter(sqlite=>(temporary_relations => 1,dbh=>$dbh)));
             eval {$engine->execute_write(command($expected,$op))};
             is $@->code,'required_data_rule_pending','trigger target needs physical mutation authority';
             is $count,0,'no row trigger runs before authority refusal';
@@ -68,7 +68,7 @@ subtest 'compound probe retains exact tuples rather than a Cartesian selection' 
     my $dbh=DBI->connect('dbi:SQLite:dbname=:memory:','','',{RaiseError=>1,PrintError=>0});
     $dbh->do('CREATE TABLE bounded_items(a INTEGER NOT NULL,b INTEGER NOT NULL,name TEXT,PRIMARY KEY(a,b))');
     $dbh->do(q{INSERT INTO bounded_items VALUES(1,1,'picked'),(2,2,'picked'),(1,2,'leave'),(2,1,'leave')});
-    my $adapter=Selecto->adapter(sqlite=>(dbh=>$dbh));
+    my $adapter=Selecto->adapter(sqlite=>(temporary_relations => 1,dbh=>$dbh));
     my $cmd=Selecto::Write::Command->new(operation=>'update',relation=>'bounded_items',
         assignments=>{name=>'changed'},predicate=>Selecto::Expression->eq('name','picked'),expected_count=>2,
         metadata=>{__selecto_primary_key=>['a','b'],__selecto_write_limit=>1000});
@@ -106,7 +106,7 @@ subtest 'PostgreSQL preflight refuses before nontransactional trigger effects' =
 
 subtest 'unproven broad-write dialects refuse, bounded key writes remain supported' => sub {
     for my $name(qw(mysql mariadb mssql duckdb)) {
-        my $adapter=Selecto->adapter($name=>(dbh=>TestSelecto::DBH->new));
+        my $adapter=Selecto->adapter($name=>(temporary_relations => 1,dbh=>TestSelecto::DBH->new));
         my $cmd=command(1)->with_metadata({__selecto_primary_key=>'id',__selecto_write_limit=>1000});
         eval{$adapter->_bounded_write_command($cmd)};
         # MySQL and MariaDB bound broad writes with a locking key probe under
@@ -136,7 +136,7 @@ subtest 'PostgreSQL fixes the selected keys and restores timeout after refusal' 
     my $table='bounded_concurrent_' . $$;
     $dbh->do("CREATE TABLE $table(id INTEGER PRIMARY KEY,name TEXT)");
     $dbh->do("INSERT INTO $table VALUES(1,'one'),(2,'two')");
-    my $adapter=Local::BoundedPostgreSQL->new(dbh=>$dbh);
+    my $adapter=Local::BoundedPostgreSQL->new(temporary_relations => 1,dbh=>$dbh);
     my $engine=Selecto::Engine->new(domain=>TestSelecto::writable_domain(
         name=>'Concurrent bounded',table=>$table,fields=>{id=>'integer',name=>'string'}),adapter=>$adapter);
     $peer->do(q{SET lock_timeout='20ms'});

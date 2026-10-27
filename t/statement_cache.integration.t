@@ -31,7 +31,7 @@ my $domain = Selecto::Domain->parse({
 });
 my $engine = sub {
     my ($handle, %options) = @_;
-    return Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $handle, %options)));
+    return Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $handle, %options)));
 };
 my $prepared = sub {
     my ($handle) = @_;
@@ -114,7 +114,7 @@ subtest 'a changed result type (0A000)' => sub {
             associations => {}},
         schemas => {}, joins => {},
     });
-    my $shaped = Selecto::Engine->new(domain => $shape, adapter => Selecto->adapter(postgresql => (dbh => $own, statement_cache => 1)));
+    my $shaped = Selecto::Engine->new(domain => $shape, adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $own, statement_cache => 1)));
     my $read = sub { $shaped->all($shaped->query->select('title')->where(Selecto::Expression->eq('site_id', 7301)))->{rows} };
     $read->() for 1 .. 2;
     $own->do('ALTER TABLE statement_cache_shape ALTER COLUMN title TYPE VARCHAR(40)');
@@ -158,7 +158,7 @@ subtest 'the cache is freed with its connection' => sub {
     {
         my $own = $connect->();
         $own->do(q{SET application_name = 'selecto_statement_cache_test'});
-        my $adapter = Selecto->adapter(postgresql => (dbh => $own, statement_cache => 1));
+        my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $own, statement_cache => 1));
         $adapter->execute_query(Selecto::Statement->new(sql => 'SELECT $1::int', params => [$_], columns => ['n'])) for 1 .. 3;
         is(Selecto::PostgreSQL::StatementCache->count($own), 1, 'one cached handle');
         is $count->(), 1, 'connected';

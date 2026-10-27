@@ -15,7 +15,7 @@ sub command {
 }
 sub engine {
     my ($dbh, $adapter, $table, $field, $type, $predicate) = @_;
-    return Selecto::Engine->new(adapter => Selecto->adapter($adapter => (dbh => $dbh)),
+    return Selecto::Engine->new(adapter => Selecto->adapter($adapter => (temporary_relations => 1,dbh => $dbh)),
         domain => TestSelecto::writable_domain(name => 'Synthetic typed admission', table => $table,
             fields => {id => 'integer', $field => $type}, required_predicate => $predicate));
 }

@@ -36,7 +36,7 @@ my $domain = Selecto::Domain->parse({
         views => {directory => {projection => 'details', segments => ['minimum'], ordering => 'descending'}},
     },
 })->with_required_predicate(Selecto::Expression->eq('tenant_id',7));
-my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(temporary_relations => 1,dbh => $dbh));
 my $handler = Selecto::API::EngineHandler->new;
 for my $case (
     [{view => 'directory'}, [[3,'Gamma',30],[4,'Delta',20]]],

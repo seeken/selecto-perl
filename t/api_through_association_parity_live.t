@@ -31,7 +31,7 @@ my $domain = Selecto::Domain->parse({
         columns => {id => {type => 'integer'}, tenant_id => {type => 'integer', internal => 1}, label => {type => 'string'}, active => {type => 'integer'}}, associations => {}}},
     joins => {tags => {type => 'left'}},
 })->with_required_predicate(Selecto::Expression->eq('tenant_id',7));
-my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(temporary_relations => 1,dbh => $dbh));
 my $handler = Selecto::API::EngineHandler->new;
 my $intent = {select => ['id', [qw(tags.id tags.label tags.active)]], order_by => [{field => 'id', direction => 'asc'}]};
 my $result = $handler->query($engine, $intent);

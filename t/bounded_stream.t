@@ -18,7 +18,7 @@ sub statement {
 }
 
 my $fake=TestSelecto::DBH->new;
-my $fake_adapter=Selecto->adapter(postgresql=>(dbh=>$fake));
+my $fake_adapter=Selecto->adapter(postgresql=>(temporary_relations => 1,dbh=>$fake));
 ok(!$fake_adapter->bounded_stream_supported,'test handles cannot claim bounded driver streaming');
 is(code(sub {$fake_adapter->stream_query(statement('SELECT 1'),bounded=>1)}),'unsupported_feature','unsupported handles refuse before preparation');
 is(scalar @{$fake->prepared},0,'no query prepared after capability refusal');
@@ -27,7 +27,7 @@ subtest 'PostgreSQL server cursor lifecycle' => sub {
     my $database=$ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all=>'disposable PostgreSQL unavailable' unless $database && eval {require DBI;require DBD::Pg;1};
     my $dbh=DBI->connect(TestPostgreSQL->connection,{RaiseError=>1,PrintError=>0,AutoCommit=>1});
-    my $adapter=Selecto->adapter(postgresql=>(dbh=>$dbh));
+    my $adapter=Selecto->adapter(postgresql=>(temporary_relations => 1,dbh=>$dbh));
     ok($adapter->bounded_stream_supported,'real Pg handle supports bounded streaming');
     is(code(sub {$adapter->stream_query(statement('SELECT 1'),bounded=>1,fetch_size=>0)}),'invalid_stream','fetch size remains validated');
     my $stream=$adapter->stream_query(statement('SELECT n::int, $1::numeric FROM generate_series(1,3) n',[2.50],['id','amount']),bounded=>1,fetch_size=>500);

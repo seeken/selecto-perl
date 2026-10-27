@@ -46,7 +46,7 @@ subtest 'anonymous adapter retains every occurrence' => sub {
 for my $name (qw(postgresql duckdb)) {
     subtest "$name grouped expression identities" => sub {
         my $engine = Selecto::Engine->new(domain=>$domain,
-            adapter=>Selecto->adapter($name=>(dbh=>TestSelecto::DBH->new)));
+            adapter=>Selecto->adapter($name=>(temporary_relations => 1,dbh=>TestSelecto::DBH->new)));
         my $statement = $engine->compile($engine->query->select($instant->as('value'),
             Selecto::Expression->count->as('n'))->group_by($instant)->order_by($instant)->use_timezone($zone));
         is_deeply $statement->params, [$zone, JSON::PP::true], 'zone binds once for selection, grouping and sorting';
@@ -78,7 +78,7 @@ sub run_live {
         (4,1730615400,true),(5,NULL,true),(6,1710055800,false)});
     $dbh->do(q{UPDATE selecto_grouped_bindings SET instant=TO_TIMESTAMP(epoch),
         naive=TO_TIMESTAMP(epoch) AT TIME ZONE 'UTC', day=CAST(TO_TIMESTAMP(epoch) AT TIME ZONE 'UTC' AS DATE)});
-    my $engine = Selecto::Engine->new(domain=>$domain, adapter=>Selecto->adapter($name=>(dbh=>$dbh)));
+    my $engine = Selecto::Engine->new(domain=>$domain, adapter=>Selecto->adapter($name=>(temporary_relations => 1,dbh=>$dbh)));
     for my $field ($instant, Selecto::Expression->field('epoch'), Selecto::Expression->epoch_datetime('epoch')) {
         my $base = $engine->query->select($field->as('value'), Selecto::Expression->count->as('n'))
             ->group_by($field)->order_by($field)->use_timezone($zone);
@@ -156,6 +156,14 @@ subtest 'DuckDB live grouped parameter identities' => sub {
 subtest 'ordered formatted groups match across native drivers' => sub {
     plan skip_all => 'both live drivers are required' unless keys(%observations) == 2;
     for my $key (sort keys %{$observations{postgresql}}) {
+        # Without a query timezone PostgreSQL now reads instants in UTC, the
+        # zone Selecto pins for its statements (R35), not the session's
+        # (Pacific/Honolulu here); DuckDB still uses its session zone.
+        if ($key =~ m{/omitted\z}) {
+            (my $utc = $key) =~ s{/omitted\z}{/UTC};
+            is_deeply $observations{postgresql}{$key}, $observations{postgresql}{$utc}, "$key: PostgreSQL reads UTC";
+            next;
+        }
         is_deeply $observations{duckdb}{$key}, $observations{postgresql}{$key}, $key;
     }
 };

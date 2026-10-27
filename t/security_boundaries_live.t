@@ -31,7 +31,7 @@ my $domain=Selecto::Domain->parse({schema_version=>1,name=>'Live bounded collect
     use Mojo::Base 'Selecto::PostgreSQL';
     sub execute_query { my ($self,@args)=@_;++$self->{executions};$self->{last_sql}=$args[0]->sql;return $self->SUPER::execute_query(@args); }
 }
-my $adapter=LiveBoundaryAdapter->new(dbh=>$dbh);
+my $adapter=LiveBoundaryAdapter->new(temporary_relations=>1,dbh=>$dbh);
 my $engine=Selecto::Engine->new(domain=>$domain,adapter=>$adapter);
 sub code {my ($run)=@_;my $ok=eval {$run->();1};return $ok?'ok':ref($@)&&$@->can('code')?$@->code:"$@";}
 my $handler=Selecto::API::EngineHandler->new(default_limit=>2,limits=>Selecto::Limits->new(max_collection_rows=>2,max_total_collection_rows=>4));

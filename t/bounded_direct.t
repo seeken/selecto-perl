@@ -20,7 +20,7 @@ sub statement {
 }
 
 subtest 'scalar column statement' => sub {
-    my $adapter = Selecto->adapter(postgresql => (dbh => TestSelecto::DBH->new));
+    my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => TestSelecto::DBH->new));
     my $rows = statement(q{SELECT "id", "label" FROM t WHERE a = $1 AND b = $2 AND c = '$1' ORDER BY "id" LIMIT 26},
         [10, 20], ['id', 'label']);
     my $total = statement(q{SELECT COUNT(DISTINCT "id") AS "total" FROM t WHERE a = $1 AND b = $2 AND c = '$2'},
@@ -48,7 +48,7 @@ subtest 'PostgreSQL direct bounded execution' => sub {
     $dbh->commit;
     my $domain = Selecto::Domain->new(name => 'Direct rows', table => 'direct_rows', primary_key => 'id',
         fields => {id => 'integer', label => 'string'});
-    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
     my $timeout = sub { ($dbh->selectrow_array('SHOW statement_timeout'))[0] };
     my @sql;
     my $page = $engine->query->select('id', 'label')->order_by('id')->limit(26);
@@ -75,7 +75,7 @@ subtest 'PostgreSQL direct bounded execution' => sub {
     $dbh->rollback;
 
     # A page that times out fails alone: its savepoint keeps the host's transaction usable.
-    my $slow = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+    my $slow = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)),
         domain => Selecto::Domain->new(name => 'Slow rows', table => 'slow_rows', primary_key => 'id',
             fields => {id => 'integer', label => 'string'}));
     my $slow_page = $slow->query->select('id', 'label')->order_by('id')->limit(26);

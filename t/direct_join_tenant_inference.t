@@ -104,7 +104,7 @@ sub check_live_reads {
     $dbh->do(q{INSERT INTO join_regions VALUES(301,7,'Own region'),(301,8,'Foreign region collision'),(302,8,'Foreign region only'),(303,8,'Foreign region')});
     my $snapshot = sub {return [map {$dbh->selectall_arrayref('SELECT * FROM '.$_.' ORDER BY 1,2')} qw(join_people join_accounts join_regions)];};
     $initial = $snapshot->();
-    my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse(contract(), strict => 1), adapter => Selecto->adapter($backend => (dbh => $dbh)), scope => {tenant => 7});
+    my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse(contract(), strict => 1), adapter => Selecto->adapter($backend => (temporary_relations => 1,dbh => $dbh)), scope => {tenant => 7});
     my $rows = $engine->all($engine->query->select('id', 'account.name', 'account.region.name')->order_by('id'))->{rows};
     is_deeply($rows, [[1,'Own beta','Own region'],[2,undef,undef],[3,'Own alpha',undef],[4,undef,undef],[5,undef,undef]], 'both actual direct edges prevent foreign matches without duplicate/drop root rows');
     is_deeply($engine->all($engine->query->select('id')->where(Selecto::Expression->eq('account.name','Foreign only')))->{rows}, [], 'foreign joined values cannot drive root membership');
@@ -162,7 +162,7 @@ subtest 'actual PostgreSQL joined, correlated and lateral reads' => sub {
 subtest 'six native dialect compilers retain inferred joins and bound parameters' => sub {
     for my $backend (qw(postgresql sqlite duckdb mysql mariadb mssql)) {
         my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse(contract(), strict => 1),
-            adapter => Selecto->adapter($backend => (dbh => TestSelecto::DBH->new)), scope => {tenant => 7});
+            adapter => Selecto->adapter($backend => (temporary_relations => 1,dbh => TestSelecto::DBH->new)), scope => {tenant => 7});
         my $statement = $engine->compile($engine->query->select(Selecto::Expression->literal(99)->as('literal'),
             'account.name','account.region.name')->where(Selecto::Expression->eq('id', 1)));
         my $sql = $statement->sql;

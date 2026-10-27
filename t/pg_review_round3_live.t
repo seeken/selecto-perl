@@ -67,7 +67,7 @@ subtest 'R2: a temp relation shadowing a through-association bridge is refused' 
             columns => {id => {type => 'integer'}, label => {type => 'string'}}, associations => {}}},
         joins => {accs => {type => 'left'}}});
     my $dbh = $connect->();
-    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)))
+    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)))
         ->with_scope(tenant => 't1');
     my $query = $engine->query->select('id', 'accs.label')->order_by('id');
     my $statement = $engine->compile($query);
@@ -88,7 +88,7 @@ subtest 'R10: a temp table shadowing an INSERT target is refused' => sub {
         'CREATE TABLE r3i (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)', q{INSERT INTO r3i VALUES (1, 't1', 'a')};
     my $dbh = $connect->();
     my $engine = Selecto::Engine->new(domain => $writable->('r3i', 'id', id => 'integer', org_key => 'string', note => 'string'),
-        adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+        adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
     my $insert = sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'r3i',
         assignments => {id => $_[0], org_key => 't1', note => 'n'}))->affected_rows };
     $dbh->do('CREATE TEMP TABLE r3i (id INT PRIMARY KEY, org_key TEXT, note TEXT)');
@@ -114,7 +114,7 @@ subtest 'R8: a deferred constraint trigger cannot change the session after the c
         schemas => {}, joins => {}});
     for my $mode (qw(own host)) {
         my $dbh = $connect->();
-        my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+        my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
         my $writer = Selecto::Engine->new(domain => $writable->('r3d_w', 'id', id => 'integer', note => 'string'), adapter => $adapter);
         my $reader = Selecto::Engine->new(domain => $reads, adapter => $adapter)->with_scope(tenant => 't1');
         my $read = sub { join ',', map { $_->[1] } @{$reader->all($reader->query->select('id', 'note')->order_by('id'))->{rows}} };
@@ -152,7 +152,7 @@ subtest 'R9: re-reads by (tableoid, ctid): a renumbering trigger cannot hide a m
     my $update = sub {
         my ($table, $key, $types, $note) = @_;
         my $engine = Selecto::Engine->new(domain => $writable->($table, $key, %columns, %$types),
-            adapter => Selecto->adapter(postgresql => (dbh => $connect->())));
+            adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $connect->())));
         return $outcome->(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => $table,
             assignments => {note => $note}, predicate => $x->eq('name', 'x'), scope_predicate => $x->eq('org_key', 't1')))->affected_rows });
     };
@@ -184,7 +184,7 @@ subtest 'R13: guarded inserts keep ordinary row triggers' => sub {
         writes => {operations => {insert => {enabled => 1}}, fields => {id => {insertable => 1}, org_key => {insertable => 1}, note => {insertable => 1}}}});
     for my $mode (qw(own host)) {
         my $dbh = $connect->();
-        my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)))
+        my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)))
             ->with_scope(tenant => 't1');
         my $id = $mode eq 'own' ? 1 : 2;
         $dbh->begin_work if $mode eq 'host';
@@ -210,7 +210,7 @@ subtest 'item 58: catalog checks resolve operators in pg_catalog only' => sub {
     # An operator schema ahead of pg_catalog on the host's own search path.
     $dbh->do('SET search_path TO r3o_evil, pg_catalog, public');
     my $engine = Selecto::Engine->new(domain => $writable->('r3o', 'id', id => 'integer', org_key => 'string', name => 'string', note => 'string'),
-        adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+        adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
     is($outcome->(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3o',
         assignments => {note => 'u'}, predicate => $x->eq('name', 'x'), scope_predicate => $x->eq('org_key', 't1')))->affected_rows }),
         'write_capability_missing', 'the statement-level trigger is still seen and refused');
@@ -240,7 +240,7 @@ subtest 'R14: a deferrable trigger created during the write cannot fire after th
         schemas => {}, joins => {}});
     for my $mode (qw(own host)) {
         my $dbh = $connect->();
-        my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+        my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
         my $writer = Selecto::Engine->new(domain => $writable->('r3m_w', 'id', id => 'integer', note => 'string'), adapter => $adapter);
         my $reader = Selecto::Engine->new(domain => $reads, adapter => $adapter)->with_scope(tenant => 't1');
         my $read = sub { join ',', map { $_->[1] } @{$reader->all($reader->query->select('id', 'note')->order_by('id'))->{rows}} };
@@ -267,7 +267,7 @@ subtest 'R17: deferred foreign keys keep their deferral around Selecto writes' =
         'CREATE TABLE r3f_w (id INT PRIMARY KEY, note TEXT)', q{INSERT INTO r3f_w VALUES (1, 'n')};
     my $dbh = $connect->();
     my $writer = Selecto::Engine->new(domain => $writable->('r3f_w', 'id', id => 'integer', note => 'string'),
-        adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+        adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
     my $update = sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3f_w',
         assignments => {note => $_[0]}, predicate => $x->eq('id', 1)))->affected_rows };
     $dbh->begin_work;
@@ -287,7 +287,7 @@ subtest 'R29/R30: relations resolve by the reset search_path; search_path is pin
         q{CREATE FUNCTION r3q_evil.yes(text, text) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
         'CREATE OPERATOR r3q_evil.= (LEFTARG = text, RIGHTARG = text, FUNCTION = r3q_evil.yes)';
     my $dbh = $connect->();
-    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
     my $tenanted = Selecto::Domain->parse({schema_version => 1, name => 'R3T',
         source => {source_table => 'r3q', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
             columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
@@ -312,11 +312,37 @@ subtest 'R29/R30: relations resolve by the reset search_path; search_path is pin
     # resolves through the reset search_path, and the evil = operator ahead
     # of pg_catalog cannot answer the tenant compare.
     $dbh->do('SET search_path TO r3q_evil, pg_catalog, public');
-    is($outcome->($ids), 'applied 1', 'a persisted search_path switch redirects neither relation nor operator');
-    like($outcome->(sub { $update->('t2-row', 2) }), qr/\A(?:applied 0|cardinality_mismatch)/, 'nor lets the tenant write reach another tenant');
+    # R38: the host's search_path now names another relation: refused rather
+    # than silently read either way.
+    is($outcome->($ids), 'query_rule_not_evaluable/relation_ambiguous', 'a persisted search_path switch to a namesake is refused');
+    is($outcome->(sub { $update->('t2-row', 2) }), 'query_rule_not_evaluable/relation_ambiguous', 'and so is the write');
     is($rows->($admin, 'SELECT note FROM r3q WHERE id = 2'), 'SECRET', "the other tenant's row is unchanged");
-    is($rows->($dbh, 'SHOW search_path'), 'r3q_evil, pg_catalog, public', "and the host's search_path is restored after each call");
+    is($rows->($dbh, 'SHOW search_path'), 'r3q_evil, pg_catalog, public', "and the host's search_path is untouched");
+    # R39: a host's hand-built statement (no recorded relations) is held to
+    # the same rule.
+    require Selecto::Statement;
+    my $raw = Selecto::Statement->new(sql => 'SELECT "id" FROM "r3q" ORDER BY "id"', params => []);
+    is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($raw)->{rows}} }),
+        'query_rule_not_evaluable/relation_ambiguous', 'a hand-built statement naming a redirected relation is refused');
+    # The evil = operator ahead of pg_catalog alone (no namesake relation)
+    # cannot answer the tenant compare: pg_catalog comes first in the pin.
+    $dbh->do('SET search_path TO r3q_evil, pg_catalog, public');
+    $admin->do('DROP VIEW r3q_evil.r3q');
+    is($outcome->($ids), 'applied 1', 'an operator ahead of pg_catalog cannot widen the tenant compare');
+    is($rows->($dbh, 'SHOW search_path'), 'r3q_evil, pg_catalog, public', "and the host's search_path is restored after the read");
     $dbh->do('RESET search_path');
+    # R36: PostgreSQL parses the reset search_path: a quoted schema with a
+    # comma is one schema, not a decoy split at the comma.
+    $admin->do($_) for 'DROP SCHEMA IF EXISTS "r3q,a" CASCADE', 'DROP SCHEMA IF EXISTS r3q_a CASCADE',
+        'CREATE SCHEMA "r3q,a"', 'CREATE TABLE "r3q,a".r3q_only (id INT PRIMARY KEY)', 'INSERT INTO "r3q,a".r3q_only VALUES (5)';
+    my $path_dbh = $connect->();
+    $path_dbh->do(q{SET search_path TO "r3q,a", public});
+    my $only = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $path_dbh)),
+        domain => Selecto::Domain->parse({schema_version => 1, name => 'O', source => {source_table => 'r3q_only', primary_key => 'id',
+            fields => ['id'], columns => {id => {type => 'integer'}}, associations => {}}, schemas => {}, joins => {}}));
+    is($outcome->(sub { join ',', map { $_->[0] } @{$only->all($only->query->select('id'))->{rows}} }),
+        'query_rule_not_evaluable/relation_unresolved', 'a relation the reset search_path cannot see is refused, never guessed');
+    $admin->do('DROP SCHEMA "r3q,a" CASCADE');
     for my $level ('REPEATABLE READ', 'SERIALIZABLE') {
         $dbh->begin_work;
         $dbh->do("SET TRANSACTION ISOLATION LEVEL $level");
@@ -339,7 +365,7 @@ subtest 'R32: internal deferrable rechecks count unless they run only pg_catalog
             . ' k INT, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
     my $dbh = $connect->();
     my $writer = Selecto::Engine->new(domain => $writable->('r3u_w', 'id', id => 'integer', note => 'string'),
-        adapter => Selecto->adapter(postgresql => (dbh => $dbh)));
+        adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
     my $update = sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3u_w',
         assignments => {note => $_[0]}, predicate => $x->eq('id', 1)))->affected_rows };
     is($outcome->(sub { $update->('a') }), 'applied 1', 'deferred foreign keys and pg_catalog unique rechecks do not block writes');
@@ -361,8 +387,16 @@ subtest 'R32: internal deferrable rechecks count unless they run only pg_catalog
         'CREATE TABLE r3u_x (k TEXT, CONSTRAINT r3u_x_k EXCLUDE USING btree ((k COLLATE r3u_c) WITH =) DEFERRABLE INITIALLY DEFERRED)';
     is($outcome->(sub { $update->('d') }), 'query_rule_not_evaluable/deferred_triggers',
         'and so does one under a user collation');
-    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP COLLATION r3u_c', 'DROP FUNCTION r3u_f(int)',
+    # R37: a deferred foreign key over a key type that is not a pg_catalog
+    # base type (an enum, a range, a composite) counts as user code.
+    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP TYPE IF EXISTS r3u_e CASCADE', q{CREATE TYPE r3u_e AS ENUM ('a', 'b')},
+        'CREATE TABLE r3u_x (k r3u_e PRIMARY KEY)',
+        'CREATE TABLE r3u_y (k r3u_e REFERENCES r3u_x (k) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('e') }), 'query_rule_not_evaluable/deferred_triggers',
+        'a deferred foreign key over a user enum key refuses writes');
+    $admin->do($_) for 'DROP TABLE r3u_y, r3u_x', 'DROP TYPE r3u_e', 'DROP COLLATION r3u_c', 'DROP FUNCTION r3u_f(int)',
         'CREATE TABLE r3u_x (k INT)';
+    is($outcome->(sub { $update->('f') }), 'applied 1', 'and writes apply again once only pg_catalog-typed deferred keys remain');
     $admin->do($_) for 'DROP TABLE r3u_w, r3u_parent, r3u_child, r3u_x CASCADE', 'DROP OPERATOR CLASS r3u_ops USING btree CASCADE';
 };
 
@@ -371,7 +405,7 @@ subtest 'R33: a CTE named like a real relation never hides it' => sub {
         'CREATE TABLE r3c (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)', q{INSERT INTO r3c VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
         'CREATE TABLE r3c_other (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)', q{INSERT INTO r3c_other VALUES (2, 't1', 'decoy')};
     my $dbh = $connect->();
-    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
     my $parse = sub {
         my ($table) = @_;
         Selecto::Domain->parse({schema_version => 1, name => "D$table",
@@ -402,7 +436,7 @@ subtest 'R35: result-affecting settings are pinned for every statement' => sub {
         source => {source_table => 'r3z', primary_key => 'id', fields => [qw(id ts d)],
             columns => {id => {type => 'integer'}, ts => {type => 'utc_datetime'}, d => {type => 'date'}}, associations => {}},
         schemas => {}, joins => {}});
-    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
     my $ids = sub {
         my ($required) = @_;
         my $engine = Selecto::Engine->new(domain => $domain->with_required_predicate($required), adapter => $adapter);
