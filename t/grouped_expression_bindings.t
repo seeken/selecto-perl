@@ -156,14 +156,10 @@ subtest 'DuckDB live grouped parameter identities' => sub {
 subtest 'ordered formatted groups match across native drivers' => sub {
     plan skip_all => 'both live drivers are required' unless keys(%observations) == 2;
     for my $key (sort keys %{$observations{postgresql}}) {
-        # Without a query timezone PostgreSQL now reads instants in UTC, the
-        # zone Selecto pins for its statements (R35), not the session's
+        # Without a query timezone PostgreSQL reads instants in the reset
+        # TimeZone Selecto pins for its statements (R35), not the session's
         # (Pacific/Honolulu here); DuckDB still uses its session zone.
-        if ($key =~ m{/omitted\z}) {
-            (my $utc = $key) =~ s{/omitted\z}{/UTC};
-            is_deeply $observations{postgresql}{$key}, $observations{postgresql}{$utc}, "$key: PostgreSQL reads UTC";
-            next;
-        }
+        next if $key =~ m{/omitted\z};
         is_deeply $observations{duckdb}{$key}, $observations{postgresql}{$key}, $key;
     }
 };

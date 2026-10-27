@@ -37,15 +37,15 @@ Unreleased
       column types (pg_catalog base types or domains over them) are all
       pg_catalog's (R37).
     - PostgreSQL session pins (R35). Behaviour change: alongside search_path,
-      every Selecto statement runs with TimeZone 'UTC', DateStyle 'ISO, MDY',
-      IntervalStyle 'postgres', extra_float_digits 3, bytea_output 'hex' and
-      standard_conforming_strings on, pinned in its transaction or savepoint
+      every Selecto statement runs with TimeZone, DateStyle, IntervalStyle,
+      extra_float_digits, bytea_output and standard_conforming_strings
+      pinned to their reset values (pg_settings.reset_val: server, database,
+      role or connection configuration) in its transaction or savepoint,
       and restored to the host's values afterwards (a bounded stream keeps
       them until it closes, so the host's own SQL between its fetches sees
-      them). Default rows (driver values) therefore render timestamptz in
-      UTC and dates in ISO whatever the host session says, and a setting a
-      trigger persisted (even masked by a local set_config) cannot change
-      what a scope literal means. "$user" in the reset search_path is the
+      them). A host that SETs one of these per session loses that inside
+      Selecto statements; a setting a trigger persisted (even masked by a
+      local set_config) cannot change what a scope literal means. "$user" in the reset search_path is the
       current user. Deferrable unique/exclusion rechecks count as user code
       unless their index has no expressions or predicate and only default or
       pg_catalog collations, operator classes and operators (R32a).

@@ -1491,16 +1491,16 @@ sub _relation_sql {
 # (operators, functions and types resolve there before anything else), then
 # the reset search path's schemas, pg_temp last; TimeZone, DateStyle,
 # IntervalStyle, extra_float_digits, bytea_output and
-# standard_conforming_strings take fixed values. A switch that persisted
+# standard_conforming_strings take their reset values (pg_settings.reset_val:
+# server, database, role or connection configuration), so the host's
+# configured semantics hold while a session-level switch does not. A switch that persisted
 # before the call (including one masked by a local set_config) cannot
 # redirect a name or change a scope literal's meaning. The host's values
 # are restored with set_config(..., true) before control returns (a
 # rollback reverts them too); on an idle autocommit handle a read sets them
 # for the session and restores them right after.
-my @PINNED_SETTINGS = (
-    [TimeZone => 'UTC'], [DateStyle => 'ISO, MDY'], [IntervalStyle => 'postgres'],
-    [extra_float_digits => '3'], [bytea_output => 'hex'], [standard_conforming_strings => 'on'],
-);
+my @PINNED_SETTINGS = map { [$_ => undef] }
+    qw(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings);
 sub _pg_pin_search_path {
     my ($self, $session) = @_;
     my $local = $session ? 'false' : 'true';
@@ -1508,15 +1508,24 @@ sub _pg_pin_search_path {
     my @schemas = $self->_pg_reset_schemas;
     my $pinned = join(', ', 'pg_catalog', (map { _quote_path_schema($_) } @schemas), 'pg_temp');
     my @pins = (['search_path' => $pinned], @PINNED_SETTINGS);
-    my @set = map { "pg_catalog.set_config('$pins[$_][0]', \$" . ($_ + 1) . ", $local)" } 0 .. $#pins;
+    # search_path takes the resolved pin; every other setting its reset
+    # value (R35 amendment), read through pg_catalog in the same statement.
+    my @set = map {
+        my $name = $pins[$_][0];
+        defined($pins[$_][1])
+            ? "pg_catalog.set_config('$name', \$" . ($_ + 1) . ", $local)"
+            : "pg_catalog.set_config('$name', (SELECT r.reset_val FROM pg_catalog.pg_settings r WHERE r.name OPERATOR(pg_catalog.=) '$name'), $local)"
+    } 0 .. $#pins;
     my $current = join ', ', map { "pg_catalog.current_setting('$pins[$_][0]') AS s$_" } 0 .. $#pins;
     my @host;
     my $ok = eval {
         @host = $self->{dbh}->selectrow_array("WITH h AS MATERIALIZED (SELECT $current) SELECT "
-            . join(', ', (map { "h.s$_" } 0 .. $#pins), @set) . ' FROM h', undef, map { $_->[1] } @pins);
+            . join(', ', (map { "h.s$_" } 0 .. $#pins), @set) . ' FROM h', undef, $pins[0][1]);
         1;
     };
-    die $self->normalize_error($@) unless $ok && @host >= @pins && !grep { !defined } @host[0 .. $#pins];
+    die $self->normalize_error($@) unless $ok;
+    Selecto::Error->throw('query_rule_not_evaluable', "the session's reset settings could not be read",
+        {reason => 'session_state_unknown'}) unless @host == 2 * @pins && !grep { !defined } @host;
     return {host => [map { [$pins[$_][0], $host[$_]] } 0 .. $#pins], pinned => $pinned, session => $session ? 1 : 0};
 }
 
@@ -2069,8 +2078,13 @@ pinned to C<pg_catalog>, the reset path's schemas and C<pg_temp> (last),
 inside its own transaction or savepoint (on an idle autocommit handle, a
 read sets it for the session), and the host's value is restored
 afterwards; so a C<search_path> switch that persisted before the call
-redirects neither relations nor operators. Hosts that C<SET search_path> to
-reach other schemas must pin the schema instead. Row triggers fired by
+redirects neither relations nor operators. C<TimeZone>, C<DateStyle>,
+C<IntervalStyle>, C<extra_float_digits>, C<bytea_output> and
+C<standard_conforming_strings> are pinned the same way, to their reset
+values (server, database, role or connection configuration): a host that
+C<SET>s one of them for its session loses that inside Selecto statements.
+Hosts that C<SET search_path> to reach other schemas must pin the schema
+instead. Row triggers fired by
 Selecto writes run under the pinned C<search_path>. Functions, operators and
 types in Selecto's own catalog and guard SQL are C<pg_catalog>-qualified.
 
