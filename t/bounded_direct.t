@@ -5,6 +5,7 @@ use Test::More;
 use Selecto;
 use Selecto::BoundedQuery;
 use lib 't/lib';
+use TestPostgreSQL ();
 use TestSelecto;
 
 sub code {
@@ -37,9 +38,9 @@ subtest 'scalar column statement' => sub {
 };
 
 subtest 'PostgreSQL direct bounded execution' => sub {
-    my $database = $ENV{SELECTO_API_TEST_DATABASE};
+    my $database = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all => 'disposable PostgreSQL unavailable' unless $database && eval { require DBI; require DBD::Pg; 1 };
-    my $dbh = DBI->connect("dbi:Pg:dbname=$database;host=/tmp", undef, undef,
+    my $dbh = DBI->connect(TestPostgreSQL->connection,
         {RaiseError => 1, PrintError => 0, AutoCommit => 0});
     $dbh->do('CREATE TEMP TABLE direct_rows (id integer primary key, label text)');
     $dbh->do('INSERT INTO direct_rows SELECT n, ' . q{'row ' || n} . ' FROM generate_series(1, 150) n');

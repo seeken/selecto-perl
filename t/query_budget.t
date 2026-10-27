@@ -2,6 +2,8 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
+use lib 't/lib';
+use TestPostgreSQL ();
 use Scalar::Util qw(blessed);
 use Selecto;
 use Selecto::Statement;
@@ -38,9 +40,9 @@ subtest 'SQLite enforces execution time and restores host settings' => sub {
 };
 
 subtest 'PostgreSQL server timeout bounds blocking execution' => sub {
-    my $database=$ENV{SELECTO_API_TEST_DATABASE};
+    my $database=$ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all => 'disposable PostgreSQL unavailable' unless $database && eval {require DBI;require DBD::Pg;1};
-    my $dbh=DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,{RaiseError=>1,PrintError=>0});
+    my $dbh=DBI->connect(TestPostgreSQL->connection,{RaiseError=>1,PrintError=>0});
     my $adapter=Selecto->adapter(postgresql=>(dbh=>$dbh));
     $dbh->do(q{SET statement_timeout='2s'});
     my $guard=$adapter->begin_query_budget(timeout_ms=>10);
@@ -97,9 +99,9 @@ subtest 'PostgreSQL server timeout bounds blocking execution' => sub {
 };
 
 subtest 'PostgreSQL budgets inside a transaction restore its timeout' => sub {
-    my $database=$ENV{SELECTO_API_TEST_DATABASE};
+    my $database=$ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all => 'disposable PostgreSQL unavailable' unless $database && eval {require DBI;require DBD::Pg;1};
-    my $dbh=DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,{RaiseError=>1,PrintError=>0,AutoCommit=>0});
+    my $dbh=DBI->connect(TestPostgreSQL->connection,{RaiseError=>1,PrintError=>0,AutoCommit=>0});
     my $adapter=Selecto->adapter(postgresql=>(dbh=>$dbh));
     my $timeout=sub {($dbh->selectrow_array(q{SHOW statement_timeout}))[0]};
     # As a bounded write probe does: a budget under a savepoint that is then released.

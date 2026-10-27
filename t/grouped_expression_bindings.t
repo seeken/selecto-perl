@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use JSON::PP ();
 use lib 't/lib';
+use TestPostgreSQL ();
 use TestSelecto;
 use Selecto;
 use Selecto::DateFormat ();
@@ -139,10 +140,10 @@ sub run_live {
 
 my %observations;
 subtest 'PostgreSQL live grouped parameter identities' => sub {
-    my $database = $ENV{SELECTO_API_TEST_DATABASE};
+    my $database = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all => 'disposable API PostgreSQL database is not configured' unless defined($database) && length($database);
     plan skip_all => 'DBD::Pg is not installed' unless eval { require DBI; require DBD::Pg; 1 };
-    my $dbh = DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,{RaiseError=>1,PrintError=>0,AutoCommit=>1});
+    my $dbh = DBI->connect(TestPostgreSQL->connection,{RaiseError=>1,PrintError=>0,AutoCommit=>1});
     $observations{postgresql} = run_live('postgresql',$dbh);
     $dbh->disconnect;
 };

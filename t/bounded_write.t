@@ -5,6 +5,7 @@ use Test::More;
 use JSON::PP ();
 use Selecto;
 use lib 't/lib';
+use TestPostgreSQL ();
 use TestSelecto;
 
 sub command {
@@ -87,9 +88,9 @@ subtest 'compound probe retains exact tuples rather than a Cartesian selection' 
 };
 
 subtest 'PostgreSQL preflight refuses before nontransactional trigger effects' => sub {
-    my $database=$ENV{SELECTO_API_TEST_DATABASE};
+    my $database=$ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all=>'disposable PostgreSQL unavailable' unless $database && eval{require DBI;require DBD::Pg;1};
-    my $dbh=DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,{RaiseError=>1,PrintError=>0});
+    my $dbh=DBI->connect(TestPostgreSQL->connection,{RaiseError=>1,PrintError=>0});
     $dbh->do('CREATE TEMP TABLE bounded_items(id INTEGER PRIMARY KEY,name TEXT)');
     $dbh->do(q{INSERT INTO bounded_items VALUES(1,'one'),(2,'two')});
     $dbh->do('CREATE TEMP SEQUENCE bounded_observed');
@@ -117,7 +118,7 @@ subtest 'unproven broad-write dialects refuse, bounded key writes remain support
     }
 };
 subtest 'PostgreSQL fixes the selected keys and restores timeout after refusal' => sub {
-    my $database=$ENV{SELECTO_API_TEST_DATABASE};
+    my $database=$ENV{SELECTO_PERL_TEST_POSTGRES_URL};
     plan skip_all=>'disposable PostgreSQL unavailable' unless $database && eval{require DBI;require DBD::Pg;1};
     {
         package Local::BoundedPostgreSQL;
@@ -130,8 +131,8 @@ subtest 'PostgreSQL fixes the selected keys and restores timeout after refusal' 
             return $bounded;
         }
     }
-    my $dbh=DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,{RaiseError=>1,PrintError=>0});
-    my $peer=DBI->connect("dbi:Pg:dbname=$database;host=/tmp",undef,undef,{RaiseError=>1,PrintError=>0});
+    my $dbh=DBI->connect(TestPostgreSQL->connection,{RaiseError=>1,PrintError=>0});
+    my $peer=DBI->connect(TestPostgreSQL->connection,{RaiseError=>1,PrintError=>0});
     my $table='bounded_concurrent_' . $$;
     $dbh->do("CREATE TABLE $table(id INTEGER PRIMARY KEY,name TEXT)");
     $dbh->do("INSERT INTO $table VALUES(1,'one'),(2,'two')");
