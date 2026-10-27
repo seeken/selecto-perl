@@ -1438,7 +1438,7 @@ sub _pg_check_unrecorded {
         Selecto::Error->throw('query_rule_not_evaluable',
             "the host's search_path resolves the relation differently from Selecto's pinned resolution",
             {reason => 'relation_ambiguous', relation => $bare})
-            if defined($current) && defined($pinned) && "$current" ne "$pinned";
+            if defined($current) && defined($pinned) && "$current" ne "$pinned" && !(defined($temp) && "$current" eq "$temp");
         Selecto::Error->throw('query_rule_not_evaluable',
             'the relation exists only as a temporary relation of the session, which the adapter does not declare',
             {reason => 'relation_unresolved', relation => $bare})
@@ -1468,17 +1468,18 @@ sub _relation_sql {
     my $refuse = sub {
         Selecto::Error->throw('query_rule_not_evaluable', $_[1], {reason => $_[0], relation => "$table"});
     };
-    # A TEMP relation shadowing the reset path's (item 56).
-    $refuse->('temporary_shadow', 'a temporary relation of the session shadows a relation the statement names')
-        if defined($pinned) && defined($temp);
-    # Only the host's declared TEMP relations may serve as domain relations.
+    # Resolution never prefers pg_temp (R38a): a relation of the reset path
+    # is named by its schema, so a TEMP namesake cannot affect it; only the
+    # host's declared TEMP relations may serve when the reset path has none.
     my $target = $pinned // ($self->temporary_relations ? $temp : undef);
     $refuse->('relation_unresolved', defined($temp)
         ? 'the relation exists only as a temporary relation of the session, which the adapter does not declare'
         : 'the relation is not in a schema of the reset search_path') unless defined $target;
-    # R38: the host's current search_path must name the same relation.
+    # R38: the host's current search_path must not name another non-temp
+    # relation (pg_temp, searched first by the host's path, is not counted:
+    # the qualified name never reaches it).
     $refuse->('relation_ambiguous', "the host's search_path resolves the relation differently from Selecto's pinned resolution")
-        unless defined($current) && "$current" eq "$target";
+        if defined($current) && "$current" ne "$target" && !(defined($temp) && "$current" eq "$temp");
     $ok = eval { ($name) = $self->{dbh}->selectrow_array($NAME_SQL, undef, $target); 1 };
     die $self->normalize_error($@) unless $ok && defined $name;
     $cache->{$plain} = $name if ref($cache) eq 'HASH';

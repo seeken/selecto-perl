@@ -158,8 +158,13 @@ subtest 'items 56/56b: trigger-created TEMP views and host TEMP shadows' => sub 
     is($update->($engine, scope => undef, note => 'plain'), 'query_rule_violation/session_state_changed', 'the write is refused');
     is($read->($engine), '1:x 2:x', 'no TEMP view survived to answer the next read');
     $dbh->do(q{CREATE TEMP TABLE selecto_ss AS SELECT 99 AS id, 't1'::text AS org_key, 'evil'::text AS name});
-    like($code->(sub { $read->($engine) }), qr/\Aquery_rule_not_evaluable/, 'a TEMP table shadowing the domain relation is refused on reads');
-    like($update->($engine, scope => undef, note => 'plain'), qr/\Aquery_rule_not_evaluable/, 'and on writes');
+    # R38a: Selecto names the domain relation by its schema, so a TEMP
+    # namesake can no longer answer reads or take writes.
+    is($read->($engine), '1:x 2:x', 'a TEMP table shadowing the domain relation never answers a read');
+    # (The write's own trigger still tries to create the TEMP view, which
+    # now collides with the TEMP table, so the write fails and rolls back.)
+    like($update->($engine, scope => undef, note => 'plain'), qr/\A(?:query_error|query_rule)/, 'a write fails without touching it');
+    is(join(',', map { $_->[0] } @{$dbh->selectall_arrayref('SELECT id FROM pg_temp.selecto_ss')}), '99', 'leaving the TEMP table alone');
     $dbh->do('DROP TABLE pg_temp.selecto_ss');
     # The host's own TEMP relation with no namesake is the host's domain (item 19).
     $dbh->do(q{CREATE TEMP TABLE selecto_ss_own (id INTEGER PRIMARY KEY, org_key TEXT NOT NULL, name TEXT, note TEXT, ts TIMESTAMPTZ)});
