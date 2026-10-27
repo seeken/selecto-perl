@@ -21,7 +21,7 @@ use Selecto::API::EngineHandler ();
 #   server's collation;
 # - a text match on a TIMESTAMP scope column is refused (it reads the text
 #   in the session zone, which a function can switch mid-statement);
-# - a zero date never satisfies a TIMESTAMP scope compare;
+# - a zero date compares in TIMESTAMP scope exactly as the server compares it;
 # - a stream on a mariadb_use_result handle works, and no row reaches the
 #   caller before the session check that covers it;
 # - caller write predicates on TIMESTAMP columns keep the server's semantics.
@@ -156,7 +156,7 @@ for my $backend (@backends) {
         "$name: a caller write predicate compiles natively");
     like($writer->adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'sse_rows',
         assignments => {note => 'u'}, predicate => $x->eq('id', 1), scope_predicate => $x->lt('ts', '2024-06-02')))->{sql},
-        qr/NULLIF\(UNIX_TIMESTAMP\(`ts`\), 0\) < CAST/, "$name: a write's scope still compares by epoch");
+        qr/ELSE UNIX_TIMESTAMP\(`ts`\) < CAST/, "$name: a write's scope still compares by epoch");
     like($writer->adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'sse_rows',
         assignments => {note => 'u'}, predicate => $x->eq('id', 1), scope_predicate => $x->starts_with('org_key', 't1')))->{sql},
         qr/CAST\(CONVERT\(`org_key` USING utf8mb4\) AS BINARY\) LIKE CAST/, "$name: a write's scope prefix compares bytes");
@@ -174,11 +174,13 @@ for my $backend (@backends) {
         schema_version => 1, name => 'Zero', source => {source_table => 'sse_zero', primary_key => 'id', fields => [qw(id ts)],
             columns => {id => {type => 'integer'}, ts => {type => 'utc_datetime'}}, associations => {}}, schemas => {}, joins => {}});
     my $zero = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)), domain => $zero_domain);
-    for my $case (['gt', '1960-01-01', '2'], ['lt', '2030-01-01', '2']) {
+    # A zero date compares as the server compares it (MySQL and MariaDB
+    # differ on ts > '1960-01-01'), never wider or narrower.
+    for my $case (['gt', '1960-01-01', $name eq 'mysql' ? '1,2' : '2'], ['lt', '2030-01-01', '1,2']) {
         my ($op, $value, $want) = @$case;
         my $engine = Selecto::Engine->new(adapter => $zero->adapter, domain => $zero_domain->with_required_predicate($x->$op('ts', $value)));
         is(outcome(sub { [map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}}] }), "ok $want",
-            "$name: a zero date never satisfies the scope ts $op $value");
+            "$name: a zero date satisfies the scope ts $op $value exactly as natively");
     }
 
     # R11: streaming on a use_result handle.

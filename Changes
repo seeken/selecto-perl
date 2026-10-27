@@ -73,6 +73,15 @@ Unreleased
       their base type) and whose index uses the column's own collation and
       the default operator class; date, timestamp, float, network and other
       keys are refused (query_rule_not_evaluable).
+    - Review R31 and the R5 note (MySQL family): catalog lookups for
+      TIMESTAMP, storage-type and temporary-shadow checks key a relation
+      exactly as the server resolves it (case-sensitively, in binary, when
+      lower_case_table_names is 0), so rv_v and rv_V no longer share one
+      entry; a lookup that matches more than one relation fails closed
+      (relation_ambiguous). A zero date in a TIMESTAMP scope compare now
+      compares as the server itself compares it (in its own CASE arm, exact
+      under negation) instead of as NULL, so scope and caller filters agree
+      on every literal and operator on both servers.
     - Review R18 R24 R25 R26 R28 (MySQL family and DuckDB): a write's scope
       is its scope predicate and query enforcement only, so a caller's own
       predicate on a column the scope compares keeps the server's
