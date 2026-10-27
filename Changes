@@ -47,8 +47,9 @@ Unreleased
       the host's search_path must not name another non-temp relation. A
       hand-built statement fails closed: its unqualified names get the same
       check (every identifier it holds, so comma FROM lists, USING lists
-      and subqueries are covered), and naming an undeclared TEMP relation
-      anywhere in its SQL is refused. The pin holds the full reset
+      and subqueries are covered), and while the session has any TEMP
+      relation the adapter does not declare, a hand-built statement is
+      refused outright (R42 FINAL). The pin holds the full reset
       search_path (extension schemas included, R43). A deferred foreign-key
       violation at Selecto's own COMMIT surfaces as the typed
       database_foreign_key_violation (R44). Nothing is cached across statements. timezone_abbreviations

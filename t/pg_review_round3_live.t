@@ -510,6 +510,11 @@ subtest 'R41/R42: every statement rechecks its relations; hand-built SQL never r
     is($outcome->(sub { join ',', map { $_->[0] } @{$declared->execute_query($raw)->{rows}} }), 'applied 42',
         'a declared-temp adapter reads it');
     is($rows->($dbh, 'SHOW timezone_abbreviations'), 'Default', 'timezone_abbreviations is restored after each statement');
+    # R42 FINAL: with any undeclared TEMP relation in the session, a
+    # hand-built statement is refused outright.
+    is($outcome->(sub { scalar @{$adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => []))->{rows}} }),
+        'query_rule_not_evaluable/temporary_shadow', 'any hand-built statement is refused while undeclared TEMP relations exist');
+    $dbh->do('DROP TABLE pg_temp.r3w_tmp');
     # R42: a comma FROM list or a subquery in hand-built SQL is checked too.
     $admin->do($_) for 'DROP SCHEMA IF EXISTS r3w_alt CASCADE', 'CREATE SCHEMA r3w_alt', 'CREATE TABLE r3w_alt.r3w (id INT)';
     $dbh->do('SET search_path TO r3w_alt, public');
