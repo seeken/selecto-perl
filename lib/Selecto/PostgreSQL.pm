@@ -1464,18 +1464,16 @@ sub _pg_check_relations {
             push @schemas, undef;
             push @tables, $bare;
         }
-        # R42: no undeclared TEMP relation may be named anywhere in it.
+        # R42 FINAL: no scanner of hand-built SQL is complete, so while the
+        # session has any TEMP relation such a statement is refused unless
+        # the adapter declares temp relations.
         unless ($self->temporary_relations) {
             my $temps;
             my $ok = eval { $temps = $self->{dbh}->selectcol_arrayref($TEMP_NAMES_SQL); 1 };
             die $self->normalize_error($@) unless $ok;
-            for my $temp (@{$temps // []}) {
-                (my $quoted = $temp) =~ s/"/""/g;
-                my $named = $sql =~ /"\Q$quoted\E"/ || ($temp =~ /\A[a-z_][a-z0-9_\$]*\z/ && $sql =~ /(?<![A-Za-z0-9_\$"])\Q$temp\E(?![A-Za-z0-9_\$"])/i);
-                Selecto::Error->throw('query_rule_not_evaluable',
-                    'a hand-built statement names a temporary relation of the session, which the adapter does not declare',
-                    {reason => 'temporary_shadow', relation => $temp}) if $named;
-            }
+            Selecto::Error->throw('query_rule_not_evaluable',
+                'a hand-built statement cannot run while the session has temporary relations the adapter does not declare',
+                {reason => 'temporary_shadow'}) if @{$temps // []};
         }
     }
     return unless @tables;
