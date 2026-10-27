@@ -219,6 +219,7 @@ t/query_enforcement_scalar_v2.t
 t/query_library.t
 t/query_member.t
 t/reference_tenant_agreement.t
+t/required_filter_exactness_live.t
 t/required_predicate_depth.t
 t/required_predicate_write_guard.t
 t/retarget.t
