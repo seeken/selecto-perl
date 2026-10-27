@@ -123,6 +123,26 @@ for my $backend (@backends) {
         "$name: so is a substring match");
     is($ids->(undef, $x->starts_with('ts', '2024-06-01')), 'ok 1', "$name: a caller text match on a TIMESTAMP keeps working");
     is($ids->($x->gte('ts', '2024-06-02')), 'ok 2,3,4', "$name: a TIMESTAMP scope range still compares by epoch");
+    # R15: any other use of a TIMESTAMP scope column (a cast, a computed value
+    # built on it) renders it in the session zone: refused; a NULL test works.
+    {
+        my $computed = Selecto::Domain->parse({schema_version => 1, name => 'Computed',
+            source => {source_table => 'sse_rows', primary_key => 'id', fields => [qw(id ts as_text)],
+                columns => {id => {type => 'integer'}, ts => {type => 'utc_datetime'},
+                    as_text => {type => 'string', computed => {kind => 'expression', expression => ['cast', ['field', 'ts'], 'string']}}},
+                associations => {}}, schemas => {}, joins => {}});
+        my $read = sub {
+            my ($domain) = @_;
+            my $engine = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)), domain => $domain);
+            return outcome(sub { [map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}}] });
+        };
+        is($read->($computed->with_required_predicate($x->gte('as_text', '2024-06-02'))), 'query_rule_not_evaluable/timestamp_operator',
+            "$name: a computed value over a TIMESTAMP scope column is refused");
+        is($read->($computed->with_required_predicate($x->not_null('ts'))), 'ok 1,2,3,4', "$name: a NULL test on it still works");
+        my $engine = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)), domain => $computed);
+        like(outcome(sub { [map { $_->[0] } @{$engine->all($engine->query->select('id')->where($x->gte('as_text', '2024-06-02'))->order_by('id'))->{rows}}] }),
+            qr/\Aok /, "$name: a caller filter on it keeps working");
+    }
 
     # R12: caller write predicates keep native semantics.
     my $writer = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)), domain => $domain->(undef,
