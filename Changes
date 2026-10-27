@@ -11,7 +11,9 @@ Unreleased
       any type work again (composite, partitioned (id, created_at), date,
       float, citext) and a key-renumbering trigger with a decoy is refused;
       guarded inserts now allow ordinary row triggers (updated_at, audit),
-      verified by that re-read. Every PostgreSQL write (own or host
+      verified by that re-read; a BEFORE INSERT trigger that rewrites the row
+      out of its guard is refused and rolled back with query_rule_not_evaluable
+      (reason transforming_trigger), as the typed insert admission requires. Every PostgreSQL write (own or host
       transaction, guarded or not) is refused while any enabled
       user-defined (non-internal) deferrable trigger exists in the database,
       checked before the DML and in the first statement after it
