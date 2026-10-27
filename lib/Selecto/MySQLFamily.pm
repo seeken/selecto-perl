@@ -648,15 +648,13 @@ sub _column_numeric_specs {
     }
     # A view column takes its proven base column's spec (R40b); any other
     # view column has none here (its scope compares are refused upstream).
-    my $sources = $self->_view_column_sources($table);
-    return \%specs unless $sources;
-    Selecto::Error->throw('query_rule_not_evaluable', 'views nest too deeply to resolve their columns',
-        {reason => 'view_column_unproven', relation => "$table"}) if ($_[2] // 0) > 8;
-    my %resolved;
-    for my $column (keys %$sources) {
-        my ($base_table, $base_column) = @{$sources->{$column}};
-        my $base = $self->_column_numeric_specs($base_table, ($_[2] // 0) + 1)->{lc $base_column};
-        $resolved{$column} = $base if $base;
+    my $view = $self->_view_column_sources($table);
+    return \%specs unless $view;
+    my %resolved = $view->{fallback} ? %specs : ();
+    for my $column (keys %{$view->{sources}}) {
+        my ($base_table, $base_column) = @{$view->{sources}{$column}};
+        my $base = $self->_column_numeric_specs($base_table)->{lc $base_column};
+        if ($base) { $resolved{$column} = $base } else { delete $resolved{$column} }
     }
     return \%resolved;
 }
@@ -979,21 +977,63 @@ sub _table_key {
 sub _column_data_types {
     my ($self, $table, $depth) = @_;
     my $types = $self->_relation_column_types($table);
-    my $sources = $self->_view_column_sources($table);
-    return $types unless $sources;
+    my $view = $self->_view_column_sources($table);
+    return $types unless $view;
     Selecto::Error->throw('query_rule_not_evaluable', 'views nest too deeply to resolve their columns',
         {reason => 'view_column_unproven', relation => "$table"}) if ($depth // 0) > 8;
     my %resolved;
     for my $column (keys %$types) {
-        my $source = $sources->{$column};
-        my $base = $source ? $self->_column_data_types($source->[0], ($depth // 0) + 1)->{lc $source->[1]} : undef;
-        $resolved{$column} = defined($base) ? $base : 'unproven';
+        my $source = $view->{sources}{$column};
+        my $base = $source ? $self->_relation_column_types($source->[0])->{lc $source->[1]} : undef;
+        $resolved{$column} = defined($base) ? $base : $view->{fallback} ? $types->{$column} : 'unproven';
     }
     return \%resolved;
 }
 
-# {lower-case view column => [base relation, base column]} for the direct
-# passthrough columns of a view, or undef when $table is no view.
+# R40d: a MySQL lexer for view definitions. Tokens are [kind, value]:
+# 'id' (a backtick identifier, `` unescaped), 'str' (a string literal,
+# backslash escapes and doubled quotes honoured; its text is dropped),
+# 'num', 'word' (lower case) and 'p' (one punctuation character). /* */,
+# -- and # comments are skipped; an executable /*! comment, an unterminated
+# literal or comment, or anything unrecognised returns undef (no proof).
+sub _mysql_tokens {
+    my ($text) = @_;
+    my @tokens;
+    pos($text) = 0;
+    while (pos($text) < length($text)) {
+        if ($text =~ /\G\s+/gc) { next }
+        if ($text =~ /\G\/\*/gc) {
+            return undef if $text =~ /\G!/gc;
+            $text =~ /\G.*?\*\//gcs or return undef;
+            next;
+        }
+        if ($text =~ /\G(?:--(?=[\s]|\z)|#)[^\n]*/gc) { next }
+        if ($text =~ /\G`((?:``|[^`])*)`/gc) { push @tokens, ['id', $1 =~ s/``/`/gr]; next }
+        if ($text =~ /\G'(?:''|\\.|[^'\\])*'/gcs) { push @tokens, ['str', '']; next }
+        if ($text =~ /\G"(?:""|\\.|[^"\\])*"/gcs) { push @tokens, ['str', '']; next }
+        return undef if $text =~ /\G['"`]/gc;
+        if ($text =~ /\G(\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)/gc) { push @tokens, ['num', $1]; next }
+        if ($text =~ /\G([A-Za-z_\$][A-Za-z0-9_\$]*)/gc) { push @tokens, ['word', lc $1]; next }
+        if ($text =~ /\G([(),.;=<>!+\-*\/%&|^~:@?{}\[\]])/gc) { push @tokens, ['p', $1]; next }
+        return undef;
+    }
+    return \@tokens;
+}
+
+my %FROM_END = map { ($_ => 1) } qw(where group having order limit window for lock into procedure);
+my %JOIN_WORD = map { ($_ => 1) } qw(join inner left right outer cross natural straight_join);
+
+# The proof for a view's columns (R40, R40b, R40c, R40d), or undef when
+# $table is no view: {sources => {lower-case column => [base table, base
+# column]}, fallback => 0|1}. A source is proven only when the definition is
+# a single plain SELECT (no UNION, INTERSECT, EXCEPT, WITH or second SELECT,
+# so no subquery or derived table), its FROM list holds only base tables of
+# this database (no parenthesised item, nested view or index hint), and the
+# item is exactly alias.col [AS name] with the alias taken from that FROM
+# list (never a table that merely bears the alias's name). Columns without
+# proof keep the view's reported type (fallback) only when the definition
+# was understood and none of its base tables has a TIMESTAMP column;
+# otherwise they are unproven.
 sub _view_column_sources {
     my ($self, $table) = @_;
     my $dbh = $self->{dbh};
@@ -1006,29 +1046,138 @@ sub _view_column_sources {
     };
     die $self->normalize_error($@) unless $ok;
     return undef unless @$views;
-    my %sources;
-    return \%sources if @$views > 1;
-    my $definition = $views->[0][0];
-    return \%sources unless defined($definition) && $definition !~ /\bunion\b/i;
+    my $none = {sources => {}, fallback => 0};
+    return $none if @$views > 1 || !defined($views->[0][0]);
+    my $tokens = _mysql_tokens($views->[0][0]) or return $none;
+    my @t = @$tokens;
+    my $is = sub { my ($i, $kind, $value) = @_; $i < @t && $t[$i][0] eq $kind && (!defined($value) || $t[$i][1] eq $value) };
+    my $selects = grep { $_->[0] eq 'word' && $_->[1] eq 'select' } @t;
+    return $none if $selects != 1 || !$is->(0, 'word', 'select')
+        || grep { $_->[0] eq 'word' && $_->[1] =~ /\A(?:union|intersect|except|with)\z/ } @t;
+    # The select list and the FROM list, at parenthesis depth 0.
+    my ($depth, $from, $end) = (0, undef, scalar @t);
+    for my $i (1 .. $#t) {
+        $depth++ if $is->($i, 'p', '(');
+        $depth-- if $is->($i, 'p', ')');
+        next if $depth;
+        if (!defined($from) && $is->($i, 'word', 'from')) { $from = $i; next }
+        if (defined($from) && $t[$i][0] eq 'word' && $FROM_END{$t[$i][1]}) { $end = $i; last }
+    }
+    my $start = 1;
+    $start++ while $start < (defined($from) ? $from : scalar @t) && $t[$start][0] eq 'word' && $t[$start][1] =~ /\A(?:distinct|all|distinctrow)\z/;
     my ($database) = $dbh->selectrow_array($self->_statement_sql('SELECT DATABASE()'));
-    my $name = qr/`(?:``|[^`])+`/;
-    my %used;
+    # FROM list: base table references, separated by commas or joins, with
+    # ON conditions (skipped) or USING lists.
+    my (%aliases, %tables);
+    if (defined $from) {
+        my $i = $from + 1;
+        while ($i < $end) {
+            # The servers write joins as ((a join b on(...)) join c ...): with a
+            # single SELECT there is no derived table, so these parentheses
+            # only group joins.
+            $i++ while $is->($i, 'p', '(');
+            my @name;
+            while ($i < $end && ($t[$i][0] eq 'id' || ($t[$i][0] eq 'word' && !$JOIN_WORD{$t[$i][1]} && $t[$i][1] ne 'on'))) {
+                push @name, $t[$i][1];
+                $i++;
+                last unless $is->($i, 'p', '.');
+                $i++;
+            }
+            return $none unless @name == 1 || @name == 2;
+            my ($base_database, $base) = @name == 2 ? @name : (undef, @name);
+            return $none if defined($base_database) && (!defined($database) || $base_database ne $database);
+            my $alias = $base;
+            $i++ if $is->($i, 'word', 'as');
+            if ($i < $end && ($t[$i][0] eq 'id' || ($t[$i][0] eq 'word' && !$JOIN_WORD{$t[$i][1]}
+                && $t[$i][1] !~ /\A(?:on|using|use|force|ignore)\z/))) {
+                $alias = $t[$i][1];
+                $i++;
+            }
+            return $none if exists $aliases{$alias};
+            $aliases{$alias} = $base;
+            $tables{$base} = 1;
+            return $none if $i < $end && $t[$i][0] eq 'word' && $t[$i][1] =~ /\A(?:use|force|ignore)\z/;
+            if ($is->($i, 'word', 'on')) {
+                my $level = 0;
+                $i++;
+                while ($i < $end) {
+                    $level++ if $is->($i, 'p', '(');
+                    if ($is->($i, 'p', ')')) { last if !$level; $level-- }
+                    last if !$level && ($is->($i, 'p', ',') || ($t[$i][0] eq 'word' && $JOIN_WORD{$t[$i][1]}));
+                    $i++;
+                }
+            } elsif ($is->($i, 'word', 'using')) {
+                $i++;
+                return $none unless $is->($i, 'p', '(');
+                $i++ while $i < $end && !$is->($i, 'p', ')');
+                $i++;
+            }
+            $i++ while $is->($i, 'p', ')');
+            last if $i >= $end;
+            if ($is->($i, 'p', ',')) { $i++; next }
+            my $joined = 0;
+            while ($i < $end && $t[$i][0] eq 'word' && $JOIN_WORD{$t[$i][1]}) {
+                $joined = 1 if $t[$i][1] eq 'join' || $t[$i][1] eq 'straight_join';
+                $i++;
+            }
+            return $none unless $joined;
+        }
+    }
+    # Every FROM item must be a base table of this database.
+    for my $base (keys %tables) {
+        my ($kind) = $dbh->selectrow_array($self->_statement_sql(q{SELECT TABLE_TYPE FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = DATABASE() AND } . ($sensitive ? 'BINARY TABLE_NAME = BINARY ?' : 'TABLE_NAME = ?')), undef, $base);
+        return $none unless defined($kind) && uc($kind) eq 'BASE TABLE';
+    }
     if ($self->name eq 'mysql') {
-        # MySQL 8.0.13+ records the relations a view reads.
-        my $rows = eval { $dbh->selectall_arrayref($self->_statement_sql(q{SELECT TABLE_NAME FROM information_schema.VIEW_TABLE_USAGE
-            WHERE VIEW_SCHEMA = DATABASE() AND TABLE_SCHEMA = DATABASE() AND }
-            . ($sensitive ? 'BINARY VIEW_NAME = BINARY ?' : 'VIEW_NAME = ?')), undef, "$table") } // [];
-        %used = map { ($self->_table_key($_->[0]) => 1) } @$rows;
+        # MySQL 8.0.13+ records the relations a view reads: they must be
+        # exactly the FROM list's.
+        my $rows = eval { $dbh->selectall_arrayref($self->_statement_sql(q{SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.VIEW_TABLE_USAGE
+            WHERE VIEW_SCHEMA = DATABASE() AND } . ($sensitive ? 'BINARY VIEW_NAME = BINARY ?' : 'VIEW_NAME = ?')), undef, "$table") };
+        return $none unless $rows;
+        my %used = map { (($_->[0] // '') eq ($database // '') ? $self->_table_key($_->[1]) : "\0" . ($_->[1] // '')) => 1 } @$rows;
+        my %listed = map { ($self->_table_key($_) => 1) } keys %tables;
+        return $none unless join("\0", sort keys %used) eq join("\0", sort keys %listed);
     }
-    while ($definition =~ /(?:\bselect\s+(?:distinct\s+)?|,)\s*((?:$name\.){1,2}$name)\s+AS\s+($name)(?=\s*(?:,|\bfrom\b|\z))/gi) {
-        my ($reference, $alias) = ($1, $2);
-        my @parts = map { substr($_, 1, -1) =~ s/``/`/gr } $reference =~ /($name)/g;
-        my ($base_database, $base_table, $base_column) = @parts == 3 ? @parts : (undef, @parts);
-        next if defined($base_database) && (!defined($database) || $base_database ne $database);
-        next if $self->name eq 'mysql' && !$used{$self->_table_key($base_table)};
-        $sources{lc(substr($alias, 1, -1) =~ s/``/`/gr)} = [$base_table, $base_column];
+    my %sources;
+    if (defined $from) {
+        my ($i, $level, @items, @item) = ($start, 0);
+        for my $j ($start .. $from - 1) {
+            $level++ if $is->($j, 'p', '(');
+            $level-- if $is->($j, 'p', ')');
+            if (!$level && $is->($j, 'p', ',')) { push @items, [@item]; @item = (); next }
+            push @item, $t[$j];
+        }
+        push @items, [@item] if @item;
+        for my $item (@items) {
+            my @x = @$item;
+            my $name = sub { $_[0] && ($_[0][0] eq 'id' || $_[0][0] eq 'word') };
+            my ($qualifier, $column, $alias);
+            if (@x >= 3 && $name->($x[0]) && $x[1][0] eq 'p' && $x[1][1] eq '.' && $name->($x[2])) {
+                if (@x >= 5 && $x[3][0] eq 'p' && $x[3][1] eq '.' && $name->($x[4])) {
+                    # db.table.col: the database must be this one, and the
+                    # table an unaliased FROM item.
+                    next unless defined($database) && $x[0][1] eq $database;
+                    ($qualifier, $column) = ($x[2][1], $x[4][1]);
+                    @x = @x[5 .. $#x];
+                } else {
+                    ($qualifier, $column) = ($x[0][1], $x[2][1]);
+                    @x = @x[3 .. $#x];
+                }
+            } else {
+                next;
+            }
+            if (!@x) { $alias = $column }
+            elsif (@x == 2 && $x[0][0] eq 'word' && $x[0][1] eq 'as' && $name->($x[1])) { $alias = $x[1][1] }
+            elsif (@x == 1 && $name->($x[0])) { $alias = $x[0][1] }
+            else { next }
+            my $base = $aliases{$qualifier};
+            next unless defined $base;
+            $sources{lc $alias} = [$base, $column];
+        }
     }
-    return \%sources;
+    my $timestamp = grep { grep { $_ eq 'timestamp' } values %{$self->_relation_column_types($_)} } keys %tables;
+    return {sources => \%sources, fallback => $timestamp ? 0 : 1};
 }
 
 sub _refuse_unproven_view_column {

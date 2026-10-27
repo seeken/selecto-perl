@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - Review R40c/R40d (MySQL family): the view passthrough proof reads
+      VIEW_DEFINITION with a MySQL lexer (strings with backslash escapes and
+      doubled quotes, backtick identifiers, /* */, -- and # comments), so a
+      string literal can no longer fake a passthrough item. It accepts only
+      a single SELECT (no UNION, INTERSECT, EXCEPT, WITH, subquery or
+      derived table) whose FROM list holds only base tables of this
+      database (MySQL also checks VIEW_TABLE_USAGE), and an item exactly
+      alias.col [AS name] whose alias that FROM list defines; the type is
+      the aliased table's, never a table that merely bears the alias's
+      name. Without proof a column keeps the view's reported type only when
+      none of the view's base tables has a TIMESTAMP column, and is
+      refused otherwise (view_column_unproven). Aliased passthroughs, also
+      in joins, are now accepted.
     - Review R40b (MySQL family): a scope comparison on ANY view column,
       whatever type the view reports, is trusted only for a proven direct
       passthrough of a base column (the view definition's select item is
