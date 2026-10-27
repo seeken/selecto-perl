@@ -73,6 +73,15 @@ Unreleased
       their base type) and whose index uses the column's own collation and
       the default operator class; date, timestamp, float, network and other
       keys are refused (query_rule_not_evaluable).
+    - R3 clarification 2: a host, trusted, required or tenant comparison on
+      a numeric column compares natively only with a literal the column's
+      type holds exactly; a lossy or non-canonical one ('1.4' or '1e0'
+      against an INTEGER, '2.505' or '1e1' against DECIMAL(10,2)) is
+      refused (query_rule_not_evaluable, inexact_literal) on DuckDB, MySQL
+      and MariaDB. On MySQL-family accepted literals are bound with an
+      exact cast (SIGNED/UNSIGNED, or the column's own DECIMAL(p,s)) from
+      the catalog type, so BIGINT and wide DECIMAL values are never
+      compared as doubles.
     - Review R31 and the R5 note (MySQL family): catalog lookups for
       TIMESTAMP, storage-type and temporary-shadow checks key a relation
       exactly as the server resolves it (case-sensitively, in binary, when

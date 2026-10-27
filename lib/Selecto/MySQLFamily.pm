@@ -313,6 +313,8 @@ sub _compile_expression {
     return $sql if defined $sql;
     $sql = $self->_timestamp_scope_sql($domain, $expression, $params);
     return $sql if defined $sql;
+    $sql = $self->_numeric_scope_sql($domain, $expression, $params);
+    return $sql if defined $sql;
     $sql = $self->_identity_predicate_sql($domain, $expression, $params);
     return $sql if defined $sql;
     Selecto::Error->throw('unsupported_feature', 'MySQL-family grouping markers require a rollup projection')
@@ -606,6 +608,134 @@ sub _integer_text_storage {
 # The catalog DATA_TYPE of a stored field's own column (R18: its own
 # relation), or undef when the catalog cannot describe it (a member or CTE
 # source, a computed field, no live handle).
+# R3 clarification 2: a host, trusted, required or tenant comparison on a
+# numeric column compares natively only with a literal the column's type
+# holds exactly, and binds it with an exact cast, never MySQL's
+# string-to-double conversion (BIGINT 9007199254740993 equals
+# '9007199254740992' as doubles; DECIMAL(30,2) loses digits):
+#   - an integer column takes a canonical integer (optional sign, digits),
+#     bound CAST(? AS SIGNED) or UNSIGNED;
+#   - DECIMAL(p,s) takes a plain decimal with at most s fractional digits
+#     (trailing zeros aside) and at most p-s integer digits, bound
+#     CAST(? AS DECIMAL(p,s));
+#   - FLOAT and DOUBLE take a plain or exponent number, compared natively.
+# Anything else is refused (query_rule_not_evaluable, reason
+# inexact_literal); '1.4' or '1e0' against an INTEGER would otherwise be
+# rounded. Other non-text columns (DATE, ...) compare as before. The type is
+# the catalog's, of the column's own relation (R18, R31).
+my %NUMERIC_KIND = (map({ ($_ => 'integer') } qw(tinyint smallint mediumint int integer bigint)),
+    decimal => 'decimal', numeric => 'decimal', float => 'float', double => 'float', real => 'float');
+
+sub _column_numeric_specs {
+    my ($self, $table) = @_;
+    my $sensitive = $self->_table_names_case_sensitive;
+    my $rows;
+    my $ok = eval {
+        $rows = $self->{dbh}->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION,
+            NUMERIC_SCALE, COLUMN_TYPE, TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND }
+            . ($sensitive ? 'BINARY TABLE_NAME = BINARY ?' : 'TABLE_NAME = ?')), undef, "$table");
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my %relations = map { ($_->[5] // '' => 1) } @$rows;
+    Selecto::Error->throw('query_rule_not_evaluable', 'the catalog describes more than one relation of this name',
+        {reason => 'relation_ambiguous', relation => "$table"}) if keys(%relations) > 1;
+    my %specs;
+    for my $row (@$rows) {
+        my $kind = $NUMERIC_KIND{lc($row->[1] // '')} or next;
+        $specs{lc $row->[0]} = {kind => $kind, precision => $row->[2], scale => $row->[3],
+            unsigned => (($row->[4] // '') =~ /\bunsigned\b/i ? 1 : 0)};
+    }
+    return \%specs;
+}
+
+# The numeric spec of a stored field's own column, or undef.
+sub _numeric_column_spec {
+    my ($self, $domain, $operand) = @_;
+    return undef unless blessed($operand) && $operand->isa('Selecto::Expression') && $operand->kind eq 'field'
+        && !ref($operand->arguments->[0]);
+    my $path = $operand->arguments->[0];
+    return undef if "$path" =~ /\./ && ref($self->{_query_sources}) eq 'HASH'
+        && exists $self->{_query_sources}{(split /\./, "$path")[0]};
+    my $resolved = eval { $domain->resolve("$path") };
+    return undef unless ref($resolved) eq 'HASH' && defined $resolved->{field};
+    my $metadata = $resolved->{association} ? eval { $domain->_field_metadata_view("$path") } : eval { $domain->field_metadata("$path") };
+    return undef if ref($metadata) eq 'HASH' && ref($metadata->{computed}) eq 'HASH';
+    my $association = $resolved->{association};
+    my $table = $association ? $association->table : $domain->table;
+    return undef if !defined($table) || ref($table) || ($association && $association->join_mode eq 'star_dimension');
+    my $dbh = $self->{dbh};
+    return undef unless eval { $dbh->isa('DBI::db') && $dbh->{Active} };
+    my $catalog = $self->{_selecto_column_catalog} // {};
+    my $specs = $catalog->{"numeric\0" . $self->_table_key($table)} //= $self->_column_numeric_specs($table);
+    return $specs->{lc $resolved->{field}};
+}
+
+# The bound marker of $value for a column of $spec (an exact cast), or a
+# typed refusal.
+sub _exact_numeric_marker {
+    my ($self, $spec, $value, $params) = @_;
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable',
+            'a scope comparison on a numeric column takes only a value its type holds exactly', {reason => 'inexact_literal'});
+    };
+    $refuse->() if !defined($value) || ref($value);
+    my $text = "$value";
+    if ($spec->{kind} eq 'integer') {
+        $refuse->() unless $text =~ /\A[+-]?\d{1,20}\z/a;
+        $refuse->() if $spec->{unsigned} && $text =~ /\A-/ && $text !~ /\A-0+\z/;
+        push @$params, $value;
+        return 'CAST(' . $self->placeholder(scalar @$params) . ($spec->{unsigned} ? ' AS UNSIGNED)' : ' AS SIGNED)');
+    }
+    if ($spec->{kind} eq 'decimal') {
+        my ($integer, $fraction) = $text =~ /\A[+-]?(\d*)(?:\.(\d*))?\z/a or $refuse->();
+        $refuse->() unless length($integer // '') || length($fraction // '');
+        $integer =~ s/\A0+//;
+        ($fraction //= '') =~ s/0+\z//;
+        my ($precision, $scale) = (0 + ($spec->{precision} // 0), 0 + ($spec->{scale} // 0));
+        $refuse->() if !$precision || length($fraction) > $scale || length($integer) > $precision - $scale;
+        push @$params, $value;
+        return 'CAST(' . $self->placeholder(scalar @$params) . " AS DECIMAL($precision,$scale))";
+    }
+    $refuse->() unless $text =~ /\A[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\z/a;
+    push @$params, $value;
+    return $self->placeholder(scalar @$params);
+}
+
+my %NUMERIC_OPERATOR = (eq => '=', ne => '<>', gt => '>', gte => '>=', lt => '<', lte => '<=');
+my %NUMERIC_FLIP = (eq => 'eq', ne => 'ne', gt => 'lt', gte => 'lte', lt => 'gt', lte => 'gte');
+
+sub _numeric_scope_sql {
+    my ($self, $domain, $expression, $params) = @_;
+    return undef unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $kind = $expression->kind;
+    return undef unless $kind =~ /\A(?:eq|ne|gt|gte|lt|lte|in|between)\z/;
+    my $address = refaddr($expression);
+    return undef unless $self->{_selecto_in_host}
+        || ($self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{$address})
+        || ($self->{_selecto_host_nodes} && $self->{_selecto_host_nodes}{$address});
+    my $is = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq $_[1] };
+    my ($field, @rest) = @{$expression->arguments};
+    if ($NUMERIC_OPERATOR{$kind} && !$is->($field, 'field') && $is->($rest[0], 'field')) {
+        ($field, @rest) = ($rest[0], $field);
+        $kind = $NUMERIC_FLIP{$kind};
+    }
+    my $spec = $self->_numeric_column_spec($domain, $field) or return undef;
+    my @values;
+    if ($kind eq 'in') {
+        return undef unless ref($rest[0]) eq 'ARRAY' && @{$rest[0]};
+        @values = @{$rest[0]};
+    } else {
+        return undef if grep { !$is->($_, 'literal') } @rest;
+        @values = map { $_->arguments->[0] } @rest;
+    }
+    my $column = $self->_compile_expression($domain, $field, $params);
+    my @markers = map { $self->_exact_numeric_marker($spec, $_, $params) } @values;
+    return "$column IN (" . join(', ', @markers) . ')' if $kind eq 'in';
+    return "$column BETWEEN $markers[0] AND $markers[1]" if $kind eq 'between';
+    return "$column $NUMERIC_OPERATOR{$kind} $markers[0]";
+}
+
 sub _stored_column_type {
     my ($self, $domain, $operand) = @_;
     return undef unless blessed($operand) && $operand->isa('Selecto::Expression') && $operand->kind eq 'field'
@@ -1024,6 +1154,13 @@ sub _write_storage_types {
     return $self->_column_data_types(Selecto::Identifier::checked($command->relation));
 }
 
+sub _write_numeric_specs {
+    my ($self, $command) = @_;
+    my $dbh = $self->{dbh};
+    return {} unless blessed($command) && $command->can('relation') && eval { $dbh->isa('DBI::db') && $dbh->{Active} };
+    return $self->_column_numeric_specs(Selecto::Identifier::checked($command->relation));
+}
+
 sub _write_field_types {
     my ($command) = @_;
     my $metadata = blessed($command) && $command->can('metadata') ? $command->metadata : {};
@@ -1049,6 +1186,24 @@ sub _compile_write_predicate {
             'a TIMESTAMP scope column can only be compared with =, <>, ranges or IN, or tested for NULL',
             {reason => 'timestamp_operator'})
             if !$direct && grep { !ref($_) && $timestamps->{lc $_} } Selecto::Expression->field_references($expression);
+    }
+    # R3 clarification 2: a scope comparison on a numeric column takes only a
+    # literal its type holds exactly, bound with an exact cast and its
+    # original value.
+    my $numeric = $self->{_selecto_write_numeric};
+    if ($scoped && $numeric && %$numeric && blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind =~ /\A(?:eq|ne|gt|gte|lt|lte|in)\z/) {
+        my ($left, $right) = @{$expression->arguments};
+        my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field' ? $left->arguments->[0] : undef;
+        my $spec = defined($field) && !ref($field) ? $numeric->{lc $field} : undef;
+        my $values = !$spec ? undef : $expression->kind eq 'in' ? $right
+            : blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal' ? [$right->arguments->[0]] : undef;
+        if (ref($values) eq 'ARRAY' && @$values) {
+            my $column = $self->quote_identifier(Selecto::Identifier::checked($field));
+            my @markers = map { $self->_exact_numeric_marker($spec, $_, $params) } @$values;
+            return "$column IN (" . join(', ', @markers) . ')' if $expression->kind eq 'in';
+            return "$column $NUMERIC_OPERATOR{$expression->kind} $markers[0]";
+        }
     }
     my $integer_text = $self->{_selecto_write_integer_text};
     if ($scoped && $integer_text && %$integer_text && blessed($expression) && $expression->isa('Selecto::Expression')) {
@@ -1708,6 +1863,7 @@ sub _compile_write {
     local $self->{_selecto_write_tenant_fields} = _write_tenant_fields($command);
     local $self->{_selecto_write_integer_text} = $self->_write_integer_text_columns($command);
     local $self->{_selecto_write_storage} = $self->_write_storage_types($command);
+    local $self->{_selecto_write_numeric} = $self->_write_numeric_specs($command);
     local $self->{_selecto_bind_copies} = [];
     my $compiled = $self->SUPER::_compile_write($command);
     # The logical parameter sequence: the bound values with each exact
@@ -1940,6 +2096,7 @@ sub _execute_compiled_write_unchecked {
     local $self->{_selecto_write_tenant_fields} = _write_tenant_fields($command);
     local $self->{_selecto_write_integer_text} = $self->_write_integer_text_columns($command);
     local $self->{_selecto_write_storage} = $self->_write_storage_types($command);
+    local $self->{_selecto_write_numeric} = $self->_write_numeric_specs($command);
     my $operation = $command->operation;
     # Every write may be refused after its statement (cardinality, row
     # ceiling, post-image, RETURNING and stored-row checks, an AFTER trigger
