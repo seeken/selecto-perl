@@ -403,7 +403,12 @@ subtest 'R32: internal deferrable rechecks count unless they run only pg_catalog
         'CREATE TABLE r3u_y (k r3u_e REFERENCES r3u_x (k) DEFERRABLE INITIALLY DEFERRED)';
     is($outcome->(sub { $update->('e') }), 'query_rule_not_evaluable/deferred_triggers',
         'a deferred foreign key over a user enum key refuses writes');
-    $admin->do($_) for 'DROP TABLE r3u_y, r3u_x', 'DROP TYPE r3u_e', 'DROP COLLATION r3u_c', 'DROP FUNCTION r3u_f(int)',
+    # R37b: so does a deferrable unique recheck over a range key (its
+    # subtype's operator class can be user code).
+    $admin->do($_) for 'DROP TABLE r3u_y, r3u_x', 'CREATE TABLE r3u_x (k int4range, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('r') }), 'query_rule_not_evaluable/deferred_triggers',
+        'a deferrable unique recheck over a range key refuses writes');
+    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP TYPE r3u_e', 'DROP COLLATION r3u_c', 'DROP FUNCTION r3u_f(int)',
         'CREATE TABLE r3u_x (k INT)';
     is($outcome->(sub { $update->('f') }), 'applied 1', 'and writes apply again once only pg_catalog-typed deferred keys remain');
     $admin->do($_) for 'DROP TABLE r3u_w, r3u_parent, r3u_child, r3u_x CASCADE', 'DROP OPERATOR CLASS r3u_ops USING btree CASCADE';
@@ -467,6 +472,46 @@ subtest 'R35: result-affecting settings are pinned to their reset values for eve
     is($rows->($dbh, 'SHOW DateStyle'), 'SQL, DMY', "and its DateStyle");
     $dbh->disconnect;
     $admin->do($_) for qq{ALTER DATABASE "$database" RESET TimeZone}, 'DROP TABLE r3z CASCADE';
+};
+
+subtest 'R41/R42: every statement rechecks its relations; hand-built SQL never reaches an undeclared TEMP relation' => sub {
+    $admin->do($_) for 'DROP TABLE IF EXISTS r3w CASCADE', 'DROP SCHEMA IF EXISTS r3w_role CASCADE',
+        q{DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'r3w_role') THEN DROP OWNED BY r3w_role; DROP ROLE r3w_role; END IF; END $$},
+        'CREATE TABLE r3w (id INT PRIMARY KEY, org_key TEXT NOT NULL)', q{INSERT INTO r3w VALUES (1, 't1'), (2, 't2')},
+        'CREATE ROLE r3w_role', 'CREATE SCHEMA r3w_role AUTHORIZATION r3w_role',
+        'CREATE TABLE r3w_role.r3w (id INT PRIMARY KEY, org_key TEXT NOT NULL)', q{INSERT INTO r3w_role.r3w VALUES (9, 't1')},
+        'GRANT USAGE ON SCHEMA public TO r3w_role', 'GRANT SELECT ON r3w TO r3w_role', 'GRANT SELECT ON r3w_role.r3w TO r3w_role';
+    my $dbh = $connect->();
+    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    my $reader = Selecto::Engine->new(adapter => $adapter, domain => Selecto::Domain->parse({schema_version => 1, name => 'W',
+        source => {source_table => 'r3w', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key)],
+            columns => {id => {type => 'integer'}, org_key => {type => 'string'}}, associations => {}}, schemas => {}, joins => {}}))
+        ->with_scope(tenant => 't1');
+    my $statement = $reader->compile($reader->query->select('id'));
+    my $run = sub { $outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($statement)->{rows}} }) };
+    is($run->(), 'applied 1', 'control: the compiled statement reads public.r3w');
+    # After SET ROLE, "$user" in the reset search_path names r3w_role first:
+    # the long-lived statement no longer matches the pinned resolution.
+    $dbh->do('SET ROLE r3w_role');
+    is($run->(), 'query_rule_not_evaluable/relation_ambiguous', 'after SET ROLE a stale compiled statement is refused');
+    $dbh->do('RESET ROLE');
+    is($run->(), 'applied 1', 'and runs again once the role is reset');
+    # R42: a hand-built statement naming an undeclared TEMP relation.
+    require Selecto::Statement;
+    $dbh->do('CREATE TEMP TABLE r3w_tmp (id INT)');
+    $dbh->do('INSERT INTO r3w_tmp VALUES (42)');
+    my $raw = Selecto::Statement->new(sql => 'SELECT "id" FROM r3w_tmp', params => []);
+    like($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($raw)->{rows}} }),
+        qr{\Aquery_rule_not_evaluable/(?:relation_unresolved|temporary_shadow)\z}, 'a hand-built statement naming an undeclared TEMP relation is refused');
+    my $hidden = Selecto::Statement->new(sql => 'SELECT (SELECT max(id) FROM ONLY r3w_tmp) AS id', params => []);
+    like($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($hidden)->{rows}} }),
+        qr{\Aquery_rule_not_evaluable/(?:relation_unresolved|temporary_shadow)\z}, 'however the SQL spells it');
+    my $declared = Selecto->adapter(postgresql => (temporary_relations => 1, dbh => $dbh));
+    is($outcome->(sub { join ',', map { $_->[0] } @{$declared->execute_query($raw)->{rows}} }), 'applied 42',
+        'a declared-temp adapter reads it');
+    is($rows->($dbh, 'SHOW timezone_abbreviations'), 'Default', 'timezone_abbreviations is restored after each statement');
+    $dbh->disconnect;
+    $admin->do($_) for 'DROP TABLE r3w CASCADE', 'DROP SCHEMA r3w_role CASCADE', 'DROP OWNED BY r3w_role', 'DROP ROLE r3w_role';
 };
 
 done_testing;
