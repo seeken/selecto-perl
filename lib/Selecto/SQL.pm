@@ -1317,6 +1317,7 @@ sub _admit_plan_storage { return; }
 # (undef: nothing to compare), and its comparison after the DML.
 sub _write_session_open { return undef; }
 sub _write_session_check { return; }
+sub _write_session_close { return; }
 # Dialect hook: true when post-statement re-reads name the written rows by
 # their physical row id (PostgreSQL: RETURNING tableoid, ctid) instead of
 # their key value. _with_row_ids appends the row ids to a compiled write.
@@ -3573,6 +3574,9 @@ sub _execute_compiled_write_in_transaction {
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
+    # The session as the host had it (PostgreSQL restores its search_path,
+    # pinned for the write, R30); a refusal above rolls the pin back instead.
+    $self->_write_session_close($session);
     return Selecto::Write::Result->new(operation => $command->operation, affected_rows => $affected, values => \%values);
 }
 

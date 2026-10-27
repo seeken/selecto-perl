@@ -1235,12 +1235,21 @@ my $SESSION_COLUMNS = join(', ',
     (map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS),
     # User-defined deferrable triggers in the database (R23): a write is
     # refused while any exists. Not part of the compared snapshot.
-    q{(SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal }
-        . q{AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable)},
-    # Under REPEATABLE READ or SERIALIZABLE that count reads the transaction
-    # snapshot and cannot see a trigger committed since (R19): writes are
-    # refused outside READ COMMITTED.
-    q{pg_catalog.current_setting('transaction_isolation')});
+    # Internal ones count too (R32), except foreign-key triggers and unique or
+    # exclusion rechecks whose operator classes and operators are all
+    # pg_catalog's: a user opclass or operator runs user code at COMMIT.
+    q{(SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc f ON f.oid OPERATOR(pg_catalog.=) t.tgfoid }
+        . q{WHERE t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable AND NOT (t.tgisinternal }
+        . q{AND f.pronamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace) AND (}
+        . q{pg_catalog.starts_with(CAST(f.proname AS pg_catalog.text), 'RI_FKey_') }
+        . q{OR (f.proname OPERATOR(pg_catalog.=) CAST('unique_key_recheck' AS pg_catalog.name) }
+        . q{AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid OPERATOR(pg_catalog.=) c.conindid }
+        . q{JOIN pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])) AS k(opclass) ON TRUE }
+        . q{JOIN pg_catalog.pg_opclass o ON o.oid OPERATOR(pg_catalog.=) k.opclass }
+        . q{WHERE c.oid OPERATOR(pg_catalog.=) t.tgconstraint AND o.opcnamespace OPERATOR(pg_catalog.<>) CAST('pg_catalog' AS pg_catalog.regnamespace)) }
+        . q{AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.unnest(c.conexclop) AS e(op) ON TRUE }
+        . q{JOIN pg_catalog.pg_operator p ON p.oid OPERATOR(pg_catalog.=) e.op }
+        . q{WHERE c.oid OPERATOR(pg_catalog.=) t.tgconstraint AND p.oprnamespace OPERATOR(pg_catalog.<>) CAST('pg_catalog' AS pg_catalog.regnamespace))))))});
 
 # A relation the statement names that resolves into this session's temp
 # schema while a same-named relation exists in a schema of the search path
@@ -1286,7 +1295,11 @@ sub _pg_statement_relations {
     Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
         {reason => 'relations_unknown'}) unless defined($sql) && !ref($sql) && length($sql);
     my $part = q{(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_\$]*+)};
-    my %names = map { ($_ => 1) } grep { defined && !ref } @{$recorded // []};
+    # A compiled statement's list is complete and names relations only (R28,
+    # R33, R34): its relations are schema-qualified, so the scan below is for
+    # a host's hand-built statement alone.
+    return [sort grep { defined && !ref } @$recorded] if ref($recorded) eq 'ARRAY';
+    my %names;
     while ($sql =~ /\b(FROM|JOIN|INTO|UPDATE|USING)\s+(?:ONLY\s+)?(?:\(\s*)*($part(?:\.$part)?)(?![A-Za-z0-9_\$".])(\s*\()?/gi) {
         my ($keyword, $name, $call) = ($1, $2, $3);
         # A function call (FROM unnest(...)), except an INSERT target's
@@ -1298,45 +1311,134 @@ sub _pg_statement_relations {
     return [sort keys %names];
 }
 
-# R23b (item 58): generated reads and writes name every relation by the
-# schema it resolves to now, when the statement is compiled, so a
-# search_path switch that persists by any route (a deferred trigger, a
-# REPEATABLE READ race no catalog count can see) cannot redirect a later
-# statement to another schema's relation. The lookup is pg_catalog-only. A
-# name that resolves into the session's temp schema while a namesake exists
-# on the search path is refused (temporary_shadow); a TEMP relation without
-# one is the host's own and is named by its temp schema. A host-pinned read
-# prefix, a query source (CTE or VALUES) and a name that resolves to nothing
-# keep their spelling. Resolved once per relation per compile.
-my $QUALIFY_SQL = 'SELECT pg_catalog.quote_ident(n.nspname), pg_catalog.quote_ident(c.relname), '
-    . "(c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA AND EXISTS (SELECT 1 FROM pg_catalog.pg_class o "
-    . 'JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) o.relnamespace '
-    . 'WHERE o.relname OPERATOR(pg_catalog.=) c.relname AND o.relnamespace OPERATOR(pg_catalog.<>) c.relnamespace '
-    . 'AND s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false))))::pg_catalog.int4 '
+# R23b / R29 (item 58): generated reads and writes name every relation by
+# its schema, resolved when the statement is compiled against a search path
+# the session cannot hijack with set_config: the host-pinned read prefix
+# when there is one, otherwise the session's search_path reset value
+# (pg_settings.reset_val, from server, database, role or connection
+# configuration; "$user" is the session user, pg_temp and pg_catalog are
+# skipped). The current search_path is never consulted. A TEMP relation
+# named like one found there shadows it and is refused (temporary_shadow);
+# a TEMP relation with no such namesake is the host's own and is named by
+# its temp schema. Query sources (CTE, VALUES) are never rendered through
+# here, so a CTE named like a real relation never hides it (R33). A
+# relation found nowhere, or a reset path that cannot be read, fails closed
+# (query_rule_not_evaluable, reason relation_unresolved): no unqualified
+# relation is ever sent. Hosts that SET search_path to reach other schemas
+# must pin the schema (the engine's tenant prefix). Resolved once per
+# relation per compile, with pg_catalog-only SQL.
+my $RESET_PATH_SQL = q{SELECT (SELECT s.reset_val FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) 'search_path'), }
+    . q{CAST(SESSION_USER AS pg_catalog.text)};
+my $QUALIFY_SQL = 'SELECT pg_catalog.quote_ident(n.nspname), pg_catalog.quote_ident(c.relname) '
+    . 'FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) WITH ORDINALITY AS p(name, ord) '
+    . 'JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) p.name '
+    . 'JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid AND c.relname OPERATOR(pg_catalog.=) $2 '
+    . 'ORDER BY p.ord LIMIT 1';
+my $TEMP_RELATION_SQL = 'SELECT pg_catalog.quote_ident(n.nspname), pg_catalog.quote_ident(c.relname) '
     . 'FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace '
-    . 'WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)';
+    . "WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA AND c.relname OPERATOR(pg_catalog.=) \$1";
+
+# The schemas of a search_path setting's text, in order: "$user" expanded,
+# quoted names unquoted, pg_temp and pg_catalog left out.
+sub _pg_path_schemas {
+    my ($path, $user) = @_;
+    my @schemas;
+    my $rest = $path // '';
+    while (length $rest) {
+        $rest =~ s/\A\s+//;
+        last unless length $rest;
+        my $name;
+        if ($rest =~ s/\A"((?:[^"]|"")*)"//) {
+            ($name = $1) =~ s/""/"/g;
+        } elsif ($rest =~ s/\A([^,]+)//) {
+            ($name = $1) =~ s/\s+\z//;
+            $name = lc $name;
+        }
+        $rest =~ s/\A\s*,?//;
+        next unless defined($name) && length($name);
+        $name = $user if $name eq '$user';
+        next if !defined($name) || $name =~ /\Apg_temp/ || $name eq 'pg_catalog';
+        push @schemas, $name;
+    }
+    return @schemas;
+}
+
+# The reset search path's schemas, once per compile (or per call).
+sub _pg_reset_schemas {
+    my ($self) = @_;
+    my $cache = $self->{_selecto_relation_schemas};
+    return @{$cache->{"\0reset"}} if ref($cache) eq 'HASH' && $cache->{"\0reset"};
+    my @row;
+    my $ok = eval { @row = $self->{dbh}->selectrow_array($RESET_PATH_SQL); 1 };
+    Selecto::Error->throw('query_rule_not_evaluable', "the session's reset search_path could not be read",
+        {reason => 'relation_unresolved'}) unless $ok && @row && defined $row[0];
+    my @schemas = _pg_path_schemas($row[0], $row[1]);
+    $cache->{"\0reset"} = \@schemas if ref($cache) eq 'HASH';
+    return @schemas;
+}
 
 sub _relation_sql {
     my ($self, $prefix, $table) = @_;
     my $plain = $self->SUPER::_relation_sql($prefix, $table);
     return $plain if defined($prefix) || !defined($table) || ref($table) || !$self->_pg_session_checked;
-    my $sources = $self->{_query_sources};
-    return $plain if ref($sources) eq 'HASH' && grep { lc($_) eq lc("$table") } keys %$sources;
     my $cache = $self->{_selecto_relation_schemas};
     return $cache->{$plain} if ref($cache) eq 'HASH' && exists $cache->{$plain};
-    # Nothing is sent on a busy, failed or unknown connection: the statement
-    # keeps its spelling, and the guard that runs it refuses with
-    # transaction_state_unsafe before anything reaches the server.
+    # Nothing is sent on a busy, failed or unknown connection: the guard that
+    # would run the statement refuses it (transaction_state_unsafe) before
+    # anything reaches the server.
     my $state = ref($cache) eq 'HASH' ? ($cache->{"\0state"} //= $self->_connection_state) : $self->_connection_state;
     return $plain unless $state =~ /\A(?:idle|intrans)\z/;
-    my @row;
-    my $ok = eval { @row = $self->{dbh}->selectrow_array($QUALIFY_SQL, undef, $plain); 1 };
+    my @schemas = $self->_pg_reset_schemas;
+    my (@row, @temp);
+    my $ok = eval {
+        @row = $self->{dbh}->selectrow_array($QUALIFY_SQL, undef, \@schemas, "$table");
+        @temp = $self->{dbh}->selectrow_array($TEMP_RELATION_SQL, undef, "$table");
+        1;
+    };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary relation of the session shadows a relation the statement names',
-        {reason => 'temporary_shadow'}) if @row && $row[2];
-    my $qualified = @row && defined($row[0]) ? "$row[0].$row[1]" : $plain;
+        {reason => 'temporary_shadow', relation => "$table"}) if @row && @temp;
+    my @found = @row ? @row : @temp;
+    Selecto::Error->throw('query_rule_not_evaluable', 'the relation is not in a schema of the reset search_path',
+        {reason => 'relation_unresolved', relation => "$table"}) unless @found && defined $found[0];
+    my $qualified = "$found[0].$found[1]";
     $cache->{$plain} = $qualified if ref($cache) eq 'HASH';
     return $qualified;
+}
+
+# R30: Selecto pins search_path for each of its statements, inside its own
+# transaction or savepoint: pg_catalog first (operators, functions and types
+# resolve there before anything else), then the reset search path's schemas,
+# pg_temp last. A switch that persisted before the call cannot redirect an
+# operator, function or relation. The host's value is restored with
+# set_config(..., true) before control returns (a rollback reverts it too).
+sub _pg_pin_search_path {
+    my ($self) = @_;
+    local $self->{_selecto_relation_schemas} = {};
+    my @schemas = $self->_pg_reset_schemas;
+    my $pinned = join(', ', 'pg_catalog', (map { _quote_path_schema($_) } @schemas), 'pg_temp');
+    my ($host);
+    my $ok = eval {
+        ($host) = $self->{dbh}->selectrow_array(q{WITH h AS MATERIALIZED (SELECT pg_catalog.current_setting('search_path') AS v) }
+            . q{SELECT h.v, pg_catalog.set_config('search_path', $1, true) FROM h}, undef, $pinned);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok && defined $host;
+    return {host => $host, pinned => $pinned};
+}
+
+sub _pg_restore_search_path {
+    my ($self, $pin) = @_;
+    return unless ref($pin) eq 'HASH';
+    my $ok = eval { $self->{dbh}->selectrow_array(q{SELECT pg_catalog.set_config('search_path', $1, true)}, undef, $pin->{host}); 1 };
+    die $self->normalize_error($@) unless $ok;
+    return;
+}
+
+sub _quote_path_schema {
+    my ($name) = @_;
+    (my $quoted = $name) =~ s/"/""/g;
+    return qq{"$quoted"};
 }
 
 # True when the handle is a live DBD::Pg handle (the session checks need
@@ -1350,8 +1452,8 @@ sub _pg_session_checked {
 sub _pg_state_row {
     my ($row) = @_;
     my ($snapshot, @settings) = @$row;
-    my ($deferrable, $isolation) = @settings[scalar(@SESSION_SETTINGS), @SESSION_SETTINGS + 1];
-    return {snapshot => $snapshot, deferrable => (defined($deferrable) && $deferrable ? 1 : 0), isolation => $isolation,
+    my $deferrable = $settings[@SESSION_SETTINGS];
+    return {snapshot => $snapshot, deferrable => (defined($deferrable) && $deferrable ? 1 : 0),
         settings => {map { ($SESSION_SETTINGS[$_] => $settings[$_]) } 0 .. $#SESSION_SETTINGS}};
 }
 
@@ -1373,7 +1475,7 @@ sub _pg_admit_session {
     my @row;
     my $ok = eval { @row = $self->{dbh}->selectrow_array($SHADOW_SQL, undef, $names); 1 };
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
-        {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS + 2 && defined $row[2];
+        {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS + 1 && defined $row[2];
     my ($relations, $types, @state) = @row;
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary relation of the session shadows a relation the statement names',
         {reason => 'temporary_shadow'}) if $relations;
@@ -1404,13 +1506,20 @@ sub _session_changed {
 sub _write_session_open {
     my ($self, $command, $compiled) = @_;
     return undef unless $self->_pg_session_checked;
+    # The write runs inside its own transaction or savepoint: pin
+    # search_path for it first (R30), then snapshot under the pin.
+    my $pin = $self->_pg_pin_search_path;
     my $state = $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled : undef);
+    $state->{pin} = $pin;
     _refuse_deferred_triggers() if $state->{deferrable};
-    Selecto::Error->throw('query_rule_not_evaluable',
-        'a PostgreSQL write requires READ COMMITTED isolation (its deferrable-trigger check reads the latest catalog)',
-        {reason => 'isolation_level', isolation => $state->{isolation}})
-        unless defined($state->{isolation}) && $state->{isolation} eq 'read committed';
     return $state;
+}
+
+# After the write's last post-statement check: the host's search_path again.
+sub _write_session_close {
+    my ($self, $state) = @_;
+    $self->_pg_restore_search_path($state->{pin}) if ref($state) eq 'HASH';
+    return;
 }
 
 sub _write_session_check {
@@ -1450,37 +1559,47 @@ sub _guarded_read {
     return $work->() if !$self->_pg_session_checked || $self->{_selecto_pg_read_guard};
     local $self->{_selecto_pg_read_guard} = 1;
     my $scope = $self->_read_guard_scope;
+    # The read runs under its own savepoint in the host's transaction, or in
+    # its own transaction on an idle handle, so search_path can be pinned for
+    # it (R30) and any change it makes is undone by a rollback.
     my $savepoint;
     if ($scope eq 'host') {
         $savepoint = Selecto::SQL::_savepoint_name('selecto_read');
         eval { $self->_savepoint_command(create => $savepoint); 1 }
             or die $self->_transaction_control_error($@);
+    } else {
+        eval { $self->_begin_transaction; 1 } or die $self->_transaction_control_error($@);
     }
-    my ($before, $result);
+    my ($pin, $before, $result);
     my $ok = eval {
+        $pin = $self->_pg_pin_search_path;
         $before = $self->_pg_admit_session($source);
         $result = $work->();
         1;
     };
     my $error = $ok ? undef : $@;
-    # A failed statement changed nothing that outlives it: in a host
-    # transaction its savepoint is rolled back below, and in autocommit its
-    # own implicit transaction already was.
     my $after = $ok && $before ? eval { $self->_pg_session_state } : undef;
     my $changed = $ok && $before && !($after && $after->{snapshot} eq $before->{snapshot});
-    if ($savepoint) {
-        my $undo = !$ok || $changed;
-        my $restored = eval {
-            $self->_savepoint_command(rollback => $savepoint) if $undo;
+    my $undo = !$ok || $changed;
+    my $finished = eval {
+        if ($savepoint) {
+            if ($undo) {
+                $self->_savepoint_command(rollback => $savepoint);
+            } else {
+                $self->_pg_restore_search_path($pin);
+            }
             $self->_savepoint_command(release => $savepoint);
-            1;
-        };
-        die $self->_transaction_control_error($@) if !$restored && $ok && !$changed;
-    } elsif ($changed) {
-        for my $name (@SESSION_SETTINGS) {
-            eval { $self->{dbh}->selectrow_array('SELECT pg_catalog.set_config($1, $2, false)', undef,
-                $name, $before->{settings}{$name}) };
+        } elsif ($undo) {
+            $self->_rollback_transaction;
+        } else {
+            $self->_commit_transaction;
         }
+        1;
+    };
+    unless ($finished) {
+        my $control = $@;
+        eval { $self->_rollback_transaction } unless $savepoint;
+        die $self->_transaction_control_error($control) if $ok && !$changed;
     }
     _session_changed() if $changed;
     die $error unless $ok;
@@ -1827,8 +1946,10 @@ makes every write to its table refuse.
 A deferrable constraint trigger fires at COMMIT, after that check, and one
 can even be created during the write (by its own row trigger, or by another
 session while the write waits for a lock). So every write (own or host
-transaction, guarded or not) is refused while any enabled user-defined
-(non-internal) deferrable trigger exists in the database, checked before
+transaction, guarded or not) is refused while any enabled deferrable
+trigger that can run user code exists in the database (every user-defined
+one, and internal unique or exclusion rechecks with a non-pg_catalog
+operator class or operator), checked before
 the DML and in the first statement after it (C<query_rule_not_evaluable>,
 reason C<deferred_triggers>). Selecto never runs C<SET CONSTRAINTS>.
 Internal foreign-key triggers are not counted: deferred foreign keys keep
@@ -1837,12 +1958,20 @@ Selecto writes.
 
 =item *
 
-Every relation a generated read or write names is schema-qualified with the
-schema it resolves to when the statement is compiled (a host-pinned read
-prefix, a query source and an unresolved name keep their spelling), so a
-C<search_path> switch that outlives a statement by any route cannot
-redirect a later one. Functions, operators and types in Selecto's own
-catalog and guard SQL are C<pg_catalog>-qualified.
+Every relation a generated read or write names is schema-qualified, with
+the schema resolved when the statement is compiled from the engine's tenant
+prefix or else the session's C<search_path> reset value
+(C<pg_settings.reset_val>), never from the current C<search_path>. A
+relation found in neither (nor, as a host's own TEMP table, in the session's
+temporary schema) is refused (C<query_rule_not_evaluable>, reason
+C<relation_unresolved>). Each Selecto statement runs with C<search_path>
+pinned to C<pg_catalog>, the reset path's schemas and C<pg_temp> (last),
+inside its own transaction or savepoint, and the host's value is restored
+afterwards; so a C<search_path> switch that persisted before the call
+redirects neither relations nor operators. Hosts that C<SET search_path> to
+reach other schemas must pin the schema instead. Row triggers fired by
+Selecto writes run under the pinned C<search_path>. Functions, operators and
+types in Selecto's own catalog and guard SQL are C<pg_catalog>-qualified.
 
 =item *
 
