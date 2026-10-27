@@ -71,8 +71,8 @@ subtest 'R2: a temp relation shadowing a through-association bridge is refused' 
         ->with_scope(tenant => 't1');
     my $query = $engine->query->select('id', 'accs.label')->order_by('id');
     my $statement = $engine->compile($query);
-    is_deeply($statement->can("relations") ? $statement->relations : undef, [sort '"r3b_acc"', '"r3b_items"', '"r3b_link"'],
-        'the compiled statement records the bridge among its relations');
+    is_deeply($statement->can("relations") ? $statement->relations : undef, [sort 'public.r3b_acc', 'public.r3b_items', 'public.r3b_link'],
+        'the compiled statement records the bridge among its relations, schema-qualified');
     my $flat = sub { join ',', map { $_->[1] // 'NULL' } @{$engine->all($query)->{rows}} };
     my $stream = sub { my $s = $engine->stream($query); my @l; while (my $r = $s->next) { push @l, $r->[1] } join ',', @l };
     is($outcome->($flat), 'applied t1-acc', 'control: the bridge read');
@@ -121,7 +121,7 @@ subtest 'R8: a deferred constraint trigger cannot change the session after the c
         $dbh->begin_work if $mode eq 'host';
         is($outcome->(sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3d_w',
             assignments => {note => 'u'}, predicate => $x->eq('id', 1)))->affected_rows }),
-            $mode eq 'own' ? 'query_rule_violation/session_state_changed' : 'query_rule_not_evaluable/deferred_trigger',
+            'query_rule_not_evaluable/deferred_triggers',
             "$mode transaction: the unscoped write is refused");
         $dbh->commit if $mode eq 'host';
         is($rows->($dbh, 'SHOW search_path'), '"$user", public', "$mode transaction: the session keeps its search_path");
@@ -247,7 +247,7 @@ subtest 'R14: a deferrable trigger created during the write cannot fire after th
         $dbh->begin_work if $mode eq 'host';
         my $result = $outcome->(sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3m_w',
             assignments => {note => 'u'}, predicate => $x->eq('id', 1)))->affected_rows });
-        like($result, qr{\Aquery_rule_(?:violation/session_state_changed|not_evaluable/deferred_trigger)\z},
+        like($result, qr{\Aquery_rule_not_evaluable/deferred_triggers\z},
             "$mode transaction: the write is refused ($result)");
         $dbh->commit if $mode eq 'host';
         is($rows->($dbh, 'SHOW search_path'), '"$user", public', "$mode transaction: the session keeps its search_path");
@@ -278,5 +278,45 @@ subtest 'R17: deferred foreign keys keep their deferral around Selecto writes' =
     is($outcome->(sub { $update->('own') }), 'applied 1', 'a write in its own transaction applies with deferred FKs present');
     is($rows->($admin, 'SELECT note FROM r3f_w'), 'own', 'both writes applied');
     $admin->do('DROP TABLE r3f_child, r3f_parent, r3f_w CASCADE');
+};
+subtest 'R19/R23b: writes need READ COMMITTED; generated SQL names relations by their schema' => sub {
+    $admin->do($_) for 'DROP SCHEMA IF EXISTS r3q_evil CASCADE', 'DROP TABLE IF EXISTS r3q CASCADE',
+        'CREATE TABLE r3q (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
+        q{INSERT INTO r3q VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
+        'CREATE SCHEMA r3q_evil', q{CREATE VIEW r3q_evil.r3q AS SELECT id, 't1'::text AS org_key, note FROM public.r3q};
+    my $dbh = $connect->();
+    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    my $writer = Selecto::Engine->new(domain => $writable->('r3q', 'id', id => 'integer', org_key => 'string', note => 'string'),
+        adapter => $adapter);
+    my $update = sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
+        assignments => {note => $_[0]}, predicate => $x->eq('id', 1)))->affected_rows };
+    for my $level ('REPEATABLE READ', 'SERIALIZABLE') {
+        $dbh->begin_work;
+        $dbh->do("SET TRANSACTION ISOLATION LEVEL $level");
+        is($outcome->(sub { $update->('rr') }), 'query_rule_not_evaluable/isolation_level',
+            "an unscoped write in a host $level transaction is refused");
+        $dbh->rollback;
+    }
+    $dbh->begin_work;
+    is($outcome->(sub { $update->('rc') }), 'applied 1', 'an unscoped write in a host READ COMMITTED transaction applies');
+    $dbh->commit;
+    like($adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
+        assignments => {note => 'x'}, predicate => $x->eq('id', 1)))->{sql}, qr/\AUPDATE public\.r3q SET /,
+        'a write names its target by schema');
+    my $reads = Selecto::Domain->parse({schema_version => 1, name => 'R',
+        source => {source_table => 'r3q', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
+            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
+        schemas => {}, joins => {}});
+    my $reader = Selecto::Engine->new(domain => $reads, adapter => $adapter)->with_scope(tenant => 't1');
+    my $query = $reader->query->select('id', 'note')->order_by('id');
+    my $statement = $reader->compile($query);
+    like($statement->sql, qr/ FROM public\.r3q AS /, 'a read names its relation by schema');
+    # A statement compiled before a search_path switch keeps reading the
+    # relation it resolved, not the evil namesake.
+    $dbh->do('SET search_path TO r3q_evil, public');
+    is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($statement)->{rows}} }), 'applied 1',
+        'a compiled read is not redirected by a later search_path switch');
+    $dbh->do('RESET search_path');
+    $admin->do($_) for 'DROP SCHEMA r3q_evil CASCADE', 'DROP TABLE r3q CASCADE';
 };
 done_testing;

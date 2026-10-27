@@ -78,6 +78,7 @@ sub compile {
     # while compiling (see _note_relation and Selecto::Statement relations).
     my $top = ref($self->{_selecto_relation_sink}) ne 'HASH';
     local $self->{_selecto_relation_sink} = $top ? {} : $self->{_selecto_relation_sink};
+    local $self->{_selecto_relation_schemas} = $top ? {} : $self->{_selecto_relation_schemas};
     my $statement = $self->_compile_query($domain, $query);
     $statement->{_selecto_relations} = [sort keys %{$self->{_selecto_relation_sink}}]
         if $top && blessed($statement) && $statement->isa('Selecto::Statement');
@@ -386,8 +387,7 @@ sub _compile_single {
     push @joins, @{$self->_compile_json_rowsets($domain, $query, \@params)};
     push @joins, @{$self->_compile_array_rowsets($domain, $query, \@params)};
     push @joins, @{$options{extra_joins} // []};
-    my $root_sql = $self->_note_relation((defined($domain->{_read_prefix}) ? $self->quote_identifier($domain->{_read_prefix}) . '.' : '')
-        . $self->quote_identifier($domain->table));
+    my $root_sql = $self->_note_relation($self->_relation_sql($domain->{_read_prefix}, $domain->table));
     my $sql = 'SELECT ' . join(', ', @selection_sql) .
         ' FROM ' . $root_sql . ' AS ' . $self->quote_identifier($self->_root_alias);
     $sql .= ' ' . join(' ', @joins) if @joins;
@@ -623,6 +623,14 @@ sub _association_source_sql {
 }
 # Records a relation as the compiled SQL names it (dialect-quoted, with any
 # schema prefix) in the current compile's relation list, and returns it.
+# A relation as generated SQL names it: under the read prefix (a schema the
+# host pinned) when there is one. A dialect may qualify it further
+# (PostgreSQL names the schema it resolves to, R23b).
+sub _relation_sql {
+    my ($self, $prefix, $table) = @_;
+    return (defined($prefix) ? $self->quote_identifier($prefix) . '.' : '') . $self->quote_identifier($table);
+}
+
 sub _note_relation {
     my ($self, $sql) = @_;
     my $sink = $self->{_selecto_relation_sink};
@@ -631,8 +639,7 @@ sub _note_relation {
 }
 sub _physical_source_sql {
     my ($self, $table) = @_;
-    return $self->_note_relation((defined($self->{_read_prefix}) ? $self->quote_identifier($self->{_read_prefix}) . '.' : '')
-        . $self->quote_identifier($table));
+    return $self->_note_relation($self->_relation_sql($self->{_read_prefix}, $table));
 }
 
 sub _append_values_ctes {
@@ -1310,9 +1317,6 @@ sub _admit_plan_storage { return; }
 # (undef: nothing to compare), and its comparison after the DML.
 sub _write_session_open { return undef; }
 sub _write_session_check { return; }
-# Dialect hook run in a managed write's own transaction just before COMMIT
-# (PostgreSQL fires deferred constraint triggers there and checks them).
-sub _before_own_commit { return; }
 # Dialect hook: true when post-statement re-reads name the written rows by
 # their physical row id (PostgreSQL: RETURNING tableoid, ctid) instead of
 # their key value. _with_row_ids appends the row ids to a compiled write.
@@ -3016,6 +3020,7 @@ sub _compile_write {
     my ($self, $command) = @_;
     # The relations the write's SQL names: its target and every reference
     # guard's parent (the session checks refuse temp shadows of them).
+    local $self->{_selecto_relation_schemas} = {};
     local $self->{_selecto_relation_sink} = {};
     my $compiled = $self->_compile_write_sql($command);
     $compiled->{relations} = [sort keys %{$self->{_selecto_relation_sink}}] if ref($compiled) eq 'HASH';
@@ -3026,7 +3031,7 @@ sub _compile_write_sql {
     my ($self, $command) = @_;
     $self->_validate_write_cardinality($command);
     my $relation = Selecto::Identifier::checked($command->relation);
-    $self->_note_relation($self->quote_identifier($relation));
+    my $target_sql = $self->_note_relation($self->_relation_sql(undef, $relation));
     my $operation = $command->operation;
     my $assignments = $command->assignments;
     if ($operation eq 'insert' || $operation eq 'upsert') {
@@ -3078,7 +3083,7 @@ sub _compile_write_sql {
         my $guard = $self->_compile_foreign_key_guards($command, \@params);
         Selecto::Error->throw('invalid_write', 'a guarded insert cannot assign DEFAULT')
             if defined($guard) && grep { $_ eq 'DEFAULT' } @values;
-        my $sql = 'INSERT INTO ' . $self->quote_identifier($relation) .
+        my $sql = 'INSERT INTO ' . $target_sql .
             ' (' . join(', ', map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @fields) . ')' .
             (defined($guard) ? ' ' . $self->_guarded_insert_source(\@values, $guard)
                 : ' VALUES (' . join(', ', @values) . ')');
@@ -3114,7 +3119,7 @@ sub _compile_write_sql {
         );
         my $guard = $self->_compile_foreign_key_guards($command, \@params);
         $predicate .= " AND $guard" if defined $guard;
-        return $self->_append_returning('UPDATE ' . $self->quote_identifier($relation) . ' SET ' . join(', ', @set) . " WHERE $predicate", \@params, $command);
+        return $self->_append_returning('UPDATE ' . $target_sql . ' SET ' . join(', ', @set) . " WHERE $predicate", \@params, $command);
     }
     if ($operation eq 'delete') {
         my @params;
@@ -3126,7 +3131,7 @@ sub _compile_write_sql {
             ),
             \@params,
         );
-        return $self->_append_returning('DELETE FROM ' . $self->quote_identifier($relation) . " WHERE $predicate", \@params, $command);
+        return $self->_append_returning('DELETE FROM ' . $target_sql . " WHERE $predicate", \@params, $command);
     }
     Selecto::Error->throw('invalid_write', "unsupported operation $operation");
 }
@@ -3164,7 +3169,7 @@ sub _compile_foreign_key_guards {
                 $condition->{tenants}, $params, $self->_guard_identity_exact($condition));
         } (exists($guard->{tenant_field}) ? ($guard) : ()), @{$guard->{more_tenant_fields} // []};
         $self->_foreign_key_exists_sql(
-            'SELECT 1 FROM ' . $self->_note_relation($self->quote_identifier(Selecto::Identifier::checked($guard->{relation}))) . " AS $alias"
+            'SELECT 1 FROM ' . $self->_note_relation($self->_relation_sql(undef, Selecto::Identifier::checked($guard->{relation}))) . " AS $alias"
             . " WHERE $alias." . $self->quote_identifier(Selecto::Identifier::checked($guard->{target_field})) . " = $value"
             . $tenant_sql,
         );
@@ -4154,8 +4159,7 @@ sub _own_transaction {
         or die $self->_transaction_control_error($@);
     my ($value, $error);
     # The write unit this transaction owns (see _savepoint_transaction).
-    local $self->{_selecto_write_unit} = {owned => 1};
-    my $ok = eval { $value = $operation->(); $self->_before_own_commit; 1 };
+    my $ok = eval { $value = $operation->(); 1 };
     if ($ok) {
         $ok = eval { $self->_commit_transaction; 1 };
         $error = $self->_transaction_control_error($@) unless $ok;
@@ -4178,7 +4182,6 @@ sub _savepoint_transaction {
         or die $self->_transaction_control_error($@);
     # Inside a transaction the host owns (or an outer unit's), the host's
     # COMMIT, not Selecto's, ends it.
-    local $self->{_selecto_write_unit} = $self->{_selecto_write_unit} // {owned => 0};
     my ($value, $error);
     my $ok = eval { $value = $operation->(); 1 };
     if ($ok) {

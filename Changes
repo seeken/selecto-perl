@@ -11,10 +11,15 @@ Unreleased
       any type work again (composite, partitioned (id, created_at), date,
       float, citext) and a key-renumbering trigger with a decoy is refused;
       guarded inserts now allow ordinary row triggers (updated_at, audit),
-      verified by that re-read. Deferrable constraint triggers are set
-      IMMEDIATE and checked before a Selecto-owned COMMIT; in a host-owned
-      transaction a write is refused while any enabled non-internal
-      deferrable trigger exists (query_rule_not_evaluable, deferred_trigger).
+      verified by that re-read. Every PostgreSQL write (own or host
+      transaction, guarded or not) is refused while any enabled
+      user-defined (non-internal) deferrable trigger exists in the database,
+      checked before the DML and in the first statement after it
+      (query_rule_not_evaluable, deferred_triggers); Selecto never runs SET
+      CONSTRAINTS, and deferred foreign keys keep working. Behaviour change:
+      a database with user-defined deferrable triggers cannot take Selecto
+      writes. Generated reads and writes name every relation by the schema
+      it resolves to at compile time (R23b).
       Catalog checks name only pg_catalog operators and types. Behaviour
       change (documented): a trigger doing CREATE TEMP TABLE IF NOT EXISTS
       (or any other temp DDL or session setting change) makes every write to
