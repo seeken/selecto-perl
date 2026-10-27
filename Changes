@@ -61,11 +61,14 @@ Unreleased
       current user. Deferrable unique/exclusion rechecks count as user code
       unless their index has no expressions or predicate and only default or
       pg_catalog collations, operator classes and operators (R32a).
-    - Required and scope filters on numeric columns accept only canonical
-      literal text (R3 clarification 2): '1e0', '1.0', '01', '-0',
-      '9007199254740992.0' and decimals with more fractional digits than the
-      column's scale are refused (query_rule_not_evaluable, inexact_literal)
-      on DuckDB, MySQL and MariaDB.
+    - Required and scope filters on numeric columns (R3c2 FINAL) accept a
+      text literal only in plain notation (optional '-', digits, optional
+      '.' and digits) whose value the column type holds exactly: an integer
+      for integer types, no non-zero digit beyond the scale for DECIMAL(p,s)
+      ('10' and '1.010' fit DECIMAL(10,2)). '1.005', '1e0', '1.01e0', ' 1',
+      '+1', '-0' and '9007199254740992.0' (for BIGINT) are refused
+      (query_rule_not_evaluable, inexact_literal) on DuckDB, MySQL and
+      MariaDB.
     - PostgreSQL search_path (R29, R30). Behaviour change: generated reads
       and writes name every relation by its schema, resolved at compile
       time from the engine's tenant prefix or else the session's search_path
