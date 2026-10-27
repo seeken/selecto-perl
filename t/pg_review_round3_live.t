@@ -53,7 +53,7 @@ my $writable = sub {
             fields => {map { ($_ => {insertable => 1, ($_ eq 'note' ? (updatable => 1) : ())}) } keys %columns}}});
 };
 
-subtest 'R2: a temp relation shadowing a through-association bridge is refused' => sub {
+subtest 'R2/R38a: a temp relation shadowing a through-association bridge never answers for it' => sub {
     $admin->do($_) for 'DROP TABLE IF EXISTS r3b_items, r3b_link, r3b_acc CASCADE',
         'CREATE TABLE r3b_items (id INT PRIMARY KEY, org_key TEXT)', q{INSERT INTO r3b_items VALUES (1, 't1'), (2, 't2')},
         'CREATE TABLE r3b_acc (id INT PRIMARY KEY, label TEXT)', q{INSERT INTO r3b_acc VALUES (10, 't1-acc'), (20, 't2-SECRET')},
@@ -77,13 +77,21 @@ subtest 'R2: a temp relation shadowing a through-association bridge is refused' 
     my $stream = sub { my $s = $engine->stream($query); my @l; while (my $r = $s->next) { push @l, $r->[1] } join ',', @l };
     is($outcome->($flat), 'applied t1-acc', 'control: the bridge read');
     $dbh->do('CREATE TEMP VIEW r3b_link AS SELECT 1 AS item_id, acc_id FROM public.r3b_link');
-    is($outcome->($flat), 'query_rule_not_evaluable/temporary_shadow', 'a read through a shadowed bridge is refused');
-    is($outcome->($stream), 'query_rule_not_evaluable/temporary_shadow', 'so is a stream');
+    # R38a: the bridge is named by its schema, so the TEMP namesake cannot
+    # answer for it (reads and streams return only t1's row).
+    is($outcome->($flat), 'applied t1-acc', 'a TEMP view shadowing the bridge never answers a read');
+    is($outcome->($stream), 'applied t1-acc', 'nor a stream');
+    # Even with the session's TEMP relations declared, resolution never
+    # prefers pg_temp over the reset path's relation.
+    my $declared = Selecto::Engine->new(domain => $domain,
+        adapter => Selecto->adapter(postgresql => (temporary_relations => 1, dbh => $dbh)))->with_scope(tenant => 't1');
+    is($outcome->(sub { join ',', map { $_->[1] // 'NULL' } @{$declared->all($query)->{rows}} }), 'applied t1-acc',
+        'a declared-temp adapter still reads the real bridge');
     $dbh->do('DROP VIEW pg_temp.r3b_link');
     is($outcome->($flat), 'applied t1-acc', 'and reads again once the shadow is gone');
 };
 
-subtest 'R10: a temp table shadowing an INSERT target is refused' => sub {
+subtest 'R10/R38a: a temp table shadowing an INSERT target never takes the row' => sub {
     $admin->do($_) for 'DROP TABLE IF EXISTS r3i CASCADE',
         'CREATE TABLE r3i (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)', q{INSERT INTO r3i VALUES (1, 't1', 'a')};
     my $dbh = $connect->();
@@ -92,8 +100,9 @@ subtest 'R10: a temp table shadowing an INSERT target is refused' => sub {
     my $insert = sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'r3i',
         assignments => {id => $_[0], org_key => 't1', note => 'n'}))->affected_rows };
     $dbh->do('CREATE TEMP TABLE r3i (id INT PRIMARY KEY, org_key TEXT, note TEXT)');
-    is($outcome->(sub { $insert->(10) }), 'query_rule_not_evaluable/temporary_shadow', 'the insert is refused');
+    is($outcome->(sub { $insert->(10) }), 'applied 1', 'the insert goes to the real relation');
     is($rows->($dbh, 'SELECT count(*) FROM pg_temp.r3i'), '0', 'nothing went into the temp table');
+    is($rows->($admin, 'SELECT count(*) FROM public.r3i WHERE id = 10'), '1', 'the row is in the real table');
     $dbh->do('DROP TABLE pg_temp.r3i');
     is($outcome->(sub { $insert->(11) }), 'applied 1', 'an unshadowed insert applies');
 };

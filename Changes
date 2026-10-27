@@ -29,6 +29,10 @@ Unreleased
       host's current search_path resolves differently from that pinned
       resolution is refused (query_rule_not_evaluable, relation_ambiguous),
       for compiled statements and for a host's hand-built statements alike.
+      Resolution never prefers pg_temp (R38a): a relation of the reset path
+      is named by its schema, so a TEMP namesake no longer answers for it
+      (reads and writes go to the real relation instead of being refused);
+      the host's search_path is compared without its pg_temp.
       A relation found only in the session's temp schema is refused
       (relation_unresolved) unless the adapter declares temp relations with
       the new temporary_relations => 1 option. Deferred foreign keys and
