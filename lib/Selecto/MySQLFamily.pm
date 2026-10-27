@@ -529,6 +529,20 @@ sub _identity_predicate_sql {
         my $sql = $self->_compile_expression($domain, $_[0], \@own);
         return ($sql, \@own);
     };
+    if ($host && $kind eq 'in' && $self->_integer_text_storage($domain, $left)) {
+        my ($column, $column_params) = $operand->($left);
+        return $self->_identity_values_sql($column, [map { _canonical_integer_text($_) } @{ref($right) eq 'ARRAY' ? $right : [$right]}],
+            $params, 1, $column_params);
+    }
+    if ($host && $kind eq 'eq') {
+        my $is_literal = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq 'literal' };
+        my ($subject, $value) = $is_literal->($right) ? ($left, $right) : $is_literal->($left) ? ($right, $left) : ();
+        if ($subject && $self->_integer_text_storage($domain, $subject)) {
+            my ($column, $column_params) = $operand->($subject);
+            return $self->_identity_values_sql($column, [_canonical_integer_text($value->arguments->[0])], $params, 1, $column_params);
+        }
+        _refuse_integer_text_storage() if !$subject && grep { $self->_integer_text_storage($domain, $_) } $left, $right;
+    }
     if ($kind eq 'in') {
         my $exact = $self->_identity_operand_field($domain, $left) or return undef;
         _refuse_inexact_identity() unless _identity_scalars($right);
@@ -561,6 +575,48 @@ sub _identity_predicate_sql {
 # collation). The case-insensitive matches cannot be made exact and are
 # refused there. Ordinary caller filters keep the server's comparison.
 
+# R26: whether $operand is a stored field declared integer whose column is
+# stored as text (the catalog type of its own relation and column, R18): a
+# collated or numeric compare would let '01', ' 1', '1 ' or '1x' stand for
+# 1. Scope compares on it are by the bytes of the canonical integer text
+# (= <> IN), and anything else is refused.
+my $INTEGER_DECLARED = qr/\A(?:integer|int|bigint|smallint|tinyint|mediumint|serial|bigserial)\z/i;
+my $TEXT_STORAGE = qr/\A(?:char|varchar|tinytext|text|mediumtext|longtext|enum|set)\z/;
+sub _integer_text_storage {
+    my ($self, $domain, $operand) = @_;
+    return 0 unless blessed($operand) && $operand->isa('Selecto::Expression') && $operand->kind eq 'field'
+        && !ref($operand->arguments->[0]);
+    my $path = $operand->arguments->[0];
+    return 0 if "$path" =~ /\./ && ref($self->{_query_sources}) eq 'HASH'
+        && exists $self->{_query_sources}{(split /\./, "$path")[0]};
+    my $resolved = eval { $domain->resolve("$path") };
+    return 0 unless ref($resolved) eq 'HASH' && defined($resolved->{field})
+        && defined($resolved->{type}) && !ref($resolved->{type}) && "$resolved->{type}" =~ $INTEGER_DECLARED;
+    my $association = $resolved->{association};
+    my $table = $association ? $association->table : $domain->table;
+    return 0 if !defined($table) || ref($table) || ($association && $association->join_mode eq 'star_dimension');
+    my $dbh = $self->{dbh};
+    return 0 unless eval { $dbh->isa('DBI::db') && $dbh->{Active} };
+    my $catalog = $self->{_selecto_column_catalog} // {};
+    my $types = $catalog->{lc $table} //= $self->_column_data_types($table);
+    my $stored = $types->{lc $resolved->{field}};
+    return defined($stored) && $stored =~ $TEXT_STORAGE ? 1 : 0;
+}
+
+sub _canonical_integer_text {
+    my ($value) = @_;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'an integer scope column stored as text takes only integer values', {reason => 'integer_text_storage'})
+        unless defined($value) && !ref($value) && "$value" =~ /\A\s*([+-]?)0*(\d{1,38})\s*\z/a;
+    my ($sign, $digits) = ($1, $2);
+    return $digits eq '0' ? '0' : ($sign eq '-' ? '-' : '') . $digits;
+}
+
+sub _refuse_integer_text_storage {
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'an integer scope column stored as text can only be compared with =, <> or IN', {reason => 'integer_text_storage'});
+}
+
 sub _identity_text_range_sql {
     my ($self, $domain, $expression, $params) = @_;
     my $kind = $expression->kind;
@@ -577,6 +633,7 @@ sub _identity_text_range_sql {
         ($operand, @rest) = ($rest[0], $operand);
         $kind = $RANGE_FLIP{$kind};
     }
+    _refuse_integer_text_storage() if $self->_integer_text_storage($domain, $operand);
     my $exact = $self->_identity_operand_field($domain, $operand) or return undef;
     Selecto::Error->throw('query_rule_not_evaluable',
         'a case-insensitive match on a tenant or scope text column cannot be compared exactly',
@@ -852,6 +909,33 @@ sub _write_text_range_sql {
     return "(CASE WHEN COLLATION($column) = 'binary' THEN $plain ELSE " . $form->(1) . ' END)';
 }
 
+# The write relation's columns declared integer but stored as text (R26).
+sub _write_integer_text_columns {
+    my ($self, $command) = @_;
+    my $dbh = $self->{dbh};
+    return {} unless blessed($command) && $command->can('relation') && eval { $dbh->isa('DBI::db') && $dbh->{Active} };
+    my $declared = _write_field_types($command);
+    my @integers = grep { defined($declared->{$_}) && !ref($declared->{$_}) && "$declared->{$_}" =~ $INTEGER_DECLARED } keys %$declared;
+    return {} unless @integers;
+    my $types = $self->_column_data_types(Selecto::Identifier::checked($command->relation));
+    return {map { ($_ => 1) } grep { defined($types->{lc $_}) && $types->{lc $_} =~ $TEXT_STORAGE } @integers};
+}
+
+sub _write_tenant_fields {
+    my ($command) = @_;
+    my $metadata = blessed($command) && $command->can('metadata') ? $command->metadata : {};
+    return {map { ($_ => 1) } grep { defined($_) && !ref($_) }
+        @{ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY' ? $metadata->{__selecto_tenant_fields} : []}};
+}
+
+# The eq node standing for a scoped ne node is scoped as well.
+sub _scope_alias {
+    my ($self, $from, $to) = @_;
+    $self->{_selecto_write_scope_nodes}{refaddr($to)} = 1
+        if $self->{_selecto_write_scope_nodes} && $self->{_selecto_write_scope_nodes}{refaddr($from)};
+    return $to;
+}
+
 sub _write_field_types {
     my ($command) = @_;
     my $metadata = blessed($command) && $command->can('metadata') ? $command->metadata : {};
@@ -878,6 +962,24 @@ sub _compile_write_predicate {
             {reason => 'timestamp_operator'})
             if !$direct && grep { !ref($_) && $timestamps->{lc $_} } Selecto::Expression->field_references($expression);
     }
+    my $integer_text = $self->{_selecto_write_integer_text};
+    if ($scoped && $integer_text && %$integer_text && blessed($expression) && $expression->isa('Selecto::Expression')) {
+        my ($left, $right) = @{$expression->arguments};
+        my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field' ? $left->arguments->[0] : undef;
+        if (defined($field) && !ref($field) && $integer_text->{$field}) {
+            my $kind = $expression->kind;
+            return 'NOT (' . $self->_compile_write_predicate(Selecto::Expression->new('eq', @{$expression->arguments}), $params) . ')'
+                if $kind eq 'ne';
+            _refuse_integer_text_storage() unless $kind eq 'eq' || $kind eq 'in' || $kind eq 'is_null' || $kind eq 'not_null';
+            if ($kind ne 'is_null' && $kind ne 'not_null') {
+                my $values = $kind eq 'in' ? $right
+                    : blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal' ? [$right->arguments->[0]] : undef;
+                _refuse_integer_text_storage() unless ref($values) eq 'ARRAY' && @$values;
+                return $self->_identity_values_sql($self->quote_identifier(Selecto::Identifier::checked($field)),
+                    [map { _canonical_integer_text($_) } @$values], $params, 1);
+            }
+        }
+    }
     if ($scoped && blessed($expression) && $expression->isa('Selecto::Expression')
         && $expression->kind =~ $TEXT_RANGE_KINDS) {
         my $sql = $self->_write_text_range_sql($expression, $params, $timestamps);
@@ -903,15 +1005,15 @@ sub _compile_write_predicate {
         my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
             ? $left->arguments->[0] : undef;
         # <> on an identity column is the negated exact equality.
-        return 'NOT (' . $self->_compile_write_predicate(Selecto::Expression->new('eq', @{$expression->arguments}), $params) . ')'
-            if defined($field) && !ref($field) && $columns->{$field};
+        return 'NOT (' . $self->_compile_write_predicate(_scope_alias($self, $expression, Selecto::Expression->new('eq', @{$expression->arguments})), $params) . ')'
+            if defined($field) && !ref($field) && $columns->{$field} && ($scoped || $self->{_selecto_write_tenant_fields}{$field});
     }
     if ($columns && %$columns && blessed($expression) && $expression->isa('Selecto::Expression')
         && ($expression->kind eq 'eq' || $expression->kind eq 'in')) {
         my ($left, $right) = @{$expression->arguments};
         my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
             ? $left->arguments->[0] : undef;
-        if (defined($field) && !ref($field) && $columns->{$field}) {
+        if (defined($field) && !ref($field) && $columns->{$field} && ($scoped || $self->{_selecto_write_tenant_fields}{$field})) {
             my $values = $expression->kind eq 'in' ? $right
                 : blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal'
                     ? [$right->arguments->[0]] : undef;
@@ -1515,6 +1617,8 @@ sub _compile_write {
     local $self->{_selecto_write_timestamps} = $self->_write_timestamp_columns($command);
     local $self->{_selecto_write_scope_nodes} = _write_scope_nodes($command);
     local $self->{_selecto_write_types} = _write_field_types($command);
+    local $self->{_selecto_write_tenant_fields} = _write_tenant_fields($command);
+    local $self->{_selecto_write_integer_text} = $self->_write_integer_text_columns($command);
     local $self->{_selecto_bind_copies} = [];
     my $compiled = $self->SUPER::_compile_write($command);
     # The logical parameter sequence: the bound values with each exact
@@ -1744,6 +1848,8 @@ sub _execute_compiled_write_unchecked {
     local $self->{_selecto_write_timestamps} = $self->_write_timestamp_columns($command);
     local $self->{_selecto_write_scope_nodes} = _write_scope_nodes($command);
     local $self->{_selecto_write_types} = _write_field_types($command);
+    local $self->{_selecto_write_tenant_fields} = _write_tenant_fields($command);
+    local $self->{_selecto_write_integer_text} = $self->_write_integer_text_columns($command);
     my $operation = $command->operation;
     # Every write may be refused after its statement (cardinality, row
     # ceiling, post-image, RETURNING and stored-row checks, an AFTER trigger
@@ -1927,26 +2033,33 @@ sub _refuse_before_insert_triggers {
 # catalog lookup (column types, keys, engines) describes the base table or
 # view of that name. A temporary table that is itself the domain relation
 # (no base table or view of its name) is the host's own and stays readable.
-# The relations checked are a superset of those the statement names: every
-# quoted identifier in it (the generated SQL quotes every relation, so the
-# root, joins, parenthesised through-bridge joins, members, retargets,
-# collections and correlated subqueries are all among them; a column or
-# alias name is looked up too and matches no relation, or the same-named
-# relation is checked harmlessly), plus every unquoted name after FROM or
-# JOIN (a host's authored SQL). A statement without SQL fails closed.
+# The relations checked are those the statement names: the ones its compile
+# recorded (Selecto::Statement relations: root, joins, through bridges,
+# members, retargets, collections, correlated subqueries), and every name in
+# a relation position of its SQL (after FROM or JOIN, through any opening
+# parentheses, so a parenthesised bridge join counts), quoted or unquoted (a
+# host's authored SQL). Column and alias identifiers are never relation
+# names (R28). A statement without SQL fails closed.
 # MariaDB lists the session's temporary tables in information_schema.TABLES;
 # MySQL 8.4 does not, so each base name is checked with SHOW CREATE TABLE.
 sub _read_relation_names {
-    my ($sql) = @_;
+    my ($sql, $recorded) = @_;
     Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
         {reason => 'relations_unknown'}) unless defined($sql) && !ref($sql) && length($sql);
+    my $name = qr/`((?:``|[^`])+)`/;
     my %names;
-    $names{$1 =~ s/``/`/gr} = 1 while $sql =~ /`((?:``|[^`])+)`/g;
-    my $text = $sql =~ s/`(?:``|[^`])*`//gr;
-    $text =~ s/'(?:''|\\.|[^'\\])*'//g;
-    while ($text =~ /\b(?:FROM|JOIN)[\s(]+([A-Za-z_][A-Za-z0-9_\$]*)\b(?!\s*\()/gi) {
-        my $name = $1;
-        $names{$name} = 1 unless $name =~ /\A(?:SELECT|LATERAL|DUAL|JSON_TABLE|VALUES|WITH|UNNEST)\z/i;
+    for my $relation (ref($recorded) eq 'ARRAY' ? @$recorded : ()) {
+        next unless defined($relation) && !ref($relation);
+        my @parts = map { s/``/`/gr } "$relation" =~ /$name/g;
+        $names{$parts[-1]} = 1 if @parts;
+    }
+    my $text = $sql =~ s/'(?:''|\\.|[^'\\])*'/''/gr;
+    while ($text =~ /\b(?:FROM|JOIN)[\s(]+$name(?:\s*\.\s*$name)?/gi) {
+        $names{(defined($2) ? $2 : $1) =~ s/``/`/gr} = 1;
+    }
+    while ($text =~ /\b(?:FROM|JOIN)[\s(]+([A-Za-z_][A-Za-z0-9_\$]*)\b(?!\s*[(.])/gi) {
+        my $word = $1;
+        $names{$word} = 1 unless $word =~ /\A(?:SELECT|LATERAL|DUAL|JSON_TABLE|VALUES|WITH|UNNEST)\z/i;
     }
     return \%names;
 }
@@ -1955,7 +2068,7 @@ sub _refuse_read_temporary_shadows {
     my ($self, $statement) = @_;
     Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
         {reason => 'relations_unknown'}) unless blessed($statement) && $statement->can('sql');
-    my %names = %{_read_relation_names($statement->sql)};
+    my %names = %{_read_relation_names($statement->sql, $statement->can('relations') ? $statement->relations : undef)};
     return unless %names;
     my $dbh = $self->{dbh};
     my @names = sort keys %names;
