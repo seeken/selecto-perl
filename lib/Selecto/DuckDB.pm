@@ -469,11 +469,13 @@ sub _declared_type {
 sub _identity_predicate_sql {
     my ($self, $domain, $expression, $params) = @_;
     my $kind = $expression->kind;
-    return undef unless $kind =~ /\A(?:eq|ne|in|gt|gte|lt|lte|between)\z/;
+    my $text_match = $kind =~ /\A(?:starts_with|text_contains|ends_with)(?:_ci)?\z/ ? 1 : 0;
+    return undef unless $text_match || $kind =~ /\A(?:eq|ne|in|gt|gte|lt|lte|between)\z/;
     my $host = ($self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{refaddr($expression)})
         || ($self->{_selecto_host_nodes} && $self->{_selecto_host_nodes}{refaddr($expression)})
         || $self->{_selecto_in_host} ? 1 : 0;
     my $arguments = $expression->arguments;
+    return $self->_identity_text_match_sql($domain, $expression, $params, $host) if $text_match;
     my $literal = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq 'literal' };
     my $field = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind ne 'literal' };
     if ($kind eq 'in') {
@@ -512,6 +514,30 @@ sub _identity_predicate_sql {
     return undef unless $field->($operand);
     return $self->_identity_range_sql($self->_compile_expression($domain, $operand, $params), $RANGE{$operator},
         $value->arguments->[0], $self->_declared_type($domain, $operand), $params);
+}
+
+# A prefix, substring or suffix match on an identity column (brief item R3)
+# matches the VARCHAR's bytes, under COLLATE posix, whatever the column's or
+# the session's collation (NOCASE would let tenant t1 match T1); on any other
+# column type it is refused. The case-insensitive matches cannot be made
+# exact there and are refused. Ordinary caller matches keep DuckDB's own.
+sub _identity_text_match_sql {
+    my ($self, $domain, $expression, $params, $host) = @_;
+    my ($operand, $literal) = @{$expression->arguments};
+    return undef unless $self->_identity_operand($domain, $operand, $host);
+    my $kind = $expression->kind;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a case-insensitive match on a tenant or scope column cannot be compared exactly',
+        {reason => 'inexact_text'}) if $kind =~ /_ci\z/;
+    my $text = blessed($literal) && $literal->isa('Selecto::Expression') && $literal->kind eq 'literal'
+        ? $literal->arguments->[0] : undef;
+    Selecto::Error->throw('invalid_query', "$kind requires a literal string value") if !defined($text) || ref($text);
+    my $column = $self->_compile_expression($domain, $operand, $params);
+    $text = $self->_escape_like("$text");
+    push @$params, $kind eq 'text_contains' ? "%$text%" : $kind eq 'ends_with' ? "%$text" : "$text%";
+    my $marker = $self->placeholder(scalar @$params);
+    return "(CASE WHEN typeof($column) = 'VARCHAR' THEN (CAST($column AS VARCHAR) COLLATE posix) LIKE $marker ESCAPE '!'"
+        . " ELSE $REFUSED_TEXT END)";
 }
 
 # A computed field (a predicate body, a value expression's condition, a
