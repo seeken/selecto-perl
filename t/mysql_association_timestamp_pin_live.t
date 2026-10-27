@@ -98,7 +98,7 @@ for my $backend (@backends) {
             my $sql = $engine->compile($query)->sql;
             my $column = $label =~ /bridge/ ? 'bat' : 'at';
             if ($type eq 'TIMESTAMP') {
-                like($sql, qr/NULLIF\(UNIX_TIMESTAMP\(`[^`]+`\.`$column`\), 0\) = CAST\(\? AS DECIMAL\(24,6\)\)/,
+                like($sql, qr/ELSE UNIX_TIMESTAMP\(`[^`]+`\.`$column`\) = CAST\(\? AS DECIMAL\(24,6\)\)/,
                     "$name $type $label: the pin compares by epoch");
             } else {
                 unlike($sql, qr/UNIX_TIMESTAMP/, "$name $type $label: a DATETIME pin compiles as before");

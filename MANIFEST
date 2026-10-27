@@ -202,6 +202,7 @@ t/duckdb_member_group_identity.t
 t/mutation_expression.t
 t/host_identity_paths_live.t
 t/host_scope_identity_live.t
+t/mysql_catalog_exactness_live.t
 t/mysql_family.integration.t
 t/mysql_family.t
 t/mysql_family_cursor.t

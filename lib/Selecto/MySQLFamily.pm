@@ -845,18 +845,33 @@ sub _write_timestamp_columns {
 # UNIX_TIMESTAMP(col) <op> the literal's UTC epoch, bound as an exact decimal.
 sub _epoch_compare_sql {
     my ($self, $column, $kind, $values, $params) = @_;
-    my @markers = map {
-        push @$params, _timestamp_epoch($_);
-        'CAST(' . $self->placeholder(scalar @$params) . ' AS DECIMAL(24,6))'
-    } @$values;
-    # A zero date ('0000-00-00 00:00:00', UNIX_TIMESTAMP 0; no valid
-    # TIMESTAMP has epoch 0) compares like NULL under every operator and any
-    # negation: the native comparisons disagree about it between MySQL and
-    # MariaDB, and PostgreSQL has no such value (item R5).
-    my $left = "NULLIF(UNIX_TIMESTAMP($column), 0)";
-    return "$left IN (" . join(', ', @markers) . ')' if $kind eq 'in';
-    return "$left BETWEEN $markers[0] AND $markers[1]" if $kind eq 'between';
-    return "$left " . {eq => '=', ne => '<>', gt => '>', gte => '>=', lt => '<', lte => '<='}->{$kind} . " $markers[0]";
+    my @epochs = map { _timestamp_epoch($_) } @$values;
+    my $operator = {eq => '=', ne => '<>', gt => '>', gte => '>=', lt => '<', lte => '<='}->{$kind};
+    my $form = sub {
+        my ($left, @markers) = @_;
+        return "$left IN (" . join(', ', @markers) . ')' if $kind eq 'in';
+        return "$left BETWEEN $markers[0] AND $markers[1]" if $kind eq 'between';
+        return "$left $operator $markers[0]";
+    };
+    # A zero date ('0000-00-00 00:00:00') is the only TIMESTAMP whose
+    # UNIX_TIMESTAMP is 0, and it has no instant: it is compared as the
+    # server itself compares it (MySQL and MariaDB differ), with the
+    # literal's UTC text (the verified session zone), in its own CASE arm, so
+    # the comparison stays a plain boolean under any negation (R5). Every
+    # other row compares its instant with the literal's epoch.
+    my @native = map { push @$params, _epoch_utc_text($_); $self->placeholder(scalar @$params) } @epochs;
+    my @markers = map { push @$params, $_; 'CAST(' . $self->placeholder(scalar @$params) . ' AS DECIMAL(24,6))' } @epochs;
+    return "(CASE WHEN UNIX_TIMESTAMP($column) = 0 THEN " . $form->($column, @native)
+        . ' ELSE ' . $form->("UNIX_TIMESTAMP($column)", @markers) . ' END)';
+}
+
+# The UTC 'YYYY-MM-DD HH:MM:SS[.ffffff]' text of an epoch from _timestamp_epoch.
+sub _epoch_utc_text {
+    my ($epoch) = @_;
+    my ($whole, $fraction) = "$epoch" =~ /\A(-?\d+)(?:\.(\d+))?\z/;
+    my ($sec, $min, $hour, $day, $month, $year) = gmtime($whole);
+    return sprintf('%04d-%02d-%02d %02d:%02d:%02d', $year + 1900, $month + 1, $day, $hour, $min, $sec)
+        . (defined($fraction) ? ".$fraction" : '');
 }
 
 # The UTC epoch (seconds, with up to six fractional digits) of a datetime
@@ -2778,8 +2793,8 @@ spelling, a number or a NULL comparison is refused (reason
 C<timestamp_literal>), and a prefix, substring or suffix match is refused
 (reason C<timestamp_operator>), as is any other use of the column there (a
 cast, a CASE result, a computed value built on it); a NULL test works. A
-zero date (C<0000-00-00 00:00:00>)
-satisfies no scope comparison, like NULL. C<DATETIME> columns compare as the
+zero date (C<0000-00-00 00:00:00>) compares exactly as the server compares
+it (MySQL and MariaDB differ), in its own arm of the comparison. C<DATETIME> columns compare as the
 server does.
 
 =back
