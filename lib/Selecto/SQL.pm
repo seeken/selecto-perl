@@ -1291,6 +1291,10 @@ sub preview_write {
 
 sub _admit_plan_storage { return; }
 
+# Dialect hooks: a snapshot of the session state a write's DML could change
+# (undef: nothing to compare), and its comparison after the DML.
+sub _write_session_open { return undef; }
+sub _write_session_check { return; }
 
 # Execution requires the engine's authorization for the exact object; see
 # Selecto::Write::Authorization. The *_unsafe variants skip domain governance
@@ -3430,8 +3434,11 @@ sub _check_write_cardinality {
 
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
-    # The write's relation as resolved before the DML (item 51) lives for
-    # this write only.
+    # Session state around the DML (dialect hook; PostgreSQL, brief items 54,
+    # 56, 59): read before any of the write's own SQL, compared by the first
+    # statement after the DML. The write's relation as resolved before the
+    # DML (item 51) lives for this write only.
+    my $session = $self->_write_session_open($command, $compiled);
     local $self->{_selecto_write_target} = {};
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
@@ -3484,6 +3491,8 @@ sub _execute_compiled_write_in_transaction {
         1;
     };
     die $self->normalize_error($@) unless $ok;
+    # The first statement after the DML (item 54a).
+    $self->_write_session_check($session);
     $self->_check_write_cardinality($command, $affected, $bounds);
     $self->_bound_target_check($command, $bound_event, 'after') if $bound_event;
     if ($post_image) {
@@ -3837,7 +3846,8 @@ sub _verify_post_image {
     my $pg = $self->name eq 'postgresql';
     # PostgreSQL (item 51/51a): through the schema-qualified relation resolved
     # before the statement, and only its own rows (and its partitions'), with
-    # pg_catalog functions.
+    # pg_catalog functions; the session check before this ensured the rest
+    # of the statement resolves as it did before the DML.
     my $target = $pg ? $self->_pg_write_target($relation) : undef;
     $table = $target->{qualified} if $target;
     my ($count, $sum) = $pg ? ('pg_catalog.count', 'pg_catalog.sum') : ('COUNT', 'SUM');

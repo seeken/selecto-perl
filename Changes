@@ -1,6 +1,23 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL session state: every Selecto write (bound or not, single,
+      batch or graph, any transaction mode) snapshots search_path,
+      TimeZone, DateStyle, IntervalStyle, extra_float_digits and the
+      session's temporary relations, rules and types before its DML and
+      compares as the first statement after it; every read does the same
+      around its statement (under its own savepoint in a host transaction,
+      restoring the settings in autocommit), and bounded streams compare
+      after every FETCH. A change rolls the work back and is refused with
+      query_rule_violation, reason session_state_changed. A relation that
+      resolves into the temporary schema while shadowing a same-named
+      relation of the search path, or a temporary type named like a
+      catalog or search-path type, is refused (query_rule_not_evaluable,
+      temporary_shadow); a host's own TEMP domain table still works. A read
+      that fails inside a host transaction now rolls back to its own
+      savepoint and leaves the host transaction healthy. Bounded streams
+      prove their own transaction by its virtual transaction id instead of
+      the forgeable selecto.guard setting.
     - PostgreSQL: a bound-scope update's post-image re-read and its trigger,
       rule and deferrable rechecks address the relation by the oid and
       schema-qualified name resolved under the write's lock before the DML,

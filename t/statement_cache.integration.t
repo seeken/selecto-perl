@@ -125,7 +125,9 @@ subtest 'a changed result type (0A000)' => sub {
     $own->begin_work;
     my $error = eval { $read->(); 1 } ? undef : $@;
     is $error && $error->details->{sqlstate}, '0A000', 'inside a transaction: the original error and SQLSTATE';
-    is $own->pg_ping, 4, 'the transaction is still the failed one (not rolled back behind the host)';
+    # The read ran under its own savepoint: only the read was rolled back,
+    # the host's transaction stays open and healthy.
+    is $own->pg_ping, 3, 'the host transaction is still open, the failed read rolled back to its own savepoint';
     $own->rollback;
     is_deeply $read->(), [['alpha']], 'after the host rolls back, the next call prepares afresh';
     $own->do('DROP TABLE statement_cache_shape');

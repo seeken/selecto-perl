@@ -88,9 +88,12 @@ sub scalar_column_statement {
 sub stream_query {
     my ($self, $statement, %options) = @_;
     unless ($options{bounded}) {
+        # DBD::Pg runs the whole statement and buffers its rows at execute,
+        # so the session check right after it covers every row.
+        my $sql = blessed($statement) && $statement->can('sql') ? $statement->sql : undef;
         $statement = $self->_canonical_statement($statement)
             if blessed($statement) && !$options{export_scalars} && $self->_canonical_requested(%options);
-        return $self->SUPER::stream_query($statement, %options);
+        return $self->_guarded_read($sql, sub { return $self->SUPER::stream_query($statement, %options) });
     }
     Selecto::Error->throw('unsupported_feature', 'bounded streaming requires a real PostgreSQL DBI handle')
         unless $self->supports('stream') && $self->bounded_stream_supported;
@@ -317,6 +320,13 @@ sub supports {
 # scale), a boolean is a JSON::PP boolean and json/jsonb is the decoded JSON
 # value; every other value is canonical. Export scalars are decoded in Perl.
 sub execute_query {
+    my ($self, $statement, %options) = @_;
+    # Session state around the read (items 56, 61): see Session state.
+    return $self->_guarded_read(blessed($statement) && $statement->can('sql') ? $statement->sql : undef,
+        sub { return $self->_execute_query_unguarded($statement, %options) });
+}
+
+sub _execute_query_unguarded {
     my ($self, $statement, %options) = @_;
     if ($options{export_scalars}) {
         local $self->{_selecto_export_scalars} = 1;
@@ -1170,6 +1180,195 @@ sub _refuse_connection_state {
         {state => exists($reason{$state}) ? $state : 'unknown'});
 }
 
+# ---- Session state (brief items 54, 54a, 54b, 56, 56b, 56c, 59, 61) --------
+#
+# An allowed row trigger, or a function a domain view calls, can change the
+# session state that later SQL resolves or parses through:
+# set_config('search_path' | 'TimeZone' | 'DateStyle' | ..., ..., true|false),
+# a TEMP relation or type (pg_temp is searched first, whatever search_path
+# says), or a rule on one. Every Selecto write and read compares a snapshot of
+# that state taken before its statement with one taken as the first statement
+# after it, read with SQL that names only pg_catalog objects so a hijacked
+# search_path cannot answer it; on any change the work is rolled back (its
+# savepoint, or its own transaction) and refused with query_rule_violation,
+# reason session_state_changed. In autocommit a read restores the settings
+# it saw before. Selecto keeps no GUC of its own to prove ownership (item 57):
+# a bounded stream proves its own transaction by its virtual transaction id.
+#
+# What a trigger does beyond this (other settings, role changes, writes to
+# unrelated tables, DDL outside the temp schema) is the schema owner's
+# responsibility, like a trigger's effects on other rows (item 56a).
+my @SESSION_SETTINGS = qw(search_path TimeZone DateStyle IntervalStyle extra_float_digits);
+my $TEMP_SCHEMA = 'pg_catalog.pg_my_temp_schema()';
+my $SESSION_COLUMNS = join(', ',
+    q{pg_catalog.concat_ws(' | ', } . join(', ', map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS) . ', '
+        . q{COALESCE((SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', c.oid, c.xmin, c.relname), ',' ORDER BY c.oid) }
+        . qq{FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), }
+        . q{COALESCE((SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', r.oid, r.xmin), ',' ORDER BY r.oid) }
+        . q{FROM pg_catalog.pg_rewrite r JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) r.ev_class }
+        . qq{WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), }
+        . q{COALESCE((SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', t.oid, t.xmin, t.typname), ',' ORDER BY t.oid) }
+        . qq{FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), 'end')},
+    map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS);
+
+# A relation the statement names that resolves into this session's temp
+# schema while a same-named relation exists in a schema of the search path
+# (current_schemas(false)) shadows it: refused. A temp relation with no such
+# namesake is the host's own (a TEMP domain table) and allowed. A temp type
+# that is not a relation's row type (or its array) and is named like a type
+# of pg_catalog or of the search path would answer an unqualified type name
+# in the statement: refused (item 56c).
+my $SHADOW_SQL = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(name) '
+    . 'JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.name) '
+    . "WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA AND EXISTS (SELECT 1 FROM pg_catalog.pg_class o "
+    . 'JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) o.relnamespace '
+    . 'WHERE o.relname OPERATOR(pg_catalog.=) c.relname AND o.relnamespace OPERATOR(pg_catalog.<>) c.relnamespace '
+    . 'AND s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false)))), '
+    . "(SELECT pg_catalog.count(*) FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA "
+    . 'AND t.typrelid OPERATOR(pg_catalog.=) 0 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e '
+    . 'WHERE e.oid OPERATOR(pg_catalog.=) t.typelem AND e.typrelid OPERATOR(pg_catalog.<>) 0) '
+    . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_type p JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) p.typnamespace '
+    . 'WHERE p.typname OPERATOR(pg_catalog.=) t.typname AND p.typnamespace OPERATOR(pg_catalog.<>) t.typnamespace '
+    . "AND (s.nspname OPERATOR(pg_catalog.=) 'pg_catalog' OR s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false))))), "
+    . $SESSION_COLUMNS;
+
+# The relation names a generated statement reads or writes, as the
+# statement spells them (quoted identifiers, or a host's own unquoted SQL),
+# for the shadow check: every name after FROM, JOIN, INTO, UPDATE or USING
+# that is not a function call. A name that is not a relation (a column after
+# EXTRACT(... FROM, say) resolves to nothing and is ignored by the check.
+sub _pg_statement_relations {
+    my ($sql) = @_;
+    Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
+        {reason => 'relations_unknown'}) unless defined($sql) && !ref($sql) && length($sql);
+    my $part = q{(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_\$]*+)};
+    my %names;
+    while ($sql =~ /\b(?:FROM|JOIN|INTO|UPDATE|USING)\s+(?:ONLY\s+)?($part(?:\.$part)?)(?![A-Za-z0-9_\$".])(?!\s*\()/gi) {
+        $names{$1} = 1;
+    }
+    return [sort keys %names];
+}
+
+# True when the handle is a live DBD::Pg handle (the session checks need
+# one; adapter tests with other handles run unchecked).
+sub _pg_session_checked {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0;
+}
+
+sub _pg_state_row {
+    my ($row) = @_;
+    my ($snapshot, @settings) = @$row;
+    return {snapshot => $snapshot, settings => {map { ($SESSION_SETTINGS[$_] => $settings[$_]) } 0 .. $#SESSION_SETTINGS}};
+}
+
+# The session snapshot, or a typed refusal when it cannot be read.
+sub _pg_session_state {
+    my ($self) = @_;
+    my @row;
+    my $ok = eval { @row = $self->{dbh}->selectrow_array("SELECT $SESSION_COLUMNS"); 1 };
+    Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
+        {reason => 'session_state_unknown'}) unless $ok && @row && defined $row[0];
+    return _pg_state_row(\@row);
+}
+
+# Refuses temp shadows of the statement's relations and of type names, and
+# returns the session snapshot, in one round trip.
+sub _pg_admit_session {
+    my ($self, $sql) = @_;
+    my $names = _pg_statement_relations($sql);
+    my @row;
+    my $ok = eval { @row = $self->{dbh}->selectrow_array($SHADOW_SQL, undef, $names); 1 };
+    Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
+        {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS && defined $row[2];
+    my ($relations, $types, @state) = @row;
+    Selecto::Error->throw('query_rule_not_evaluable', 'a temporary relation of the session shadows a relation the statement names',
+        {reason => 'temporary_shadow'}) if $relations;
+    Selecto::Error->throw('query_rule_not_evaluable', 'a temporary type of the session shadows a type name',
+        {reason => 'temporary_shadow'}) if $types;
+    return _pg_state_row(\@state);
+}
+
+sub _session_changed {
+    Selecto::Error->throw('query_rule_violation',
+        "the statement changed the session's settings, temporary relations or temporary types",
+        {reason => 'session_state_changed'});
+}
+
+# Writes (see Selecto::SQL::_execute_compiled_write_in_transaction): before
+# the DML, refuse temp shadows and snapshot; the first statement after the
+# DML compares. The transaction wrapper rolls the write back on refusal.
+sub _write_session_open {
+    my ($self, $command, $compiled) = @_;
+    return undef unless $self->_pg_session_checked;
+    return $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled->{sql} : undef);
+}
+
+sub _write_session_check {
+    my ($self, $before) = @_;
+    return unless defined $before;
+    my $after = eval { $self->_pg_session_state };
+    _session_changed() unless $after && $after->{snapshot} eq $before->{snapshot};
+    return;
+}
+
+# Reads: the statement runs under its own savepoint in a host transaction
+# (rolling back to it reverts local and session-level set_config, and any
+# temp object the statement made), and in autocommit restores the settings
+# it saw before. Nested guarded reads (a read inside a guarded read) run
+# under the outer guard.
+sub _guarded_read {
+    my ($self, $sql, $work) = @_;
+    return $work->() if !$self->_pg_session_checked || $self->{_selecto_pg_read_guard};
+    local $self->{_selecto_pg_read_guard} = 1;
+    my $scope = $self->_read_guard_scope;
+    my $savepoint;
+    if ($scope eq 'host') {
+        $savepoint = Selecto::SQL::_savepoint_name('selecto_read');
+        eval { $self->_savepoint_command(create => $savepoint); 1 }
+            or die $self->_transaction_control_error($@);
+    }
+    my ($before, $result);
+    my $ok = eval {
+        $before = $self->_pg_admit_session($sql);
+        $result = $work->();
+        1;
+    };
+    my $error = $ok ? undef : $@;
+    # A failed statement changed nothing that outlives it: in a host
+    # transaction its savepoint is rolled back below, and in autocommit its
+    # own implicit transaction already was.
+    my $after = $ok && $before ? eval { $self->_pg_session_state } : undef;
+    my $changed = $ok && $before && !($after && $after->{snapshot} eq $before->{snapshot});
+    if ($savepoint) {
+        my $undo = !$ok || $changed;
+        my $restored = eval {
+            $self->_savepoint_command(rollback => $savepoint) if $undo;
+            $self->_savepoint_command(release => $savepoint);
+            1;
+        };
+        die $self->_transaction_control_error($@) if !$restored && $ok && !$changed;
+    } elsif ($changed) {
+        for my $name (@SESSION_SETTINGS) {
+            eval { $self->{dbh}->selectrow_array('SELECT pg_catalog.set_config($1, $2, false)', undef,
+                $name, $before->{settings}{$name}) };
+        }
+    }
+    _session_changed() if $changed;
+    die $error unless $ok;
+    return $result;
+}
+
+# This transaction's virtual transaction id: setting-independent, and no
+# statement can forge it (item 57).
+sub _virtual_transaction_id {
+    my ($self) = @_;
+    my ($id) = $self->{dbh}->selectrow_array(q{SELECT l.virtualxid FROM pg_catalog.pg_locks l
+        WHERE l.locktype OPERATOR(pg_catalog.=) 'virtualxid' AND l.pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
+          AND l.granted AND l.mode OPERATOR(pg_catalog.=) 'ExclusiveLock'});
+    return $id;
+}
 
 # Item 51/51a: the relation a write's post-statement SQL addresses, resolved
 # before the statement (under its lock): its oid, its schema-qualified name
@@ -1457,12 +1656,77 @@ savepoint). A connection with the host's pending asynchronous result
 (C<pg_async>, before C<pg_result>), busy with another statement, inside an
 already aborted transaction, or in an unknown state is refused with
 C<transaction_state_unsafe> (details C<state>: C<active>, C<inerror> or
-C<unknown>) before anything is sent. Otherwise a rollback could discard the
+C<unknown>) before anything is sent. A read inside the host's transaction
+runs under its own savepoint (see L</SESSION STATE>): a read that fails is
+rolled back to it, so the host's transaction stays healthy and keeps its
+earlier work, and the read's error is raised. Otherwise a rollback could discard the
 host's pending result and its transaction, and the host's next statement
 would autocommit. Checking costs one C<pg_ping> round trip where none was
 made before (a stream or a savepoint budget on an C<< AutoCommit => 0 >>
 handle). A bounded stream also refuses, after it opened, to roll back
 anything it cannot prove is its own; see L<Selecto::PostgreSQL::Stream>.
+
+=head1 SESSION STATE
+
+PostgreSQL resolves names through the session: C<search_path>, then the
+session's temporary schema, which is searched first for relations and types
+whatever C<search_path> says. Literals parse through C<TimeZone>,
+C<DateStyle>, C<IntervalStyle> and C<extra_float_digits>. A row trigger on
+a written table, or a function a domain view calls, can change all of these
+(C<set_config(..., true|false)>, C<CREATE TEMP VIEW>, C<CREATE TYPE pg_temp...>),
+and the change would steer Selecto's own later SQL: a re-read could count
+another relation's rows, and the next read in the host's transaction could
+read another tenant's rows through a TEMP view.
+
+=over 4
+
+=item *
+
+Every Selecto write (bound or not, single, batch or graph, in every
+transaction mode) reads a snapshot of that state before its DML: the
+settings above, and the (oid, xmin, name) of every relation, rewrite rule
+and type of the temporary schema. The first statement after each DML reads
+it again. Any change rolls the write back (its own transaction, or its
+savepoint in a host's transaction) and refuses it with
+C<query_rule_violation>, reason C<session_state_changed>. Both reads name
+only C<pg_catalog> objects.
+
+=item *
+
+Every read (C<all>, streams, bounded results, canned pages, co-domain
+lookups, retargets, anchors) does the same around its statement. Inside a
+host transaction it runs under its own savepoint, rolled back on a change;
+in autocommit the settings it saw are restored. A bounded stream compares
+after every C<FETCH> before it hands out the batch.
+
+=item *
+
+A relation a statement names that resolves into the temporary schema while
+a same-named relation exists in a schema of C<search_path> is refused
+(C<query_rule_not_evaluable>, reason C<temporary_shadow>), on reads and
+writes; so is a temporary type named like a type of C<pg_catalog> or of the
+search path. A TEMP table that is itself the domain relation (no namesake)
+is the host's own and works.
+
+=item *
+
+Post-statement SQL of a governed write (the post-image re-read and the
+trigger, rule and deferrable rechecks) addresses the relation by the oid
+and schema-qualified name resolved under its lock before the DML, with
+C<tableoid = ANY(...)>. The re-read names rows by an enforced unique key
+whose every column round-trips exactly whatever the session settings
+(integers, numeric, uuid, and text types under a deterministic collation
+matching the index's, with the default operator class); a table without
+one is refused for bound-scope updates.
+
+=back
+
+What a trigger or view function does beyond this (other settings, role
+changes, writes to unrelated tables, DDL outside the temporary schema) is
+host-owned schema behaviour and the schema owner's responsibility, like a
+row trigger's effects on other rows. Selecto keeps no session variable of
+its own to prove ownership; a bounded stream identifies its own transaction
+by its virtual transaction id.
 
 =head1 SEE ALSO
 
