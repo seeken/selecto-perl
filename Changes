@@ -29,6 +29,22 @@ Unreleased
       their base type) and whose index uses the column's own collation and
       the default operator class; date, timestamp, float, network and other
       keys are refused (query_rule_not_evaluable).
+    - MySQL and MariaDB session and transaction state: every write and read
+      compares @@SESSION.time_zone and sql_mode with the verified session
+      after each statement (streams per batch); a change is restored and
+      refused with query_rule_violation, reason session_state_changed, and a
+      write rolls back. Host, trusted, required and tenant comparisons, and
+      association and bridge where pins, on TIMESTAMP columns compare
+      UNIX_TIMESTAMP(col) with the literal's UTC epoch, so a function that
+      switches time_zone and back within one statement cannot widen them;
+      DATETIME columns and caller filters compile as before. A write on a
+      handle inside a transaction the driver did not open (a raw BEGIN, or
+      autocommit=0 with or without a statement run) is refused before any
+      DML (invalid_adapter, reason transaction_outside_driver) instead of
+      implicitly committing the host's work. An AUTO_INCREMENT key assigned
+      a value MySQL treats as zero ('0', '00', ' 0', '0.0', '-0') is never
+      re-read by that value. A TEMPORARY table shadowing a relation a read
+      names is refused (query_rule_not_evaluable, temporary_shadow).
     - DuckDB: a column deciding tenant, trusted or host-scope identity (the
       engine tenant, writes.scope tenants, required tenant pins, host scope
       and trusted predicates, association and bridge where pins, scope keys,

@@ -87,6 +87,7 @@ t/external_graph_implicit_transaction_live.t
 t/mysql_post_image_metadata_lock_live.t
 t/mysql_returning_insert_trigger_live.t
 t/mysql_host_savepoint_collision_live.t
+t/mysql_association_timestamp_pin_live.t
 t/mysql_auto_increment_zero_live.t
 t/mysql_transaction_outside_driver_live.t
 t/mysql_session_state_live.t
