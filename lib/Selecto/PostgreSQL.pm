@@ -1224,7 +1224,7 @@ sub _refuse_connection_state {
 # What a trigger does beyond this (other settings, role changes, writes to
 # unrelated tables, DDL outside the temp schema) is the schema owner's
 # responsibility, like a trigger's effects on other rows (item 56a).
-my @SESSION_SETTINGS = qw(search_path TimeZone DateStyle IntervalStyle extra_float_digits timezone_abbreviations);
+my @SESSION_SETTINGS = qw(search_path TimeZone DateStyle IntervalStyle extra_float_digits timezone_abbreviations bytea_output standard_conforming_strings);
 my $TEMP_SCHEMA = 'pg_catalog.pg_my_temp_schema()';
 # The count of enabled deferrable triggers that can run user code at COMMIT
 # (R23, R32, R32a, R37): every user-defined one, and an internal foreign-key
