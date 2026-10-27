@@ -1291,6 +1291,7 @@ sub preview_write {
 
 sub _admit_plan_storage { return; }
 
+
 # Execution requires the engine's authorization for the exact object; see
 # Selecto::Write::Authorization. The *_unsafe variants skip domain governance
 # and exist for trusted internal tooling and adapter tests only.
@@ -3429,6 +3430,9 @@ sub _check_write_cardinality {
 
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
+    # The write's relation as resolved before the DML (item 51) lives for
+    # this write only.
+    local $self->{_selecto_write_target} = {};
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
@@ -3544,7 +3548,8 @@ sub _admit_post_image_target {
             # stays true for these relations until commit.
             $dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
             $self->_require_read_committed($table);
-            @row = $self->_pg_post_image_catalog($table);
+            # Resolved under the lock, before the statement (item 51).
+            @row = $self->_pg_post_image_catalog($self->_pg_resolve_write_target($table)->{oid});
         } elsif ($name eq 'sqlite') {
             @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
                 undef, $table);
@@ -3614,11 +3619,12 @@ sub _require_read_committed {
 # kind; whether any enabled non-internal deferrable trigger exists in the
 # database; statement-level UPDATE triggers, (non-partition) inheritance
 # children and rules on the relation or any partition or child below it.
+# Read by the oid resolved before the statement (item 51a).
 sub _pg_post_image_catalog {
-    my ($self, $table) = @_;
+    my ($self, $oid) = @_;
     return $self->dbh->selectrow_array(q{
                 WITH RECURSIVE tree(oid, partition) AS (
-                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass
+                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid = CAST(? AS pg_catalog.oid)
                   UNION ALL
                   SELECT i.inhrelid, child.relispartition FROM pg_catalog.pg_inherits i
                   JOIN tree ON i.inhparent = tree.oid
@@ -3631,7 +3637,7 @@ sub _pg_post_image_catalog {
                   (EXISTS(SELECT 1 FROM tree WHERE NOT tree.partition))::integer,
                   (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
                     WHERE r.rulename <> '_RETURN'))::integer
-                FROM pg_catalog.pg_class c WHERE c.oid = ?::regclass}, undef, ($self->quote_identifier($table)) x 2);
+                FROM pg_catalog.pg_class c WHERE c.oid = CAST(? AS pg_catalog.oid)}, undef, $oid, $oid);
 }
 
 # After the UPDATE and before the re-read (PostgreSQL): the table lock keeps
@@ -3646,7 +3652,8 @@ sub _recheck_post_image_target {
     return unless $self->name eq 'postgresql';
     my $table = Selecto::Identifier::checked($command->relation);
     my @row;
-    my $ok = eval { @row = $self->_pg_post_image_catalog($table); 1 };
+    my $oid = $self->_pg_write_target($table)->{oid};
+    my $ok = eval { @row = $self->_pg_post_image_catalog($oid); 1 };
     die $self->normalize_error($@) unless $ok;
     my ($kind, $deferrable, $statement_trigger, $inheritance, $rules) = @row;
     Selecto::Error->throw('query_rule_not_evaluable',
@@ -3673,13 +3680,32 @@ sub _enforced_unique_key {
     my @indexes;
     my $ok = eval {
         if ($self->name eq 'postgresql') {
+            # Items 34, 40, 43, 47: the re-read rebinds the keys it locked as
+            # text, so every column of the index must round-trip exactly and
+            # independently of session settings (integers, numeric, uuid, and
+            # text types under a deterministic collation; domains resolve to
+            # their base type), and the index must enforce uniqueness with
+            # the semantics the re-read's `=` uses: the column's own
+            # collation and the default operator class. A float, temporal,
+            # network or other key is never trusted to name rows.
             my $rows = $dbh->selectall_arrayref(q{
-                SELECT i.indexrelid, a.attname, a.attnotnull::integer
+                SELECT i.indexrelid, a.attname,
+                  (a.attnotnull AND k.coll = a.attcollation
+                    AND EXISTS (SELECT 1 FROM pg_catalog.pg_opclass o WHERE o.oid = k.opclass AND o.opcdefault)
+                    AND (WITH RECURSIVE b(oid, base) AS (
+                           SELECT t.oid, t.typbasetype FROM pg_catalog.pg_type t WHERE t.oid = a.atttypid
+                           UNION ALL
+                           SELECT t.oid, t.typbasetype FROM pg_catalog.pg_type t JOIN b ON t.oid = b.base WHERE b.base <> 0)
+                         SELECT pg_catalog.bool_and(b.oid IN (20, 21, 23, 1700, 2950, 25, 1042, 1043)) FROM b WHERE b.base = 0)
+                    AND (a.attcollation = 0 OR COALESCE((SELECT co.collisdeterministic FROM pg_catalog.pg_collation co
+                         WHERE co.oid = a.attcollation), FALSE)))::pg_catalog.int4
                 FROM pg_catalog.pg_index i
-                JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON TRUE
+                JOIN LATERAL ROWS FROM (pg_catalog.unnest(CAST(i.indkey AS pg_catalog.int2[])),
+                  pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])),
+                  pg_catalog.unnest(CAST(i.indcollation AS pg_catalog.oid[]))) AS k(attnum, opclass, coll) ON TRUE
                 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-                WHERE i.indrelid = ?::regclass AND i.indisunique AND i.indisvalid AND i.indimmediate
-                  AND i.indpred IS NULL AND i.indexprs IS NULL}, undef, $self->quote_identifier($table));
+                WHERE i.indrelid = CAST(? AS pg_catalog.oid) AND i.indisunique AND i.indisvalid AND i.indimmediate
+                  AND i.indpred IS NULL AND i.indexprs IS NULL}, undef, $self->_pg_resolve_write_target($table)->{oid});
             my %by;
             push @{$by{$_->[0]}}, [$_->[1], $_->[2]] for @$rows;
             @indexes = values %by;
@@ -3754,13 +3780,18 @@ sub _bound_target_check {
     my ($first_rule, $second_rule) = (@rule_events, @rule_events)[0, 1];
     my ($deferrable, $statement, $rules);
     my $ok = eval {
+        my $oid;
         if ($phase eq 'before') {
             $self->dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
             $self->_require_read_committed($table);
+            $oid = $self->_pg_resolve_write_target($table)->{oid};
+        } else {
+            # By the oid resolved before the statement (item 51a).
+            $oid = $self->_pg_write_target($table)->{oid};
         }
         ($deferrable, $statement, $rules) = $self->dbh->selectrow_array(q{
             WITH RECURSIVE tree(oid) AS (
-              SELECT ?::regclass::oid
+              SELECT CAST(? AS pg_catalog.oid)
               UNION ALL
               SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree ON i.inhparent = tree.oid)
             SELECT
@@ -3770,7 +3801,7 @@ sub _bound_target_check {
                 AND t.tgenabled <> 'D' AND (t.tgtype & 1) = 0 AND (t.tgtype & ?) <> 0))::integer,
               (EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class = tree.oid
                 WHERE r.ev_type IN (?, ?) AND r.rulename <> '_RETURN'))::integer},
-            undef, $self->quote_identifier($table), $mask, $first_rule, $second_rule);
+            undef, $oid, $mask, $first_rule, $second_rule);
         1;
     };
     die $self->normalize_error($@) unless $ok;
@@ -3801,9 +3832,21 @@ sub _verify_post_image {
             Selecto::Expression->all(map { Selecto::Expression->eq($keys[$_], $identity->[$_]) } 0 .. $#keys)
         } @$identities);
     my @params;
-    my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
-    my $sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN (" . $self->_compile_write_predicate($predicate, \@params)
+    my $relation = Selecto::Identifier::checked($command->relation);
+    my $table = $self->quote_identifier($relation);
+    my $pg = $self->name eq 'postgresql';
+    # PostgreSQL (item 51/51a): through the schema-qualified relation resolved
+    # before the statement, and only its own rows (and its partitions'), with
+    # pg_catalog functions.
+    my $target = $pg ? $self->_pg_write_target($relation) : undef;
+    $table = $target->{qualified} if $target;
+    my ($count, $sum) = $pg ? ('pg_catalog.count', 'pg_catalog.sum') : ('COUNT', 'SUM');
+    my $sql = "SELECT $count(*), COALESCE($sum(CASE WHEN (" . $self->_compile_write_predicate($predicate, \@params)
         . ") THEN 1 ELSE 0 END), 0) FROM $table WHERE " . $self->_compile_write_predicate($locked, \@params);
+    if ($target) {
+        push @params, $target->{oids};
+        $sql .= ' AND tableoid OPERATOR(pg_catalog.=) ANY (CAST(' . $self->placeholder(scalar @params) . ' AS pg_catalog.oid[]))';
+    }
     my @row;
     my $ok = eval { @row = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
     die $self->normalize_error($@) unless $ok;

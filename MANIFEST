@@ -78,6 +78,7 @@ t/update_post_image_pg_race_live.t
 t/pg_guarded_write_isolation_live.t
 t/pg_bound_delete_lock_live.t
 t/pg_graph_bound_descendants_live.t
+t/pg_post_image_reread_live.t
 t/host_transaction_refusal_live.t
 t/write_atomicity_modes_live.t
 t/guarded_insert_trigger_refusal_live.t
