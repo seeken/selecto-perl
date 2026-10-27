@@ -4310,6 +4310,9 @@ sub _commit_transaction {
 
 sub _rollback_transaction {
     my ($self) = @_;
+    # A COMMIT that failed (a deferred constraint) has already ended the
+    # transaction and turned AutoCommit back on: nothing is left to roll back.
+    return if eval { $self->{dbh}{AutoCommit} } && !eval { $self->{dbh}{BegunWork} };
     $self->{dbh}->rollback;
     return;
 }

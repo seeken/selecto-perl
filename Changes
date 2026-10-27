@@ -46,8 +46,12 @@ Unreleased
       since compile refuses a long-lived statement, relation_ambiguous), and
       the host's search_path must not name another non-temp relation. A
       hand-built statement fails closed: its unqualified names get the same
-      check, and naming an undeclared TEMP relation anywhere in its SQL is
-      refused. Nothing is cached across statements. timezone_abbreviations
+      check (every identifier it holds, so comma FROM lists, USING lists
+      and subqueries are covered), and naming an undeclared TEMP relation
+      anywhere in its SQL is refused. The pin holds the full reset
+      search_path (extension schemas included, R43). A deferred foreign-key
+      violation at Selecto's own COMMIT surfaces as the typed
+      database_foreign_key_violation (R44). Nothing is cached across statements. timezone_abbreviations
       is pinned and snapshotted too (R35); unique rechecks over range or
       composite keys count as user code (R37b).
     - PostgreSQL relation resolution (R36-R39). Behaviour change: PostgreSQL
