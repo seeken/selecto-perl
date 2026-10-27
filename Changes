@@ -40,6 +40,13 @@ Unreleased
       writes. Deferrable internal rechecks count too unless they are
       foreign-key triggers or unique/exclusion rechecks whose operator
       classes and operators are all pg_catalog's (R32).
+    - PostgreSQL operator and function shadows (R46). Behaviour change: while
+      any schema of the reset search_path holds an operator or function that
+      is not an extension member and is named like one of pg_catalog's (a
+      user public.=(varchar, varchar) would beat pg_catalog's text = text by
+      exact type match), every Selecto statement is refused
+      (query_rule_not_evaluable, reason operator_shadow). Extension members
+      (citext and the like) keep their native semantics.
     - PostgreSQL per-statement relation checks (R41, R42): before every
       statement's pin, each recorded relation must still be what the reset
       search_path resolves its name to (a SET ROLE or changed reset value

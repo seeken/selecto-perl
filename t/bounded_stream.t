@@ -131,7 +131,7 @@ subtest 'PostgreSQL server cursor lifecycle' => sub {
     }
     $dbh->begin_work;
     $dbh->do('INSERT INTO bounded_stream_host VALUES (1)');
-    my $failing=Local::BoundedDecodeFailure->new(dbh=>$dbh);
+    my $failing=Local::BoundedDecodeFailure->new(temporary_relations=>1,dbh=>$dbh);
     $stream=$failing->stream_query(statement('SELECT 1'),bounded=>1,canonical_values=>1);
     my $ok=eval {$stream->next;1};
     my $error=$@;

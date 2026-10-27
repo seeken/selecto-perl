@@ -528,4 +528,30 @@ subtest 'R41/R42: every statement rechecks its relations; hand-built SQL never r
     $admin->do($_) for 'DROP TABLE r3w CASCADE', 'DROP SCHEMA r3w_role CASCADE', 'DROP OWNED BY r3w_role', 'DROP ROLE r3w_role';
 };
 
+subtest 'R46: an exact-match user operator in the reset path cannot answer a scope compare' => sub {
+    $admin->do($_) for 'DROP TABLE IF EXISTS r3o CASCADE', 'DROP OPERATOR IF EXISTS public.= (varchar, varchar)',
+        'DROP FUNCTION IF EXISTS public.r3o_yes(varchar, varchar)',
+        'CREATE TABLE r3o (id INT PRIMARY KEY, org_key VARCHAR(10) NOT NULL, note TEXT)',
+        q{INSERT INTO r3o VALUES (1, 't1', 'n'), (2, 't2', 'SECRET')};
+    my $dbh = $connect->();
+    my $engine = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
+        domain => Selecto::Domain->parse({schema_version => 1, name => 'O',
+            source => {source_table => 'r3o', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
+                columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
+            schemas => {}, joins => {},
+            writes => {operations => {update => {enabled => 1}}, fields => {note => {updatable => 1}}}}))->with_scope(tenant => 't1');
+    my $update = sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3o',
+        assignments => {note => 'x'}, predicate => $x->eq('id', 2)))->affected_rows };
+    my $read = sub { join ',', map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}} };
+    is($outcome->($read), 'applied 1', 'control: the tenant read');
+    $admin->do($_) for q{CREATE FUNCTION public.r3o_yes(varchar, varchar) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
+        'CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = public.r3o_yes)';
+    is($outcome->($update), 'query_rule_not_evaluable/operator_shadow', "a tenant update cannot reach another tenant's row");
+    is($rows->($admin, 'SELECT note FROM r3o WHERE id = 2'), 'SECRET', 'which is unchanged');
+    is($outcome->($read), 'query_rule_not_evaluable/operator_shadow', 'and the tenant read is refused');
+    $admin->do($_) for 'DROP OPERATOR public.= (varchar, varchar)', 'DROP FUNCTION public.r3o_yes(varchar, varchar)';
+    is($outcome->($read), 'applied 1', 'reads work again once the operator is gone');
+    $admin->do('DROP TABLE r3o CASCADE');
+};
+
 done_testing;

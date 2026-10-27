@@ -1285,6 +1285,31 @@ my $SESSION_COLUMNS = join(', ',
 # that is not a relation's row type (or its array) and is named like a type
 # of pg_catalog or of the search path would answer an unqualified type name
 # in the statement: refused (item 56c).
+# R46: the pinned search_path puts pg_catalog first, but PostgreSQL prefers
+# an exact argument-type match over a coercion whatever the schema order: a
+# user operator public.=(varchar, varchar) beats pg_catalog's text = text
+# for a varchar column, and the same holds for a function such as
+# lower(varchar). Generated SQL compares and calls through unqualified
+# operators and functions, so while any schema of the pinned path (the
+# reset search_path; the statement runs under it) holds an operator or
+# function that is not part of an extension and is named like one of
+# pg_catalog's, every statement is refused (query_rule_not_evaluable,
+# reason operator_shadow). Extension members (citext and the like) are the
+# DBA's own and keep their native semantics.
+my $OBJECT_SHADOW_SQL = '(SELECT pg_catalog.count(*) FROM pg_catalog.pg_operator o '
+    . 'JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) o.oprnamespace '
+    . "WHERE s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false)) AND s.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' "
+    . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_operator p WHERE p.oprname OPERATOR(pg_catalog.=) o.oprname '
+    . 'AND p.oprnamespace OPERATOR(pg_catalog.=) CAST(\'pg_catalog\' AS pg_catalog.regnamespace)) '
+    . 'AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid OPERATOR(pg_catalog.=) CAST(\'pg_catalog.pg_operator\' AS pg_catalog.regclass) '
+    . "AND d.objid OPERATOR(pg_catalog.=) o.oid AND d.deptype OPERATOR(pg_catalog.=) 'e')) "
+    . 'OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc f '
+    . 'JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) f.pronamespace '
+    . "WHERE s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false)) AND s.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' "
+    . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc p WHERE p.proname OPERATOR(pg_catalog.=) f.proname '
+    . 'AND p.pronamespace OPERATOR(pg_catalog.=) CAST(\'pg_catalog\' AS pg_catalog.regnamespace)) '
+    . 'AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid OPERATOR(pg_catalog.=) CAST(\'pg_catalog.pg_proc\' AS pg_catalog.regclass) '
+    . "AND d.objid OPERATOR(pg_catalog.=) f.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'))";
 my $SHADOW_SQL = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(name) '
     . 'JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.name) '
     . "WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA AND EXISTS (SELECT 1 FROM pg_catalog.pg_class o "
@@ -1297,6 +1322,7 @@ my $SHADOW_SQL = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST
     . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_type p JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) p.typnamespace '
     . 'WHERE p.typname OPERATOR(pg_catalog.=) t.typname AND p.typnamespace OPERATOR(pg_catalog.<>) t.typnamespace '
     . "AND (s.nspname OPERATOR(pg_catalog.=) 'pg_catalog' OR s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false))))), "
+    . $OBJECT_SHADOW_SQL . ', '
     . $SESSION_COLUMNS;
 
 # The relation names a statement reads or writes, as its SQL spells them,
@@ -1645,8 +1671,11 @@ sub _pg_admit_session {
     my @row;
     my $ok = eval { @row = $self->{dbh}->selectrow_array($SHADOW_SQL, undef, $names); 1 };
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
-        {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS + 1 && defined $row[2];
-    my ($relations, $types, @state) = @row;
+        {reason => 'session_state_unknown'}) unless $ok && @row == 3 + 1 + @SESSION_SETTINGS + 1 && defined $row[3];
+    my ($relations, $types, $objects, @state) = @row;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a schema of the search path holds an operator or function that could answer for pg_catalog\'s',
+        {reason => 'operator_shadow'}) if $objects;
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary relation of the session shadows a relation the statement names',
         {reason => 'temporary_shadow'}) if $relations;
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary type of the session shadows a type name',
