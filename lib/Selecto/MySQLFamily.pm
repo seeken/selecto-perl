@@ -239,8 +239,18 @@ sub stream_query {
     my ($self, $statement, %options) = @_;
     Selecto::Error->throw('unsupported_feature', 'MySQL-family date formats cannot be streamed')
         if blessed($statement) && $statement->{_selecto_formatters};
-    $self->_require_session;
-    return $self->SUPER::stream_query($statement, %options);
+    my $state = $self->_require_session;
+    my $stream = $self->SUPER::stream_query($statement, %options);
+    # A stored result (the DBD::MariaDB default) was produced in full by the
+    # statement, so the session is compared once now; a use_result stream is
+    # compared again at every fetch batch and at its end.
+    my $ok = eval { $self->_check_session_state($state); 1 };
+    unless ($ok) { my $error = $@; $stream->close; die $error }
+    if (eval { $stream->{sth}{mariadb_use_result} }) {
+        bless $stream, 'Selecto::MySQLFamily::Stream';
+        @{$stream}{qw(_selecto_adapter _selecto_state _selecto_batch _selecto_seen)} = ($self, $state, $options{fetch_size} // 500, 0);
+    }
+    return $stream;
 }
 
 # DBD::MariaDB binds client-side, quoting every value, and both servers need
@@ -1353,6 +1363,14 @@ sub _append_returning {
 # A re-read that disagrees with the affected count fails the write.
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
+    my $result = $self->_execute_compiled_write_unchecked($command, $compiled);
+    # Before the transaction (or savepoint) can commit.
+    $self->_check_session_state($self->{_selecto_write_session});
+    return $result;
+}
+
+sub _execute_compiled_write_unchecked {
+    my ($self, $command, $compiled) = @_;
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
     my $operation = $command->operation;
     # Every write may be refused after its statement (cardinality, row
@@ -1796,9 +1814,13 @@ sub _column_types {
 # canonical as usual.
 sub execute_query {
     my ($self, $statement, %options) = @_;
-    $self->_require_session;
+    my $state = $self->_require_session;
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
-    return $self->_apply_formatters($statement, $self->SUPER::execute_query($statement));
+    my $result = $self->SUPER::execute_query($statement);
+    # A view's stored function can SET time_zone or sql_mode mid-statement;
+    # the rows it shaped are discarded and the read refused.
+    $self->_check_session_state($state);
+    return $self->_apply_formatters($statement, $result);
 }
 
 sub _decode {
@@ -1927,7 +1949,7 @@ my %UTC_ZONES = map { ($_ => 1) } ('UTC', '+00:00', 'Etc/UTC');
 
 sub _require_session {
     my ($self, %options) = @_;
-    return if $self->{_selecto_session_verified};
+    return $self->{_selecto_session_verified} if $self->{_selecto_session_verified};
     my $dbh = $self->{dbh};
     my $mariadb = $self->name eq 'mariadb';
     my $open_check = $options{write} && eval { $dbh->{AutoCommit} };
@@ -1990,7 +2012,48 @@ sub _require_session {
             die $self->normalize_error($@);
         }
     }
-    return 1;
+    return [$zone, $mode];
+}
+
+# Items 59 and 62: a trigger (SET time_zone in a BEFORE/AFTER row trigger)
+# or a view's stored function can change the session's time zone or
+# sql_mode during a statement; MySQL then evaluates later TIMESTAMP
+# comparisons (and the post-image re-read) under the new zone, and leaves
+# the session changed for the host. The session is compared with the
+# verified state ($state, from _require_session) after every read, every
+# write statement and every write: on any change the verified values are
+# restored and the operation is refused (a write rolls back with its
+# transaction or savepoint). A change and its undo within one statement is
+# invisible here; host comparisons on TIMESTAMP columns are zone
+# independent for that reason (see _timestamp_scope_sql).
+sub _check_session_state {
+    my ($self, $state) = @_;
+    return unless ref($state) eq 'ARRAY';
+    my $dbh = $self->{dbh};
+    my @now;
+    my $ok = eval { local $dbh->{PrintError} = 0; @now = $dbh->selectrow_array('SELECT @@SESSION.time_zone, @@SESSION.sql_mode'); 1 };
+    die $self->normalize_error($@) unless $ok;
+    return if @now == 2 && defined($now[0]) && defined($now[1]) && $now[0] eq $state->[0] && $now[1] eq $state->[1];
+    my $restored = eval {
+        local $dbh->{PrintError} = 0;
+        $dbh->do('SET SESSION time_zone = ?, sql_mode = ?', undef, @$state);
+        1;
+    };
+    Selecto::Error->throw('query_rule_violation',
+        'a trigger or function changed the session time zone or sql_mode during the statement',
+        {reason => 'session_state_changed', ($restored ? () : (restored => JSON::PP::false))});
+}
+
+# Every write statement is followed at once by the session comparison, so
+# nothing (a re-read, a catalog check, the next command) runs under a
+# changed time zone or sql_mode.
+my $DML = qr/\A\s*(?:\Q$MARIADB_STATEMENT\E)?\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b/i;
+sub _execute_statement {
+    my ($self, $sth, $params) = @_;
+    my $result = $self->SUPER::_execute_statement($sth, $params);
+    my $state = $self->{_selecto_write_session};
+    $self->_check_session_state($state) if ref($state) eq 'ARRAY' && (eval { $sth->{Statement} } // '') =~ $DML;
+    return $result;
 }
 
 # Runs $work with the session verified once for the whole call, so reads and
@@ -1998,8 +2061,9 @@ sub _require_session {
 sub _with_verified_session {
     my ($self, $write, $work) = @_;
     return $work->() if $self->{_selecto_session_verified};
-    $self->_require_session(write => $write);
-    local $self->{_selecto_session_verified} = 1;
+    my $state = $self->_require_session(write => $write);
+    local $self->{_selecto_session_verified} = $state;
+    local $self->{_selecto_write_session} = $write ? $state : $self->{_selecto_write_session};
     return $work->();
 }
 
@@ -2021,6 +2085,31 @@ sub execute_graph_unsafe {
 sub execute_transaction {
     my ($self, @arguments) = @_;
     return $self->_with_verified_session(1, sub { $self->SUPER::execute_transaction(@arguments) });
+}
+
+package Selecto::MySQLFamily::Stream;
+
+use parent -norequire, 'Selecto::Stream';
+
+# A use_result stream: the server evaluates rows as they are fetched, so the
+# session is compared after every fetch batch and at the end. A stream that
+# saw a change is refused from then on, whatever the session later says.
+sub next {
+    my ($self) = @_;
+    Selecto::Error->throw('query_rule_violation', 'the session changed while the stream was read',
+        {reason => 'session_state_changed'}) if $self->{_selecto_changed};
+    my $row = $self->SUPER::next;
+    my $seen = ++$self->{_selecto_seen};
+    if (!defined($row) || $seen % $self->{_selecto_batch} == 0) {
+        my $ok = eval { $self->{_selecto_adapter}->_check_session_state($self->{_selecto_state}); 1 };
+        unless ($ok) {
+            my $error = $@;
+            $self->{_selecto_changed} = 1;
+            $self->close;
+            die $error;
+        }
+    }
+    return $row;
 }
 
 1;
