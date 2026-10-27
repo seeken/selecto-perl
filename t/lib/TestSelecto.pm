@@ -102,16 +102,20 @@ sub prepared   { return [@{$_[0]->{prepared}}]; }
 # transaction); every other direct select is unknown to it.
 sub selectrow_array {
     my ($self, $sql) = @_;
+    return TestSelecto::DBH::session_state() if TestSelecto::DBH::state_query($sql);
     die "TestSelecto::DBH has no answer for $sql\n" unless TestSelecto::DBH::session_query($sql);
     return TestSelecto::DBH::session_row($sql);
 }
 sub session_query { return $_[0] =~ /SELECT VERSION\(\), \@\@SESSION\.time_zone\b/ ? 1 : 0; }
+# The MySQL-family session comparison after reads and writes: unchanged.
+sub state_query { return $_[0] eq 'SELECT @@SESSION.time_zone, @@SESSION.sql_mode' ? 1 : 0; }
+sub session_state { return ('UTC', 'STRICT_TRANS_TABLES'); }
 sub session_row {
     my ($sql) = @_;
     # VERSION() first: a MariaDB adapter's statements carry its SET STATEMENT
     # prefix, and the server family must match the adapter's.
     return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'), 'UTC', 'UTC', 'utf8mb4', 'utf8mb4', 'utf8mb4', 'STRICT_TRANS_TABLES', "\x{1F600}",
-        '2024-03-10 02:30:00.500000', ($sql =~ /\@\@in_transaction\z/ ? (0) : ()));
+        '2024-03-10 02:30:00.500000', ($sql =~ /\@\@SESSION\.transaction_read_only\z/ ? (1, 0) : ()));
 }
 sub events     { return [@{$_[0]->{events}}]; }
 

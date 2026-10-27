@@ -171,7 +171,10 @@ package RecordingDBH {
         # control: answered without an event.
         return '0E0' if $sql =~ /\bLIMIT 0\z/;
         push @{$self->{events}}, $sql;
-        if (defined($self->{fail_do}) && $sql =~ $self->{fail_do}) { $self->{errstr} = "$sql refused"; return undef; }
+        if (defined($self->{fail_do}) && $sql =~ $self->{fail_do}) {
+            ($self->{errstr}, $self->{err}) = ("$sql refused", $self->{fail_errno});
+            return undef;
+        }
         return '0E0';
     }
     sub selectrow_array {
@@ -180,7 +183,12 @@ package RecordingDBH {
             push @{$self->{events}}, 'SESSION';
             # VERSION() of the adapter's own server family comes first.
             return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'),
-                @{$self->{session}}[0 .. ($sql =~ /\@\@in_transaction\z/ ? 8 : 7)]);
+                @{$self->{session}}[0 .. ($sql =~ /\@\@SESSION\.transaction_read_only\z/ ? 9 : 7)]);
+        }
+        # The session comparison after reads and writes: unchanged.
+        if (defined($self->{session}) && $sql eq 'SELECT @@SESSION.time_zone, @@SESSION.sql_mode') {
+            push @{$self->{events}}, 'STATE';
+            return @{$self->{session}}[0, 5];
         }
         # The MySQL-family storage checks: an InnoDB base table, no shadow.
         return ('items', 'CREATE TABLE `items` (`id` int)') if $sql =~ /SHOW CREATE TABLE/;
@@ -194,6 +202,7 @@ package RecordingDBH {
         return RecordingSTH->new(owner => $self);
     }
     sub errstr { return $_[0]{errstr}; }
+    sub err    { return $_[0]{err}; }
     sub state  { return ''; }
 }
 
@@ -292,34 +301,36 @@ subtest 'savepoints inside an open DBI transaction' => sub {
 };
 
 subtest 'MySQL and MariaDB' => sub {
-    # A UTC, utf8mb4, strict session that decodes exactly; the last value is
-    # MariaDB's @@in_transaction.
+    # A UTC, utf8mb4, strict session that decodes exactly; a write on a
+    # handle whose AutoCommit is on also reads @@autocommit and
+    # @@transaction_read_only.
     my @session = ('UTC', 'UTC', 'utf8mb4', 'utf8mb4', 'utf8mb4', 'STRICT_TRANS_TABLES', "\x{1F600}",
         '2024-03-10 02:30:00.500000');
     for my $name (qw(mysql mariadb)) {
-        # Whether a host transaction is open is the driver's AutoCommit, never
-        # the server's @@in_transaction. A server transaction opened behind
-        # the driver's back is refused on MariaDB (it would be committed or
-        # discarded); MySQL cannot report one.
-        my $raw = RecordingDBH->new(session => [@session, 1]);
+        # A server transaction the driver did not open (a raw BEGIN, a pooled
+        # handle left in one) makes SET TRANSACTION fail with 1568, and a
+        # session autocommit=0 is an implicit one: both are refused before
+        # any transaction control, on both servers.
+        my $raw = RecordingDBH->new(session => [@session, 1, 0], fail_do => qr/\ASET TRANSACTION/, fail_errno => 1568);
         my $error = $write->(Selecto->adapter($name => (dbh => $raw)));
-        if ($name eq 'mariadb') {
-            is($error && $error->code, 'invalid_adapter', 'mariadb refuses a transaction opened outside the driver');
-            is_deeply($raw->events, ['SESSION'], 'before any transaction control');
-        } else {
-            ok(!$error, 'mysql write succeeds');
-            is_deeply($raw->events, ['SESSION', 'begin_work', 'write', 'commit'],
-                'mysql decides by AutoCommit alone');
-        }
+        is($error && $error->code, 'invalid_adapter', "$name refuses a transaction opened outside the driver");
+        is_deeply($raw->events, ['SESSION', 'SET TRANSACTION READ WRITE'], 'before any transaction control');
+        my $implicit = RecordingDBH->new(session => [@session, 0, 0]);
+        $error = $write->(Selecto->adapter($name => (dbh => $implicit)));
+        is($error && $error->code, 'invalid_adapter', "$name refuses a session left at autocommit=0");
+        is_deeply($implicit->events, ['SESSION'], 'before any transaction control');
 
-        my $idle = RecordingDBH->new(session => [@session, 0]);
+        my $idle = RecordingDBH->new(session => [@session, 1, 0]);
         ok(!$write->(Selecto->adapter($name => (dbh => $idle))), "$name write succeeds");
-        is_deeply($idle->events, ['SESSION', 'begin_work', 'write', 'commit'],
-            "$name begins and commits on an idle connection");
+        is_deeply($idle->events, ['SESSION', 'SET TRANSACTION READ WRITE', 'begin_work', 'write', 'STATE', 'commit'],
+            "$name begins and commits on an idle connection, comparing the session before it commits");
+        my $read_only = RecordingDBH->new(session => [@session, 1, 1]);
+        ok(!$write->(Selecto->adapter($name => (dbh => $read_only))), "$name write on a read-only session default");
+        is($read_only->events->[1], 'SET TRANSACTION READ ONLY', "$name keeps the session's own access mode");
 
-        my $manual = RecordingDBH->new(AutoCommit => 0, session => [@session, 1]);
+        my $manual = RecordingDBH->new(AutoCommit => 0, session => [@session]);
         ok(!$write->(Selecto->adapter($name => (dbh => $manual))), "$name write inside begin_work succeeds");
-        is_deeply($manual->events, ['SESSION', 'SAVEPOINT selecto_write_1', 'write', 'RELEASE SAVEPOINT selecto_write_1'],
+        is_deeply($manual->events, ['SESSION', 'SAVEPOINT selecto_write_1', 'write', 'STATE', 'RELEASE SAVEPOINT selecto_write_1'],
             "$name with AutoCommit off uses a savepoint");
 
         my $unknown = RecordingDBH->new;
