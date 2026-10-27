@@ -2,8 +2,10 @@ package Selecto::DuckDB;
 
 use Mojo::Base 'Selecto::SQL';
 use DBI qw(SQL_VARCHAR);
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
+use Selecto::Expression ();
+use Selecto::Identifier ();
 use Selecto::QueryEnforcement ();
 
 sub name    { return 'duckdb'; }
@@ -122,7 +124,11 @@ sub _execute_statement {
         Selecto::Error->throw('query_error', 'DuckDB parameter binding failed') unless defined $bound;
     }
     my $executed = $sth->execute;
-    Selecto::Error->throw('query_error', 'DuckDB statement execution failed') unless defined $executed;
+    unless (defined $executed) {
+        my $refusal = $self->_refusal_error(eval { $sth->errstr });
+        die $refusal if $refusal;
+        Selecto::Error->throw('query_error', 'DuckDB statement execution failed');
+    }
     return $executed;
 }
 
@@ -179,6 +185,13 @@ sub _compile_expression {
     my ($self, $domain, $expression, $params, $selections) = @_;
     return $self->SUPER::_compile_expression($domain, $expression, $params, $selections)
         unless blessed($expression) && $expression->isa('Selecto::Expression');
+    # Below a node of a host-trusted predicate, a referenced computed field
+    # compiles its comparisons as host identity too.
+    my $host_nodes = $self->{_selecto_host_nodes};
+    local $self->{_selecto_in_host} = $self->{_selecto_in_host}
+        || ($host_nodes && $host_nodes->{refaddr($expression)} ? 1 : 0);
+    my $identity = $self->_identity_predicate_sql($domain, $expression, $params);
+    return $identity if defined $identity;
     my $kind = $expression->kind;
     my $args = $expression->arguments;
     my %operators = (eq=>'=', ne=>'<>', gt=>'>', gte=>'>=', lt=>'<', lte=>'<=');
@@ -199,6 +212,391 @@ sub _compile_expression {
             join(', ', map { $self->_numeric_parameter($_, $params) } @{$args->[1]}) . ')';
     }
     return $self->SUPER::_compile_expression($domain, $expression, $params, $selections);
+}
+
+# ---- Tenant, trusted and host-scope identity ---------------------------------
+#
+# DuckDB compares VARCHAR under the column's or the session's collation
+# (COLLATE NOCASE, SET default_collation), casts a bound text value to a
+# numeric column's type with rounding ('1.4' and '1e0' equal INTEGER 1,
+# '1.005' equals DECIMAL(18,2) 1.01) and converts DECIMAL to DOUBLE through
+# the wrong neighbour. None of that may decide who sees a row. A column that
+# decides tenant, trusted or host-scope identity (the engine tenant, the
+# writes.scope tenant, tenant-pin required conjuncts, the host's scope and
+# trusted predicates, association and bridge where pins, scope keys, tenant
+# pairs and member correlations) must therefore have one of these catalog
+# types, read from the statement itself (typeof), so the check binds the
+# relation and column exactly as the statement does:
+#   - an integer type (TINYINT .. HUGEINT, UTINYINT .. UHUGEINT), compared by
+#     exact value with a canonical integer literal only ('01' and '+1' as
+#     PostgreSQL reads them; '1.0', '1e0' and '1.4' are refused);
+#   - VARCHAR, compared by its UTF-8 bytes (encode), which no collation
+#     touches;
+#   - UUID, by value;
+#   - BOOLEAN, with a boolean literal only.
+# Any other type (DECIMAL, DOUBLE, REAL, DATE, TIMESTAMP, BLOB, ENUM, ...)
+# raises in the statement and is refused with query_rule_not_evaluable,
+# reason identity_column_type. Every form is exact under NOT as well (<>,
+# NOT IN), unlike a text image of a number.
+#
+# Ranges (<, <=, >, >=, BETWEEN) in that scope are not identity compares
+# but must be exact: a VARCHAR column by its bytes, an integer or DECIMAL
+# (scale up to 18) column by exact value with a plain decimal literal, a
+# column of a declared temporal or boolean type by its own cast (as
+# PostgreSQL casts a literal); anything else, a floating column or a DECIMAL
+# of scale above 18, is refused (reasons inexact_text, decimal_scale).
+#
+# Ordinary caller filters on other columns keep DuckDB's own semantics,
+# collation included, for = and ranges alike.
+
+my $INTEGER_TYPES = q{('TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT', 'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'UHUGEINT')};
+my $IDENTITY_TYPES = q{('VARCHAR', 'UUID', 'BOOLEAN', 'TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT', 'UTINYINT', 'USMALLINT', 'UINTEGER', 'UBIGINT', 'UHUGEINT')};
+
+sub _refusal_sql {
+    my ($reason, $message) = @_;
+    return "error('selecto-refusal:$reason: $message')";
+}
+my $REFUSED_IDENTITY = _refusal_sql('identity_column_type',
+    'a tenant, trusted or host-scope column must be an integer, VARCHAR, UUID or BOOLEAN column on DuckDB');
+my $REFUSED_NUMBER = _refusal_sql('inexact_number', 'an integer identity column takes only canonical integer literals');
+my $REFUSED_BOOLEAN = _refusal_sql('identity_column_type', 'a BOOLEAN identity column takes only boolean literals');
+my $REFUSED_TEXT = _refusal_sql('inexact_text', 'this value cannot be compared exactly with this column');
+my $REFUSED_SCALE = _refusal_sql('decimal_scale', 'a DECIMAL of scale above 18 cannot be compared exactly');
+
+sub _exact_identity_compare { return 1; }
+
+sub _identity_bytes_sql { return "encode(CAST($_[1] AS VARCHAR))"; }
+
+# Declared types decide nothing here: the column's catalog type does, in the
+# statement. Every identity comparison is classified 2 (decided by the
+# server); 0 still means "not identity" (an ordinary member join or filter).
+sub _association_identity_exact { return 2; }
+sub _guard_identity_exact { return 2; }
+
+sub _identity_field_exact {
+    my ($self, $domain, $path) = @_;
+    return 0 unless blessed($domain) && $domain->can('resolve') && defined($path) && !ref($path);
+    my $resolved = eval { $domain->resolve("$path") };
+    return 0 unless ref($resolved) eq 'HASH' && defined $resolved->{field};
+    my %names = map { ($_ => 1) } $self->_identity_root_columns($domain);
+    if (my $association = $resolved->{association}) {
+        my $target = eval { $association->target_tenant_field };
+        $names{$target} = 1 if defined $target;
+    }
+    return 0 unless $names{$resolved->{field}};
+    my $metadata = eval { $domain->_field_metadata_view("$path") } // {};
+    return 0 if ref($metadata) eq 'HASH' && ref($metadata->{computed}) eq 'HASH';
+    return 2;
+}
+
+sub _member_pair_exact {
+    my ($self, @sides) = @_;
+    for my $side (@sides) {
+        my ($domain, $path) = @$side;
+        next unless defined $domain;
+        my $resolved = eval { $domain->resolve("$path") };
+        next unless ref($resolved) eq 'HASH' && defined($resolved->{field}) && !$resolved->{association};
+        my %names = map { ($_ => 1) } $self->_identity_root_columns($domain),
+            Selecto::SQL::_comparison_fields(eval { $domain->required_predicate }, @{$self->{_selecto_trusted_predicates} // []});
+        return 2 if $names{$resolved->{field}};
+    }
+    return 0;
+}
+
+# An association's fixed where policy (on its target or a through bridge) is
+# domain-authored scope: every pin compares as identity.
+sub _constant_join_predicates {
+    my ($self, $alias, $where, $params, $types) = @_;
+    return () unless ref($where) eq 'HASH' && keys %$where;
+    return map {
+        my $column = $self->_qualified($alias, $_);
+        defined($where->{$_}) ? $self->_identity_values_sql($column, [$where->{$_}], $params, 2) : "$column IS NULL"
+    } sort keys %$where;
+}
+
+# The identity comparison of $column with one bound value.
+sub _identity_value_term {
+    my ($self, $column, $value, $params) = @_;
+    unless (defined $value) {
+        push @$params, undef;
+        return "$column = " . $self->placeholder(scalar @$params);
+    }
+    Selecto::Error->throw('query_rule_not_evaluable', 'an identity comparison requires a scalar value',
+        {reason => 'identity_column_type'}) if ref($value) && !_boolean_object($value);
+    my $boolean = _boolean_literal($value);
+    my $text = _boolean_object($value) ? ($value ? 'true' : 'false') : "$value";
+    push @$params, $value;
+    my $marker = $self->placeholder(scalar @$params);
+    my $type = "typeof($column)";
+    my $integer = _canonical_integer($text);
+    my $integer_sql = defined($integer)
+        ? "TRY_CAST($column AS DECIMAL(38,0)) = CAST('$integer' AS DECIMAL(38,0))" : $REFUSED_NUMBER;
+    my $boolean_sql = defined($boolean) ? "TRY_CAST($column AS BOOLEAN) = $boolean" : $REFUSED_BOOLEAN;
+    return "(CASE WHEN $type = 'VARCHAR' THEN " . $self->_identity_bytes_sql($column) . ' = '
+        . $self->_identity_bytes_sql($marker)
+        . " WHEN $type IN $INTEGER_TYPES THEN $integer_sql"
+        . " WHEN $type = 'UUID' THEN CAST($column AS VARCHAR) = CAST(TRY_CAST(CAST($marker AS VARCHAR) AS UUID) AS VARCHAR)"
+        . " WHEN $type = 'BOOLEAN' THEN $boolean_sql"
+        . " ELSE $REFUSED_IDENTITY END)";
+}
+
+sub _boolean_object {
+    my ($value) = @_;
+    return 1 if blessed($value) && ($value->isa('JSON::PP::Boolean') || $value->isa('Mojo::JSON::_Bool'));
+    return 1 if !ref($value) && defined(&builtin::is_bool) && do { no warnings; builtin::is_bool($value) };
+    return 0;
+}
+
+# TRUE or FALSE for a value PostgreSQL reads as a boolean literal, else undef.
+sub _boolean_literal {
+    my ($value) = @_;
+    return undef unless defined $value;
+    return $value ? 'TRUE' : 'FALSE' if _boolean_object($value);
+    return undef if ref $value;
+    my $text = lc("$value");
+    $text =~ s/\A\s+|\s+\z//g;
+    return 'TRUE' if $text =~ /\A(?:t|tr|tru|true|y|ye|yes|on|1)\z/;
+    return 'FALSE' if $text =~ /\A(?:f|fa|fal|fals|false|n|no|off|of|0)\z/;
+    return undef;
+}
+
+# The canonical digits of an integer literal (optional sign, leading zeros
+# allowed as PostgreSQL reads them), or undef.
+sub _canonical_integer {
+    my ($text) = @_;
+    return undef unless defined($text) && $text =~ /\A\s*([+-]?)0*(\d+)\s*\z/a;
+    my ($sign, $digits) = ($1, $2);
+    return undef if length($digits) > 38;
+    return $digits eq '0' ? '0' : ($sign eq '-' ? '-' : '') . $digits;
+}
+
+# The plain decimal text of a value DECIMAL(38,18) holds exactly, or undef.
+sub _exact_decimal {
+    my ($text) = @_;
+    return undef unless defined($text) && !ref($text) && "$text" =~ /\A\s*([+-]?)(\d*)(?:\.(\d*))?\s*\z/a;
+    my ($sign, $whole, $fraction) = ($1, $2, $3 // '');
+    return undef unless length($whole) || length($fraction);
+    $whole =~ s/\A0+//;
+    $fraction =~ s/0+\z//;
+    return undef if length($whole) > 20 || length($fraction) > 18;
+    my $number = (length($whole) ? $whole : '0') . (length($fraction) ? ".$fraction" : '');
+    return $number eq '0' ? '0' : ($sign eq '-' ? '-' : '') . $number;
+}
+
+sub _identity_values_sql {
+    my ($self, $column, $values, $params, $exact) = @_;
+    return $self->SUPER::_identity_values_sql($column, $values, $params) unless $exact;
+    Selecto::Error->throw('query_rule_not_evaluable', 'an identity comparison requires values',
+        {reason => 'identity_column_type'}) unless ref($values) eq 'ARRAY' && @$values;
+    my @terms = map { $self->_identity_value_term($column, $_, $params) } @$values;
+    return @terms == 1 ? $terms[0] : '(' . join(' OR ', @terms) . ')';
+}
+
+# Two identity columns: both of an identity type; two integers compare by
+# value, anything else by the bytes of its text (an INTEGER 7 never matches
+# a VARCHAR '07' or ' 7').
+sub _identity_pair_sql {
+    my ($self, $left, $right) = @_;
+    my ($lt, $rt) = ("typeof($left)", "typeof($right)");
+    return "(CASE WHEN $lt NOT IN $IDENTITY_TYPES OR $rt NOT IN $IDENTITY_TYPES THEN $REFUSED_IDENTITY"
+        . " WHEN $lt IN $INTEGER_TYPES AND $rt IN $INTEGER_TYPES"
+        . " THEN TRY_CAST($left AS DECIMAL(38,0)) = TRY_CAST($right AS DECIMAL(38,0))"
+        . ' ELSE ' . $self->_identity_bytes_sql($left) . ' = ' . $self->_identity_bytes_sql($right) . ' END)';
+}
+
+sub _identity_equal_sql {
+    my ($self, $left, $right, $exact) = @_;
+    return "$left = $right" unless $exact;
+    return $self->_identity_pair_sql($left, $right);
+}
+
+sub _identity_correlation_sql {
+    my ($self, $inner, $outer, $exact) = @_;
+    return $self->SUPER::_identity_correlation_sql($inner, $outer) unless $exact;
+    return '(' . $self->_identity_pair_sql($inner, $outer) . " OR ($inner IS NULL AND $outer IS NULL))";
+}
+
+my %RANGE = (gt => '>', gte => '>=', lt => '<', lte => '<=');
+my %FLIP = (gt => 'lt', gte => 'lte', lt => 'gt', lte => 'gte');
+
+# Declared types whose own cast of a text literal PostgreSQL shares.
+sub _known_cast_type {
+    my ($type) = @_;
+    return 0 unless defined($type) && !ref($type);
+    return lc("$type") =~ /\A(?:date|time|datetime|timestamp|naive_datetime|utc_datetime|boolean|bool)\z/ ? 1 : 0;
+}
+
+sub _identity_range_sql {
+    my ($self, $column, $operator, $value, $type, $params) = @_;
+    my $kind = "typeof($column)";
+    my ($text_sql, $number_sql, $other_sql) = ($REFUSED_TEXT, $REFUSED_TEXT, $REFUSED_TEXT);
+    if (defined($value) && !ref($value)) {
+        push @$params, "$value";
+        my $marker = $self->placeholder(scalar @$params);
+        $text_sql = $self->_identity_bytes_sql($column) . " $operator " . $self->_identity_bytes_sql($marker);
+        my $number = _exact_decimal("$value");
+        $number_sql = "TRY_CAST($column AS DECIMAL(38,18)) $operator CAST('$number' AS DECIMAL(38,18))" if defined $number;
+        $other_sql = "$column $operator $marker" if _known_cast_type($type);
+    }
+    return "(CASE WHEN $kind = 'VARCHAR' THEN $text_sql"
+        . " WHEN $kind IN ('DOUBLE', 'FLOAT', 'REAL') THEN $REFUSED_TEXT"
+        . " WHEN regexp_matches($kind, '^DECIMAL\\([0-9]+,(19|[2-9][0-9])\\)\$') THEN $REFUSED_SCALE"
+        . " WHEN $kind IN $INTEGER_TYPES OR $kind LIKE 'DECIMAL(%' THEN $number_sql"
+        . " ELSE $other_sql END)";
+}
+
+# Whether $operand is an identity column of this compile: a tenant or scope
+# column of its relation (whatever the comparison's origin, so a caller = and
+# a caller range on it agree), or any field compared by a host-trusted
+# predicate.
+sub _identity_operand {
+    my ($self, $domain, $operand, $host) = @_;
+    return 0 unless blessed($operand) && $operand->isa('Selecto::Expression');
+    return $host ? 2 : 0 unless $operand->kind eq 'field' && !ref($operand->arguments->[0]);
+    return 2 if $self->_identity_field_exact($domain, $operand->arguments->[0]);
+    return $host ? 2 : 0;
+}
+
+sub _declared_type {
+    my ($self, $domain, $operand) = @_;
+    return undef unless blessed($operand) && $operand->kind eq 'field' && !ref($operand->arguments->[0]);
+    my $resolved = eval { $domain->resolve($operand->arguments->[0]) };
+    return ref($resolved) eq 'HASH' ? $resolved->{type} : undef;
+}
+
+# A comparison (eq, ne, IN, a range or BETWEEN) that decides identity, as
+# SQL, or undef for an ordinary one.
+sub _identity_predicate_sql {
+    my ($self, $domain, $expression, $params) = @_;
+    my $kind = $expression->kind;
+    return undef unless $kind =~ /\A(?:eq|ne|in|gt|gte|lt|lte|between)\z/;
+    my $host = ($self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{refaddr($expression)})
+        || ($self->{_selecto_host_nodes} && $self->{_selecto_host_nodes}{refaddr($expression)})
+        || $self->{_selecto_in_host} ? 1 : 0;
+    my $arguments = $expression->arguments;
+    my $literal = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq 'literal' };
+    my $field = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind ne 'literal' };
+    if ($kind eq 'in') {
+        my ($left, $values) = @$arguments;
+        return undef unless ref($values) eq 'ARRAY' && $self->_identity_operand($domain, $left, $host);
+        return $self->_identity_values_sql($self->_compile_expression($domain, $left, $params), [@$values], $params, 2);
+    }
+    if ($kind eq 'between') {
+        my ($operand, $low, $high) = @$arguments;
+        return undef unless $self->_identity_operand($domain, $operand, $host);
+        my $type = $self->_declared_type($domain, $operand);
+        my $column = $self->_compile_expression($domain, $operand, $params);
+        my @bounds = map { $literal->($_) ? $_->arguments->[0] : $_ } $low, $high;
+        return undef if grep { ref($_) } @bounds;
+        return '(' . $self->_identity_range_sql($column, '>=', $bounds[0], $type, $params) . ' AND '
+            . $self->_identity_range_sql($column, '<=', $bounds[1], $type, $params) . ')';
+    }
+    my ($left, $right) = @$arguments;
+    my ($left_identity, $right_identity) = map { $self->_identity_operand($domain, $_, $host) } $left, $right;
+    return undef unless $left_identity || $right_identity;
+    if ($kind eq 'eq' || $kind eq 'ne') {
+        my $sql;
+        if ($field->($left) && $field->($right)) {
+            $sql = $self->_identity_pair_sql($self->_compile_expression($domain, $left, $params),
+                $self->_compile_expression($domain, $right, $params));
+        } else {
+            my ($operand, $value) = $literal->($right) ? ($left, $right) : $literal->($left) ? ($right, $left) : return undef;
+            $sql = $self->_identity_values_sql($self->_compile_expression($domain, $operand, $params),
+                [$value->arguments->[0]], $params, 2);
+        }
+        return $kind eq 'ne' ? "NOT $sql" : $sql;
+    }
+    # A range against a literal; a range between two columns stays plain.
+    my ($operand, $value, $operator) = $literal->($right) ? ($left, $right, $kind)
+        : $literal->($left) ? ($right, $left, $FLIP{$kind}) : return undef;
+    return undef unless $field->($operand);
+    return $self->_identity_range_sql($self->_compile_expression($domain, $operand, $params), $RANGE{$operator},
+        $value->arguments->[0], $self->_declared_type($domain, $operand), $params);
+}
+
+# A computed field (a predicate body, a value expression's condition, a
+# nested computed field) referenced by a host-trusted predicate is host scope
+# as well; referenced by a caller filter it stays plain.
+sub _compile_authored_condition {
+    my ($self, $domain, $ast, $params) = @_;
+    return $self->SUPER::_compile_authored_condition($domain, $ast, $params) unless $self->{_selecto_in_host};
+    my $expression = $self->_authored_condition($ast);
+    local $self->{_selecto_host_nodes} = {%{$self->{_selecto_host_nodes} // {}},
+        map { (refaddr($_) => 1) } Selecto::SQL::_expression_nodes($expression)};
+    return $self->_compile_expression($domain, $expression, $params);
+}
+
+# Write predicates, foreign-key guards and stored-row checks compare the
+# command's identity columns (the engine's __selecto_tenant_fields, and
+# every field its scope predicate or query enforcement reads) the same way.
+sub _write_identity_columns {
+    my ($self, $command) = @_;
+    my $metadata = blessed($command) && $command->can('metadata') ? $command->metadata : {};
+    my $fields = ref($metadata->{__selecto_tenant_fields}) eq 'ARRAY' ? $metadata->{__selecto_tenant_fields} : [];
+    my $types = ref($metadata->{__selecto_insert_types}) eq 'HASH' ? $metadata->{__selecto_insert_types}
+        : ref($metadata->{field_types}) eq 'HASH' ? $metadata->{field_types} : {};
+    my @host = blessed($command) && $command->can('scope_predicate')
+        ? map { Selecto::Expression->field_references($_) } grep { defined } $command->scope_predicate,
+            defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef
+        : ();
+    return {map { ($_ => {type => $types->{$_}}) } grep { defined($_) && !ref($_) && !/\./ } @$fields, @host};
+}
+
+sub _compile_write {
+    my ($self, $command) = @_;
+    local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
+    return $self->SUPER::_compile_write($command);
+}
+
+sub _execute_compiled_write_in_transaction {
+    my ($self, $command, @rest) = @_;
+    local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
+    return $self->SUPER::_execute_compiled_write_in_transaction($command, @rest);
+}
+
+sub _compile_write_predicate {
+    my ($self, $expression, $params) = @_;
+    my $columns = $self->{_selecto_identity_columns};
+    if ($columns && %$columns && blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind =~ /\A(?:eq|ne|in|gt|gte|lt|lte)\z/) {
+        my $kind = $expression->kind;
+        my ($left, $right) = @{$expression->arguments};
+        my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
+            ? $left->arguments->[0] : undef;
+        if (defined($field) && !ref($field) && $columns->{$field}) {
+            my $column = $self->quote_identifier(Selecto::Identifier::checked($field));
+            if ($kind eq 'in') {
+                Selecto::Error->throw('query_rule_unsupported_predicate', 'query-enforced IN requires values')
+                    unless ref($right) eq 'ARRAY' && @$right;
+                return $self->_identity_values_sql($column, [@$right], $params, 2);
+            }
+            my $value = Selecto::SQL::_write_literal($right);
+            return $self->_identity_range_sql($column, $RANGE{$kind}, $value, $columns->{$field}{type}, $params)
+                if $RANGE{$kind};
+            my $sql = $self->_identity_values_sql($column, [$value], $params, 2);
+            return $kind eq 'ne' ? "NOT $sql" : $sql;
+        }
+    }
+    return $self->SUPER::_compile_write_predicate($expression, $params);
+}
+
+# A refusal raised in a statement (error('selecto-refusal:<reason>: ...'))
+# is the typed query_rule_not_evaluable it stands for.
+sub _refusal_error {
+    my ($self, @texts) = @_;
+    for my $text (@texts) {
+        next unless defined($text) && "$text" =~ /selecto-refusal:([a-z_]+):/;
+        return Selecto::Error->new(code => 'query_rule_not_evaluable',
+            message => 'this comparison cannot be decided exactly on DuckDB', details => {reason => $1});
+    }
+    return undef;
+}
+
+sub normalize_error {
+    my ($self, $error) = @_;
+    return $error if blessed($error) && $error->isa('Selecto::Error');
+    my $refusal = $self->_refusal_error(eval { "$error" }, eval { $self->{dbh}->errstr });
+    return $refusal // $self->SUPER::normalize_error($error);
 }
 
 sub _compile_single {
@@ -675,6 +1073,24 @@ than one node. Foreign-key guard and RETURNING checks refuse only when
 nothing was affected, so a single guarded write still runs. Writes that
 cannot be refused after their statement run directly as before; for
 example C<expected_count => 1> on an update by primary key.
+
+Tenant, trusted and host-scope identity is decided by the catalog type of
+the column the statement binds (C<typeof>, so a temporary table, the
+search path and case folding resolve as in the statement itself): an
+integer column compares by exact value with a canonical integer literal
+only, VARCHAR by its UTF-8 bytes (no column collation or
+C<default_collation> applies), UUID by value and BOOLEAN with a boolean
+literal. Any other type is refused with C<query_rule_not_evaluable>
+(details C<< {reason => 'identity_column_type'} >>); a fractional or
+exponent literal on an integer column with reason C<inexact_number>. This
+covers the engine tenant, writes.scope tenants, required tenant pins, the
+host's scope and trusted predicates, association and bridge where pins,
+scope keys, tenant pairs and member correlations, for reads and writes,
+under C<=>, C<< <> >>, C<IN> and C<NOT IN>. Ranges in that scope compare
+VARCHAR by bytes and integer or DECIMAL (scale up to 18) columns by exact
+value; a floating column, a wider DECIMAL or a non-numeric literal is
+refused (C<inexact_text>, C<decimal_scale>). Ordinary caller filters on other columns keep DuckDB's own
+semantics, collation included.
 
 DBD::DuckDB 0.16 decodes some timestamps and decimals inexactly and infers
 numeric-looking strings as floating point. The adapter works around this
