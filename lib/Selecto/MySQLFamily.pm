@@ -154,6 +154,9 @@ sub compile {
     my ($self, $domain, $query) = @_;
     my $top = !$self->{_selecto_in_compile};
     local $self->{_selecto_in_compile} = 1;
+    # Column data types read for zone-independent TIMESTAMP scope compares,
+    # once per relation per compile.
+    local $self->{_selecto_column_catalog} = $top ? {} : $self->{_selecto_column_catalog};
     my $scope = $top && blessed($query) && !@{$query->set_operations} && $query->grouping_mode ne 'rollup'
         ? {pending => 1, formatters => {}} : undef;
     local $self->{_selecto_format_scope} = $scope;
@@ -300,6 +303,8 @@ sub _compile_expression {
         $self, $domain, $expression, $params, $compiled_selections,
         sub { return $self->SUPER::_compile_expression(@_); },
     );
+    return $sql if defined $sql;
+    $sql = $self->_timestamp_scope_sql($domain, $expression, $params);
     return $sql if defined $sql;
     $sql = $self->_identity_predicate_sql($domain, $expression, $params);
     return $sql if defined $sql;
@@ -535,6 +540,128 @@ sub _identity_predicate_sql {
         $column_params);
 }
 
+# Item 62a: a stored function can switch time_zone and back within one MySQL
+# statement, so a TIMESTAMP compared with a datetime literal is evaluated
+# under whatever zone is current for that row, and no before/after check
+# sees it. Host, trusted, required and tenant comparisons (and every write
+# predicate, re-read and stored-row check) on a TIMESTAMP column therefore
+# compare UNIX_TIMESTAMP(col) (the stored instant, zone independent) with
+# the literal's epoch, computed here in UTC (the verified session zone).
+# DATETIME columns are zone independent and compile as before; caller
+# filters keep the server's comparison (and the column's index).
+sub _timestamp_scope_sql {
+    my ($self, $domain, $expression, $params) = @_;
+    return undef unless blessed($expression) && $expression->isa('Selecto::Expression');
+    my $kind = $expression->kind;
+    return undef unless $kind =~ /\A(?:eq|ne|gt|gte|lt|lte|in|between)\z/;
+    my $address = refaddr($expression);
+    return undef unless $self->{_selecto_in_host}
+        || ($self->{_selecto_host_conjuncts} && $self->{_selecto_host_conjuncts}{$address})
+        || ($self->{_selecto_host_nodes} && $self->{_selecto_host_nodes}{$address});
+    my ($field, @rest) = @{$expression->arguments};
+    my $is = sub { blessed($_[0]) && $_[0]->isa('Selecto::Expression') && $_[0]->kind eq $_[1] };
+    # A literal on the left reverses the comparison.
+    if ($kind =~ /\A(?:eq|ne|gt|gte|lt|lte)\z/ && !$is->($field, 'field') && $is->($rest[0], 'field')) {
+        ($field, @rest) = ($rest[0], $field);
+        $kind = {eq => 'eq', ne => 'ne', gt => 'lt', gte => 'lte', lt => 'gt', lte => 'gte'}->{$kind};
+    }
+    return undef unless $is->($field, 'field') && !ref($field->arguments->[0]);
+    my $path = $field->arguments->[0];
+    return undef if "$path" =~ /\./ && ref($self->{_query_sources}) eq 'HASH'
+        && exists $self->{_query_sources}{(split /\./, "$path")[0]};
+    my $resolved = eval { $domain->resolve("$path") };
+    return undef unless ref($resolved) eq 'HASH';
+    my $metadata = $resolved->{association} ? eval { $domain->_field_metadata_view("$path") } : eval { $domain->field_metadata("$path") };
+    return undef if ref($metadata) eq 'HASH' && ref($metadata->{computed}) eq 'HASH';
+    my $association = $resolved->{association};
+    return undef if $association && $association->join_mode eq 'star_dimension';
+    my $table = $association ? $association->table : $domain->table;
+    return undef unless $self->_timestamp_column($table, $resolved->{field}, $resolved->{type});
+    my @values = $kind eq 'in' ? (ref($rest[0]) eq 'ARRAY' ? @{$rest[0]} : ())
+        : map { $is->($_, 'literal') ? $_->arguments->[0] : return undef } @rest;
+    return undef unless @values;
+    my $alias = $association ? $self->_join_alias($resolved->{association_path}) : $self->_root_alias;
+    my $column = $self->quote_identifier($alias) . '.' . $self->quote_identifier($resolved->{field});
+    return $self->_epoch_compare_sql($column, $kind, \@values, $params);
+}
+
+# Whether $table.$column is a TIMESTAMP column, from the catalog (once per
+# relation per compile). A relation or column the catalog does not describe
+# (a temporary table, a view's derived column) is refused for a declared
+# datetime field: an unchecked comparison could be zone dependent.
+sub _timestamp_column {
+    my ($self, $table, $column, $declared) = @_;
+    my $dbh = $self->{dbh};
+    return 0 unless eval { $dbh->isa('DBI::db') && $dbh->{Active} };
+    my $catalog = $self->{_selecto_column_catalog} //= {};
+    my $types = $catalog->{lc $table} //= $self->_column_data_types($table);
+    my $type = $types->{lc $column};
+    return $type eq 'timestamp' ? 1 : 0 if defined $type;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a host comparison names a datetime column the catalog does not describe',
+        {reason => 'column_unresolved', field => "$column"})
+        if defined($declared) && $declared =~ /\A(?:utc_datetime|naive_datetime|datetime|timestamp)\z/;
+    return 0;
+}
+
+sub _column_data_types {
+    my ($self, $table) = @_;
+    my $rows;
+    my $ok = eval {
+        $rows = $self->{dbh}->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, DATA_TYPE
+            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, "$table");
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return {map { (lc($_->[0]) => lc($_->[1] // '')) } @$rows};
+}
+
+# The TIMESTAMP columns of a write's relation (lower case), read when the
+# write is compiled and again in its transaction.
+sub _write_timestamp_columns {
+    my ($self, $command) = @_;
+    my $dbh = $self->{dbh};
+    return {} unless blessed($command) && $command->can('relation') && eval { $dbh->isa('DBI::db') && $dbh->{Active} };
+    my $types = $self->_column_data_types(Selecto::Identifier::checked($command->relation));
+    return {map { ($_ => 1) } grep { $types->{$_} eq 'timestamp' } keys %$types};
+}
+
+# UNIX_TIMESTAMP(col) <op> the literal's UTC epoch, bound as an exact decimal.
+sub _epoch_compare_sql {
+    my ($self, $column, $kind, $values, $params) = @_;
+    my @markers = map {
+        push @$params, _timestamp_epoch($_);
+        'CAST(' . $self->placeholder(scalar @$params) . ' AS DECIMAL(24,6))'
+    } @$values;
+    my $left = "UNIX_TIMESTAMP($column)";
+    return "$left IN (" . join(', ', @markers) . ')' if $kind eq 'in';
+    return "$left BETWEEN $markers[0] AND $markers[1]" if $kind eq 'between';
+    return "$left " . {eq => '=', ne => '<>', gt => '>', gte => '>=', lt => '<', lte => '<='}->{$kind} . " $markers[0]";
+}
+
+# The UTC epoch (seconds, with up to six fractional digits) of a datetime
+# literal: 'YYYY-MM-DD', optionally ' HH:MM[:SS[.ffffff]]' (or 'T'), and an
+# optional 'Z' or +HH:MM offset. Anything else is refused.
+sub _timestamp_epoch {
+    my ($value) = @_;
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable',
+            'a TIMESTAMP scope comparison requires a datetime literal', {reason => 'timestamp_literal'});
+    };
+    $refuse->() if !defined($value) || ref($value);
+    my ($y, $mo, $d, $h, $mi, $sec, $frac, $zone) = "$value" =~ /\A(\d{4})-(\d{2})-(\d{2})
+        (?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?)?(Z|[+-]\d{2}:\d{2})?\z/x or $refuse->();
+    require Time::Local;
+    my $epoch = eval { Time::Local::timegm($sec // 0, $mi // 0, $h // 0, $d, $mo - 1, $y) };
+    $refuse->() unless defined $epoch;
+    if (defined($zone) && $zone ne 'Z') {
+        my ($sign, $zh, $zm) = $zone =~ /\A([+-])(\d{2}):(\d{2})\z/;
+        $refuse->() if $zh > 14 || $zm > 59;
+        $epoch -= ($sign eq '-' ? -1 : 1) * ($zh * 3600 + $zm * 60);
+    }
+    return defined($frac) ? "$epoch.$frac" : "$epoch";
+}
+
 # Write predicates, storage re-reads and guarded-insert probes of a governed
 # command compare its text tenant columns (the engine's __selecto_tenant_fields:
 # tenant_field, writes.scope.tenant, pins and stored root tenant columns) the
@@ -556,6 +683,20 @@ sub _write_identity_columns {
 
 sub _compile_write_predicate {
     my ($self, $expression, $params) = @_;
+    my $timestamps = $self->{_selecto_write_timestamps};
+    if ($timestamps && %$timestamps && blessed($expression) && $expression->isa('Selecto::Expression')
+        && $expression->kind =~ /\A(?:eq|ne|gt|gte|lt|lte|in)\z/) {
+        my ($left, $right) = @{$expression->arguments};
+        my $field = blessed($left) && $left->isa('Selecto::Expression') && $left->kind eq 'field'
+            ? $left->arguments->[0] : undef;
+        if (defined($field) && !ref($field) && $timestamps->{lc $field}) {
+            my $values = $expression->kind eq 'in' ? $right
+                : blessed($right) && $right->isa('Selecto::Expression') && $right->kind eq 'literal'
+                    ? [$right->arguments->[0]] : undef;
+            return $self->_epoch_compare_sql($self->quote_identifier(Selecto::Identifier::checked($field)),
+                $expression->kind, $values, $params) if ref($values) eq 'ARRAY' && @$values;
+        }
+    }
     my $columns = $self->{_selecto_identity_columns};
     if ($columns && %$columns && blessed($expression) && $expression->isa('Selecto::Expression')
         && $expression->kind eq 'ne') {
@@ -1146,6 +1287,7 @@ sub _compile_write {
     my ($self, $command) = @_;
     _refuse_scoped_upsert($command) if $command->operation eq 'upsert';
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
+    local $self->{_selecto_write_timestamps} = $self->_write_timestamp_columns($command);
     local $self->{_selecto_bind_copies} = [];
     my $compiled = $self->SUPER::_compile_write($command);
     # The logical parameter sequence: the bound values with each exact
@@ -1372,6 +1514,7 @@ sub _execute_compiled_write_in_transaction {
 sub _execute_compiled_write_unchecked {
     my ($self, $command, $compiled) = @_;
     local $self->{_selecto_identity_columns} = $self->_write_identity_columns($command);
+    local $self->{_selecto_write_timestamps} = $self->_write_timestamp_columns($command);
     my $operation = $command->operation;
     # Every write may be refused after its statement (cardinality, row
     # ceiling, post-image, RETURNING and stored-row checks, an AFTER trigger
@@ -2005,11 +2148,13 @@ sub _require_session {
         };
         $outside->() unless defined($autocommit) && "$autocommit" eq '1';
         my $probe = 'SET TRANSACTION ' . (defined($read_only) && "$read_only" eq '1' ? 'READ ONLY' : 'READ WRITE');
-        my $ok = eval { local $dbh->{PrintError} = 0; $dbh->do($probe); 1 };
+        # A handle without RaiseError reports the failure by returning undef.
+        my $ok = eval { local $dbh->{PrintError} = 0; defined($dbh->do($probe)) or die Selecto::SQL::_dbi_error($dbh, 'session transaction probe failed'); 1 };
         unless ($ok) {
+            my $error = $@;
             my $errno = eval { $dbh->err };
             $outside->() if defined($errno) && "$errno" eq '1568';
-            die $self->normalize_error($@);
+            die $self->normalize_error($error);
         }
     }
     return [$zone, $mode];
@@ -2033,10 +2178,11 @@ sub _check_session_state {
     my @now;
     my $ok = eval { local $dbh->{PrintError} = 0; @now = $dbh->selectrow_array('SELECT @@SESSION.time_zone, @@SESSION.sql_mode'); 1 };
     die $self->normalize_error($@) unless $ok;
+    # (No row, as from a handle without RaiseError that failed, is a change.)
     return if @now == 2 && defined($now[0]) && defined($now[1]) && $now[0] eq $state->[0] && $now[1] eq $state->[1];
     my $restored = eval {
         local $dbh->{PrintError} = 0;
-        $dbh->do('SET SESSION time_zone = ?, sql_mode = ?', undef, @$state);
+        defined($dbh->do('SET SESSION time_zone = ?, sql_mode = ?', undef, @$state)) or die "restore failed\n";
         1;
     };
     Selecto::Error->throw('query_rule_violation',

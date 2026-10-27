@@ -94,7 +94,8 @@ for my $backend (@backends) {
     $dbh->do(q{INSERT INTO selecto_session_base VALUES (1, 't1', '2023-12-31 22:00:00', 'in'),
         (2, 't1', '2024-01-01 03:00:00', 'OUT'), (3, 't1', '2023-12-31 20:00:00', 'in3')});
     $dbh->do(q{CREATE FUNCTION selecto_session_fn(i INT) RETURNS INT DETERMINISTIC NO SQL
-        BEGIN IF @selecto_arm = 1 AND i = 1 THEN SET time_zone = '-05:00'; END IF; RETURN i; END});
+        BEGIN IF @selecto_arm >= 1 AND i = 1 THEN SET time_zone = '-05:00'; END IF;
+        IF @selecto_arm = 2 AND i = 3 THEN SET time_zone = '+00:00'; END IF; RETURN i; END});
     $dbh->do('CREATE VIEW selecto_session_view AS SELECT id, org_key, ts, note, selecto_session_fn(id) AS k FROM selecto_session_base');
     my $reader = Selecto::Engine->new(adapter => $adapter,
         domain => domain('selecto_session_view', 0, 'k')->with_required_predicate($x->lt('ts', '2024-01-01 00:00:00')));
@@ -110,7 +111,26 @@ for my $backend (@backends) {
         is(outcome($reads{$kind}), 'query_rule_violation/session_state_changed', "$name $kind: a zone switch mid-read is refused");
         $dbh->do('SET @selecto_arm = 0');
         is($session->(), $verified, "$name $kind: and the session is restored");
+        # Item 62a: switched and switched back within the statement, the
+        # before/after compare sees nothing; the TIMESTAMP scope compare is
+        # zone independent, so row 2 (03:00 UTC) stays out.
+        $dbh->do('SET @selecto_arm = 2');
+        is(outcome($reads{$kind}), 'ok in,in3', "$name $kind: a zone switched and back mid-read cannot widen the scope");
+        $dbh->do('SET @selecto_arm = 0');
+        is($session->(), $verified, "$name $kind: and the session ends verified");
     }
+    like($reader->compile($query)->sql, qr/UNIX_TIMESTAMP\(`s0`\.`ts`\) < CAST\(\? AS DECIMAL/,
+        "$name: the host TIMESTAMP compare is zone independent");
+    like($engine->adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_session_items',
+        assignments => {note => 'x'}, predicate => $x->eq('id', 1), scope_predicate => $x->lt('ts', '2024-01-01 00:00:00')))->{sql},
+        qr/UNIX_TIMESTAMP\(`ts`\) < CAST\(\? AS DECIMAL/, "$name: so is a write's TIMESTAMP scope");
+    # DATETIME is zone independent and compiles as before; caller filters keep the server's compare.
+    $dbh->do('ALTER TABLE selecto_session_base MODIFY ts DATETIME NULL');
+    my $plain = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)),
+        domain => domain('selecto_session_view', 0, 'k')->with_required_predicate($x->lt('ts', '2024-01-01 00:00:00')));
+    unlike($plain->compile($plain->query->select('id'))->sql, qr/UNIX_TIMESTAMP/, "$name: a DATETIME scope compiles as before");
+    unlike($reader->compile($reader->query->select('id')->where($x->gt('ts', '2020-01-01')))->sql, qr/UNIX_TIMESTAMP\(`s0`\.`ts`\) >/,
+        "$name: a caller filter keeps the server's compare");
     $dbh->do('DROP VIEW IF EXISTS selecto_session_view');
     $dbh->do('DROP FUNCTION IF EXISTS selecto_session_fn');
     $dbh->do('DROP TABLE IF EXISTS selecto_session_base');

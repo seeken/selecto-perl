@@ -53,6 +53,7 @@ for my $adapter ($mysql, $mariadb) {
     our @ISA = ('TestSelecto::DBH');
     sub selectrow_array {
         my ($self, $sql) = @_;
+        return ($self->{zone}[0], 'STRICT_TRANS_TABLES') if TestSelecto::DBH::state_query($sql);
         my @row = TestSelecto::DBH::session_row($sql);
         @row[1, 2] = @{$self->{zone}};
         return @row;
