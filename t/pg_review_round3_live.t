@@ -427,30 +427,37 @@ subtest 'R33: a CTE named like a real relation never hides it' => sub {
     $admin->do('DROP TABLE r3c, r3c_other CASCADE');
 };
 
-subtest 'R35: result-affecting settings are pinned for every statement' => sub {
+subtest 'R35: result-affecting settings are pinned to their reset values for every statement' => sub {
+    my ($database) = $admin->selectrow_array('SELECT pg_catalog.current_database()');
     $admin->do($_) for 'DROP TABLE IF EXISTS r3z CASCADE',
         'CREATE TABLE r3z (id INT PRIMARY KEY, ts TIMESTAMPTZ NOT NULL, d DATE NOT NULL)',
-        q{INSERT INTO r3z VALUES (1, '2024-01-02 00:00:00+00', '2024-03-01'), (2, '2023-12-31 12:00:00+00', '2024-01-02')};
+        q{INSERT INTO r3z VALUES (1, '2024-01-02 00:00:00+00', '2024-03-01'), (2, '2023-12-31 12:00:00+00', '2024-01-02'),
+            (3, '2023-12-31 20:00:00+00', '2024-01-02')},
+        qq{ALTER DATABASE "$database" SET TimeZone = 'Asia/Kolkata'};
+    # A database-level TimeZone that is not UTC: the configured zone holds.
     my $dbh = $connect->();
     my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Z',
         source => {source_table => 'r3z', primary_key => 'id', fields => [qw(id ts d)],
             columns => {id => {type => 'integer'}, ts => {type => 'utc_datetime'}, d => {type => 'date'}}, associations => {}},
         schemas => {}, joins => {}});
-    my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
+    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
     my $ids = sub {
         my ($required) = @_;
         my $engine = Selecto::Engine->new(domain => $domain->with_required_predicate($required), adapter => $adapter);
         return join ',', map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}};
     };
-    # A setting that persisted before Selecto's call (a masked set_config in
-    # an earlier trigger, say) cannot change what a scope literal means.
+    my $instant = $x->gte('ts', '2024-01-01 00:00:00');
+    is($outcome->(sub { $ids->($instant) }), 'applied 1,3', 'a timestamptz scope literal is read in the configured zone (Asia/Kolkata)');
+    # A setting switched for the session before Selecto's call (a masked
+    # set_config in an earlier trigger, say) cannot change what it means.
     $dbh->do(q{SET TimeZone = 'Pacific/Kiritimati'});
-    is($outcome->(sub { $ids->($x->gte('ts', '2024-01-01 00:00:00')) }), 'applied 1', 'a timestamptz scope literal is read in UTC');
+    is($outcome->(sub { $ids->($instant) }), 'applied 1,3', 'a session TimeZone switch does not change it');
     $dbh->do(q{SET DateStyle = 'SQL, DMY'});
-    is($outcome->(sub { $ids->($x->gte('d', '02/01/2024')) }), 'applied 1', 'a date scope literal is read MDY');
+    is($outcome->(sub { $ids->($x->gte('d', '02/01/2024')) }), 'applied 1', 'nor does a session DateStyle switch');
     is($rows->($dbh, 'SHOW TimeZone'), 'Pacific/Kiritimati', "the host's TimeZone is restored");
     is($rows->($dbh, 'SHOW DateStyle'), 'SQL, DMY', "and its DateStyle");
-    $admin->do('DROP TABLE r3z CASCADE');
+    $dbh->disconnect;
+    $admin->do($_) for qq{ALTER DATABASE "$database" RESET TimeZone}, 'DROP TABLE r3z CASCADE';
 };
 
 done_testing;

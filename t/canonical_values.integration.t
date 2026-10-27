@@ -177,16 +177,16 @@ my @settings = (
     ['Africa/Monrovia', 'German, DMY', 1],
 );
 
-# Selecto pins the result-affecting settings for each of its statements
-# (R35: TimeZone UTC, DateStyle ISO, MDY, extra_float_digits 3, ...), so
-# its default rows are the driver's values under those pins, whatever the
-# host session says. The host session is restored afterwards.
+# Selecto pins the result-affecting settings for each of its statements to
+# their reset values (R35 amendment: server, database, role or connection
+# configuration), so its default rows are the driver's values under those,
+# whatever the host session SET. The host session is restored afterwards.
 sub pinned {
     my ($handle, $work) = @_;
     my @names = qw(TimeZone DateStyle IntervalStyle extra_float_digits);
     my %host = map { ($_ => scalar $handle->selectrow_array("SELECT pg_catalog.current_setting('$_')")) } @names;
-    $handle->do(q{SELECT pg_catalog.set_config('TimeZone', 'UTC', false), pg_catalog.set_config('DateStyle', 'ISO, MDY', false),
-        pg_catalog.set_config('IntervalStyle', 'postgres', false), pg_catalog.set_config('extra_float_digits', '3', false)});
+    $handle->do(q{SELECT pg_catalog.set_config(r.name, r.reset_val, false) FROM pg_catalog.pg_settings r WHERE r.name = ANY (?)},
+        undef, \@names);
     my @result = $work->();
     $handle->do('SELECT pg_catalog.set_config(?, ?, false)', undef, $_, $host{$_}) for @names;
     return wantarray ? @result : $result[0];
@@ -298,8 +298,9 @@ subtest 'streams' => sub {
     require Selecto::BoundedQuery;
     same_rows(Selecto::BoundedQuery->all($raw_engine, $query, max_rows => 1000, max_cell_bytes => 1000,
         canonical_values => 1)->{rows}, $expected, 'and BoundedQuery');
-    # Selecto pins DateStyle to ISO for its statements (R35), so a host's
-    # German DateStyle no longer changes the dates it returns.
+    # Selecto pins DateStyle to its reset value for its statements (R35), so
+    # a host's session-level German DateStyle no longer changes the dates it
+    # returns.
     $dbh->do(q{SET DateStyle = 'German, DMY'});
     my $german = $perl_engine->all($query)->{rows};
     ok(!(grep { defined($_->[9]) && $_->[9] =~ /\A\d\d\.\d\d\.\d{4}/ } @$german),
