@@ -1,6 +1,17 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: a bound-scope update's post-image re-read and its trigger,
+      rule and deferrable rechecks address the relation by the oid and
+      schema-qualified name resolved under the write's lock before the DML,
+      with tableoid = ANY(the relation and its partitions); a trigger's
+      search_path switch or DDL can no longer substitute another relation.
+      The re-read names rows only by an enforced unique key whose columns
+      round-trip exactly whatever the session settings (integers, numeric,
+      uuid, text types under a deterministic collation; domains resolve to
+      their base type) and whose index uses the column's own collation and
+      the default operator class; date, timestamp, float, network and other
+      keys are refused (query_rule_not_evaluable).
     - DuckDB: a column deciding tenant, trusted or host-scope identity (the
       engine tenant, writes.scope tenants, required tenant pins, host scope
       and trusted predicates, association and bridge where pins, scope keys,

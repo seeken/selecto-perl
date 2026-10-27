@@ -1171,6 +1171,39 @@ sub _refuse_connection_state {
 }
 
 
+# Item 51/51a: the relation a write's post-statement SQL addresses, resolved
+# before the statement (under its lock): its oid, its schema-qualified name
+# and the oids its rows may live in (itself and its partitions). Rechecks
+# use the oid and re-reads the qualified name with tableoid = ANY(oids),
+# never a search_path lookup a trigger could redirect.
+sub _pg_resolve_write_target {
+    my ($self, $table) = @_;
+    my $context = $self->{_selecto_write_target};
+    return $context->{$table} if ref($context) eq 'HASH' && $context->{$table};
+    my @row = $self->dbh->selectrow_array(q{
+        SELECT c.oid, pg_catalog.quote_ident(n.nspname) OPERATOR(pg_catalog.||) '.' OPERATOR(pg_catalog.||) pg_catalog.quote_ident(c.relname),
+          ARRAY(SELECT CAST(t.relid AS pg_catalog.oid) FROM pg_catalog.pg_partition_tree(c.oid) t
+                UNION SELECT c.oid)
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+        WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)}, undef, $self->quote_identifier($table));
+    Selecto::Error->throw('query_rule_not_evaluable', 'the written relation could not be resolved',
+        {reason => 'relation_unresolved', relation => $table}) unless @row && defined $row[0];
+    my $target = {oid => $row[0], qualified => $row[1], oids => $row[2]};
+    $context->{$table} = $target if ref($context) eq 'HASH';
+    return $target;
+}
+
+# The target resolved before the statement; a post-statement check without
+# one fails closed.
+sub _pg_write_target {
+    my ($self, $table) = @_;
+    my $context = $self->{_selecto_write_target};
+    my $target = ref($context) eq 'HASH' ? $context->{$table} : undef;
+    Selecto::Error->throw('query_rule_not_evaluable', 'the written relation was not resolved before the statement',
+        {reason => 'relation_unresolved', relation => $table}) unless $target;
+    return $target;
+}
+
 sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
 
 1;
