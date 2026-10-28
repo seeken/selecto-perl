@@ -79,6 +79,8 @@ sub new {
 sub next {
     my ($self) = @_;
     return undef if $self->{closed};
+    # Under SELECTO_PG_SQL_LINT, the stream's own statements are Selecto's.
+    local $self->{dbh}{private_selecto_lint_depth} = 1 if $ENV{SELECTO_PG_SQL_LINT};
     return shift @{$self->{buffer}} if @{$self->{buffer}};
     my $rows;
     my $ok = eval {

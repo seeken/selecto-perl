@@ -1368,10 +1368,18 @@ sub execute_transaction {
     if ($self->transaction_mode eq 'external') {
         Selecto::Error->throw('invalid_adapter', 'protected rules require an open host transaction')
             unless $self->_transaction_open;
-        return $self->_savepoint_transaction($request->{work});
+        my $external = $request->{work};
+        return $self->_savepoint_transaction(sub { my $depth = $self->_host_code_begin; return $external->(@_) });
     }
-    return $self->_transaction($request->{work});
+    my $work = $request->{work};
+    return $self->_transaction(sub { my $depth = $self->_host_code_begin; return $work->(@_) });
 }
+
+# Dialect hooks around host code Selecto calls into (a transaction callback,
+# a transaction_handler): PostgreSQL's SQL lint never inspects the host's
+# own statements (R48).
+sub _host_code_begin { return undef; }
+sub _host_code_end { return; }
 
 sub execute_write_unsafe {
     my ($self, $command) = @_;
@@ -4246,7 +4254,9 @@ sub _savepoint_transaction {
 sub _handler_transaction {
     my ($self, $handler, $operation) = @_;
     my ($ran, $value, $failure) = (0);
+    my $depth = $self->_host_code_begin;
     $handler->(sub {
+        $self->_host_code_end($depth);
         $ran = 1;
         my $ok = eval {
             Selecto::Error->throw('transaction_unavailable',

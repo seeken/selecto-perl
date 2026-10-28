@@ -627,20 +627,38 @@ sub _render {
     return "(($left) " . _op_sql($state, $node->{binary}, $node->{left}, $node->{right}) . ($quantified ? " $right)" : " ($right))");
 }
 
-# OPERATOR(schema.op): pg_catalog unless an operand is a column of an
-# extension member type with its own operator.
+# OPERATOR(schema.op). PostgreSQL's own resolution picks an extension
+# type's operator (citext = citext) only when both operands have that type,
+# or one has it and the other is an untyped parameter or literal (which takes
+# its type); a citext against text resolves to pg_catalog's text operator
+# (R48). The same choice is made here, whatever the operand order.
 sub _op_sql {
     my ($state, $op, $left, $right) = @_;
     return "OPERATOR($op->{schema}.$op->{op})" if $op->{explicit};
+    my @sides = map { _operand_class($state, $_, $op->{op}) } $left, $right;
+    my ($l, $r) = @sides;
     my $schema = 'pg_catalog';
-    for my $side ($left, $right) {
-        next unless $side && $side->{atom} && defined $side->{atom}{column};
-        my $key = $side->{atom}{column};
-        my $entry = $state->{columns}{$key};
-        $entry //= $state->{columns}{($key =~ /([^.]+)\z/)[0]} unless $key =~ /\./;
-        if (ref($entry) eq 'HASH' && defined $entry->{$op->{op}}) { $schema = $entry->{$op->{op}}; last }
-    }
+    if ($l->{schema} && $r->{schema} && $l->{schema} eq $r->{schema}) { $schema = $l->{schema} }
+    elsif ($l->{schema} && $r->{untyped}) { $schema = $l->{schema} }
+    elsif ($r->{schema} && $l->{untyped}) { $schema = $r->{schema} }
     return "OPERATOR($schema.$op->{op})";
+}
+
+# An operand: {schema => <the extension schema of its type's operator op>}
+# for a column of an extension member type, {untyped => 1} for a bare
+# parameter or string literal (or a missing operand of a prefix operator),
+# else {} (a known non-extension type, or an expression).
+sub _operand_class {
+    my ($state, $side, $op) = @_;
+    return {untyped => 1} unless $side;
+    return {} unless $side->{atom};
+    my $atom = $side->{atom};
+    return {untyped => 1} if !defined($atom->{column}) && $atom->{sql} =~ /\A(?:\$\d+|\?|'(?:[^']|'')*')\z/;
+    return {} unless defined $atom->{column};
+    my $key = $atom->{column};
+    my $entry = $state->{columns}{$key};
+    $entry //= $state->{columns}{$key} unless $key =~ /\./;
+    return ref($entry) eq 'HASH' && defined($entry->{$op}) ? {schema => $entry->{$op}} : {};
 }
 
 sub _unquote {

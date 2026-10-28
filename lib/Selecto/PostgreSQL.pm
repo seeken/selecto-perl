@@ -104,6 +104,17 @@ sub _with_relations {
 
 sub stream_query {
     my ($self, $statement, %options) = @_;
+    if ($ENV{SELECTO_PG_SQL_LINT} && _pg_hand_built($statement)) {
+        local $self->{_selecto_pg_host_statement} = $statement->sql;
+        return $self->_lint_scope(sub { $self->_stream_query_linted($statement, %options) });
+    }
+    return $self->_lint_scope(sub { $self->_stream_query_linted($statement, %options) })
+        if $ENV{SELECTO_PG_SQL_LINT} && !$self->{dbh}{private_selecto_lint_depth};
+    return $self->_stream_query_linted($statement, %options);
+}
+
+sub _stream_query_linted {
+    my ($self, $statement, %options) = @_;
     unless ($options{bounded}) {
         # DBD::Pg runs the whole statement and buffers its rows at execute,
         # so the session check right after it covers every row.
@@ -346,6 +357,19 @@ sub supports {
 # scale), a boolean is a JSON::PP boolean and json/jsonb is the decoded JSON
 # value; every other value is canonical. Export scalars are decoded in Perl.
 sub execute_query {
+    my ($self, $statement, %options) = @_;
+    if ($ENV{SELECTO_PG_SQL_LINT} && _pg_hand_built($statement)) {
+        # The host's own statement: Selecto's guard SQL around it is still
+        # linted, the host's SQL is not (see _query_transport_sql).
+        local $self->{_selecto_pg_host_statement} = $statement->sql;
+        return $self->_lint_scope(sub { $self->_execute_query_linted($statement, %options) });
+    }
+    return $self->_lint_scope(sub { $self->_execute_query_linted($statement, %options) })
+        if $ENV{SELECTO_PG_SQL_LINT} && !$self->{dbh}{private_selecto_lint_depth};
+    return $self->_execute_query_linted($statement, %options);
+}
+
+sub _execute_query_linted {
     my ($self, $statement, %options) = @_;
     # Session state around the read (items 56, 61): see Session state.
     return $self->_guarded_read($statement,
@@ -1823,6 +1847,20 @@ sub _pg_write_target {
 
 sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
 
+# A statement Selecto compiled (or derived from one) carries its recorded
+# relations and is qualified; a host's hand-built Statement is the host's
+# own SQL and is sent exactly as written (R48), outside the lint.
+sub _query_transport_sql {
+    my ($self, $statement) = @_;
+    return $statement->sql if _pg_hand_built($statement);
+    return $self->_statement_sql($statement->sql);
+}
+
+sub _pg_hand_built {
+    my ($statement) = @_;
+    return blessed($statement) && $statement->can('relations') && !defined($statement->relations) ? 1 : 0;
+}
+
 # The statement as executed: every operator and pg_catalog function
 # qualified (R46/R47). SELECTO_PG_SQL_LINT=1 makes any construct left to the
 # session's lookup a hard error (the lint the test suite runs under).
@@ -1837,6 +1875,76 @@ sub _statement_sql {
         die "SELECTO_PG_SQL_LINT: @problems in: $qualified\n" if @problems;
     }
     return $qualified;
+}
+
+# ---- SQL lint (SELECTO_PG_SQL_LINT=1, the test suite's corpus check) ------
+#
+# Under the lint, every statement Selecto itself executes on the handle,
+# business SQL and its guard and catalog SQL alike (R48), must resolve no
+# operator or pg_catalog function through the session; any that does dies.
+# Only Selecto's own work is inspected: the host's statements, including
+# those a transaction callback or transaction_handler runs, never are.
+my %LINT_SKIP = map { ($_ => 1) } qw(SAVEPOINT RELEASE ROLLBACK BEGIN COMMIT SET LOCK DECLARE FETCH CLOSE DEALLOCATE);
+sub _lint_scope {
+    my ($self, $work) = @_;
+    my $dbh = $self->{dbh};
+    return $work->() unless $ENV{SELECTO_PG_SQL_LINT} && $self->_pg_session_checked;
+    unless ($dbh->{private_selecto_lint_hooked}) {
+        $dbh->{private_selecto_lint_hooked} = 1;
+        my $adapter = $self;
+        Scalar::Util::weaken($adapter);
+        my $check = sub {
+            my ($handle, $sql) = @_;
+            return unless $handle->{private_selecto_lint_depth};
+            return unless defined($sql) && !ref($sql) && $adapter;
+            my ($first) = $sql =~ /\A\s*([A-Za-z]+)/;
+            return if $first && $LINT_SKIP{uc $first};
+            # The host's own statement (raw, or inside a stream's cursor).
+            my $host = $adapter->{_selecto_pg_host_statement};
+            return if defined($host) && index($sql, $host) >= 0;
+            require Selecto::PostgreSQL::Qualify;
+            local $handle->{private_selecto_lint_depth} = 0;
+            my @problems = Selecto::PostgreSQL::Qualify::lint($sql, $adapter->_pg_catalog_functions);
+            die "SELECTO_PG_SQL_LINT: @problems in: $sql\n" if @problems;
+        };
+        my %callbacks = %{$dbh->{Callbacks} // {}};
+        my %child = %{$callbacks{ChildCallbacks} // {}};
+        my $prior_execute = $child{execute};
+        $child{execute} = sub { $check->($_[0]{Database}, $_[0]{Statement}); return $prior_execute ? $prior_execute->(@_) : () };
+        my $prior_do = $callbacks{do};
+        $callbacks{do} = sub { $check->($_[0], $_[1]); return $prior_do ? $prior_do->(@_) : () };
+        $callbacks{ChildCallbacks} = \%child;
+        $dbh->{Callbacks} = \%callbacks;
+    }
+    local $dbh->{private_selecto_lint_depth} = 1;
+    return $work->();
+}
+
+sub _host_code_begin {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return undef unless eval { $dbh->isa('DBI::db') };
+    my $depth = $dbh->{private_selecto_lint_depth};
+    $dbh->{private_selecto_lint_depth} = 0;
+    return $depth;
+}
+
+sub _host_code_end {
+    my ($self, $depth) = @_;
+    my $dbh = $self->{dbh};
+    $dbh->{private_selecto_lint_depth} = $depth if eval { $dbh->isa('DBI::db') };
+    return;
+}
+
+for my $method (qw(compile preview_write execute_write execute_batch execute_graph execute_transaction
+    execute_write_unsafe execute_batch_unsafe execute_graph_unsafe)) {
+    no strict 'refs';
+    my $inherited = Selecto::SQL->can($method) or next;
+    next if defined &{"Selecto::PostgreSQL::$method"};
+    *{"Selecto::PostgreSQL::$method"} = sub {
+        my ($self, @args) = @_;
+        return $self->_lint_scope(sub { $self->$inherited(@args) });
+    };
 }
 
 # pg_catalog's function names, once per connection (pg_catalog is fixed for
