@@ -49,7 +49,7 @@ sub new {
         # host transaction, the host's own statements see the pinned values.
         if ($adapter->_pg_session_checked) {
             $adapter->_pg_check_relations($args{statement});
-            $self->{pin} = $adapter->_pg_pin_search_path(0);
+            $self->{pin} = $adapter->_pg_pin_search_path(0, $args{statement});
             $self->{session} = $adapter->_pg_admit_session($args{statement});
         }
         my $declaration = $dbh->prepare('DECLARE ' . $name . ' NO SCROLL CURSOR WITHOUT HOLD FOR '

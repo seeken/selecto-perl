@@ -99,6 +99,8 @@ sub _with_relations {
         $names{$_} = 1 for @$list;
     }
     $derived->{_selecto_relations} = [sort keys %names];
+    my %declared = map { ($_ => 1) } map { @{$_->{_selecto_declared_schemas} // []} } grep { blessed($_) } @sources;
+    $derived->{_selecto_declared_schemas} = [sort keys %declared];
     return $derived;
 }
 
@@ -1454,6 +1456,13 @@ sub _unquote_identifier {
     return lc $text;
 }
 
+# The schemas a compiled statement's read declared (a tenant prefix).
+sub _pg_declared_schemas {
+    my ($source) = @_;
+    my $list = blessed($source) ? $source->{_selecto_declared_schemas} : ref($source) eq 'HASH' ? $source->{declared_schemas} : undef;
+    return ref($list) eq 'ARRAY' ? grep { defined && length } @$list : ();
+}
+
 sub _pg_check_relations {
     my ($self, $source) = @_;
     my $recorded = blessed($source) && $source->can('relations') ? $source->relations
@@ -1502,7 +1511,10 @@ sub _pg_check_relations {
     }
     return unless @tables;
     local $self->{_selecto_relation_schemas} = {};
-    my @reset = $self->_pg_reset_schemas;
+    # Declared (prefix) schemas first: the host's explicit choice (R43).
+    my @declared = _pg_declared_schemas($source);
+    my %declared = map { ($_ => 1) } @declared;
+    my @reset = (@declared, $self->_pg_reset_schemas);
     my $rows;
     my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($CHECK_SQL, undef, \@schemas, \@tables, \@reset); 1 };
     die $self->normalize_error($@) unless $ok && ref($rows) eq 'ARRAY';
@@ -1523,8 +1535,11 @@ sub _pg_check_relations {
                     unless defined($fixed) && defined($pinned) && "$fixed" eq "$pinned";
             }
             my $target = $fixed;
+            # A relation in a declared schema is the host's explicit choice:
+            # the host's current search_path does not decide it.
             $refuse->('relation_ambiguous', "the host's search_path resolves the relation differently from Selecto's pinned resolution", $table)
-                if defined($current) && defined($target) && "$current" ne "$target" && !(defined($temp) && "$current" eq "$temp");
+                if !$declared{$schemas[$ord - 1]}
+                    && defined($current) && defined($target) && "$current" ne "$target" && !(defined($temp) && "$current" eq "$temp");
         } else {
             $refuse->('relation_ambiguous', "the host's search_path resolves the relation differently from Selecto's pinned resolution", $table)
                 if defined($current) && defined($pinned) && "$current" ne "$pinned" && !(defined($temp) && "$current" eq "$temp");
@@ -1591,10 +1606,12 @@ sub _relation_sql {
 my @PINNED_SETTINGS = map { [$_ => undef] }
     qw(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings timezone_abbreviations);
 sub _pg_pin_search_path {
-    my ($self, $session) = @_;
+    my ($self, $session, $source) = @_;
     my $local = $session ? 'false' : 'true';
     local $self->{_selecto_relation_schemas} = {};
-    my @schemas = $self->_pg_reset_schemas;
+    my @declared = _pg_declared_schemas($source);
+    my %seen;
+    my @schemas = grep { !$seen{$_}++ } @declared, $self->_pg_reset_schemas;
     my $pinned = join(', ', 'pg_catalog', (map { _quote_path_schema($_) } @schemas), 'pg_temp');
     my @pins = (['search_path' => $pinned], @PINNED_SETTINGS);
     # search_path takes the resolved pin; every other setting its reset
@@ -1769,7 +1786,7 @@ sub _guarded_read {
     my ($pin, $before, $result);
     my $ok = eval {
         $self->_pg_check_relations($source);
-        $pin = $self->_pg_pin_search_path(!$savepoint);
+        $pin = $self->_pg_pin_search_path(!$savepoint, $source);
         $before = $self->_pg_admit_session($source);
         $result = $work->();
         1;
@@ -1907,13 +1924,14 @@ sub _lint_scope {
             my @problems = Selecto::PostgreSQL::Qualify::lint($sql, $adapter->_pg_catalog_functions);
             die "SELECTO_PG_SQL_LINT: @problems in: $sql\n" if @problems;
         };
+        # prepare sees every statement (selectrow_array and friends prepare
+        # internally; a ChildCallbacks execute hook would miss those), and do
+        # without parameters runs without one.
         my %callbacks = %{$dbh->{Callbacks} // {}};
-        my %child = %{$callbacks{ChildCallbacks} // {}};
-        my $prior_execute = $child{execute};
-        $child{execute} = sub { $check->($_[0]{Database}, $_[0]{Statement}); return $prior_execute ? $prior_execute->(@_) : () };
-        my $prior_do = $callbacks{do};
-        $callbacks{do} = sub { $check->($_[0], $_[1]); return $prior_do ? $prior_do->(@_) : () };
-        $callbacks{ChildCallbacks} = \%child;
+        for my $method (qw(prepare do)) {
+            my $prior = $callbacks{$method};
+            $callbacks{$method} = sub { $check->($_[0], $_[1]); return $prior ? $prior->(@_) : () };
+        }
         $dbh->{Callbacks} = \%callbacks;
     }
     local $dbh->{private_selecto_lint_depth} = 1;
@@ -1965,7 +1983,8 @@ sub _pg_catalog_functions {
     return \%names;
 }
 
-# Columns of extension member types (citext and the like) of the relations
+# Columns of extension member types (citext and the like), or of domains
+# over one (the typbasetype chain is followed down to the base type), of the relations
 # the statement names, with the schema of each operator their own extension
 # defines for the type (never a user operator someone added beside it), so
 # their comparisons keep the extension's semantics: {"alias.col" or "col" =>
@@ -1974,7 +1993,13 @@ my $EXTENSION_OPERATORS_SQL = q{SELECT CAST(r.alias AS pg_catalog.text), CAST(a.
       CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
     FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS r(rel, alias)
     JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.rel) AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
-    JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) a.atttypid
+    JOIN LATERAL (WITH RECURSIVE b(oid, depth) AS (
+        SELECT a.atttypid, 0
+        UNION ALL
+        SELECT t.typbasetype, b.depth OPERATOR(pg_catalog.+) 1 FROM pg_catalog.pg_type t JOIN b ON t.oid OPERATOR(pg_catalog.=) b.oid
+        WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND b.depth OPERATOR(pg_catalog.<) 16)
+      SELECT b.oid FROM b ORDER BY b.depth DESC LIMIT 1) AS base ON TRUE
+    JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) base.oid
     JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
       AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'
     JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) ty.oid AND o.oprright OPERATOR(pg_catalog.=) ty.oid
@@ -1986,35 +2011,31 @@ sub _pg_extension_operators {
     my ($self, $sql) = @_;
     require Selecto::PostgreSQL::Qualify;
     my $tokens = eval { Selecto::PostgreSQL::Qualify::tokenize($sql) } or return {};
-    # Relations as the SQL names them, schema-qualified, with their alias
-    # (or the bare relation name for an unaliased write target).
-    my (@rels, @aliases);
+    # Every schema-qualified relation the SQL names (generated SQL always
+    # qualifies them, R23b); the qualifier resolves column references to
+    # these by query scope.
+    my %rels;
     for my $k (0 .. $#$tokens - 2) {
         next unless $tokens->[$k][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 1][1] eq '.' && $tokens->[$k + 2][0] =~ /\A(?:id|qid)\z/;
         next if $k > 0 && $tokens->[$k - 1][1] eq '.';
         my $after = $k + 3 < @$tokens ? $tokens->[$k + 3] : undef;
-        next if $after && $after->[1] eq '(';
-        my $rel = "$tokens->[$k][1].$tokens->[$k + 2][1]";
-        my $alias = $after && uc($after->[1]) eq 'AS' && $k + 4 < @$tokens ? $tokens->[$k + 4][1]
-            : $after && $after->[0] eq 'qid' ? $after->[1] : '';
-        $alias =~ s/\A"((?:[^"]|"")*)"\z/$1/ and $alias =~ s/""/"/g;
+        next if $after && ($after->[1] eq '(' || $after->[1] eq '.') && !($k > 0 && uc($tokens->[$k - 1][1]) eq 'INTO');
         my $prev = $k > 0 ? uc($tokens->[$k - 1][1]) : '';
         next unless $prev =~ /\A(?:FROM|JOIN|INTO|UPDATE|ONLY|\(|,)\z/;
-        push @rels, $rel;
-        push @aliases, $alias;
+        $rels{"$tokens->[$k][1].$tokens->[$k + 2][1]"} = 1;
     }
-    return {} unless @rels;
+    return {} unless %rels;
+    my @rels = sort keys %rels;
     my $rows;
-    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@aliases); 1 };
+    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@rels); 1 };
     die $self->normalize_error($@) unless $ok;
-    my %columns;
+    my %relations;
     for my $row (@{$rows // []}) {
-        my ($alias, $column, $op, $schema) = @$row;
-        my $quoted = '"' . ($schema =~ s/"/""/gr) . '"';
-        $columns{lc $column}{$op} //= $quoted;
-        $columns{lc("$alias.$column")}{$op} = $quoted if length $alias;
+        my ($rel, $column, $op, $schema) = @$row;
+        my $key = lc join '.', map { s/\A"((?:[^"]|"")*)"\z/$1/r =~ s/""/"/gr } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $rel;
+        $relations{$key}{lc $column}{$op} = '"' . ($schema =~ s/"/""/gr) . '"';
     }
-    return \%columns;
+    return %relations ? {relations => \%relations} : {};
 }
 
 1;

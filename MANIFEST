@@ -80,6 +80,7 @@ t/pg_bound_delete_lock_live.t
 t/pg_graph_bound_descendants_live.t
 t/pg_review_round3_live.t
 t/pg_operator_qualification_live.t
+t/pg_extension_scope_live.t
 t/pg_post_image_reread_live.t
 t/pg_session_state_live.t
 t/host_transaction_refusal_live.t
