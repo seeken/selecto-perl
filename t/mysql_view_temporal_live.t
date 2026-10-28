@@ -112,6 +112,27 @@ for my $backend (@backends) {
         is($got, $want, "$name: a view aliasing a table like a decoy takes the aliased table's type ($type tenant)");
     }
     $dbh->do($_) for 'DROP VIEW IF EXISTS svt_keys', 'DROP TABLE IF EXISTS svt_items', 'DROP TABLE IF EXISTS svt_dd';
+
+    # R40d amendment: without proof, a text or temporal view column is never
+    # taken at its reported type, even with no TIMESTAMP base table; and a
+    # backslash in a view literal makes the scan uncertain.
+    $dbh->do($_) for 'DROP VIEW IF EXISTS svt_txt', 'DROP TABLE IF EXISTS svt_plain',
+        'CREATE TABLE svt_plain (id INT PRIMARY KEY, org_key VARCHAR(20), dt DATETIME NULL) ENGINE=InnoDB',
+        q{INSERT INTO svt_plain VALUES (1, 't1', '2023-01-01 00:00:00'), (2, 'T1', '2023-01-01 00:00:00')};
+    for my $view ([q{SELECT p.id, LOWER(p.org_key) AS org_key, p.dt FROM svt_plain p}, 'a computed text column'],
+        [q{SELECT p.id, p.org_key AS org_key, p.dt, 'a\\\\b' AS note FROM svt_plain p}, 'a backslash literal in the view']) {
+        $dbh->do('DROP VIEW IF EXISTS svt_txt');
+        $dbh->do("CREATE VIEW svt_txt AS $view->[0]");
+        my $engine = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $dbh)), scope => {tenant => 't1'},
+            domain => Selecto::Domain->parse({schema_version => 1, name => 'Txt', source => {source_table => 'svt_txt', primary_key => 'id',
+                tenant_field => 'org_key', fields => [qw(id org_key)], columns => {id => {type => 'integer'}, org_key => {type => 'string'}},
+                associations => {}}, schemas => {}, joins => {}}));
+        my $rows = eval { [map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}}] };
+        my $got = $rows ? 'ok ' . join(',', @$rows)
+            : blessed($@) ? $@->code . '/' . ((ref($@->details) eq 'HASH' ? $@->details->{reason} : undef) // '') : "died: $@";
+        is($got, 'query_rule_not_evaluable/view_column_unproven', "$name: a tenant compare on $view->[1] is refused");
+    }
+    $dbh->do($_) for 'DROP VIEW IF EXISTS svt_txt', 'DROP TABLE IF EXISTS svt_plain';
     $dbh->disconnect;
 }
 done_testing;

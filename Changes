@@ -53,6 +53,11 @@ Unreleased
       writes. Deferrable internal rechecks count too unless they are
       foreign-key triggers or unique/exclusion rechecks whose operator
       classes and operators are all pg_catalog's (R32).
+    - MySQL-family views (R40d amendment): without a passthrough proof, a
+      text or temporal view column is never taken at its reported type, even
+      when no base table has a TIMESTAMP; and a backslash in any literal of
+      the view definition makes the scan uncertain (no proof). Such a column
+      in scope is refused (query_rule_not_evaluable, view_column_unproven).
     - PostgreSQL operator and function qualification (R46 FINAL-2, R47):
       every statement the adapter executes passes through one qualifying
       emitter (Selecto::PostgreSQL::Qualify). Every operator is written
