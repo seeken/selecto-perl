@@ -79,9 +79,14 @@ sub compile {
     my $top = ref($self->{_selecto_relation_sink}) ne 'HASH';
     local $self->{_selecto_relation_sink} = $top ? {} : $self->{_selecto_relation_sink};
     local $self->{_selecto_relation_schemas} = $top ? {} : $self->{_selecto_relation_schemas};
+    # Schemas the host declared for the read (a tenant prefix): its explicit
+    # choice, which the PostgreSQL session checks resolve under (R43).
+    local $self->{_selecto_declared_sink} = $top ? {} : $self->{_selecto_declared_sink};
     my $statement = $self->_compile_query($domain, $query);
-    $statement->{_selecto_relations} = [sort keys %{$self->{_selecto_relation_sink}}]
-        if $top && blessed($statement) && $statement->isa('Selecto::Statement');
+    if ($top && blessed($statement) && $statement->isa('Selecto::Statement')) {
+        $statement->{_selecto_relations} = [sort keys %{$self->{_selecto_relation_sink}}];
+        $statement->{_selecto_declared_schemas} = [sort keys %{$self->{_selecto_declared_sink}}];
+    }
     # Selecto::Engine::compile admits these parameters itself, with the same
     # limits, code and label, as soon as this returns.
     $self->admit_parameters(
@@ -643,6 +648,7 @@ sub _nullif_sql { my ($self, $value, $null) = @_; return "NULLIF($value, $null)"
 # (PostgreSQL names the schema it resolves to, R23b).
 sub _relation_sql {
     my ($self, $prefix, $table) = @_;
+    $self->{_selecto_declared_sink}{"$prefix"} = 1 if defined($prefix) && ref($self->{_selecto_declared_sink}) eq 'HASH';
     return (defined($prefix) ? $self->quote_identifier($prefix) . '.' : '') . $self->quote_identifier($table);
 }
 
@@ -4063,7 +4069,9 @@ sub _bounded_write_command {
         unless $lockable;
     my @params;
     my $where = $self->_compile_write_predicate($predicate, \@params);
-    my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
+    # The relation as the write's own statement names it (PostgreSQL:
+    # schema-qualified, so the probe resolves and types exactly as the DML).
+    my $table = $self->_relation_sql(undef, Selecto::Identifier::checked($command->relation));
     my $columns = join(', ', map { $self->quote_identifier($_) } @keys);
     my $probe_limit = $limit + 1;
     # PostgreSQL locks and then names the rows by (tableoid, ctid): exact

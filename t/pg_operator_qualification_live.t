@@ -197,6 +197,24 @@ ok((grep { /r47_items/ && /\bOPERATOR\(/ } @prepared), 'the corpus holds the bus
 ok(!%bad, 'no executed statement resolves an operator or function through the session')
     or diag join "\n", map { "$bad{$_}: $_" } sort keys %bad;
 
+# The lint covers Selecto's own guard SQL (review M2): a bare operator in a
+# guard statement fails it.
+{
+    my $dbh = $connect->();
+    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh)))
+        ->with_scope(tenant => 't1');
+    no warnings 'redefine';
+    my $original = \&Selecto::PostgreSQL::_pg_reset_schemas;
+    local *Selecto::PostgreSQL::_pg_reset_schemas = sub {
+        my ($self) = @_;
+        $self->{dbh}->selectrow_array(q{SELECT 1 WHERE (2 & 3) <> 0});
+        return $original->(@_);
+    };
+    like($outcome->(sub { scalar @{$engine->all($engine->query->select('id'))->{rows}} }), qr/SELECTO_PG_SQL_LINT: bare operator/,
+        'a bare operator in guard SQL fails the lint');
+    $dbh->disconnect;
+}
+
 $admin->do($_) for 'DROP TABLE r47_items, r47_links, r47_accs, r47_tags CASCADE', 'DROP TYPE r47_en', 'DROP DOMAIN r47_dom';
 $admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r47ext CASCADE');
 done_testing;

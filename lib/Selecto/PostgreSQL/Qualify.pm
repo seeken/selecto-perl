@@ -75,7 +75,10 @@ sub tokenize {
                 {reason => 'sql_unqualifiable'});
         }
     }
-    return [grep { $_->[0] ne 'ws' } @tokens];
+    my @significant = grep { $_->[0] ne 'ws' } @tokens;
+    # Each token keeps its position, so slices still name it.
+    $significant[$_][2] = $_ for 0 .. $#significant;
+    return \@significant;
 }
 
 # ---- Parsing into a light tree --------------------------------------------
@@ -94,6 +97,9 @@ sub qualify {
     my ($sql, $functions, $columns) = @_;
     my $state = new_state($functions, $columns);
     my $tokens = tokenize($sql);
+    # $columns: {relations => {lc "schema.table" => {lc column => {op => schema}}}}
+    # (columns of extension member types, or domains over one, by relation).
+    $state->{scopes} = _scopes($tokens) if ref($columns) eq 'HASH' && ref($columns->{relations}) eq 'HASH' && %{$columns->{relations}};
     my $pos = 0;
     my $out = _sequence($state, $tokens, \$pos, undef);
     Selecto::Error->throw('query_rule_not_evaluable', 'generated SQL has unbalanced parentheses',
@@ -426,6 +432,7 @@ sub _atom {
         $sql = "($inner)";
     } elsif ($type eq 'id' && !$KEYWORD{$up} || $type eq 'qid') {
         # A name chain: a.b.c, possibly a function call.
+        my $start = $token->[2];
         my @names = ($text);
         my @kinds = ($type);
         $$pos++;
@@ -461,7 +468,7 @@ sub _atom {
             }
         } else {
             $sql = join '.', @names;
-            $column = lc(join '.', map { _unquote($_) } @names);
+            $column = {names => [map { _unquote($_) } @names], at => $start};
         }
     } else {
         return undef;
@@ -654,11 +661,210 @@ sub _operand_class {
     return {} unless $side->{atom};
     my $atom = $side->{atom};
     return {untyped => 1} if !defined($atom->{column}) && $atom->{sql} =~ /\A(?:\$\d+|\?|'(?:[^']|'')*')\z/;
-    return {} unless defined $atom->{column};
-    my $key = $atom->{column};
-    my $entry = $state->{columns}{$key};
-    $entry //= $state->{columns}{$key} unless $key =~ /\./;
+    return {} unless ref($atom->{column}) eq 'HASH' && $state->{scopes};
+    my $entry = _resolve_column($state, $atom->{column}{at}, $atom->{column}{names});
     return ref($entry) eq 'HASH' && defined($entry->{$op}) ? {schema => $entry->{$op}} : {};
+}
+
+# ---- Column sources by query scope (R48 / review M1) ----------------------
+#
+# A column reference resolves through the scope it appears in: its alias
+# names a relation, a CTE or a derived table (a subquery, a LATERAL join, a
+# member) of that scope or an enclosing one. A CTE's or derived table's
+# output passes its source column's type on when its select item is that
+# column, so citext keeps its operators through member CTEs and laterals,
+# and a reused alias ("s0" in a CTE body and in the outer query) resolves to
+# its own scope's relation.
+
+sub _scopes {
+    my ($tokens) = @_;
+    my (@scope_of, @depth_of, %opens, %closes, @scopes, %cte);
+    @scopes = ({parent => undef, aliases => {}, items => [], depth => 0, select => undef});
+    my @stack = ({scope => 0, open => undef});
+    for my $i (0 .. $#$tokens) {
+        my $t = $tokens->[$i];
+        if ($t->[0] eq 'punct' && $t->[1] eq '(') {
+            push @stack, {scope => $stack[-1]{scope}, open => $i};
+        } elsif ($t->[0] eq 'punct' && $t->[1] eq ')') {
+            my $frame = pop @stack;
+            $closes{$frame->{open}} = $i if defined $frame->{open};
+            @stack = ({scope => 0, open => undef}) unless @stack;
+        } elsif (_upper($t) eq 'SELECT') {
+            push @scopes, {parent => $stack[-1]{scope}, aliases => {}, items => [], depth => scalar(@stack), select => $i};
+            $stack[-1]{scope} = $#scopes;
+            $opens{$stack[-1]{open}} //= $#scopes if defined $stack[-1]{open};
+        }
+        $scope_of[$i] = $stack[-1]{scope};
+        $depth_of[$i] = scalar @stack;
+    }
+    my $state = {tokens => $tokens, scope_of => \@scope_of, depth_of => \@depth_of, opens => \%opens,
+        closes => \%closes, scopes => \@scopes, cte => \%cte};
+    my $name_at = sub {
+        my ($k) = @_;
+        my @names;
+        return (undef, $k) unless $k < @$tokens && $tokens->[$k][0] =~ /\A(?:id|qid)\z/;
+        push @names, _unquote($tokens->[$k][1]);
+        $k++;
+        while ($k + 1 < @$tokens && $tokens->[$k][1] eq '.' && $tokens->[$k + 1][0] =~ /\A(?:id|qid)\z/) {
+            push @names, _unquote($tokens->[$k + 1][1]);
+            $k += 2;
+        }
+        return (\@names, $k);
+    };
+    my $cols_at = sub {
+        my ($k) = @_;
+        return (undef, $k) unless $k < @$tokens && $tokens->[$k][1] eq '(';
+        my $end = $closes{$k} // return (undef, $k);
+        my @cols = map { _unquote($tokens->[$_][1]) } grep { $tokens->[$_][0] =~ /\A(?:id|qid)\z/ } $k + 1 .. $end - 1;
+        return (\@cols, $end + 1);
+    };
+    # CTEs: WITH [RECURSIVE] name [(cols)] AS [NOT] [MATERIALIZED] ( body ), ...
+    for my $i (0 .. $#$tokens) {
+        next unless _upper($tokens->[$i]) eq 'WITH';
+        my $k = $i + 1;
+        $k++ if _upper($tokens->[$k]) eq 'RECURSIVE';
+        while (1) {
+            my ($names, $after) = $name_at->($k);
+            last unless $names && @$names == 1;
+            my ($cols, $next) = $cols_at->($after);
+            $k = $next;
+            last unless _upper($tokens->[$k]) eq 'AS';
+            $k++;
+            $k++ if _upper($tokens->[$k]) eq 'NOT';
+            $k++ if _upper($tokens->[$k]) eq 'MATERIALIZED';
+            last unless $k < @$tokens && $tokens->[$k][1] eq '(';
+            $cte{lc $names->[0]} = {scope => $opens{$k}, cols => $cols};
+            $k = ($closes{$k} // last) + 1;
+            last unless $k < @$tokens && $tokens->[$k][1] eq ',';
+            $k++;
+        }
+    }
+    # Each scope's select items and FROM items.
+    my %stop = map { ($_ => 1) } qw(FROM WHERE GROUP ORDER LIMIT OFFSET UNION INTERSECT EXCEPT HAVING WINDOW FOR INTO RETURNING);
+    for my $id (1 .. $#scopes) {
+        my $scope = $scopes[$id];
+        my $depth = $depth_of[$scope->{select}];
+        my @item;
+        my $k = $scope->{select} + 1;
+        $k++ if _upper($tokens->[$k]) eq 'DISTINCT';
+        for (; $k < @$tokens; $k++) {
+            last if $depth_of[$k] < $depth;
+            if ($depth_of[$k] == $depth && $scope_of[$k] == $id) {
+                last if $stop{_upper($tokens->[$k])};
+                if ($tokens->[$k][1] eq ',') { push @{$scope->{items}}, [@item]; @item = (); next }
+            }
+            push @item, $k;
+        }
+        push @{$scope->{items}}, [@item] if @item;
+    }
+    for my $k (0 .. $#$tokens) {
+        my $up = _upper($tokens->[$k]);
+        next unless $up eq 'FROM' || $up eq 'JOIN' || $up eq 'UPDATE' || ($up eq 'INTO' && $k > 0 && _upper($tokens->[$k - 1]) eq 'INSERT');
+        my $scope = $scope_of[$k];
+        my $j = $k + 1;
+        while ($j < @$tokens) {
+            $j++ while $j < @$tokens && _upper($tokens->[$j]) =~ /\A(?:LATERAL|ONLY)\z/;
+            my ($source, $default);
+            if ($j < @$tokens && $tokens->[$j][1] eq '(') {
+                my $close = $closes{$j} // last;
+                $source = {derived => $opens{$j}};
+                $j = $close + 1;
+            } else {
+                my ($names, $after) = $name_at->($j);
+                last unless $names;
+                last if $after < @$tokens && $tokens->[$after][1] eq '(' && $up ne 'INTO';
+                $default = $names->[-1];
+                $source = @$names == 1 && $cte{lc $names->[0]} ? {cte => lc $names->[0]}
+                    : {relation => lc(join '.', @$names)};
+                $j = $after;
+            }
+            $j++ if _upper($tokens->[$j]) eq 'AS';
+            my $alias = $default;
+            if ($j < @$tokens && $tokens->[$j][0] =~ /\A(?:id|qid)\z/ && !($tokens->[$j][0] eq 'id' && _keyword($tokens->[$j][1]))) {
+                $alias = _unquote($tokens->[$j][1]);
+                $j++;
+            }
+            my ($cols, $next) = $cols_at->($j);
+            if ($cols && ($source->{derived} || $source->{cte})) { $source->{cols} = $cols; $j = $next }
+            $scopes[$scope]{aliases}{lc $alias} = $source if defined $alias;
+            last unless $up eq 'FROM' && $j < @$tokens && $tokens->[$j][1] eq ',';
+            $j++;
+        }
+    }
+    return $state;
+}
+
+sub _keyword { my ($word) = @_; return $KEYWORD{uc $word} || $CONSTANT{uc $word} }
+
+# The extension operators ({op => schema}) of the column a reference at token
+# $at names, or undef.
+sub _resolve_column {
+    my ($state, $at, $names, $guard) = @_;
+    my $scopes = $state->{scopes} or return undef;
+    return undef if ($guard // 0) > 16 || !@$names || @$names > 3;
+    my $scope = $scopes->{scope_of}[$at] // 0;
+    return _resolve_in($state, $scope, @$names > 1 ? lc $names->[-2] : undef, lc $names->[-1], ($guard // 0) + 1);
+}
+
+sub _resolve_in {
+    my ($state, $scope, $qualifier, $column, $guard) = @_;
+    my $info = $state->{scopes};
+    return undef if $guard > 16;
+    for (my $s = $scope; defined $s; $s = $info->{scopes}[$s]{parent}) {
+        my $aliases = $info->{scopes}[$s]{aliases};
+        my $source;
+        if (defined $qualifier) {
+            $source = $aliases->{$qualifier};
+        } elsif (keys(%$aliases) == 1) {
+            ($source) = values %$aliases;
+        }
+        next unless $source;
+        return _source_column($state, $source, $column, $guard + 1);
+    }
+    return undef;
+}
+
+sub _source_column {
+    my ($state, $source, $column, $guard) = @_;
+    my $info = $state->{scopes};
+    if (defined $source->{relation}) {
+        my $relations = $state->{columns}{relations};
+        my $columns = $relations->{$source->{relation}} // return undef;
+        return $columns->{$column};
+    }
+    my ($scope, $cols);
+    if (defined $source->{cte}) {
+        my $cte = $info->{cte}{$source->{cte}} // return undef;
+        ($scope, $cols) = ($cte->{scope}, $source->{cols} // $cte->{cols});
+    } else {
+        ($scope, $cols) = ($source->{derived}, $source->{cols});
+    }
+    return undef unless defined $scope;
+    my $items = $info->{scopes}[$scope]{items};
+    my $tokens = $info->{tokens};
+    for my $index (0 .. $#$items) {
+        my @t = map { $tokens->[$_] } @{$items->[$index]};
+        # A passthrough item: a [b.]c [[AS] name].
+        my @chain;
+        my $k = 0;
+        while ($k < @t && $t[$k][0] =~ /\A(?:id|qid)\z/) {
+            push @chain, _unquote($t[$k][1]);
+            $k++;
+            last unless $k < @t && $t[$k][1] eq '.';
+            $k++;
+        }
+        next unless @chain && @chain <= 3;
+        my $name = $chain[-1];
+        if ($k < @t) {
+            $k++ if _upper($t[$k]) eq 'AS';
+            next unless $k == $#t && $t[$k][0] =~ /\A(?:id|qid)\z/;
+            $name = _unquote($t[$k][1]);
+        }
+        my $output = ref($cols) eq 'ARRAY' && $index < @$cols ? $cols->[$index] : $name;
+        next unless lc($output) eq $column;
+        return _resolve_in($state, $scope, @chain > 1 ? lc $chain[-2] : undef, lc $chain[-1], $guard + 1);
+    }
+    return undef;
 }
 
 sub _unquote {
