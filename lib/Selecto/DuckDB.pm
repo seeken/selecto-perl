@@ -460,8 +460,10 @@ sub _required_native_sql {
     my $integer_sql = defined($text) && $text =~ /\A-?[0-9]+\z/ && $text !~ /\A-0+\z/ ? $native : $REFUSED_LITERAL;
     my $float_sql = defined($text) && $text =~ /\A-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/ ? $native : $REFUSED_LITERAL;
     my $decimal_sql = $REFUSED_LITERAL;
-    if (defined($text) && $text =~ /\A(-?)([0-9]+)(?:\.([0-9]+))?\z/ && !($1 && "$2" . ($3 // '') !~ /[1-9]/)) {
-        my ($whole, $fraction) = ($2, $3 // '');
+    my ($sign, $whole, $fraction) = defined($text) ? $text =~ /\A(-?)([0-9]+)(?:\.([0-9]+))?\z/ : ();
+    # Negative zero ('-0', '-0.00') is not plain notation (R3c2 FINAL).
+    if (defined($whole) && !($sign && ($whole . ($fraction // '')) !~ /[1-9]/)) {
+        $fraction //= '';
         $whole =~ s/\A0+(?=[0-9])//;
         $fraction =~ s/0+\z//;
         my ($digits, $scale) = ($whole eq '0' ? 0 : length($whole), length($fraction));
