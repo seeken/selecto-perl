@@ -53,7 +53,7 @@ subtest 'on: one named statement per SQL text' => sub {
     my $sql = $scoped->compile($scoped->query->select('title')->order_by('id'))->sql;
     my $statements = $prepared->($dbh);
     is scalar(@$statements), 1, 'one named statement on the server';
-    is $statements->[0][1], $sql, 'for exactly the compiled SQL';
+    is $statements->[0][1], $scoped->adapter->_statement_sql($sql), 'for exactly the compiled SQL as executed (operators qualified, R47)';
     Selecto::PostgreSQL::StatementCache->forget($dbh);
     $dbh->do('DEALLOCATE ALL');
 };

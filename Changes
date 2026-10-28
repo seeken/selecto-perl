@@ -53,13 +53,25 @@ Unreleased
       writes. Deferrable internal rechecks count too unless they are
       foreign-key triggers or unique/exclusion rechecks whose operator
       classes and operators are all pg_catalog's (R32).
-    - PostgreSQL operator and function shadows (R46). Behaviour change: while
-      any schema of the reset search_path holds an operator or function that
-      is not an extension member and is named like one of pg_catalog's (a
-      user public.=(varchar, varchar) would beat pg_catalog's text = text by
-      exact type match), every Selecto statement is refused
-      (query_rule_not_evaluable, reason operator_shadow). Extension members
-      (citext and the like) keep their native semantics.
+    - PostgreSQL operator and function qualification (R46 FINAL-2, R47):
+      every statement the adapter executes passes through one qualifying
+      emitter (Selecto::PostgreSQL::Qualify). Every operator is written
+      OPERATOR(pg_catalog.op) with both operands parenthesized as
+      PostgreSQL's precedence groups them; for a column of an extension
+      member type (citext and the like) the operator of that type's own
+      extension is used, so its semantics are kept. Every pg_catalog
+      function call is schema-qualified. IN lists, IN subqueries, BETWEEN,
+      LIKE/ILIKE (with ESCAPE through pg_catalog.like_escape), IS [NOT]
+      DISTINCT FROM, NULLIF and simple CASE are rewritten with explicit
+      operators. A user operator or function that matches an operand type
+      exactly (public.=(varchar, varchar), public.lower(varchar)) can no
+      longer answer a scope compare. Compiled SQL (Statement->sql,
+      preview_write) is unchanged; the executed text differs.
+      SELECTO_PG_SQL_LINT=1 makes any executed statement that still
+      resolves an operator or function through the session a hard error;
+      t/pg_operator_qualification_live.t lints every executed statement of a
+      corpus. The interim detection-based refusal (operator_shadow) is
+      withdrawn.
     - PostgreSQL per-statement relation checks (R41, R42): before every
       statement's pin, each recorded relation must still be what the reset
       search_path resolves its name to (a SET ROLE or changed reset value
