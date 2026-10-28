@@ -1375,17 +1375,36 @@ sub execute_transaction {
         Selecto::Error->throw('invalid_adapter', 'protected rules require an open host transaction')
             unless $self->_transaction_open;
         my $external = $request->{work};
-        return $self->_savepoint_transaction(sub { my $depth = $self->_host_code_begin; return $external->(@_) });
+        return $self->_savepoint_transaction(sub { return $self->_in_host_code($external, @_) });
     }
     my $work = $request->{work};
-    return $self->_transaction(sub { my $depth = $self->_host_code_begin; return $work->(@_) });
+    return $self->_transaction(sub { return $self->_in_host_code($work, @_) });
 }
 
 # Dialect hooks around host code Selecto calls into (a transaction callback,
 # a transaction_handler): PostgreSQL's SQL lint never inspects the host's
-# own statements (R48).
+# own statements (R48). Every begin is paired with an end, on success and on
+# failure, so Selecto's own statements after the host code are linted again.
 sub _host_code_begin { return undef; }
 sub _host_code_end { return; }
+
+# Runs host code in the caller's context between the two hooks.
+sub _in_host_code {
+    my ($self, $code, @args) = @_;
+    my $want = wantarray;
+    my $depth = $self->_host_code_begin;
+    my @result;
+    my $ok = eval {
+        if ($want) { @result = $code->(@args) }
+        elsif (defined $want) { $result[0] = $code->(@args) }
+        else { $code->(@args) }
+        1;
+    };
+    my $error = $@;
+    $self->_host_code_end($depth);
+    die $error unless $ok;
+    return $want ? @result : $result[0];
+}
 
 sub execute_write_unsafe {
     my ($self, $command) = @_;
@@ -4263,22 +4282,31 @@ sub _handler_transaction {
     my ($self, $handler, $operation) = @_;
     my ($ran, $value, $failure) = (0);
     my $depth = $self->_host_code_begin;
-    $handler->(sub {
-        $self->_host_code_end($depth);
-        $ran = 1;
-        my $ok = eval {
-            Selecto::Error->throw('transaction_unavailable',
-                'transaction_handler ran the write outside a transaction', {reason => 'autocommit'})
-                unless $self->_transaction_open;
-            # The write's own savepoint inside the handler's transaction: a
-            # write refused after its statement undoes itself even when the
-            # handler (or the host around it) goes on to commit.
-            $value = $self->_handler_unit($operation);
-            1;
-        };
-        unless ($ok) { $failure = $@; die $failure }
-        return $value;
-    });
+    my $handled = eval {
+        $handler->(sub {
+            # Selecto's own write inside the handler, then back to host code.
+            $self->_host_code_end($depth);
+            $ran = 1;
+            my $ok = eval {
+                Selecto::Error->throw('transaction_unavailable',
+                    'transaction_handler ran the write outside a transaction', {reason => 'autocommit'})
+                    unless $self->_transaction_open;
+                # The write's own savepoint inside the handler's transaction: a
+                # write refused after its statement undoes itself even when the
+                # handler (or the host around it) goes on to commit.
+                $value = $self->_handler_unit($operation);
+                1;
+            };
+            $failure = $@ unless $ok;
+            $self->_host_code_begin;
+            die $failure unless $ok;
+            return $value;
+        });
+        1;
+    };
+    my $handler_error = $@;
+    $self->_host_code_end($depth);
+    die $handler_error unless $handled;
     Selecto::Error->throw('invalid_adapter', 'transaction handler did not run the write')
         unless $ran;
     # A handler that swallowed the write's failure (and perhaps committed)

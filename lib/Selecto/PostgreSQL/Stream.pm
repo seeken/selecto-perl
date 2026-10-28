@@ -48,9 +48,12 @@ sub new {
         # compared with it (items 56, 61). While a stream is open inside a
         # host transaction, the host's own statements see the pinned values.
         if ($adapter->_pg_session_checked) {
-            $adapter->_pg_check_relations($args{statement});
-            $self->{pin} = $adapter->_pg_pin_search_path(0, $args{statement});
-            $self->{session} = $adapter->_pg_admit_session($args{statement});
+            {
+                local $adapter->{_selecto_reset_operation} = {};
+                $adapter->_pg_check_relations($args{statement});
+                $self->{pin} = $adapter->_pg_pin_search_path(0, $args{statement});
+            }
+            $self->{session} = $adapter->_pg_admit_session($args{statement}, read => 1);
         }
         my $declaration = $dbh->prepare('DECLARE ' . $name . ' NO SCROLL CURSOR WITHOUT HOLD FOR '
             . $adapter->_query_transport_sql($args{statement}));
@@ -96,7 +99,7 @@ sub next {
         # function the statement calls may have switched search_path or made
         # a temp relation while the server produced it.
         if ($self->{session}) {
-            my $after = eval { $self->{adapter}->_pg_session_state };
+            my $after = eval { $self->{adapter}->_pg_session_state(undef, read => 1) };
             unless ($after && $after->{snapshot} eq $self->{session}{snapshot}) {
                 $self->{session_changed} = 1;
                 die 'session state changed';

@@ -1290,7 +1290,7 @@ my $DEFERRABLE_COUNT = '(SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
     . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c WHERE c.oid OPERATOR(pg_catalog.=) t.tgconstraint '
     . "AND NOT ($INDEX_BAD) AND NOT ($OPS_BAD) AND NOT ($TYPES_BAD))))";
 
-my $SESSION_COLUMNS = join(', ',
+my $SESSION_SNAPSHOT_COLUMNS = join(', ',
     q{pg_catalog.concat_ws(' | ', } . join(', ', map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS) . ', '
         . q{COALESCE((SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', c.oid, c.xmin, c.relname), ',' ORDER BY c.oid) }
         . qq{FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), }
@@ -1299,10 +1299,12 @@ my $SESSION_COLUMNS = join(', ',
         . qq{WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), }
         . q{COALESCE((SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', t.oid, t.xmin, t.typname), ',' ORDER BY t.oid) }
         . qq{FROM pg_catalog.pg_type t WHERE t.typnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), 'end')},
-    (map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS),
-    # Deferrable triggers that can run user code at COMMIT (R23): a write is
-    # refused while any exists. Not part of the compared snapshot.
-    $DEFERRABLE_COUNT);
+    (map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS));
+# Deferrable triggers that can run user code at COMMIT (R23): a write is
+# refused while any exists. Not part of the compared snapshot, and a read
+# never asks (its plan alone is a large part of a read's guard cost).
+my $SESSION_COLUMNS = "$SESSION_SNAPSHOT_COLUMNS, $DEFERRABLE_COUNT";
+my $READ_SESSION_COLUMNS = "$SESSION_SNAPSHOT_COLUMNS, 0";
 
 # A relation the statement names that resolves into this session's temp
 # schema while a same-named relation exists in a schema of the search path
@@ -1311,7 +1313,7 @@ my $SESSION_COLUMNS = join(', ',
 # that is not a relation's row type (or its array) and is named like a type
 # of pg_catalog or of the search path would answer an unqualified type name
 # in the statement: refused (item 56c).
-my $SHADOW_SQL = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(name) '
+my $SHADOW_PREFIX = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(name) '
     . 'JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.name) '
     . "WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA AND EXISTS (SELECT 1 FROM pg_catalog.pg_class o "
     . 'JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) o.relnamespace '
@@ -1323,7 +1325,9 @@ my $SHADOW_SQL = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST
     . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_type p JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) p.typnamespace '
     . 'WHERE p.typname OPERATOR(pg_catalog.=) t.typname AND p.typnamespace OPERATOR(pg_catalog.<>) t.typnamespace '
     . "AND (s.nspname OPERATOR(pg_catalog.=) 'pg_catalog' OR s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false))))), "
-    . $SESSION_COLUMNS;
+;
+my $SHADOW_SQL = $SHADOW_PREFIX . $SESSION_COLUMNS;
+my $READ_SHADOW_SQL = $SHADOW_PREFIX . $READ_SESSION_COLUMNS;
 
 # The relation names a statement reads or writes, as its SQL spells them,
 # for the shadow check (items 56b, R2, R10). A statement Selecto compiled
@@ -1405,6 +1409,10 @@ my $NAME_SQL = 'SELECT pg_catalog.quote_ident(n.nspname) OPERATOR(pg_catalog.||)
 # The reset search path's schemas, once per compile (or per call).
 sub _pg_reset_schemas {
     my ($self) = @_;
+    # Shared by one operation's relation check and pin (they run back to
+    # back, in the same session), never across operations (R38).
+    my $operation = $self->{_selecto_reset_operation};
+    return @{$operation->{schemas}} if ref($operation) eq 'HASH' && $operation->{schemas};
     my $cache = $self->{_selecto_relation_schemas};
     return @{$cache->{"\0reset"}} if ref($cache) eq 'HASH' && $cache->{"\0reset"};
     my $dbh = $self->{dbh};
@@ -1429,6 +1437,7 @@ sub _pg_reset_schemas {
         {reason => 'relation_unresolved'}) if defined($error) || ref($schemas) ne 'ARRAY';
     my @schemas = grep { defined && !/\Apg_temp/ && $_ ne 'pg_catalog' } @$schemas;
     $cache->{"\0reset"} = \@schemas if ref($cache) eq 'HASH';
+    $operation->{schemas} = [@schemas] if ref($operation) eq 'HASH';
     return @schemas;
 }
 
@@ -1615,17 +1624,22 @@ sub _pg_pin_search_path {
     my $pinned = join(', ', 'pg_catalog', (map { _quote_path_schema($_) } @schemas), 'pg_temp');
     my @pins = (['search_path' => $pinned], @PINNED_SETTINGS);
     # search_path takes the resolved pin; every other setting its reset
-    # value (R35 amendment), read through pg_catalog in the same statement.
+    # value (R35 amendment), read through pg_catalog in the same statement,
+    # from one scan of pg_settings (each scan builds every setting's row).
+    my @reset = map { $_->[0] } grep { !defined $_->[1] } @pins;
     my @set = map {
         my $name = $pins[$_][0];
         defined($pins[$_][1])
             ? "pg_catalog.set_config('$name', \$" . ($_ + 1) . ", $local)"
-            : "pg_catalog.set_config('$name', (SELECT r.reset_val FROM pg_catalog.pg_settings r WHERE r.name OPERATOR(pg_catalog.=) '$name'), $local)"
+            : "pg_catalog.set_config('$name', (SELECT r.reset_val FROM r WHERE r.name OPERATOR(pg_catalog.=) '$name'), $local)"
     } 0 .. $#pins;
     my $current = join ', ', map { "pg_catalog.current_setting('$pins[$_][0]') AS s$_" } 0 .. $#pins;
+    my $names = '{' . join(',', @reset) . '}';
     my @host;
     my $ok = eval {
-        @host = $self->{dbh}->selectrow_array("WITH h AS MATERIALIZED (SELECT $current) SELECT "
+        @host = $self->{dbh}->selectrow_array("WITH h AS MATERIALIZED (SELECT $current), "
+            . 'r AS MATERIALIZED (SELECT s.name, s.reset_val FROM pg_catalog.pg_settings s '
+            . "WHERE s.name OPERATOR(pg_catalog.=) ANY (CAST('$names' AS pg_catalog.text[]))) SELECT "
             . join(', ', (map { "h.s$_" } 0 .. $#pins), @set) . ' FROM h', undef, $pins[0][1]);
         1;
     };
@@ -1638,12 +1652,19 @@ sub _pg_pin_search_path {
 sub _pg_restore_search_path {
     my ($self, $pin) = @_;
     return unless ref($pin) eq 'HASH';
-    my $local = $pin->{session} ? 'false' : 'true';
-    my @host = @{$pin->{host}};
-    my $sql = 'SELECT ' . join(', ', map { "pg_catalog.set_config('$host[$_][0]', \$" . ($_ + 1) . ", $local)" } 0 .. $#host);
-    my $ok = eval { $self->{dbh}->selectrow_array($sql, undef, map { $_->[1] } @host); 1 };
+    my ($set, @binds) = _pg_restore_columns($pin);
+    my $ok = eval { $self->{dbh}->selectrow_array("SELECT $set", undef, @binds); 1 };
     die $self->normalize_error($@) unless $ok;
     return;
+}
+
+# The set_config list that puts the host's settings back, and its binds.
+sub _pg_restore_columns {
+    my ($pin) = @_;
+    my $local = $pin->{session} ? 'false' : 'true';
+    my @host = @{$pin->{host}};
+    return (join(', ', map { "pg_catalog.set_config('$host[$_][0]', \$" . ($_ + 1) . ", $local)" } 0 .. $#host),
+        map { $_->[1] } @host);
 }
 
 sub _quote_path_schema {
@@ -1669,22 +1690,36 @@ sub _pg_state_row {
 }
 
 # The session snapshot, or a typed refusal when it cannot be read.
+#
+# With a pin, the same statement then restores the host's settings (see
+# _pg_restore_search_path): the snapshot is materialized before any
+# set_config in the outer list runs.
 sub _pg_session_state {
-    my ($self) = @_;
+    my ($self, $pin, %options) = @_;
+    my $width = 1 + @SESSION_SETTINGS + 1;
+    my ($sql, @binds) = ("SELECT " . ($options{read} ? $READ_SESSION_COLUMNS : $SESSION_COLUMNS));
+    if (ref($pin) eq 'HASH') {
+        my ($set, @values) = _pg_restore_columns($pin);
+        my @names = map { "c$_" } 0 .. $width - 1;
+        $sql = 'WITH st(' . join(', ', @names) . ") AS MATERIALIZED ($sql) SELECT "
+            . join(', ', (map { "st.$_" } @names), $set) . ' FROM st';
+        @binds = @values;
+    }
     my @row;
-    my $ok = eval { @row = $self->{dbh}->selectrow_array("SELECT $SESSION_COLUMNS"); 1 };
+    my $ok = eval { @row = $self->{dbh}->selectrow_array($sql, undef, @binds); 1 };
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
         {reason => 'session_state_unknown'}) unless $ok && @row && defined $row[0];
-    return _pg_state_row(\@row);
+    return _pg_state_row([@row[0 .. $width - 1]]);
 }
 
 # Refuses temp shadows of the statement's relations and of type names, and
-# returns the session snapshot, in one round trip.
+# returns the session snapshot, in one round trip. A read (option read)
+# leaves out the deferrable-trigger count only writes refuse on.
 sub _pg_admit_session {
-    my ($self, $source) = @_;
+    my ($self, $source, %options) = @_;
     my $names = _pg_statement_relations($source);
     my @row;
-    my $ok = eval { @row = $self->{dbh}->selectrow_array($SHADOW_SQL, undef, $names); 1 };
+    my $ok = eval { @row = $self->{dbh}->selectrow_array($options{read} ? $READ_SHADOW_SQL : $SHADOW_SQL, undef, $names); 1 };
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
         {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS + 1 && defined $row[2];
     my ($relations, $types, @state) = @row;
@@ -1720,8 +1755,11 @@ sub _write_session_open {
     # The write runs inside its own transaction or savepoint: check its
     # relations (R41), pin search_path for it (R30), then snapshot under the
     # pin.
-    $self->_pg_check_relations(ref($compiled) eq 'HASH' ? $compiled : undef) if ref($compiled) eq 'HASH';
-    my $pin = $self->_pg_pin_search_path;
+    my $pin = do {
+        local $self->{_selecto_reset_operation} = {};
+        $self->_pg_check_relations($compiled) if ref($compiled) eq 'HASH';
+        $self->_pg_pin_search_path;
+    };
     my $state = $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled : undef);
     $state->{pin} = $pin;
     _refuse_deferred_triggers() if $state->{deferrable};
@@ -1785,20 +1823,26 @@ sub _guarded_read {
     }
     my ($pin, $before, $result);
     my $ok = eval {
-        $self->_pg_check_relations($source);
-        $pin = $self->_pg_pin_search_path(!$savepoint, $source);
-        $before = $self->_pg_admit_session($source);
+        {
+            local $self->{_selecto_reset_operation} = {};
+            $self->_pg_check_relations($source);
+            $pin = $self->_pg_pin_search_path(!$savepoint, $source);
+        }
+        $before = $self->_pg_admit_session($source, read => 1);
         $result = $work->();
         1;
     };
     my $error = $ok ? undef : $@;
-    my $after = $ok && $before ? eval { $self->_pg_session_state } : undef;
+    # The after-snapshot and the host's settings again, in one round trip:
+    # the snapshot is read before the restore runs.
+    my $after = $ok && $before ? eval { $self->_pg_session_state($pin, read => 1) } : undef;
+    my $restored = $after ? 1 : 0;
     my $changed = $ok && $before && !($after && $after->{snapshot} eq $before->{snapshot});
     my $finished = eval {
         if ($savepoint) {
             if (!$ok || $changed) {
                 $self->_savepoint_command(rollback => $savepoint);
-            } else {
+            } elsif (!$restored) {
                 $self->_pg_restore_search_path($pin);
             }
             $self->_savepoint_command(release => $savepoint);
@@ -1808,8 +1852,9 @@ sub _guarded_read {
                     eval { $self->{dbh}->selectrow_array('SELECT pg_catalog.set_config($1, $2, false)', undef,
                         $name, $before->{settings}{$name}) };
                 }
+                $restored = 0;
             }
-            $self->_pg_restore_search_path($pin) if $pin;
+            $self->_pg_restore_search_path($pin) if $pin && !$restored;
         }
         1;
     };
@@ -1984,22 +2029,23 @@ sub _pg_catalog_functions {
 }
 
 # Columns of extension member types (citext and the like), or of domains
-# over one (the typbasetype chain is followed down to the base type), of the relations
-# the statement names, with the schema of each operator their own extension
-# defines for the type (never a user operator someone added beside it), so
-# their comparisons keep the extension's semantics: {"alias.col" or "col" =>
-# {op => schema}}. Read per statement; nothing is cached.
-my $EXTENSION_OPERATORS_SQL = q{SELECT CAST(r.alias AS pg_catalog.text), CAST(a.attname AS pg_catalog.text),
+# over one (the typbasetype chain is followed down to the base type), of the
+# relations the statement names, with the schema of each operator their own
+# extension defines for the type (never a user operator someone added beside
+# it), so their comparisons keep the extension's semantics:
+# {relations => {"schema.table" => {column => {op => schema}}}}. Read per
+# statement; nothing is cached. One recursive CTE over the columns (rather
+# than a recursive LATERAL per column) keeps its planning cheap.
+my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE c(rel, att, oid, depth) AS (
+      SELECT r.rel, a.attname, a.atttypid, 0 FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(rel)
+      JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.rel)
+        AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+      UNION ALL
+      SELECT c.rel, c.att, t.typbasetype, c.depth OPERATOR(pg_catalog.+) 1 FROM c JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.oid
+      WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND c.depth OPERATOR(pg_catalog.<) 16)
+    SELECT CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text),
       CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
-    FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS r(rel, alias)
-    JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.rel) AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
-    JOIN LATERAL (WITH RECURSIVE b(oid, depth) AS (
-        SELECT a.atttypid, 0
-        UNION ALL
-        SELECT t.typbasetype, b.depth OPERATOR(pg_catalog.+) 1 FROM pg_catalog.pg_type t JOIN b ON t.oid OPERATOR(pg_catalog.=) b.oid
-        WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND b.depth OPERATOR(pg_catalog.<) 16)
-      SELECT b.oid FROM b ORDER BY b.depth DESC LIMIT 1) AS base ON TRUE
-    JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) base.oid
+    FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
     JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
       AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'
     JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) ty.oid AND o.oprright OPERATOR(pg_catalog.=) ty.oid
@@ -2027,7 +2073,7 @@ sub _pg_extension_operators {
     return {} unless %rels;
     my @rels = sort keys %rels;
     my $rows;
-    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@rels); 1 };
+    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels); 1 };
     die $self->normalize_error($@) unless $ok;
     my %relations;
     for my $row (@{$rows // []}) {

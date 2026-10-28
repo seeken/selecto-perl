@@ -34,7 +34,7 @@ my ($dsn, $username, $password) = Selecto::Certification::_connection_parts($url
 # snapshots before and after each read) run around it.
 sub last_query {
     my ($handle) = @_;
-    return (grep { !/\ASELECT (?:pg_catalog\.concat_ws|\(SELECT pg_catalog\.count|pg_catalog\.set_config|\(SELECT s\.reset_val|pg_catalog\.quote_ident)|\AWITH h AS MATERIALIZED/ } @{$handle->{private_prepared} // []})[-1] // '';
+    return (grep { !/\ASELECT (?:pg_catalog\.concat_ws|\(SELECT pg_catalog\.count|pg_catalog\.set_config|\(SELECT s\.reset_val|pg_catalog\.quote_ident)|\AWITH (?:h|st\(c0[^)]*\)) AS MATERIALIZED/ } @{$handle->{private_prepared} // []})[-1] // '';
 }
 sub connect_db {
     my $handle = _connect_db();
