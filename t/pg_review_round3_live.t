@@ -546,11 +546,12 @@ subtest 'R46: an exact-match user operator in the reset path cannot answer a sco
     is($outcome->($read), 'applied 1', 'control: the tenant read');
     $admin->do($_) for q{CREATE FUNCTION public.r3o_yes(varchar, varchar) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
         'CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = public.r3o_yes)';
-    is($outcome->($update), 'query_rule_not_evaluable/operator_shadow', "a tenant update cannot reach another tenant's row");
+    # Every generated operator is OPERATOR(pg_catalog.op) (R46 FINAL-2/R47),
+    # so the user operator never answers.
+    like($outcome->($update), qr/\A(?:applied 0|cardinality_mismatch)/, "a tenant update cannot reach another tenant's row");
     is($rows->($admin, 'SELECT note FROM r3o WHERE id = 2'), 'SECRET', 'which is unchanged');
-    is($outcome->($read), 'query_rule_not_evaluable/operator_shadow', 'and the tenant read is refused');
+    is($outcome->($read), 'applied 1', 'and the tenant read returns only its own row');
     $admin->do($_) for 'DROP OPERATOR public.= (varchar, varchar)', 'DROP FUNCTION public.r3o_yes(varchar, varchar)';
-    is($outcome->($read), 'applied 1', 'reads work again once the operator is gone');
     $admin->do('DROP TABLE r3o CASCADE');
 };
 

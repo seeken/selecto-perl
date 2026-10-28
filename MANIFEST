@@ -79,6 +79,7 @@ t/pg_guarded_write_isolation_live.t
 t/pg_bound_delete_lock_live.t
 t/pg_graph_bound_descendants_live.t
 t/pg_review_round3_live.t
+t/pg_operator_qualification_live.t
 t/pg_post_image_reread_live.t
 t/pg_session_state_live.t
 t/host_transaction_refusal_live.t
@@ -279,6 +280,7 @@ script/importer-memory-check
 script/rules-package-consumer
 script/verify-rules-package
 t/security_boundaries_live.t
+lib/Selecto/PostgreSQL/Qualify.pm
 lib/Selecto/PostgreSQL/Stream.pm
 lib/Selecto/PostgreSQL/StatementCache.pm
 t/bounded_stream.t

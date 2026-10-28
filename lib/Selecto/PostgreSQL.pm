@@ -1285,31 +1285,6 @@ my $SESSION_COLUMNS = join(', ',
 # that is not a relation's row type (or its array) and is named like a type
 # of pg_catalog or of the search path would answer an unqualified type name
 # in the statement: refused (item 56c).
-# R46: the pinned search_path puts pg_catalog first, but PostgreSQL prefers
-# an exact argument-type match over a coercion whatever the schema order: a
-# user operator public.=(varchar, varchar) beats pg_catalog's text = text
-# for a varchar column, and the same holds for a function such as
-# lower(varchar). Generated SQL compares and calls through unqualified
-# operators and functions, so while any schema of the pinned path (the
-# reset search_path; the statement runs under it) holds an operator or
-# function that is not part of an extension and is named like one of
-# pg_catalog's, every statement is refused (query_rule_not_evaluable,
-# reason operator_shadow). Extension members (citext and the like) are the
-# DBA's own and keep their native semantics.
-my $OBJECT_SHADOW_SQL = '(SELECT pg_catalog.count(*) FROM pg_catalog.pg_operator o '
-    . 'JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) o.oprnamespace '
-    . "WHERE s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false)) AND s.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' "
-    . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_operator p WHERE p.oprname OPERATOR(pg_catalog.=) o.oprname '
-    . 'AND p.oprnamespace OPERATOR(pg_catalog.=) CAST(\'pg_catalog\' AS pg_catalog.regnamespace)) '
-    . 'AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid OPERATOR(pg_catalog.=) CAST(\'pg_catalog.pg_operator\' AS pg_catalog.regclass) '
-    . "AND d.objid OPERATOR(pg_catalog.=) o.oid AND d.deptype OPERATOR(pg_catalog.=) 'e')) "
-    . 'OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc f '
-    . 'JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) f.pronamespace '
-    . "WHERE s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false)) AND s.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' "
-    . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc p WHERE p.proname OPERATOR(pg_catalog.=) f.proname '
-    . 'AND p.pronamespace OPERATOR(pg_catalog.=) CAST(\'pg_catalog\' AS pg_catalog.regnamespace)) '
-    . 'AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid OPERATOR(pg_catalog.=) CAST(\'pg_catalog.pg_proc\' AS pg_catalog.regclass) '
-    . "AND d.objid OPERATOR(pg_catalog.=) f.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'))";
 my $SHADOW_SQL = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(name) '
     . 'JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.name) '
     . "WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA AND EXISTS (SELECT 1 FROM pg_catalog.pg_class o "
@@ -1322,7 +1297,6 @@ my $SHADOW_SQL = 'SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest(CAST
     . 'AND EXISTS (SELECT 1 FROM pg_catalog.pg_type p JOIN pg_catalog.pg_namespace s ON s.oid OPERATOR(pg_catalog.=) p.typnamespace '
     . 'WHERE p.typname OPERATOR(pg_catalog.=) t.typname AND p.typnamespace OPERATOR(pg_catalog.<>) t.typnamespace '
     . "AND (s.nspname OPERATOR(pg_catalog.=) 'pg_catalog' OR s.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(false))))), "
-    . $OBJECT_SHADOW_SQL . ', '
     . $SESSION_COLUMNS;
 
 # The relation names a statement reads or writes, as its SQL spells them,
@@ -1671,11 +1645,8 @@ sub _pg_admit_session {
     my @row;
     my $ok = eval { @row = $self->{dbh}->selectrow_array($SHADOW_SQL, undef, $names); 1 };
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
-        {reason => 'session_state_unknown'}) unless $ok && @row == 3 + 1 + @SESSION_SETTINGS + 1 && defined $row[3];
-    my ($relations, $types, $objects, @state) = @row;
-    Selecto::Error->throw('query_rule_not_evaluable',
-        'a schema of the search path holds an operator or function that could answer for pg_catalog\'s',
-        {reason => 'operator_shadow'}) if $objects;
+        {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS + 1 && defined $row[2];
+    my ($relations, $types, @state) = @row;
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary relation of the session shadows a relation the statement names',
         {reason => 'temporary_shadow'}) if $relations;
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary type of the session shadows a type name',
@@ -1851,6 +1822,92 @@ sub _pg_write_target {
 }
 
 sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
+
+# The statement as executed: every operator and pg_catalog function
+# qualified (R46/R47). SELECTO_PG_SQL_LINT=1 makes any construct left to the
+# session's lookup a hard error (the lint the test suite runs under).
+sub _statement_sql {
+    my ($self, $sql) = @_;
+    return $sql unless defined($sql) && !ref($sql) && $self->_pg_session_checked;
+    require Selecto::PostgreSQL::Qualify;
+    my $functions = $self->_pg_catalog_functions;
+    my $qualified = Selecto::PostgreSQL::Qualify::qualify($sql, $functions, $self->_pg_extension_operators($sql));
+    if ($ENV{SELECTO_PG_SQL_LINT}) {
+        my @problems = Selecto::PostgreSQL::Qualify::lint($qualified, $functions);
+        die "SELECTO_PG_SQL_LINT: @problems in: $qualified\n" if @problems;
+    }
+    return $qualified;
+}
+
+# pg_catalog's function names, once per connection (pg_catalog is fixed for
+# a server; nothing a session does can change it).
+sub _pg_catalog_functions {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return $dbh->{private_selecto_pg_functions} if ref($dbh->{private_selecto_pg_functions}) eq 'HASH';
+    my $names;
+    my $ok = eval {
+        $names = $dbh->selectcol_arrayref(q{SELECT DISTINCT CAST(p.proname AS pg_catalog.text) FROM pg_catalog.pg_proc p
+            WHERE p.pronamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)});
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    my %names = map { (lc($_) => 1) } @{$names // []};
+    $dbh->{private_selecto_pg_functions} = \%names;
+    return \%names;
+}
+
+# Columns of extension member types (citext and the like) of the relations
+# the statement names, with the schema of each operator their own extension
+# defines for the type (never a user operator someone added beside it), so
+# their comparisons keep the extension's semantics: {"alias.col" or "col" =>
+# {op => schema}}. Read per statement; nothing is cached.
+my $EXTENSION_OPERATORS_SQL = q{SELECT CAST(r.alias AS pg_catalog.text), CAST(a.attname AS pg_catalog.text),
+      CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
+    FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS r(rel, alias)
+    JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.rel) AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+    JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) a.atttypid
+    JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
+      AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'
+    JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) ty.oid AND o.oprright OPERATOR(pg_catalog.=) ty.oid
+    JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
+      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e'
+      AND od.refobjid OPERATOR(pg_catalog.=) d.refobjid
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace};
+sub _pg_extension_operators {
+    my ($self, $sql) = @_;
+    require Selecto::PostgreSQL::Qualify;
+    my $tokens = eval { Selecto::PostgreSQL::Qualify::tokenize($sql) } or return {};
+    # Relations as the SQL names them, schema-qualified, with their alias
+    # (or the bare relation name for an unaliased write target).
+    my (@rels, @aliases);
+    for my $k (0 .. $#$tokens - 2) {
+        next unless $tokens->[$k][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 1][1] eq '.' && $tokens->[$k + 2][0] =~ /\A(?:id|qid)\z/;
+        next if $k > 0 && $tokens->[$k - 1][1] eq '.';
+        my $after = $k + 3 < @$tokens ? $tokens->[$k + 3] : undef;
+        next if $after && $after->[1] eq '(';
+        my $rel = "$tokens->[$k][1].$tokens->[$k + 2][1]";
+        my $alias = $after && uc($after->[1]) eq 'AS' && $k + 4 < @$tokens ? $tokens->[$k + 4][1]
+            : $after && $after->[0] eq 'qid' ? $after->[1] : '';
+        $alias =~ s/\A"((?:[^"]|"")*)"\z/$1/ and $alias =~ s/""/"/g;
+        my $prev = $k > 0 ? uc($tokens->[$k - 1][1]) : '';
+        next unless $prev =~ /\A(?:FROM|JOIN|INTO|UPDATE|ONLY|\(|,)\z/;
+        push @rels, $rel;
+        push @aliases, $alias;
+    }
+    return {} unless @rels;
+    my $rows;
+    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@aliases); 1 };
+    die $self->normalize_error($@) unless $ok;
+    my %columns;
+    for my $row (@{$rows // []}) {
+        my ($alias, $column, $op, $schema) = @$row;
+        my $quoted = '"' . ($schema =~ s/"/""/gr) . '"';
+        $columns{lc $column}{$op} //= $quoted;
+        $columns{lc("$alias.$column")}{$op} = $quoted if length $alias;
+    }
+    return \%columns;
+}
 
 1;
 

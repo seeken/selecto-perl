@@ -598,7 +598,7 @@ sub _compile_retargeted {
         );
         my $sql = $self->_shift_placeholders($statement->sql, scalar @$params);
         push @$params, @{$statement->params};
-        return $exists ? "EXISTS ($sql)" : "$outer_key IN ($sql)";
+        return $exists ? "EXISTS ($sql)" : $self->_in_subquery_sql($outer_key, $sql);
     };
     # The last hop's fixed where policy confines which of the target's rows
     # the association reaches, and the key alone does not identify them
@@ -623,6 +623,21 @@ sub _association_source_sql {
 }
 # Records a relation as the compiled SQL names it (dialect-quoted, with any
 # schema prefix) in the current compile's relation list, and returns it.
+# Dialect hooks for the comparisons whose operator a database looks up
+# implicitly; PostgreSQL writes them with explicit operators (R46/R47).
+sub _in_list_sql { my ($self, $operand, $markers) = @_; return "$operand IN (" . join(', ', @$markers) . ')'; }
+sub _in_subquery_sql { my ($self, $operand, $sql) = @_; return "$operand IN ($sql)"; }
+sub _between_sql { my ($self, $value, $low, $high) = @_; return "$value BETWEEN $low AND $high"; }
+sub _distinct_sql {
+    my ($self, $left, $right, $not) = @_;
+    return "$left IS " . ($not ? 'NOT ' : '') . "DISTINCT FROM $right";
+}
+sub _like_sql {
+    my ($self, $field, $marker, $ci) = @_;
+    return $ci ? "LOWER($field) LIKE LOWER($marker) ESCAPE '!'" : "$field LIKE $marker ESCAPE '!'";
+}
+sub _nullif_sql { my ($self, $value, $null) = @_; return "NULLIF($value, $null)"; }
+
 # A relation as generated SQL names it: under the read prefix (a schema the
 # host pinned) when there is one. A dialect may qualify it further
 # (PostgreSQL names the schema it resolves to, R23b).
@@ -1708,16 +1723,12 @@ sub _compile_expression {
         my $field_sql = $self->_compile_expression($domain, $arguments->[0], $params);
         push @$params, $kind =~ /\Atext_contains/ ? "%$text%"
             : $kind =~ /\Aends_with/ ? "%$text" : "$text%";
-        return 'LOWER(' . $field_sql . ') LIKE LOWER(' .
-            $self->placeholder(scalar @$params) . q{) ESCAPE '!'}
-            if $kind =~ /_ci\z/;
-        return $field_sql . ' LIKE ' . $self->placeholder(scalar @$params)
-            . q{ ESCAPE '!'};
+        return $self->_like_sql($field_sql, $self->placeholder(scalar @$params), $kind =~ /_ci\z/ ? 1 : 0);
     }
     if ($kind eq 'between') {
-        return $self->_compile_expression($domain, $arguments->[0], $params) . ' BETWEEN ' .
-            $self->_compile_expression($domain, $arguments->[1], $params) . ' AND ' .
-            $self->_compile_expression($domain, $arguments->[2], $params);
+        my $value = $self->_compile_expression($domain, $arguments->[0], $params);
+        my $low = $self->_compile_expression($domain, $arguments->[1], $params);
+        return $self->_between_sql($value, $low, $self->_compile_expression($domain, $arguments->[2], $params));
     }
     return $self->_compile_expression($domain, $arguments->[0], $params) . ' IS NULL' if $kind eq 'is_null';
     return $self->_compile_expression($domain, $arguments->[0], $params) . ' IS NOT NULL' if $kind eq 'not_null';
@@ -1752,7 +1763,7 @@ sub _compile_expression {
         # computed/association-existence operands on the left of IN.
         my $operand = $self->_compile_expression($domain, $arguments->[0], $params);
         my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
-        return $operand . ' IN (' . join(', ', @markers) . ')';
+        return $self->_in_list_sql($operand, \@markers);
     }
     if ($kind eq 'and' || $kind eq 'or') {
         my $expressions = $arguments->[0];
@@ -1797,7 +1808,7 @@ sub _compile_expression {
         my $denominator = $self->_compile_expression($domain, $arguments->[0], $params);
         $numerator = "($numerator)" if $arguments->[0]->kind ne 'field';
         return "(100.0 * COUNT(CASE WHEN $numerator = TRUE THEN 1 END) / " .
-            "NULLIF(COUNT($denominator), 0))";
+            $self->_nullif_sql("COUNT($denominator)", '0') . ')';
     }
     return $self->_compile_date_shortcut($domain, $expression, $params)
         if $kind eq 'date_shortcut';
@@ -2212,8 +2223,7 @@ sub _related_collection_cursor_predicate {
             my $value = $cursor->{values}[$prior];
             if (defined $value) {
                 push @$params, $value;
-                push @prefix, $column . ' IS NOT DISTINCT FROM ' .
-                    $self->placeholder(scalar @$params);
+                push @prefix, $self->_distinct_sql($column, $self->placeholder(scalar @$params), 1);
             }
             else {
                 push @prefix, $column . ' IS NULL';
@@ -2234,7 +2244,7 @@ sub _related_collection_cursor_predicate {
         }
         push @terms, '(' . join(' AND ', @prefix, $comparison) . ')';
     }
-    return '(' . $owner_key . ' IS DISTINCT FROM ' . $parent_marker .
+    return '(' . $self->_distinct_sql($owner_key, $parent_marker, 0) .
         ' OR (' . join(' OR ', @terms) . '))';
 }
 
@@ -2794,7 +2804,7 @@ sub _identity_correlation_sql {
 sub _identity_values_sql {
     my ($self, $column, $values, $params, $exact) = @_;
     my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
-    return $column . (@markers == 1 ? " = $markers[0]" : ' IN (' . join(', ', @markers) . ')');
+    return @markers == 1 ? "$column = $markers[0]" : $self->_in_list_sql($column, \@markers);
 }
 
 # How a declared field type takes part in exact identity comparison: 1 for a
@@ -3302,7 +3312,7 @@ sub _compile_write_predicate {
         Selecto::Error->throw('query_rule_unsupported_predicate', 'query-enforced IN requires values')
             unless ref($values) eq 'ARRAY' && @$values;
         my @markers = map { push @$params, $_; $self->placeholder(scalar @$params) } @$values;
-        return $self->quote_identifier(_write_field($arguments->[0])) . ' IN (' . join(', ', @markers) . ')';
+        return $self->_in_list_sql($self->quote_identifier(_write_field($arguments->[0])), \@markers);
     }
     if ($kind eq 'and' || $kind eq 'or') {
         my $nested = $arguments->[0];
@@ -3510,7 +3520,7 @@ sub _execute_compiled_write_in_transaction {
     my ($sth, $affected, %values);
     my $ok = eval {
         if ($self->_statement_cache_enabled) {
-            $sth = $self->_cached_execute($compiled->{sql}, $compiled->{params}, 'database write failed');
+            $sth = $self->_cached_execute($self->_statement_sql($compiled->{sql}), $compiled->{params}, 'database write failed');
         } else {
             $sth = $self->{dbh}->prepare($self->_statement_sql($compiled->{sql}));
             die _dbi_error($self->{dbh}, 'database prepare failed') unless $sth;
