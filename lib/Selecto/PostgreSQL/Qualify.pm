@@ -765,6 +765,12 @@ sub _scopes {
         while ($j < @$tokens) {
             $j++ while $j < @$tokens && _upper($tokens->[$j]) =~ /\A(?:LATERAL|ONLY)\z/;
             my ($source, $default);
+            # A parenthesised join group, FROM (a JOIN b ON ...): its first
+            # item is registered here, the others by their own JOIN.
+            if ($j < @$tokens && $tokens->[$j][1] eq '(' && !defined $opens{$j}) {
+                $j++;
+                next;
+            }
             if ($j < @$tokens && $tokens->[$j][1] eq '(') {
                 my $close = $closes{$j} // last;
                 $source = {derived => $opens{$j}};

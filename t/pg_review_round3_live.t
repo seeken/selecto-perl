@@ -403,12 +403,24 @@ subtest 'R32: internal deferrable rechecks count unless they run only pg_catalog
         'CREATE TABLE r3u_y (k r3u_e REFERENCES r3u_x (k) DEFERRABLE INITIALLY DEFERRED)';
     is($outcome->(sub { $update->('e') }), 'query_rule_not_evaluable/deferred_triggers',
         'a deferred foreign key over a user enum key refuses writes');
-    # R37b: so does a deferrable unique recheck over a range key (its
-    # subtype's operator class can be user code).
+    # R37b: a pg_catalog range or multirange key (pg_catalog subtype,
+    # operator class and collation) is pg_catalog's own; a range type
+    # defined outside pg_catalog still counts (its subtype's operator class,
+    # canonical and subtype-difference functions can be user code).
     $admin->do($_) for 'DROP TABLE r3u_y, r3u_x', 'CREATE TABLE r3u_x (k int4range, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('r') }), 'query_rule_not_evaluable/deferred_triggers',
-        'a deferrable unique recheck over a range key refuses writes');
-    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP TYPE r3u_e', 'DROP COLLATION r3u_c', 'DROP FUNCTION r3u_f(int)',
+    is($outcome->(sub { $update->('r') }), 'applied 1', 'a deferrable unique recheck over an int4range key does not block writes');
+    $admin->do($_) for 'DROP TABLE r3u_x', 'CREATE TABLE r3u_x (k int4multirange, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('m') }), 'applied 1', 'nor one over an int4multirange key');
+    $admin->do($_) for 'DROP TABLE r3u_x', 'CREATE TABLE r3u_x (k tstzrange, CONSTRAINT r3u_x_k EXCLUDE USING gist (k WITH &&) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('t') }), 'applied 1', 'nor a deferrable gist exclusion over a tstzrange key');
+    $admin->do($_) for 'DROP TABLE r3u_x', 'CREATE TABLE r3u_x (k int4range PRIMARY KEY)',
+        'CREATE TABLE r3u_y (k int4range REFERENCES r3u_x (k) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('k') }), 'applied 1', 'nor a deferred foreign key over an int4range key');
+    $admin->do($_) for 'DROP TABLE r3u_y, r3u_x', 'DROP TYPE IF EXISTS r3u_rng CASCADE', 'CREATE TYPE r3u_rng AS RANGE (subtype = int4)',
+        'CREATE TABLE r3u_x (k r3u_rng, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
+    is($outcome->(sub { $update->('u') }), 'query_rule_not_evaluable/deferred_triggers',
+        'a deferrable unique recheck over a range type defined outside pg_catalog refuses writes');
+    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP TYPE r3u_rng', 'DROP TYPE r3u_e', 'DROP COLLATION r3u_c', 'DROP FUNCTION r3u_f(int)',
         'CREATE TABLE r3u_x (k INT)';
     is($outcome->(sub { $update->('f') }), 'applied 1', 'and writes apply again once only pg_catalog-typed deferred keys remain');
     $admin->do($_) for 'DROP TABLE r3u_w, r3u_parent, r3u_child, r3u_x CASCADE', 'DROP OPERATOR CLASS r3u_ops USING btree CASCADE';
