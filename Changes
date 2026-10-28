@@ -77,6 +77,14 @@ Unreleased
       t/pg_operator_qualification_live.t lints every executed statement of a
       corpus. The interim detection-based refusal (operator_shadow) is
       withdrawn.
+      R48: Selecto's own guard and catalog SQL is qualified with exact
+      casts and is linted too (SELECTO_PG_SQL_LINT checks every statement
+      Selecto runs on the handle, guard SQL included, never the host's). A
+      host's hand-built Statement and the SQL a transaction callback or
+      transaction_handler runs are never rewritten. An extension type's
+      operator is used only when both operands have that type (or one is an
+      untyped parameter or literal); citext against text compares as text,
+      whatever the operand order, and citext joins keep citext semantics.
     - PostgreSQL per-statement relation checks (R41, R42): before every
       statement's pin, each recorded relation must still be what the reset
       search_path resolves its name to (a SET ROLE or changed reset value
