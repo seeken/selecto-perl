@@ -215,6 +215,27 @@ ok(!%bad, 'no executed statement resolves an operator or function through the se
     $dbh->disconnect;
 }
 
+# Host code around Selecto's write in a transaction_handler is the host's:
+# its own statements after the write returns are never linted.
+{
+    my $dbh = $connect->();
+    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $dbh,
+        transaction_handler => sub {
+            my ($write) = @_;
+            $dbh->begin_work;
+            my $value = eval { $write->() };
+            my $error = $@;
+            $dbh->selectrow_array(q{SELECT 1 WHERE 2 <> 3});
+            $error ? $dbh->rollback : $dbh->commit;
+            die $error if $error;
+            return $value;
+        })))->with_scope(tenant => 't1');
+    is($outcome->(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update',
+        relation => 'r47_items', assignments => {name => 'mixed'}, predicate => $x->eq('id', 3)))->affected_rows }), 'applied 1',
+        "a handler's own statement after Selecto's write is not linted");
+    $dbh->disconnect;
+}
+
 $admin->do($_) for 'DROP TABLE r47_items, r47_links, r47_accs, r47_tags CASCADE', 'DROP TYPE r47_en', 'DROP DOMAIN r47_dom';
 $admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r47ext CASCADE');
 done_testing;
