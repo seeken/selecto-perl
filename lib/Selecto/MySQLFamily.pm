@@ -985,7 +985,11 @@ sub _column_data_types {
     for my $column (keys %$types) {
         my $source = $view->{sources}{$column};
         my $base = $source ? $self->_relation_column_types($source->[0])->{lc $source->[1]} : undef;
-        $resolved{$column} = defined($base) ? $base : $view->{fallback} ? $types->{$column} : 'unproven';
+        # Without proof, a temporal or text column is never taken at its
+        # reported type (R40d amendment): only a numeric or boolean one is.
+        my $reported = $types->{$column} // '';
+        my $plain = $reported !~ /\A(?:timestamp|datetime|date|time|year|char|varchar|tinytext|text|mediumtext|longtext|enum|set|binary|varbinary|json)\z/;
+        $resolved{$column} = defined($base) ? $base : $view->{fallback} && $plain ? $reported : 'unproven';
     }
     return \%resolved;
 }
@@ -1009,8 +1013,10 @@ sub _mysql_tokens {
         }
         if ($text =~ /\G(?:--(?=[\s]|\z)|#)[^\n]*/gc) { next }
         if ($text =~ /\G`((?:``|[^`])*)`/gc) { push @tokens, ['id', $1 =~ s/``/`/gr]; next }
-        if ($text =~ /\G'(?:''|\\.|[^'\\])*'/gcs) { push @tokens, ['str', '']; next }
-        if ($text =~ /\G"(?:""|\\.|[^"\\])*"/gcs) { push @tokens, ['str', '']; next }
+        # A backslash in a string makes the scan uncertain (its meaning
+        # depends on NO_BACKSLASH_ESCAPES): no proof (R40d amendment).
+        if ($text =~ /\G'((?:''|\\.|[^'\\])*)'/gcs) { return undef if index($1, '\\') >= 0; push @tokens, ['str', '']; next }
+        if ($text =~ /\G"((?:""|\\.|[^"\\])*)"/gcs) { return undef if index($1, '\\') >= 0; push @tokens, ['str', '']; next }
         return undef if $text =~ /\G['"`]/gc;
         if ($text =~ /\G(\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)/gc) { push @tokens, ['num', $1]; next }
         if ($text =~ /\G([A-Za-z_\$][A-Za-z0-9_\$]*)/gc) { push @tokens, ['word', lc $1]; next }
@@ -1032,8 +1038,8 @@ my %JOIN_WORD = map { ($_ => 1) } qw(join inner left right outer cross natural s
 # item is exactly alias.col [AS name] with the alias taken from that FROM
 # list (never a table that merely bears the alias's name). Columns without
 # proof keep the view's reported type (fallback) only when the definition
-# was understood and none of its base tables has a TIMESTAMP column;
-# otherwise they are unproven.
+# was understood, none of its base tables has a TIMESTAMP column, and the
+# reported type is neither temporal nor text; otherwise they are unproven.
 sub _view_column_sources {
     my ($self, $table) = @_;
     my $dbh = $self->{dbh};
