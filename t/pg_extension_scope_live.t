@@ -55,7 +55,8 @@ my $engine = sub {
 my $ids = sub { my ($e, $q) = @_; join ',', map { $_->[0] } @{$e->all($q->order_by('id'))->{rows}} };
 
 $admin->do($_) for 'DROP SCHEMA IF EXISTS r49_a CASCADE', 'DROP SCHEMA IF EXISTS r49_b CASCADE',
-    'DROP TABLE IF EXISTS r49_acct, r49_root, r49_mem CASCADE', 'DROP DOMAIN IF EXISTS r49_email CASCADE';
+    'DROP TABLE IF EXISTS r49_acct, r49_root, r49_mem, r49_deep16, r49_deep17, r49_it, r49_acc, r49_lk CASCADE',
+    'DROP DOMAIN IF EXISTS r49_email CASCADE', 'DROP DOMAIN IF EXISTS r49_d1 CASCADE';
 
 # H2: schema-per-tenant prefix reads.
 $admin->do($_) for 'CREATE SCHEMA r49_a', 'CREATE SCHEMA r49_b',
@@ -88,7 +89,7 @@ SKIP: {
     my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
     my $has = $preinstalled
         || eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r49ext'); $admin->do('CREATE EXTENSION citext SCHEMA r49ext'); 1 };
-    skip 'citext is not available', 8 unless $has;
+    skip 'citext is not available', 14 unless $has;
     my ($schema) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
     my $citext = qq{"$schema".citext};
     # Natively, with the extension schema on the path.
@@ -140,6 +141,51 @@ SKIP: {
         join => {type => 'inner', owner_key => 'id', related_key => 'id'})->select('id')->where($x->ne('m.ci', 'ABC'))) }), 'applied 3',
         'a filter on a CTE citext output compares as natively');
 
+    # M-A: a through-association's bridge is the first item of a
+    # parenthesised join group; its citext columns keep the extension's
+    # operators (bridge pins and keys).
+    $admin->do($_) for "CREATE TABLE r49_it (id INT PRIMARY KEY, org $citext NOT NULL)",
+        q{INSERT INTO r49_it VALUES (1, 't1'), (2, 'T1'), (3, 't2')},
+        "CREATE TABLE r49_acc (id INT PRIMARY KEY, org $citext NOT NULL, label $citext)",
+        q{INSERT INTO r49_acc VALUES (10, 't1', 'Gold'), (20, 't1', 'gold'), (30, 't2', 'SILVER')},
+        "CREATE TABLE r49_lk (item_id INT, acc_id INT, site $citext, PRIMARY KEY (item_id, acc_id))",
+        q{INSERT INTO r49_lk VALUES (1, 10, 'S1'), (1, 20, 's1'), (2, 20, 's1'), (3, 30, 'S1'), (2, 10, 'other')};
+    my $bridge = Selecto::Domain->parse({schema_version => 1, name => 'R49B', source => {source_table => 'r49_it', primary_key => 'id',
+        tenant_field => 'org', fields => [qw(id org)], columns => {id => {type => 'integer'}, org => {type => 'string'}},
+        associations => {accs => {queryable => 'acc', owner_key => 'id', related_key => 'id', cardinality => 'many',
+            through => {table => 'r49_lk', owner_key => 'item_id', related_key => 'acc_id', where => {site => 's1'}}}}},
+        schemas => {acc => {source_table => 'r49_acc', primary_key => 'id', fields => [qw(id org label)],
+            columns => {id => {type => 'integer'}, org => {type => 'string'}, label => {type => 'string'}}, associations => {}}},
+        joins => {accs => {type => 'left'}}});
+    my $native_accs = join ',', @{$admin->selectcol_arrayref(q{SELECT a.id FROM r49_acc a WHERE a.id IN
+        (SELECT l.acc_id FROM r49_it i JOIN r49_lk l ON i.id = l.item_id AND l.site = 's1' WHERE i.org = 't1') ORDER BY 1})};
+    is($native_accs, '10,20', 'natively the citext bridge pin and tenant match case-insensitively');
+    my $eb = $engine->($bridge, tenant => 't1');
+    for my $strategy (qw(in exists)) {
+        is($outcome->(sub { $ids->($eb, $eb->query->retarget('accs', strategy => $strategy)->select('id')) }), "applied $native_accs",
+            "retarget ($strategy) through a citext bridge reads as natively");
+    }
+    my $native_labels = join ',', map { "$_->[0]:$_->[1]" } @{$admin->selectall_arrayref(q{SELECT i.id, a.label FROM r49_it i
+        LEFT JOIN (r49_lk l JOIN r49_acc a ON l.acc_id = a.id) ON i.id = l.item_id AND l.site = 's1' WHERE i.org = 't1' ORDER BY 1, 2})};
+    is($outcome->(sub { join ',', map { "$_->[0]:$_->[1]" } sort { $a->[0] <=> $b->[0] || $a->[1] cmp $b->[1] }
+        @{$eb->all($eb->query->select('id', 'accs.label'))->{rows}} }), "applied $native_labels", 'a bridge join reads as natively');
+
+    # LOW: a domain chain deeper than the walk follows is refused, typed.
+    my $prev = $citext;
+    for my $level (1 .. 17) { $admin->do("CREATE DOMAIN r49_d$level AS $prev"); $prev = "r49_d$level" }
+    $admin->do($_) for 'CREATE TABLE r49_deep16 (id INT PRIMARY KEY, org TEXT NOT NULL, note r49_d16)',
+        'CREATE TABLE r49_deep17 (id INT PRIMARY KEY, org TEXT NOT NULL, note r49_d17)';
+    $admin->do("INSERT INTO $_ VALUES (1, 't1', 'abc'), (2, 't1', 'ABC'), (3, 't1', 'xyz')") for qw(r49_deep16 r49_deep17);
+    for my $case (['r49_deep16', 'applied 3'], ['r49_deep17', 'query_rule_not_evaluable/domain_chain_too_deep']) {
+        my ($table, $want) = @$case;
+        my $deep = Selecto::Domain->parse({schema_version => 1, name => 'R49D', source => {source_table => $table, primary_key => 'id',
+            tenant_field => 'org', fields => [qw(id org note)], columns => {id => {type => 'integer'}, org => {type => 'string'},
+            note => {type => 'string'}}, associations => {}}, schemas => {}, joins => {}})->with_required_predicate($x->ne('note', 'abc'));
+        my $ed = $engine->($deep, tenant => 't1');
+        is($outcome->(sub { $ids->($ed, $ed->query->select('id')) }), $want, "a required <> on a citext domain chain ($table): $want");
+    }
+
+    $admin->do($_) for 'DROP TABLE r49_deep16, r49_deep17, r49_it, r49_acc, r49_lk', 'DROP DOMAIN r49_d1 CASCADE';
     $admin->do($_) for 'DROP TABLE r49_acct, r49_root, r49_mem CASCADE', 'DROP DOMAIN r49_email';
     $admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r49ext CASCADE');
 }

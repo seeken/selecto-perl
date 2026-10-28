@@ -1259,7 +1259,7 @@ my $TEMP_SCHEMA = 'pg_catalog.pg_my_temp_schema()';
 # key) with no expressions or predicate and only default or pg_catalog
 # collations and operator classes; its exclusion and foreign-key operators
 # and their functions; and every key column's type (a base type, or a
-# domain over one).
+# domain over one, or a pg_catalog range or multirange over one, R37b).
 my $PGC = q{CAST('pg_catalog' AS pg_catalog.regnamespace)};
 my $OPS_BAD = join ' OR ', map {
     "EXISTS (SELECT 1 FROM pg_catalog.unnest(c.$_) AS e(op) JOIN pg_catalog.pg_operator p ON p.oid OPERATOR(pg_catalog.=) e.op "
@@ -1274,13 +1274,29 @@ my $INDEX_BAD = "EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indexrelid 
     . 'OR EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(i.indclass AS pg_catalog.oid[])) AS k(opclass) '
     . 'LEFT JOIN pg_catalog.pg_opclass o ON o.oid OPERATOR(pg_catalog.=) k.opclass '
     . "WHERE o.oid IS NULL OR o.opcnamespace OPERATOR(pg_catalog.<>) $PGC)))";
+# A range or multirange key column (R37b): pg_catalog's own type whose
+# pg_range entry names a pg_catalog base subtype, operator class and
+# collation (or none) and no canonical or subtype-difference function outside
+# pg_catalog. A range type defined outside pg_catalog still counts.
+my $RANGE_OK = 'EXISTS (SELECT 1 FROM pg_catalog.pg_range rg '
+    . 'JOIN pg_catalog.pg_type st ON st.oid OPERATOR(pg_catalog.=) rg.rngsubtype '
+    . 'JOIN pg_catalog.pg_opclass oc ON oc.oid OPERATOR(pg_catalog.=) rg.rngsubopc '
+    . 'WHERE (rg.rngtypid OPERATOR(pg_catalog.=) b.oid OR rg.rngmultitypid OPERATOR(pg_catalog.=) b.oid) '
+    . "AND st.typnamespace OPERATOR(pg_catalog.=) $PGC AND st.typtype OPERATOR(pg_catalog.=) 'b' "
+    . "AND oc.opcnamespace OPERATOR(pg_catalog.=) $PGC "
+    . 'AND (rg.rngcollation OPERATOR(pg_catalog.=) CAST(0 AS pg_catalog.oid) OR EXISTS (SELECT 1 FROM pg_catalog.pg_collation co '
+    . "WHERE co.oid OPERATOR(pg_catalog.=) rg.rngcollation AND co.collnamespace OPERATOR(pg_catalog.=) $PGC)) "
+    . join(' ', map { "AND (CAST(rg.$_ AS pg_catalog.oid) OPERATOR(pg_catalog.=) CAST(0 AS pg_catalog.oid) "
+        . "OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc rp WHERE rp.oid OPERATOR(pg_catalog.=) CAST(rg.$_ AS pg_catalog.oid) "
+        . "AND rp.pronamespace OPERATOR(pg_catalog.=) $PGC))" } qw(rngcanonical rngsubdiff)) . ')';
 my $TYPES_BAD = join ' OR ', map {
     my ($rel, $keys) = @$_;
     "EXISTS (SELECT 1 FROM pg_catalog.unnest(c.$keys) AS kk(attnum) JOIN pg_catalog.pg_attribute a "
         . "ON a.attrelid OPERATOR(pg_catalog.=) c.$rel AND a.attnum OPERATOR(pg_catalog.=) kk.attnum "
         . 'JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) a.atttypid '
         . "LEFT JOIN pg_catalog.pg_type b ON b.oid OPERATOR(pg_catalog.=) (CASE WHEN ty.typtype OPERATOR(pg_catalog.=) 'd' THEN ty.typbasetype ELSE ty.oid END) "
-        . "WHERE b.oid IS NULL OR b.typnamespace OPERATOR(pg_catalog.<>) $PGC OR b.typtype OPERATOR(pg_catalog.<>) 'b')"
+        . "WHERE b.oid IS NULL OR b.typnamespace OPERATOR(pg_catalog.<>) $PGC OR NOT (b.typtype OPERATOR(pg_catalog.=) 'b' "
+        . "OR ((b.typtype OPERATOR(pg_catalog.=) 'r' OR b.typtype OPERATOR(pg_catalog.=) 'm') AND $RANGE_OK)))"
 } [conrelid => 'conkey'], [confrelid => 'confkey'];
 my $DEFERRABLE_COUNT = '(SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc f ON f.oid OPERATOR(pg_catalog.=) t.tgfoid '
     . "WHERE t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable AND NOT (t.tgisinternal "
@@ -2035,7 +2051,9 @@ sub _pg_catalog_functions {
 # it), so their comparisons keep the extension's semantics:
 # {relations => {"schema.table" => {column => {op => schema}}}}. Read per
 # statement; nothing is cached. One recursive CTE over the columns (rather
-# than a recursive LATERAL per column) keeps its planning cheap.
+# than a recursive LATERAL per column) keeps its planning cheap. A column
+# whose domain chain is still a domain after 16 steps comes back with no
+# operator, and the statement is refused.
 my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE c(rel, att, oid, depth) AS (
       SELECT r.rel, a.attname, a.atttypid, 0 FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(rel)
       JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.rel)
@@ -2043,6 +2061,10 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE c(rel, att, oid, depth) AS (
       UNION ALL
       SELECT c.rel, c.att, t.typbasetype, c.depth OPERATOR(pg_catalog.+) 1 FROM c JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.oid
       WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND c.depth OPERATOR(pg_catalog.<) 16)
+    SELECT CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
+    FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
+    WHERE c.depth OPERATOR(pg_catalog.=) 16
+    UNION ALL
     SELECT CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text),
       CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
     FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
@@ -2078,6 +2100,10 @@ sub _pg_extension_operators {
     my %relations;
     for my $row (@{$rows // []}) {
         my ($rel, $column, $op, $schema) = @$row;
+        # A domain chain deeper than the walk follows: its base type, and so
+        # its operators, are unknown (review LOW).
+        Selecto::Error->throw('query_rule_not_evaluable', 'a column is a domain chain too deep to resolve its base type',
+            {reason => 'domain_chain_too_deep', relation => $rel, column => $column}) unless defined $op;
         my $key = lc join '.', map { s/\A"((?:[^"]|"")*)"\z/$1/r =~ s/""/"/gr } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $rel;
         $relations{$key}{lc $column}{$op} = '"' . ($schema =~ s/"/""/gr) . '"';
     }
