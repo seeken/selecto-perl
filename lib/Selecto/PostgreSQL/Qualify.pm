@@ -495,9 +495,13 @@ sub _atom {
             my $key = sub { $kinds[$_[0]] eq 'qid' ? _unquote($names[$_[0]]) : lc $names[$_[0]] };
             my $fname = $key->($#names);
             my $info = $state->{columns}{host_functions}{(@names == 2 ? $key->(0) : '') . "\0" . $fname};
+            # Every pinned candidate is pg_catalog's (regexp_split_to_table,
+            # string_to_table...): pg_catalog-qualified, its arguments left to
+            # PostgreSQL's own resolution there (no one else can write to it).
+            my $catalog = ref($info) eq 'HASH' && $info->{catalog} && ($info->{count} // 0) > 0;
             Selecto::Error->throw('query_rule_not_evaluable', "a function read from must resolve to exactly one function in the pinned schemas",
                 {reason => 'function_ambiguous', function => $fname})
-                unless ref($info) eq 'HASH' && ($info->{count} // 0) == 1 && defined $info->{schema};
+                unless $catalog || ref($info) eq 'HASH' && ($info->{count} // 0) == 1 && defined $info->{schema};
             $$pos++;
             my @args;
             unless (_peek_punct($tokens, $$pos, ')')) {
@@ -508,13 +512,28 @@ sub _atom {
                 }
             }
             _expect($tokens, $pos, ')');
-            my @types = @{$info->{args} // []};
-            Selecto::Error->throw('query_rule_not_evaluable', "a function read from takes arguments its declaration does not",
-                {reason => 'function_ambiguous', function => $fname})
-                unless @args <= @types && @args >= @types - ($info->{defaults} // 0);
             my $quote = sub { '"' . ($_[0] =~ s/"/""/gr) . '"' };
-            $sql = $quote->($info->{schema}) . '.' . $quote->($fname) . '('
-                . join(', ', map { "CAST(($args[$_]) AS $types[$_])" } 0 .. $#args) . ')';
+            if ($catalog) {
+                $sql = 'pg_catalog.' . $quote->($fname) . '(' . join(', ', @args) . ')';
+                return _postfix($state, $tokens, $pos, $sql, undef, 1, undef, $mark);
+            }
+            my @types = @{$info->{args} // []};
+            my @cast;
+            if (defined $info->{variadic} && @types) {
+                # VARIADIC: the fixed arguments cast to their types, the
+                # trailing ones to the element type, passed as VARIADIC ARRAY.
+                my $fixed = @types - 1;
+                Selecto::Error->throw('query_rule_not_evaluable', "a function read from takes arguments its declaration does not",
+                    {reason => 'function_ambiguous', function => $fname}) unless @args > $fixed;
+                @cast = ((map { "CAST(($args[$_]) AS $types[$_])" } 0 .. $fixed - 1),
+                    'VARIADIC ARRAY[' . join(', ', map { "CAST(($args[$_]) AS $info->{variadic})" } $fixed .. $#args) . ']');
+            } else {
+                Selecto::Error->throw('query_rule_not_evaluable', "a function read from takes arguments its declaration does not",
+                    {reason => 'function_ambiguous', function => $fname})
+                    unless @args <= @types && @args >= @types - ($info->{defaults} // 0);
+                @cast = map { "CAST(($args[$_]) AS $types[$_])" } 0 .. $#args;
+            }
+            $sql = $quote->($info->{schema}) . '.' . $quote->($fname) . '(' . join(', ', @cast) . ')';
             return _postfix($state, $tokens, $pos, $sql, undef, 1, undef, $mark);
         }
         if (_peek_punct($tokens, $$pos, '(')) {
@@ -1232,10 +1251,18 @@ sub lint {
     my ($sql, $functions) = @_;
     my $tokens = tokenize($sql);
     my @problems;
+    # The clause each parenthesis level is in (a comma in a FROM list starts
+    # another FROM item; review LOW 4).
+    my @clause = ('');
     # A second pass over the original SQL for bare operators and functions.
     for my $k (0 .. $#$tokens) {
         my ($type, $text) = @{$tokens->[$k]};
         my $prev = $k > 0 ? $tokens->[$k - 1] : ['', ''];
+        if ($type eq 'punct' && $text eq '(') { push @clause, '' }
+        elsif ($type eq 'punct' && $text eq ')') { pop @clause; @clause = ('') unless @clause }
+        elsif ($type eq 'id' && uc($text) =~ /\A(?:SELECT|FROM|JOIN|ON|WHERE|GROUP|HAVING|ORDER|LIMIT|OFFSET|WINDOW|UNION|INTERSECT|EXCEPT|RETURNING|SET|VALUES|USING)\z/) {
+            $clause[-1] = uc($text) =~ /\A(?:FROM|JOIN|ON|USING)\z/ ? 'FROM' : uc $text;
+        }
         if ($type eq 'op') {
             next if $text eq '*' && ($prev->[1] =~ /\A(?:\(|,|\.)\z/ || uc($prev->[1]) =~ /\A(?:SELECT|DISTINCT|RETURNING)\z/);
             next if $prev->[1] eq '.' && $k >= 4 && uc($tokens->[$k - 4][1]) eq 'OPERATOR';
@@ -1248,7 +1275,7 @@ sub lint {
             && $prev->[1] ne '.' && $prev->[1] ne '::' && uc($prev->[1]) ne 'AS' && $functions->{lc $text}) {
             push @problems, "unqualified function $text";
         } elsif ($type =~ /\A(?:id|qid)\z/ && $k + 1 < @$tokens && $tokens->[$k + 1][1] eq '(' && !$KEYWORD{uc $text}
-            && uc($prev->[1]) =~ /\A(?:FROM|JOIN|LATERAL)\z/) {
+            && (uc($prev->[1]) =~ /\A(?:FROM|JOIN|LATERAL)\z/ || ($prev->[1] eq ',' && $clause[-1] eq 'FROM'))) {
             # A function rowset must name its schema (review M1).
             push @problems, "unqualified function rowset $text";
         }

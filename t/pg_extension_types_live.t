@@ -238,7 +238,38 @@ is(($fl->())[0], 'query_rule_not_evaluable/function_ambiguous', 'a same-schema o
 $admin->do($_) for 'DROP FUNCTION r50_rows(text)', q{CREATE FUNCTION r50_fn.r50_rows(n int) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT 'unpinned' $$};
 is(($fl->())[0], 'applied host:7,host:7', 'a namesake in a schema outside the pin does not count');
 $admin->do($_) for 'DROP FUNCTION r50_rows(int)', 'DROP SCHEMA r50_fn CASCADE';
+# Review of 2e95065 (MEDIUM): pg_catalog set-returning functions (every
+# pinned candidate pg_catalog's) are called pg_catalog-qualified, and a
+# VARIADIC host function as VARIADIC, as a function_lateral and as a
+# declared lateral member, with native results.
+$admin->do($_) for 'DROP FUNCTION IF EXISTS r50_tags_of(text[])',
+    q{CREATE FUNCTION r50_tags_of(VARIADIC xs text[]) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT pg_catalog.unnest(xs) $$};
+my $lm = Selecto::Domain->parse({schema_version => 1, name => 'R50L', source => {source_table => 'r50_ma', primary_key => 'id', tenant_field => 'org',
+    fields => [qw(id org code)], columns => $cols->(id => 'integer', org => 'string', code => 'string'), associations => {}}, schemas => {}, joins => {},
+    query_members => {laterals => {
+        parts => {source => ['function', 'regexp_split_to_table', ['red,green', ',']], columns => ['v']},
+        words => {source => ['function', 'string_to_table', ['a b', ' ']], columns => ['v']},
+        tags => {source => ['function', 'r50_tags_of', ['x', 'y']], columns => ['v']},
+        one => {source => ['function', 'r50_tags_of', ['{a,b}']], columns => ['v']}}}});
+my $le = Selecto::Engine->new(domain => $lm, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+my $vals = sub { my ($q) = @_; join ',', sort map { $_->[1] } grep { $_->[0] == 1 } @{$le->all($q)->{rows}} };
+for my $case (['parts', 'green,red'], ['words', 'a,b'], ['tags', 'x,y'], ['one', '{a,b}']) {
+    my ($member, $want) = @$case;
+    is($outcome->(sub { $vals->($le->query->with_lateral($member)->select('id', "$member.v")) }), "applied $want", "declared lateral member $member: $want");
+}
+for my $case (['regexp_split_to_table', ['red,green', ','], 'green,red'], ['string_to_table', ['a b', ' '], 'a,b'],
+    ['r50_tags_of', ['x', 'y'], 'x,y'], ['r50_tags_of', ['{a,b}'], '{a,b}']) {
+    my ($fn, $args, $want) = @$case;
+    is($outcome->(sub { $vals->($le->query->function_lateral($fn, $args, as => 'f', columns => ['v'])->select('id', 'f.v')) }), "applied $want",
+        "function_lateral $fn(@$args): $want");
+}
+like($le->adapter->_statement_sql($le->compile($le->query->function_lateral('r50_tags_of', ['x', 'y'], as => 'f', columns => ['v'])->select('id'))->sql),
+    qr/"r50_tags_of"\(VARIADIC ARRAY\[CAST\(\(\$\d+\) AS pg_catalog\.text\), CAST/, 'a VARIADIC host function is called as VARIADIC with cast elements');
+$admin->do('DROP FUNCTION r50_tags_of(text[])');
+
 require Selecto::PostgreSQL::Qualify;
+like(join('; ', Selecto::PostgreSQL::Qualify::lint(q{SELECT "s0"."id" FROM public.t AS "s0", "r50_rows"($1) AS "f"("v")}, {})),
+    qr/unqualified function rowset/, 'the lint flags an unqualified function rowset in a FROM list');
 like(join('; ', Selecto::PostgreSQL::Qualify::lint(q{SELECT "s0"."id" FROM public.t AS "s0" JOIN LATERAL "r50_rows"($1) AS "f"("v") ON TRUE}, {})),
     qr/unqualified function rowset/, 'the lint flags an unqualified function rowset');
 
