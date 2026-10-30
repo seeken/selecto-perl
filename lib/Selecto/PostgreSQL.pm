@@ -2167,6 +2167,14 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     WHERE (SELECT pg_catalog.count(*) FROM f g WHERE g.proname OPERATOR(pg_catalog.=) f.proname) OPERATOR(pg_catalog.=) 1
     UNION ALL
     SELECT 'iso', NULL, NULL, pg_catalog.current_setting('transaction_isolation'), NULL};
+# The same without the function-rowset parts (most statements read from no
+# function): far less to plan (review LOW 3).
+my $EXTENSION_OPERATORS_NO_FUNCTIONS_SQL = do {
+    my $sql = $EXTENSION_OPERATORS_SQL;
+    $sql =~ s/\),\n    x\(oid, depth\) AS \(.*?\n    SELECT 'col'/)\n    SELECT 'col'/s or die 'extension SQL: no function CTEs';
+    $sql =~ s/\n    UNION ALL\n    SELECT 'fun'.*?\n    UNION ALL\n    SELECT 'iso'/\n    UNION ALL\n    SELECT 'iso'/s or die 'extension SQL: no function rows';
+    $sql;
+};
 my $EXTENSION_PROBE_SQL = q{SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
       WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'),
     pg_catalog.current_setting('transaction_isolation'),
@@ -2177,7 +2185,13 @@ my $EXTENSION_PROBE_SQL = q{SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
             pg_catalog.quote_ident(CAST(t.typname AS pg_catalog.text)))
           FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS u(o, i)
           JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) u.o JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
-          ORDER BY u.i), pg_catalog.chr(30))))
+          ORDER BY u.i), pg_catalog.chr(30))), pg_catalog.chr(31),
+        CASE WHEN pg_catalog.bool_and(n.nspname OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.name)) THEN 'catalog' ELSE '' END,
+        pg_catalog.chr(31),
+        pg_catalog.min((SELECT pg_catalog.concat(pg_catalog.quote_ident(CAST(vn.nspname AS pg_catalog.text)), '.',
+            pg_catalog.quote_ident(CAST(vt.typname AS pg_catalog.text)))
+          FROM pg_catalog.pg_type vt JOIN pg_catalog.pg_namespace vn ON vn.oid OPERATOR(pg_catalog.=) vt.typnamespace
+          WHERE vt.oid OPERATOR(pg_catalog.=) p.provariadic)))
       FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS k(sch, name)
       LEFT JOIN (pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace)
         ON CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.name
@@ -2223,6 +2237,22 @@ sub _pg_extension_operators {
     return {} unless %rels || %functions;
     my @rels = sort keys %rels;
     my @functions = sort keys %functions;
+    # Within one write (its statements run under the write's relation lock),
+    # the same relations and functions are read once (review LOW 3).
+    my $shared = $self->{_selecto_write_catalog};
+    my $key = join("\0", @rels) . "\x1f" . join("\0", @functions) . "\x1f" . join("\0", sort keys %host)
+        . "\x1f" . join("\0", @{$self->{_selecto_qualify_declared} // []});
+    return $shared->{$key} if ref($shared) eq 'HASH' && $shared->{$key};
+    my $result = $self->_pg_extension_lookup(\@rels, \@functions, \%host);
+    $shared->{$key} = $result if ref($shared) eq 'HASH';
+    return $result;
+}
+
+sub _pg_extension_lookup {
+    my ($self, $rels, $functions, $host_set) = @_;
+    my @rels = @$rels;
+    my @functions = @$functions;
+    my %host = %$host_set;
     # Whether the database has any extension-owned type, the isolation level,
     # and the schema of each function read from (when only one schema has
     # it; review LOW 7): with no extension type and read committed, nothing
@@ -2236,15 +2266,17 @@ sub _pg_extension_operators {
     my ($has_extension, $level, $candidates) = @probe;
     my %host_functions;
     for (@{$candidates // []}) {
-        my ($sch, $fname, $count, $schema, $nargs, $defaults, $args) = split /\x1f/, $_, 7;
+        my ($sch, $fname, $count, $schema, $nargs, $defaults, $args, $catalog, $variadic) = split /\x1f/, $_, 9;
         $host_functions{"$sch\0$fname"} = {count => $count, schema => $schema, nargs => $nargs, defaults => $defaults,
-            args => [length($args // '') ? split(/\x1e/, $args) : ()]};
+            args => [length($args // '') ? split(/\x1e/, $args) : ()], catalog => ($catalog // '') eq 'catalog' ? 1 : 0,
+            variadic => length($variadic // '') ? $variadic : undef};
     }
     if (!$has_extension && defined($level) && $level eq 'read committed') {
         return {functions => {map { ($_ => {state => 'known'}) } @functions}, host_functions => \%host_functions, extension => 0};
     }
     my $rows;
-    $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@functions); 1 };
+    $ok = eval { $rows = @functions ? $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@functions)
+        : $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_NO_FUNCTIONS_SQL, undef, \@rels); 1 };
     die $self->normalize_error($@) unless $ok;
     my (%relations, %types, %known, $isolation);
     my $key = sub { lc join '.', map { s/\A"((?:[^"]|"")*)"\z/$1/r =~ s/""/"/gr } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $_[0] };

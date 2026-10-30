@@ -3523,6 +3523,10 @@ sub _execute_compiled_write_in_transaction {
     # DML (item 51) lives for this write only.
     my $session = $self->_write_session_open($command, $compiled);
     local $self->{_selecto_write_target} = {};
+    # Catalog facts a dialect reads per statement may be shared by this
+    # write's statements, all run under its relation lock (PostgreSQL's
+    # extension-operator types).
+    local $self->{_selecto_write_catalog} = {};
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
