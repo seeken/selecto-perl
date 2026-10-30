@@ -55,7 +55,7 @@ my $engine = sub {
 my $ids = sub { my ($e, $q) = @_; join ',', map { $_->[0] } @{$e->all($q->order_by('id'))->{rows}} };
 
 $admin->do($_) for 'DROP SCHEMA IF EXISTS r49_a CASCADE', 'DROP SCHEMA IF EXISTS r49_b CASCADE',
-    'DROP TABLE IF EXISTS r49_acct, r49_root, r49_mem, r49_deep16, r49_deep17, r49_it, r49_acc, r49_lk CASCADE',
+    'DROP TABLE IF EXISTS r49_hr, r49_hm, r49_hc, r49_acct, r49_root, r49_mem, r49_deep16, r49_deep17, r49_it, r49_acc, r49_lk CASCADE',
     'DROP DOMAIN IF EXISTS r49_email CASCADE', 'DROP DOMAIN IF EXISTS r49_d1 CASCADE';
 
 # H2: schema-per-tenant prefix reads.
@@ -89,7 +89,7 @@ SKIP: {
     my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
     my $has = $preinstalled
         || eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r49ext'); $admin->do('CREATE EXTENSION citext SCHEMA r49ext'); 1 };
-    skip 'citext is not available', 14 unless $has;
+    skip 'citext is not available', 31 unless $has;
     my ($schema) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
     my $citext = qq{"$schema".citext};
     # Natively, with the extension schema on the path.
@@ -185,6 +185,65 @@ SKIP: {
         is($outcome->(sub { $ids->($ed, $ed->query->select('id')) }), $want, "a required <> on a citext domain chain ($table): $want");
     }
 
+    # Review of 4aa5b81: a member output written as a value expression of a
+    # citext column, ("s0"."tag") AS "t2", in a CTE or a lateral, and a
+    # computed column that passes a citext column through, keep citext's
+    # operators, as a caller filter and as a host required predicate. An
+    # expression over a citext column whose type cannot be resolved here
+    # (COALESCE) is refused, never compared with text operators.
+    $admin->do($_) for 'CREATE TABLE r49_hr (id INT PRIMARY KEY, org TEXT NOT NULL, k INT)',
+        q{INSERT INTO r49_hr VALUES (1, 't1', 1), (2, 't1', 2), (3, 't1', 3), (4, 't2', 1)},
+        "CREATE TABLE r49_hm (id INT PRIMARY KEY, org TEXT NOT NULL, k INT, tag $citext)",
+        q{INSERT INTO r49_hm VALUES (10, 't1', 1, 'Gold'), (11, 't1', 2, 'GOLD'), (12, 't1', 3, 'silver'), (13, 't2', 1, 'gold')},
+        "CREATE TABLE r49_hc (id INT PRIMARY KEY, org TEXT NOT NULL, code $citext, note TEXT)",
+        q{INSERT INTO r49_hc VALUES (1, 't1', 'abc', 'abc'), (2, 't1', 'ABC', 'abc'), (3, 't1', 'Abc', 'ABC'), (4, 't2', 'abc', 'abc')};
+    my %t = (id => 'integer', org => 'string', k => 'integer', tag => 'string');
+    my $hm = {source_table => 'r49_hm', primary_key => 'id', tenant_field => 'org', fields => [qw(id org k tag)],
+        columns => {map { ($_ => {type => $t{$_}}) } qw(id org k tag)}, associations => {}};
+    my $hr = {source_table => 'r49_hr', primary_key => 'id', tenant_field => 'org', fields => [qw(id org k)],
+        columns => {map { ($_ => {type => $t{$_}}) } qw(id org k)}, associations => {}};
+    my $members = Selecto::Domain->parse({schema_version => 1, name => 'R49H', source => $hr, schemas => {mem => $hm}, joins => {},
+        query_members => {
+            ctes => {al => {source => 'mem', query => {select => ['k', {as => 't2', value => ['field', 'tag']}]},
+                join => {owner_key => 'k', related_key => 'k', type => 'inner'}}},
+            laterals => {la => {source => 'mem', query => {select => ['id', {as => 't2', value => ['field', 'tag']}],
+                order_by => [['id', 'asc']], limit => 5}, correlations => {k => 'k'}, join_type => 'inner'}}}});
+    my $joined = q{SELECT r.id FROM r49_hr r JOIN r49_hm m ON r.k = m.k AND m.org = 't1' WHERE r.org = 't1'};
+    for my $member (qw(al la)) {
+        for my $case (['<>', 'gold', 'ne'], ['=', 'GOLD', 'eq']) {
+            my ($op, $value, $method) = @$case;
+            my $native_ids = join ',', @{$admin->selectcol_arrayref("$joined AND m.tag $op '$value' ORDER BY 1")};
+            my $predicate = $x->$method("$member.t2", $value);
+            my $caller = $engine->($members, tenant => 't1');
+            is($outcome->(sub { $ids->($caller, $caller->query->with_member($member)->select('id')->where($predicate)) }),
+                "applied $native_ids", "member $member value output: t2 $op '$value' as natively (caller filter)");
+            my $host = $engine->($members->with_required_predicate($predicate), tenant => 't1');
+            is($outcome->(sub { $ids->($host, $host->query->with_member($member)->select('id')) }),
+                "applied $native_ids", "and as a host required predicate");
+        }
+    }
+    my %c = (id => {type => 'integer'}, org => {type => 'string'}, code => {type => 'string'}, note => {type => 'string'},
+        codealias => {type => 'string', computed => {kind => 'expression', expression => ['field', 'code']}},
+        upc => {type => 'string', computed => {kind => 'expression', expression => ['upper', ['field', 'code']]}},
+        code2 => {type => 'string', computed => {kind => 'expression', expression => ['coalesce', ['field', 'code'], ['literal', 'zz']]}});
+    my $computed = Selecto::Domain->parse({schema_version => 1, name => 'R49C', source => {source_table => 'r49_hc', primary_key => 'id',
+        tenant_field => 'org', fields => [sort keys %c], columns => \%c, associations => {}}, schemas => {}, joins => {}});
+    for my $case (['codealias', 'ne', 'abc', "code <> 'abc'"], ['codealias', 'eq', 'abc', "code = 'abc'"],
+        ['upc', 'eq', 'ABC', "upper(code) = 'ABC'"], ['upc', 'eq', ['field', 'code'], 'upper(code) = code']) {
+        my ($field, $method, $value, $where) = @$case;
+        my $native_ids = join ',', @{$admin->selectcol_arrayref("SELECT id FROM r49_hc WHERE org = 't1' AND $where ORDER BY 1")};
+        my $predicate = $x->$method($field, ref $value ? $x->field($value->[1]) : $value);
+        my $caller = $engine->($computed, tenant => 't1');
+        is($outcome->(sub { $ids->($caller, $caller->query->select('id')->where($predicate)) }), "applied $native_ids",
+            "computed $where as natively (caller filter)");
+        my $host = $engine->($computed->with_required_predicate($predicate), tenant => 't1');
+        is($outcome->(sub { $ids->($host, $host->query->select('id')) }), "applied $native_ids", 'and as a host required predicate');
+    }
+    my $coalesce = $engine->($computed->with_required_predicate($x->ne('code2', 'abc')), tenant => 't1');
+    is($outcome->(sub { $ids->($coalesce, $coalesce->query->select('id')) }), 'query_rule_not_evaluable/operand_type_unknown',
+        'a required <> on COALESCE over a citext column is refused, not compared as text');
+
+    $admin->do($_) for 'DROP TABLE r49_hr, r49_hm, r49_hc';
     $admin->do($_) for 'DROP TABLE r49_deep16, r49_deep17, r49_it, r49_acc, r49_lk', 'DROP DOMAIN r49_d1 CASCADE';
     $admin->do($_) for 'DROP TABLE r49_acct, r49_root, r49_mem CASCADE', 'DROP DOMAIN r49_email';
     $admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r49ext CASCADE');
