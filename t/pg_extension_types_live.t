@@ -120,6 +120,17 @@ my $ea = Selecto::Engine->new(domain => $agg, adapter => Selecto->adapter(postgr
 is($outcome->(sub { join ',', @{$ea->all($ea->query->select($x->max('code')->as('mx'), $x->min('code')->as('mn')))->{rows}[0]} }),
     "applied $max,$min", "citext max and min as natively ($max,$min)");
 
+# A function planted beside the extension's type (lower(citext) in the
+# extension's schema, not a member of it) is never resolved: lower stays
+# pg_catalog's, and the member output compares as pg_catalog.lower's text.
+$admin->do(qq{CREATE FUNCTION "$schema".lower($ci) RETURNS text LANGUAGE sql IMMUTABLE AS \$\$SELECT 'planted'\$\$});
+my $planted = $native->("$joined AND pg_catalog.lower(CAST(m.tag AS text)) <> 'gold'");
+my $ep = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+my $lq = $ep->query->with_member('lw')->select('id')->where($x->ne('lw.v', 'gold'));
+is($outcome->(sub { $ids->($ep, $lq) }), "applied $planted", "a planted lower(citext) is not used: as pg_catalog.lower [$planted]");
+like($ep->adapter->_statement_sql($ep->compile($lq)->sql), qr/pg_catalog\.lower\(/i, 'the statement calls pg_catalog.lower');
+$admin->do(qq{DROP FUNCTION "$schema".lower($ci)});
+
 # M4: a column altered text -> citext after a REPEATABLE READ host
 # transaction's snapshot: a host required note <> 'secret' is refused, typed
 # (read committed reads the current types).

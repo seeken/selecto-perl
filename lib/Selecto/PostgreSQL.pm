@@ -2063,8 +2063,10 @@ sub _pg_catalog_functions {
 #   domain over one (the typbasetype chain is followed to the base type) or
 #   an array of one: the schema of each operator and of each function the
 #   type's own extension defines for it (never a user object someone added
-#   beside them), and whether the function returns the type (citext's max
-#   and min);
+#   beside them: each must be a pg_depend member of the type's extension),
+#   and, for the aggregates that extension defines over the type alone
+#   (citext's max and min), whether they return the type; every other
+#   function stays pg_catalog's, whatever is planted beside it;
 # - for each function the statement reads rows from: whether its outputs can
 #   be an extension type ("unknown") or not ("known");
 # - the transaction's isolation level (see _pg_verify_column_types).
@@ -2113,7 +2115,8 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     SELECT CASE WHEN e.arr THEN 'efn' ELSE 'fn' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
       CAST(p.proname AS pg_catalog.text),
       pg_catalog.concat(n.nspname, CASE WHEN p.prorettype OPERATOR(pg_catalog.=) e.oid THEN '|self' ELSE '' END)
-    FROM e JOIN pg_catalog.pg_proc p ON p.pronargs OPERATOR(pg_catalog.>) 0 AND p.proargtypes[0] OPERATOR(pg_catalog.=) e.oid
+    FROM e JOIN pg_catalog.pg_proc p ON p.pronargs OPERATOR(pg_catalog.=) 1 AND p.proargtypes[0] OPERATOR(pg_catalog.=) e.oid
+      AND p.prokind OPERATOR(pg_catalog.=) 'a'
     JOIN pg_catalog.pg_depend pd ON pd.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_proc' AS pg_catalog.regclass)
       AND pd.objid OPERATOR(pg_catalog.=) p.oid AND pd.deptype OPERATOR(pg_catalog.=) 'e' AND pd.refobjid OPERATOR(pg_catalog.=) e.refobjid
     JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
