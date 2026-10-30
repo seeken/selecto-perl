@@ -523,12 +523,15 @@ sub _atom {
             my @plain = grep { !$_->{member} } @reach;
             if (@plain && @plain < @reach) {
                 # The extension's own functions are dropped only beside
-                # pg_catalog's or another extension's (review of fc1b811):
-                # beside anything else, which could be a plant in a writable
-                # pinned schema, the call is ambiguous.
+                # pg_catalog's or other members of that same extension
+                # (reviews of fc1b811 and 31aedf3): beside anything else,
+                # which could be a plant in a writable pinned schema, even
+                # one added to another extension its creator installed, the
+                # call is ambiguous.
+                my %own = map { ($_->{extension} // '') => 1 } grep { $_->{member} } @reach;
                 Selecto::Error->throw('query_rule_not_evaluable', "a function read from must resolve to exactly one function in the pinned schemas",
                     {reason => 'function_ambiguous', function => $fname})
-                    if grep { $_->{schema} ne 'pg_catalog' && !$_->{extension} } @plain;
+                    if grep { $_->{schema} ne 'pg_catalog' && !(defined($_->{extension}) && $own{$_->{extension}}) } @plain;
                 @reach = @plain;
             }
             my $catalog = !grep { $_->{schema} ne 'pg_catalog' } @reach;
@@ -549,10 +552,10 @@ sub _atom {
                 Selecto::Error->throw('query_rule_not_evaluable', 'a function read from takes VARIADIC "any"',
                     {reason => 'function_not_castable', function => $fname}) if $info->{variadic} =~ /(?:\A|\.)"?any"?\z/;
                 my $fixed = @types - 1;
-                Selecto::Error->throw('query_rule_not_evaluable', "a function read from takes arguments its declaration does not",
-                    {reason => 'function_not_found', function => $fname}) unless @args > $fixed;
-                @cast = ((map { "CAST(($args[$_]) AS $types[$_])" } 0 .. $fixed - 1),
-                    'VARIADIC ARRAY[' . join(', ', map { "CAST(($args[$_]) AS $info->{variadic})" } $fixed .. $#args) . ']');
+                # No variadic argument: only when the VARIADIC parameter
+                # has a default (reach checked that), which then applies.
+                @cast = ((map { "CAST(($args[$_]) AS $types[$_])" } 0 .. ($fixed < @args ? $fixed : scalar @args) - 1),
+                    (@args > $fixed ? 'VARIADIC ARRAY[' . join(', ', map { "CAST(($args[$_]) AS $info->{variadic})" } $fixed .. $#args) . ']' : ()));
             } else {
                 Selecto::Error->throw('query_rule_not_evaluable', "a function read from takes arguments its declaration does not",
                     {reason => 'function_ambiguous', function => $fname})

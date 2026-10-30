@@ -303,7 +303,7 @@ SKIP: {
 SKIP: {
     my $had = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'hstore'}))[0];
     my $made = !$had && eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r51hs'); $admin->do('CREATE EXTENSION hstore SCHEMA r51hs'); 1 };
-    skip 'hstore is not available', 6 unless $had || $made;
+    skip 'hstore is not available', 8 unless $had || $made;
     my ($hs) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'hstore'});
     my ($dsn, @auth) = TestPostgreSQL->connection;
     my $dbh = DBI->connect($dsn . qq{;options='-c search_path=public,"$hs"'}, @auth, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
@@ -330,9 +330,48 @@ SKIP: {
     }
     $admin->do($_) for 'DROP FUNCTION public.each(text)', 'DROP FUNCTION public.akeys(text[])',
         ($hs ne 'public' ? (qq{DROP FUNCTION public.skeys($hsq.hstore)}) : ());
+    # Review of 31aedf3 (MEDIUM): a plant added to an extension a non-superuser
+    # installed (trusted seg) is not a safe neighbour of hstore's own.
+    SKIP: {
+        my ($can) = $admin->selectrow_array(q{SELECT rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = CURRENT_USER});
+        my $seg = ($admin->selectrow_array(q{SELECT count(*) FROM pg_available_extensions WHERE name = 'seg'}))[0]
+            && !($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'seg'}))[0];
+        skip 'roles cannot be created or seg is unavailable or installed', 2 unless $can && $seg;
+        my ($db) = $admin->selectrow_array('SELECT current_database()');
+        $admin->do($_) for q{DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'r51_att') THEN CREATE ROLE r51_att LOGIN; END IF; END $$},
+            qq{GRANT CREATE ON DATABASE "$db" TO r51_att}, 'GRANT CREATE, USAGE ON SCHEMA public TO r51_att', qq{GRANT USAGE ON SCHEMA $hsq TO r51_att};
+        my ($adsn, @aauth) = TestPostgreSQL->connection;
+        my $att = DBI->connect($adsn, 'r51_att', $aauth[1], {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+        $att->do('SET client_min_messages TO warning');
+        my @own = (q{CREATE EXTENSION seg SCHEMA public},
+            q{CREATE FUNCTION public.each(text) RETURNS TABLE(key text, value text) LANGUAGE sql STABLE AS $$ SELECT 'PLANTED', 'PLANTED' $$},
+            q{ALTER EXTENSION seg ADD FUNCTION public.each(text)});
+        push @own, (qq{CREATE FUNCTION public.skeys($hsq.hstore) RETURNS SETOF text LANGUAGE sql STABLE AS \$\$ SELECT 'PLANTED' \$\$},
+            qq{ALTER EXTENSION seg ADD FUNCTION public.skeys($hsq.hstore)}) if $hs ne 'public';
+        $att->do($_) for @own;
+        for my $case (['each', ['key', 'value']], ($hs ne 'public' ? (['skeys', ['v']]) : (['each', ['key', 'value']]))) {
+            my ($fn, $cols) = @$case;
+            is($outcome->(sub { $he->all($he->query->function_lateral($fn, ['a=>1,b=>2'], as => 'f', columns => $cols)->select('id')) }),
+                'query_rule_not_evaluable/function_ambiguous', "a plant added to another extension (seg, installed by a non-superuser) is refused: $fn");
+        }
+        $att->do('DROP EXTENSION seg CASCADE');
+        $att->disconnect;
+        $admin->do($_) for qq{REVOKE CREATE ON DATABASE "$db" FROM r51_att}, 'REVOKE CREATE, USAGE ON SCHEMA public FROM r51_att',
+            qq{REVOKE USAGE ON SCHEMA $hsq FROM r51_att}, 'DROP ROLE r51_att';
+    }
     $dbh->disconnect;
     $admin->do($_) for $made ? ('DROP EXTENSION hstore', 'DROP SCHEMA r51hs') : ();
 }
+# Review of 31aedf3 (LOW 1b): a VARIADIC parameter with a default, called
+# with no variadic argument, resolves as natively.
+$admin->do($_) for 'DROP FUNCTION IF EXISTS r51_vdef(text, text[])',
+    q{CREATE FUNCTION r51_vdef(a text, VARIADIC xs text[] DEFAULT '{}') RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT a || ':' || pg_catalog.cardinality(xs) $$};
+for my $case ([['p'], 'p:0'], [['p', 'x', 'y'], 'p:2']) {
+    my ($args, $want) = @$case;
+    is($outcome->(sub { $vals->($le->query->function_lateral('r51_vdef', $args, as => 'f', columns => ['v'])->select('id', 'f.v')) }), "applied $want",
+        "a VARIADIC parameter with a default: r51_vdef(@$args) gives $want");
+}
+$admin->do('DROP FUNCTION r51_vdef(text, text[])');
 $admin->do('DROP FUNCTION r50_tags_of(text[])');
 
 require Selecto::PostgreSQL::Qualify;
