@@ -1307,7 +1307,10 @@ my $DEFERRABLE_COUNT = '(SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
     . "AND NOT ($INDEX_BAD) AND NOT ($OPS_BAD) AND NOT ($TYPES_BAD))))";
 
 my $SESSION_SNAPSHOT_COLUMNS = join(', ',
+    # CURRENT_USER too: a trigger's set_config('role', ..., false) changes
+    # who every later statement runs as (review LOW 8).
     q{pg_catalog.concat_ws(' | ', } . join(', ', map { "pg_catalog.current_setting('$_')" } @SESSION_SETTINGS) . ', '
+        . 'CAST(CURRENT_USER AS pg_catalog.text), '
         . q{COALESCE((SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', c.oid, c.xmin, c.relname), ',' ORDER BY c.oid) }
         . qq{FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) $TEMP_SCHEMA), ''), }
         . q{COALESCE((SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', r.oid, r.xmin), ',' ORDER BY r.oid) }
@@ -2112,6 +2115,11 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
       AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
     JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace
     UNION ALL
+    SELECT CASE WHEN e.arr THEN 'etyp' ELSE 'typ' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
+      pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), NULL
+    FROM e JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) e.oid
+    JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) ty.typnamespace
+    UNION ALL
     SELECT CASE WHEN e.arr THEN 'efn' ELSE 'fn' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
       CAST(p.proname AS pg_catalog.text),
       pg_catalog.concat(n.nspname, CASE WHEN p.prorettype OPERATOR(pg_catalog.=) e.oid THEN '|self' ELSE '' END)
@@ -2140,7 +2148,9 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     JOIN LATERAL (
       SELECT NULL AS op, CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
           WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
-            AND d.objid OPERATOR(pg_catalog.=) w.t) THEN 'ext'
+            AND d.objid OPERATOR(pg_catalog.=) w.t)
+          THEN pg_catalog.concat('ext:', pg_catalog.quote_ident(CAST((SELECT tn.nspname FROM pg_catalog.pg_namespace tn
+            WHERE tn.oid OPERATOR(pg_catalog.=) wt.typnamespace) AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(wt.typname AS pg_catalog.text)))
         WHEN w.t OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x)) OR wt.typtype OPERATOR(pg_catalog.=) 'p'
           OR wt.typtype OPERATOR(pg_catalog.=) 'c' THEN 'unknown' ELSE 'known' END AS schema
       UNION ALL
@@ -2154,6 +2164,13 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     WHERE (SELECT pg_catalog.count(*) FROM f g WHERE g.proname OPERATOR(pg_catalog.=) f.proname) OPERATOR(pg_catalog.=) 1
     UNION ALL
     SELECT 'iso', NULL, NULL, pg_catalog.current_setting('transaction_isolation'), NULL};
+my $EXTENSION_PROBE_SQL = q{SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+      WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'),
+    pg_catalog.current_setting('transaction_isolation'),
+    ARRAY(SELECT pg_catalog.concat(CAST(p.proname AS pg_catalog.text), pg_catalog.chr(31), CAST(pg_catalog.min(n.nspname) AS pg_catalog.text))
+      FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
+      WHERE CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY (CAST($1 AS pg_catalog.text[]))
+      GROUP BY p.proname HAVING pg_catalog.count(DISTINCT p.pronamespace) OPERATOR(pg_catalog.=) 1)};
 sub _pg_extension_operators {
     my ($self, $sql) = @_;
     require Selecto::PostgreSQL::Qualify;
@@ -2180,8 +2197,21 @@ sub _pg_extension_operators {
     }
     return {} unless %rels || %functions;
     my @rels = sort keys %rels;
+    my @functions = sort keys %functions;
+    # Whether the database has any extension-owned type, the isolation level,
+    # and the schema of each function read from (when only one schema has
+    # it; review LOW 7): with no extension type and read committed, nothing
+    # else is needed (review LOW 10).
+    my @probe;
+    my $ok = eval { @probe = $self->{dbh}->selectrow_array($EXTENSION_PROBE_SQL, undef, \@functions); 1 };
+    die $self->normalize_error($@) unless $ok;
+    my ($has_extension, $level, $schemas) = @probe;
+    my %function_schema = map { split /\x1f/, $_, 2 } @{$schemas // []};
+    if (!$has_extension && defined($level) && $level eq 'read committed') {
+        return {functions => {map { ($_ => {state => 'known', schema => $function_schema{$_}}) } @functions}, extension => 0};
+    }
     my $rows;
-    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, [sort keys %functions]); 1 };
+    $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@functions); 1 };
     die $self->normalize_error($@) unless $ok;
     my (%relations, %types, %known, $isolation);
     my $key = sub { lc join '.', map { s/\A"((?:[^"]|"")*)"\z/$1/r =~ s/""/"/gr } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $_[0] };
@@ -2193,7 +2223,12 @@ sub _pg_extension_operators {
         if ($kind eq 'fun') { $known{$column}{state} = $b; $extension = 1 if $b ne 'known'; next }
         # The one function of that name: each output column's type (review
         # M2), an extension type's operators included.
-        if ($kind eq 'fcol') { $known{$column}{cols}[$rel - 1] //= {}; $known{$column}{cols}[$rel - 1]{"\0unknown"} = 1 if $b eq 'unknown'; next }
+        if ($kind eq 'fcol') {
+            my $col = $known{$column}{cols}[$rel - 1] //= {};
+            $col->{"\0unknown"} = 1 if $b eq 'unknown';
+            $col->{"\0type"} = $1 if $b =~ /\Aext:(.+)\z/s;
+            next;
+        }
         if ($kind eq 'fop') { $known{$column}{cols}[$rel - 1]{$a} = $quote->($b); next }
         my $columns = $relations{$key->($rel)} //= {};
         my $entry = $columns->{lc $column} //= {};
@@ -2204,7 +2239,11 @@ sub _pg_extension_operators {
             {reason => 'domain_chain_too_deep', relation => $rel, column => $column}) if $kind eq 'deep';
         $extension = 1;
         my $target = $kind =~ /\Ae/ ? ($entry->{"\0elem"} //= {}) : $entry;
-        if ($kind =~ /op\z/) {
+        if ($kind =~ /typ\z/) {
+            # The member type's own name: operands of its operators are cast
+            # to it (R50).
+            $target->{"\0type"} = $a;
+        } elsif ($kind =~ /op\z/) {
             $target->{$a} = $quote->($b);
         } else {
             my ($schema, $self_type) = $b =~ /\A(.*?)(\|self)?\z/s;
@@ -2212,6 +2251,7 @@ sub _pg_extension_operators {
         }
     }
     $self->_pg_verify_column_types(\%types) if %types && defined($isolation) && $isolation ne 'read committed';
+    $known{$_}{schema} = $function_schema{$_} for grep { defined $function_schema{$_} } @functions;
     return {relations => \%relations, functions => \%known, extension => $extension};
 }
 
