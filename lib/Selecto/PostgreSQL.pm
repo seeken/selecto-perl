@@ -1934,6 +1934,7 @@ sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
 sub _query_transport_sql {
     my ($self, $statement) = @_;
     return $statement->sql if _pg_hand_built($statement);
+    local $self->{_selecto_qualify_declared} = [_pg_declared_schemas($statement)];
     return $self->_statement_sql($statement->sql);
 }
 
@@ -2114,6 +2115,7 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
       AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
     JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace
+    WHERE o.oprnamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
     UNION ALL
     SELECT CASE WHEN e.arr THEN 'etyp' ELSE 'typ' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
       pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), NULL
@@ -2128,6 +2130,7 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     JOIN pg_catalog.pg_depend pd ON pd.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_proc' AS pg_catalog.regclass)
       AND pd.objid OPERATOR(pg_catalog.=) p.oid AND pd.deptype OPERATOR(pg_catalog.=) 'e' AND pd.refobjid OPERATOR(pg_catalog.=) e.refobjid
     JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
+    WHERE p.pronamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
     UNION ALL
     SELECT 'fun', NULL, CAST(f.proname AS pg_catalog.text), NULL,
       CASE WHEN pg_catalog.bool_or(EXISTS (SELECT 1 FROM pg_catalog.unnest(f.outs) AS o(t)
@@ -2167,10 +2170,20 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
 my $EXTENSION_PROBE_SQL = q{SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
       WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'),
     pg_catalog.current_setting('transaction_isolation'),
-    ARRAY(SELECT pg_catalog.concat(CAST(p.proname AS pg_catalog.text), pg_catalog.chr(31), CAST(pg_catalog.min(n.nspname) AS pg_catalog.text))
-      FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
-      WHERE CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY (CAST($1 AS pg_catalog.text[]))
-      GROUP BY p.proname HAVING pg_catalog.count(DISTINCT p.pronamespace) OPERATOR(pg_catalog.=) 1)};
+    ARRAY(SELECT pg_catalog.concat(k.sch, pg_catalog.chr(31), k.name, pg_catalog.chr(31), pg_catalog.count(p.oid), pg_catalog.chr(31),
+        CAST(pg_catalog.min(n.nspname) AS pg_catalog.text), pg_catalog.chr(31), pg_catalog.min(p.pronargs), pg_catalog.chr(31),
+        pg_catalog.min(p.pronargdefaults), pg_catalog.chr(31),
+        pg_catalog.min(pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
+            pg_catalog.quote_ident(CAST(t.typname AS pg_catalog.text)))
+          FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS u(o, i)
+          JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) u.o JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
+          ORDER BY u.i), pg_catalog.chr(30))))
+      FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS k(sch, name)
+      LEFT JOIN (pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace)
+        ON CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.name
+        AND CASE WHEN k.sch OPERATOR(pg_catalog.=) '' THEN CAST(n.nspname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY (CAST($3 AS pg_catalog.text[]))
+          ELSE CAST(n.nspname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.sch END
+      GROUP BY k.sch, k.name)};
 sub _pg_extension_operators {
     my ($self, $sql) = @_;
     require Selecto::PostgreSQL::Qualify;
@@ -2178,7 +2191,7 @@ sub _pg_extension_operators {
     # Every schema-qualified relation the SQL names (generated SQL always
     # qualifies them, R23b), and every function it reads rows from; the
     # qualifier resolves column references to these by query scope.
-    my (%rels, %functions);
+    my (%rels, %functions, %host);
     my $name = sub { my ($t) = @_; my $v = $t->[1]; $v =~ s/\A"((?:[^"]|"")*)"\z/$1/ ? $v =~ s/""/"/gr : lc $v };
     for my $k (0 .. $#$tokens - 1) {
         next unless $tokens->[$k][0] =~ /\A(?:id|qid)\z/;
@@ -2186,7 +2199,19 @@ sub _pg_extension_operators {
         if ($prev =~ /\A(?:FROM|JOIN|LATERAL|,|\()\z/) {
             my $j = $k;
             $j += 2 while $j + 2 < @$tokens && $tokens->[$j + 1][1] eq '.' && $tokens->[$j + 2][0] =~ /\A(?:id|qid)\z/;
-            $functions{$name->($tokens->[$j])} = 1 if $j + 1 < @$tokens && $tokens->[$j + 1][1] eq '(';
+            if ($j + 1 < @$tokens && $tokens->[$j + 1][1] eq '(') {
+                $functions{$name->($tokens->[$j])} = 1;
+                # A function read from (function_lateral): resolved among
+                # the pinned schemas, or the schema it names (review M1).
+                # (A keyword construct or a pg_catalog function, as the
+                # qualifier treats them, is not one.)
+                my $bare = $j == $k && $tokens->[$k][0] eq 'id';
+                $host{($j == $k + 2 ? $name->($tokens->[$k]) : '') . "\0" . $name->($tokens->[$j])} = 1
+                    if $prev =~ /\A(?:FROM|JOIN|LATERAL|,)\z/ && ($j == $k || $j == $k + 2)
+                    && !($bare && (Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1]) || $self->_pg_catalog_functions->{lc $tokens->[$k][1]}
+                        || uc($tokens->[$k][1]) =~ /\A(?:CAST|EXISTS|ARRAY|ANY|ALL|SOME|EXTRACT|COALESCE|GREATEST|LEAST|ROW|TRIM|SUBSTRING|POSITION|OVERLAY|NULLIF)\z/))
+                    && !($j == $k + 2 && lc($name->($tokens->[$k])) eq 'pg_catalog');
+            }
         }
         next unless $k + 2 <= $#$tokens && $tokens->[$k + 1][1] eq '.' && $tokens->[$k + 2][0] =~ /\A(?:id|qid)\z/;
         next if $k > 0 && $tokens->[$k - 1][1] eq '.';
@@ -2202,13 +2227,21 @@ sub _pg_extension_operators {
     # and the schema of each function read from (when only one schema has
     # it; review LOW 7): with no extension type and read committed, nothing
     # else is needed (review LOW 10).
+    my @host = sort keys %host;
+    my @pinned = @host ? ('pg_catalog', @{$self->{_selecto_qualify_declared} // []}, $self->_pg_reset_schemas) : ();
     my @probe;
-    my $ok = eval { @probe = $self->{dbh}->selectrow_array($EXTENSION_PROBE_SQL, undef, \@functions); 1 };
+    my $ok = eval { @probe = $self->{dbh}->selectrow_array($EXTENSION_PROBE_SQL, undef,
+        [map { (split /\0/, $_, 2)[0] } @host], [map { (split /\0/, $_, 2)[1] } @host], \@pinned); 1 };
     die $self->normalize_error($@) unless $ok;
-    my ($has_extension, $level, $schemas) = @probe;
-    my %function_schema = map { split /\x1f/, $_, 2 } @{$schemas // []};
+    my ($has_extension, $level, $candidates) = @probe;
+    my %host_functions;
+    for (@{$candidates // []}) {
+        my ($sch, $fname, $count, $schema, $nargs, $defaults, $args) = split /\x1f/, $_, 7;
+        $host_functions{"$sch\0$fname"} = {count => $count, schema => $schema, nargs => $nargs, defaults => $defaults,
+            args => [length($args // '') ? split(/\x1e/, $args) : ()]};
+    }
     if (!$has_extension && defined($level) && $level eq 'read committed') {
-        return {functions => {map { ($_ => {state => 'known', schema => $function_schema{$_}}) } @functions}, extension => 0};
+        return {functions => {map { ($_ => {state => 'known'}) } @functions}, host_functions => \%host_functions, extension => 0};
     }
     my $rows;
     $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@functions); 1 };
@@ -2251,8 +2284,8 @@ sub _pg_extension_operators {
         }
     }
     $self->_pg_verify_column_types(\%types) if %types && defined($isolation) && $isolation ne 'read committed';
-    $known{$_}{schema} = $function_schema{$_} for grep { defined $function_schema{$_} } @functions;
-    return {relations => \%relations, functions => \%known, extension => $extension};
+
+    return {relations => \%relations, functions => \%known, host_functions => \%host_functions, extension => $extension};
 }
 
 # R49a: under REPEATABLE READ or SERIALIZABLE the catalog read above sees the

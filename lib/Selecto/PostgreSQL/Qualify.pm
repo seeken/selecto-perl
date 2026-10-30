@@ -473,6 +473,8 @@ sub _atom {
     } elsif ($type eq 'id' && !$KEYWORD{$up} || $type eq 'qid') {
         # A name chain: a.b.c, possibly a function call.
         my $start = $token->[2];
+        # Its position in this token list (a CASE branch is parsed from a slice).
+        my $here = $$pos;
         my @names = ($text);
         my @kinds = ($type);
         $$pos++;
@@ -481,6 +483,39 @@ sub _atom {
             push @names, $tokens->[$$pos + 1][1];
             push @kinds, $tokens->[$$pos + 1][0];
             $$pos += 2;
+        }
+        my $from = $here > 0 && (_upper($tokens->[$here - 1]) =~ /\A(?:FROM|JOIN|LATERAL)\z/ || $tokens->[$here - 1][1] eq ',');
+        if ($from && _peek_punct($tokens, $$pos, '(') && @names <= 2
+            && !(@names == 1 && $kinds[0] eq 'id' && $state->{functions}{lc $names[0]})
+            && !(@names == 2 && lc(_unquote($names[0])) eq 'pg_catalog')) {
+            # A host function read from (function_lateral; review M1): the
+            # one candidate among the pinned schemas (or the schema it
+            # names), overloads included, qualified, with each argument cast
+            # to its declared type. Anything else is refused.
+            my $key = sub { $kinds[$_[0]] eq 'qid' ? _unquote($names[$_[0]]) : lc $names[$_[0]] };
+            my $fname = $key->($#names);
+            my $info = $state->{columns}{host_functions}{(@names == 2 ? $key->(0) : '') . "\0" . $fname};
+            Selecto::Error->throw('query_rule_not_evaluable', "a function read from must resolve to exactly one function in the pinned schemas",
+                {reason => 'function_ambiguous', function => $fname})
+                unless ref($info) eq 'HASH' && ($info->{count} // 0) == 1 && defined $info->{schema};
+            $$pos++;
+            my @args;
+            unless (_peek_punct($tokens, $$pos, ')')) {
+                while (1) {
+                    push @args, _render($state, _read_run($state, $tokens, $pos, undef));
+                    last unless _peek_punct($tokens, $$pos, ',');
+                    $$pos++;
+                }
+            }
+            _expect($tokens, $pos, ')');
+            my @types = @{$info->{args} // []};
+            Selecto::Error->throw('query_rule_not_evaluable', "a function read from takes arguments its declaration does not",
+                {reason => 'function_ambiguous', function => $fname})
+                unless @args <= @types && @args >= @types - ($info->{defaults} // 0);
+            my $quote = sub { '"' . ($_[0] =~ s/"/""/gr) . '"' };
+            $sql = $quote->($info->{schema}) . '.' . $quote->($fname) . '('
+                . join(', ', map { "CAST(($args[$_]) AS $types[$_])" } 0 .. $#args) . ')';
+            return _postfix($state, $tokens, $pos, $sql, undef, 1, undef, $mark);
         }
         if (_peek_punct($tokens, $$pos, '(')) {
             $$pos++;
@@ -510,13 +545,6 @@ sub _atom {
                 # A pg_catalog function with no polymorphic overload returns
                 # a pg_catalog type, whatever its arguments.
                 $known = 1 if $state->{functions}{lc $names[0]} ne 'polymorphic';
-            } elsif (@names == 1 && $start > 0 && _upper($tokens->[$start - 1]) =~ /\A(?:FROM|JOIN|LATERAL)\z/
-                || (@names == 1 && $start > 0 && $tokens->[$start - 1][1] eq ',')) {
-                # A host function read from (function_lateral): the one
-                # schema that has it (review LOW 7).
-                my $key = $kinds[0] eq 'qid' ? _unquote($names[0]) : lc $names[0];
-                my $info = $state->{columns}{functions}{$key};
-                $name = '"' . ($info->{schema} =~ s/"/""/gr) . '".' . $names[0] if ref($info) eq 'HASH' && defined $info->{schema};
             }
             $sql = "$name($inner)";
             # FILTER (WHERE ...) / OVER (...) / WITHIN GROUP (...) follow.
@@ -723,6 +751,9 @@ sub _render {
 # (R48). The same choice is made here, whatever the operand order.
 sub _op_sql {
     my ($state, $op, $left, $right) = @_;
+    # Each operator decides its own operand casts; none carries over to the
+    # next (review of b969df8, HIGH 1).
+    $state->{op_cast} = undef;
     return "OPERATOR($op->{schema}.$op->{op})" if $op->{explicit};
     my @sides = map { _operand_class($state, $_, $op->{op}) } $left, $right;
     my ($l, $r) = @sides;
@@ -1216,6 +1247,10 @@ sub lint {
         } elsif ($type eq 'id' && $k + 1 < @$tokens && $tokens->[$k + 1][1] eq '(' && !$KEYWORD{uc $text}
             && $prev->[1] ne '.' && $prev->[1] ne '::' && uc($prev->[1]) ne 'AS' && $functions->{lc $text}) {
             push @problems, "unqualified function $text";
+        } elsif ($type =~ /\A(?:id|qid)\z/ && $k + 1 < @$tokens && $tokens->[$k + 1][1] eq '(' && !$KEYWORD{uc $text}
+            && uc($prev->[1]) =~ /\A(?:FROM|JOIN|LATERAL)\z/) {
+            # A function rowset must name its schema (review M1).
+            push @problems, "unqualified function rowset $text";
         }
     }
     return @problems;

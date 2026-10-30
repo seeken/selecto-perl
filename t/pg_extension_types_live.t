@@ -201,6 +201,47 @@ for my $isolation ('REPEATABLE READ', 'READ COMMITTED') {
         "$isolation: a column altered to citext after the snapshot " . ($isolation eq 'READ COMMITTED' ? 'reads as natively' : 'is refused, typed'));
 }
 
+# Review of b969df8, HIGH 1: guarded updates (single row and bulk) on a
+# table whose tenant column is citext or a domain over citext: the tenant
+# compare's citext casts never leak into the post-image re-read.
+$admin->do($_) for 'DROP TABLE IF EXISTS r50_wt', 'DROP DOMAIN IF EXISTS r50_tenant CASCADE', "CREATE DOMAIN r50_tenant AS $ci";
+for my $tenant ($ci, 'r50_tenant') {
+    $admin->do($_) for 'DROP TABLE IF EXISTS r50_wt', "CREATE TABLE r50_wt (id INT PRIMARY KEY, org $tenant NOT NULL, note TEXT)",
+        q{INSERT INTO r50_wt VALUES (1, 't1', 'a'), (2, 'T1', 'b'), (3, 't2', 'c')};
+    my $wd = Selecto::Domain->parse({schema_version => 1, name => 'R50WT', source => {source_table => 'r50_wt', primary_key => 'id', tenant_field => 'org',
+        fields => [qw(id org note)], columns => $cols->(id => 'integer', org => 'string', note => 'string'), associations => {}},
+        schemas => {}, joins => {}, writes => {operations => {update => {enabled => 1, bulk => 1, expected_cardinality => 'many'}},
+            fields => {note => {updatable => 1}}}});
+    my $we = Selecto::Engine->new(domain => $wd, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+    require Selecto::Write;
+    is($outcome->(sub { $we->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r50_wt',
+        assignments => {note => 'one'}, predicate => $x->eq('id', 1)))->affected_rows }), 'applied 1', "tenant $tenant: a guarded update applies");
+    is($outcome->(sub { $we->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r50_wt',
+        assignments => {note => 'bulk'}, predicate => $x->gt('id', 0), expected_count => 2))->affected_rows }), 'applied 2', "tenant $tenant: a bulk update applies to the tenant's rows (citext)");
+    is(join(',', @{$admin->selectcol_arrayref('SELECT note FROM r50_wt ORDER BY id')}), 'bulk,bulk,c', "tenant $tenant: the other tenant's row is unchanged");
+}
+$admin->do($_) for 'DROP TABLE r50_wt', 'DROP DOMAIN r50_tenant CASCADE';
+
+# Review of b969df8, MEDIUM 1: a function read from resolves to exactly one
+# function among the pinned schemas (overloads included), qualified, with its
+# arguments cast to their declared types; an ambiguous name is refused.
+$admin->do($_) for 'DROP SCHEMA IF EXISTS r50_fn CASCADE', 'CREATE SCHEMA r50_fn', 'DROP FUNCTION IF EXISTS r50_rows(int)', 'DROP FUNCTION IF EXISTS r50_rows(text)',
+    q{CREATE FUNCTION r50_rows(n int) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT 'host:' || n $$};
+my $fl = sub { my $e = Selecto::Engine->new(domain => $agg, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+    my $q = $e->query->function_lateral('r50_rows', [7], as => 'f', columns => ['v'])->select('id', 'f.v');
+    ($outcome->(sub { join ',', map { $_->[1] } @{$e->all($q)->{rows}} }), eval { $e->adapter->_statement_sql($e->compile($q)->sql) } // '') };
+my ($got, $sql) = $fl->();
+is($got, 'applied host:7,host:7', 'the one r50_rows(int) is called');
+like($sql, qr/"public"\."r50_rows"\(CAST\(\(\$\d+\) AS pg_catalog\.int4\)\)/, 'qualified, with its argument cast to the declared type');
+$admin->do(q{CREATE FUNCTION r50_rows(n text) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT 'PLANTED' $$});
+is(($fl->())[0], 'query_rule_not_evaluable/function_ambiguous', 'a same-schema overload makes it ambiguous: refused');
+$admin->do($_) for 'DROP FUNCTION r50_rows(text)', q{CREATE FUNCTION r50_fn.r50_rows(n int) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT 'unpinned' $$};
+is(($fl->())[0], 'applied host:7,host:7', 'a namesake in a schema outside the pin does not count');
+$admin->do($_) for 'DROP FUNCTION r50_rows(int)', 'DROP SCHEMA r50_fn CASCADE';
+require Selecto::PostgreSQL::Qualify;
+like(join('; ', Selecto::PostgreSQL::Qualify::lint(q{SELECT "s0"."id" FROM public.t AS "s0" JOIN LATERAL "r50_rows"($1) AS "f"("v") ON TRUE}, {})),
+    qr/unqualified function rowset/, 'the lint flags an unqualified function rowset');
+
 # Review LOW 8: a row trigger that switches the session's role with
 # set_config('role', ..., false) refuses the write (CURRENT_USER is part of
 # the session snapshot).
