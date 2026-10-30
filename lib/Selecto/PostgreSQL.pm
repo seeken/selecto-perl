@@ -1779,19 +1779,6 @@ sub _write_session_open {
         $self->_pg_check_relations($compiled) if ref($compiled) eq 'HASH';
         $self->_pg_pin_search_path;
     };
-    # The other relations the write consults (reference and membership
-    # guards' parents) are locked ACCESS SHARE before any of their types are
-    # read, so an owner's ALTER cannot slip in during the write's lock wait
-    # (review of 07d36d8, LOW 1). The target takes its own lock later.
-    if (ref($compiled) eq 'HASH' && ref($compiled->{relations}) eq 'ARRAY') {
-        my $target = blessed($command) && $command->can('relation') ? lc Selecto::Identifier::checked($command->relation) : '';
-        my $last = sub { my ($name) = @_; my ($part) = $name =~ /("(?:[^"]|"")*"|[^."]+)\z/; $part //= $name;
-            $part =~ /\A"(.*)"\z/s ? lc($1 =~ s/""/"/gr) : lc $part };
-        for my $relation (grep { defined && length && $last->($_) ne $target } @{$compiled->{relations}}) {
-            my $ok = eval { $self->{dbh}->do("LOCK TABLE $relation IN ACCESS SHARE MODE"); 1 };
-            die $self->normalize_error($@) unless $ok;
-        }
-    }
     my $state = $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled : undef);
     $state->{pin} = $pin;
     _refuse_deferred_triggers() if $state->{deferrable};
@@ -2188,40 +2175,36 @@ my $EXTENSION_OPERATORS_NO_FUNCTIONS_SQL = do {
     $sql =~ s/\n    UNION ALL\n    SELECT 'fun'.*?\n    UNION ALL\n    SELECT 'iso'/\n    UNION ALL\n    SELECT 'iso'/s or die 'extension SQL: no function rows';
     $sql;
 };
-# Function rowset candidates (review M1 of b969df8): an installed
-# extension's own overload over one of that extension's types (citext's
-# regexp_split_to_table(citext, text)) is not counted; for untyped arguments
-# PostgreSQL picks pg_catalog's text overload (review of 07d36d8).
+# Function rowset candidates (review M1 of b969df8), one entry per
+# function of that name in the pinned schemas (or the schema the call
+# names), with whether it is an installed extension's own function over one
+# of that extension's types (see _pg_function_rowset).
 my $EXTENSION_PROBE_SQL = q{SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
       WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'),
     pg_catalog.current_setting('transaction_isolation'),
-    ARRAY(SELECT pg_catalog.concat(k.sch, pg_catalog.chr(31), k.name, pg_catalog.chr(31), pg_catalog.count(p.oid), pg_catalog.chr(31),
-        CAST(pg_catalog.min(n.nspname) AS pg_catalog.text), pg_catalog.chr(31), pg_catalog.min(p.pronargs), pg_catalog.chr(31),
-        pg_catalog.min(p.pronargdefaults), pg_catalog.chr(31),
-        pg_catalog.min(pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
+    ARRAY(SELECT pg_catalog.concat(k.sch, pg_catalog.chr(31), k.name, pg_catalog.chr(31), CAST(n.nspname AS pg_catalog.text), pg_catalog.chr(31),
+        p.pronargs, pg_catalog.chr(31), p.pronargdefaults, pg_catalog.chr(31),
+        pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
             pg_catalog.quote_ident(CAST(t.typname AS pg_catalog.text)))
           FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS u(o, i)
           JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) u.o JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
-          ORDER BY u.i), pg_catalog.chr(30))), pg_catalog.chr(31),
-        CASE WHEN pg_catalog.bool_and(n.nspname OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.name)) THEN 'catalog' ELSE '' END,
-        pg_catalog.chr(31),
-        pg_catalog.min((SELECT pg_catalog.concat(pg_catalog.quote_ident(CAST(vn.nspname AS pg_catalog.text)), '.',
+          ORDER BY u.i), pg_catalog.chr(30)), pg_catalog.chr(31),
+        (SELECT pg_catalog.concat(pg_catalog.quote_ident(CAST(vn.nspname AS pg_catalog.text)), '.',
             pg_catalog.quote_ident(CAST(vt.typname AS pg_catalog.text)))
           FROM pg_catalog.pg_type vt JOIN pg_catalog.pg_namespace vn ON vn.oid OPERATOR(pg_catalog.=) vt.typnamespace
-          WHERE vt.oid OPERATOR(pg_catalog.=) p.provariadic)))
-      FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS k(sch, name)
-      LEFT JOIN (pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace)
-        ON CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.name
-        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend pd
+          WHERE vt.oid OPERATOR(pg_catalog.=) p.provariadic), pg_catalog.chr(31),
+        CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend pd
           WHERE pd.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_proc' AS pg_catalog.regclass) AND pd.objid OPERATOR(pg_catalog.=) p.oid
             AND pd.deptype OPERATOR(pg_catalog.=) 'e'
             AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS ua(t)
               JOIN pg_catalog.pg_depend td ON td.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
                 AND td.objid OPERATOR(pg_catalog.=) ua.t AND td.deptype OPERATOR(pg_catalog.=) 'e'
-                AND td.refobjid OPERATOR(pg_catalog.=) pd.refobjid))
+                AND td.refobjid OPERATOR(pg_catalog.=) pd.refobjid)) THEN 'member' ELSE '' END)
+      FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS k(sch, name)
+      JOIN (pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace)
+        ON CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.name
         AND CASE WHEN k.sch OPERATOR(pg_catalog.=) '' THEN CAST(n.nspname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY (CAST($3 AS pg_catalog.text[]))
-          ELSE CAST(n.nspname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.sch END
-      GROUP BY k.sch, k.name)};
+          ELSE CAST(n.nspname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.sch END)};
 sub _pg_extension_operators {
     my ($self, $sql) = @_;
     require Selecto::PostgreSQL::Qualify;
@@ -2288,12 +2271,12 @@ sub _pg_extension_lookup {
         [map { (split /\0/, $_, 2)[0] } @host], [map { (split /\0/, $_, 2)[1] } @host], \@pinned); 1 };
     die $self->normalize_error($@) unless $ok;
     my ($has_extension, $level, $candidates) = @probe;
-    my %host_functions;
+    my %host_functions = map { ($_ => {candidates => []}) } @host;
     for (@{$candidates // []}) {
-        my ($sch, $fname, $count, $schema, $nargs, $defaults, $args, $catalog, $variadic) = split /\x1f/, $_, 9;
-        $host_functions{"$sch\0$fname"} = {count => $count, schema => $schema, nargs => $nargs, defaults => $defaults,
-            args => [length($args // '') ? split(/\x1e/, $args) : ()], catalog => ($catalog // '') eq 'catalog' ? 1 : 0,
-            variadic => length($variadic // '') ? $variadic : undef};
+        my ($sch, $fname, $schema, $nargs, $defaults, $args, $variadic, $member) = split /\x1f/, $_, 8;
+        push @{$host_functions{"$sch\0$fname"}{candidates}}, {schema => $schema, nargs => $nargs, defaults => $defaults,
+            args => [length($args // '') ? split(/\x1e/, $args) : ()], variadic => length($variadic // '') ? $variadic : undef,
+            member => ($member // '') eq 'member' ? 1 : 0};
     }
     if (!$has_extension && defined($level) && $level eq 'read committed') {
         return {functions => {map { ($_ => {state => 'known'}) } @functions}, host_functions => \%host_functions, extension => 0};

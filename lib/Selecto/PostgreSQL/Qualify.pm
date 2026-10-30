@@ -495,13 +495,6 @@ sub _atom {
             my $key = sub { $kinds[$_[0]] eq 'qid' ? _unquote($names[$_[0]]) : lc $names[$_[0]] };
             my $fname = $key->($#names);
             my $info = $state->{columns}{host_functions}{(@names == 2 ? $key->(0) : '') . "\0" . $fname};
-            # Every pinned candidate is pg_catalog's (regexp_split_to_table,
-            # string_to_table...): pg_catalog-qualified, its arguments left to
-            # PostgreSQL's own resolution there (no one else can write to it).
-            my $catalog = ref($info) eq 'HASH' && $info->{catalog} && ($info->{count} // 0) > 0;
-            Selecto::Error->throw('query_rule_not_evaluable', "a function read from must resolve to exactly one function in the pinned schemas",
-                {reason => 'function_ambiguous', function => $fname})
-                unless $catalog || ref($info) eq 'HASH' && ($info->{count} // 0) == 1 && defined $info->{schema};
             $$pos++;
             my @args;
             unless (_peek_punct($tokens, $$pos, ')')) {
@@ -512,6 +505,28 @@ sub _atom {
                 }
             }
             _expect($tokens, $pos, ')');
+            # The candidates this call's argument count can reach (as
+            # PostgreSQL filters them first). An installed extension's own
+            # function over one of its own types is dropped while another
+            # candidate remains (untyped arguments resolve to that one:
+            # citext's regexp_split_to_table); alone, it is the candidate
+            # (hstore's each). Every remaining candidate pg_catalog's: the
+            # call is pg_catalog-qualified, its arguments left to PostgreSQL
+            # there (no one else can write to it). Exactly one other: its
+            # schema and its argument types (R50). Else refused.
+            my @reach = grep {
+                my $c = $_;
+                defined($c->{variadic}) ? @args >= $c->{nargs} - 1
+                    : @args <= $c->{nargs} && @args >= $c->{nargs} - ($c->{defaults} // 0)
+            } @{ref($info) eq 'HASH' ? $info->{candidates} // [] : []};
+            Selecto::Error->throw('query_rule_not_evaluable', "a function read from was not found in the pinned schemas",
+                {reason => 'function_not_found', function => $fname}) unless @reach;
+            my @plain = grep { !$_->{member} } @reach;
+            @reach = @plain if @plain;
+            my $catalog = !grep { $_->{schema} ne 'pg_catalog' } @reach;
+            Selecto::Error->throw('query_rule_not_evaluable', "a function read from must resolve to exactly one function in the pinned schemas",
+                {reason => 'function_ambiguous', function => $fname}) unless $catalog || @reach == 1;
+            $info = $reach[0];
             my $quote = sub { '"' . ($_[0] =~ s/"/""/gr) . '"' };
             if ($catalog) {
                 $sql = 'pg_catalog.' . $quote->($fname) . '(' . join(', ', @args) . ')';

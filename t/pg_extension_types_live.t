@@ -293,6 +293,28 @@ SKIP: {
     $admin->do(qq{ALTER EXTENSION citext SET SCHEMA "$schema"});
     is_deeply(\@got, \@want, 'and with citext in public');
 }
+# Review of c2d1554: an extension's own function that is the only
+# candidate (hstore's skeys, each; ltree's subpath by argument count) is
+# called, schema-qualified with its argument cast to its type; a name with
+# no candidate is refused as not found.
+SKIP: {
+    my $had = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'hstore'}))[0];
+    my $made = !$had && eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r51hs'); $admin->do('CREATE EXTENSION hstore SCHEMA r51hs'); 1 };
+    skip 'hstore is not available', 3 unless $had || $made;
+    my ($hs) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'hstore'});
+    my ($dsn, @auth) = TestPostgreSQL->connection;
+    my $dbh = DBI->connect($dsn . qq{;options='-c search_path=public,"$hs"'}, @auth, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+    my $he = Selecto::Engine->new(domain => $lm, adapter => Selecto->adapter(postgresql => (dbh => $dbh)))->with_scope(tenant => 't1');
+    is($outcome->(sub { join ',', sort map { $_->[1] } grep { $_->[0] == 1 }
+        @{$he->all($he->query->function_lateral('skeys', ['a=>1,b=>2'], as => 'f', columns => ['v'])->select('id', 'f.v'))->{rows}} }),
+        'applied a,b', "hstore's skeys, the only candidate, is called");
+    like($he->adapter->_statement_sql($he->compile($he->query->function_lateral('skeys', ['a=>1'], as => 'f', columns => ['v'])->select('id'))->sql),
+        qr/"\Q$hs\E"\."skeys"\(CAST\(\(\$\d+\) AS [^)]*hstore\)\)/, 'qualified, its argument cast to hstore');
+    is($outcome->(sub { $he->all($he->query->function_lateral('r51_no_such_rows', ['x'], as => 'f', columns => ['v'])->select('id')) }),
+        'query_rule_not_evaluable/function_not_found', 'a function with no candidate is refused as not found');
+    $dbh->disconnect;
+    $admin->do($_) for $made ? ('DROP EXTENSION hstore', 'DROP SCHEMA r51hs') : ();
+}
 $admin->do('DROP FUNCTION r50_tags_of(text[])');
 
 require Selecto::PostgreSQL::Qualify;
