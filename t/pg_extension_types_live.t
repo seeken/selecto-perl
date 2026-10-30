@@ -1,0 +1,148 @@
+use 5.034;
+use strict;
+use warnings;
+use Test::More;
+use DBI ();
+use Scalar::Util qw(blessed);
+use Selecto;
+use Selecto::Engine;
+use Selecto::Domain;
+use Selecto::Expression;
+use lib 't/lib';
+use TestPostgreSQL ();
+
+# Review of 96961bf (R49): operand types for extension operators.
+# - M1: a computed member output whose type is known (lower(), a cast,
+#   count()) is not refused, and a column's type is resolved through its own
+#   relation, never by a namesake column of another relation.
+# - M2: function rowsets (unnest of a citext[] column, a function returning
+#   citext, a json rowset's declared columns) carry their column types.
+# - M3 (R49c): citext's own max and min, which keep the citext type.
+# - M4 (R49a): types read under a REPEATABLE READ snapshot are checked
+#   against the current catalog; a column altered after the snapshot is
+#   refused, typed.
+plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
+plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
+local $ENV{SELECTO_PG_SQL_LINT} = 1;
+my $x = 'Selecto::Expression';
+my $admin = TestPostgreSQL->connect;
+$admin->do('SET client_min_messages TO warning');
+my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
+my $has = $preinstalled
+    || eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r50ext'); $admin->do('CREATE EXTENSION citext SCHEMA r50ext'); 1 };
+plan skip_all => 'citext is not available' unless $has;
+my ($schema) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
+my $ci = qq{"$schema".citext};
+# Natively, with the extension schema on the path.
+$admin->do(qq{SET search_path = public, "$schema"});
+my $outcome = sub {
+    my ($work) = @_;
+    my $value = eval { $work->() };
+    return 'applied' . (defined($value) && !ref($value) ? " $value" : '') unless $@;
+    my $error = $@;
+    return blessed($error) && $error->can('code')
+        ? $error->code . (ref($error->details) eq 'HASH' && $error->details->{reason} ? '/' . $error->details->{reason} : '')
+        : "died: $error";
+};
+my $connect = sub { my $dbh = TestPostgreSQL->connect; $dbh->do('SET client_min_messages TO warning'); $dbh };
+my $native = sub { my %seen; join ',', grep { !$seen{$_}++ } sort { $a <=> $b } @{$admin->selectcol_arrayref($_[0])} };
+my $ids = sub { my ($e, $q) = @_; my %seen; join ',', grep { !$seen{$_}++ } sort { $a <=> $b } map { $_->[0] } @{$e->all($q)->{rows}} };
+
+$admin->do($_) for 'DROP TABLE IF EXISTS r50_r, r50_m, r50_ma, r50_rr CASCADE', 'DROP FUNCTION IF EXISTS r50_ci_tags(text)',
+    "CREATE TABLE r50_r (id INT PRIMARY KEY, org TEXT NOT NULL, k INT, email TEXT, tags $ci\[], doc JSONB)",
+    q{INSERT INTO r50_r VALUES (1, 't1', 1, 'A@x.com', '{Gold,red}', '[{"code":"GOLD"}]'), (2, 't1', 2, 'b@x.com', '{GOLD}', '[{"code":"gold"}]'),
+        (3, 't1', 3, 'c@x.com', '{silver}', '[{"code":"silver"}]'), (4, 't2', 1, 'd@x.com', '{gold}', '[]')},
+    "CREATE TABLE r50_m (id INT PRIMARY KEY, org TEXT NOT NULL, k INT, tag $ci, email $ci, code $ci)",
+    q{INSERT INTO r50_m VALUES (10, 't1', 1, 'Gold', 'A@X.COM', 'x'), (11, 't1', 2, 'GOLD', 'b@x.com', 'x'), (12, 't1', 3, 'silver', 'zz@x.com', 'x'),
+        (13, 't2', 1, 'gold', 'd@x.com', 'x')},
+    "CREATE FUNCTION r50_ci_tags(o text) RETURNS TABLE(t $ci) LANGUAGE sql STABLE AS \$\$ SELECT tag FROM r50_m WHERE org = o AND tag ILIKE 'gold' \$\$";
+my $cols = sub { my %h = @_; +{map { ($_ => ref $h{$_} ? $h{$_} : {type => $h{$_}}) } keys %h} };
+my $mem = {source_table => 'r50_m', primary_key => 'id', tenant_field => 'org', fields => [qw(id org k tag email)],
+    columns => $cols->(id => 'integer', org => 'string', k => 'integer', tag => 'string', email => 'string'), associations => {}};
+my $rc = $cols->(id => 'integer', org => 'string', k => 'integer', email => 'string', tags => {type => 'array', items => 'string'}, doc => 'jsonb');
+$rc->{lemail} = {type => 'string', computed => {kind => 'expression', expression => ['lower', ['field', 'email']]}};
+my $member = sub { my ($as, $item, @rest) = @_; ($as => {source => 'mem', query => {select => ['k', $item], @rest},
+    join => {owner_key => 'k', related_key => 'k', type => 'inner'}}) };
+my $copy = {source_table => 'r50_r', primary_key => 'id', tenant_field => 'org', fields => [qw(id org k email)],
+    columns => {map { ($_ => $rc->{$_}) } qw(id org k email)}, associations => {}};
+my $domain = Selecto::Domain->parse({schema_version => 1, name => 'R50', source => {source_table => 'r50_r', primary_key => 'id',
+    tenant_field => 'org', fields => [sort keys %$rc], columns => $rc, associations => {mm => {queryable => 'mem', owner_key => 'k', related_key => 'k'}}},
+    schemas => {mem => $mem, rootcopy => $copy}, joins => {mm => {type => 'left'}},
+    query_members => {ctes => {
+        $member->('lw', {as => 'v', value => ['lower', ['field', 'tag']]}),
+        $member->('ts', {as => 'v', value => ['cast', ['field', 'tag'], 'string']}),
+        $member->('cn', {as => 'v', aggregate => 'count', field => 'tag'}, group_by => ['k']),
+        $member->('mx', {as => 'v', aggregate => 'max', field => 'tag'}, group_by => ['k']),
+        $member->('mn', {as => 'v', aggregate => 'min', field => 'tag'}, group_by => ['k']),
+        re => {source => 'rootcopy', query => {select => ['k', {as => 'le', value => ['lower', ['field', 'email']]}]},
+            join => {owner_key => 'k', related_key => 'k', type => 'inner'}}}}});
+my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+my $joined = q{SELECT r.id FROM r50_r r JOIN r50_m m ON r.k = m.k AND m.org = 't1' WHERE r.org = 't1'};
+my @cases = (
+    # M1
+    ['member lower(citext) output <> gold', sub { $_[0]->with_member('lw')->select('id')->where($x->ne('lw.v', 'gold')) }, "$joined AND lower(m.tag) <> 'gold'"],
+    ['member cast(citext as text) output <> gold', sub { $_[0]->with_member('ts')->select('id')->where($x->ne('ts.v', 'gold')) }, "$joined AND m.tag::text <> 'gold'"],
+    ['member count(citext) output > 0', sub { $_[0]->with_member('cn')->select('id')->where($x->gt('cn.v', 0)) }, $joined],
+    ['lower(text email) with a citext email relation joined', sub { $_[0]->select('id', 'mm.id')->where($x->ne('lemail', 'a@x.com')) },
+        q{SELECT r.id FROM r50_r r LEFT JOIN r50_m m ON m.k = r.k AND m.org = 't1' WHERE r.org = 't1' AND lower(r.email) <> 'a@x.com'}],
+    ['member lower(TEXT email) output with a citext email relation joined', sub { $_[0]->with_member('re')->select('id', 'mm.id')->where($x->ne('re.le', 'a@x.com')) },
+        q{SELECT r.id FROM r50_r r LEFT JOIN r50_m m ON m.k = r.k AND m.org = 't1' WHERE r.org = 't1' AND lower(r.email) <> 'a@x.com'}],
+    ['text email <> with a citext email relation joined', sub { $_[0]->select('id', 'mm.id')->where($x->ne('email', 'a@x.com')) },
+        q{SELECT r.id FROM r50_r r LEFT JOIN r50_m m ON m.k = r.k AND m.org = 't1' WHERE r.org = 't1' AND r.email <> 'a@x.com'}],
+    ['json_rowset text column = gold, a citext code relation joined',
+        sub { $_[0]->json_rowset('doc', 'jr', {code => 'string'})->select('id', 'mm.id')->where($x->eq('jr.code', 'gold')) },
+        q{SELECT r.id FROM r50_r r CROSS JOIN LATERAL jsonb_to_recordset(r.doc) AS jr(code text) WHERE r.org = 't1' AND jr.code = 'gold'}],
+    # M2
+    ['unnest(citext[]) value <> gold', sub { $_[0]->array_rowset('tags', 'tr')->select('id')->where($x->ne('tr.value', 'gold')) },
+        q{SELECT r.id FROM r50_r r CROSS JOIN LATERAL unnest(r.tags) AS tr(value) WHERE r.org = 't1' AND tr.value <> 'gold'}],
+    ['unnest(citext[]) value = GOLD', sub { $_[0]->array_rowset('tags', 'tr')->select('id')->where($x->eq('tr.value', 'GOLD')) },
+        q{SELECT r.id FROM r50_r r CROSS JOIN LATERAL unnest(r.tags) AS tr(value) WHERE r.org = 't1' AND tr.value = 'GOLD'}],
+    ['function returning citext: t <> gold', sub { $_[0]->function_lateral('r50_ci_tags', ['t1'], as => 'ft', columns => ['t'])->select('id')->where($x->ne('ft.t', 'gold')) },
+        q{SELECT r.id FROM r50_r r JOIN LATERAL r50_ci_tags('t1') AS ft(t) ON TRUE WHERE r.org = 't1' AND ft.t <> 'gold'}],
+    # M3
+    ['member max(citext) output <> GOLD', sub { $_[0]->with_member('mx')->select('id')->where($x->ne('mx.v', 'GOLD')) },
+        q{SELECT r.id FROM r50_r r JOIN (SELECT k, max(tag) v FROM r50_m WHERE org = 't1' GROUP BY k) x ON x.k = r.k WHERE r.org = 't1' AND x.v <> 'GOLD'}],
+    ['member min(citext) output = gold', sub { $_[0]->with_member('mn')->select('id')->where($x->eq('mn.v', 'gold')) },
+        q{SELECT r.id FROM r50_r r JOIN (SELECT k, min(tag) v FROM r50_m WHERE org = 't1' GROUP BY k) x ON x.k = r.k WHERE r.org = 't1' AND x.v = 'gold'}],
+);
+for my $case (@cases) {
+    my ($label, $build, $sql) = @$case;
+    my $want = $native->($sql);
+    is($outcome->(sub { $ids->($engine, $build->($engine->query)) }), "applied $want", "$label: as natively [$want]");
+}
+# M3: citext's max and min order case-insensitively.
+my $agg = Selecto::Domain->parse({schema_version => 1, name => 'R50M', source => {source_table => 'r50_ma', primary_key => 'id',
+    tenant_field => 'org', fields => [qw(id org code)], columns => $cols->(id => 'integer', org => 'string', code => 'string'), associations => {}},
+    schemas => {}, joins => {}});
+$admin->do($_) for "CREATE TABLE r50_ma (id INT PRIMARY KEY, org TEXT NOT NULL, code $ci)", q{INSERT INTO r50_ma VALUES (1, 't1', 'a'), (2, 't1', 'B'), (3, 't2', 'z')};
+my ($max, $min) = $admin->selectrow_array(q{SELECT max(code), min(code) FROM r50_ma WHERE org = 't1'});
+my $ea = Selecto::Engine->new(domain => $agg, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+is($outcome->(sub { join ',', @{$ea->all($ea->query->select($x->max('code')->as('mx'), $x->min('code')->as('mn')))->{rows}[0]} }),
+    "applied $max,$min", "citext max and min as natively ($max,$min)");
+
+# M4: a column altered text -> citext after a REPEATABLE READ host
+# transaction's snapshot: a host required note <> 'secret' is refused, typed
+# (read committed reads the current types).
+my $rr = Selecto::Domain->parse({schema_version => 1, name => 'R50R', source => {source_table => 'r50_rr', primary_key => 'id',
+    tenant_field => 'org', fields => [qw(id org note)], columns => $cols->(id => 'integer', org => 'string', note => 'string'), associations => {}},
+    schemas => {}, joins => {}})->with_required_predicate($x->ne('note', 'secret'));
+for my $isolation ('REPEATABLE READ', 'READ COMMITTED') {
+    $admin->do($_) for 'DROP TABLE IF EXISTS r50_rr', 'CREATE TABLE r50_rr (id INT PRIMARY KEY, org TEXT, note TEXT)',
+        q{INSERT INTO r50_rr VALUES (1, 't1', 'ok'), (2, 't1', 'SECRET'), (3, 't2', 'c')};
+    my $host = $connect->();
+    my $e = Selecto::Engine->new(domain => $rr, adapter => Selecto->adapter(postgresql => (dbh => $host)))->with_scope(tenant => 't1');
+    $host->begin_work;
+    $host->do("SET TRANSACTION ISOLATION LEVEL $isolation");
+    $host->selectall_arrayref('SELECT count(*) FROM r50_ma');
+    $admin->do("ALTER TABLE r50_rr ALTER COLUMN note TYPE $ci");
+    my $want = join ',', map { $_->[0] } @{$admin->selectall_arrayref(q{SELECT id FROM r50_rr WHERE org = 't1' AND note <> 'secret' ORDER BY 1})};
+    my $got = $outcome->(sub { $ids->($e, $e->query->select('id')) });
+    $host->rollback;
+    $host->disconnect;
+    is($got, $isolation eq 'READ COMMITTED' ? "applied $want" : 'query_rule_not_evaluable/catalog_changed',
+        "$isolation: a column altered to citext after the snapshot " . ($isolation eq 'READ COMMITTED' ? 'reads as natively' : 'is refused, typed'));
+}
+
+$admin->do($_) for 'DROP TABLE r50_r, r50_m, r50_ma, r50_rr CASCADE', 'DROP FUNCTION r50_ci_tags(text)';
+$admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r50ext CASCADE');
+done_testing;
