@@ -250,7 +250,8 @@ my $lm = Selecto::Domain->parse({schema_version => 1, name => 'R50L', source => 
         parts => {source => ['function', 'regexp_split_to_table', ['red,green', ',']], columns => ['v']},
         words => {source => ['function', 'string_to_table', ['a b', ' ']], columns => ['v']},
         tags => {source => ['function', 'r50_tags_of', ['x', 'y']], columns => ['v']},
-        one => {source => ['function', 'r50_tags_of', ['{a,b}']], columns => ['v']}}}});
+        one => {source => ['function', 'r50_tags_of', ['{a,b}']], columns => ['v']},
+        matches => {source => ['function', 'regexp_matches', ['abcb', 'b', 'g']], columns => ['v']}}}});
 my $le = Selecto::Engine->new(domain => $lm, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
 my $vals = sub { my ($q) = @_; join ',', sort map { $_->[1] } grep { $_->[0] == 1 } @{$le->all($q)->{rows}} };
 for my $case (['parts', 'green,red'], ['words', 'a,b'], ['tags', 'x,y'], ['one', '{a,b}']) {
@@ -265,6 +266,33 @@ for my $case (['regexp_split_to_table', ['red,green', ','], 'green,red'], ['stri
 }
 like($le->adapter->_statement_sql($le->compile($le->query->function_lateral('r50_tags_of', ['x', 'y'], as => 'f', columns => ['v'])->select('id'))->sql),
     qr/"r50_tags_of"\(VARIADIC ARRAY\[CAST\(\(\$\d+\) AS pg_catalog\.text\), CAST/, 'a VARIADIC host function is called as VARIADIC with cast elements');
+# Review of 07d36d8 (MEDIUM): citext's own overloads (regexp_split_to_table,
+# regexp_matches over citext) do not make the pg_catalog functions ambiguous,
+# with citext's schema on the reset path, and with citext in public.
+my $srf = sub {
+    my (%options) = @_;
+    my ($dsn, @auth) = TestPostgreSQL->connection;
+    $dsn .= ";options='$options{options}'" if $options{options};
+    my $dbh = DBI->connect($dsn, @auth, {RaiseError => 1, PrintError => 0, AutoCommit => 1, pg_enable_utf8 => 1});
+    my $e = Selecto::Engine->new(domain => $lm, adapter => Selecto->adapter(postgresql => (dbh => $dbh)))->with_scope(tenant => 't1');
+    my $count = sub { my ($q) = @_; scalar grep { $_->[0] == 1 } @{$e->all($q)->{rows}} };
+    my $splits = sub { my ($q) = @_; join ',', sort map { $_->[1] } grep { $_->[0] == 1 } @{$e->all($q)->{rows}} };
+    return (
+        $outcome->(sub { $splits->($e->query->function_lateral('regexp_split_to_table', ['red,green', ','], as => 'f', columns => ['v'])->select('id', 'f.v')) }),
+        $outcome->(sub { $count->($e->query->function_lateral('regexp_matches', ['abcb', 'b', 'g'], as => 'f', columns => ['v'])->select('id', 'f.v')) }),
+        $outcome->(sub { $splits->($e->query->with_lateral('parts')->select('id', 'parts.v')) }),
+        $outcome->(sub { $count->($e->query->with_lateral('matches')->select('id', 'matches.v')) }));
+};
+my @want = ('applied green,red', 'applied 2', 'applied green,red', 'applied 2');
+is_deeply([$srf->(options => qq{-c search_path=public,"$schema"})], \@want,
+    "citext's own regexp overloads on the reset path: pg_catalog's set-returning functions as function_lateral and lateral members");
+SKIP: {
+    skip 'citext was preinstalled; not moved', 1 if $preinstalled || $schema eq 'public';
+    $admin->do('ALTER EXTENSION citext SET SCHEMA public');
+    my @got = $srf->();
+    $admin->do(qq{ALTER EXTENSION citext SET SCHEMA "$schema"});
+    is_deeply(\@got, \@want, 'and with citext in public');
+}
 $admin->do('DROP FUNCTION r50_tags_of(text[])');
 
 require Selecto::PostgreSQL::Qualify;
