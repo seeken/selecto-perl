@@ -123,13 +123,15 @@ is($outcome->(sub { join ',', @{$ea->all($ea->query->select($x->max('code')->as(
 # A function planted beside the extension's type (lower(citext) in the
 # extension's schema, not a member of it) is never resolved: lower stays
 # pg_catalog's, and the member output compares as pg_catalog.lower's text.
-$admin->do(qq{CREATE FUNCTION "$schema".lower($ci) RETURNS text LANGUAGE sql IMMUTABLE AS \$\$SELECT 'planted'\$\$});
+# (Under a poisoned template one may be planted already: it is left alone.)
+my $had_lower = ($admin->selectrow_array(qq{SELECT count(*) FROM pg_proc WHERE proname = 'lower' AND pronamespace = '"$schema"'::regnamespace}))[0];
+$admin->do(qq{CREATE FUNCTION "$schema".lower($ci) RETURNS text LANGUAGE sql IMMUTABLE AS \$\$SELECT 'planted'\$\$}) unless $had_lower;
 my $planted = $native->("$joined AND pg_catalog.lower(CAST(m.tag AS text)) <> 'gold'");
 my $ep = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
 my $lq = $ep->query->with_member('lw')->select('id')->where($x->ne('lw.v', 'gold'));
 is($outcome->(sub { $ids->($ep, $lq) }), "applied $planted", "a planted lower(citext) is not used: as pg_catalog.lower [$planted]");
 like($ep->adapter->_statement_sql($ep->compile($lq)->sql), qr/pg_catalog\.lower\(/i, 'the statement calls pg_catalog.lower');
-$admin->do(qq{DROP FUNCTION "$schema".lower($ci)});
+$admin->do(qq{DROP FUNCTION "$schema".lower($ci)}) unless $had_lower;
 
 # R50 (review of 0ce754a, HIGH-1/HIGH-2): operators and aggregates in the
 # extension's schema take operands cast to the member type, so exact-match
@@ -139,7 +141,8 @@ $admin->do($_) for 'DROP TABLE IF EXISTS r50_dm', 'DROP DOMAIN IF EXISTS r50_ema
     q{INSERT INTO r50_dm VALUES (10, 't1', 1, 'Gold'), (11, 't1', 2, 'GOLD'), (12, 't1', 3, 'silver'), (13, 't2', 1, 'gold')};
 my %want = (eq => $native->(q{SELECT id FROM r50_dm WHERE org = 't1' AND tag = 'gold'}),
     max => join(',', $admin->selectrow_array(q{SELECT CAST(max(tag) AS text), CAST(min(tag) AS text) FROM r50_dm WHERE org = 't1'})));
-$admin->do($_) for
+# (A plant that already exists, as under a poisoned template, is kept.)
+eval { $admin->do($_); 1 } for
     qq{CREATE FUNCTION "$schema".r50_yes(r50_email, r50_email) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
     qq{CREATE OPERATOR "$schema".= (LEFTARG = r50_email, RIGHTARG = r50_email, FUNCTION = "$schema".r50_yes)},
     qq{CREATE OPERATOR "$schema".<> (LEFTARG = r50_email, RIGHTARG = r50_email, FUNCTION = "$schema".r50_yes)},
@@ -300,7 +303,7 @@ SKIP: {
 SKIP: {
     my $had = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'hstore'}))[0];
     my $made = !$had && eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r51hs'); $admin->do('CREATE EXTENSION hstore SCHEMA r51hs'); 1 };
-    skip 'hstore is not available', 3 unless $had || $made;
+    skip 'hstore is not available', 6 unless $had || $made;
     my ($hs) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'hstore'});
     my ($dsn, @auth) = TestPostgreSQL->connection;
     my $dbh = DBI->connect($dsn . qq{;options='-c search_path=public,"$hs"'}, @auth, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
@@ -312,6 +315,21 @@ SKIP: {
         qr/"\Q$hs\E"\."skeys"\(CAST\(\(\$\d+\) AS [^)]*hstore\)\)/, 'qualified, its argument cast to hstore');
     is($outcome->(sub { $he->all($he->query->function_lateral('r51_no_such_rows', ['x'], as => 'f', columns => ['v'])->select('id')) }),
         'query_rule_not_evaluable/function_not_found', 'a function with no candidate is refused as not found');
+    # Review of fc1b811 (HIGH): a non-member planted beside the extension's
+    # own functions (in a writable pinned schema) is never chosen: the call
+    # is ambiguous, refused.
+    my $hsq = qq{"$hs"};
+    my @plants = (q{CREATE FUNCTION public.each(text) RETURNS TABLE(key text, value text) LANGUAGE sql STABLE AS $$ SELECT 'PLANTED', 'PLANTED' $$},
+        q{CREATE FUNCTION public.akeys(VARIADIC text[]) RETURNS text[] LANGUAGE sql STABLE AS $$ SELECT ARRAY['PLANTED'] $$},
+        ($hs ne 'public' ? (qq{CREATE FUNCTION public.skeys($hsq.hstore) RETURNS SETOF text LANGUAGE sql STABLE AS \$\$ SELECT 'PLANTED' \$\$}) : ()));
+    $admin->do($_) for @plants;
+    for my $case (['each', ['key', 'value']], ['akeys', ['v']], ($hs ne 'public' ? (['skeys', ['v']]) : ())) {
+        my ($fn, $cols) = @$case;
+        is($outcome->(sub { $he->all($he->query->function_lateral($fn, ['a=>1,b=>2'], as => 'f', columns => $cols)->select('id')) }),
+            'query_rule_not_evaluable/function_ambiguous', "a planted public.$fn beside hstore's own is refused, never chosen");
+    }
+    $admin->do($_) for 'DROP FUNCTION public.each(text)', 'DROP FUNCTION public.akeys(text[])',
+        ($hs ne 'public' ? (qq{DROP FUNCTION public.skeys($hsq.hstore)}) : ());
     $dbh->disconnect;
     $admin->do($_) for $made ? ('DROP EXTENSION hstore', 'DROP SCHEMA r51hs') : ();
 }

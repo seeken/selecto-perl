@@ -2199,7 +2199,10 @@ my $EXTENSION_PROBE_SQL = q{SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
             AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS ua(t)
               JOIN pg_catalog.pg_depend td ON td.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
                 AND td.objid OPERATOR(pg_catalog.=) ua.t AND td.deptype OPERATOR(pg_catalog.=) 'e'
-                AND td.refobjid OPERATOR(pg_catalog.=) pd.refobjid)) THEN 'member' ELSE '' END)
+                AND td.refobjid OPERATOR(pg_catalog.=) pd.refobjid)) THEN 'member'
+          WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend xd
+            WHERE xd.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_proc' AS pg_catalog.regclass) AND xd.objid OPERATOR(pg_catalog.=) p.oid
+              AND xd.deptype OPERATOR(pg_catalog.=) 'e') THEN 'extension' ELSE '' END)
       FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS k(sch, name)
       JOIN (pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace)
         ON CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.name
@@ -2276,7 +2279,7 @@ sub _pg_extension_lookup {
         my ($sch, $fname, $schema, $nargs, $defaults, $args, $variadic, $member) = split /\x1f/, $_, 8;
         push @{$host_functions{"$sch\0$fname"}{candidates}}, {schema => $schema, nargs => $nargs, defaults => $defaults,
             args => [length($args // '') ? split(/\x1e/, $args) : ()], variadic => length($variadic // '') ? $variadic : undef,
-            member => ($member // '') eq 'member' ? 1 : 0};
+            member => ($member // '') eq 'member' ? 1 : 0, extension => ($member // '') ne '' ? 1 : 0};
     }
     if (!$has_extension && defined($level) && $level eq 'read committed') {
         return {functions => {map { ($_ => {state => 'known'}) } @functions}, host_functions => \%host_functions, extension => 0};
