@@ -2055,70 +2055,188 @@ sub _pg_catalog_functions {
     return \%names;
 }
 
-# Columns of extension member types (citext and the like), or of domains
-# over one (the typbasetype chain is followed down to the base type), of the
-# relations the statement names, with the schema of each operator their own
-# extension defines for the type (never a user operator someone added beside
-# it), so their comparisons keep the extension's semantics:
-# {relations => {"schema.table" => {column => {op => schema}}}}. Read per
-# statement; nothing is cached. One recursive CTE over the columns (rather
-# than a recursive LATERAL per column) keeps its planning cheap. A column
-# whose domain chain is still a domain after 16 steps comes back with no
-# operator, and the statement is refused.
-my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE c(rel, att, oid, depth) AS (
-      SELECT r.rel, a.attname, a.atttypid, 0 FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(rel)
-      JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.rel)
-        AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+# What the qualifier needs to type operands (R48, R49, review M1-M4), read
+# per statement, nothing cached:
+# - every column of each relation the statement names (one missing from the
+#   list was not there when the types were read);
+# - for a column of an extension member type (citext and the like), a
+#   domain over one (the typbasetype chain is followed to the base type) or
+#   an array of one: the schema of each operator and of each function the
+#   type's own extension defines for it (never a user object someone added
+#   beside them), and whether the function returns the type (citext's max
+#   and min);
+# - for each function the statement reads rows from: whether its outputs can
+#   be an extension type ("unknown") or not ("known");
+# - the transaction's isolation level (see _pg_verify_column_types).
+# A column whose domain chain is still a domain after 16 steps is refused.
+my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
+    a AS (SELECT r.rel, at.attname, at.atttypid FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(rel)
+      JOIN pg_catalog.pg_attribute at ON at.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.rel)
+        AND at.attnum OPERATOR(pg_catalog.>) 0 AND NOT at.attisdropped),
+    c(rel, att, oid, depth, arr) AS (
+      SELECT a.rel, a.attname, a.atttypid, 0, false FROM a
       UNION ALL
-      SELECT c.rel, c.att, t.typbasetype, c.depth OPERATOR(pg_catalog.+) 1 FROM c JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.oid
-      WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND c.depth OPERATOR(pg_catalog.<) 16)
-    SELECT CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
+      SELECT c.rel, c.att, CASE WHEN t.typtype OPERATOR(pg_catalog.=) 'd' THEN t.typbasetype ELSE t.typelem END,
+        c.depth OPERATOR(pg_catalog.+) 1, c.arr OR t.typtype OPERATOR(pg_catalog.<>) 'd'
+      FROM c JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.oid
+      WHERE c.depth OPERATOR(pg_catalog.<) 16 AND (t.typtype OPERATOR(pg_catalog.=) 'd' OR (NOT c.arr
+        AND t.typtype OPERATOR(pg_catalog.=) 'b' AND t.typcategory OPERATOR(pg_catalog.=) 'A'
+        AND t.typelem OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid) AND t.typlen OPERATOR(pg_catalog.<) 0))),
+    e AS (SELECT c.rel, c.att, c.arr, ty.oid, d.refobjid FROM c
+      JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
+      JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
+        AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'),
+    x(oid, depth) AS (
+      SELECT d.objid, 0 FROM pg_catalog.pg_depend d
+      WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
+      UNION ALL
+      SELECT t.oid, x.depth OPERATOR(pg_catalog.+) 1 FROM pg_catalog.pg_type t
+      JOIN x ON t.typbasetype OPERATOR(pg_catalog.=) x.oid OR t.typelem OPERATOR(pg_catalog.=) x.oid
+      WHERE x.depth OPERATOR(pg_catalog.<) 16),
+    f AS (SELECT p.oid, p.proname, CASE WHEN p.proallargtypes IS NULL THEN ARRAY[p.prorettype]
+        ELSE ARRAY(SELECT u.t FROM ROWS FROM (pg_catalog.unnest(p.proallargtypes), pg_catalog.unnest(p.proargmodes)) AS u(t, m)
+          WHERE u.m OPERATOR(pg_catalog.=) ANY (CAST('{o,b,t}' AS "char"[]))) END AS outs
+      FROM pg_catalog.pg_proc p WHERE CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY (CAST($2 AS pg_catalog.text[])))
+    SELECT 'col', CAST(a.rel AS pg_catalog.text), CAST(a.attname AS pg_catalog.text), CAST(a.atttypid AS pg_catalog.text), NULL FROM a
+    UNION ALL
+    SELECT 'deep', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
     FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
     WHERE c.depth OPERATOR(pg_catalog.=) 16
     UNION ALL
-    SELECT CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text),
+    SELECT CASE WHEN e.arr THEN 'eop' ELSE 'op' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
       CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
-    FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
-    JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
-      AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'
-    JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) ty.oid AND o.oprright OPERATOR(pg_catalog.=) ty.oid
+    FROM e JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) e.oid AND o.oprright OPERATOR(pg_catalog.=) e.oid
     JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
-      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e'
-      AND od.refobjid OPERATOR(pg_catalog.=) d.refobjid
-    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace};
+      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace
+    UNION ALL
+    SELECT CASE WHEN e.arr THEN 'efn' ELSE 'fn' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
+      CAST(p.proname AS pg_catalog.text),
+      pg_catalog.concat(n.nspname, CASE WHEN p.prorettype OPERATOR(pg_catalog.=) e.oid THEN '|self' ELSE '' END)
+    FROM e JOIN pg_catalog.pg_proc p ON p.pronargs OPERATOR(pg_catalog.>) 0 AND p.proargtypes[0] OPERATOR(pg_catalog.=) e.oid
+    JOIN pg_catalog.pg_depend pd ON pd.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_proc' AS pg_catalog.regclass)
+      AND pd.objid OPERATOR(pg_catalog.=) p.oid AND pd.deptype OPERATOR(pg_catalog.=) 'e' AND pd.refobjid OPERATOR(pg_catalog.=) e.refobjid
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
+    UNION ALL
+    SELECT 'fun', NULL, CAST(f.proname AS pg_catalog.text), NULL,
+      CASE WHEN pg_catalog.bool_or(EXISTS (SELECT 1 FROM pg_catalog.unnest(f.outs) AS o(t)
+        JOIN pg_catalog.pg_type ot ON ot.oid OPERATOR(pg_catalog.=) o.t
+        WHERE o.t OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x))
+          OR (ot.typtype OPERATOR(pg_catalog.=) 'p' AND ot.oid OPERATOR(pg_catalog.<>) CAST('pg_catalog.record' AS pg_catalog.regtype)
+            AND EXISTS (SELECT 1 FROM x))
+          OR (ot.typtype OPERATOR(pg_catalog.=) 'c' AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
+            WHERE ca.attrelid OPERATOR(pg_catalog.=) ot.typrelid AND ca.attnum OPERATOR(pg_catalog.>) 0 AND NOT ca.attisdropped
+              AND ca.atttypid OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x))))))
+        THEN 'unknown' ELSE 'known' END
+    FROM f GROUP BY f.proname
+    UNION ALL
+    SELECT CASE WHEN o.op IS NULL THEN 'fcol' ELSE 'fop' END, CAST(w.pos AS pg_catalog.text), CAST(f.proname AS pg_catalog.text),
+      o.op, o.schema
+    FROM f JOIN LATERAL (SELECT u.pos, u.t FROM pg_catalog.unnest(f.outs) WITH ORDINALITY AS u(t, pos)) AS w ON TRUE
+    JOIN pg_catalog.pg_type wt ON wt.oid OPERATOR(pg_catalog.=) w.t
+    JOIN LATERAL (
+      SELECT NULL AS op, CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+          WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
+            AND d.objid OPERATOR(pg_catalog.=) w.t) THEN 'ext'
+        WHEN w.t OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x)) OR wt.typtype OPERATOR(pg_catalog.=) 'p'
+          OR wt.typtype OPERATOR(pg_catalog.=) 'c' THEN 'unknown' ELSE 'known' END AS schema
+      UNION ALL
+      SELECT CAST(op.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
+      FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_operator op ON op.oprleft OPERATOR(pg_catalog.=) w.t AND op.oprright OPERATOR(pg_catalog.=) w.t
+      JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
+        AND od.objid OPERATOR(pg_catalog.=) op.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) d.refobjid
+      JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) op.oprnamespace
+      WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
+        AND d.objid OPERATOR(pg_catalog.=) w.t) AS o ON TRUE
+    WHERE (SELECT pg_catalog.count(*) FROM f g WHERE g.proname OPERATOR(pg_catalog.=) f.proname) OPERATOR(pg_catalog.=) 1
+    UNION ALL
+    SELECT 'iso', NULL, NULL, pg_catalog.current_setting('transaction_isolation'), NULL};
 sub _pg_extension_operators {
     my ($self, $sql) = @_;
     require Selecto::PostgreSQL::Qualify;
     my $tokens = eval { Selecto::PostgreSQL::Qualify::tokenize($sql) } or return {};
     # Every schema-qualified relation the SQL names (generated SQL always
-    # qualifies them, R23b); the qualifier resolves column references to
-    # these by query scope.
-    my %rels;
-    for my $k (0 .. $#$tokens - 2) {
-        next unless $tokens->[$k][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 1][1] eq '.' && $tokens->[$k + 2][0] =~ /\A(?:id|qid)\z/;
+    # qualifies them, R23b), and every function it reads rows from; the
+    # qualifier resolves column references to these by query scope.
+    my (%rels, %functions);
+    my $name = sub { my ($t) = @_; my $v = $t->[1]; $v =~ s/\A"((?:[^"]|"")*)"\z/$1/ ? $v =~ s/""/"/gr : lc $v };
+    for my $k (0 .. $#$tokens - 1) {
+        next unless $tokens->[$k][0] =~ /\A(?:id|qid)\z/;
+        my $prev = $k > 0 ? uc($tokens->[$k - 1][1]) : '';
+        if ($prev =~ /\A(?:FROM|JOIN|LATERAL|,|\()\z/) {
+            my $j = $k;
+            $j += 2 while $j + 2 < @$tokens && $tokens->[$j + 1][1] eq '.' && $tokens->[$j + 2][0] =~ /\A(?:id|qid)\z/;
+            $functions{$name->($tokens->[$j])} = 1 if $j + 1 < @$tokens && $tokens->[$j + 1][1] eq '(';
+        }
+        next unless $k + 2 <= $#$tokens && $tokens->[$k + 1][1] eq '.' && $tokens->[$k + 2][0] =~ /\A(?:id|qid)\z/;
         next if $k > 0 && $tokens->[$k - 1][1] eq '.';
         my $after = $k + 3 < @$tokens ? $tokens->[$k + 3] : undef;
         next if $after && ($after->[1] eq '(' || $after->[1] eq '.') && !($k > 0 && uc($tokens->[$k - 1][1]) eq 'INTO');
-        my $prev = $k > 0 ? uc($tokens->[$k - 1][1]) : '';
         next unless $prev =~ /\A(?:FROM|JOIN|INTO|UPDATE|ONLY|\(|,)\z/;
         $rels{"$tokens->[$k][1].$tokens->[$k + 2][1]"} = 1;
     }
-    return {} unless %rels;
+    return {} unless %rels || %functions;
     my @rels = sort keys %rels;
     my $rows;
-    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels); 1 };
+    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, [sort keys %functions]); 1 };
     die $self->normalize_error($@) unless $ok;
-    my %relations;
+    my (%relations, %types, %known, $isolation);
+    my $key = sub { lc join '.', map { s/\A"((?:[^"]|"")*)"\z/$1/r =~ s/""/"/gr } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $_[0] };
+    my $quote = sub { '"' . ($_[0] =~ s/"/""/gr) . '"' };
+    my $extension = 0;
     for my $row (@{$rows // []}) {
-        my ($rel, $column, $op, $schema) = @$row;
+        my ($kind, $rel, $column, $a, $b) = @$row;
+        if ($kind eq 'iso') { $isolation = $a; next }
+        if ($kind eq 'fun') { $known{$column}{state} = $b; $extension = 1 if $b ne 'known'; next }
+        # The one function of that name: each output column's type (review
+        # M2), an extension type's operators included.
+        if ($kind eq 'fcol') { $known{$column}{cols}[$rel - 1] //= {}; $known{$column}{cols}[$rel - 1]{"\0unknown"} = 1 if $b eq 'unknown'; next }
+        if ($kind eq 'fop') { $known{$column}{cols}[$rel - 1]{$a} = $quote->($b); next }
+        my $columns = $relations{$key->($rel)} //= {};
+        my $entry = $columns->{lc $column} //= {};
+        if ($kind eq 'col') { $types{$rel}{$column} = $a; next }
         # A domain chain deeper than the walk follows: its base type, and so
         # its operators, are unknown (review LOW).
         Selecto::Error->throw('query_rule_not_evaluable', 'a column is a domain chain too deep to resolve its base type',
-            {reason => 'domain_chain_too_deep', relation => $rel, column => $column}) unless defined $op;
-        my $key = lc join '.', map { s/\A"((?:[^"]|"")*)"\z/$1/r =~ s/""/"/gr } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $rel;
-        $relations{$key}{lc $column}{$op} = '"' . ($schema =~ s/"/""/gr) . '"';
+            {reason => 'domain_chain_too_deep', relation => $rel, column => $column}) if $kind eq 'deep';
+        $extension = 1;
+        my $target = $kind =~ /\Ae/ ? ($entry->{"\0elem"} //= {}) : $entry;
+        if ($kind =~ /op\z/) {
+            $target->{$a} = $quote->($b);
+        } else {
+            my ($schema, $self_type) = $b =~ /\A(.*?)(\|self)?\z/s;
+            $target->{"\0fn"}{lc $a} = {schema => $quote->($schema), self => $self_type ? 1 : 0};
+        }
     }
-    return %relations ? {relations => \%relations} : {};
+    $self->_pg_verify_column_types(\%types) if %types && defined($isolation) && $isolation ne 'read committed';
+    return {relations => \%relations, functions => \%known, extension => $extension};
+}
+
+# R49a: under REPEATABLE READ or SERIALIZABLE the catalog read above sees the
+# transaction's snapshot, while the statement is planned against the
+# current catalog. Each column's type is read again through the parser,
+# pg_typeof((NULL::relation).column), and each relation's column count from
+# its current row type; any difference is refused, typed.
+sub _pg_verify_column_types {
+    my ($self, $types) = @_;
+    my (@select, @expected);
+    for my $rel (sort keys %$types) {
+        my $row = "CAST(NULL AS $rel)";
+        push @select, "(SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(pg_catalog.to_jsonb("
+            . "pg_catalog.jsonb_populate_record($row, CAST('{}' AS pg_catalog.jsonb)))))";
+        push @expected, scalar keys %{$types->{$rel}};
+        for my $column (sort keys %{$types->{$rel}}) {
+            push @select, "CAST(pg_catalog.pg_typeof(($row)." . $self->quote_identifier($column) . ') AS pg_catalog.oid)';
+            push @expected, $types->{$rel}{$column};
+        }
+    }
+    my @row;
+    my $ok = eval { @row = $self->{dbh}->selectrow_array('SELECT ' . join(', ', @select)); 1 };
+    my $same = $ok && @row == @expected && !grep { !defined($row[$_]) || "$row[$_]" ne "$expected[$_]" } 0 .. $#expected;
+    Selecto::Error->throw('query_rule_not_evaluable',
+        "a relation's column types changed after the transaction's snapshot; they cannot be read in this transaction",
+        {reason => 'catalog_changed'}) unless $same;
+    return;
 }
 
 1;

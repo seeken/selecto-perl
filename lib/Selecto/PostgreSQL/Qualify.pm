@@ -37,6 +37,13 @@ my %KEYWORD = map { ($_ => 1) } qw(
     CHARACTER VARYING DOUBLE PRECISION WITHOUT DECLARE CURSOR SCROLL HOLD SAVEPOINT RELEASE ROLLBACK BEGIN
     COMMIT LOCK MODE EXCLUSIVE SYMMETRIC ASYMMETRIC LEADING TRAILING BOTH PLACING NORMALIZE DEFAULT
 );
+# Declared column types of a record function's column list that are no
+# extension's (json_rowset and the like).
+my %BUILTIN_TYPE = map { ($_ => 1) } map { ($_, "$_\[]") } qw(text varchar character char bpchar name integer int int2 int4 int8
+    smallint bigint numeric decimal real float4 float8 boolean bool date time timetz timestamp timestamptz interval json
+    jsonb uuid bytea inet cidr macaddr money oid xml), 'character varying', 'double precision', 'timestamp with time zone',
+    'timestamp without time zone', 'time with time zone', 'time without time zone';
+my %SYSTEM_COLUMN = map { ($_ => 1) } qw(tableoid ctid xmin xmax cmin cmax);
 my %CONSTANT = map { ($_ => 1) } qw(TRUE FALSE NULL CURRENT_DATE CURRENT_TIMESTAMP CURRENT_TIME LOCALTIMESTAMP
     LOCALTIME CURRENT_USER SESSION_USER CURRENT_ROLE);
 # Keywords that introduce a typed literal: INTERVAL '1 day'.
@@ -99,7 +106,10 @@ sub qualify {
     my $tokens = tokenize($sql);
     # $columns: {relations => {lc "schema.table" => {lc column => {op => schema}}}}
     # (columns of extension member types, or domains over one, by relation).
-    $state->{scopes} = _scopes($tokens) if ref($columns) eq 'HASH' && ref($columns->{relations}) eq 'HASH' && %{$columns->{relations}};
+    # Scopes (and so operand types) matter only when an extension type can
+    # reach the statement: a column of one, or a function rowset that may
+    # return one (see Selecto::PostgreSQL::_pg_extension_operators).
+    $state->{scopes} = _scopes($tokens) if ref($columns) eq 'HASH' && $columns->{extension};
     my $pos = 0;
     my $out = _sequence($state, $tokens, \$pos, undef);
     Selecto::Error->throw('query_rule_not_evaluable', 'generated SQL has unbalanced parentheses',
@@ -116,10 +126,11 @@ sub _sequence {
     my @parts;
     my @run;
     my $set_list = 0;
-    my $lone;
+    my ($lone, $first);
     my $flush = sub {
         if (@run) {
             $lone = @run == 1 && $run[0]{kind} eq 'atom' && !@parts ? $run[0] : undef;
+            $first = $lone if !@parts;
             push @parts, _emit_run($state, \@run);
             @run = ();
         }
@@ -189,6 +200,8 @@ sub _sequence {
     # The sequence was one atom (a column, a function call...): a redundant
     # group around it keeps what is known of it.
     $state->{lone_atom} = @parts == 1 ? $lone : undef;
+    # The first argument, when it is one atom (a function's first argument).
+    $state->{first_atom} = $first;
     return join ' ', @parts;
 }
 
@@ -378,7 +391,9 @@ sub _atom {
     my $token = $tokens->[$$pos];
     my ($type, $text) = @$token;
     my $up = _upper($token);
-    my ($sql, $column, $known);
+    my ($sql, $column, $known, $entry);
+    # Column references read inside this atom (see _postfix).
+    my $mark = scalar @{$state->{refs} //= []};
     if ($type eq 'num' || $type eq 'str' || $type eq 'param') {
         $sql = $text; $$pos++;
     } elsif ($type eq 'id' && $CONSTANT{$up} && !_peek_punct($tokens, $$pos + 1, '(')) {
@@ -425,7 +440,7 @@ sub _atom {
             my $left = _render($state, $a);
             my $op = _op_sql($state, {kind => 'op', op => '='}, $a, $b);
             return _postfix($state, $tokens, $pos,
-                "(CASE WHEN ($left) $op (" . _render($state, $b) . ") THEN NULL ELSE ($left) END)", undef);
+                "(CASE WHEN ($left) $op (" . _render($state, $b) . ") THEN NULL ELSE ($left) END)", undef, undef, undef, $mark);
         }
         my $open = $tokens->[$$pos + 1][1];
         my $close = $open eq '(' ? ')' : ']';
@@ -445,7 +460,7 @@ sub _atom {
         my $lone = $state->{lone_atom};
         _expect($tokens, $pos, ')');
         $sql = "($inner)";
-        ($column, $known) = ($lone->{column}, $lone->{known}) if $lone;
+        ($column, $known, $entry) = ($lone->{column}, $lone->{known}, $lone->{entry}) if $lone;
     } elsif ($type eq 'id' && !$KEYWORD{$up} || $type eq 'qid') {
         # A name chain: a.b.c, possibly a function call.
         my $start = $token->[2];
@@ -461,9 +476,19 @@ sub _atom {
         if (_peek_punct($tokens, $$pos, '(')) {
             $$pos++;
             my $inner = _sequence($state, $tokens, $pos, ')');
+            my $first = $state->{first_atom};
             _expect($tokens, $pos, ')');
             my $name = join '.', @names;
-            if (@names == 1 && $kinds[0] eq 'id' && $state->{functions}{lc $names[0]}) {
+            # R49c: a function the extension of its first argument's type
+            # defines for that type (citext's max and min) resolves in the
+            # extension's schema, as PostgreSQL resolves it, and its result
+            # keeps the type when it returns it.
+            my $function = @names == 1 && $kinds[0] eq 'id' && $first && $state->{scopes}
+                ? _extension_function($state, $first, lc $names[0]) : undef;
+            if ($function) {
+                $name = "$function->{schema}.$names[0]";
+                if ($function->{self}) { $entry = $function->{entry} } else { $known = 1 }
+            } elsif (@names == 1 && $kinds[0] eq 'id' && $state->{functions}{lc $names[0]}) {
                 $name = "pg_catalog.$names[0]";
                 # A pg_catalog function with no polymorphic overload returns
                 # a pg_catalog type, whatever its arguments.
@@ -492,11 +517,11 @@ sub _atom {
     } else {
         return undef;
     }
-    return _postfix($state, $tokens, $pos, $sql, $column, $known);
+    return _postfix($state, $tokens, $pos, $sql, $column, $known, $entry, $mark);
 }
 
 sub _postfix {
-    my ($state, $tokens, $pos, $sql, $column, $known) = @_;
+    my ($state, $tokens, $pos, $sql, $column, $known, $entry, $mark) = @_;
     while ($$pos < @$tokens) {
         my $t = $tokens->[$$pos];
         if ($t->[0] eq 'punct' && $t->[1] eq '::') {
@@ -514,14 +539,14 @@ sub _postfix {
             }
             while (_peek_punct($tokens, $$pos, '[') && _peek_punct($tokens, $$pos + 1, ']')) { $cast .= '[]'; $$pos += 2 }
             $sql .= "::$cast";
-            $column = undef;
+            ($column, $entry) = (undef, undef);
             $known = 1;
         } elsif ($t->[0] eq 'punct' && $t->[1] eq '[') {
             $$pos++;
             my $inner = _sequence($state, $tokens, $pos, ']');
             _expect($tokens, $pos, ']');
             $sql .= "[$inner]";
-            $column = undef;
+            ($column, $entry) = (undef, undef);
             $known = 0;
         } elsif (_upper($t) eq 'AT' && _upper($tokens->[$$pos + 1]) eq 'TIME' && _upper($tokens->[$$pos + 2]) eq 'ZONE') {
             $$pos += 3;
@@ -529,7 +554,7 @@ sub _postfix {
             Selecto::Error->throw('query_rule_not_evaluable', 'generated SQL could not be parsed for operator qualification',
                 {reason => 'sql_unqualifiable'}) unless defined $zone;
             $sql = "($sql AT TIME ZONE $zone->{sql})";
-            $column = undef;
+            ($column, $entry) = (undef, undef);
             $known = 1;
         } elsif (_upper($t) eq 'COLLATE') {
             $$pos++;
@@ -542,7 +567,14 @@ sub _postfix {
             last;
         }
     }
-    return {kind => 'atom', sql => $sql, column => $column, known => $known};
+    # The column references this atom's type depends on: itself for a
+    # column; none for a known or extension-typed result; else those read
+    # inside it.
+    my $refs = $state->{refs} //= [];
+    $mark //= scalar @$refs;
+    if ($known || $entry) { splice(@$refs, $mark) }
+    elsif ($column) { splice(@$refs, $mark); push @$refs, {column => $column} }
+    return {kind => 'atom', sql => $sql, column => $column, known => $known, entry => $entry, refs => [@$refs[$mark .. $#$refs]]};
 }
 
 # CASE ... END: WHEN/THEN/ELSE are boundaries inside.
@@ -693,30 +725,68 @@ sub _operand_class {
     my ($state, $side, $op) = @_;
     return {untyped => 1} unless $side;
     return {} unless $side->{atom};
-    my $atom = $side->{atom};
+    my $class = _class_of($state, $side->{atom});
+    return $class unless $class->{entry};
+    return defined($class->{entry}{$op}) ? {schema => $class->{entry}{$op}} : {};
+}
+
+# What is known of an atom's type: {untyped => 1} (a bare parameter or
+# string literal), {entry => <its extension type's operators and
+# functions>}, {unknown => 1} (it may have an extension type that cannot be
+# resolved here), or {} (a known type that is no extension's).
+sub _class_of {
+    my ($state, $atom) = @_;
     return {untyped => 1} if !defined($atom->{column}) && $atom->{sql} =~ /\A(?:\$\d+|\?|'(?:[^']|'')*')\z/;
-    return {} unless $state->{scopes};
-    if (ref($atom->{column}) eq 'HASH') {
-        my $entry = _resolve_column($state, $atom->{column}{at}, $atom->{column}{names});
-        if (ref($entry) eq 'HASH') {
-            return {unknown => 1} if $entry->{"\0unknown"};
-            return defined($entry->{$op}) ? {schema => $entry->{$op}} : {};
-        }
-        # No source found: unknown when an extension-typed column has its name.
-        return _names_extension_column($state, [$atom->{column}{names}[-1]]) ? {unknown => 1} : {};
+    return {entry => $atom->{entry}} if $atom->{entry};
+    return {} if $atom->{known} || !$state->{scopes};
+    return _ref_class($state, {column => $atom->{column}}) if ref($atom->{column}) eq 'HASH';
+    # An expression: its result type follows its operands. Unknown when one
+    # has (or may have) an extension type.
+    for my $ref (@{$atom->{refs} // []}) {
+        my $class = _ref_class($state, $ref);
+        return {unknown => 1} if $class->{entry} || $class->{unknown};
     }
-    return {} if $atom->{known};
-    # An expression: unknown when it names an extension-typed column.
-    my @names = map { _unquote($_->[1]) } grep { $_->[0] =~ /\A(?:id|qid)\z/ } @{tokenize($atom->{sql})};
-    return _names_extension_column($state, \@names) ? {unknown => 1} : {};
+    return {};
+}
+
+sub _ref_class {
+    my ($state, $ref) = @_;
+    my $column = $ref->{column};
+    my $entry = _resolve_column($state, $column->{at}, $column->{names});
+    if (ref($entry) eq 'HASH') {
+        return {unknown => 1} if $entry->{"\0unknown"};
+        return _is_extension($entry) ? {entry => $entry} : {};
+    }
+    # No source found: unknown only when an extension-typed column of a
+    # relation the statement names has its name.
+    return _names_extension_column($state, [$column->{names}[-1]]) ? {unknown => 1} : {};
+}
+
+# A column entry of an extension type: its operators and functions.
+sub _is_extension {
+    my ($entry) = @_;
+    return ref($entry) eq 'HASH' && grep { substr($_, 0, 1) ne "\0" || $_ eq "\0fn" } keys %$entry;
+}
+
+# The extension function a call to $name resolves to when its first
+# argument has that extension's type: {schema, self, entry}, or undef.
+sub _extension_function {
+    my ($state, $first, $name) = @_;
+    my $class = _class_of($state, $first);
+    my $entry = $class->{entry} or return undef;
+    my $function = ref($entry->{"\0fn"}) eq 'HASH' ? $entry->{"\0fn"}{$name} : undef;
+    return undef unless $function;
+    return {schema => $function->{schema}, self => $function->{self}, entry => $entry};
 }
 
 # Whether any of the names is a column of an extension member type (or a
-# domain over one) of a relation the statement names.
+# domain over one, or an array of one) of a relation the statement names:
+# only for references whose source cannot be resolved.
 sub _names_extension_column {
     my ($state, $names) = @_;
     my $set = $state->{extension_names} //= {
-        map { %$_ } map { +{map { ($_ => 1) } keys %$_} } values %{$state->{columns}{relations} // {}} };
+        map { %$_ } map { my $columns = $_; +{map { ($_ => 1) } grep { _is_extension($columns->{$_}) || $columns->{$_}{"\0elem"} } keys %$columns} }
+        values %{$state->{columns}{relations} // {}} };
     return scalar grep { $set->{lc $_} } @$names;
 }
 
@@ -832,11 +902,23 @@ sub _scopes {
             } else {
                 my ($names, $after) = $name_at->($j);
                 last unless $names;
-                last if $after < @$tokens && $tokens->[$after][1] eq '(' && $up ne 'INTO';
-                $default = $names->[-1];
-                $source = @$names == 1 && $cte{lc $names->[0]} ? {cte => lc $names->[0]}
-                    : {relation => lc(join '.', @$names)};
-                $j = $after;
+                if ($after < @$tokens && $tokens->[$after][1] eq '(' && $up ne 'INTO') {
+                    # A function rowset, FROM fn(args) [WITH ORDINALITY]
+                    # [AS] alias [(col [type], ...)] (review M2).
+                    my $close = $closes{$after} // last;
+                    $source = {function => lc $names->[-1], open => $after, close => $close};
+                    $default = $names->[-1];
+                    $j = $close + 1;
+                    if (_upper($tokens->[$j]) eq 'WITH' && _upper($tokens->[$j + 1]) eq 'ORDINALITY') {
+                        $source->{ordinality} = 1;
+                        $j += 2;
+                    }
+                } else {
+                    $default = $names->[-1];
+                    $source = @$names == 1 && $cte{lc $names->[0]} ? {cte => lc $names->[0]}
+                        : {relation => lc(join '.', @$names)};
+                    $j = $after;
+                }
             }
             $j++ if _upper($tokens->[$j]) eq 'AS';
             my $alias = $default;
@@ -844,8 +926,30 @@ sub _scopes {
                 $alias = _unquote($tokens->[$j][1]);
                 $j++;
             }
-            my ($cols, $next) = $cols_at->($j);
-            if ($cols && ($source->{derived} || $source->{cte})) { $source->{cols} = $cols; $j = $next }
+            if (defined $source->{function}) {
+                # Its column list, with declared types (a record function's).
+                if ($j < @$tokens && $tokens->[$j][1] eq '(' && defined(my $end = $closes{$j})) {
+                    my (@cols, @types, @current);
+                    for my $k ($j + 1 .. $end) {
+                        if ($k == $end || ($tokens->[$k][1] eq ',' && $depth_of[$k] == $depth_of[$j + 1])) {
+                            if (@current) {
+                                push @cols, _unquote($tokens->[$current[0]][1]);
+                                push @types, @current > 1 ? lc join(' ', map { $tokens->[$_][1] } @current[1 .. $#current]) : undef;
+                            }
+                            @current = ();
+                            next;
+                        }
+                        push @current, $k;
+                    }
+                    @{$source}{qw(cols types)} = (\@cols, \@types);
+                    $j = $end + 1;
+                } else {
+                    $source->{cols} = [$alias];
+                }
+            } else {
+                my ($cols, $next) = $cols_at->($j);
+                if ($cols && ($source->{derived} || $source->{cte})) { $source->{cols} = $cols; $j = $next }
+            }
             $scopes[$scope]{aliases}{lc $alias} = $source if defined $alias;
             last unless $up eq 'FROM' && $j < @$tokens && $tokens->[$j][1] eq ',';
             $j++;
@@ -892,8 +996,11 @@ sub _source_column {
         # A relation the statement names: a column of an extension type has
         # its operators; any other column is a known non-extension one.
         my $columns = $relations->{$source->{relation}} // return {};
-        return $columns->{$column} // {};
+        # The relation's columns are all listed: one that is not was not
+        # there when its types were read (M4).
+        return $columns->{$column} // ($SYSTEM_COLUMN{$column} ? {} : {"\0unknown" => 1});
     }
+    return _function_column($state, $source, $column, $guard) if defined $source->{function};
     my ($scope, $cols);
     if (defined $source->{cte}) {
         my $cte = $info->{cte}{$source->{cte}} // return undef;
@@ -927,11 +1034,85 @@ sub _source_column {
         my $output = ref($cols) eq 'ARRAY' && $index < @$cols ? $cols->[$index] : $name;
         next unless defined($output) && lc($output) eq $column;
         return _resolve_in($state, $scope, @chain > 1 ? lc $chain[-2] : undef, lc $chain[-1], $guard + 1) if $passthrough;
-        # A computed output: unknown when it names an extension-typed column.
-        my @names = map { _unquote($_->[1]) } grep { $_->[0] =~ /\A(?:id|qid)\z/ } @body;
-        return _names_extension_column($state, \@names) ? {"\0unknown" => 1} : {};
+        # A computed output: typed as the qualifier types an operand (review
+        # M1): a cast, a non-polymorphic pg_catalog function, an extension
+        # function, or an expression over columns of known types.
+        my $first = $items->[$index][0];
+        my $last = $first + @body - 1;
+        return _computed_entry($state, $first, $last, $guard);
     }
     return undef;
+}
+
+# A computed select item's type, from its tokens $first .. $last.
+sub _computed_entry {
+    my ($state, $first, $last, $guard) = @_;
+    my $cache = $state->{computed} //= {};
+    return $cache->{"$first:$last"} if exists $cache->{"$first:$last"};
+    return {"\0unknown" => 1} if ($state->{computing} // 0) > 8;
+    local $state->{computing} = ($state->{computing} // 0) + 1;
+    my $tokens = $state->{scopes}{tokens};
+    my $entry = {"\0unknown" => 1};
+    my $ok = eval {
+        local $state->{refs} = [];
+        local $state->{problems} = [];
+        my $pos = $first;
+        my $tree = _read_run($state, $tokens, \$pos, undef);
+        if ($pos == $last + 1) {
+            my $class = !$tree->{atom} ? {} : _class_of($state, $tree->{atom});
+            $entry = $class->{entry} ? $class->{entry} : $class->{unknown} ? {"\0unknown" => 1} : {};
+        }
+        1;
+    };
+    $entry = {"\0unknown" => 1} unless $ok;
+    return $cache->{"$first:$last"} = $entry;
+}
+
+# A function rowset's output column (review M2): a declared column type
+# (a record function's column list), the element type of an array for
+# unnest, or what the catalog says of the function's outputs. Unknown types
+# are never taken for text.
+sub _function_column {
+    my ($state, $source, $column, $guard) = @_;
+    my $cols = $source->{cols} // [];
+    my ($index) = grep { lc($cols->[$_]) eq $column } 0 .. $#$cols;
+    return undef unless defined $index;
+    my $types = $source->{types} // [];
+    if (defined $types->[$index]) {
+        (my $type = $types->[$index]) =~ s/"//g;
+        $type =~ s/\A\s*pg_catalog\.//;
+        $type =~ s/\s*\(.*\z//;
+        $type =~ s/\s*\[\]\z/[]/;
+        return $BUILTIN_TYPE{$type} ? {} : {"\0unknown" => 1};
+    }
+    # WITH ORDINALITY's last column is bigint.
+    return {} if $source->{ordinality} && $index == $#$cols && @$cols > 1;
+    my $info = $state->{scopes};
+    my $tokens = $info->{tokens};
+    if ($source->{function} eq 'unnest') {
+        # unnest(array column): the column's element type.
+        my @args = $source->{open} + 1 .. $source->{close} - 1;
+        my @chain;
+        my @inner = grep { $tokens->[$_][1] ne '(' && $tokens->[$_][1] ne ')' } @args;
+        for my $k (0 .. $#inner) {
+            my $t = $tokens->[$inner[$k]];
+            if ($k % 2 == 0) { return {"\0unknown" => 1} unless $t->[0] =~ /\A(?:id|qid)\z/; push @chain, _unquote($t->[1]) }
+            else { return {"\0unknown" => 1} unless $t->[1] eq '.' }
+        }
+        return {"\0unknown" => 1} unless @chain && @chain <= 3 && $index == 0;
+        my $entry = _resolve_in($state, $info->{scope_of}[$source->{open}], @chain > 1 ? lc $chain[-2] : undef, lc $chain[-1], $guard + 1);
+        return {"\0unknown" => 1} unless ref($entry) eq 'HASH';
+        return $entry->{"\0elem"} if $entry->{"\0elem"};
+        return $entry->{"\0unknown"} || _is_extension($entry) ? {"\0unknown" => 1} : {};
+    }
+    my $function = $state->{columns}{functions}{$source->{function}};
+    return {"\0unknown" => 1} unless ref($function) eq 'HASH';
+    # The one function of that name: its output column's own type.
+    if (ref($function->{cols}) eq 'ARRAY' && @{$function->{cols}} == @$cols - ($source->{ordinality} ? 1 : 0)) {
+        my $entry = $function->{cols}[$index];
+        return ref($entry) eq 'HASH' ? $entry : {"\0unknown" => 1};
+    }
+    return ($function->{state} // '') eq 'known' ? {} : {"\0unknown" => 1};
 }
 
 sub _unquote {
