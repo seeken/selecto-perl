@@ -2032,14 +2032,25 @@ sub _pg_catalog_functions {
     my ($self) = @_;
     my $dbh = $self->{dbh};
     return $dbh->{private_selecto_pg_functions} if ref($dbh->{private_selecto_pg_functions}) eq 'HASH';
-    my $names;
+    my $rows;
+    # Each name, and whether an overload returns a scalar polymorphic type
+    # taken from a scalar or array argument (its result can then be an
+    # extension type, as unnest(citext[]) or a polymorphic aggregate's: see
+    # Qualify's operand classes). A range's or enum's element alone does not
+    # count (upper(anyrange)).
     my $ok = eval {
-        $names = $dbh->selectcol_arrayref(q{SELECT DISTINCT CAST(p.proname AS pg_catalog.text) FROM pg_catalog.pg_proc p
-            WHERE p.pronamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)});
+        $rows = $dbh->selectall_arrayref(q{SELECT CAST(p.proname AS pg_catalog.text),
+            pg_catalog.bool_or(CAST(p.prorettype AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
+                (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray}' AS pg_catalog.regtype[]))
+              AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS a(t)
+                WHERE CAST(a.t AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
+                  (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray,anyarray,anycompatiblearray}' AS pg_catalog.regtype[]))))
+            FROM pg_catalog.pg_proc p
+            WHERE p.pronamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace) GROUP BY 1});
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    my %names = map { (lc($_) => 1) } @{$names // []};
+    my %names = map { (lc($_->[0]) => ($_->[1] ? 'polymorphic' : 1)) } @{$rows // []};
     $dbh->{private_selecto_pg_functions} = \%names;
     return \%names;
 }
