@@ -131,6 +131,53 @@ is($outcome->(sub { $ids->($ep, $lq) }), "applied $planted", "a planted lower(ci
 like($ep->adapter->_statement_sql($ep->compile($lq)->sql), qr/pg_catalog\.lower\(/i, 'the statement calls pg_catalog.lower');
 $admin->do(qq{DROP FUNCTION "$schema".lower($ci)});
 
+# R50 (review of 0ce754a, HIGH-1/HIGH-2): operators and aggregates in the
+# extension's schema take operands cast to the member type, so exact-match
+# objects planted there over a DOMAIN of citext are never chosen.
+$admin->do($_) for 'DROP TABLE IF EXISTS r50_dm', 'DROP DOMAIN IF EXISTS r50_email CASCADE', "CREATE DOMAIN r50_email AS $ci",
+    'CREATE TABLE r50_dm (id INT PRIMARY KEY, org TEXT NOT NULL, k INT, tag r50_email)',
+    q{INSERT INTO r50_dm VALUES (10, 't1', 1, 'Gold'), (11, 't1', 2, 'GOLD'), (12, 't1', 3, 'silver'), (13, 't2', 1, 'gold')};
+my %want = (eq => $native->(q{SELECT id FROM r50_dm WHERE org = 't1' AND tag = 'gold'}),
+    max => join(',', $admin->selectrow_array(q{SELECT CAST(max(tag) AS text), CAST(min(tag) AS text) FROM r50_dm WHERE org = 't1'})));
+$admin->do($_) for
+    qq{CREATE FUNCTION "$schema".r50_yes(r50_email, r50_email) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
+    qq{CREATE OPERATOR "$schema".= (LEFTARG = r50_email, RIGHTARG = r50_email, FUNCTION = "$schema".r50_yes)},
+    qq{CREATE OPERATOR "$schema".<> (LEFTARG = r50_email, RIGHTARG = r50_email, FUNCTION = "$schema".r50_yes)},
+    qq{CREATE FUNCTION "$schema".r50_zzz(r50_email, r50_email) RETURNS r50_email LANGUAGE sql IMMUTABLE AS \$\$SELECT CAST('zzz' AS r50_email)\$\$},
+    qq{CREATE AGGREGATE "$schema".max(r50_email) (SFUNC = "$schema".r50_zzz, STYPE = r50_email)},
+    qq{CREATE AGGREGATE "$schema".min(r50_email) (SFUNC = "$schema".r50_zzz, STYPE = r50_email)};
+my $dm = Selecto::Domain->parse({schema_version => 1, name => 'R50D', source => {source_table => 'r50_dm', primary_key => 'id',
+    tenant_field => 'org', fields => [qw(id org k tag)], columns => $cols->(id => 'integer', org => 'string', k => 'integer', tag => 'string'),
+    associations => {}}, schemas => {}, joins => {}});
+my $host = Selecto::Engine->new(domain => $dm->with_required_predicate($x->eq('tag', 'gold')),
+    adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+is($outcome->(sub { $ids->($host, $host->query->select('id')) }), "applied $want{eq}",
+    "a host required tag = 'gold' on a citext domain ignores a planted =(domain, domain) [$want{eq}]");
+like($host->adapter->_statement_sql($host->compile($host->query->select('id'))->sql), qr/CAST\(\("s0"\."tag"\) AS [^)]*citext\)\) OPERATOR\(/,
+    'the extension operator takes operands cast to the member type');
+my $de = Selecto::Engine->new(domain => $dm, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+is($outcome->(sub { join ',', @{$de->all($de->query->select($x->max('tag')->as('mx'), $x->min('tag')->as('mn')))->{rows}[0]} }),
+    "applied $want{max}", "citext max and min over a domain ignore a planted max/min(domain) [$want{max}]");
+$admin->do($_) for 'DROP TABLE r50_dm', 'DROP DOMAIN r50_email CASCADE';
+
+# Review MEDIUM: a CASE whose WHEN compares a citext column but whose result
+# is a text literal is not refused.
+$admin->do($_) for 'CREATE TABLE r50_tier (id INT PRIMARY KEY, org TEXT NOT NULL, tier ' . $ci . ')',
+    q{INSERT INTO r50_tier VALUES (1, 't1', 'Gold'), (2, 't1', 'silver'), (3, 't1', NULL)};
+my %tc = (id => {type => 'integer'}, org => {type => 'string'}, tier => {type => 'string'},
+    label => {type => 'string', computed => {kind => 'expression', expression => ['case', [['eq', 'tier', 'gold'], ['literal', 'G']], ['else', ['literal', 'O']]]}});
+my $td = Selecto::Domain->parse({schema_version => 1, name => 'R50T', source => {source_table => 'r50_tier', primary_key => 'id', tenant_field => 'org',
+    fields => [sort keys %tc], columns => \%tc, associations => {}}, schemas => {}, joins => {}});
+my $te = Selecto::Engine->new(domain => $td, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
+my $tw = $native->(q{SELECT id FROM r50_tier WHERE org = 't1' AND (CASE WHEN tier = 'gold' THEN 'G' ELSE 'O' END) = 'G'});
+is($outcome->(sub { $ids->($te, $te->query->select('id')->where($x->eq('label', 'G'))) }), "applied $tw",
+    "CASE WHEN tier = 'gold' THEN 'G' ELSE 'O' END = 'G' reads as natively [$tw]");
+$admin->do('DROP TABLE r50_tier');
+
+# Review LOW 7: a host function read from is schema-qualified.
+like($engine->adapter->_statement_sql($engine->compile($engine->query->function_lateral('r50_ci_tags', ['t1'], as => 'ft', columns => ['t'])
+    ->select('id'))->sql), qr/"public"\.r50_ci_tags\(|"[^"]+"\."?r50_ci_tags"?\(/, 'function_lateral names its function with its schema');
+
 # M4: a column altered text -> citext after a REPEATABLE READ host
 # transaction's snapshot: a host required note <> 'secret' is refused, typed
 # (read committed reads the current types).
@@ -152,6 +199,32 @@ for my $isolation ('REPEATABLE READ', 'READ COMMITTED') {
     $host->disconnect;
     is($got, $isolation eq 'READ COMMITTED' ? "applied $want" : 'query_rule_not_evaluable/catalog_changed',
         "$isolation: a column altered to citext after the snapshot " . ($isolation eq 'READ COMMITTED' ? 'reads as natively' : 'is refused, typed'));
+}
+
+# Review LOW 8: a row trigger that switches the session's role with
+# set_config('role', ..., false) refuses the write (CURRENT_USER is part of
+# the session snapshot).
+SKIP: {
+    my ($can) = $admin->selectrow_array(q{SELECT rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = CURRENT_USER});
+    skip 'roles cannot be created', 2 unless $can;
+    $admin->do($_) for 'DROP TABLE IF EXISTS r50_rw', q{DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'r50_switch') THEN CREATE ROLE r50_switch; END IF; END $$},
+        'GRANT r50_switch TO CURRENT_USER', 'CREATE TABLE r50_rw (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
+        q{INSERT INTO r50_rw VALUES (1, 't1', 'a')}, 'GRANT SELECT, UPDATE ON r50_rw TO r50_switch',
+        q{CREATE OR REPLACE FUNCTION r50_rw_sw() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.set_config('role', 'r50_switch', false); RETURN NEW; END $$},
+        'CREATE TRIGGER r50_rw_tr AFTER UPDATE ON r50_rw FOR EACH ROW EXECUTE FUNCTION r50_rw_sw()';
+    my $rw = Selecto::Domain->parse({schema_version => 1, name => 'R50W', source => {source_table => 'r50_rw', primary_key => 'id', tenant_field => 'org_key',
+        fields => [qw(id org_key note)], columns => $cols->(id => 'integer', org_key => 'string', note => 'string'), associations => {}},
+        schemas => {}, joins => {}, writes => {operations => {update => {enabled => 1}}, fields => {note => {updatable => 1}}}});
+    my $wh = $connect->();
+    my $we = Selecto::Engine->new(domain => $rw, adapter => Selecto->adapter(postgresql => (dbh => $wh)))->with_scope(tenant => 't1');
+    require Selecto::Write;
+    is($outcome->(sub { $we->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r50_rw',
+        assignments => {note => 'b'}, predicate => $x->eq('id', 1)))->affected_rows }), 'query_rule_violation/session_state_changed',
+        "a trigger's role switch refuses the write");
+    is(($wh->selectrow_array('SELECT CURRENT_USER'))[0], ($admin->selectrow_array('SELECT CURRENT_USER'))[0], 'and the role switch was rolled back');
+    $wh->disconnect;
+    $admin->do($_) for 'DROP TABLE r50_rw', 'DROP FUNCTION r50_rw_sw()';
+    $admin->do('DROP ROLE r50_switch') if eval { $admin->do('REVOKE r50_switch FROM CURRENT_USER'); 1 };
 }
 
 $admin->do($_) for 'DROP TABLE r50_r, r50_m, r50_ma, r50_rr CASCADE', 'DROP FUNCTION r50_ci_tags(text)';
