@@ -249,41 +249,81 @@ sub insert_admission_storage {
     $fail->() unless $relation && $relation->{relkind} eq 'r'
         && !$relation->{relispartition} && ($triggers_checked || !$relation->{triggers}) && !$relation->{rules}
         && !$relation->{inheritance};
+    # Each column's type, and its base type through any domain chain (a
+    # cast to the domain enforces its CHECK constraints, as PostgreSQL does
+    # natively), with whether that base is the citext extension's own type
+    # (a member of the citext extension in the extension's own schema).
     my $rows = $dbh->selectall_arrayref(q{
-        SELECT a.attname, t.typname, n.nspname AS type_schema,
+        WITH RECURSIVE b(att, oid, depth) AS (
+          SELECT a.attname, a.atttypid, 0 FROM pg_catalog.pg_attribute a
+          WHERE a.attrelid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid) AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+          UNION ALL
+          SELECT b.att, t.typbasetype, b.depth OPERATOR(pg_catalog.+) 1 FROM b JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) b.oid
+          WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND b.depth OPERATOR(pg_catalog.<) 16)
+        SELECT a.attname, t.typname, n.nspname AS type_schema, CAST(t.typtype AS pg_catalog.text) AS typtype,
           pg_catalog.format_type(a.atttypid,a.atttypmod) AS declaration,
-          a.attgenerated, col.collname, cn.nspname AS collation_schema
+          a.attgenerated, col.collname, cn.nspname AS collation_schema,
+          bt.typname AS base_name, bn.nspname AS base_schema, CAST(bt.typtype AS pg_catalog.text) AS base_typtype,
+          pg_catalog.format_type(bt.oid, CASE WHEN t.typtype OPERATOR(pg_catalog.=) 'd' THEN t.typtypmod ELSE a.atttypmod END) AS base_declaration,
+          CAST(EXISTS (SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e ON e.oid OPERATOR(pg_catalog.=) d.refobjid
+            WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.objid OPERATOR(pg_catalog.=) bt.oid
+              AND d.deptype OPERATOR(pg_catalog.=) 'e' AND e.extname OPERATOR(pg_catalog.=) CAST('citext' AS pg_catalog.name)
+              AND e.extnamespace OPERATOR(pg_catalog.=) bt.typnamespace) AS pg_catalog.int4) AS base_citext
         FROM pg_catalog.pg_attribute a
         JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) a.atttypid
         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) t.typnamespace
+        JOIN b ON b.att OPERATOR(pg_catalog.=) a.attname
+        JOIN pg_catalog.pg_type bt ON bt.oid OPERATOR(pg_catalog.=) b.oid AND bt.typtype OPERATOR(pg_catalog.<>) 'd'
+        JOIN pg_catalog.pg_namespace bn ON bn.oid OPERATOR(pg_catalog.=) bt.typnamespace
         LEFT JOIN pg_catalog.pg_collation col ON col.oid OPERATOR(pg_catalog.=) a.attcollation
         LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid OPERATOR(pg_catalog.=) col.collnamespace
         WHERE a.attrelid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid) AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
-    }, {Slice => {}}, $relation->{oid});
+    }, {Slice => {}}, $relation->{oid}, $relation->{oid});
     my %columns = map { $_->{attname} => $_ } @$rows;
     my %storage;
     for my $field (keys %$types) {
         my $column = $columns{$field};
-        $fail->() unless $column && $column->{type_schema} eq 'pg_catalog' && !$column->{attgenerated};
+        $fail->() unless $column && !$column->{attgenerated};
+        my $domain = $column->{typtype} eq 'd';
+        # A domain is cast to itself (qualified), its base checked below.
+        my $qualified = $self->quote_identifier($column->{type_schema}) . '.' . $self->quote_identifier($column->{typname});
+        my ($name, $declaration) = @{$column}{qw(base_name base_declaration)};
+        my $builtin = $column->{base_schema} eq 'pg_catalog' && $column->{base_typtype} eq 'b';
+        $fail->() unless $domain || $column->{type_schema} eq 'pg_catalog' || $column->{base_citext};
         my $type = $types->{$field};
-        my $name = $column->{typname};
-        my ($cast, $collation);
+        my ($cast, $collation, $profile);
         if ($type eq 'integer') {
-            $fail->() unless $name =~ /\A(?:int2|int4|int8)\z/;
-            $cast = {int2 => 'SMALLINT', int4 => 'INTEGER', int8 => 'BIGINT'}->{$name};
+            $fail->() unless $builtin && $name =~ /\A(?:int2|int4|int8)\z/;
+            $cast = $domain ? $qualified : {int2 => 'SMALLINT', int4 => 'INTEGER', int8 => 'BIGINT'}->{$name};
         } elsif ($type eq 'boolean') {
-            $fail->() unless $name eq 'bool'; $cast = 'BOOLEAN';
+            $fail->() unless $builtin && $name eq 'bool';
+            $cast = $domain ? $qualified : 'BOOLEAN';
         } elsif ($type eq 'decimal') {
-            $fail->() unless $name eq 'numeric' && $column->{declaration} =~ /\Anumeric(?:\(\d+,-?\d+\))?\z/;
+            $fail->() unless !$domain && $builtin && $name eq 'numeric' && $column->{declaration} =~ /\Anumeric(?:\(\d+,-?\d+\))?\z/;
             $cast = $column->{declaration};
+        } elsif ($type eq 'uuid') {
+            $fail->() unless $builtin && $name eq 'uuid';
+            $cast = $domain ? $qualified : 'pg_catalog.uuid';
+            $profile = 'uuid';
+        } elsif ($builtin && $name eq 'uuid') {
+            # uuid compares canonically; a candidate must already be in
+            # canonical text form (checked against the cast's output).
+            $cast = $domain ? $qualified : 'pg_catalog.uuid';
+            $profile = 'uuid';
         } else {
-            $fail->() unless $name =~ /\A(?:text|varchar)\z/
-                && $column->{declaration} =~ /\A(?:text|character varying(?:\(\d+\))?)\z/;
-            $cast = $column->{declaration};
+            if ($column->{base_citext}) {
+                # citext: compared with the extension's own operators (the
+                # qualifier types the cast and casts its operands, R50).
+                $cast = $qualified;
+            } else {
+                $fail->() unless $builtin && $name =~ /\A(?:text|varchar)\z/
+                    && $declaration =~ /\A(?:text|character varying(?:\(\d+\))?)\z/;
+                $cast = $domain ? $qualified : $column->{declaration};
+            }
             $fail->() unless defined($column->{collname}) && defined($column->{collation_schema});
             $collation = $self->quote_identifier($column->{collation_schema}) . '.' . $self->quote_identifier($column->{collname});
         }
-        $storage{$field} = {cast => $cast, defined($collation) ? (collation => $collation) : ()};
+        $storage{$field} = {cast => $cast, defined($collation) ? (collation => $collation) : (), defined($profile) ? (profile => $profile) : ()};
     }
     return \%storage;
 }
@@ -2245,18 +2285,73 @@ sub _pg_extension_operators {
         next unless $prev =~ /\A(?:FROM|JOIN|INTO|UPDATE|ONLY|\(|,)\z/;
         $rels{"$tokens->[$k][1].$tokens->[$k + 2][1]"} = 1;
     }
-    return {} unless %rels || %functions;
+    # Casts to a schema-qualified type outside pg_catalog (the guarded
+    # insert admission's CAST($n AS "public"."citext")): an extension type,
+    # or a domain over one, gives the cast its extension operators.
+    my %casts;
+    for my $k (0 .. $#$tokens - 4) {
+        next unless uc($tokens->[$k][1]) eq 'AS' && $tokens->[$k + 1][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 2][1] eq '.'
+            && $tokens->[$k + 3][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 4][1] eq ')';
+        my $schema = $name->($tokens->[$k + 1]);
+        next if $schema eq 'pg_catalog';
+        $casts{lc($schema) . '.' . $name->($tokens->[$k + 3])} = "$tokens->[$k + 1][1].$tokens->[$k + 3][1]";
+    }
+    return {} unless %rels || %functions || %casts;
     my @rels = sort keys %rels;
     my @functions = sort keys %functions;
     # Within one write (its statements run under the write's relation lock),
     # the same relations and functions are read once (review LOW 3).
     my $shared = $self->{_selecto_write_catalog};
     my $key = join("\0", @rels) . "\x1f" . join("\0", @functions) . "\x1f" . join("\0", sort keys %host)
-        . "\x1f" . join("\0", @{$self->{_selecto_qualify_declared} // []});
+        . "\x1f" . join("\0", @{$self->{_selecto_qualify_declared} // []}) . "\x1f" . join("\0", sort keys %casts);
     return $shared->{$key} if ref($shared) eq 'HASH' && $shared->{$key};
     my $result = $self->_pg_extension_lookup(\@rels, \@functions, \%host);
+    if (%casts && ref($result) eq 'HASH' && $result->{extension_types}) {
+        $result->{casts} = $self->_pg_cast_types(\%casts);
+        $result->{extension} = 1 if %{$result->{casts}};
+    }
     $shared->{$key} = $result if ref($shared) eq 'HASH';
     return $result;
+}
+
+# A cast target's extension type (through any domain chain): its own
+# operators (members of its extension, in its schema) and its qualified name
+# (R50 casts), keyed like Selecto::PostgreSQL::Qualify's cast lookup.
+my $CAST_TYPES_SQL = q{WITH RECURSIVE k(name, spelled) AS (
+      SELECT * FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[])))),
+    c(name, oid, depth) AS (
+      SELECT k.name, CAST(pg_catalog.to_regtype(k.spelled) AS pg_catalog.oid), 0 FROM k
+      UNION ALL
+      SELECT c.name, t.typbasetype, c.depth OPERATOR(pg_catalog.+) 1 FROM c JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.oid
+      WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND c.depth OPERATOR(pg_catalog.<) 16),
+    e AS (SELECT c.name, ty.oid, ty.typnamespace, d.refobjid FROM c
+      JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
+      JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
+        AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e')
+    SELECT 'typ', e.name, pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
+        pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), NULL
+    FROM e JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) e.oid
+    JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) ty.typnamespace
+    UNION ALL
+    SELECT 'op', e.name, CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
+    FROM e JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) e.oid AND o.oprright OPERATOR(pg_catalog.=) e.oid
+      AND o.oprnamespace OPERATOR(pg_catalog.=) e.typnamespace
+    JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
+      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace};
+sub _pg_cast_types {
+    my ($self, $casts) = @_;
+    my @keys = sort keys %$casts;
+    my $rows;
+    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($CAST_TYPES_SQL, undef, \@keys, [map { $casts->{$_} } @keys]); 1 };
+    die $self->normalize_error($@) unless $ok;
+    my %entries;
+    for my $row (@{$rows // []}) {
+        my ($kind, $key, $a, $b) = @$row;
+        if ($kind eq 'typ') { $entries{$key}{"\0type"} = $a }
+        else { $entries{$key}{$a} = '"' . ($b =~ s/"/""/gr) . '"' }
+    }
+    return \%entries;
 }
 
 sub _pg_extension_lookup {
@@ -2285,6 +2380,8 @@ sub _pg_extension_lookup {
     if (!$has_extension && defined($level) && $level eq 'read committed') {
         return {functions => {map { ($_ => {state => 'known'}) } @functions}, host_functions => \%host_functions, extension => 0};
     }
+    return {functions => {}, host_functions => \%host_functions, extension => 0, extension_types => $has_extension ? 1 : 0}
+        unless @rels || @functions;
     my $rows;
     $ok = eval { $rows = @functions ? $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@functions)
         : $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_NO_FUNCTIONS_SQL, undef, \@rels); 1 };
@@ -2328,7 +2425,8 @@ sub _pg_extension_lookup {
     }
     $self->_pg_verify_column_types(\%types) if %types && defined($isolation) && $isolation ne 'read committed';
 
-    return {relations => \%relations, functions => \%known, host_functions => \%host_functions, extension => $extension};
+    return {relations => \%relations, functions => \%known, host_functions => \%host_functions, extension => $extension,
+        extension_types => $has_extension ? 1 : 0};
 }
 
 # R49a: under REPEATABLE READ or SERIALIZABLE the catalog read above sees the

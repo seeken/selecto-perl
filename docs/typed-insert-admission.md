@@ -40,9 +40,30 @@ or text affinity. String comparison uses the actual BINARY, NOCASE, or RTRIM
 collation. Unsupported custom collations/types are refused. PostgreSQL requires
 a real DBD::Pg handle and ordinary nonpartitioned/noninherited table without
 user triggers or rewrite rules. Supported storage types are built-in integer,
-numeric (including declared precision/scale), text/varchar, and boolean; actual
-column collation is preserved. Custom/domain types, generated policy columns,
-and unsupported storage mismatches are refused.
+numeric (including declared precision/scale), text/varchar, boolean and uuid,
+the citext extension's own type (a member of the citext extension in the
+extension's schema), and domains over these (followed through the domain
+chain; except numeric). Actual column collation is preserved. A candidate is
+cast to the column's own type (a domain to itself, so its CHECK constraints
+apply as natively, and a violation is a typed `database_check_violation`). A
+citext column compares with citext's own operators, its operands cast to the
+member type (R50). A uuid candidate must be canonical text (lower-case,
+hyphenated) and readable as a uuid, else `query_rule_not_evaluable`; a domain
+field may also be declared `uuid`. Other custom types, generated policy
+columns, and unsupported storage mismatches are refused.
+
+The tenant column of a tenant-scoped insert or upsert is checked by the engine
+before any SQL: an explicit value must equal the trusted scope value exactly,
+else `tenant_mismatch` (a case variant such as `T1` for a citext tenant `t1`, or
+an upper-case uuid, is refused, as in Python; native citext equality does not
+admit it); an omitted value is filled from the scope. The storage check then
+compares the candidate with the column's own semantics, and the post-image
+re-read verifies the stored row.
+
+Threat model for this profile: in scope is a role with CREATE on a pinned
+schema (planted functions, operators and overloads) and session-state changes;
+out of scope are extension installers and owners, superusers, and concurrent
+DDL by table owners.
 
 PostgreSQL holds a table lock across metadata inspection and DML; SQLite's
 transaction keeps the inspected schema stable. A five-second database query

@@ -3461,11 +3461,25 @@ sub _typed_insert_admission_probe {
             # may be 0/1 or t/f and need not match canonical caller scalars.
             next if $candidate->{types}{$fields[$index]} eq 'boolean';
             Selecto::InsertAdmission::_value($candidate->{types}{$fields[$index]}, $row[$index + 1], $fields[$index]);
+            # A uuid candidate must already be its canonical text: what
+            # the cast stores (lower-case, hyphenated) is what was given.
+            my $given = $candidate->{values}{$fields[$index]};
+            Selecto::InsertAdmission::_not_evaluable($fields[$index])
+                if ($storage->{$fields[$index]}{profile} // '') eq 'uuid' && defined($given)
+                    && (!defined($row[$index + 1]) || "$row[$index + 1]" ne "$given");
         }
         1;
     };
+    # A candidate its storage type cannot read (invalid uuid text, say) is
+    # not a canonical typed scalar: refused, typed.
+    my $failure = $ok ? undef : $@;
+    my $state = $ok ? '' : (eval { $self->dbh->state } // '');
+    if (!$ok && $state eq '22P02') {
+        eval { $sth->finish } if $sth;
+        Selecto::InsertAdmission::_not_evaluable($fields[0] // '');
+    }
     # Normalize first: finish clears the handle's SQLSTATE.
-    my $error = $ok ? undef : $self->normalize_error($@);
+    my $error = $ok ? undef : $self->normalize_error($failure);
     eval { $sth->finish } if $sth;
     die $error unless $ok;
     $budget->check;
