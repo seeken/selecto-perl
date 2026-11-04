@@ -434,7 +434,7 @@ sub _atom {
             my $inner = _sequence_until_end($state, $tokens, $pos);
             $sql = "CASE $inner END";
         }
-    } elsif ($type eq 'id' && $up =~ /\A(?:CAST|EXISTS|ARRAY|ANY|ALL|SOME|EXTRACT|COALESCE|GREATEST|LEAST|ROW|TRIM|SUBSTRING|POSITION|OVERLAY|NULLIF)\z/
+    } elsif ($type eq 'id' && $up =~ /\A(?:CAST|EXISTS|ARRAY|ANY|ALL|SOME|EXTRACT|COALESCE|GREATEST|LEAST|ROW|TRIM|SUBSTRING|POSITION|OVERLAY|NULLIF|GROUPING)\z/
         && ($$pos + 1 < @$tokens) && ($tokens->[$$pos + 1][1] eq '(' || ($up eq 'ARRAY' && $tokens->[$$pos + 1][1] eq '['))) {
         if ($up eq 'NULLIF') {
             # NULLIF(a, b) resolves = through the session: CASE with an
@@ -458,9 +458,9 @@ sub _atom {
         _expect($tokens, $pos, $close);
         $sql = "$text$open$inner$close";
         # These return a type of their own (pg_catalog's, or the CAST
-        # target's); COALESCE, GREATEST, LEAST, ARRAY, ROW and the
+        # target's; GROUPING's is integer); COALESCE, GREATEST, LEAST, ARRAY, ROW and the
         # quantifiers take their arguments' type.
-        $known = 1 if $up =~ /\A(?:CAST|EXISTS|EXTRACT|TRIM|SUBSTRING|POSITION|OVERLAY)\z/;
+        $known = 1 if $up =~ /\A(?:CAST|EXISTS|EXTRACT|TRIM|SUBSTRING|POSITION|OVERLAY|GROUPING)\z/;
     } elsif ($type eq 'punct' && $text eq '(') {
         $$pos++;
         my $inner = _sequence($state, $tokens, $pos, ')');
