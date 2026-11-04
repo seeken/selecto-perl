@@ -30,7 +30,7 @@ sub prepare {
         _unsupported() unless exists($types->{$field}) && $field !~ /\./;
         my $type = lc($types->{$field} // '');
         $type = 'string' if $type eq 'text';
-        _unsupported() unless $type =~ /\A(?:integer|decimal|string|boolean)\z/;
+        _unsupported() unless $type =~ /\A(?:integer|decimal|string|boolean|uuid)\z/;
         _not_evaluable($field) unless exists $assignments->{$field};
         my $value = $assignments->{$field};
         if (blessed($value) && $value->isa('Selecto::Write::Expression')) {
@@ -91,6 +91,9 @@ sub _value {
         _not_evaluable($field) unless $text =~ /\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/;
     } elsif ($type eq 'boolean') {
         _not_evaluable($field) unless $text =~ /\A[01]\z/;
+    } elsif ($type eq 'uuid') {
+        # Canonical text only (lower-case, hyphenated), as stored.
+        _not_evaluable($field) unless $text =~ /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/;
     } elsif (looks_like_number($value)) {
         # Preserve the existing portable refusal of native/non-finite scalars.
         _not_evaluable($field) unless $text =~ /\A[ \t\r\n\f\x0b]*[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[ \t\r\n\f\x0b]*\z/;

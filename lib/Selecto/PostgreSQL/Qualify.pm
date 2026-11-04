@@ -461,6 +461,14 @@ sub _atom {
         # target's; GROUPING's is integer); COALESCE, GREATEST, LEAST, ARRAY, ROW and the
         # quantifiers take their arguments' type.
         $known = 1 if $up =~ /\A(?:CAST|EXISTS|EXTRACT|TRIM|SUBSTRING|POSITION|OVERLAY|GROUPING)\z/;
+        # A cast to an extension type (or a domain over one) has that type:
+        # its operators are the extension's (the guarded insert admission's
+        # CAST($n AS "public"."citext")).
+        if ($up eq 'CAST' && ref($state->{columns}{casts}) eq 'HASH' && $inner =~ /\bAS\s+(\S+)\s*\z/si) {
+            my @parts = map { $_->[0] eq 'qid' ? _unquote($_->[1]) : lc $_->[1] } grep { $_->[0] =~ /\A(?:id|qid)\z/ } @{tokenize($1)};
+            my $cast = @parts == 2 ? $state->{columns}{casts}{lc($parts[0]) . '.' . $parts[1]} : undef;
+            ($entry, $known) = ($cast, 0) if ref($cast) eq 'HASH' && $cast->{"\0type"};
+        }
     } elsif ($type eq 'punct' && $text eq '(') {
         $$pos++;
         my $inner = _sequence($state, $tokens, $pos, ')');

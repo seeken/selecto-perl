@@ -82,6 +82,7 @@ t/pg_review_round3_live.t
 t/pg_operator_qualification_live.t
 t/pg_extension_scope_live.t
 t/pg_extension_types_live.t
+t/pg_insert_storage_types_live.t
 t/pg_post_image_reread_live.t
 t/pg_qualify_grouping.t
 t/pg_session_state_live.t

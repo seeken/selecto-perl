@@ -1,6 +1,19 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL guarded inserts and upsert inserts on a uuid, citext,
+      domain-over-text, domain-over-citext or domain-over-uuid tenant column
+      are admitted (they were refused: "PostgreSQL cannot establish the
+      guarded insert storage contract"). The typed insert admission storage
+      profile adds uuid, the citext extension's own type and domains over
+      admitted base types (cast to the domain, so its CHECK constraints apply;
+      a violation is database_check_violation). A citext candidate compares
+      with citext's own operators, operands cast to the member type (R50); a
+      uuid candidate must be canonical text, else query_rule_not_evaluable
+      (also for text no uuid can be read from). A field may be declared uuid.
+      The tenant value still has to equal the trusted scope exactly
+      (tenant_mismatch for a case variant, as in Python); the post-image
+      re-read is unchanged.
     - Review R40c/R40d (MySQL family): the view passthrough proof reads
       VIEW_DEFINITION with a MySQL lexer (strings with backslash escapes and
       doubled quotes, backtick identifiers, /* */, -- and # comments), so a

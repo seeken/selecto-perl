@@ -93,10 +93,13 @@ for my $ddl (['CHAR(4)', 'CHAR(4)'], ['CHAR(4) COLLATE "C"', 'CHAR(4) COLLATE ut
     ["12 $ddl->[1] = 't1 '", @$ddl, 'string', $x->eq('org_key', 't1 '), 't1 ', 'refuse'];
 }
 # PostgreSQL domains (here over varchar(2) and numeric(10,0)) hide the
-# typmod from the declared name: storage admission refuses them, so neither
-# 't1 ' = 't1 ' (stored as 't1') nor 1.4 = 1.4 (stored as 1) is admitted.
+# typmod from the declared name. A domain over text or varchar is admitted:
+# the candidate is cast to the domain itself, typmod and CHECKs included, so
+# 't1 ' = 't1 ' (stored as 't1') is refused and the tenant's own 't1' admitted.
+# A domain over numeric stays refused, so 1.4 = 1.4 (stored as 1) is not
+# admitted.
 push @cases, ["13 domain over varchar(2) = 't1 '", 'selecto_v2_org_domain', 'n/a', 'string', $x->eq('org_key', 't1 '), 't1 ', 'refuse'],
-  ["13 domain over varchar(2) = own", 'selecto_v2_org_domain', 'n/a', 'string', $x->eq('org_key', 't1'), 't1', 'refuse'],
+  ["13 domain over varchar(2) = own", 'selecto_v2_org_domain', 'n/a', 'string', $x->eq('org_key', 't1'), 't1', 'apply'],
   ["13 domain over numeric(10,0) = 1.4", 'selecto_v2_amount_domain', 'n/a', 'decimal', $x->eq('org_key', '1.4'), '1.4', 'refuse'];
 push @cases, ["N integer = 10 '010'", 'INTEGER', 'INT', 'integer', $x->eq('org_key', 10), '010', 'apply'],
   ["N numeric = 10 '10.0'", 'NUMERIC', 'DECIMAL(10,2)', 'decimal', $x->eq('org_key', 10), '10.0', 'apply'],
