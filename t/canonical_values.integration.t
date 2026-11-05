@@ -53,7 +53,7 @@ my $table = 'selecto_perl_test_canonical';
 $dbh->do("DROP TABLE IF EXISTS $table");
 $dbh->do("CREATE TABLE $table (id integer primary key, grp text, n numeric, n4 numeric(12,4),
     n0 numeric(10,0), f4 real, f8 double precision, ts timestamp, tstz timestamptz, d date,
-    b boolean, i8 bigint)");
+    b boolean, i8 bigint) WITH (autovacuum_enabled = off)");
 
 my @numeric = ('0', '-0', '0.000', '1', '-1', '1.500', '10.500', '9.5', '100', '1000.000', '0.0001',
     '-0.0001000', '123456789012345678901234567890.123456789000', '0.00000000000000000001',
@@ -91,6 +91,10 @@ for my $id (1 .. $rows) {
         $pick->(\@timestamptz, 5), $pick->(\@date, 4), ($id % 3 == 0 ? undef : $id % 2 ? 1 : 0),
         ($id % 5 == 0 ? undef : $id * 1_000_000_007 - 31_000_000_000));
 }
+# Statistics are taken once, here: an autovacuum ANALYZE part-way through would
+# change the planner's group estimate, and with it the order in which a hashed
+# ROLLUP without ORDER BY returns its rows between two runs being compared.
+$dbh->do("ANALYZE $table");
 
 # real and double precision are declared float (not a portable type): only
 # decimal fields are formatted in SQL; see the declared-type subtest.

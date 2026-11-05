@@ -140,9 +140,18 @@ subtest 'R8: a deferred constraint trigger cannot change the session after the c
     $admin->do($_) for 'DROP TABLE r3d_w CASCADE', 'DROP FUNCTION r3d_f() CASCADE';
 };
 
+# citext in its own schema, off the search path, unless it is installed
+# already (then it is left alone).
+my ($r3k_ext, $ci);
+# Remove what this file installed even if it dies part-way, so a later
+# run never mistakes a leftover for a preinstalled extension.
+END { eval { $admin->do($_) for 'DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r3kext CASCADE' } if $r3k_ext }
 subtest 'R9: re-reads by (tableoid, ctid): a renumbering trigger cannot hide a moved row; keys of any type work' => sub {
+    $r3k_ext = !($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
+    $admin->do($_) for $r3k_ext ? ('CREATE SCHEMA IF NOT EXISTS r3kext', 'CREATE EXTENSION citext SCHEMA r3kext') : ();
+    $ci = qq{"$_".citext} for $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
     $admin->do($_) for 'DROP TABLE IF EXISTS r3k, r3k_p, r3k_q, r3k_c CASCADE', 'DROP FUNCTION IF EXISTS r3k_b() CASCADE',
-        'DROP FUNCTION IF EXISTS r3k_a() CASCADE', 'CREATE EXTENSION IF NOT EXISTS citext',
+        'DROP FUNCTION IF EXISTS r3k_a() CASCADE',
         'CREATE TABLE r3k (id INT PRIMARY KEY, org_key TEXT NOT NULL, name TEXT, note TEXT)', q{INSERT INTO r3k VALUES (1, 't1', 'x', 'n')},
         q{CREATE FUNCTION r3k_b() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
             IF NEW.note = 'move' THEN NEW.id := 99; NEW.org_key := 't2'; END IF; RETURN NEW; END $$},
@@ -156,7 +165,7 @@ subtest 'R9: re-reads by (tableoid, ctid): a renumbering trigger cannot hide a m
         q{INSERT INTO r3k_p VALUES (1, '2024-05-01', 't1', 'x', 'n')},
         'CREATE TABLE r3k_q (account_id INT, period DATE, org_key TEXT NOT NULL, name TEXT, note TEXT, PRIMARY KEY (account_id, period))',
         q{INSERT INTO r3k_q VALUES (1, '2024-01-01', 't1', 'x', 'n')},
-        'CREATE TABLE r3k_c (id citext PRIMARY KEY, org_key TEXT NOT NULL, name TEXT, note TEXT)', q{INSERT INTO r3k_c VALUES ('a', 't1', 'x', 'n')};
+        "CREATE TABLE r3k_c (id $ci PRIMARY KEY, org_key TEXT NOT NULL, name TEXT, note TEXT)", q{INSERT INTO r3k_c VALUES ('a', 't1', 'x', 'n')};
     my %columns = (org_key => 'string', name => 'string', note => 'string');
     my $update = sub {
         my ($table, $key, $types, $note) = @_;

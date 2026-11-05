@@ -85,10 +85,15 @@ for my $case (['r49_a', 'a1,a2'], ['r49_b', 'b1']) {
     is($outcome->(sub { $notes->($e) }), "applied $want", "prefix $prefix read with $other first on the host's current path");
 }
 
+my $drop_r49ext;
+# Remove what this file installed even if it dies part-way, so a later
+# run never mistakes a leftover for a preinstalled extension.
+END { eval { $admin->do($_) for 'DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r49ext CASCADE' } if $drop_r49ext }
 SKIP: {
     my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
     my $has = $preinstalled
         || eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r49ext'); $admin->do('CREATE EXTENSION citext SCHEMA r49ext'); 1 };
+    $drop_r49ext = $has && !$preinstalled;
     skip 'citext is not available', 31 unless $has;
     my ($schema) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
     my $citext = qq{"$schema".citext};
@@ -246,7 +251,6 @@ SKIP: {
     $admin->do($_) for 'DROP TABLE r49_hr, r49_hm, r49_hc';
     $admin->do($_) for 'DROP TABLE r49_deep16, r49_deep17, r49_it, r49_acc, r49_lk', 'DROP DOMAIN r49_d1 CASCADE';
     $admin->do($_) for 'DROP TABLE r49_acct, r49_root, r49_mem CASCADE', 'DROP DOMAIN r49_email';
-    $admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r49ext CASCADE');
 }
 $admin->do($_) for 'DROP SCHEMA r49_a CASCADE', 'DROP SCHEMA r49_b CASCADE';
 done_testing;
