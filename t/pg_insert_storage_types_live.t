@@ -30,6 +30,9 @@ $admin->do('SET client_min_messages TO warning');
 my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
 my $has = $preinstalled
     || eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r52ext'); $admin->do('CREATE EXTENSION citext SCHEMA r52ext'); 1 };
+# Remove what this file installed even if it dies part-way, so a later
+# run never mistakes a leftover for a preinstalled extension.
+END { eval { $admin->do($_) for 'DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r52ext CASCADE' } if $has && !$preinstalled }
 plan skip_all => 'citext is not available' unless $has;
 my ($schema) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
 my $ci = qq{"$schema".citext};
@@ -117,5 +120,4 @@ is($run->('uuid', 'string', 'not-a-uuid', 'own', 'insert', {id => 9, note => 'n'
 is($run->('uuid', 'string', uc $U1, 'own', 'insert', {id => 9, note => 'n'}), 'query_rule_not_evaluable', 'a non-canonical uuid tenant is refused, typed');
 is($stored->(), '', 'and nothing is stored');
 $admin->do($_) for 'DROP TABLE r52_t', map({ "DROP DOMAIN $_" } qw(r52_tdom r52_cidom r52_udom r52_short));
-$admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r52ext CASCADE');
 done_testing;

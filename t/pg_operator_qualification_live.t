@@ -45,6 +45,9 @@ my $outcome = sub {
 my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
 my $has_citext = $preinstalled
     || eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r47ext'); $admin->do('CREATE EXTENSION citext SCHEMA r47ext'); 1 };
+# Remove what this file installed even if it dies part-way, so a later
+# run never mistakes a leftover for a preinstalled extension.
+END { eval { $admin->do($_) for 'DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r47ext CASCADE' } if $has_citext && !$preinstalled }
 my $citext_schema = $has_citext ? ($admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'}))[0] : undef;
 my $ci_type = $has_citext ? qq{"$citext_schema".citext} : 'text';
 my @evil = (
@@ -237,5 +240,4 @@ ok(!%bad, 'no executed statement resolves an operator or function through the se
 }
 
 $admin->do($_) for 'DROP TABLE r47_items, r47_links, r47_accs, r47_tags CASCADE', 'DROP TYPE r47_en', 'DROP DOMAIN r47_dom';
-$admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r47ext CASCADE');
 done_testing;

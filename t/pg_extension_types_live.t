@@ -30,6 +30,9 @@ $admin->do('SET client_min_messages TO warning');
 my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
 my $has = $preinstalled
     || eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r50ext'); $admin->do('CREATE EXTENSION citext SCHEMA r50ext'); 1 };
+# Remove what this file installed even if it dies part-way, so a later
+# run never mistakes a leftover for a preinstalled extension.
+END { eval { $admin->do($_) for 'DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r50ext CASCADE' } if $has && !$preinstalled }
 plan skip_all => 'citext is not available' unless $has;
 my ($schema) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
 my $ci = qq{"$schema".citext};
@@ -407,5 +410,4 @@ SKIP: {
 }
 
 $admin->do($_) for 'DROP TABLE r50_r, r50_m, r50_ma, r50_rr CASCADE', 'DROP FUNCTION r50_ci_tags(text)';
-$admin->do($_) for $preinstalled ? () : ('DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r50ext CASCADE');
 done_testing;
