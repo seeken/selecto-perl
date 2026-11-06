@@ -71,7 +71,7 @@ sub request ($self, $engine, $request) {
         invalid_field => 'invalid_field', invalid_api_query => 'invalid_query',
         invalid_query => 'invalid_query', unsupported_feature => 'operation_unsupported',
         tenant_scope_required => 'operation_forbidden', missing_tenant_scope => 'operation_forbidden',
-        tenant_mismatch => 'operation_forbidden',
+        tenant_mismatch => 'operation_forbidden', query_rule_not_evaluable => 'invalid_query',
         query_timeout => 'query_timeout', result_limit_exceeded => 'invalid_query',
         api_result_limit_exceeded => 'invalid_query');
     $code = $map{$code} // $code;

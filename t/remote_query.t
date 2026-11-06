@@ -115,6 +115,20 @@ sub exercise {
         is $result->{error}{code}, $case->[3], "$case->[0] code";
         is_deeply $result->{error}{details}, {}, 'refusal has no trusted or native details';
     }
+    {
+        # A typed refusal at execution (an operator the qualifier refuses, say)
+        # is a 422, with no type or column in the public body.
+        no warnings 'redefine';
+        local *Selecto::API::RemoteQuery::query = sub {
+            Selecto::Error->throw('query_rule_not_evaluable', 'the operator < is not a member of its extension (type public.hstore, column h)',
+                {reason => 'operator_not_member', column => 'h'});
+        };
+        ($status, $result) = $call->($envelope->());
+        is $status, 422, 'an execution refusal is a 422, not a 500';
+        is $result->{error}{code}, 'invalid_query', 'mapped to invalid_query';
+        is_deeply $result->{error}{details}, {}, 'and carries no native details';
+        unlike(JSON::PP->new->canonical->encode($result), qr/hstore/, 'nor names the type');
+    }
     ($status) = $call->($envelope->(), 'text/plain'); is $status, 415, 'media type checked';
     for my $path ('/api/items', '/api/items/') {
         my $manifest = $host->request($engine, {method => 'GET', path => $path});
