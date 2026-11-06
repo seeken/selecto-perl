@@ -180,6 +180,13 @@ Selecto::PostgreSQL::StatementCache - opt-in per-connection statement handles
 
 =head1 DESCRIPTION
 
+B<Do not enable this on a database where untrusted roles can reach code that
+runs in the session.> A named statement can be replaced from plpgsql with
+DEALLOCATE and PREPARE, using the name in C<pg_prepared_statements>, and the
+replacement persists on the connection: a planted function reached from a view
+can make a cached tenant read return other tenants' rows. Selecto's guards do
+not use this cache and run unnamed; the business statement does not.
+
 Used by L<Selecto::PostgreSQL> when its C<statement_cache> attribute is
 true. Each distinct SQL text keeps one DBI statement handle per database
 handle (through C<prepare_cached>, with a private attribute that keeps these
