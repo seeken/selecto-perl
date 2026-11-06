@@ -2275,7 +2275,7 @@ sub _pg_extension_operators {
                     if $prev =~ /\A(?:FROM|JOIN|LATERAL|,)\z/ && ($j == $k || $j == $k + 2)
                     && !($bare && (Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1]) || $self->_pg_catalog_functions->{lc $tokens->[$k][1]}
                         || uc($tokens->[$k][1]) =~ /\A(?:CAST|EXISTS|ARRAY|ANY|ALL|SOME|EXTRACT|COALESCE|GREATEST|LEAST|ROW|TRIM|SUBSTRING|POSITION|OVERLAY|NULLIF)\z/))
-                    && !($j == $k + 2 && lc($name->($tokens->[$k])) eq 'pg_catalog');
+                    && !($j == $k + 2 && $name->($tokens->[$k]) eq 'pg_catalog');
             }
         }
         next unless $k + 2 <= $#$tokens && $tokens->[$k + 1][1] eq '.' && $tokens->[$k + 2][0] =~ /\A(?:id|qid)\z/;
@@ -2294,7 +2294,7 @@ sub _pg_extension_operators {
             && $tokens->[$k + 3][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 4][1] eq ')';
         my $schema = $name->($tokens->[$k + 1]);
         next if $schema eq 'pg_catalog';
-        $casts{lc($schema) . '.' . $name->($tokens->[$k + 3])} = "$tokens->[$k + 1][1].$tokens->[$k + 3][1]";
+        $casts{"$schema." . $name->($tokens->[$k + 3])} = "$tokens->[$k + 1][1].$tokens->[$k + 3][1]";
     }
     return {} unless %rels || %functions || %casts;
     my @rels = sort keys %rels;
@@ -2387,7 +2387,9 @@ sub _pg_extension_lookup {
         : $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_NO_FUNCTIONS_SQL, undef, \@rels); 1 };
     die $self->normalize_error($@) unless $ok;
     my (%relations, %types, %known, $isolation);
-    my $key = sub { lc join '.', map { s/\A"((?:[^"]|"")*)"\z/$1/r =~ s/""/"/gr } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $_[0] };
+    # Folded as PostgreSQL folds it: an unquoted part to lower case, a quoted
+    # part exact (R56). Column names come from the catalog, exact.
+    my $key = sub { join '.', map { /\A"((?:[^"]|"")*)"\z/ ? $1 =~ s/""/"/gr : lc } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $_[0] };
     my $quote = sub { '"' . ($_[0] =~ s/"/""/gr) . '"' };
     my $extension = 0;
     for my $row (@{$rows // []}) {
@@ -2404,7 +2406,7 @@ sub _pg_extension_lookup {
         }
         if ($kind eq 'fop') { $known{$column}{cols}[$rel - 1]{$a} = $quote->($b); next }
         my $columns = $relations{$key->($rel)} //= {};
-        my $entry = $columns->{lc $column} //= {};
+        my $entry = $columns->{$column} //= {};
         if ($kind eq 'col') { $types{$rel}{$column} = $a; next }
         # A domain chain deeper than the walk follows: its base type, and so
         # its operators, are unknown (review LOW).
