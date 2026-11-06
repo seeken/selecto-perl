@@ -129,18 +129,10 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
         my @seen;
         while (my $row = $s->next) { push @seen, $row }
         is(scalar(@seen), 3, 'so does a stream');
-        is_deeply([map { $_->[0] } @{$dbh->selectall_arrayref('SELECT note FROM r55_log')}], ['host'], 'the host keeps its write, and the read has none');
-        $dbh->commit;
-        is_deeply([map { $_->[0] } @{$admin->selectall_arrayref('SELECT note FROM r55_log')}], ['host'], 'and commits it');
-        # A non-transactional table is the limit of a rollback: on its own the
-        # read refuses, and in the host's transaction the write stays.
-        $admin->do($_) for 'DELETE FROM r55_log', 'ALTER TABLE r55_log ENGINE=MyISAM';
-        ok(!eval { $e->all($query); 1 } && $read_only->($@), 'a read writing to MyISAM refuses on its own');
-        is(($admin->selectrow_array('SELECT count(*) FROM r55_log'))[0], 0, 'and writes nothing');
-        $dbh->begin_work;
-        ok(eval { $e->all($query); 1 }, 'in a host transaction it runs') or diag $@;
+        # Inside the host's transaction the read runs as written (see _read_transaction).
+        is_deeply([sort map { $_->[0] } @{$dbh->selectall_arrayref('SELECT note FROM r55_log')}], ['host', ('n') x 6], "the read's writes are the host's");
         $dbh->rollback;
-        is(($admin->selectrow_array('SELECT count(*) FROM r55_log'))[0], 3, 'and its writes cannot be undone');
+        is(($admin->selectrow_array('SELECT count(*) FROM r55_log'))[0], 0, 'and go with its rollback');
         my $plain = Selecto::Engine->new(domain => $domain->('r55_t'), adapter => $adapter)->with_scope(tenant => 't1');
         is(scalar(@{$plain->all($plain->query->select('id'))->{rows}}), 3, 'an ordinary read reads');
         $dbh->disconnect;

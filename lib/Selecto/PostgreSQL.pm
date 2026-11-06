@@ -1917,9 +1917,17 @@ sub _guarded_read {
     # rollback also ends the read-only mode and the pin (R30). A read that locks
     # rows cannot be read-only, and in the host's transaction it keeps its
     # savepoint's work so its locks last until the host's commit.
+    # R66: the host's transaction must not lose by this. The rollback would release
+    # the read's table locks, and read-only mode set before the transaction's first
+    # snapshot would register it read-only (a SERIALIZABLE host's SSI stops), so
+    # _pg_hold_relations takes both before the savepoint. A hand-built statement
+    # names no relations to hold: there it runs as written, and keeps its work.
     my $locks = blessed($source) && $source->{_selecto_row_lock};
+    my $keep = $locks;
     my $savepoint;
     if ($scope eq 'host') {
+        $keep ||= _pg_hand_built($source);
+        $self->_pg_hold_relations($source) unless $keep;
         $savepoint = Selecto::SQL::_savepoint_name('selecto_read');
         eval { $self->_savepoint_command(create => $savepoint); 1 }
             or die $self->_transaction_control_error($@);
@@ -1931,7 +1939,7 @@ sub _guarded_read {
         {
             local $self->{_selecto_reset_operation} = {};
             $self->_pg_check_relations($source);
-            $pin = $self->_pg_pin_search_path(0, $source, read_only => !$locks);
+            $pin = $self->_pg_pin_search_path(0, $source, read_only => !$keep);
         }
         $before = $self->_pg_admit_session($source, read => 1);
         $result = $work->();
@@ -1944,7 +1952,7 @@ sub _guarded_read {
     my $changed = $ok && $before && !($after && $after->{snapshot} eq $before->{snapshot});
     my $finished = eval {
         if ($savepoint) {
-            $self->_savepoint_command(rollback => $savepoint) if !$ok || $changed || !$locks;
+            $self->_savepoint_command(rollback => $savepoint) if !$ok || $changed || !$keep;
             $self->_savepoint_command(release => $savepoint);
         } else {
             $self->{dbh}->rollback or die 'read transaction rollback failed';
@@ -1955,6 +1963,23 @@ sub _guarded_read {
     _session_changed() if $changed;
     die $error unless $ok;
     return $result;
+}
+
+# Inside the host's transaction, before a read's savepoint: the transaction's
+# first snapshot, and the table locks the read would have held to its end. LIMIT 0
+# runs nothing a view calls. A relation that fails here is the read's to report,
+# so a savepoint of its own keeps the failure from the host.
+sub _pg_hold_relations {
+    my ($self, $source) = @_;
+    my $relations = blessed($source) && $source->can('relations') ? $source->relations : undef;
+    my $dbh = $self->{dbh};
+    my $savepoint = Selecto::SQL::_savepoint_name('selecto_hold');
+    my @sql = ("SAVEPOINT $savepoint", (map { "SELECT 1 FROM $_ LIMIT 0" } @{$relations // []}), 'SELECT 1', "RELEASE SAVEPOINT $savepoint");
+    my $held = eval { local $dbh->{PrintError} = 0; defined($dbh->do(join '; ', @sql)) };
+    return if $held;
+    eval { local $dbh->{PrintError} = 0; $dbh->do("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint") }
+        or die $self->_transaction_control_error($@);
+    return;
 }
 
 # This transaction's virtual transaction id: setting-independent, and no
@@ -2858,11 +2883,19 @@ anything it cannot prove is its own; see L<Selecto::PostgreSQL::Stream>.
 A read is C<READ ONLY> and ends in C<ROLLBACK>, or in a rollback to its own
 savepoint inside the host's transaction, so a view using C<nextval> or an audit
 function refuses (C<query_error>, C<details.category> C<read_only_transaction>,
-SQLSTATE C<25006>). So does a hand-built statement that writes, given to
-C<execute_query> or C<stream_query>. A bounded stream ends each fetch that way
-inside a host transaction, and the host can write between fetches. A
-C<for_update> or C<for_share> read cannot be read only: it is not, and inside
-the host's transaction it keeps its savepoint's work, so its locks last.
+SQLSTATE C<25006>). A bounded stream ends each fetch that way inside a host
+transaction, and the host can write between fetches. A hand-built statement that
+writes, given to C<execute_query> or C<stream_query>, refuses the same way on its
+own. C<for_update> and C<for_share> reads cannot be read only: they are not, and
+inside the host's transaction they keep their savepoint's work, so their locks
+last. A hand-built statement inside the host's transaction also runs as written,
+because Selecto cannot name what it would have to keep locked.
+
+None of this weakens the host's transaction. Before the savepoint the read takes
+the transaction's first snapshot, so a C<SERIALIZABLE> host stays read-write to
+C<SSI>, and the table locks of the relations it names, so they last to the host's
+commit. That is one more round trip for a read inside a host transaction. Locks
+on tables reached only inside a function a view calls end with the read.
 
 =head1 SESSION STATE
 
