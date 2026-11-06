@@ -17,7 +17,7 @@ use TestPostgreSQL ();
 # snapshot and post-image statements are prepared afresh each time, and DBD::Pg
 # names a statement only on the second execution of one handle
 # (pg_switch_prepared), so they run unnamed. This pins that: if a guard ever
-# moves to a reused handle or the statement cache, it fails here.
+# moves to a reused handle, it fails here.
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
 my $x = 'Selecto::Expression';
@@ -34,10 +34,10 @@ my @fields = qw(id org note);
 my $domain = Selecto::Domain->parse({schema_version => 1, name => 'R63', source => {source_table => 'r63_t', primary_key => 'id', tenant_field => 'org',
     fields => \@fields, columns => {map { ($_ => {type => $_ eq 'id' ? 'integer' : 'string'}) } @fields}, associations => {}}, schemas => {}, joins => {},
     writes => {operations => {update => {enabled => 1, bulk => 1, expected_cardinality => 'many'}}, fields => {note => {updatable => 1}}}});
-for my $cache (0, 1) {
+{
     $admin->do('DELETE FROM r63_seen');
     my $dbh = TestPostgreSQL->connect;
-    my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh, statement_cache => $cache))->with_scope(tenant => 't1');
+    my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 't1');
     for my $i (1 .. 6) {
         $e->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r63_t', assignments => {note => "w$i"},
             predicate => $x->eq('id', 1), expected_count => undef));
@@ -46,8 +46,8 @@ for my $cache (0, 1) {
     my @names = (@{$admin->selectcol_arrayref('SELECT DISTINCT stmt FROM r63_seen')},
         @{$dbh->selectcol_arrayref('SELECT statement FROM pg_catalog.pg_prepared_statements')});
     my @guards = grep { !/\A(?:UPDATE public\.r63_t|SELECT "s0"\."id")/ } @names;
-    is_deeply(\@guards, [], "statement_cache $cache: no guard, snapshot or post-image statement is named");
-    is(scalar(@names), 0, 'and nothing at all is named by default') unless $cache;
+    is_deeply(\@guards, [], 'no guard, snapshot or post-image statement is named');
+    is(scalar(@names), 0, 'and nothing at all is');
 }
 
 done_testing;

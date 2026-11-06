@@ -1241,13 +1241,8 @@ sub execute_query {
     my ($self, $statement) = @_;
     my ($sth, $rows);
     my $ok = eval {
-        if ($self->_statement_cache_enabled) {
-            $sth = $self->_cached_execute($self->_query_transport_sql($statement), $statement->params,
-                'database query failed');
-        } else {
-            $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
-            $self->_execute_statement($sth, $statement->params);
-        }
+        $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
+        $self->_execute_statement($sth, $statement->params);
         my @types = $self->_column_types($sth);
         $rows = $sth->fetchall_arrayref;
         $self->_decode_rows($rows, \@types);
@@ -1317,11 +1312,6 @@ sub _query_transport_sql { return $_[0]->_statement_sql($_[1]->sql); }
 # writes, probes and re-reads). The default sends it unchanged.
 sub _statement_sql { return $_[1]; }
 sub _execute_statement { return $_[1]->execute(@{$_[2]}); }
-
-# Dialect hook: true when queries and writes reuse statement handles
-# (Selecto::PostgreSQL's opt-in statement_cache). The dialect then provides
-# _cached_execute(sql, params, failure), returning the executed handle.
-sub _statement_cache_enabled { return 0; }
 
 sub preview_write {
     my ($self, $command) = @_;
@@ -3570,14 +3560,10 @@ sub _execute_compiled_write_in_transaction {
     my @row_ids;
     my ($sth, $affected, %values);
     my $ok = eval {
-        if ($self->_statement_cache_enabled) {
-            $sth = $self->_cached_execute($self->_statement_sql($compiled->{sql}), $compiled->{params}, 'database write failed');
-        } else {
-            $sth = $self->{dbh}->prepare($self->_statement_sql($compiled->{sql}));
-            die _dbi_error($self->{dbh}, 'database prepare failed') unless $sth;
-            my $executed = $self->_execute_statement($sth, $compiled->{params});
-            die _dbi_error($sth, 'database write failed') unless defined $executed;
-        }
+        $sth = $self->{dbh}->prepare($self->_statement_sql($compiled->{sql}));
+        die _dbi_error($self->{dbh}, 'database prepare failed') unless $sth;
+        my $executed = $self->_execute_statement($sth, $compiled->{params});
+        die _dbi_error($sth, 'database write failed') unless defined $executed;
         if ($compiled->{row_ids}) {
             # Every row's (tableoid, ctid) follows the requested RETURNING
             # columns; the first row's leading columns are the values.

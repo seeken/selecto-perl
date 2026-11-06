@@ -10,11 +10,12 @@ Unreleased
       also part of the session check, so a change during a read is seen; a
       change made by planted code during a write's own statements is not
       re-read before that statement.
-    - PostgreSQL: Selecto's guard, snapshot and post-image statements run
-      unnamed, so session code cannot replace them with DEALLOCATE and PREPARE
-      (R63); a test pins this. The opt-in statement_cache names business
-      statements, which can be replaced that way: do not enable it where
-      untrusted roles can reach code that runs in the session.
+    - PostgreSQL: removed the statement_cache and statement_cache_size adapter
+      attributes and Selecto::PostgreSQL::StatementCache. Named statements can
+      be replaced with DEALLOCATE and PREPARE by code running in the session.
+      Every statement now runs unnamed, guards included, and a test pins that
+      (R63). An adapter still passing statement_cache gets a plain unnamed
+      statement per call: the attribute is ignored.
     - MySQL and MariaDB: execute_query takes driver_values => 1 for the values
       the driver fetched, undecoded, under the same session checks.
     - PostgreSQL bounded streams verify their cursor before every fetch (R64).

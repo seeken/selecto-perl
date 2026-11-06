@@ -323,8 +323,8 @@ subtest 'streams' => sub {
 
 subtest 'statement cache' => sub {
     my $cached = connect_db();
-    my $engine = engine_for($cached, canonical_values => 1, statement_cache => 1, canonical_sql => 1);
-    my $perl = engine_for($cached, canonical_values => 1, statement_cache => 1);
+    my $engine = engine_for($cached, canonical_values => 1, canonical_sql => 1);
+    my $perl = engine_for($cached, canonical_values => 1);
     for my $name (qw(all_columns grouped timezone)) {
         my $expected = $perl_engine->all($queries{$name})->{rows};
         same_rows($engine->all($queries{$name})->{rows}, $expected, "$name, run $_ (SQL)") for 1 .. 3;

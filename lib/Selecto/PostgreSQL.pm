@@ -8,7 +8,6 @@ use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
-use Selecto::PostgreSQL::StatementCache ();
 use Selecto::Statement ();
 
 has rollup_sort_fix => 'auto';
@@ -27,11 +26,9 @@ has canonical_sql => 0;
 # Each compiled statement's outermost SELECT list: see Canonical values in SQL.
 Hash::Util::FieldHash::fieldhash(my %PROJECTION);
 # Opt-in, off by default: see STATEMENT CACHE below.
-has statement_cache => 0;
 # The host declares that its own session TEMP relations may serve as domain
 # relations (R38); otherwise a relation found only in pg_temp is refused.
 has temporary_relations => 0;
-has statement_cache_size => 256;
 
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
@@ -1184,25 +1181,6 @@ sub _export_scalar {
     return ($value eq 't' || "$value" eq '1') ? JSON::PP::true : JSON::PP::false if $type eq 'bool';
     return $value if ref $value;
     return Mojo::JSON::from_json("$value");
-}
-
-sub _statement_cache_enabled {
-    my ($self) = @_;
-    return 0 unless $self->statement_cache;
-    my $size = $self->statement_cache_size;
-    Selecto::Error->throw('invalid_adapter', 'statement_cache_size must be a positive integer')
-        unless defined($size) && !ref($size) && "$size" =~ /\A[1-9]\d{0,5}\z/;
-    return 1;
-}
-
-sub _cached_execute {
-    my ($self, $sql, $params, $failure) = @_;
-    return Selecto::PostgreSQL::StatementCache->execute($self->{dbh}, $sql, $params,
-        size => 0 + $self->statement_cache_size,
-        execute => sub { return $self->_execute_statement(@_); },
-        normalize => sub { return $self->normalize_error($_[0]); },
-        failure => $failure,
-    );
 }
 
 # A raw BEGIN leaves AutoCommit on, but the server still reports the
@@ -2600,8 +2578,6 @@ Selecto::PostgreSQL - PostgreSQL adapter
       dbh              => $dbh,
       transaction_mode => 'external',  # see Selecto::SQL
       rollup_sort_fix  => 'auto',      # 'auto' (default), 1 or 0
-      statement_cache  => 1,           # opt-in, default 0; see below
-      statement_cache_size => 256,     # handles kept per connection
       canonical_values => 1,           # default 0: driver values; see RESULT VALUES
       canonical_sql    => 0,           # default 0: decode canonical values in Perl
   ));
@@ -2712,7 +2688,7 @@ C<timestamptz> (a date, timestamp or text type).
 The formatted statement is longer: PostgreSQL parses and plans each datetime
 column's formatter in roughly 30 to 50 microseconds, a date's or decimal's in
 about 10 to 20, every time the statement is prepared. That is paid on every
-call without the statement cache (see L</statement_cache>), and only once per
+call, and only once per
 connection and SQL text with it. Per row, C<TO_CHAR> costs PostgreSQL about
 0.2 (date) to 0.6 (timestamptz) microseconds.
 
@@ -2781,35 +2757,6 @@ C<0> (the default): every canonical value is decoded in Perl from the result
 types, and dates and timestamps follow the session C<DateStyle>. C<1>
 (opt-in): canonical decimal, date and timestamp fields are formatted by
 PostgreSQL, always in the ISO form (see L</Canonical values in SQL (opt-in)>).
-
-=head2 statement_cache
-
-Off (C<0>) by default, and then every query and write prepares a new DBI
-statement handle exactly as before: DBD::Pg sends it unnamed, so the server
-parses and plans each call.
-
-With C<< statement_cache => 1 >>, query execution (C<execute_query>, so
-C<all> and friends) and executed writes reuse one statement handle per
-distinct SQL text and database handle (L<Selecto::PostgreSQL::StatementCache>).
-DBD::Pg prepares a reused handle on the server as a named statement on its
-second execution, and later executions send only Bind/Execute. Streams,
-insert admission and bounded-write probes still prepare afresh. Results,
-types and errors are unchanged, including C<details.sqlstate>.
-
-The cache belongs to the database handle: it is kept in the handle's
-C<CachedKids> (under keys C<prepare_cached> never uses) and freed with it.
-It is keyed by the SQL text alone; parameter values are always bound. At
-most C<statement_cache_size> (default 256) handles are kept per connection,
-least recently used first out, and an evicted handle is deallocated. A
-statement the server lost (26000) or whose result type changed (0A000) is
-prepared again once outside a transaction; inside one the error stands, as
-it has aborted the transaction. After running C<DISCARD ALL> or
-C<DEALLOCATE ALL> yourself, call
-C<< Selecto::PostgreSQL::StatementCache->forget($dbh) >>.
-
-Leave it off behind a transaction-mode pooler: PgBouncer before 1.21 (or
-without C<max_prepared_statements>) cannot route named statements to the
-server connection that prepared them.
 
 =head1 ERRORS
 
