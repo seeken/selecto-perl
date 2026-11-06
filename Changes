@@ -1,6 +1,17 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: new adapter attribute schemas, the schemas the host's relations
+      live in. Root, reference guard, joined relation, column catalog and
+      post-image all resolve there and nowhere else, and they come first after
+      pg_catalog in the pinned search_path (R59).
+      Behaviour change with nothing declared: what a root refers to now resolves
+      in the root's schema, or refuses query_rule_not_evaluable with reason
+      relation_unresolved. A namesake earlier on the reset path used to serve a
+      reference guard, so public.parents could admit another tenant's parent for
+      app.children. A real cross-schema reference or join must now be declared
+      with schemas; a namesake ahead of the root's schema refuses
+      relation_ambiguous. A TEMP root keeps the reset path.
     - Reads no longer write (R55). What newly refuses: a read through a view or
       function that writes, such as a view using nextval or an audit function
       that inserts, and a hand-built statement that writes passed to

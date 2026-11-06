@@ -82,6 +82,10 @@ sub compile {
     # Schemas the host declared for the read (a tenant prefix): its explicit
     # choice, which the PostgreSQL session checks resolve under (R43).
     local $self->{_selecto_declared_sink} = $top ? {} : $self->{_selecto_declared_sink};
+    # What the read's references resolve beside (see PostgreSQL's _relation_sql).
+    local $self->{_selecto_root_relation} = $top && blessed($domain) && defined($domain->table)
+        ? {table => '' . $domain->table, (defined($domain->{_read_prefix}) ? (schema => '' . $domain->{_read_prefix}) : ())}
+        : $self->{_selecto_root_relation};
     my $statement = $self->_compile_query($domain, $query);
     if ($top && blessed($statement) && $statement->isa('Selecto::Statement')) {
         $statement->{_selecto_relations} = [sort keys %{$self->{_selecto_relation_sink}}];
@@ -3058,6 +3062,7 @@ sub _compile_write {
     # The relations the write's SQL names: its target and every reference
     # guard's parent (the session checks refuse temp shadows of them).
     local $self->{_selecto_relation_schemas} = {};
+    local $self->{_selecto_root_relation} = {table => '' . $command->relation};
     local $self->{_selecto_relation_sink} = {};
     my $compiled = $self->_compile_write_sql($command);
     $compiled->{relations} = [sort keys %{$self->{_selecto_relation_sink}}] if ref($compiled) eq 'HASH';

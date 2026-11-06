@@ -87,6 +87,7 @@ t/pg_guard_statements_unnamed_live.t
 t/pg_stream_cursor_replaced_live.t
 t/pg_stream_host_takeover_live.t
 t/pg_client_encoding_live.t
+t/pg_declared_schemas_live.t
 t/pg_keyword_functions_live.t
 t/pg_qualify_keyword_functions.t
 t/pg_extension_scope_live.t

@@ -28,6 +28,18 @@ Hash::Util::FieldHash::fieldhash(my %PROJECTION);
 # The host declares that its own session TEMP relations may serve as domain
 # relations (R38); otherwise a relation found only in pg_temp is refused.
 has temporary_relations => 0;
+# The schemas the host declares its relations live in, in order: every relation
+# resolves there and nowhere else. See Declared schemas below.
+has schemas => sub { [] };
+
+sub new {
+    my ($class, @args) = @_;
+    my $self = $class->SUPER::new(@args);
+    my $schemas = $self->schemas;
+    Selecto::Error->throw('invalid_adapter', 'schemas must be a list of schema names')
+        unless ref($schemas) eq 'ARRAY' && !grep { !defined($_) || ref($_) || !length($_) } @$schemas;
+    return $self;
+}
 
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
@@ -1518,9 +1530,10 @@ sub _pg_require_utf8 {
 }
 
 sub _pg_declared_schemas {
-    my ($source) = @_;
+    my ($self, $source) = @_;
     my $list = blessed($source) ? $source->{_selecto_declared_schemas} : ref($source) eq 'HASH' ? $source->{declared_schemas} : undef;
-    return ref($list) eq 'ARRAY' ? grep { defined && length } @$list : ();
+    my %seen;
+    return grep { defined && length && !$seen{$_}++ } @{$self->schemas}, ref($list) eq 'ARRAY' ? @$list : ();
 }
 
 sub _pg_check_relations {
@@ -1572,7 +1585,7 @@ sub _pg_check_relations {
     return unless @tables;
     local $self->{_selecto_relation_schemas} = {};
     # Declared (prefix) schemas first: the host's explicit choice (R43).
-    my @declared = _pg_declared_schemas($source);
+    my @declared = $self->_pg_declared_schemas($source);
     my %declared = map { ($_ => 1) } @declared;
     my @reset = (@declared, $self->_pg_reset_schemas);
     my $rows;
@@ -1621,7 +1634,15 @@ sub _relation_sql {
     # anything reaches the server.
     my $state = ref($cache) eq 'HASH' ? ($cache->{"\0state"} //= $self->_connection_state) : $self->_connection_state;
     return $plain unless $state =~ /\A(?:idle|intrans)\z/;
-    my @schemas = $self->_pg_reset_schemas;
+    # Declared schemas, in order, and nothing else. With none declared, the
+    # reset path for the root, and for what it refers to, the root's schema
+    # (R59): a namesake earlier on the path never serves a reference guard or a
+    # join. (A TEMP root has no schema of its own to hold them to.)
+    my @declared = @{$self->schemas};
+    my @schemas = @declared ? @declared : $self->_pg_reset_schemas;
+    my $root = $self->{_selecto_root_relation};
+    my $home = !@declared && ref($root) eq 'HASH' && $root->{table} ne "$table" ? $self->_pg_root_schema($root) : undef;
+    @schemas = ($home) if defined $home;
     my ($pinned, $temp, $current, $name);
     my $ok = eval {
         ($pinned, $temp, $current) = $self->{dbh}->selectrow_array($QUALIFY_SQL, undef, \@schemas, "$table", $plain);
@@ -1637,16 +1658,38 @@ sub _relation_sql {
     my $target = $pinned // ($self->temporary_relations ? $temp : undef);
     $refuse->('relation_unresolved', defined($temp)
         ? 'the relation exists only as a temporary relation of the session, which the adapter does not declare'
+        : @declared ? 'the relation is not in a declared schema'
+        : defined($home) ? "the relation is not in the root relation's schema; the adapter's schemas option declares others"
         : 'the relation is not in a schema of the reset search_path') unless defined $target;
     # R38: the host's current search_path must not name another non-temp
     # relation (pg_temp, searched first by the host's path, is not counted:
     # the qualified name never reaches it).
+    # A declared schema is the host's explicit choice: its search_path does not
+    # decide that (R43).
     $refuse->('relation_ambiguous', "the host's search_path resolves the relation differently from Selecto's pinned resolution")
-        if defined($current) && "$current" ne "$target" && !(defined($temp) && "$current" eq "$temp");
+        if !@declared && defined($current) && "$current" ne "$target" && !(defined($temp) && "$current" eq "$temp");
     $ok = eval { ($name) = $self->{dbh}->selectrow_array($NAME_SQL, undef, $target); 1 };
     die $self->normalize_error($@) unless $ok && defined $name;
     $cache->{$plain} = $name if ref($cache) eq 'HASH';
     return $name;
+}
+
+# The schema the compile's root relation resolves to: a tenant prefix, else
+# wherever the reset path finds it. Undef for a TEMP root.
+sub _pg_root_schema {
+    my ($self, $root) = @_;
+    return $root->{schema} if exists $root->{schema};
+    my $name = do { local $self->{_selecto_root_relation}; $self->_relation_sql(undef, $root->{table}) };
+    my ($schema, $temporary);
+    my $ok = eval {
+        ($schema, $temporary) = $self->{dbh}->selectrow_array('SELECT CAST(n.nspname AS pg_catalog.text), '
+            . "CAST(n.oid OPERATOR(pg_catalog.=) $TEMP_SCHEMA AS pg_catalog.int4) "
+            . 'FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace '
+            . 'WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)', undef, $name);
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+    return $root->{schema} = $temporary ? undef : $schema;
 }
 
 # R30, R35: Selecto pins search_path, and every setting that changes how
@@ -1669,7 +1712,7 @@ sub _pg_pin_search_path {
     my ($self, $session, $source, %options) = @_;
     my $local = $session ? 'false' : 'true';
     local $self->{_selecto_relation_schemas} = {};
-    my @declared = _pg_declared_schemas($source);
+    my @declared = $self->_pg_declared_schemas($source);
     my %seen;
     my @schemas = grep { !$seen{$_}++ } @declared, $self->_pg_reset_schemas;
     my $pinned = join(', ', 'pg_catalog', (map { _quote_path_schema($_) } @schemas), 'pg_temp');
@@ -1965,7 +2008,7 @@ sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
 sub _query_transport_sql {
     my ($self, $statement) = @_;
     return $statement->sql if _pg_hand_built($statement);
-    local $self->{_selecto_qualify_declared} = [_pg_declared_schemas($statement)];
+    local $self->{_selecto_qualify_declared} = [$self->_pg_declared_schemas($statement)];
     return $self->_statement_sql($statement->sql);
 }
 
@@ -2728,6 +2771,19 @@ are C<1> or C<0> and JSON columns are text.
 
 =head1 ATTRIBUTES
 
+=head2 schemas
+
+  Selecto->adapter(postgresql => (dbh => $dbh, schemas => ['app', 'shared']));
+
+The schemas the host's relations live in, in order. Every relation, root,
+reference guard, joined relation, column catalog and post-image alike, resolves
+in the first of them that has it, whatever the reset C<search_path> or the host's
+current one say, and refuses C<relation_unresolved> otherwise. They come first
+after C<pg_catalog> in the pinned C<search_path>. A tenant prefix on the engine
+still decides a read's own schema. Declare them to reach a schema the reset path
+does not name, and for a relation that refers across schemas: with nothing
+declared, a reference resolves only in the root's schema.
+
 =head2 rollup_sort_fix
 
 Selecto sorts rollup results so the grand total precedes the values of a
@@ -2842,7 +2898,10 @@ prefix or else the session's C<search_path> reset value
 current C<search_path>. A relation found in neither is refused
 (C<query_rule_not_evaluable>, reason C<relation_unresolved>); so is one
 found only in the session's temporary schema unless the adapter is built
-with C<< temporary_relations => 1 >>. A relation the host's current
+with C<< temporary_relations => 1 >>. What the root refers to, a reference
+guard's relation or a joined relation, resolves in the root's own schema or
+refuses the same way, never at whatever comes first on the path; the schemas
+attribute below declares more. A relation the host's current
 C<search_path> resolves to a different relation is refused (reason
 C<relation_ambiguous>), for compiled statements and a host's hand-built
 statements alike. Each Selecto statement runs with C<search_path>
