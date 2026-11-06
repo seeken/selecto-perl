@@ -1474,6 +1474,7 @@ sub _pg_reset_schemas {
     return @{$operation->{schemas}} if ref($operation) eq 'HASH' && $operation->{schemas};
     my $cache = $self->{_selecto_relation_schemas};
     return @{$cache->{"\0reset"}} if ref($cache) eq 'HASH' && $cache->{"\0reset"};
+    $self->_pg_require_utf8;
     my $dbh = $self->{dbh};
     my $inside = !$dbh->{AutoCommit} || $self->_connection_state eq 'intrans';
     my $savepoint = $inside ? Selecto::SQL::_savepoint_name('selecto_path') : undef;
@@ -1525,6 +1526,20 @@ sub _unquote_identifier {
 }
 
 # The schemas a compiled statement's read declared (a tenant prefix).
+# R65, first of all and in a statement of its own: the session must be UTF8
+# before Selecto sends anything else. Bound values are UTF-8, and PostgreSQL
+# itself can spin on a ROLLBACK TO that restores a non-ASCII search_path in a
+# session of another encoding, so nothing that opens a savepoint runs before
+# this. The server's own value is read, never the driver's belief; it reports
+# UNICODE as set.
+sub _pg_require_utf8 {
+    my ($self) = @_;
+    my ($encoding) = $self->{dbh}->selectrow_array(q{SELECT pg_catalog.current_setting('client_encoding')});
+    Selecto::Error->throw('query_rule_not_evaluable', "the session's client_encoding must be UTF8",
+        {reason => 'client_encoding'}) unless uc($encoding // '') =~ /\A(?:UTF8|UNICODE)\z/;
+    return;
+}
+
 sub _pg_declared_schemas {
     my ($source) = @_;
     my $list = blessed($source) ? $source->{_selecto_declared_schemas} : ref($source) eq 'HASH' ? $source->{declared_schemas} : undef;
@@ -1874,6 +1889,7 @@ sub _guarded_read {
     return $work->() if !$self->_pg_session_checked || $self->{_selecto_pg_read_guard};
     local $self->{_selecto_pg_read_guard} = 1;
     my $scope = $self->_read_guard_scope;
+    $self->_pg_require_utf8;
     # In the host's transaction the read runs under its own savepoint, with
     # search_path pinned for it locally (R30); a rollback to the savepoint
     # undoes the pin and anything the statement changed. On an idle
@@ -2071,7 +2087,13 @@ for my $method (qw(compile preview_write execute_write execute_batch execute_gra
     next if defined &{"Selecto::PostgreSQL::$method"};
     *{"Selecto::PostgreSQL::$method"} = sub {
         my ($self, @args) = @_;
-        return $self->_lint_scope(sub { $self->$inherited(@args) });
+        return $self->_lint_scope(sub {
+            # Before a write opens its transaction or savepoint (R65). A failed
+            # or busy connection is the write's own guard to refuse.
+            $self->_pg_require_utf8 if $method =~ /\Aexecute_/ && $self->_pg_session_checked
+                && $self->_connection_state =~ /\A(?:idle|intrans)\z/;
+            return $self->$inherited(@args);
+        });
     };
 }
 

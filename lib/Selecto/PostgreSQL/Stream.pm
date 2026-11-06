@@ -11,8 +11,9 @@ my $SERIAL = 0;
 # R64: session code run by anything else on the connection between fetches can
 # CLOSE this cursor and DECLARE another of the same name, read from pg_cursors.
 # Its statement and creation time identify it: no DECLARE can reproduce the
-# time. Each batch checks them before its FETCH.
-my $CURSOR_SQL = q{SELECT c.statement, CAST(c.creation_time AS pg_catalog.text) FROM pg_catalog.pg_cursors c }
+# time. Each batch checks them before its FETCH. The time is read as an epoch, so
+# a changed TimeZone is the session check's to report, not a replacement.
+my $CURSOR_SQL = q{SELECT c.statement, CAST(EXTRACT(EPOCH FROM c.creation_time) AS pg_catalog.text) FROM pg_catalog.pg_cursors c }
     . q{WHERE c.name OPERATOR(pg_catalog.=) CAST($1 AS pg_catalog.text)};
 
 sub new {
@@ -26,6 +27,7 @@ sub new {
     # Refuses a pending result, an aborted transaction or an unknown state
     # before anything is sent.
     my $scope = $adapter->_read_guard_scope;
+    $adapter->_pg_require_utf8 if $adapter->_pg_session_checked;
     # Chosen here and declared explicitly, so the cursor is identified by this
     # name and never by searching pg_cursors. Not guessable ahead of time; one
     # that is pre-declared fails the DECLARE, and the stream does not open.
@@ -107,13 +109,17 @@ sub next {
         # Before the FETCH: during it the portal is active and cannot be closed,
         # so nothing can replace it after this check. A replacement of another
         # width would also crash the driver's fetch (DBI's field count).
+        # Only a cursor of this name that differs is a replacement. No answer,
+        # or no such cursor, is the transaction's state, not a replacement: the
+        # FETCH then fails and _failure_origin says whose failure that is (the
+        # host may have rolled back, aborted or moved on). It is never ours to
+        # assume, because the cleanup would act on the host's transaction.
         if ($self->{cursor}) {
-            my @now = $self->{dbh}->selectrow_array($CURSOR_SQL, undef, $self->{name});
-            unless (@now && defined($now[1]) && $now[0] eq $self->{cursor}[0] && $now[1] eq $self->{cursor}[1]) {
-                $self->{cursor_replaced} = 1;
-                Selecto::Error->throw('query_rule_not_evaluable', "the stream's cursor was replaced while it was open",
-                    {reason => 'stream_cursor_replaced'});
-            }
+            my @now = eval { local $self->{dbh}{RaiseError} = 1; local $self->{dbh}{PrintError} = 0;
+                $self->{dbh}->selectrow_array($CURSOR_SQL, undef, $self->{name}) };
+            Selecto::Error->throw('query_rule_not_evaluable', "the stream's cursor was replaced while it was open",
+                {reason => 'stream_cursor_replaced'})
+                if @now && defined($now[1]) && !($now[0] eq $self->{cursor}[0] && $now[1] eq $self->{cursor}[1]);
         }
         defined($sth->execute) or die 'cursor fetch failed';
         $self->{types} //= [$self->{adapter}->_column_types($sth)];
@@ -138,7 +144,7 @@ sub next {
         my $error = $self->{adapter}->normalize_error($@);
         # A changed session is the stream's own work to undo: its savepoint
         # or its own transaction is rolled back, which reverts the change.
-        my $origin = $self->{session_changed} || $self->{cursor_replaced} ? 'own' : $self->_failure_origin;
+        my $origin = $self->{session_changed} ? 'own' : $self->_failure_origin;
         $error = eval { Selecto::PostgreSQL::_session_changed(); 1 } ? $error : $@ if $self->{session_changed};
         my $cleanup = eval { $self->_close($origin); 1 } ? undef : $@;
         die _cleanup_error($cleanup) // $error;
