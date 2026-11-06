@@ -2865,6 +2865,9 @@ sub execute_query {
     my $state = $self->_require_session;
     $self->_refuse_read_temporary_shadows($statement);
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
+    # driver_values: the values DBD::MariaDB fetched, undecoded, under the same
+    # session checks.
+    local $self->{_selecto_driver_values} = $options{driver_values} ? 1 : 0;
     my $result = $self->SUPER::execute_query($statement);
     # A view's stored function can SET time_zone or sql_mode mid-statement;
     # the rows it shaped are discarded and the read refused.
@@ -2875,6 +2878,7 @@ sub execute_query {
 sub _decode {
     my ($self, $value, $type) = @_;
     return undef unless defined $value;
+    return $value if $self->{_selecto_driver_values};
     $type = uc($type // '');
     if ($self->{_selecto_export_scalars}) {
         return "$value" if $type =~ /\A(?:DECIMAL|NUMERIC)\z/;
