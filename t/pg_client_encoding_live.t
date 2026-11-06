@@ -93,6 +93,28 @@ is($admin->selectrow_array(q{SELECT count(*) FROM r65_t WHERE note = 'W'}), 0, '
     $dbh->disconnect;
 }
 
+# The check comes first, before any savepoint: a ROLLBACK TO restoring a non-ASCII
+# search_path in a non-UTF8 session makes PostgreSQL itself spin.
+{
+    $admin->do('CREATE SCHEMA IF NOT EXISTS "r65_é"');
+    my $dbh = TestPostgreSQL->connect;
+    $dbh->do('SET statement_timeout = 5000');
+    my $e = Selecto::Engine->new(domain => $domain->('r65_t'), adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 'cafe');
+    my $q = $e->query->select('id');
+    $dbh->do('SET search_path = "r65_é", public');
+    $dbh->do(q{SET client_encoding = 'LATIN1'});
+    ok($refused->(sub { $e->all($q) }), 'a read in autocommit refuses, typed');
+    $dbh->begin_work;
+    ok($refused->(sub { $e->all($q) }), 'a read in a host transaction refuses, typed');
+    ok($refused->(sub { $e->stream($q, bounded => 1) }), 'a bounded stream too');
+    ok($refused->(sub { $e->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r65_t', assignments => {note => 'W'},
+        predicate => $x->gt('id', 0), expected_count => undef)) }), 'a write too');
+    is(($dbh->selectrow_array('SELECT 1'))[0], 1, 'and the host transaction is untouched');
+    $dbh->rollback;
+    $dbh->disconnect;
+    $admin->do('DROP SCHEMA "r65_é"');
+}
+
 # A change made during the statement is seen by the session check.
 {
     my $dbh = TestPostgreSQL->connect;
