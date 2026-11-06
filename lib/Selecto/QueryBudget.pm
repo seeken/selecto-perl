@@ -160,9 +160,13 @@ sub begin {
             my $value = $name eq 'mysql' ? 0 + $ms : $ms / 1000;
             $value = 0 + $prior if $prior > 0 && $prior < $value;
             my $literal = sub { return $name eq 'mysql' ? sprintf('%d', $_[0]) : sprintf('%.6f', $_[0]); };
+            # A KILL QUERY can land here as on anything else: tried again, not left in force.
             $self->{restore} = sub {
-                defined($dbh->do('SET SESSION ' . $setting . ' = ' . $literal->($prior)))
-                    or die 'query timeout restoration failed';
+                for my $attempt (1 .. 5) {
+                    return if eval { local $dbh->{PrintError} = 0; defined($dbh->do('SET SESSION ' . $setting . ' = ' . $literal->($prior))) };
+                    select(undef, undef, undef, 0.01);
+                }
+                die 'query timeout restoration failed';
             };
             defined($dbh->do('SET SESSION ' . $setting . ' = ' . $literal->($value)))
                 or die 'query timeout configuration failed';
@@ -177,7 +181,13 @@ sub begin {
         1;
     };
     if (!$ok) {
+        my $cause = $@;
+        # MySQL family: a statement killed here is cancelled, as anywhere, and a
+        # host's exception is the host's.
+        my $typed = $name =~ /\A(?:mysql|mariadb)\z/ ? eval { $adapter->normalize_error($cause) } : undef;
         eval { $self->close };
+        die $typed if defined($typed) && (!blessed($typed)
+            || (blessed($typed) && $typed->can('details') && ($typed->details->{category} // '') eq 'query_canceled'));
         Selecto::Error->throw('query_budget_unavailable', 'database query deadline could not be configured');
     }
     return $self;

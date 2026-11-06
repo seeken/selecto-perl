@@ -115,8 +115,10 @@ sub next {
         # host may have rolled back, aborted or moved on). It is never ours to
         # assume, because the cleanup would act on the host's transaction.
         if ($self->{cursor}) {
-            my @now = eval { local $self->{dbh}{RaiseError} = 1; local $self->{dbh}{PrintError} = 0;
-                $self->{dbh}->selectrow_array($CURSOR_SQL, undef, $self->{name}) };
+            # (An error here is the same: it fails this batch, as the FETCH would.)
+            my @now;
+            eval { local $self->{dbh}{RaiseError} = 1; local $self->{dbh}{PrintError} = 0;
+                @now = $self->{dbh}->selectrow_array($CURSOR_SQL, undef, $self->{name}); 1 } or die $@;
             Selecto::Error->throw('query_rule_not_evaluable', "the stream's cursor was replaced while it was open",
                 {reason => 'stream_cursor_replaced'})
                 if @now && defined($now[1]) && !($now[0] eq $self->{cursor}[0] && $now[1] eq $self->{cursor}[1]);

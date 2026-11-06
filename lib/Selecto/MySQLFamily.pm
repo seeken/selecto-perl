@@ -88,10 +88,14 @@ sub _server_version {
     my $dbh = $self->{dbh};
     return $self->{_selecto_server_version}
         if $self->{_selecto_server_version} && ($self->{_selecto_server_dbh} // 0) == ($dbh // 0);
-    my ($text) = eval {
+    my $text;
+    my $ok = eval {
         local $dbh->{PrintError} = 0;
-        $dbh->selectrow_array($self->_statement_sql('SELECT VERSION()'));
+        ($text) = $dbh->selectrow_array($self->_statement_sql('SELECT VERSION()'));
+        1;
     };
+    # Not knowing is not the same as an old server, least of all kept for later.
+    die $self->normalize_error($@) if !$ok && eval { $dbh->isa('DBI::db') };
     my @version = defined($text) && "$text" =~ /\A(\d+)\.(\d+)\.(\d+)/ ? ($1, $2, $3) : ();
     my $mariadb = defined($text) && "$text" =~ /mariadb/i ? 1 : 0;
     @version = () if @version && $mariadb != ($self->name eq 'mariadb' ? 1 : 0);
@@ -1140,8 +1144,15 @@ sub _view_column_sources {
     if ($self->name eq 'mysql') {
         # MySQL 8.0.13+ records the relations a view reads: they must be
         # exactly the FROM list's.
-        my $rows = eval { $dbh->selectall_arrayref($self->_statement_sql(q{SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.VIEW_TABLE_USAGE
-            WHERE VIEW_SCHEMA = DATABASE() AND } . ($sensitive ? 'BINARY VIEW_NAME = BINARY ?' : 'VIEW_NAME = ?')), undef, "$table") };
+        my $rows;
+        my $read = eval { $rows = $dbh->selectall_arrayref($self->_statement_sql(q{SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.VIEW_TABLE_USAGE
+            WHERE VIEW_SCHEMA = DATABASE() AND } . ($sensitive ? 'BINARY VIEW_NAME = BINARY ?' : 'VIEW_NAME = ?')), undef, "$table"); 1 };
+        unless ($read) {
+            # (Only a server without the table has no answer; anything else is a failure.)
+            my $cause = $@;
+            return $none if (eval { $dbh->err } // '') eq '1109';
+            die $self->normalize_error($cause);
+        }
         return $none unless $rows;
         my %used = map { (($_->[0] // '') eq ($database // '') ? $self->_table_key($_->[1]) : "\0" . ($_->[1] // '')) => 1 } @$rows;
         my %listed = map { ($self->_table_key($_) => 1) } keys %tables;
@@ -1533,6 +1544,15 @@ sub normalize_error {
     my $errstr = eval { blessed($dbh) && $dbh->can('errstr') ? $dbh->errstr : undef };
     my $errno = defined($errstr) && length($errstr) && index($text, $errstr) >= 0
         ? eval { $dbh->err } : undef;
+    # (The handle's error can be gone by now: the text is what is left.)
+    $errno //= 1317 if $text =~ /\bQuery execution was interrupted\b/;
+    # Not the database's: an exception that passed through, a host's alarm say. An
+    # unsafe signal handler's dies inside the driver with a reply unread, whichever
+    # statement it was, and this is where every failure comes.
+    if (!defined($errno) && !blessed($error) && eval { $dbh->isa('DBI::db') } && $text !~ /\bDBD::|\bDBI\b|database/) {
+        $self->_close_session('the connection lost its place') if eval { $dbh->{Active} } && !$self->_in_step;
+        return $error;
+    }
     return $self->SUPER::normalize_error($error) unless defined($errno) && "$errno" =~ /\A\d+\z/;
     if ($errno == 1062) {
         return Selecto::Error->new(code => 'database_unique_violation',
@@ -1579,7 +1599,7 @@ sub normalize_error {
     }
     # max_execution_time (MySQL) and max_statement_time (MariaDB): PostgreSQL's
     # 57014. The category outlives the read's rollback, which clears the handle.
-    if ($errno == 3024 || $errno == 1969) {
+    if ($errno == 3024 || $errno == 1969 || $errno == 1317) {
         return Selecto::Error->new(code => 'query_error', message => 'Execution failed',
             details => {cause => 'database_error', category => 'query_canceled'});
     }
@@ -2285,22 +2305,20 @@ sub _execute_upsert {
     # takes the key's record lock directly; a loser waits for the winner and
     # gets 1062.
     my $savepoint = Selecto::SQL::_savepoint_name('selecto_upsert');
-    $self->_savepoint_command(create => $savepoint);
+    eval { $self->_savepoint_command(create => $savepoint); 1 }
+        or die $self->_transaction_control_error($@);
     my $inserted = eval { $result = $run->($insert); 1 };
     my $error = $@;
     if ($inserted) {
-        $self->_savepoint_command(release => $savepoint);
+        eval { $self->_savepoint_command(release => $savepoint); 1 }
+            or die $self->_transaction_control_error($@);
         return $done->();
     }
     # A deadlock victim's whole transaction is already rolled back, its
     # savepoint with it: the failed ROLLBACK TO (1305) must not replace the
     # typed retryable error. Any other failure to restore the savepoint also
     # ends the upsert with its original error.
-    my $restored = eval {
-        $self->_savepoint_command(rollback => $savepoint);
-        $self->_savepoint_command(release => $savepoint);
-        1;
-    };
+    my $restored = $self->_undo_savepoint($savepoint, $error);
     die $error unless $restored && blessed($error) && $error->isa('Selecto::Error')
         && $error->code eq 'database_unique_violation' && !$null;
     # As PostgreSQL's arbiter index does, the declared target alone decides
@@ -2893,38 +2911,76 @@ sub execute_query {
 # cannot be read only, and rolling back to one takes more than the read's writes
 # with it: the transaction's snapshot and shared locks when the read was its first
 # InnoDB access, and the metadata locks that keep its tables from DDL until it ends.
-# A hand-built statement inside the host's transaction has nothing to stop a write,
-# and its text cannot prove it makes none: it refuses (see _admit_hand_built).
+# A hand-built statement there has nothing to stop a write, so one whose text says it
+# writes refuses; a read runs as written (a function it calls is the host's, as a view's is).
 sub _read_transaction {
     my ($self, $statement, $work) = @_;
     my $dbh = $self->{dbh};
     $self->_admit_hand_built($statement);
     unless ($dbh->{AutoCommit}) {
-        Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement cannot be proved a read inside a host transaction here',
-            {reason => 'hand_built_in_host_transaction'}) if Selecto::SQL::_hand_built($statement);
+        $self->_refuse_hand_built_write($statement);
         return $work->();
     }
-    my $begun = eval {
-        local $dbh->{PrintError} = 0;
-        for my $sql ('SET TRANSACTION READ ONLY', 'SET autocommit = 0') {
-            defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
+    my ($value, $ok, $error, $finished);
+    # A host's alarm can die anywhere in here, between one statement and the next:
+    # whatever it interrupts, the finish still runs and its error still stands.
+    my $whole = eval {
+        my $begun = eval {
+            local $dbh->{PrintError} = 0;
+            for my $sql ('SET TRANSACTION READ ONLY', 'SET autocommit = 0') {
+                defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
+            }
+            1;
+        };
+        if ($begun) {
+            $ok = eval { $value = $work->(); 1 };
+            $error = $@ unless $ok;
+        } else {
+            # SET TRANSACTION lasts until a transaction ends, which a plain statement
+            # that touches no table does not do; and which step failed is not known.
+            $error = $self->_transaction_control_error($@);
         }
+        $finished = !$ok && $self->_foreign_failure($error) ? $self->_close_session('the read was interrupted') : $self->_finish_read;
         1;
     };
-    unless ($begun) {
-        # SET TRANSACTION lasts until a transaction ends, which a plain statement
-        # that touches no table does not do; and which step failed is not known.
-        my $failure = $self->_transaction_control_error($@);
-        $self->_finish_read;
-        die $failure;
+    unless ($whole) {
+        ($ok, $error) = (0, $error // $@);
+        $finished = $self->_close_session('the read was interrupted');
     }
-    my $value;
-    my $ok = eval { $value = $work->(); 1 };
-    my $error = $@;
-    my $finished = $self->_finish_read;
-    die $error unless $ok;
+    die($finished eq '1' ? $error : $self->_undo_failed($error)) unless $ok;
     die $finished unless $finished eq '1';
     return $value;
+}
+
+# A failure the database did not report: a host's alarm or an exception that may
+# have left the driver's call part way through. A reply still on the wire would
+# answer the host's next INSERT, which reports success for a row never stored, and
+# a half-read one can hang the next statement, so nothing more is sent on it: the
+# connection is closed, which also ends the read. Inside the host's transaction the
+# read has opened nothing of its own, and the connection stays the host's.
+sub _foreign_failure {
+    my ($self, $error) = @_;
+    return eval { $self->{dbh}->err } ? 0 : 1 unless blessed($error) && $error->isa('Selecto::Error');
+    return 0 unless $error->code eq 'query_error' && !grep { defined $error->details->{$_} } qw(sqlstate category);
+    # (The server's own answer leaves its number on the handle: it is in step.)
+    return eval { $self->{dbh}->err } ? 0 : 1;
+}
+
+# Whether the next reply on the connection is the answer to the next statement. A
+# reply left unread would otherwise answer the host's next INSERT, which then
+# reports success for a row that was never stored. (A KILL QUERY landing here says
+# nothing either way, so it is asked again.)
+sub _in_step {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return 1 unless eval { $dbh->isa('DBI::db') };
+    my $mark = sprintf('selecto_step_%d_%d', $$, int(rand(1e9)));
+    for my $attempt (1 .. $CONTROL_ATTEMPTS) {
+        my ($answer) = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->selectrow_array("SELECT '$mark'") };
+        return 1 if defined($answer) && $answer eq $mark;
+        return 0 unless (eval { $dbh->err } // 0) eq '1317';
+    }
+    return 0;
 }
 
 # INTO writes a file or a user variable, := a variable, and a conditional comment
@@ -2938,11 +2994,16 @@ sub _hand_built_refusal {
 # A read may end up READ ONLY or with autocommit off only by accident, and a host
 # whose next write is refused, or never commits, is worse off than one with no
 # connection. So what puts the session back is retried (a KILL QUERY can land on
-# it), and a session that cannot be put back is closed. Returns 1, or the error.
+# it), and a session that cannot be put back is closed. A killed ROLLBACK can leave
+# the one-shot READ ONLY armed where no variable shows it, so a retry is the only
+# proof. Returns 1, or the error.
 sub _finish_read {
     my ($self) = @_;
-    return 1 if $self->_retry_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_retry_control('SET autocommit = 1');
-    return $self->_close_session('the read could not be ended');
+    local $self->{_selecto_control_retried} = 0;
+    return $self->_close_session('the read could not be ended')
+        unless $self->_retry_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_retry_control('SET autocommit = 1');
+    return $self->_close_session('the connection lost its place') if $self->{_selecto_control_retried} && !$self->_in_step;
+    return 1;
 }
 
 sub _retry_control {
@@ -2950,6 +3011,7 @@ sub _retry_control {
     my $dbh = $self->{dbh};
     for my $attempt (1 .. $CONTROL_ATTEMPTS) {
         return 1 if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; defined($dbh->do($sql)) };
+        $self->{_selecto_control_retried} = 1;
         select(undef, undef, undef, 0.01);
     }
     return 0;
@@ -2961,6 +3023,29 @@ sub _close_session {
     eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
     return Selecto::Error->new(code => 'transaction_state_unsafe', message => "$message: the connection was closed",
         details => {state => 'unknown', reason => 'session_not_restored', %details});
+}
+
+# A deadlock rolled the whole transaction back: its savepoint is gone with it.
+sub _savepoint_gone {
+    my ($self, $cause) = @_;
+    return blessed($cause) && $cause->isa('Selecto::Error') && $cause->code eq 'database_deadlock_detected' ? 1 : 0;
+}
+
+# begin_work sends SET autocommit = 0, which can fail like anything else, and leaves
+# nothing for a rollback to end. Whether it took is not known from here, and a host
+# whose autocommit went quietly off loses its next write at close: so it is put back,
+# with retries, or the connection is closed. The failure stands either way.
+sub _begin_transaction {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return if eval { $self->SUPER::_begin_transaction; 1 };
+    my $cause = $@;
+    my $failure = $self->normalize_error(eval { $dbh->err } ? ($dbh->errstr // $cause) : $cause);
+    $self->_close_session('the write was interrupted') if $self->_foreign_failure($failure);
+    $self->_close_session('the write could not begin') unless !eval { $dbh->{Active} }
+        || ($self->_retry_control('SET autocommit = 1') && $self->_leave_transaction);
+    die $self->_undo_failed($failure) unless eval { $dbh->{Active} };
+    die $failure;
 }
 
 # Selecto's own transactions end the same way. The driver's commit and rollback
@@ -2975,16 +3060,25 @@ sub _commit_transaction {
         defined($dbh->do('COMMIT AND NO CHAIN NO RELEASE'))
             or die Selecto::SQL::_dbi_error($dbh, 'database transaction could not commit');
     }
-    $self->_leave_transaction or die $self->_close_session('the write committed, but its session could not be restored', committed => JSON::PP::true);
+    local $self->{_selecto_control_retried} = 0;
+    die $self->_close_session('the write committed, but its session could not be restored', committed => JSON::PP::true)
+        unless $self->_leave_transaction && (!$self->{_selecto_control_retried} || $self->_in_step);
     return;
 }
 
 sub _rollback_transaction {
-    my ($self) = @_;
+    my ($self, $cause) = @_;
     my $dbh = $self->{dbh};
-    # A commit that failed may already have ended it: see the parent.
+    # A commit that failed may already have ended it: see the parent. So has the
+    # connection that was closed because its session could not be put back.
     return if eval { $dbh->{AutoCommit} } && !eval { $dbh->{BegunWork} };
-    return if $self->_retry_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_leave_transaction;
+    return if blessed($cause) && $cause->isa('Selecto::Error') && $cause->code eq 'transaction_state_unsafe' && !eval { $dbh->{Active} };
+    # Autocommit is restored only after a ROLLBACK that worked: restored after one
+    # that did not, it would commit what was refused (a KILL QUERY on MariaDB).
+    die $self->_close_session('the write was interrupted') if defined($cause) && $self->_foreign_failure($cause);
+    local $self->{_selecto_control_retried} = 0;
+    return if $self->_retry_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_leave_transaction
+        && (!$self->{_selecto_control_retried} || $self->_in_step);
     die $self->_close_session('the write could not be rolled back');
 }
 
@@ -2996,6 +3090,7 @@ sub _leave_transaction {
             $dbh->{BegunWork} = 0;
             return 1;
         }
+        $self->{_selecto_control_retried} = 1;
         select(undef, undef, undef, 0.01);
     }
     return 0;
@@ -3158,7 +3253,7 @@ sub _require_session {
         my $error = $@;
         # MySQL rejects MariaDB's SET STATEMENT prefix (and @@in_transaction)
         # as a syntax error: the MariaDB adapter is then on another server.
-        if ($mariadb) {
+        if ($mariadb && (eval { $dbh->err } // 0) =~ /\A(?:1064|1193)\z/) {
             my ($version) = eval { local $dbh->{PrintError} = 0; $dbh->selectrow_array('SELECT VERSION()') };
             $family->() if defined($version) && "$version" !~ /mariadb/i;
         }
@@ -3342,6 +3437,15 @@ pending before a write on an idle handle is consumed by the write: by the
 open-transaction probe, and otherwise by the adapter's own transaction, to
 which it would apply. Set transaction characteristics inside the host's own
 C<begin_work> transaction, or with C<SET SESSION TRANSACTION>.
+
+A connection Selecto cannot put back is closed, never left wrong: a C<ROLLBACK> or
+autocommit restore that still fails after retries, a failed C<RELEASE SAVEPOINT>
+that cannot be rolled back to, or a failure that left the connection out of step
+with its replies, which is what an unsafe signal handler's C<die> inside the driver
+does. What failed first is still what is raised; details C<connection_closed> and
+C<transaction_state> say so. Only a C<die> from a safe signal, a plain C<alarm>,
+keeps the handle: it arrives between statements, or is lost in a C<DESTROY>, as
+Perl does with any C<die> there.
 
 This module is an internal part of the L<Selecto> distribution. Its interface
 may change without notice; applications should use the public entry points

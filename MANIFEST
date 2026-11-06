@@ -89,6 +89,7 @@ t/pg_stream_host_takeover_live.t
 t/pg_client_encoding_live.t
 t/pg_declared_schemas_live.t
 t/pg_extension_cast_forms_live.t
+t/pg_function_resolution_live.t
 t/pg_keyword_functions_live.t
 t/pg_qualify_keyword_functions.t
 t/pg_extension_scope_live.t
@@ -226,6 +227,7 @@ t/mysql_family_cursor.t
 t/mysql_family_date_format.t
 t/mysql_completion_type_live.t
 t/mysql_family_live.t
+t/mysql_alarm_reply_live.t
 t/mysql_kill_query_storm_live.t
 t/mysql_family_session_live.t
 t/mysql_family_sql.t

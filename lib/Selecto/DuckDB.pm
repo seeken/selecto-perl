@@ -1030,16 +1030,15 @@ sub _transaction_statement {
 # view's nextval is refused. Inside an open transaction, the host's or a managed
 # write's, there is nothing to wrap the read in, as DuckDB has no savepoints: it
 # runs as written, and has no triggers or procedures to reach, so a sequence is
-# all it can change there. A hand-built statement has nothing to stop it there,
-# so it refuses. A stream can end at execute: the driver holds the whole result by
+# all it can change there. A hand-built statement whose text says it writes
+# refuses. A stream can end at execute: the driver holds the whole result by
 # then. Trying BEGIN to find out would abort the open transaction, so the check is
 # that two statements share a transaction id.
 sub _read_transaction {
     my ($self, $statement, $work) = @_;
     $self->_admit_hand_built($statement);
     if ($self->_read_inside_transaction) {
-        Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement cannot be proved a read inside a host transaction here',
-            {reason => 'hand_built_in_host_transaction'}) if Selecto::SQL::_hand_built($statement);
+        $self->_refuse_hand_built_write($statement);
         return $work->();
     }
     eval { $self->_transaction_statement('BEGIN TRANSACTION READ ONLY'); 1 } or die $self->_transaction_control_error($@);
@@ -1057,8 +1056,14 @@ sub _read_inside_transaction {
     my ($self) = @_;
     my $dbh = $self->dbh;
     return 1 unless $dbh->{AutoCommit};
-    # (An aborted transaction answers neither: the read will say so itself.)
-    my @ids = eval { local $dbh->{PrintError} = 0; map { $dbh->selectrow_array('SELECT txid_current()') } 1, 2 };
+    # (An aborted transaction answers neither, and the read will say so itself;
+    # any other failure is not an answer.)
+    my @ids;
+    unless (eval { local $dbh->{PrintError} = 0; @ids = map { $dbh->selectrow_array('SELECT txid_current()') } 1, 2; 1 }) {
+        my $error = $@;
+        return 1 if "$error" =~ /Current transaction is aborted/;
+        die $self->normalize_error($error);
+    }
     return @ids == 2 && defined($ids[0]) && defined($ids[1]) && $ids[0] ne $ids[1] ? 0 : 1;
 }
 
