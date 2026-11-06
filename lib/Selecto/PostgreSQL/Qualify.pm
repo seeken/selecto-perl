@@ -141,13 +141,15 @@ sub _sequence {
     my @parts;
     my @run;
     my $set_list = 0;
-    my ($lone, $first, @each);
+    my ($lone, $first, $whole, @each);
     my $flush = sub {
         if (@run) {
             $lone = @run == 1 && $run[0]{kind} eq 'atom' && !@parts ? $run[0] : undef;
             $first = $lone if !@parts;
             push @each, @run == 1 && $run[0]{kind} eq 'atom' ? $run[0] : undef;
+            my $alone = !@parts;
             push @parts, _emit_run($state, \@run);
+            $whole = $alone ? $state->{run_tree} : undef;
             @run = ();
         }
     };
@@ -181,6 +183,8 @@ sub _sequence {
             my $construct = _construct($state, $tokens, $pos, \@run);
             if (defined $construct) { push @run, $construct; next }
         }
+        # x IS [NOT] NULL, TRUE...: a test of x, which types nothing around it.
+        _consume({atom => $_}) for $up eq 'IS' ? grep { $_->{kind} eq 'atom' } @run : ();
         my $atom = _atom($state, $tokens, $pos);
         if (defined $atom) {
             # Two atoms in a row (an alias after an expression): a new run.
@@ -213,6 +217,10 @@ sub _sequence {
         $$pos++;
     }
     $flush->();
+    # What is known of the sequence's type, when it is one expression. Read
+    # first: it can parse a derived column, which runs through here.
+    my $class = @parts == 1 && $whole && $state->{scopes} ? _tree_class($state, $whole) : undef;
+    $state->{lone_class} = $class;
     # The sequence was one atom (a column, a function call...): a redundant
     # group around it keeps what is known of it.
     $state->{lone_atom} = @parts == 1 ? $lone : undef;
@@ -414,7 +422,7 @@ sub _atom {
     my $token = $tokens->[$$pos];
     my ($type, $text) = @$token;
     my $up = _upper($token);
-    my ($sql, $column, $known, $entry);
+    my ($sql, $column, $known, $entry, $class);
     # Column references read inside this atom (see _postfix).
     my $mark = scalar @{$state->{refs} //= []};
     if ($type eq 'num' || $type eq 'str' || $type eq 'param') {
@@ -431,7 +439,7 @@ sub _atom {
             # A simple CASE x WHEN v ...: searched, with explicit operators.
             my $subject = _read_run($state, $tokens, $pos, 'WHEN');
             my $left = _render($state, $subject);
-            my @parts;
+            my (@parts, @results);
             while (_upper($tokens->[$$pos]) eq 'WHEN') {
                 $$pos++;
                 my $value = _read_run($state, $tokens, $pos, 'THEN');
@@ -440,16 +448,21 @@ sub _atom {
                 my $value_sql = _render($state, $value);
                 my $op = _op_sql($state, {kind => 'op', op => '='}, $subject, $value);
                 push @parts, 'WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $value_sql) . ') THEN ' . _render($state, $result);
+                push @results, $state->{scopes} ? _tree_class($state, $result) : undef;
             }
             if (_upper($tokens->[$$pos]) eq 'ELSE') {
                 $$pos++;
-                push @parts, 'ELSE ' . _render($state, _read_run($state, $tokens, $pos, undef));
+                my $result = _read_run($state, $tokens, $pos, undef);
+                push @parts, 'ELSE ' . _render($state, $result);
+                push @results, $state->{scopes} ? _tree_class($state, $result) : undef;
             }
             _expect_word($tokens, $pos, 'END');
             $sql = 'CASE ' . join(' ', @parts) . ' END';
+            $class = _case_class(@results);
         } else {
             my $inner = _sequence_until_end($state, $tokens, $pos);
             $sql = "CASE $inner END";
+            $class = _case_class(@{$state->{case_results}});
         }
     } elsif ($type eq 'id' && $up =~ /\A(?:CAST|EXISTS|ARRAY|ANY|ALL|SOME|EXTRACT|COALESCE|GREATEST|LEAST|ROW|TRIM|SUBSTRING|POSITION|OVERLAY|NULLIF|GROUPING)\z/
         && ($$pos + 1 < @$tokens) && ($tokens->[$$pos + 1][1] eq '(' || ($up eq 'ARRAY' && $tokens->[$$pos + 1][1] eq '['))) {
@@ -464,9 +477,11 @@ sub _atom {
             my $left = _render($state, $a);
             my $right = _render($state, $b);
             my $op = _op_sql($state, {kind => 'op', op => '='}, $a, $b);
+            # Its type is its first argument's.
+            my $first = $state->{scopes} ? _tree_class($state, $a) : {};
             return _postfix($state, $tokens, $pos,
                 '(CASE WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . ") THEN NULL ELSE ($left) END)",
-                undef, undef, undef, $mark);
+                undef, $first->{string} || $first->{untyped} ? 'string' : undef, undef, $mark);
         }
         my $open = $tokens->[$$pos + 1][1];
         my $close = $open eq '(' ? ')' : ']';
@@ -502,13 +517,16 @@ sub _atom {
         }
     } elsif ($type eq 'punct' && $text eq '(') {
         $$pos++;
+        my $subquery = _upper($tokens->[$$pos]) eq 'SELECT';
         my $inner = _sequence($state, $tokens, $pos, ')');
         # A redundant group around one atom, ("s0"."tag"): its column (and
         # so its type) or its known result type is carried through.
         my $lone = $state->{lone_atom};
+        $class = $lone ? undef : $state->{lone_class};
         _expect($tokens, $pos, ')');
         $sql = "($inner)";
-        ($column, $known, $entry) = ($lone->{column}, $lone->{known}, $lone->{entry}) if $lone;
+        ($column, $known, $entry, $class) = ($lone->{column}, $lone->{known}, $lone->{entry}, $lone->{class}) if $lone;
+        $class = _subquery_class($state, $token->[2]) if $subquery;
     } elsif ($type eq 'id' && (!$KEYWORD{$up} || _keyword_call($tokens, $$pos)) || $type eq 'qid') {
         # A name chain: a.b.c, possibly a function call.
         my $start = $token->[2];
@@ -636,6 +654,13 @@ sub _atom {
             } elsif (@names == 1 && $kinds[0] eq 'id' && $KEYWORD{uc $names[0]}) {
                 Selecto::Error->throw('query_rule_not_evaluable', 'a function named like an SQL keyword cannot be qualified',
                     {reason => 'function_keyword', function => lc $names[0]});
+            } elsif (@names <= 2) {
+                # Any other function: when no overload of that name returns
+                # an extension type, or a type that could be one, its result
+                # is plain, whatever its arguments (similarity, nlevel, ST_X).
+                my $info = $state->{columns}{functions}{_unquote($names[-1])};
+                my $returns = ref($info) eq 'HASH' ? $info->{state} // '' : '';
+                $known = $returns eq 'string' ? 'string' : $returns eq 'known' ? 1 : $known;
             }
             $sql = "$name($inner)";
             # FILTER (WHERE ...) / OVER (...) / WITHIN GROUP (...) follow.
@@ -660,7 +685,15 @@ sub _atom {
     } else {
         return undef;
     }
-    return _postfix($state, $tokens, $pos, $sql, $column, $known, $entry, $mark);
+    # A class of plain or string results is known; one that may be an extension
+    # type stays on the atom, unless a postfix changes what the atom is.
+    if ($class && !$known && !$entry) {
+        $known = $class->{string} ? 'string' : 1 if !$class->{unknown} && !$class->{entry};
+        $class = undef if $known;
+    }
+    my $atom = _postfix($state, $tokens, $pos, $sql, $column, $known, $entry, $mark);
+    $atom->{class} = $class if $class && $atom->{sql} eq $sql;
+    return $atom;
 }
 
 sub _postfix {
@@ -723,10 +756,11 @@ sub _postfix {
 # CASE ... END: WHEN/THEN/ELSE are boundaries inside.
 sub _sequence_until_end {
     my ($state, $tokens, $pos) = @_;
-    my @parts;
+    my (@parts, @results);
+    my $word = '';
     while ($$pos < @$tokens && _upper($tokens->[$$pos]) ne 'END') {
         my $token = $tokens->[$$pos];
-        if (_upper($token) =~ /\A(?:WHEN|THEN|ELSE)\z/) { push @parts, $token->[1]; $$pos++; next }
+        if (_upper($token) =~ /\A(?:WHEN|THEN|ELSE)\z/) { $word = _upper($token); push @parts, $token->[1]; $$pos++; next }
         # One expression up to the next WHEN/THEN/ELSE/END.
         my @chunk;
         my $depth = 0;
@@ -753,8 +787,11 @@ sub _sequence_until_end {
         my @slice = @{$tokens}[$start .. $$pos - 1];
         my $p = 0;
         push @parts, _sequence($state, \@slice, \$p, undef);
+        # A CASE takes its type from its results, never its conditions.
+        push @results, $state->{lone_class} if $word ne 'WHEN';
     }
     _expect_word($tokens, $pos, 'END');
+    $state->{case_results} = \@results;
     return join ' ', @parts;
 }
 
@@ -782,7 +819,9 @@ sub _emit_run {
     my $i = 0;
     my $tree = _climb($state, \@items, \$i, 0);
     my @rest = map { $_->{kind} eq 'atom' ? $_->{sql} : _op_sql($state, $_, undef, undef) } @items[$i .. $#items];
-    return join ' ', _render($state, $tree), @rest;
+    my $sql = join ' ', _render($state, $tree), @rest;
+    $state->{run_tree} = @rest ? undef : $tree;
+    return $sql;
 }
 
 sub _primary {
@@ -857,6 +896,9 @@ sub _op_sql {
     return "OPERATOR($op->{schema}.$op->{op})" if $op->{explicit};
     my @sides = map { _operand_class($state, $_, $op->{op}) } $left, $right;
     my ($l, $r) = @sides;
+    # Typing an operand can parse a derived column, whose own operators set
+    # these.
+    @{$state}{qw(op_cast op_cast_right)} = (undef, undef);
     # An operand whose type may be an extension type but cannot be resolved
     # (an expression over such a column, or a reference with no known
     # source) against an untyped value, an extension-typed column or another
@@ -870,19 +912,28 @@ sub _op_sql {
             'an operand that may have an extension type could not be resolved for operator qualification',
             {reason => 'operand_type_unknown'})
             if $unknown->{unknown} && ($other->{untyped} || $other->{ext} || $other->{unknown}
-                || ($unknown->{over_extension} && !($unknown->{soft} && $other->{string})));
+                || ($unknown->{over_extension} && !($unknown->{soft} && $other->{string}))
+                || ($other->{string} && _soft_member($unknown, $unknown == $l, $op->{op})));
     }
     my $schema = 'pg_catalog';
     my ($left_type, $right_type);
     my $refuse = sub {
+        my ($ext) = grep { $_->{ext} } $l, $r;
+        my ($side) = grep { $_ && $_->{atom} && ref($_->{atom}{column}) eq 'HASH' } $l->{ext} ? $left : (), $r->{ext} ? $right : ();
+        my $type = $ext->{type} // $ext->{entry}{"\0extdom_type"};
+        my $column = $side ? $side->{atom}{column}{names}[-1] : undef;
         Selecto::Error->throw('query_rule_not_evaluable',
-            'an operator on an extension type is not a member of its extension for these operands',
-            {reason => 'operator_not_member', operator => $op->{op}});
+            "the operator $op->{op} is not a member of its extension for these operands"
+                . (defined($type) ? " (type $type" . (defined($column) ? ", column $column" : '') . ')' : ''),
+            {reason => 'operator_not_member', operator => $op->{op}, defined($type) ? (type => $type) : (),
+                defined($column) ? (column => $column) : ()});
     };
     if ($l->{ext} && $r->{ext}) {
         if (defined($l->{type}) && defined($r->{type}) && $l->{type} eq $r->{type}) {
-            $refuse->() unless defined $l->{schema};
-            ($schema, $left_type, $right_type) = ($l->{schema}, $l->{type}, $r->{type});
+            # Without a member, a string-category type's operands resolve to
+            # the text operator (citext || citext, R51 amendment 3).
+            $refuse->() unless defined($l->{schema}) || $l->{string_category};
+            ($schema, $left_type, $right_type) = ($l->{schema}, $l->{type}, $r->{type}) if defined $l->{schema};
         } else {
             my $member = _cross_member($l, $r, $op->{op}) // $refuse->();
             ($schema, $left_type, $right_type) = ($member, $l->{type}, $r->{type});
@@ -909,6 +960,16 @@ sub _op_sql {
     # WHEN tier = 'gold' THEN 'G' ...): their references are consumed.
     if ($BOOLEAN_OP{$op->{op}}) { _consume($_) for grep { defined } $left, $right }
     return "OPERATOR($schema.$op->{op})";
+}
+
+# Whether op would be an extension member if an operand that may have the
+# extension's string type (a CASE over citext, say) has it, against text:
+# citext ~ text is citext's, so pg_catalog's cannot stand in for it.
+sub _soft_member {
+    my ($unknown, $on_left, $op) = @_;
+    my $entry = $unknown->{soft_entry} or return 0;
+    my $type = {type => $entry->{"\0type"}, entry => $entry};
+    return defined _cross_member($on_left ? ($type, {}) : ({}, $type), $op) ? 1 : 0;
 }
 
 # The schema of the extension member op(left type, right type), or undef. A
@@ -952,9 +1013,12 @@ sub _consume {
 sub _operand_class {
     my ($state, $side, $op) = @_;
     return {untyped => 1} unless $side;
-    return {} unless $side->{atom};
+    return $state->{scopes} ? _tree_class($state, $side) : {} unless $side->{atom};
     my $class = _class_of($state, $side->{atom});
     if (my $entry = $class->{entry}) {
+        # A domain an extension owns over a pg_catalog type compares as that
+        # type where pg_catalog's operator is an exact match (lo = 101).
+        return {} if !defined($entry->{"\0type"}) && ref($entry->{"\0extdom"}) eq 'HASH' && $entry->{"\0extdom"}{$op};
         return {ext => 1, entry => $entry, type => $entry->{"\0type"}, schema => $entry->{$op}, string_category => $entry->{"\0strcat"}};
     }
     # x op ANY (...): the quantifier's elements, as PostgreSQL resolves them.
@@ -966,28 +1030,82 @@ sub _operand_class {
 # literal or NULL), {entry => <its extension type's operators and functions>},
 # {string => 1} (a pg_catalog string type), {unknown => 1} (it may have an
 # extension type that cannot be resolved here; over_extension when it reads a
-# column of one, soft when all it can be is a string-category one), or {} (a
-# known type that is no extension's).
+# column of one, soft when all it can be is a string-category one, soft_entry
+# that type), or {} (a known type that is no extension's).
 sub _class_of {
     my ($state, $atom) = @_;
     return {untyped => 1} if !defined($atom->{column}) && $atom->{sql} =~ /\A(?:\$\d+|\?|'(?:[^']|'')*'|NULL)\z/i;
     return {entry => $atom->{entry}} if $atom->{entry};
     return {} unless $state->{scopes};
+    return $atom->{class} if $atom->{class};
     return {string => 1} if ($atom->{known} // '') eq 'string';
     return {} if $atom->{known};
     return _ref_class($state, {column => $atom->{column}}) if ref($atom->{column}) eq 'HASH';
     # An expression: its result type follows its operands. Unknown when one
     # has (or may have) an extension type.
-    my ($unknown, $soft, $over) = (0, 1, 0);
+    my ($unknown, $soft, $over, $soft_entry) = (0, 1, 0, undef);
     for my $ref (@{$atom->{refs} // []}) {
         next if $ref->{consumed};
         my $class = _ref_class($state, $ref);
         next unless $class->{entry} || $class->{unknown};
+        # A domain an extension owns over a pg_catalog type is that type.
+        next if $class->{entry} && !defined $class->{entry}{"\0type"};
         $unknown = 1;
         $over ||= $class->{entry} ? 1 : $class->{over_extension};
         $soft = 0 unless $class->{entry} ? $class->{entry}{"\0strcat"} : $class->{soft};
+        $soft_entry //= $class->{entry} // $class->{soft_entry};
     }
-    return $unknown ? {unknown => 1, soft => $soft, over_extension => $over} : {};
+    return $unknown ? {unknown => 1, soft => $soft, over_extension => $over, soft_entry => $soft_entry} : {};
+}
+
+# What is known of an expression tree's type. A comparison is boolean; ||
+# over strings is text (citext has no || of its own, so over it too); any other
+# operator over an extension operand has a type of its own that is not read
+# here, so it stays unknown, and an expression over plain operands is plain.
+sub _tree_class {
+    my ($state, $node) = @_;
+    return {} unless ref($node) eq 'HASH';
+    return _class_of($state, $node->{atom}) if $node->{atom};
+    my $op = ($node->{binary} // $node->{prefix} // {})->{op} // '';
+    return {} if $node->{binary} && $BOOLEAN_OP{$op};
+    my @sides = map { _tree_class($state, $_) } grep { defined } @{$node}{qw(left right operand)};
+    my $text = sub { $_[0]{string} || $_[0]{untyped} || ($_[0]{entry} && $_[0]{entry}{"\0strcat"}) };
+    return {string => 1} if $node->{binary} && $op eq '||' && @sides == 2 && !grep { !$text->($_) } @sides;
+    return {unknown => 1} if grep { ($_->{entry} && defined $_->{entry}{"\0type"}) || $_->{unknown} } @sides;
+    return {};
+}
+
+# A CASE's type from its results' (R51 amendment 3): strings alone are text,
+# and an extension type in any result leaves the type unresolved, as it is for
+# any expression. undef when a result could not be classed.
+sub _case_class {
+    my @results = @_;
+    return undef if !@results || grep { !$_ } @results;
+    my ($unknown, $soft, $over, $soft_entry, $plain) = (0, 1, 0, undef, 0);
+    for my $class (@results) {
+        if ($class->{entry} || $class->{unknown}) {
+            $unknown = 1;
+            $over ||= $class->{entry} ? 1 : $class->{over_extension};
+            $soft = 0 unless $class->{entry} ? $class->{entry}{"\0strcat"} : $class->{soft};
+            $soft_entry //= $class->{entry} // $class->{soft_entry};
+        } elsif (!$class->{string} && !$class->{untyped}) {
+            $plain = 1;
+        }
+    }
+    return {unknown => 1, soft => $soft, over_extension => $over, soft_entry => $soft_entry} if $unknown;
+    return $plain ? {} : {string => 1};
+}
+
+# A scalar subquery's type: its one select item's.
+sub _subquery_class {
+    my ($state, $open) = @_;
+    my $info = $state->{scopes} or return undef;
+    my $scope = $info->{opens}{$open} // return undef;
+    return undef unless @{$info->{scopes}[$scope]{items}} == 1;
+    my $entry = _item_entry($state, $scope, 0, 0) // return undef;
+    return {unknown => 1, soft => $entry->{"\0soft"}, over_extension => $entry->{"\0over"}} if $entry->{"\0unknown"};
+    return undef if _is_extension($entry);
+    return $entry->{"\0string"} ? {string => 1} : {};
 }
 
 sub _ref_class {
@@ -995,7 +1113,8 @@ sub _ref_class {
     my $column = $ref->{column};
     my $entry = _resolve_column($state, $column->{at}, $column->{names});
     if (ref($entry) eq 'HASH') {
-        return {unknown => 1, soft => $entry->{"\0soft"}, over_extension => $entry->{"\0over"}} if $entry->{"\0unknown"};
+        return {unknown => 1, soft => $entry->{"\0soft"}, over_extension => $entry->{"\0over"}, soft_entry => $entry->{"\0softentry"}}
+            if $entry->{"\0unknown"};
         return {entry => $entry} if _is_extension($entry);
         return $entry->{"\0string"} ? {string => 1} : {};
     }
@@ -1221,15 +1340,25 @@ sub _keyword_call {
     my ($tokens, $k) = @_;
     return 0 unless $FUNCTION_KEYWORD{uc $tokens->[$k][1]} && $k + 1 < @$tokens && $tokens->[$k + 1][1] eq '(';
     my $prev = $k > 0 ? uc $tokens->[$k - 1][1] : '';
-    return 0 if $prev eq '.' || $prev eq 'FETCH' || $prev eq 'PRIMARY' || $prev eq 'FOREIGN';
-    if (uc($tokens->[$k][1]) eq 'RANGE') {
-        my $depth = 0;
-        for my $j ($k + 1 .. $#$tokens) {
-            $depth++ if $tokens->[$j][0] eq 'punct' && $tokens->[$j][1] eq '(';
-            $depth-- if $tokens->[$j][0] eq 'punct' && $tokens->[$j][1] eq ')';
-            next if $depth;
-            return uc($tokens->[$j + 1][1] // '') =~ /\A(?:PRECEDING|FOLLOWING)\z/ ? 0 : 1;
-        }
+    # A name, not a call: a relation, alias or CTE being declared.
+    return 0 if $prev =~ /\A(?:\.|FETCH|PRIMARY|FOREIGN|AS|INTO|WITH|RECURSIVE)\z/;
+    my $word = uc $tokens->[$k][1];
+    # MERGE ... WHEN NOT MATCHED THEN INSERT (...).
+    if ($word eq 'INSERT' && $prev eq 'THEN') {
+        my $j = $k - 1;
+        $j-- while $j > 0 && uc($tokens->[$j][1]) ne 'WHEN';
+        return 0 if uc($tokens->[$j + 1][1] // '') =~ /\A(?:NOT|MATCHED)\z/;
+    }
+    my $depth = 0;
+    for my $j ($k + 1 .. $#$tokens) {
+        $depth++ if $tokens->[$j][0] eq 'punct' && $tokens->[$j][1] eq '(';
+        $depth-- if $tokens->[$j][0] eq 'punct' && $tokens->[$j][1] eq ')';
+        next if $depth;
+        my ($next, $after) = map { $_ < @$tokens ? uc $tokens->[$_][1] : '' } $j + 1, $j + 2;
+        return 0 if $word eq 'RANGE' && $next =~ /\A(?:PRECEDING|FOLLOWING)\z/;
+        # A later CTE of a WITH list: , name (cols) AS (...).
+        return 0 if $prev eq ',' && $next eq 'AS' && $after =~ /\A(?:\(|NOT|MATERIALIZED)\z/;
+        last;
     }
     return 1;
 }
@@ -1298,39 +1427,52 @@ sub _source_column {
         ($scope, $cols) = ($source->{derived}, $source->{cols});
     }
     return undef unless defined $scope;
-    my $items = $info->{scopes}[$scope]{items};
-    my $tokens = $info->{tokens};
-    for my $index (0 .. $#$items) {
-        my @t = map { $tokens->[$_] } @{$items->[$index]};
-        # Its output name: the column list's, an alias, or a bare column's.
-        my $alias = @t >= 2 && $t[-1][0] =~ /\A(?:id|qid)\z/ && (_upper($t[-2]) eq 'AS' || $t[-2][1] eq ')')
-            ? _unquote($t[-1][1]) : undef;
-        my @body = @t;
-        splice(@body, _upper($t[-2]) eq 'AS' ? -2 : -1) if defined $alias;
-        # A passthrough item: a [b.]c, in any redundant parentheses.
-        my $wrap = 0;
-        $wrap++ while $wrap < @body && $body[$wrap][1] eq '(' && $body[-1 - $wrap][1] eq ')';
-        my @chain;
-        my $k = $wrap;
-        while ($k < @body - $wrap && $body[$k][0] =~ /\A(?:id|qid)\z/) {
-            push @chain, _unquote($body[$k][1]);
-            $k++;
-            last unless $k < @body - $wrap && $body[$k][1] eq '.';
-            $k++;
-        }
-        my $passthrough = @chain && @chain <= 3 && $k == @body - $wrap;
-        my $name = defined($alias) ? $alias : $passthrough ? $chain[-1] : undef;
-        my $output = ref($cols) eq 'ARRAY' && $index < @$cols ? $cols->[$index] : $name;
+    for my $index (0 .. $#{$info->{scopes}[$scope]{items}}) {
+        my $item = _select_item($info, $scope, $index);
+        my $output = ref($cols) eq 'ARRAY' && $index < @$cols ? $cols->[$index] : $item->{name};
         next unless defined($output) && $output eq $column;
-        return _resolve_in($state, $scope, @chain > 1 ? $chain[-2] : undef, $chain[-1], $guard + 1) if $passthrough;
-        # A computed output: typed as the qualifier types an operand (review
-        # M1): a cast, a non-polymorphic pg_catalog function, an extension
-        # function, or an expression over columns of known types.
-        my $first = $items->[$index][0];
-        my $last = $first + @body - 1;
-        return _computed_entry($state, $first, $last, $guard);
+        return _item_entry($state, $scope, $index, $guard);
     }
     return undef;
+}
+
+# A select item: its output name (an alias or a bare column's), and the column
+# chain when it is a passthrough, a [b.]c in any redundant parentheses.
+sub _select_item {
+    my ($info, $scope, $index) = @_;
+    my $tokens = $info->{tokens};
+    my @t = map { $tokens->[$_] } @{$info->{scopes}[$scope]{items}[$index]};
+    my $alias = @t >= 2 && $t[-1][0] =~ /\A(?:id|qid)\z/ && (_upper($t[-2]) eq 'AS' || $t[-2][1] eq ')')
+        ? _unquote($t[-1][1]) : undef;
+    my @body = @t;
+    splice(@body, _upper($t[-2]) eq 'AS' ? -2 : -1) if defined $alias;
+    my $wrap = 0;
+    $wrap++ while $wrap < @body && $body[$wrap][1] eq '(' && $body[-1 - $wrap][1] eq ')';
+    my @chain;
+    my $k = $wrap;
+    while ($k < @body - $wrap && $body[$k][0] =~ /\A(?:id|qid)\z/) {
+        push @chain, _unquote($body[$k][1]);
+        $k++;
+        last unless $k < @body - $wrap && $body[$k][1] eq '.';
+        $k++;
+    }
+    my $passthrough = @chain && @chain <= 3 && $k == @body - $wrap;
+    return {name => defined($alias) ? $alias : $passthrough ? $chain[-1] : undef, chain => $passthrough ? \@chain : undef, length => scalar @body};
+}
+
+# What a select item outputs: the column it passes through, or a computed
+# output typed as the qualifier types an operand (review M1): a cast, a
+# non-polymorphic pg_catalog function, an extension function, or an expression
+# over columns of known types.
+sub _item_entry {
+    my ($state, $scope, $index, $guard) = @_;
+    my $info = $state->{scopes};
+    my $item = _select_item($info, $scope, $index);
+    my $chain = $item->{chain};
+    return _resolve_in($state, $scope, @$chain > 1 ? $chain->[-2] : undef, $chain->[-1], $guard + 1) if $chain;
+    return undef unless $item->{length};
+    my $first = $info->{scopes}[$scope]{items}[$index][0];
+    return _computed_entry($state, $first, $first + $item->{length} - 1, $guard);
 }
 
 # A computed select item's type, from its tokens $first .. $last.
@@ -1348,9 +1490,9 @@ sub _computed_entry {
         my $pos = $first;
         my $tree = _read_run($state, $tokens, \$pos, undef);
         if ($pos == $last + 1) {
-            my $class = !$tree->{atom} ? {} : _class_of($state, $tree->{atom});
+            my $class = _tree_class($state, $tree);
             # A parameter or literal output is text (R57).
-            $entry = $class->{entry} ? $class->{entry} : $class->{unknown} ? {"\0unknown" => 1, "\0soft" => $class->{soft}, "\0over" => $class->{over_extension}}
+            $entry = $class->{entry} ? $class->{entry} : $class->{unknown} ? {"\0unknown" => 1, "\0soft" => $class->{soft}, "\0over" => $class->{over_extension}, "\0softentry" => $class->{soft_entry}}
                 : $class->{string} || $class->{untyped} ? {"\0string" => 1} : {};
         }
         1;
@@ -1403,7 +1545,8 @@ sub _function_column {
         my $entry = $function->{cols}[$index];
         return ref($entry) eq 'HASH' ? $entry : {"\0unknown" => 1};
     }
-    return ($function->{state} // '') eq 'known' ? {} : {"\0unknown" => 1};
+    my $returns = $function->{state} // '';
+    return $returns eq 'string' ? {"\0string" => 1} : $returns eq 'known' ? {} : {"\0unknown" => 1};
 }
 
 sub _unquote {

@@ -1,6 +1,9 @@
 Revision history for Selecto
 
 Unreleased
+    - The remote query route answers a typed refusal at execution
+      (query_rule_not_evaluable) with 422 invalid_query, not 500
+      internal_failure.
     - Documented that the SQL text of compile and preview_write is for
       inspection and not safe to run directly (R52).
     - PostgreSQL: a function named like an SQL keyword is qualified or refused
@@ -8,25 +11,49 @@ Unreleased
       overlay are written pg_catalog.name(...); delete, last, key, update and
       the like, which pg_catalog does not have, are refused with reason
       function_keyword. The lint reports them. text_prefix buckets now call
-      pg_catalog.left.
+      pg_catalog.left. Names in a declaring position (WITH key(a) AS, AS
+      first(a), INSERT INTO range (...), MERGE's THEN INSERT (...)) are not
+      calls.
     - PostgreSQL: an operator on an extension type is written in the
       extension's schema only when it is a member for those operand types,
       cross-type members included (isbn13 = ean13, citext ~~ text, ltree ||
       text, each operand cast to its own member type). Without a member, the
-      pg_catalog operator is used in one case only: a string-category extension
-      type (citext, domains over it) against a pg_catalog string type or an
-      untyped value, which is what PostgreSQL resolves. Everything else is now
-      refused, query_rule_not_evaluable with reason operator_not_member. This
-      is a behaviour change: comparisons that worked through an implicit cast
-      stop working, for example box3d = anything (it compared by area), a
-      box3d tenant column, geography <> (it compared through bytea), geometry
-      against text, geometry against geography, hstore <, vector against
-      halfvec, any operator on a composite extension type such as
-      topogeometry, on a domain an extension owns over a built-in type such as
-      lo, and citext against a type that is no string, or against another
-      extension type. An expression over an extension column is refused against
-      a plain operand too (operand_type_unknown), unless all it can be is a
-      string-category type against a string.
+      pg_catalog operator is used only where PostgreSQL itself resolves to it
+      exactly: a string-category extension type (citext, domains over it)
+      against a pg_catalog string type, an untyped value or itself (citext ||
+      citext, citext ^@ citext), and a domain an extension owns over a
+      pg_catalog type, which compares as that type (lo = 101).
+      This is a behaviour change. These now fail with
+      query_rule_not_evaluable, reason operator_not_member (which names the
+      type and column), where they used to answer through an implicit cast:
+        * any comparison on box3d, including a box3d tenant column. It
+          compared by area, so disjoint boxes matched.
+        * geography <>, which compared through bytea, and LIKE-style matches
+          on geography.
+        * geometry against a text, varchar, char or name column, and geometry
+          against bytea. It compared as text.
+        * geometry against geography. The answer depended on operand order.
+        * two different extension types compared with each other, such as
+          vector against halfvec, or citext against hstore, ltree, cube, an
+          isn type, vector, geometry or geography.
+        * an extension type against a built-in type that is not a string,
+          such as citext against integer or box3d against box.
+        * any comparison on a composite type an extension owns, such as
+          topogeometry, geometry_dump or the raster types.
+        * || between a non-string extension type and a value, unless the
+          extension defines it.
+        * a domain an extension owns over an array, such as topoelement.
+      An expression that reads a column of an extension type and may have that
+      type stays refused against a value or an extension column
+      (operand_type_unknown); against a plain column it is now refused too,
+      unless all it can be is citext and the other side is a string. Nothing
+      changes for an expression whose type Selecto can prove: a CASE takes its
+      type from its results and not its conditions, a column tested with IS
+      [NOT] NULL gives nothing its type, an expression of strings alone (a
+      text CASE, NULLIF, a || b, a scalar subquery of a string) compares as
+      text against citext, and a function that can only return a non-extension
+      type (similarity, nlevel, ST_Area) is a plain value. Some of those were
+      refused before and now answer, as PostgreSQL does.
     - PostgreSQL: catalog facts for the operator qualifier are keyed by the
       exact name, as PostgreSQL folds identifiers (R56). With org text and
       "ORG" citext in one table, org took citext's operators: a tenant read,
