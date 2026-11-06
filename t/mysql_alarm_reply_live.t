@@ -35,6 +35,14 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             'CREATE TABLE al_log (hit INT PRIMARY KEY) ENGINE=InnoDB', q{INSERT INTO al_t VALUES (1, 't1'), (2, 't1'), (3, 't1')};
         my $domain = Selecto::Domain->parse({schema_version => 1, name => 'AL', source => {source_table => 'al_t', primary_key => 'id', tenant_field => 'org',
             fields => [qw(id org)], columns => {id => {type => 'integer'}, org => {type => 'string'}}, associations => {}}, schemas => {}, joins => {}});
+        # A host's exception stands inside an operation; asked directly, the adapter
+        # always answers with a typed error.
+        {
+            my $adapter = Selecto->adapter($name => (dbh => $admin));
+            my $error = $adapter->normalize_error('synthetic');
+            ok(blessed($error) && $error->isa('Selecto::Error'), 'normalize_error is typed for anything it is given');
+            ok($admin->{Active}, 'and an in-step connection stays open');
+        }
         # An unsafe handler (POSIX::sigaction, as Sys::SigAction uses) dies inside the
         # driver while the reply is awaited, so it stays on the wire, and the host's
         # next statement would take it for its own. Selecto closes such a connection.

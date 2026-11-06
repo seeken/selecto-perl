@@ -58,10 +58,11 @@ Unreleased
       write on its own or, on PostgreSQL, in the host's transaction, and FOR UPDATE
       in one refuses. Otherwise it runs exactly as written, with no qualification,
       and the answer is the driver's. On MySQL, MariaDB and DuckDB nothing can stop a
-      write inside the host's transaction, so a statement beginning WITH that ends in
-      a write refuses there, as does any that takes a sequence's value, reason
-      hand_built_in_host_transaction. A read runs as written, and a function it calls
-      is the host's to undo. Before this, all of these ran as written.
+      write inside the host's transaction, so a statement beginning WITH must go on
+      to SELECT, VALUES or TABLE, and none may take a sequence's value, or it refuses
+      there, reason hand_built_in_host_transaction. A read runs as written, and a
+      function it calls is the host's to undo. Before this, all of these ran as
+      written.
       PostgreSQL: every read and stream is READ ONLY and ends in ROLLBACK or, in
       the host's transaction, in a rollback to its savepoint, and a bounded
       stream does so per fetch, so the host can write between fetches. So a

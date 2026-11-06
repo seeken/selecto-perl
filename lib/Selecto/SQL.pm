@@ -1274,9 +1274,20 @@ sub _admit_hand_built {
 # text stands whole, words in literals and all: no lexer has to agree with the server.
 sub _hand_built_text {
     my ($sql) = @_;
-    return $sql if $sql =~ m{/\*|--|\#|\\|\[|\$(?!\d)};
+    return $sql unless _hand_built_one_reading($sql);
     (my $text = $sql) =~ s/('[^']*')|("[^"]*"|`[^`]*`)/defined($1) ? "\x01" : $2/ge;
     return index($text, q{'}) >= 0 ? $sql : $text;
+}
+
+sub _hand_built_one_reading { return $_[0] =~ m{/\*|--|\#|\\|\[|\$(?!\d)} ? 0 : 1; }
+
+# What a statement that begins WITH goes on to do: the word after its list, with every
+# parenthesis taken out. Undef if the list cannot be followed.
+sub _hand_built_main {
+    my ($text) = @_;
+    1 while $text =~ s/\([^()]*\)/ /g;
+    my $name = qr/(?:"[^"]*"|`[^`]*`|\w+)\s*AS\s*(?:(?:NOT\s+)?MATERIALIZED\s*)?/i;
+    return $text =~ /\AWITH\s+(?:RECURSIVE\s+)?$name(?:,\s*$name)*(\w+|\)|\z)/i ? $1 : undef;
 }
 
 # Past any comments and opening parentheses.
@@ -1292,16 +1303,26 @@ sub _hand_built_refusal { return undef; }
 
 # Where nothing can stop a write (a host's transaction on MySQL, MariaDB and DuckDB)
 # the text has to show none, and a hand-built read then runs as written. _admit_hand_built
-# leaves two ways for a statement to write there: one that begins WITH can end in a
-# write of its own, and any can take a sequence's next value. REPLACE(, INSERT( and
-# TRUNCATE( are functions. A function the host wrote is the host's, as a view's is.
+# leaves two ways for a statement to write there. One that begins WITH can go on to
+# write: it must go on to read, by name, not merely not say UPDATE, and where the text
+# has more than one reading it must not hold a writing word either. And any can take
+# a sequence's next value, comments or not. A function the host wrote is the host's, as
+# a view's is, and REPLACE( in a SELECT is a function.
 sub _refuse_hand_built_write {
     my ($self, $statement) = @_;
     return unless _hand_built($statement);
-    my $text = _hand_built_text($statement->sql) =~ s/\bFOR\s+UPDATE\b//gir;
-    my $writes = _hand_built_start($text) =~ /\AWITH\b/i && $text =~ /\b(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b(?!\s*\()/i;
+    my $sql = $statement->sql;
+    my $text = _hand_built_text($sql);
+    my $start = _hand_built_start($text);
+    my $writes = 0;
+    if ($start =~ /\AWITH\b/i) {
+        my $main = _hand_built_main($start);
+        $writes = !defined($main) || $main !~ /\A(?:SELECT|VALUES|TABLE|\)|)\z/i
+            || (!_hand_built_one_reading($sql) && ($text =~ s/\bFOR\s+UPDATE\b//gir) =~ /\b(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b/i) ? 1 : 0;
+    }
+    my $sequence = qr/\b(?:NEXTVAL|SETVAL)["`]?\s*\(|\bNEXT\s+VALUE\s+FOR\b/i;
     Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement that may write cannot run inside a host transaction here',
-        {reason => 'hand_built_in_host_transaction'}) if $writes || $text =~ /\b(?:NEXTVAL|SETVAL)["`]?\s*\(|\bNEXT\s+VALUE\s+FOR\b/i;
+        {reason => 'hand_built_in_host_transaction'}) if $writes || $text =~ $sequence || ($text =~ s{/\*.*?\*/|--[^\n]*|\#[^\n]*}{ }gsr) =~ $sequence;
     return;
 }
 

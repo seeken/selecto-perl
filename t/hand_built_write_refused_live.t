@@ -5,6 +5,7 @@ use Test::More;
 use DBI ();
 use Mojo::URL;
 use Scalar::Util qw(blessed);
+use Time::HiRes ();
 use Selecto;
 use Selecto::Statement;
 use Selecto::PostgreSQL ();
@@ -87,8 +88,11 @@ SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; int
         is($state->(), $clean, 'and nothing written');
         $dbh->disconnect;
     }
-    # A hand-built read in the host's transaction keeps its table's lock, literals or not.
-    for my $sql ('SELECT id FROM public.hb_t WHERE id = 1', q{SELECT id FROM public.hb_t WHERE note <> 'update'}) {
+    # A hand-built read in the host's transaction keeps its table's lock, whatever its
+    # words: the plan says what it does, not the text.
+    $admin->do('ALTER TABLE hb_t ADD COLUMN "delete" TEXT, ADD COLUMN "update" TEXT');
+    for my $sql ('SELECT id FROM public.hb_t WHERE id = 1', q{SELECT id FROM public.hb_t WHERE note <> 'update'}, q{SELECT "delete" FROM public.hb_t}, q{SELECT id, "update" FROM public.hb_t},
+        q{SELECT id AS "merge" FROM public.hb_t}, q{SELECT id FROM public.hb_t WHERE note <> 'delete' /* c */}, q{WITH "update" AS (SELECT id FROM public.hb_t) SELECT id FROM "update"}) {
         my $dbh = TestPostgreSQL->connect;
         my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
         $dbh->begin_work;
@@ -101,6 +105,35 @@ SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; int
         $admin->do('ALTER TABLE hb_t DROP COLUMN extra') if $altered;
         $dbh->disconnect;
     }
+    # One that will refuse keeps nothing: planning it took a lock, which goes back.
+    for my $sql (q{WITH w AS (DELETE FROM public.hb_t RETURNING id) SELECT id FROM w}, 'SELECT id FROM public.hb_t FOR UPDATE', 'SELECT id FROM public.hb_t FOR SHARE') {
+        my $dbh = TestPostgreSQL->connect;
+        $dbh->begin_work;
+        is($outcome->(Selecto::PostgreSQL->new(dbh => $dbh), 'postgresql', $sql), 'refused', "refused: $sql");
+        is(($admin->selectrow_array(q{SELECT count(*) FROM pg_locks WHERE relation = 'hb_t'::regclass AND mode <> 'AccessShareLock' AND pid = ?}, undef, $dbh->{pg_pid}))[0], 0, 'and no lock of a writer stays');
+        $dbh->rollback;
+        $dbh->disconnect;
+    }
+    # The host's deadline covers the plan: a table another session holds cannot keep a read past it.
+    {
+        my $locker = TestPostgreSQL->connect;
+        $locker->begin_work;
+        $locker->do('LOCK TABLE hb_t IN ACCESS EXCLUSIVE MODE');
+        my $dbh = TestPostgreSQL->connect;
+        $dbh->begin_work;
+        $dbh->do(q{SET LOCAL statement_timeout = '200ms'});
+        my $started = Time::HiRes::time();
+        my $done = eval { Selecto::PostgreSQL->new(dbh => $dbh)->execute_query(Selecto::Statement->new(sql => 'SELECT id FROM public.hb_t', params => [], columns => ['a'], adapter_name => 'postgresql')); 1 };
+        my $error = $@;
+        ok(!$done, 'a read behind an exclusive lock does not answer');
+        cmp_ok(Time::HiRes::time() - $started, '<', 2, 'and it stops at the deadline');
+        is(blessed($error) && $error->details->{sqlstate}, '57014', 'as a cancellation');
+        $dbh->rollback;
+        $dbh->disconnect;
+        $locker->rollback;
+        $locker->disconnect;
+    }
+    $admin->do('ALTER TABLE hb_t DROP COLUMN "delete", DROP COLUMN "update"');
     # The same with a parameter.
     {
         my $dbh = TestPostgreSQL->connect;
@@ -142,7 +175,9 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
         my $clean = $state->();
         for my $sql (q{INSERT INTO hb_t VALUES (10, 'x')}, q{UPDATE hb_t SET note = 'x'}, q{DELETE FROM hb_t}, q{REPLACE INTO hb_t VALUES (1, 'x')},
             ($name eq 'mariadb' ? (q{SELECT NEXTVAL(hb_s)}, q{SELECT NEXT VALUE FOR hb_s}, q{SELECT SETVAL(hb_s, 50)}) : ()),
-            q{WITH c AS (SELECT 1 AS id) DELETE hb_t FROM hb_t JOIN c ON c.id = hb_t.id}, q{WITH c AS (SELECT 'x' AS note) UPDATE hb_t JOIN c SET hb_t.note = c.note}, q{SELECT 1 INTO @hb_x}, q{SELECT id FROM hb_t INTO OUTFILE '/tmp/hb_never'},
+            ($name eq 'mariadb' ? (q{SELECT NEXT /* c */ VALUE FOR hb_s}, q{SELECT NEXTVAL /* c */ (hb_s)}) : ()),
+            q{WITH c AS (SELECT 1 AS id) DELETE hb_t FROM hb_t JOIN c ON c.id = hb_t.id}, q{WITH c AS (SELECT 'x' AS note) UPDATE hb_t JOIN c SET hb_t.note = c.note}, q{SELECT 1 INTO @hb_x},
+            q{WITH c AS (SELECT 1 AS id) UPDATE (hb_t) SET note = 'x'}, q{WITH c AS (SELECT 1 AS id) /* c */ UPDATE (hb_t) SET note = 'x'}, q{WITH RECURSIVE c (id) AS (SELECT 1), d AS (SELECT 2) UPDATE (hb_t) SET note = 'x'}, q{SELECT id FROM hb_t INTO OUTFILE '/tmp/hb_never'},
             q{SELECT @hb_x := 1}, q{SELECT 1 /*! INTO @hb_x */}, q{SELECT 1 /*M! INTO @hb_x */}, q{CALL hb_p()}, q{TRUNCATE hb_t}, q{CREATE TABLE hb_new (id INT)}, q{SELECT 1; DELETE FROM hb_t}, q{COMMIT},
             q{/* c */ DELETE FROM hb_t}, q{# c
 DELETE FROM hb_t}) {
@@ -167,7 +202,8 @@ DELETE FROM hb_t}) {
             # host's rollback undoes it.)
             is($state->(), $clean, ($host ? 'host transaction' : 'alone') . ': a function that writes wrote nothing') or diag $result;
             for my $sql ('SELECT id FROM hb_t', q{SELECT REPLACE(note, 'a', 'b') FROM hb_t}, q{SELECT INSERT(note, 1, 1, 'z') FROM hb_t}, q{SELECT TRUNCATE(1.55, 1)},
-                q{SELECT note FROM hb_t WHERE note <> 'delete; into := update'}, q{WITH c AS (SELECT 'update' AS a) SELECT a FROM c}) {
+                q{SELECT note FROM hb_t WHERE note <> 'delete; into := update'}, q{WITH c AS (SELECT 'update' AS a) SELECT a FROM c},
+                q{WITH c (a) AS (SELECT 1), d AS (SELECT REPLACE('a', 'a', 'b') AS b) SELECT a, REPLACE(b, 'b', 'c') FROM c, d}, q{WITH `update` AS (SELECT 1 AS a) SELECT a FROM `update`}, ($name eq 'mysql' ? q{(WITH c AS (SELECT 1 AS a) SELECT a FROM c)} : ())) {
                 $dbh->begin_work if $host;
                 is($outcome->($adapter, $name, $sql), 'answered', ($host ? 'in a host transaction' : 'alone') . ": a read reads as written: $sql");
                 $dbh->rollback if $host;

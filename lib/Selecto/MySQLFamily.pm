@@ -159,6 +159,7 @@ sub compile {
     my ($self, $domain, $query) = @_;
     my $top = !$self->{_selecto_in_compile};
     local $self->{_selecto_in_compile} = 1;
+    local $self->{_selecto_operation} = 1;
     # Column data types read for zone-independent TIMESTAMP scope compares,
     # once per relation per compile.
     local $self->{_selecto_column_catalog} = $top ? {} : $self->{_selecto_column_catalog};
@@ -245,6 +246,7 @@ sub _apply_formatters {
 
 sub stream_query {
     my ($self, $statement, %options) = @_;
+    local $self->{_selecto_operation} = 1;
     Selecto::Error->throw('unsupported_feature', 'MySQL-family date formats cannot be streamed')
         if blessed($statement) && $statement->{_selecto_formatters};
     my $state = $self->_require_session;
@@ -1548,10 +1550,11 @@ sub normalize_error {
     $errno //= 1317 if $text =~ /\bQuery execution was interrupted\b/;
     # Not the database's: an exception that passed through, a host's alarm say. An
     # unsafe signal handler's dies inside the driver with a reply unread, whichever
-    # statement it was, and this is where every failure comes.
+    # statement it was, and this is where every failure comes. Inside Selecto's own
+    # operations it stands as it came, so a host's timeout stays the host's.
     if (!defined($errno) && !blessed($error) && eval { $dbh->isa('DBI::db') } && $text !~ /\bDBD::|\bDBI\b|database/) {
         $self->_close_session('the connection lost its place') if eval { $dbh->{Active} } && !$self->_in_step;
-        return $error;
+        return $error if $self->{_selecto_operation};
     }
     return $self->SUPER::normalize_error($error) unless defined($errno) && "$errno" =~ /\A\d+\z/;
     if ($errno == 1062) {
@@ -2888,6 +2891,7 @@ sub _column_types {
 # canonical as usual.
 sub execute_query {
     my ($self, $statement, %options) = @_;
+    local $self->{_selecto_operation} = 1;
     my $state = $self->_require_session;
     $self->_refuse_read_temporary_shadows($statement);
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
@@ -3342,6 +3346,7 @@ sub _execute_statement {
 # writes nested inside it are not checked again.
 sub _with_verified_session {
     my ($self, $write, $work) = @_;
+    local $self->{_selecto_operation} = 1;
     return $work->() if $self->{_selecto_session_verified};
     my $state = $self->_require_session(write => $write);
     local $self->{_selecto_session_verified} = $state;
