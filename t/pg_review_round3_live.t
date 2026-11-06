@@ -33,6 +33,12 @@ my $connect = sub {
 };
 my $x = 'Selecto::Expression';
 my $admin = $connect->();
+END {
+    eval {
+        $admin->do($_) for 'DROP SCHEMA IF EXISTS r3d_evil CASCADE', 'DROP TABLE IF EXISTS r3b_acc, r3b_items, r3b_link, r3d_items, r3d_w, r3i CASCADE',
+            map { "DROP FUNCTION IF EXISTS public.$_ CASCADE" } qw(r3k_a r3k_b r3t_aud r3t_upd);
+    } if $admin;
+}
 my $outcome = sub {
     my ($work) = @_;
     my $value = eval { $work->() };
