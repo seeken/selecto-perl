@@ -2399,6 +2399,25 @@ sub _pg_extension_operators {
         next if $schema eq 'pg_catalog';
         $casts{"$schema." . $name->($tokens->[$k + 3])} = "$tokens->[$k + 1][1].$tokens->[$k + 3][1]";
     }
+    # x::public.citext, x::citext and CAST(x AS citext) too: a name that is no
+    # extension's type finds nothing. (AS name) may be a column alias, so a bare
+    # name is spelled quoted, which to_regtype cannot refuse as a keyword. It
+    # resolves as the statement will, under the pinned search_path.
+    for my $k (0 .. $#$tokens - 1) {
+        my $first = $tokens->[$k + 1];
+        my $after = $k + 2 <= $#$tokens ? $tokens->[$k + 2][1] : '';
+        my $form = $tokens->[$k][1] eq '::' ? 'cast' : uc($tokens->[$k][1]) eq 'AS' && $after eq ')' ? 'as' : next;
+        next unless $first->[0] =~ /\A(?:id|qid)\z/;
+        my $second = $form eq 'cast' && $after eq '.' && $k + 3 <= $#$tokens ? $tokens->[$k + 3] : undef;
+        if ($second) {
+            next if $name->($first) eq 'pg_catalog' || $second->[0] !~ /\A(?:id|qid)\z/;
+            $casts{$name->($first) . '.' . $name->($second)} = "$first->[1].$second->[1]";
+        } else {
+            my $bare = $name->($first);
+            next if Selecto::PostgreSQL::Qualify::_string_type($bare);
+            $casts{$bare} = '"' . ($bare =~ s/"/""/gr) . '"';
+        }
+    }
     return {} unless %rels || %functions || %casts;
     my @rels = sort keys %rels;
     my @functions = sort keys %functions;
