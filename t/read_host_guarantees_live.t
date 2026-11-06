@@ -95,6 +95,29 @@ subtest postgresql => sub {
         $d->disconnect;
     }
 
+    # A relation that cannot be held is the read's to report, and costs the host nothing.
+    {
+        my ($h, $eh) = $open->('r66_gone');
+        $h->begin_work;
+        $h->do('INSERT INTO r66_other VALUES (1)');
+        ok(!eval { $eh->all($eh->query->select('id')); 1 }, 'a read of a missing relation refuses in a host transaction');
+        is(($h->selectrow_array('SELECT count(*) FROM r66_other'))[0], 1, 'and the host transaction lives on');
+        $h->rollback;
+        # A lock wait while holding stands, as the read's would.
+        my ($l, $el) = $open->();
+        $admin->begin_work;
+        $admin->do('LOCK TABLE r66_doctors IN ACCESS EXCLUSIVE MODE');
+        $l->begin_work;
+        $l->do('INSERT INTO r66_other VALUES (1)');
+        $l->do(q{SET LOCAL lock_timeout = '100ms'});
+        ok(!eval { $el->all($el->query->select('id')); 1 }, 'a lock timeout in a read fails');
+        is($state->($@), '55P03', 'as 55P03');
+        is(($l->selectrow_array('SELECT count(*) FROM r66_other'))[0], 1, 'and the host keeps its write');
+        $l->rollback;
+        $admin->rollback;
+        $_->disconnect for $h, $l;
+    }
+
     # (d) A cancellation and a deadlock keep their SQLSTATE, on their own and in a
     # host transaction, which survives what can be survived.
     my ($a, $ea) = $open->('r66_slow');

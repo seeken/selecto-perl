@@ -1967,8 +1967,9 @@ sub _guarded_read {
 
 # Inside the host's transaction, before a read's savepoint: the transaction's
 # first snapshot, and the table locks the read would have held to its end. LIMIT 0
-# runs nothing a view calls. A relation that fails here is the read's to report,
-# so a savepoint of its own keeps the failure from the host.
+# runs nothing a view calls. A relation that is missing or not readable is the
+# read's to report, so a savepoint of its own keeps that from the host; anything
+# else, a cancellation or a lock timeout, stands.
 sub _pg_hold_relations {
     my ($self, $source) = @_;
     my $relations = blessed($source) && $source->can('relations') ? $source->relations : undef;
@@ -1977,8 +1978,11 @@ sub _pg_hold_relations {
     my @sql = ("SAVEPOINT $savepoint", (map { "SELECT 1 FROM $_ LIMIT 0" } @{$relations // []}), 'SELECT 1', "RELEASE SAVEPOINT $savepoint");
     my $held = eval { local $dbh->{PrintError} = 0; defined($dbh->do(join '; ', @sql)) };
     return if $held;
+    my $failure = $self->normalize_error($@);
+    my $state = eval { $dbh->state } // '';
     eval { local $dbh->{PrintError} = 0; $dbh->do("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint") }
         or die $self->_transaction_control_error($@);
+    die $failure unless $state =~ /\A42/;
     return;
 }
 
