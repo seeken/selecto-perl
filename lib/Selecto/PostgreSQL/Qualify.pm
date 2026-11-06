@@ -118,22 +118,6 @@ sub _unicode_identifier {
     return '"' . ($text =~ s/"/""/gr) . '"';
 }
 
-# USING and NATURAL join on an = PostgreSQL looks up through the session, with
-# nothing here to name: public.=(varchar, varchar) would be taken for a varchar pair.
-sub _refuse_implicit_join {
-    my ($tokens) = @_;
-    for my $k (0 .. $#$tokens) {
-        next unless $tokens->[$k][0] eq 'id';
-        my $up = uc $tokens->[$k][1];
-        my $next = $k < $#$tokens ? uc $tokens->[$k + 1][1] : '';
-        my $using = $up eq 'USING' && $next eq '(' && !($k + 2 <= $#$tokens && uc($tokens->[$k + 2][1]) =~ /\A(?:SELECT|WITH|VALUES)\z/);
-        next unless $using || ($up eq 'NATURAL' && $next =~ /\A(?:JOIN|INNER|LEFT|RIGHT|FULL)\z/);
-        Selecto::Error->throw('query_rule_not_evaluable', 'a join on USING or NATURAL has an operator that cannot be named here',
-            {reason => 'implicit_join_operator'});
-    }
-    return;
-}
-
 # ---- Parsing into a light tree --------------------------------------------
 #
 # The token stream is read into nodes: an expression run is a sequence of
@@ -150,7 +134,6 @@ sub qualify {
     my ($sql, $functions, $columns) = @_;
     my $state = new_state($functions, $columns);
     my $tokens = tokenize($sql);
-    _refuse_implicit_join($tokens);
     # $columns: {relations => {"schema.table" => {column => {op => schema}}}}
     # (columns of extension member types, or domains over one, by relation).
     # Every name here is the catalog's exact name: a reference is folded once,
@@ -461,6 +444,21 @@ sub _operator {
     return {kind => 'op', op => $op, schema => $schema, explicit => 1};
 }
 
+# Whether the comma before $k separates FROM items, not select items or arguments.
+sub _in_from_list {
+    my ($tokens, $k) = @_;
+    my $depth = 0;
+    for (my $j = $k - 1; $j >= 0; $j--) {
+        my $t = _upper($tokens->[$j]);
+        $depth++ if $tokens->[$j][1] eq ')';
+        if ($tokens->[$j][1] eq '(') { return 0 unless $depth; $depth--; next }
+        next if $depth;
+        return 1 if $t eq 'FROM';
+        return 0 if $t =~ /\A(?:SELECT|WHERE|GROUP|ORDER|HAVING|SET|VALUES|RETURNING)\z/;
+    }
+    return 0;
+}
+
 sub _tokens_at { my ($tokens, $k) = @_; return $k < @$tokens ? $tokens->[$k][1] : '' }
 
 # An array expression cast to a pg_catalog array type: undef, as the operand of
@@ -633,7 +631,7 @@ sub _atom {
             push @kinds, $tokens->[$$pos + 1][0];
             $$pos += 2;
         }
-        my $from = $here > 0 && (_upper($tokens->[$here - 1]) =~ /\A(?:FROM|JOIN|LATERAL)\z/ || $tokens->[$here - 1][1] eq ',');
+        my $from = $here > 0 && (_upper($tokens->[$here - 1]) =~ /\A(?:FROM|JOIN|LATERAL)\z/ || ($tokens->[$here - 1][1] eq ',' && _in_from_list($tokens, $here)));
         if ($from && _peek_punct($tokens, $$pos, '(') && @names <= 2
             && !(@names == 1 && $kinds[0] eq 'id' && $state->{functions}{lc $names[0]})
             && !(@names == 2 && _unquote($names[0]) eq 'pg_catalog')) {
@@ -761,8 +759,9 @@ sub _atom {
             } elsif (my $named = !_declares_columns($tokens, $here, $$pos) && _resolve_call($state, \@names, \@kinds, \@arguments)) {
                 $name = $named;
                 my $info = $state->{columns}{functions}{_unquote($names[-1])};
-                my $returns = ref($info) eq 'HASH' ? $info->{state} // '' : '';
-                $known = $returns eq 'string' ? 'string' : $returns eq 'known' ? 1 : $known;
+                # (An overload of a pg_catalog name returns what pg_catalog's does.)
+                my $returns = ref($info) eq 'HASH' ? $info->{state} // '' : $state->{functions}{lc $names[-1]} // '';
+                $known = $returns eq 'string' ? 'string' : $returns eq 'known' || $returns eq '1' ? 1 : $known;
                 $class = {unknown => 1, over_extension => 1} if $returns eq 'unknown';
             } elsif (@names == 1 && $kinds[0] eq 'id' && $state->{functions}{lc $names[0]}) {
                 $name = "pg_catalog.$names[0]";
@@ -1671,51 +1670,22 @@ sub _grouping_position {
     return 0;
 }
 
-# R58, R62: Selecto does not redo PostgreSQL's overload resolution. Of the functions
-# a call can reach by name and argument count, those its arguments could not be
-# given do not count. pg_catalog's stand unless an extension's could take an argument
-# of an extension type too: which one wins is not worked out here, so that refuses
-# (strpos(ci, 'O') is citext's). Outside pg_catalog a function must be an extension's,
-# named or not: one that is not, beside one that is, is a plant until shown otherwise.
-# What is left must be one extension's in one schema, whose overloads PostgreSQL then
-# resolves itself; anything else refuses function_ambiguous. An argument is never
-# cast to fit. Returns the qualified name, or undef for pg_catalog's own handling.
+# R60, R62: which overload a bare call means is PostgreSQL's to say. pg_catalog's name
+# is written only where no extension's function of that name could take the
+# arguments: where one could (strpos(ci, 'O') is citext's, and a keyword-named
+# delete(h, 'a') is hstore's), the call stays as written, resolved under the pin.
+# Returns the name to write, or undef for the usual handling.
 sub _resolve_call {
     my ($state, $names, $kinds, $trees) = @_;
-    return undef unless $state->{scopes} && @$names <= 2;
+    return undef unless $state->{scopes} && @$names == 1;
     my $table = $state->{columns}{host_functions};
     return undef unless ref($table) eq 'HASH';
-    my $fname = _unquote($names->[-1]);
-    my $schema = @$names == 2 ? _unquote($names->[0]) : '';
-    return undef if $schema eq 'pg_catalog';
-    return undef if @$names == 1 && $kinds->[0] eq 'qid' && !$table->{"\0$fname"};
-    my $info = $table->{"$schema\0$fname"} // return undef;
-    my @all = @{$info->{candidates} // []};
-    my $refuse = sub {
-        Selecto::Error->throw('query_rule_not_evaluable', 'a function call must resolve to exactly one function of an extension or of pg_catalog',
-            {reason => $_[0], function => $fname});
-    };
-    return undef unless @all;
+    my $info = $table->{"\0" . _unquote($names->[0])} // return undef;
     my @classes = map { _tree_class($state, $_) } @$trees;
-    my @reach = grep {
-        my $c = $_;
-        @classes >= $c->{nargs} - ($c->{defaults} // 0) && (defined($c->{variadic}) || @classes <= $c->{nargs})
-    } @all;
-    my @accept = grep { _accepts($_, \@classes) } @reach;
-    my @catalog = grep { $_->{schema} eq 'pg_catalog' } @accept;
-    my @extension = grep { defined $_->{extension} && $_->{schema} ne 'pg_catalog' } @accept;
-    my @others = grep { !defined($_->{extension}) && $_->{schema} ne 'pg_catalog' } @accept;
-    if (@catalog || (!@accept && grep { $_->{schema} eq 'pg_catalog' } @all)) {
-        $refuse->('function_ambiguous') if @extension && grep { $_->{entry} || $_->{unknown} } @classes;
-        return undef if $state->{functions}{lc $fname};
-        return 'pg_catalog.' . _quote_name($fname);
-    }
-    $refuse->('function_ambiguous') if !@accept || @others;
-    # All of one extension in one schema: naming the schema leaves the overload to
-    # PostgreSQL, among exactly what it would have chosen from.
-    my %homes = map { ("$_->{schema}\0$_->{extension}" => 1) } @extension;
-    $refuse->('function_ambiguous') unless keys(%homes) == 1;
-    return _quote_name($extension[0]{schema}) . '.' . _quote_name($fname);
+    my @extension = grep { $_->{schema} ne 'pg_catalog' && defined $_->{extension} && _accepts($_, \@classes) } @{$info->{candidates} // []};
+    return undef unless @extension;
+    return $names->[0] if $KEYWORD{uc $names->[0]} || grep { $_->{entry} || $_->{unknown} } @classes;
+    return undef;
 }
 
 # Whether name(...) at $k is a declaration with a column list, not a call: an alias
@@ -1725,8 +1695,6 @@ sub _declares_columns {
     return 1 if $k > 0 && uc($tokens->[$k - 1][1]) eq 'AS';
     return $after + 1 < @$tokens && uc($tokens->[$after][1]) eq 'AS' && $tokens->[$after + 1][1] =~ /\A(?:\(|NOT|MATERIALIZED)\z/i ? 1 : 0;
 }
-
-sub _quote_name { return '"' . ($_[0] =~ s/"/""/gr) . '"' }
 
 # Whether a candidate could take these arguments. What is not known counts as yes.
 sub _accepts {
