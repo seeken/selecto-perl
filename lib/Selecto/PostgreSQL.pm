@@ -1787,10 +1787,10 @@ sub _pg_admit_session {
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary type of the session shadows a type name',
         {reason => 'temporary_shadow'}) if $types;
     my $session = _pg_state_row(\@state);
-    # R65: bound values are sent as UTF-8. Read as LATIN1 they are other
+    # R65: bound values are sent as UTF-8 (the server reports UNICODE as set). Read as LATIN1 they are other
     # values: a tenant name with an accent becomes another name, which is another tenant's row.
     Selecto::Error->throw('query_rule_not_evaluable', "the session's client_encoding must be UTF8",
-        {reason => 'client_encoding'}) unless uc($session->{settings}{client_encoding} // '') eq 'UTF8';
+        {reason => 'client_encoding'}) unless uc($session->{settings}{client_encoding} // '') =~ /\A(?:UTF8|UNICODE)\z/;
     return $session;
 }
 

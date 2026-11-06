@@ -68,6 +68,31 @@ for my $name (sort keys %how) {
 }
 is($admin->selectrow_array(q{SELECT count(*) FROM r65_t WHERE note = 'W'}), 0, 'nothing was written');
 
+# Every other encoding the server will take is refused, as the server reports
+# it, whatever the driver believes. UNICODE and UTF-8 are UTF8's own names.
+{
+    my $names = $admin->selectcol_arrayref(q{SELECT DISTINCT pg_catalog.pg_encoding_to_char(g) FROM pg_catalog.generate_series(0, 63) AS g
+        WHERE pg_catalog.pg_encoding_to_char(g) <> '' ORDER BY 1});
+    my ($set, @missed) = (0);
+    my $dbh = TestPostgreSQL->connect;
+    my $e = Selecto::Engine->new(domain => $domain->('r65_t'), adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 'cafe');
+    for my $name (grep { $_ ne 'UTF8' } @$names) {
+        next unless eval { $dbh->do("SET client_encoding = '$name'"); 1 };
+        $set++;
+        my $refuses = $refused->(sub { $e->all($e->query->select('id')) });
+        my $stream = $refused->(sub { my $s = $e->stream($e->query->select('id'), bounded => 1); 1 while $s->next });
+        push @missed, $name unless $refuses && $stream;
+        $dbh->do(q{SET client_encoding = 'UTF8'});
+    }
+    is_deeply(\@missed, [], "all $set other encodings the server accepts refuse, read and bounded stream");
+    cmp_ok($set, '>=', 30, 'and that covers the server-settable ones');
+    for my $name (qw(UNICODE UTF8 utf8 UTF-8 utf-8)) {
+        $dbh->do("SET client_encoding = '$name'");
+        ok(eval { $e->all($e->query->select('id')); 1 }, "$name is UTF8");
+    }
+    $dbh->disconnect;
+}
+
 # A change made during the statement is seen by the session check.
 {
     my $dbh = TestPostgreSQL->connect;
