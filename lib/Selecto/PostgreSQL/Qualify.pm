@@ -146,10 +146,10 @@ sub _sequence {
         if (@run) {
             $lone = @run == 1 && $run[0]{kind} eq 'atom' && !@parts ? $run[0] : undef;
             $first = $lone if !@parts;
-            push @each, @run == 1 && $run[0]{kind} eq 'atom' ? $run[0] : undef;
             my $alone = !@parts;
             push @parts, _emit_run($state, \@run);
             $whole = $alone ? $state->{run_tree} : undef;
+            push @each, $state->{run_tree};
             @run = ();
         }
     };
@@ -183,8 +183,13 @@ sub _sequence {
             my $construct = _construct($state, $tokens, $pos, \@run);
             if (defined $construct) { push @run, $construct; next }
         }
-        # x IS [NOT] NULL, TRUE...: a test of x, which types nothing around it.
-        _consume({atom => $_}) for $up eq 'IS' ? grep { $_->{kind} eq 'atom' } @run : ();
+        # x IS [NOT] NULL: a test of x, which types nothing around it. (IS TRUE
+        # tests a boolean the run itself computes.)
+        if ($up eq 'IS' && @run == 1 && $run[0]{kind} eq 'atom') {
+            my $next = _upper($tokens->[$$pos + 1]);
+            $next = _upper($tokens->[$$pos + 2]) if $next eq 'NOT';
+            _consume({atom => $run[0]}) if $next eq 'NULL';
+        }
         my $atom = _atom($state, $tokens, $pos);
         if (defined $atom) {
             # Two atoms in a row (an alias after an expression): a new run.
@@ -226,8 +231,8 @@ sub _sequence {
     $state->{lone_atom} = @parts == 1 ? $lone : undef;
     # The first argument, when it is one atom (a function's first argument).
     $state->{first_atom} = $first;
-    # Each argument, undef for one that is not one atom.
-    $state->{each_atom} = \@each;
+    # Each argument's tree, undef for one that could not be read as one.
+    $state->{each_tree} = \@each;
     return join ' ', @parts;
 }
 
@@ -305,9 +310,12 @@ sub _construct {
         my $inner = $at + 2 < @$tokens ? _upper($tokens->[$at + 2]) : '';
         $$pos = $at + 2;
         if ($inner eq 'SELECT' || $inner eq 'WITH' || $inner eq 'VALUES') {
+            # The subquery's own output type, when it is known to be none of an
+            # extension's: x IN (SELECT 'a') compares with text.
+            my $output = $state->{scopes} ? _subquery_class($state, $tokens->[$at + 1][2]) : undef;
             my $query = _sequence($state, $tokens, $pos, ')');
             _expect($tokens, $pos, ')');
-            my $op = _op_sql($state, {kind => 'op', op => $negate ? '<>' : '='}, $operand, undef);
+            my $op = _op_sql($state, {kind => 'op', op => $negate ? '<>' : '='}, $operand, $output ? {atom => {sql => '', class => $output}} : undef);
             $query = "SELECT CAST((q.v) AS $state->{op_cast_right}) FROM ($query) AS q(v)" if defined $state->{op_cast};
             $sql = '((' . _cast_operand($state, $left) . ") $op " . ($negate ? 'ALL' : 'ANY') . " ($query))";
         } else {
@@ -474,38 +482,46 @@ sub _atom {
             _expect($tokens, $pos, ',');
             my $b = _read_run($state, $tokens, $pos, undef);
             _expect($tokens, $pos, ')');
+            # Its type is its first argument's, resolved against the second:
+            # read before the comparison consumes their references.
+            my ($first, $second) = $state->{scopes} ? map { _tree_class($state, $_) } $a, $b : ({}, {});
             my $left = _render($state, $a);
             my $right = _render($state, $b);
             my $op = _op_sql($state, {kind => 'op', op => '='}, $a, $b);
-            # Its type is its first argument's.
-            my $first = $state->{scopes} ? _tree_class($state, $a) : {};
-            return _postfix($state, $tokens, $pos,
-                '(CASE WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . ") THEN NULL ELSE ($left) END)",
-                undef, $first->{string} || $first->{untyped} ? 'string' : undef, undef, $mark);
+            # citext against a string compares as text, so the result is text.
+            my $text_result = $first->{entry} && $first->{entry}{"\0strcat"} && $second->{string};
+            my $result = $text_result ? undef : $first->{entry} // ($first->{untyped} ? $second->{entry} : undef);
+            my $text = '(CASE WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . ") THEN NULL ELSE ($left) END)";
+            my $atom = _postfix($state, $tokens, $pos, $text, undef,
+                !$result && ($text_result || $first->{string} || $first->{untyped}) ? 'string' : undef, $result, $mark);
+            $atom->{class} = $first if $first->{unknown} && $atom->{sql} eq $text;
+            return $atom;
         }
         my $open = $tokens->[$$pos + 1][1];
         my $close = $open eq '(' ? ')' : ']';
         my $open_at = $$pos + 1;
         $$pos += 2;
         my $inner = _sequence($state, $tokens, $pos, $close);
+        my $lone_atom = $state->{lone_atom};
         _expect($tokens, $pos, $close);
         $sql = "$text$open$inner$close";
         # The comma forms of SUBSTRING and OVERLAY are plain calls, resolved
         # through the session (R60); the keyword forms are pg_catalog's.
         $sql = "pg_catalog.$sql" if $up =~ /\A(?:SUBSTRING|OVERLAY)\z/ && _comma_form($tokens, $open_at);
+        # x = ANY (array column): the comparison is over its element type.
+        if ($up =~ /\A(?:ANY|ALL|SOME)\z/ && $state->{scopes} && $lone_atom && ref($lone_atom->{column}) eq 'HASH') {
+            my $array = _resolve_column($state, $lone_atom->{column}{at}, $lone_atom->{column}{names});
+            $class = ref($array) ne 'HASH' ? undef : $array->{"\0elem"} ? {entry => $array->{"\0elem"}} : undef;
+        }
         # These return a type of their own (pg_catalog's, or the CAST
         # target's; GROUPING's is integer); COALESCE, GREATEST, LEAST, ARRAY, ROW and the
         # quantifiers take their arguments' type.
         $known = 1 if $up =~ /\A(?:CAST|EXISTS|EXTRACT|TRIM|SUBSTRING|POSITION|OVERLAY|GROUPING)\z/;
         $known = 'string' if $up =~ /\A(?:TRIM|SUBSTRING|OVERLAY)\z/
             || ($up eq 'CAST' && $inner =~ /.*\bAS\s+(\S.*?)\s*\z/si && _string_type($1));
-        # COALESCE and the like over strings alone are strings.
+        # COALESCE and the like resolve their arguments like a CASE's results.
         if ($up =~ /\A(?:COALESCE|GREATEST|LEAST)\z/ && $state->{scopes}) {
-            my $each = $state->{each_atom};
-            $known = 'string' if @$each && !grep {
-                my $class = $_ ? _class_of($state, $_) : {};
-                !$class->{string} && !$class->{untyped};
-            } @$each;
+            $class = _case_class(map { $_ ? _tree_class($state, $_) : undef } @{$state->{each_tree}});
         }
         # A cast to an extension type (or a domain over one) has that type:
         # its operators are the extension's (the guarded insert admission's
@@ -627,6 +643,7 @@ sub _atom {
             my $inner = _sequence($state, $tokens, $pos, ')');
             my $first = $state->{first_atom};
             my $lone = $state->{lone_atom};
+            my $argument = $state->{lone_class};
             _expect($tokens, $pos, ')');
             my $name = join '.', @names;
             # R49c: a function the extension of its first argument's type
@@ -661,6 +678,8 @@ sub _atom {
                 # a pg_catalog type, whatever its arguments.
                 my $returns = $state->{functions}{lc $names[0]};
                 $known = $returns eq 'string' ? 'string' : 1 if $returns ne 'polymorphic';
+                # One argument the result follows: max(text) is text.
+                $known = 'string' if $returns =~ /\A(?:polymorphic|follows)\z/ && $argument && ($argument->{string} || $argument->{untyped});
             } elsif (@names == 1 && $kinds[0] eq 'id' && $KEYWORD{uc $names[0]}) {
                 Selecto::Error->throw('query_rule_not_evaluable', 'a function named like an SQL keyword cannot be qualified',
                     {reason => 'function_keyword', function => lc $names[0]});
@@ -670,7 +689,12 @@ sub _atom {
                 # is plain, whatever its arguments (similarity, nlevel, ST_X).
                 my $info = $state->{columns}{functions}{_unquote($names[-1])};
                 my $returns = ref($info) eq 'HASH' ? $info->{state} // '' : '';
-                $known = $returns eq 'string' ? 'string' : $returns eq 'known' ? 1 : $known;
+                # Already qualified to pg_catalog: what it says of that name.
+                $returns = $state->{functions}{_unquote($names[-1])} // '' if @names == 2 && _unquote($names[0]) eq 'pg_catalog';
+                $known = $returns eq 'string' ? 'string' : $returns eq 'known' || $returns eq '1' ? 1 : $known;
+                # A function that can return an extension type, whatever its
+                # arguments' types (citext(x)).
+                $class = {unknown => 1, over_extension => 1} if $returns eq 'unknown';
             }
             $sql = "$name($inner)";
             # FILTER (WHERE ...) / OVER (...) / WITHIN GROUP (...) follow.
@@ -698,7 +722,8 @@ sub _atom {
     # A class of plain or string results is known; one that may be an extension
     # type stays on the atom, unless a postfix changes what the atom is.
     if ($class && !$known && !$entry) {
-        $known = $class->{string} ? 'string' : 1 if !$class->{unknown} && !$class->{entry};
+        ($entry, $class) = ($class->{entry}, undef) if $class->{entry};
+        $known = $class->{string} ? 'string' : 1 if $class && !$class->{unknown};
         $class = undef if $known;
     }
     my $atom = _postfix($state, $tokens, $pos, $sql, $column, $known, $entry, $mark);
@@ -732,8 +757,15 @@ sub _postfix {
             my $inner = _sequence($state, $tokens, $pos, ']');
             _expect($tokens, $pos, ']');
             $sql .= "[$inner]";
+            # An element of an array column has its element's type.
+            my $array = $state->{scopes} && ref($column) eq 'HASH' && $inner !~ /:/
+                ? _resolve_column($state, $column->{at}, $column->{names}) : undef;
             ($column, $entry) = (undef, undef);
             $known = 0;
+            if (ref($array) eq 'HASH') {
+                $entry = $array->{"\0elem"};
+                $known = 'string' if $array->{"\0elemstr"};
+            }
         } elsif (_upper($t) eq 'AT' && _upper($tokens->[$$pos + 1]) eq 'TIME' && _upper($tokens->[$$pos + 2]) eq 'ZONE') {
             $$pos += 3;
             my $zone = _atom($state, $tokens, $pos);
@@ -879,8 +911,6 @@ sub _render {
     # operator's syntax and takes no parentheses of its own.
     my $quantified = $node->{right} && $node->{right}{atom} && $node->{right}{atom}{sql} =~ /\A(?:ANY|ALL|SOME)\(/i;
     my $op = _op_sql($state, $node->{binary}, $node->{left}, $node->{right});
-    Selecto::Error->throw('query_rule_not_evaluable', 'a quantified comparison cannot take an extension operator here',
-        {reason => 'operand_type_unknown'}) if $quantified && defined $state->{op_cast};
     return '((' . _cast_operand($state, $left) . ") $op" . ($quantified ? " $right)" : ' (' . _cast_right($state, $right) . '))');
 }
 
@@ -932,9 +962,10 @@ sub _op_sql {
         my ($side) = grep { $_ && $_->{atom} && ref($_->{atom}{column}) eq 'HASH' } $l->{ext} ? $left : (), $r->{ext} ? $right : ();
         my $type = $ext->{type} // $ext->{entry}{"\0extdom_type"};
         my $column = $side ? $side->{atom}{column}{names}[-1] : undef;
+        # A fixed message: hosts pass messages on to clients; the type and column
+        # are for the host, in the details.
         Selecto::Error->throw('query_rule_not_evaluable',
-            "the operator $op->{op} is not a member of its extension for these operands"
-                . (defined($type) ? " (type $type" . (defined($column) ? ", column $column" : '') . ')' : ''),
+            'an operator on an extension type is not a member of its extension for these operands',
             {reason => 'operator_not_member', operator => $op->{op}, defined($type) ? (type => $type) : (),
                 defined($column) ? (column => $column) : ()});
     };
@@ -1044,7 +1075,8 @@ sub _operand_class {
 # that type), or {} (a known type that is no extension's).
 sub _class_of {
     my ($state, $atom) = @_;
-    return {untyped => 1} if !defined($atom->{column}) && $atom->{sql} =~ /\A(?:\$\d+|\?|'(?:[^']|'')*'|NULL)\z/i;
+    return {untyped => 1} if !defined($atom->{column}) && $atom->{sql} =~ /\A(\(*)(?:\$\d+|\?|'(?:[^']|'')*'|NULL)(\)*)\z/i
+        && length($1) == length($2);
     return {entry => $atom->{entry}} if $atom->{entry};
     return {} unless $state->{scopes};
     return $atom->{class} if $atom->{class};
@@ -1081,27 +1113,39 @@ sub _tree_class {
     my @sides = map { _tree_class($state, $_) } grep { defined } @{$node}{qw(left right operand)};
     my $text = sub { $_[0]{string} || $_[0]{untyped} || ($_[0]{entry} && $_[0]{entry}{"\0strcat"}) };
     return {string => 1} if $node->{binary} && $op eq '||' && @sides == 2 && !grep { !$text->($_) } @sides;
+    # text || anything else that is no extension's is text too (1 || s.tx).
+    return {string => 1} if $node->{binary} && $op eq '||' && @sides == 2 && grep({ $_->{string} } @sides) && !grep { $_->{entry} || $_->{unknown} } @sides;
     return {unknown => 1} if grep { ($_->{entry} && defined $_->{entry}{"\0type"}) || $_->{unknown} } @sides;
     return {};
 }
 
-# A CASE's type from its results' (R51 amendment 3): strings alone are text,
-# and an extension type in any result leaves the type unresolved, as it is for
-# any expression. undef when a result could not be classed.
+# A CASE's type from its results' (R51 amendment 3), by PostgreSQL's common-type
+# rule: strings alone are text; a string-category extension type beside a
+# pg_catalog string is text, its preferred type; an untyped value takes the
+# others' type, so citext alone or with untyped values is citext. Any other mix
+# with an extension type is not resolved here. undef when a result could not be
+# classed.
 sub _case_class {
     my @results = @_;
     return undef if !@results || grep { !$_ } @results;
-    my ($unknown, $soft, $over, $soft_entry, $plain) = (0, 1, 0, undef, 0);
+    # One extension type, with at most untyped values beside it, is that type.
+    my @typed = grep { !$_->{untyped} } @results;
+    my %types = map { (($_->{entry} ? $_->{entry}{"\0type"} // '' : '') => 1) } @typed;
+    return {entry => $typed[0]{entry}} if @typed && !grep({ !$_->{entry} } @typed) && keys(%types) == 1 && !$types{''};
+    my ($unknown, $soft, $over, $soft_entry, $plain, $string) = (0, 1, 0, undef, 0, 0);
     for my $class (@results) {
         if ($class->{entry} || $class->{unknown}) {
             $unknown = 1;
             $over ||= $class->{entry} ? 1 : $class->{over_extension};
             $soft = 0 unless $class->{entry} ? $class->{entry}{"\0strcat"} : $class->{soft};
             $soft_entry //= $class->{entry} // $class->{soft_entry};
-        } elsif (!$class->{string} && !$class->{untyped}) {
+        } elsif ($class->{string}) {
+            $string = 1;
+        } elsif (!$class->{untyped}) {
             $plain = 1;
         }
     }
+    return {string => 1} if $unknown && $soft && $string && !$plain;
     return {unknown => 1, soft => $soft, over_extension => $over, soft_entry => $soft_entry} if $unknown;
     return $plain ? {} : {string => 1};
 }
@@ -1114,7 +1158,7 @@ sub _subquery_class {
     return undef unless @{$info->{scopes}[$scope]{items}} == 1;
     my $entry = _item_entry($state, $scope, 0, 0) // return undef;
     return {unknown => 1, soft => $entry->{"\0soft"}, over_extension => $entry->{"\0over"}} if $entry->{"\0unknown"};
-    return undef if _is_extension($entry);
+    return {entry => $entry} if _is_extension($entry);
     return $entry->{"\0string"} ? {string => 1} : {};
 }
 
@@ -1427,6 +1471,7 @@ sub _resolve_in {
 sub _source_column {
     my ($state, $source, $column, $guard) = @_;
     my $info = $state->{scopes};
+    return {"\0unknown" => 1} if $source->{star_unknown};
     if (defined $source->{relation}) {
         my $relations = $state->{columns}{relations};
         # A relation the statement names: a column of an extension type has
@@ -1446,6 +1491,15 @@ sub _source_column {
         ($scope, $cols) = ($source->{derived}, $source->{cols});
     }
     return undef unless defined $scope;
+    if (my $star = _star_source($info, $scope)) {
+        return _source_column($state, $star, $column, $guard + 1) unless ref($cols) eq 'ARRAY';
+        my ($position) = grep { $cols->[$_] eq $column } 0 .. $#$cols;
+        return defined($position) ? _item_entry($state, $scope, $position, $guard) : undef;
+    }
+    if (ref($cols) eq 'ARRAY' && $info->{scopes}[$scope]{branches}) {
+        my ($position) = grep { $cols->[$_] eq $column } 0 .. $#$cols;
+        return defined($position) ? _item_entry($state, $scope, $position, $guard) : undef;
+    }
     for my $index (0 .. $#{$info->{scopes}[$scope]{items}}) {
         my $item = _select_item($info, $scope, $index);
         my $output = ref($cols) eq 'ARRAY' && $index < @$cols ? $cols->[$index] : $item->{name};
@@ -1453,6 +1507,18 @@ sub _source_column {
         return _item_entry($state, $scope, $index, $guard);
     }
     return undef;
+}
+
+# The source a SELECT * or SELECT a.* expands, when that is the scope's one item.
+sub _star_source {
+    my ($info, $scope) = @_;
+    my $items = $info->{scopes}[$scope]{items};
+    return undef unless @$items == 1;
+    my @t = map { $info->{tokens}[$_] } @{$items->[0]};
+    return undef unless @t && $t[-1][1] eq '*' && (@t == 1 || (@t == 3 && $t[1][1] eq '.'));
+    my $aliases = $info->{scopes}[$scope]{aliases};
+    return $aliases->{_unquote($t[0][1])} // {star_unknown => 1} if @t == 3;
+    return keys(%$aliases) == 1 ? (values %$aliases)[0] : {star_unknown => 1};
 }
 
 # A select item: its output name (an alias or a bare column's), and the column
@@ -1498,6 +1564,12 @@ sub _item_entry {
         return _common_entry(@entries);
     }
     return undef if $state->{in_branches}{$scope} && $branches && $state->{in_branches}{"$scope.$index"}++;
+    # SELECT *: the item of that position in what it expands, or nothing
+    # known. It is never dropped: a branch left out would type the rest wrongly.
+    if (my $star = _star_source($info, $scope)) {
+        my $inner = defined($star->{derived}) ? $star->{derived} : defined($star->{cte}) ? ($info->{cte}{$star->{cte}} // {})->{scope} : undef;
+        return defined($inner) ? _item_entry($state, $inner, $index, $guard + 1) // {"\0unknown" => 1} : {"\0unknown" => 1};
+    }
     return undef unless $index < @{$info->{scopes}[$scope]{items}};
     my $item = _select_item($info, $scope, $index);
     my $chain = $item->{chain};
@@ -1507,19 +1579,24 @@ sub _item_entry {
     return _computed_entry($state, $first, $first + $item->{length} - 1, $guard);
 }
 
+# A set operation's output, by the same rule. An untyped value (a literal or
+# parameter output) takes the others' type here.
 sub _common_entry {
     my @entries = @_;
     return undef unless @entries;
     my @extension = grep { _is_extension($_) } @entries;
-    if (@extension) {
-        my %types = map { (($_->{"\0type"} // '') => 1) } @extension;
-        return $extension[0] if @extension == @entries && keys(%types) == 1;
-        my $soft = !grep { !$_->{"\0strcat"} } @extension;
-        return {"\0unknown" => 1, "\0soft" => $soft, "\0over" => 1, "\0softentry" => $extension[0]};
+    my @unknown = grep { $_->{"\0unknown"} } @entries;
+    my @rest = grep { !$_->{"\0untyped"} && !_is_extension($_) && !$_->{"\0unknown"} } @entries;
+    my @plain = grep { !$_->{"\0string"} } @rest;
+    my %types = map { (($_->{"\0type"} // '') => 1) } @extension;
+    return $extension[0] if @extension && !@unknown && !@rest && keys(%types) == 1;
+    if (@extension || @unknown) {
+        my $soft = !grep({ !$_->{"\0strcat"} } @extension) && !grep { !$_->{"\0soft"} } @unknown;
+        return {"\0string" => 1} if $soft && @rest && !@plain;
+        return {"\0unknown" => 1, "\0soft" => $soft, "\0over" => @extension ? 1 : scalar(grep { $_->{"\0over"} } @unknown),
+            "\0softentry" => $extension[0] // (map { $_->{"\0softentry"} // () } @unknown)[0]};
     }
-    my ($unknown) = grep { $_->{"\0unknown"} } @entries;
-    return $unknown if $unknown;
-    return @entries == grep({ $_->{"\0string"} } @entries) ? {"\0string" => 1} : {};
+    return @plain ? {} : {"\0string" => 1};
 }
 
 # A computed select item's type, from its tokens $first .. $last.
@@ -1540,7 +1617,7 @@ sub _computed_entry {
             my $class = _tree_class($state, $tree);
             # A parameter or literal output is text (R57).
             $entry = $class->{entry} ? $class->{entry} : $class->{unknown} ? {"\0unknown" => 1, "\0soft" => $class->{soft}, "\0over" => $class->{over_extension}, "\0softentry" => $class->{soft_entry}}
-                : $class->{string} || $class->{untyped} ? {"\0string" => 1} : {};
+                : $class->{untyped} ? {"\0string" => 1, "\0untyped" => 1} : $class->{string} ? {"\0string" => 1} : {};
         }
         1;
     };
@@ -1583,6 +1660,7 @@ sub _function_column {
         my $entry = _resolve_in($state, $info->{scope_of}[$source->{open}], @chain > 1 ? $chain[-2] : undef, $chain[-1], $guard + 1);
         return {"\0unknown" => 1} unless ref($entry) eq 'HASH';
         return $entry->{"\0elem"} if $entry->{"\0elem"};
+        return {"\0string" => 1} if $entry->{"\0elemstr"};
         return $entry->{"\0unknown"} || _is_extension($entry) ? {"\0unknown" => 1} : {};
     }
     my $function = $state->{columns}{functions}{$source->{function}};

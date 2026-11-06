@@ -125,13 +125,13 @@ is($read->($e, $x->starts_with('l', 'a')), $refused, 'a pattern on ltree is refu
 {
     my $adapter = $e->adapter;
     my $qualified = sub { my ($sql) = @_; local $ENV{SELECTO_PG_SQL_LINT} = 0; $attempt->(sub { $adapter->_statement_sql($sql) }) };
-    is($qualified->(q{SELECT a.id FROM public.r51_t AS a WHERE COALESCE(a.h, a.h) = a.tx}), 'query_rule_not_evaluable/operand_type_unknown',
+    is($qualified->(q{SELECT a.id FROM public.r51_t AS a WHERE COALESCE(a.h, a.h) = a.tx}), 'query_rule_not_evaluable/operator_not_member',
         'an expression over hstore against text is refused');
-    is($qualified->(q{SELECT a.id FROM public.r51_t AS a WHERE COALESCE(a.h, a.h) = a.id}), 'query_rule_not_evaluable/operand_type_unknown',
+    is($qualified->(q{SELECT a.id FROM public.r51_t AS a WHERE COALESCE(a.h, a.h) = a.id}), 'query_rule_not_evaluable/operator_not_member',
         'an expression over hstore against an integer is refused');
     unlike($qualified->(q{SELECT a.id FROM public.r51_t AS a WHERE COALESCE(a.ci, a.ci) = a.tx}), qr/\Aquery_rule/,
         'an expression over citext against text falls back, as natively');
-    is($qualified->(q{SELECT a.id FROM public.r51_t AS a WHERE COALESCE(a.ci, a.ci) = a.id}), 'query_rule_not_evaluable/operand_type_unknown',
+    is($qualified->(q{SELECT a.id FROM public.r51_t AS a WHERE COALESCE(a.ci, a.ci) = a.id}), 'query_rule_not_evaluable/operator_not_member',
         'an expression over citext against an integer is refused');
     unlike($qualified->(q{SELECT a.id FROM public.r51_t AS a JOIN LATERAL unnest(CAST($1 AS integer[])) AS u(x) ON u.x = a.id}), qr/\Aquery_rule/,
         'unnest over a parameter against a plain column still qualifies');

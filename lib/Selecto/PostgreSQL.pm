@@ -2094,13 +2094,18 @@ sub _pg_catalog_functions {
                 (CAST('{pg_catalog.text,pg_catalog.varchar,pg_catalog.bpchar,pg_catalog.name}' AS pg_catalog.regtype[]))
               OR EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS a(t, i)
                 WHERE a.i OPERATOR(pg_catalog.=) CAST(1 AS pg_catalog.int8) AND CAST(a.t AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
-                  (CAST('{anyrange,anymultirange,pg_catalog.bytea,pg_catalog.bit,pg_catalog.varbit}' AS pg_catalog.regtype[]))))
+                  (CAST('{anyrange,anymultirange,pg_catalog.bytea,pg_catalog.bit,pg_catalog.varbit}' AS pg_catalog.regtype[])))),
+            pg_catalog.bool_or(p.pronargs OPERATOR(pg_catalog.=) CAST(1 AS pg_catalog.int2)
+              AND CAST(p.prorettype AS pg_catalog.regtype) OPERATOR(pg_catalog.=) CAST('pg_catalog.text' AS pg_catalog.regtype)
+              AND p.proargtypes[0] OPERATOR(pg_catalog.=) CAST(CAST('pg_catalog.text' AS pg_catalog.regtype) AS pg_catalog.oid))
             FROM pg_catalog.pg_proc p
             WHERE p.pronamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace) GROUP BY 1});
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    my %names = map { (lc($_->[0]) => ($_->[1] ? 'polymorphic' : $_->[2] ? 'string' : 1)) } @{$rows // []};
+    # 'follows': a text overload returns text, so a string argument gives a
+    # string (max, min).
+    my %names = map { (lc($_->[0]) => ($_->[1] ? 'polymorphic' : $_->[2] ? 'string' : $_->[3] ? 'follows' : 1)) } @{$rows // []};
     $dbh->{private_selecto_pg_functions} = \%names;
     return \%names;
 }
@@ -2160,9 +2165,9 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
     WHERE c.depth OPERATOR(pg_catalog.=) 16
     UNION ALL
-    SELECT 'str', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
+    SELECT CASE WHEN c.arr THEN 'estr' ELSE 'str' END, CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
     FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
-    WHERE NOT c.arr AND ty.typcategory OPERATOR(pg_catalog.=) 'S'
+    WHERE ty.typcategory OPERATOR(pg_catalog.=) 'S'
       AND ty.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)
     UNION ALL
     SELECT 'xdom', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), CAST(o.oprname AS pg_catalog.text),
@@ -2486,6 +2491,7 @@ sub _pg_extension_lookup {
         my $entry = $columns->{$column} //= {};
         if ($kind eq 'col') { $types{$rel}{$column} = $a; next }
         if ($kind eq 'str') { $entry->{"\0string"} = 1; next }
+        if ($kind eq 'estr') { $entry->{"\0elemstr"} = 1; next }
         # A domain chain deeper than the walk follows: its base type, and so
         # its operators, are unknown (review LOW).
         Selecto::Error->throw('query_rule_not_evaluable', 'a column is a domain chain too deep to resolve its base type',

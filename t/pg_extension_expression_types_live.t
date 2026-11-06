@@ -47,8 +47,9 @@ my ($dsn, @auth) = TestPostgreSQL->connection;
 my $dbh = DBI->connect("$dsn;options='-c search_path=" . ($path =~ s/,/\\,/gr) . "'", @auth, {RaiseError => 1, PrintError => 0, AutoCommit => 1, pg_enable_utf8 => 1});
 $dbh->do('SET client_min_messages TO warning');
 $dbh->do($_) for 'DROP TABLE IF EXISTS public.a3_t CASCADE',
-    q{CREATE TABLE public.a3_t (id INT PRIMARY KEY, org TEXT NOT NULL, ci citext, ci2 citext, tx TEXT, n INT, h hstore, l ltree, loo lo)},
-    q{INSERT INTO public.a3_t VALUES (1, 't1', 'a@x', 'A@X', 'gold', 1, 'a=>1', 'a.b', 101), (2, 't1', NULL, NULL, 'GOLD', 2, NULL, NULL, 102), (3, 't2', 'b@x', 'b@x', 'gold', 3, 'b=>1', 'b.c', 103)};
+    q{CREATE TABLE public.a3_t (id INT PRIMARY KEY, org TEXT NOT NULL, ci citext, ci2 citext, tx TEXT, n INT, h hstore, l ltree, loo lo, ta TEXT[], cat TEXT)},
+    q{INSERT INTO public.a3_t VALUES (1, 't1', 'a@x', 'A@X', 'gold', 1, 'a=>1', 'a.b', 101, '{a@x,A@X}', 'a@x'), (2, 't1', NULL, NULL, 'GOLD', 2, NULL, NULL, 102, '{x}', 'A@X'),
+      (3, 't2', 'b@x', 'b@x', 'gold', 3, 'b=>1', 'b.c', 103, '{b@x}', 'b@x')};
 my $case_null = sub { ['case', [['is_null', $_[0]], ['literal', 1]], ['else', ['literal', 0]]] };
 my %computed = (
     missing_ci => {type => 'integer', expression => $case_null->('ci')},
@@ -57,10 +58,13 @@ my %computed = (
     weight => {type => 'integer', expression => ['add', ['field', 'n'], $case_null->('ci')]},
     label => {type => 'string', expression => ['case', [['eq', 'tx', 'gold'], ['literal', 'a@x']], ['else', ['literal', 'other']]]},
     by_ci => {type => 'string', expression => ['case', [['eq', 'ci', 'A@X'], ['literal', 'A@X']], ['else', ['literal', 'other']]]},
-    ci_case => {type => 'string', expression => ['case', [['eq', 'id', 1], ['field', 'ci']], ['else', ['literal', 'x']]]},
+    ci_case => {type => 'string', expression => ['case', [['eq', 'id', 1], ['field', 'ci']], ['else', ['field', 'ci2']]]},
+    ci_text => {type => 'string', expression => ['case', [['eq', 'id', 1], ['field', 'ci']], ['else', ['literal', 'x']]]},
+    ci_coalesce => {type => 'string', expression => ['coalesce', ['field', 'ci'], ['literal', 'x']]},
 );
-my @fields = qw(id org ci ci2 tx n h l loo);
+my @fields = qw(id org ci ci2 tx n h l loo ta cat);
 my %columns = map { ($_ => {type => /\A(?:id|n)\z/ ? 'integer' : 'string'}) } @fields;
+$columns{ta} = {type => 'array', items => 'string'};
 $columns{$_} = {type => $computed{$_}{type}, computed => {kind => 'expression', expression => $computed{$_}{expression}}} for keys %computed;
 my $domain = Selecto::Domain->parse({schema_version => 1, name => 'A3', source => {source_table => 'a3_t', primary_key => 'id', tenant_field => 'org',
     fields => [@fields, sort keys %computed], columns => \%columns, associations => {}}, schemas => {}, joins => {}});
@@ -101,6 +105,35 @@ my $member = sub {
 is($member->('label', $x->eq('ci2', $f->('m.v'))), '', 'a member output of strings against citext compares as text');
 is($member->('label', undef, owner_key => 'ci', related_key => 'v'), '1', 'and joins as text');
 
+# Text results compare as text against citext, through every public shape: an
+# aggregate, an array rowset and a subquery join, not only a plain column.
+my $one = {owner_key => 'id', related_key => 'id', type => 'inner'};
+my $maximum = sub { $e->query->select('id', $x->max($_[0])->as('v'))->group_by('id') };
+is($rows->($e->query->with_cte('m', $domain, $maximum->('cat'), columns => ['id', 'v'], join => {owner_key => 'ci', related_key => 'v', type => 'inner'})->select('id')->order_by('id')),
+    '1', 'a member of max(text) joined to citext');
+is($rows->($e->query->with_cte('m', $domain, $maximum->('cat'), columns => ['id', 'v'], join => $one)->select('id')->where($x->eq('ci2', $f->('m.v')))->order_by('id')),
+    '', 'max(text) = citext compares as text');
+is($rows->($e->query->array_rowset('ta', 'r')->select('id')->where($x->eq('ci2', $f->('r.value')))->order_by('id')), '1', 'an array rowset of text against citext');
+is($rows->($e->query->subquery_join('m', $domain, $maximum->('cat'), on => [{left => 'ci', right => 'v'}])->select('id')->order_by('id')), '1;2', 'a subquery join of max(text) to citext, left join');
+
+# Set operations in a member, through the public API, against what PostgreSQL
+# answers for the same text. The right-nested form compiles to SELECT *.
+{
+    my $branch = sub { $e->query->select('id', $_[0]) };
+    my $native = TestPostgreSQL->connect;
+    $native->do("SET search_path = " . join(', ', map { qq{"$_"} } split(/,/, $path)));
+    for my $case (['tx union ci', sub { $branch->('tx')->union($branch->('ci')) }], ['ci union (ci union tx)', sub { $branch->('ci')->union($branch->('ci')->union($branch->('tx'))) }],
+        ['(ci union ci) union tx', sub { $branch->('ci')->union($branch->('ci'))->union($branch->('tx')) }], ['ci union ci2', sub { $branch->('ci')->union($branch->('ci2')) }]) {
+        my ($name, $set) = @$case;
+        for my $predicate ([eq => $x->eq('m.v', 'A@X')], [ne => $x->ne('m.v', 'A@X')]) {
+            my $q = $e->query->with_cte('m', $domain, $set->(), columns => ['id', 'v'], join => $one)->select('id', 'm.v')->where($predicate->[1])->order_by('id');
+            my $statement = $e->compile($q);
+            my $want = join ';', sort map { join ',', map { $_ // 'NULL' } @$_ } @{$native->selectall_arrayref($statement->sql, undef, @{$statement->params})};
+            is($attempt->(sub { join ';', sort map { join ',', map { $_ // 'NULL' } @$_ } @{$e->all($q)->{rows}} }), $want, "$name, $predicate->[0]: as natively");
+        }
+    }
+}
+
 # An output that is no string against text is PostgreSQL's error, and no
 # operand cast left over from typing the member (a citext cast here once made
 # bigint = text answer).
@@ -129,37 +162,44 @@ like($text->(q{SELECT a.id FROM public.a3_t AS a WHERE (a.ci || a.ci2) = a.tx}),
 like($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.ci ^@ a.ci2}), qr/OPERATOR\(pg_catalog\.\^@\)/, 'citext ^@ citext is the text operator');
 is($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.loo || a.tx = a.tx}), 'query_rule_not_evaluable/operator_not_member', 'lo has no exact ||');
 
+like($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.ci = ('A')}), qr/\.=\)\s*\(CAST/, 'a parenthesised literal is still untyped');
+like($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.ci = (($1))}), qr/\.=\)\s*\(CAST/, 'and a parenthesised parameter');
+
 # Still refused: an expression that can have the extension type, where that
 # decides the operator.
-is($where->($x->eq('ci_case', 'A@X')), 'query_rule_not_evaluable/operand_type_unknown', 'a citext-typed CASE against a value');
-is($where->($x->eq('ci_case', $f->('ci'))), 'query_rule_not_evaluable/operand_type_unknown', 'a citext-typed CASE against citext');
+is($where->($x->eq('ci_case', 'A@X')), '1', "a CASE of citext alone is citext: its own operator");
+is($where->($x->eq('ci_case', $f->('ci'))), '1', 'against citext too');
 is($where->($x->eq('ci_case', $f->('tx'))), '', 'against text it compares as text');
-is($text->(q{SELECT a.id FROM public.a3_t AS a WHERE (CASE WHEN a.id = 1 THEN a.ci ELSE a.ci END) ~ LEFT(a.tx, 4)}), 'query_rule_not_evaluable/operand_type_unknown',
-    'citext ~ text is a cross-type member, so a CASE that may be citext is refused (L2)');
-is($text->(q{SELECT a.id FROM public.a3_t AS a WHERE (CASE WHEN a.id = 1 THEN a.ci ELSE a.ci END) ~~ a.tx}), 'query_rule_not_evaluable/operand_type_unknown', 'and ~~');
+
+# PostgreSQL's common type: citext beside a pg_catalog string is text, and a
+# Selecto literal is CAST AS TEXT. So these are text, and answer as natively.
+is($where->($x->eq('ci_text', 'a@x')), '1', 'citext beside a literal is text: exact match');
+is($where->($x->eq('ci_text', 'A@X')), '', 'and case-sensitive');
+is($rows->($e->query->select($x->max('ci_coalesce')->as('m'))), 'x', "max over citext beside a literal is pg_catalog's, as native");
+like($text->(q{SELECT a.id FROM public.a3_t AS a WHERE (CASE WHEN a.id = 1 THEN a.ci ELSE a.ci END) ~ LEFT(a.tx, 4)}), qr/"\w+"\.~\)/,
+    'citext ~ text is a cross-type member: a CASE of citext takes it (L2)');
+like($text->(q{SELECT a.id FROM public.a3_t AS a WHERE (CASE WHEN a.id = 1 THEN a.ci ELSE a.ci END) ~~ a.tx}), qr/"\w+"\.~~\)/, 'and ~~');
 unlike($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.tx ~ (CASE WHEN a.id = 1 THEN a.ci ELSE a.ci END)}), qr/\Aquery_rule/, 'text ~ citext has no member, and is text');
 
-# A CASE with citext results never gets pg_catalog's operator or aggregate
-# where PostgreSQL takes citext's: native 'MIXED' matches case-insensitively,
-# and text's = would narrow the rows silently.
+# A CASE of citext results gets citext's own operator and aggregate, operands
+# cast, never pg_catalog's: native 'A@X' matches case-insensitively, and text's =
+# would narrow the rows silently.
 {
     my $citext_case = q{(CASE WHEN a.id > 0 THEN a.ci END)};
+    my $member = qr/"\w+"\.=\)\s*\(CAST/;
+    for my $case (["$citext_case = 'A\@X'", 'CASE of citext = a literal'], ["'A\@X' = $citext_case", 'a literal = CASE of citext'],
+        [q{CASE WHEN a.id > 0 THEN a.ci END = $1}, 'CASE of citext = a parameter'], ["$citext_case = a.ci2", 'CASE of citext = citext'],
+        ["$citext_case IN ('A\@X')", 'CASE of citext in a list'], ["NULLIF(a.ci, 'x') = 'A\@X'", 'NULLIF of citext'], ["COALESCE(a.ci, a.ci2) = 'A\@X'", 'COALESCE of citext']) {
+        like($text->("SELECT a.id FROM public.a3_t AS a WHERE $case->[0]"), $member, "$case->[1] uses the member");
+    }
+    like($text->("SELECT max$citext_case FROM public.a3_t AS a"), qr/"\w+"\.max\(CAST/, "max over a CASE of citext is citext's");
+    like($text->("SELECT min(COALESCE(a.ci, a.ci2)) FROM public.a3_t AS a"), qr/"\w+"\.min\(CAST/, "min over a COALESCE of citext is citext's");
+    like($text->("WITH m AS (SELECT a.id, $citext_case AS v FROM public.a3_t AS a) SELECT m.id FROM m WHERE m.v = 'A\@X'"), $member, 'a member output of a CASE of citext');
+    is($rows->($e->query->select($x->max('ci')->as('m'))), 'a@x', "max over the column itself is citext's");
+    is($where->($x->eq('ci_case', 'A@X')), '1', 'and through the public API');
     my $unknown = 'query_rule_not_evaluable/operand_type_unknown';
-    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case = 'A\@X'"), $unknown, 'CASE of citext = a literal');
-    is($text->("SELECT a.id FROM public.a3_t AS a WHERE 'A\@X' = $citext_case"), $unknown, 'a literal = CASE of citext');
-    is($text->(q{SELECT a.id FROM public.a3_t AS a WHERE CASE WHEN a.id > 0 THEN a.ci END = $1}), $unknown, 'CASE of citext = a parameter');
-    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case = a.ci2"), $unknown, 'CASE of citext = citext');
-    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case IN ('A\@X')"), $unknown, 'CASE of citext in a list');
-    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case BETWEEN 'a' AND 'b'"), $unknown, 'CASE of citext between');
-    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case LIKE 'A%'"), $unknown, 'CASE of citext LIKE');
-    is($text->("SELECT max$citext_case FROM public.a3_t AS a"), $unknown, 'max over a CASE of citext');
-    is($text->("SELECT min(COALESCE(a.ci, a.ci2)) FROM public.a3_t AS a"), $unknown, 'min over a COALESCE of citext');
-    is($text->("WITH m AS (SELECT a.id, $citext_case AS v FROM public.a3_t AS a) SELECT m.id FROM m WHERE m.v = 'A\@X'"), $unknown, 'a member output of a CASE of citext');
-    is($text->("SELECT a.id FROM public.a3_t AS a WHERE (SELECT $citext_case) = 'A\@X'"), $unknown, 'a scalar subquery of it');
-    my $max = $rows->($e->query->select($x->max('ci')->as('m')));
-    is($max, 'a@x', "max over the column itself is citext's");
-    is($where->($x->eq('ci_case', 'A@X')), $unknown, 'and through the public API');
-    is($rows->($e->query->select($x->max('ci_case')->as('m'))), $unknown, 'max of a computed CASE through the public API');
+    is($text->("SELECT a.id FROM public.a3_t AS a WHERE citext(a.tx) = 'A'"), $unknown, 'a function that may return citext is refused against a value');
+    like($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.ci IN (SELECT 'A')}), qr/pg_catalog\.=/, 'IN a subquery of a literal is text, as natively');
 }
 
 # A set operation's output is what its branches resolve to together, not its
@@ -167,8 +207,11 @@ unlike($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.tx ~ (CASE WHEN a.id 
 # text. Each of these answered wrongly when only the first branch was read.
 {
     my $unknown = 'query_rule_not_evaluable/operand_type_unknown';
-    is($text->(q{SELECT 1 FROM (SELECT 'a' AS x UNION ALL SELECT s.ci FROM public.a3_t AS s) AS d WHERE d.x = 'A'}), $unknown, 'a literal beside citext');
-    is($text->(q{SELECT 1 FROM (SELECT s.ci AS x FROM public.a3_t AS s UNION ALL SELECT s.tx FROM public.a3_t AS s) AS d WHERE d.x = 'A'}), $unknown, 'citext beside text');
+    like($text->(q{SELECT 1 FROM (SELECT 'a' AS x UNION ALL SELECT s.ci FROM public.a3_t AS s) AS d WHERE d.x = 'A'}), qr/\.=\)\s*\(CAST/, 'an untyped literal beside citext is citext');
+    like($text->(q{SELECT 1 FROM (SELECT s.ci AS x FROM public.a3_t AS s UNION ALL SELECT s.tx FROM public.a3_t AS s) AS d WHERE d.x = 'A'}), qr/pg_catalog\.=/, 'citext beside text is text');
+    like($text->(q{SELECT 1 FROM (SELECT s.ci AS x FROM public.a3_t AS s UNION SELECT * FROM (SELECT t.ci AS x FROM public.a3_t AS t UNION SELECT t.tx FROM public.a3_t AS t) AS r) AS d WHERE d.x = 'A'}),
+        qr/pg_catalog\.=/, 'a SELECT * branch is expanded, not dropped');
+    is($text->(q{SELECT 1 FROM (SELECT s.ci AS x FROM public.a3_t AS s UNION SELECT * FROM public.a3_t) AS d WHERE d.x = 'A'}), $unknown, 'a SELECT * of a relation is unknown, not dropped');
     like($text->(q{SELECT 1 FROM (SELECT s.ci AS x FROM public.a3_t AS s UNION SELECT t.ci2 FROM public.a3_t AS t) AS d WHERE d.x = 'A'}), qr/OPERATOR\("?\w+"?\.=\)\s*\(CAST/,
         'citext beside citext stays citext');
     like($text->(q{WITH RECURSIVE m(id, v) AS (SELECT s.id, s.ci FROM public.a3_t AS s UNION ALL SELECT m.id + 1, m.v FROM m WHERE m.id < 2) SELECT m.id FROM m WHERE m.v = 'A'}),
@@ -180,7 +223,7 @@ unlike($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.tx ~ (CASE WHEN a.id 
 my $refused = eval { $e->all($e->query->select('id')->where($x->lt('h', 'a=>1'))); 1 } ? undef : $@;
 is($refused->details->{column}, 'h', 'the refusal names the column');
 like($refused->details->{type}, qr/hstore/, 'and the type');
-like($refused->message, qr/hstore.*column h/, 'in its message too');
+unlike($refused->message, qr/hstore|column h/, 'but its message is fixed: hosts pass messages on to clients');
 
 SKIP: {
     my ($available) = $admin->selectrow_array(q{SELECT count(*) FROM pg_available_extensions WHERE name = 'postgis'});
