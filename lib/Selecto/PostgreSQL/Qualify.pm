@@ -105,8 +105,11 @@ sub qualify {
     my ($sql, $functions, $columns) = @_;
     my $state = new_state($functions, $columns);
     my $tokens = tokenize($sql);
-    # $columns: {relations => {lc "schema.table" => {lc column => {op => schema}}}}
+    # $columns: {relations => {"schema.table" => {column => {op => schema}}}}
     # (columns of extension member types, or domains over one, by relation).
+    # Every name here is the catalog's exact name: a reference is folded once,
+    # by _unquote, as PostgreSQL folds it (an unquoted identifier to lower
+    # case, a quoted one exact), so org and "ORG" stay two columns (R56).
     # Scopes (and so operand types) matter only when an extension type can
     # reach the statement: a column of one, or a function rowset that may
     # return one (see Selecto::PostgreSQL::_pg_extension_operators).
@@ -465,8 +468,8 @@ sub _atom {
         # its operators are the extension's (the guarded insert admission's
         # CAST($n AS "public"."citext")).
         if ($up eq 'CAST' && ref($state->{columns}{casts}) eq 'HASH' && $inner =~ /\bAS\s+(\S+)\s*\z/si) {
-            my @parts = map { $_->[0] eq 'qid' ? _unquote($_->[1]) : lc $_->[1] } grep { $_->[0] =~ /\A(?:id|qid)\z/ } @{tokenize($1)};
-            my $cast = @parts == 2 ? $state->{columns}{casts}{lc($parts[0]) . '.' . $parts[1]} : undef;
+            my @parts = map { _unquote($_->[1]) } grep { $_->[0] =~ /\A(?:id|qid)\z/ } @{tokenize($1)};
+            my $cast = @parts == 2 ? $state->{columns}{casts}{"$parts[0].$parts[1]"} : undef;
             ($entry, $known) = ($cast, 0) if ref($cast) eq 'HASH' && $cast->{"\0type"};
         }
     } elsif ($type eq 'punct' && $text eq '(') {
@@ -495,7 +498,7 @@ sub _atom {
         my $from = $here > 0 && (_upper($tokens->[$here - 1]) =~ /\A(?:FROM|JOIN|LATERAL)\z/ || $tokens->[$here - 1][1] eq ',');
         if ($from && _peek_punct($tokens, $$pos, '(') && @names <= 2
             && !(@names == 1 && $kinds[0] eq 'id' && $state->{functions}{lc $names[0]})
-            && !(@names == 2 && lc(_unquote($names[0])) eq 'pg_catalog')) {
+            && !(@names == 2 && _unquote($names[0]) eq 'pg_catalog')) {
             # A host function read from (function_lateral; review M1): the
             # one candidate among the pinned schemas (or the schema it
             # names), overloads included, qualified, with each argument cast
@@ -931,7 +934,7 @@ sub _names_extension_column {
     my $set = $state->{extension_names} //= {
         map { %$_ } map { my $columns = $_; +{map { ($_ => 1) } grep { _is_extension($columns->{$_}) || $columns->{$_}{"\0elem"} } keys %$columns} }
         values %{$state->{columns}{relations} // {}} };
-    return scalar grep { $set->{lc $_} } @$names;
+    return scalar grep { $set->{$_} } @$names;
 }
 
 # ---- Column sources by query scope (R48 / review M1) ----------------------
@@ -1001,7 +1004,7 @@ sub _scopes {
             $k++ if _upper($tokens->[$k]) eq 'NOT';
             $k++ if _upper($tokens->[$k]) eq 'MATERIALIZED';
             last unless $k < @$tokens && $tokens->[$k][1] eq '(';
-            $cte{lc $names->[0]} = {scope => $opens{$k}, cols => $cols};
+            $cte{$names->[0]} = {scope => $opens{$k}, cols => $cols};
             $k = ($closes{$k} // last) + 1;
             last unless $k < @$tokens && $tokens->[$k][1] eq ',';
             $k++;
@@ -1050,7 +1053,7 @@ sub _scopes {
                     # A function rowset, FROM fn(args) [WITH ORDINALITY]
                     # [AS] alias [(col [type], ...)] (review M2).
                     my $close = $closes{$after} // last;
-                    $source = {function => lc $names->[-1], open => $after, close => $close};
+                    $source = {function => $names->[-1], open => $after, close => $close};
                     $default = $names->[-1];
                     $j = $close + 1;
                     if (_upper($tokens->[$j]) eq 'WITH' && _upper($tokens->[$j + 1]) eq 'ORDINALITY') {
@@ -1059,8 +1062,8 @@ sub _scopes {
                     }
                 } else {
                     $default = $names->[-1];
-                    $source = @$names == 1 && $cte{lc $names->[0]} ? {cte => lc $names->[0]}
-                        : {relation => lc(join '.', @$names)};
+                    $source = @$names == 1 && $cte{$names->[0]} ? {cte => $names->[0]}
+                        : {relation => join('.', @$names)};
                     $j = $after;
                 }
             }
@@ -1094,7 +1097,7 @@ sub _scopes {
                 my ($cols, $next) = $cols_at->($j);
                 if ($cols && ($source->{derived} || $source->{cte})) { $source->{cols} = $cols; $j = $next }
             }
-            $scopes[$scope]{aliases}{lc $alias} = $source if defined $alias;
+            $scopes[$scope]{aliases}{$alias} = $source if defined $alias;
             last unless $up eq 'FROM' && $j < @$tokens && $tokens->[$j][1] eq ',';
             $j++;
         }
@@ -1111,7 +1114,7 @@ sub _resolve_column {
     my $scopes = $state->{scopes} or return undef;
     return undef if ($guard // 0) > 16 || !@$names || @$names > 3;
     my $scope = $scopes->{scope_of}[$at] // 0;
-    return _resolve_in($state, $scope, @$names > 1 ? lc $names->[-2] : undef, lc $names->[-1], ($guard // 0) + 1);
+    return _resolve_in($state, $scope, @$names > 1 ? $names->[-2] : undef, $names->[-1], ($guard // 0) + 1);
 }
 
 sub _resolve_in {
@@ -1177,8 +1180,8 @@ sub _source_column {
         my $passthrough = @chain && @chain <= 3 && $k == @body - $wrap;
         my $name = defined($alias) ? $alias : $passthrough ? $chain[-1] : undef;
         my $output = ref($cols) eq 'ARRAY' && $index < @$cols ? $cols->[$index] : $name;
-        next unless defined($output) && lc($output) eq $column;
-        return _resolve_in($state, $scope, @chain > 1 ? lc $chain[-2] : undef, lc $chain[-1], $guard + 1) if $passthrough;
+        next unless defined($output) && $output eq $column;
+        return _resolve_in($state, $scope, @chain > 1 ? $chain[-2] : undef, $chain[-1], $guard + 1) if $passthrough;
         # A computed output: typed as the qualifier types an operand (review
         # M1): a cast, a non-polymorphic pg_catalog function, an extension
         # function, or an expression over columns of known types.
@@ -1220,7 +1223,7 @@ sub _computed_entry {
 sub _function_column {
     my ($state, $source, $column, $guard) = @_;
     my $cols = $source->{cols} // [];
-    my ($index) = grep { lc($cols->[$_]) eq $column } 0 .. $#$cols;
+    my ($index) = grep { $cols->[$_] eq $column } 0 .. $#$cols;
     return undef unless defined $index;
     my $types = $source->{types} // [];
     if (defined $types->[$index]) {
@@ -1245,7 +1248,7 @@ sub _function_column {
             else { return {"\0unknown" => 1} unless $t->[1] eq '.' }
         }
         return {"\0unknown" => 1} unless @chain && @chain <= 3 && $index == 0;
-        my $entry = _resolve_in($state, $info->{scope_of}[$source->{open}], @chain > 1 ? lc $chain[-2] : undef, lc $chain[-1], $guard + 1);
+        my $entry = _resolve_in($state, $info->{scope_of}[$source->{open}], @chain > 1 ? $chain[-2] : undef, $chain[-1], $guard + 1);
         return {"\0unknown" => 1} unless ref($entry) eq 'HASH';
         return $entry->{"\0elem"} if $entry->{"\0elem"};
         return $entry->{"\0unknown"} || _is_extension($entry) ? {"\0unknown" => 1} : {};
