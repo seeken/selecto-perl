@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: a function named like an SQL keyword is qualified or refused
+      (R60): left, right, mode, like and the comma forms of substring and
+      overlay are written pg_catalog.name(...); delete, last, key, update and
+      the like, which pg_catalog does not have, are refused with reason
+      function_keyword. The lint reports them. text_prefix buckets now call
+      pg_catalog.left.
     - PostgreSQL: an operator on an extension type is written in the
       extension's schema only when it is a member for those operand types,
       cross-type members included (isbn13 = ean13, citext ~~ text, ltree ||

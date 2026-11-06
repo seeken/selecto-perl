@@ -82,6 +82,8 @@ t/pg_review_round3_live.t
 t/pg_operator_qualification_live.t
 t/pg_case_twin_columns_live.t
 t/pg_extension_member_fallback_live.t
+t/pg_keyword_functions_live.t
+t/pg_qualify_keyword_functions.t
 t/pg_extension_scope_live.t
 t/pg_extension_types_live.t
 t/pg_insert_storage_types_live.t
