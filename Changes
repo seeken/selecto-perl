@@ -1,6 +1,29 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: an operator on an extension type is written in the
+      extension's schema only when it is a member for those operand types,
+      cross-type members included (isbn13 = ean13, citext ~~ text, ltree ||
+      text, each operand cast to its own member type). Without a member, the
+      pg_catalog operator is used in one case only: a string-category extension
+      type (citext, domains over it) against a pg_catalog string type or an
+      untyped value, which is what PostgreSQL resolves. Everything else is now
+      refused, query_rule_not_evaluable with reason operator_not_member. This
+      is a behaviour change: comparisons that worked through an implicit cast
+      stop working, for example box3d = anything (it compared by area), a
+      box3d tenant column, geography <> (it compared through bytea), geometry
+      against text, geometry against geography, hstore <, vector against
+      halfvec, any operator on a composite extension type such as
+      topogeometry, on a domain an extension owns over a built-in type such as
+      lo, and citext against a type that is no string, or against another
+      extension type. An expression over an extension column is refused against
+      a plain operand too (operand_type_unknown), unless all it can be is a
+      string-category type against a string.
+    - PostgreSQL: catalog facts for the operator qualifier are keyed by the
+      exact name, as PostgreSQL folds identifiers (R56). With org text and
+      "ORG" citext in one table, org took citext's operators: a tenant read,
+      updated and deleted a tenant differing only in case. Relations, aliases,
+      CTE names and member outputs are compared the same way.
     - PostgreSQL guarded inserts and upsert inserts on a uuid, citext,
       domain-over-text, domain-over-citext or domain-over-uuid tenant column
       are admitted (they were refused: "PostgreSQL cannot establish the

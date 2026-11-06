@@ -130,11 +130,12 @@ sub _sequence {
     my @parts;
     my @run;
     my $set_list = 0;
-    my ($lone, $first);
+    my ($lone, $first, @each);
     my $flush = sub {
         if (@run) {
             $lone = @run == 1 && $run[0]{kind} eq 'atom' && !@parts ? $run[0] : undef;
             $first = $lone if !@parts;
+            push @each, @run == 1 && $run[0]{kind} eq 'atom' ? $run[0] : undef;
             push @parts, _emit_run($state, \@run);
             @run = ();
         }
@@ -206,6 +207,8 @@ sub _sequence {
     $state->{lone_atom} = @parts == 1 ? $lone : undef;
     # The first argument, when it is one atom (a function's first argument).
     $state->{first_atom} = $first;
+    # Each argument, undef for one that is not one atom.
+    $state->{each_atom} = \@each;
     return join ' ', @parts;
 }
 
@@ -286,7 +289,7 @@ sub _construct {
             my $query = _sequence($state, $tokens, $pos, ')');
             _expect($tokens, $pos, ')');
             my $op = _op_sql($state, {kind => 'op', op => $negate ? '<>' : '='}, $operand, undef);
-            $query = "SELECT CAST((q.v) AS $state->{op_cast}) FROM ($query) AS q(v)" if defined $state->{op_cast};
+            $query = "SELECT CAST((q.v) AS $state->{op_cast_right}) FROM ($query) AS q(v)" if defined $state->{op_cast};
             $sql = '((' . _cast_operand($state, $left) . ") $op " . ($negate ? 'ALL' : 'ANY') . " ($query))";
         } else {
             my @terms;
@@ -294,7 +297,7 @@ sub _construct {
                 my $element = _read_run($state, $tokens, $pos, undef);
                 my $right = _render($state, $element);
                 my $op = _op_sql($state, {kind => 'op', op => '='}, $operand, $element);
-                push @terms, '((' . _cast_operand($state, $left) . ") $op (" . _cast_operand($state, $right) . '))';
+                push @terms, '((' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . '))';
                 last unless _peek_punct($tokens, $$pos, ',');
                 $$pos++;
             }
@@ -313,9 +316,9 @@ sub _construct {
         my $high = _read_run($state, $tokens, $pos, undef);
         my ($low_sql, $high_sql) = (_render($state, $low), _render($state, $high));
         my $ge = _op_sql($state, {kind => 'op', op => '>='}, $operand, $low);
-        my $first = '(' . _cast_operand($state, $left) . ") $ge (" . _cast_operand($state, $low_sql) . ')';
+        my $first = '(' . _cast_operand($state, $left) . ") $ge (" . _cast_right($state, $low_sql) . ')';
         my $le = _op_sql($state, {kind => 'op', op => '<='}, $operand, $high);
-        $sql = "($first AND (" . _cast_operand($state, $left) . ") $le (" . _cast_operand($state, $high_sql) . '))';
+        $sql = "($first AND (" . _cast_operand($state, $left) . ") $le (" . _cast_right($state, $high_sql) . '))';
         $sql = "(NOT $sql)" if $negate;
         return {kind => 'atom', sql => $sql};
     }
@@ -332,7 +335,7 @@ sub _construct {
             $pattern = "pg_catalog.like_escape($pattern, $escape->{sql})";
         }
         my $op = _op_sql($state, {kind => 'op', op => ($negate ? '!' : '') . ($up eq 'LIKE' ? '~~' : '~~*')}, $operand, undef);
-        return {kind => 'atom', sql => '((' . _cast_operand($state, $left) . ") $op (" . _cast_operand($state, $pattern) . '))'};
+        return {kind => 'atom', sql => '((' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $pattern) . '))'};
     }
     if ($up eq 'IS' && $at + 1 < @$tokens) {
         my $k = $at + 1;
@@ -345,7 +348,7 @@ sub _construct {
         my $right_tree = _read_run($state, $tokens, $pos, undef);
         my $right = _render($state, $right_tree);
         my $op = _op_sql($state, {kind => 'op', op => '='}, $operand, $right_tree);
-        $sql = '(COALESCE((' . _cast_operand($state, $left) . ") $op (" . _cast_operand($state, $right)
+        $sql = '(COALESCE((' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right)
             . "), FALSE) OR (($left) IS NULL AND ($right) IS NULL))";
         $sql = "(NOT $sql)" unless $not;
         return {kind => 'atom', sql => $sql};
@@ -425,7 +428,7 @@ sub _atom {
                 my $result = _read_run($state, $tokens, $pos, undef);
                 my $value_sql = _render($state, $value);
                 my $op = _op_sql($state, {kind => 'op', op => '='}, $subject, $value);
-                push @parts, 'WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_operand($state, $value_sql) . ') THEN ' . _render($state, $result);
+                push @parts, 'WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $value_sql) . ') THEN ' . _render($state, $result);
             }
             if (_upper($tokens->[$$pos]) eq 'ELSE') {
                 $$pos++;
@@ -451,7 +454,7 @@ sub _atom {
             my $right = _render($state, $b);
             my $op = _op_sql($state, {kind => 'op', op => '='}, $a, $b);
             return _postfix($state, $tokens, $pos,
-                '(CASE WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_operand($state, $right) . ") THEN NULL ELSE ($left) END)",
+                '(CASE WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . ") THEN NULL ELSE ($left) END)",
                 undef, undef, undef, $mark);
         }
         my $open = $tokens->[$$pos + 1][1];
@@ -464,6 +467,16 @@ sub _atom {
         # target's; GROUPING's is integer); COALESCE, GREATEST, LEAST, ARRAY, ROW and the
         # quantifiers take their arguments' type.
         $known = 1 if $up =~ /\A(?:CAST|EXISTS|EXTRACT|TRIM|SUBSTRING|POSITION|OVERLAY|GROUPING)\z/;
+        $known = 'string' if $up =~ /\A(?:TRIM|SUBSTRING|OVERLAY)\z/
+            || ($up eq 'CAST' && $inner =~ /.*\bAS\s+(\S.*?)\s*\z/si && _string_type($1));
+        # COALESCE and the like over strings alone are strings.
+        if ($up =~ /\A(?:COALESCE|GREATEST|LEAST)\z/ && $state->{scopes}) {
+            my $each = $state->{each_atom};
+            $known = 'string' if @$each && !grep {
+                my $class = $_ ? _class_of($state, $_) : {};
+                !$class->{string} && !$class->{untyped};
+            } @$each;
+        }
         # A cast to an extension type (or a domain over one) has that type:
         # its operators are the extension's (the guarded insert admission's
         # CAST($n AS "public"."citext")).
@@ -603,7 +616,8 @@ sub _atom {
                 $name = "pg_catalog.$names[0]";
                 # A pg_catalog function with no polymorphic overload returns
                 # a pg_catalog type, whatever its arguments.
-                $known = 1 if $state->{functions}{lc $names[0]} ne 'polymorphic';
+                my $returns = $state->{functions}{lc $names[0]};
+                $known = $returns eq 'string' ? 'string' : 1 if $returns ne 'polymorphic';
             }
             $sql = "$name($inner)";
             # FILTER (WHERE ...) / OVER (...) / WITHIN GROUP (...) follow.
@@ -651,7 +665,7 @@ sub _postfix {
             while (_peek_punct($tokens, $$pos, '[') && _peek_punct($tokens, $$pos + 1, ']')) { $cast .= '[]'; $$pos += 2 }
             $sql .= "::$cast";
             ($column, $entry) = (undef, undef);
-            $known = 1;
+            $known = _string_type($cast) ? 'string' : 1;
         } elsif ($t->[0] eq 'punct' && $t->[1] eq '[') {
             $$pos++;
             my $inner = _sequence($state, $tokens, $pos, ']');
@@ -800,19 +814,28 @@ sub _render {
     my $op = _op_sql($state, $node->{binary}, $node->{left}, $node->{right});
     Selecto::Error->throw('query_rule_not_evaluable', 'a quantified comparison cannot take an extension operator here',
         {reason => 'operand_type_unknown'}) if $quantified && defined $state->{op_cast};
-    return '((' . _cast_operand($state, $left) . ") $op" . ($quantified ? " $right)" : ' (' . _cast_operand($state, $right) . '))');
+    return '((' . _cast_operand($state, $left) . ") $op" . ($quantified ? " $right)" : ' (' . _cast_right($state, $right) . '))');
 }
 
-# OPERATOR(schema.op). PostgreSQL's own resolution picks an extension
-# type's operator (citext = citext) only when both operands have that type,
-# or one has it and the other is an untyped parameter or literal (which takes
-# its type); a citext against text resolves to pg_catalog's text operator
-# (R48). The same choice is made here, whatever the operand order.
+# OPERATOR(schema.op). An operator is named in an extension's schema only
+# when it is a member of the extension for these operand types (R51):
+# - T op T, or T against an untyped parameter or literal (which takes T):
+#   both operands cast to T (R50);
+# - a cross-type member, T op U (isbn13 = ean13, citext ~~ text): each
+#   operand cast to its own member argument type;
+# Without a member, OPERATOR(pg_catalog.op) is written in exactly one case
+# (R51 amendment 2): T is in the string category and the other operand is a
+# pg_catalog string type or an untyped value, which is what PostgreSQL resolves
+# (citext = text compares as text, R48). Every other operator on an extension
+# operand is refused here: an implicit cast can make pg_catalog's operator
+# resolve and compare the wrong thing (box3d by area, geography through
+# bytea, geometry as text), so the server cannot be relied on to refuse it.
+# The same choice is made whatever the operand order.
 sub _op_sql {
     my ($state, $op, $left, $right) = @_;
     # Each operator decides its own operand casts; none carries over to the
     # next (review of b969df8, HIGH 1).
-    $state->{op_cast} = undef;
+    @{$state}{qw(op_cast op_cast_right)} = (undef, undef);
     return "OPERATOR($op->{schema}.$op->{op})" if $op->{explicit};
     my @sides = map { _operand_class($state, $_, $op->{op}) } $left, $right;
     my ($l, $r) = @sides;
@@ -820,27 +843,49 @@ sub _op_sql {
     # (an expression over such a column, or a reference with no known
     # source) against an untyped value, an extension-typed column or another
     # such operand: PostgreSQL's choice cannot be made here (review of
-    # 4aa5b81). Refused rather than defaulted to pg_catalog's operator.
+    # 4aa5b81). Refused rather than defaulted to pg_catalog's operator. An
+    # expression over an extension column is refused against anything else
+    # too, unless all it can be is a string-category type against a string.
     for my $pair ([$l, $r], [$r, $l]) {
         my ($unknown, $other) = @$pair;
         Selecto::Error->throw('query_rule_not_evaluable',
             'an operand that may have an extension type could not be resolved for operator qualification',
             {reason => 'operand_type_unknown'})
-            if $unknown->{unknown} && ($other->{untyped} || $other->{schema} || $other->{unknown});
+            if $unknown->{unknown} && ($other->{untyped} || $other->{ext} || $other->{unknown}
+                || ($unknown->{over_extension} && !($unknown->{soft} && $other->{string})));
     }
     my $schema = 'pg_catalog';
-    my $type;
-    if ($l->{schema} && $r->{schema} && $l->{schema} eq $r->{schema}) { ($schema, $type) = ($l->{schema}, $l->{type} // $r->{type}) }
-    elsif ($l->{schema} && $r->{untyped}) { ($schema, $type) = ($l->{schema}, $l->{type}) }
-    elsif ($r->{schema} && $l->{untyped}) { ($schema, $type) = ($r->{schema}, $r->{type}) }
+    my ($left_type, $right_type);
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable',
+            'an operator on an extension type is not a member of its extension for these operands',
+            {reason => 'operator_not_member', operator => $op->{op}});
+    };
+    if ($l->{ext} && $r->{ext}) {
+        if (defined($l->{type}) && defined($r->{type}) && $l->{type} eq $r->{type}) {
+            $refuse->() unless defined $l->{schema};
+            ($schema, $left_type, $right_type) = ($l->{schema}, $l->{type}, $r->{type});
+        } else {
+            my $member = _cross_member($l, $r, $op->{op}) // $refuse->();
+            ($schema, $left_type, $right_type) = ($member, $l->{type}, $r->{type});
+        }
+    } elsif ($l->{ext} || $r->{ext}) {
+        my ($ext, $other) = $l->{ext} ? ($l, $r) : ($r, $l);
+        if ($other->{untyped} && defined $ext->{schema}) {
+            ($schema, $left_type, $right_type) = ($ext->{schema}, $ext->{type}, $ext->{type});
+        } elsif ($other->{string} && defined(my $member = _cross_member($l, $r, $op->{op}))) {
+            ($schema, $left_type, $right_type) = ($member, $l->{type} // 'pg_catalog.text', $r->{type} // 'pg_catalog.text');
+        } elsif (!$ext->{string_category} || !($other->{untyped} || $other->{string})) {
+            $refuse->();
+        }
+    }
     # R50: an operator in an extension's schema (commonly writable) takes
-    # operands cast to the member's own type, so no exact-match operator
+    # operands cast to the member's own types, so no exact-match operator
     # planted beside it (over a domain, say) can be chosen instead.
-    $state->{op_cast} = undef;
     if ($schema ne 'pg_catalog') {
         Selecto::Error->throw('query_rule_not_evaluable', "an extension operator's operand type could not be named",
-            {reason => 'operand_type_unknown'}) unless defined $type;
-        $state->{op_cast} = $type;
+            {reason => 'operand_type_unknown'}) unless defined($left_type) && defined($right_type);
+        @{$state}{qw(op_cast op_cast_right)} = ($left_type, $right_type);
     }
     # A comparison's operands do not type an expression around it (a CASE
     # WHEN tier = 'gold' THEN 'G' ...): their references are consumed.
@@ -848,11 +893,29 @@ sub _op_sql {
     return "OPERATOR($schema.$op->{op})";
 }
 
+# The schema of the extension member op(left type, right type), or undef. A
+# string operand is looked up as text.
+sub _cross_member {
+    my ($l, $r, $op) = @_;
+    my ($left, $right) = ($l->{type} // 'pg_catalog.text', $r->{type} // 'pg_catalog.text');
+    for my $entry (grep { $_ } $l->{entry}, $r->{entry}) {
+        my $schema = ref($entry->{"\0x"}) eq 'HASH' ? $entry->{"\0x"}{$op}{"$left\0$right"} : undef;
+        return $schema if defined $schema;
+    }
+    return undef;
+}
+
 # The operand SQL cast as the last _op_sql chose (R50).
 sub _cast_operand {
     my ($state, $sql) = @_;
     return $sql unless defined $state->{op_cast};
     return "CAST(($sql) AS $state->{op_cast})";
+}
+
+sub _cast_right {
+    my ($state, $sql) = @_;
+    return $sql unless defined $state->{op_cast_right};
+    return "CAST(($sql) AS $state->{op_cast_right})";
 }
 
 sub _consume {
@@ -863,37 +926,50 @@ sub _consume {
     return;
 }
 
-# An operand: {schema => <the extension schema of its type's operator op>}
-# for a column of an extension member type, {untyped => 1} for a bare
-# parameter or string literal (or a missing operand of a prefix operator),
-# else {} (a known non-extension type, or an expression).
+# An operand: {ext => 1, entry, type, schema => <the extension schema of its
+# type's member op(T, T), if any>, string_category} for a value of an extension
+# type, {untyped => 1} for a bare parameter or string literal (or a missing
+# operand of a prefix operator), {string => 1} for a pg_catalog string type,
+# {unknown => 1, soft} as in _class_of, else {} (another known type).
 sub _operand_class {
     my ($state, $side, $op) = @_;
     return {untyped => 1} unless $side;
     return {} unless $side->{atom};
     my $class = _class_of($state, $side->{atom});
-    return $class unless $class->{entry};
-    return defined($class->{entry}{$op}) ? {schema => $class->{entry}{$op}, type => $class->{entry}{"\0type"}} : {};
+    if (my $entry = $class->{entry}) {
+        return {ext => 1, entry => $entry, type => $entry->{"\0type"}, schema => $entry->{$op}, string_category => $entry->{"\0strcat"}};
+    }
+    # x op ANY (...): the quantifier's elements, as PostgreSQL resolves them.
+    return {string => 1} if !$class->{unknown} && $side->{atom}{sql} =~ /\A(?:ANY|ALL|SOME)\(/i;
+    return $class;
 }
 
-# What is known of an atom's type: {untyped => 1} (a bare parameter or
-# string literal), {entry => <its extension type's operators and
-# functions>}, {unknown => 1} (it may have an extension type that cannot be
-# resolved here), or {} (a known type that is no extension's).
+# What is known of an atom's type: {untyped => 1} (a bare parameter, string
+# literal or NULL), {entry => <its extension type's operators and functions>},
+# {string => 1} (a pg_catalog string type), {unknown => 1} (it may have an
+# extension type that cannot be resolved here; over_extension when it reads a
+# column of one, soft when all it can be is a string-category one), or {} (a
+# known type that is no extension's).
 sub _class_of {
     my ($state, $atom) = @_;
-    return {untyped => 1} if !defined($atom->{column}) && $atom->{sql} =~ /\A(?:\$\d+|\?|'(?:[^']|'')*')\z/;
+    return {untyped => 1} if !defined($atom->{column}) && $atom->{sql} =~ /\A(?:\$\d+|\?|'(?:[^']|'')*'|NULL)\z/i;
     return {entry => $atom->{entry}} if $atom->{entry};
-    return {} if $atom->{known} || !$state->{scopes};
+    return {} unless $state->{scopes};
+    return {string => 1} if ($atom->{known} // '') eq 'string';
+    return {} if $atom->{known};
     return _ref_class($state, {column => $atom->{column}}) if ref($atom->{column}) eq 'HASH';
     # An expression: its result type follows its operands. Unknown when one
     # has (or may have) an extension type.
+    my ($unknown, $soft, $over) = (0, 1, 0);
     for my $ref (@{$atom->{refs} // []}) {
         next if $ref->{consumed};
         my $class = _ref_class($state, $ref);
-        return {unknown => 1} if $class->{entry} || $class->{unknown};
+        next unless $class->{entry} || $class->{unknown};
+        $unknown = 1;
+        $over ||= $class->{entry} ? 1 : $class->{over_extension};
+        $soft = 0 unless $class->{entry} ? $class->{entry}{"\0strcat"} : $class->{soft};
     }
-    return {};
+    return $unknown ? {unknown => 1, soft => $soft, over_extension => $over} : {};
 }
 
 sub _ref_class {
@@ -901,18 +977,31 @@ sub _ref_class {
     my $column = $ref->{column};
     my $entry = _resolve_column($state, $column->{at}, $column->{names});
     if (ref($entry) eq 'HASH') {
-        return {unknown => 1} if $entry->{"\0unknown"};
-        return _is_extension($entry) ? {entry => $entry} : {};
+        return {unknown => 1, soft => $entry->{"\0soft"}, over_extension => $entry->{"\0over"}} if $entry->{"\0unknown"};
+        return {entry => $entry} if _is_extension($entry);
+        return $entry->{"\0string"} ? {string => 1} : {};
     }
     # No source found: unknown only when an extension-typed column of a
     # relation the statement names has its name.
     return _names_extension_column($state, [$column->{names}[-1]]) ? {unknown => 1} : {};
 }
 
-# A column entry of an extension type: its operators and functions.
+# A column entry of an extension type, with or without operators of its own
+# (a composite type has none; a domain an extension owns over a pg_catalog type
+# has only \0extdom).
 sub _is_extension {
     my ($entry) = @_;
-    return ref($entry) eq 'HASH' && grep { substr($_, 0, 1) ne "\0" || $_ eq "\0fn" } keys %$entry;
+    return ref($entry) eq 'HASH' && grep { substr($_, 0, 1) ne "\0" || $_ eq "\0fn" || $_ eq "\0type" || $_ eq "\0extdom" } keys %$entry;
+}
+
+# Whether a type name, as written, is a pg_catalog string type.
+sub _string_type {
+    my ($type) = @_;
+    return 0 if $type =~ /"char"/i;
+    (my $name = lc $type) =~ s/"//g;
+    $name =~ s/\A\s*pg_catalog\s*\.\s*//;
+    $name =~ s/\s*\(.*\z//s;
+    return $name =~ /\A(?:text|varchar|bpchar|char|name|character|character varying)\z/ ? 1 : 0;
 }
 
 # The extension function a call to $name resolves to when its first
@@ -1208,7 +1297,9 @@ sub _computed_entry {
         my $tree = _read_run($state, $tokens, \$pos, undef);
         if ($pos == $last + 1) {
             my $class = !$tree->{atom} ? {} : _class_of($state, $tree->{atom});
-            $entry = $class->{entry} ? $class->{entry} : $class->{unknown} ? {"\0unknown" => 1} : {};
+            # A parameter or literal output is text (R57).
+            $entry = $class->{entry} ? $class->{entry} : $class->{unknown} ? {"\0unknown" => 1, "\0soft" => $class->{soft}, "\0over" => $class->{over_extension}}
+                : $class->{string} || $class->{untyped} ? {"\0string" => 1} : {};
         }
         1;
     };
@@ -1231,7 +1322,7 @@ sub _function_column {
         $type =~ s/\A\s*pg_catalog\.//;
         $type =~ s/\s*\(.*\z//;
         $type =~ s/\s*\[\]\z/[]/;
-        return $BUILTIN_TYPE{$type} ? {} : {"\0unknown" => 1};
+        return _string_type($type) ? {"\0string" => 1} : $BUILTIN_TYPE{$type} ? {} : {"\0unknown" => 1};
     }
     # WITH ORDINALITY's last column is bigint.
     return {} if $source->{ordinality} && $index == $#$cols && @$cols > 1;

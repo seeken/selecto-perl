@@ -2081,20 +2081,26 @@ sub _pg_catalog_functions {
     # taken from a scalar or array argument (its result can then be an
     # extension type, as unnest(citext[]) or a polymorphic aggregate's: see
     # Qualify's operand classes). A range's or enum's element alone does not
-    # count (upper(anyrange)).
+    # count (upper(anyrange)). 'string': every overload over strings returns a
+    # pg_catalog string type.
     my $ok = eval {
         $rows = $dbh->selectall_arrayref(q{SELECT CAST(p.proname AS pg_catalog.text),
             pg_catalog.bool_or(CAST(p.prorettype AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
                 (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray}' AS pg_catalog.regtype[]))
               AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS a(t)
                 WHERE CAST(a.t AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
-                  (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray,anyarray,anycompatiblearray}' AS pg_catalog.regtype[]))))
+                  (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray,anyarray,anycompatiblearray}' AS pg_catalog.regtype[])))),
+            pg_catalog.bool_and(CAST(p.prorettype AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
+                (CAST('{pg_catalog.text,pg_catalog.varchar,pg_catalog.bpchar,pg_catalog.name}' AS pg_catalog.regtype[]))
+              OR EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS a(t, i)
+                WHERE a.i OPERATOR(pg_catalog.=) CAST(1 AS pg_catalog.int8) AND CAST(a.t AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
+                  (CAST('{anyrange,anymultirange,pg_catalog.bytea,pg_catalog.bit,pg_catalog.varbit}' AS pg_catalog.regtype[]))))
             FROM pg_catalog.pg_proc p
             WHERE p.pronamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace) GROUP BY 1});
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    my %names = map { (lc($_->[0]) => ($_->[1] ? 'polymorphic' : 1)) } @{$rows // []};
+    my %names = map { (lc($_->[0]) => ($_->[1] ? 'polymorphic' : $_->[2] ? 'string' : 1)) } @{$rows // []};
     $dbh->{private_selecto_pg_functions} = \%names;
     return \%names;
 }
@@ -2114,6 +2120,10 @@ sub _pg_catalog_functions {
 # - for each function the statement reads rows from: whether its outputs can
 #   be an extension type ("unknown") or not ("known");
 # - the transaction's isolation level (see _pg_verify_column_types).
+# - for an extension type: whether it is in the string category, and the
+#   cross-type members of its extension (R51: isbn13 = ean13, citext ~~ text);
+# - which columns are pg_catalog string types, or a domain over one, and which
+#   are a domain an extension owns over a type it does not;
 # A column whose domain chain is still a domain after 16 steps is refused.
 my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     a AS (SELECT r.rel, at.attname, at.atttypid FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(rel)
@@ -2130,6 +2140,7 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
         AND t.typelem OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid) AND t.typlen OPERATOR(pg_catalog.<) 0))),
     e AS (SELECT c.rel, c.att, c.arr, ty.oid, d.refobjid FROM c
       JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
+        AND ty.typcategory OPERATOR(pg_catalog.<>) 'A'
       JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
         AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'),
     x(oid, depth) AS (
@@ -2149,6 +2160,33 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
     WHERE c.depth OPERATOR(pg_catalog.=) 16
     UNION ALL
+    SELECT 'str', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
+    FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
+    WHERE NOT c.arr AND ty.typcategory OPERATOR(pg_catalog.=) 'S'
+      AND ty.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)
+    UNION ALL
+    SELECT 'xdom', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
+    FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
+    JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
+      AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'
+    WHERE NOT c.arr
+    UNION ALL
+    SELECT 'xop', CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
+      pg_catalog.concat(o.oprname, pg_catalog.chr(31),
+        pg_catalog.quote_ident(CAST(ln.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(lt.typname AS pg_catalog.text)), pg_catalog.chr(31),
+        pg_catalog.quote_ident(CAST(rn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(rt.typname AS pg_catalog.text))),
+      CAST(n.nspname AS pg_catalog.text)
+    FROM e JOIN pg_catalog.pg_operator o ON (o.oprleft OPERATOR(pg_catalog.=) e.oid OR o.oprright OPERATOR(pg_catalog.=) e.oid)
+      AND o.oprleft OPERATOR(pg_catalog.<>) o.oprright
+    JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
+      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace
+    JOIN pg_catalog.pg_type lt ON lt.oid OPERATOR(pg_catalog.=) o.oprleft
+    JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lt.typnamespace
+    JOIN pg_catalog.pg_type rt ON rt.oid OPERATOR(pg_catalog.=) o.oprright
+    JOIN pg_catalog.pg_namespace rn ON rn.oid OPERATOR(pg_catalog.=) rt.typnamespace
+    WHERE NOT e.arr AND o.oprnamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
+    UNION ALL
     SELECT CASE WHEN e.arr THEN 'eop' ELSE 'op' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
       CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
     FROM e JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) e.oid AND o.oprright OPERATOR(pg_catalog.=) e.oid
@@ -2158,7 +2196,8 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     WHERE o.oprnamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
     UNION ALL
     SELECT CASE WHEN e.arr THEN 'etyp' ELSE 'typ' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
-      pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), NULL
+      pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))),
+      CAST(ty.typcategory AS pg_catalog.text)
     FROM e JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) e.oid
     JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) ty.typnamespace
     UNION ALL
@@ -2192,10 +2231,13 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
       SELECT NULL AS op, CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
           WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
             AND d.objid OPERATOR(pg_catalog.=) w.t)
-          THEN pg_catalog.concat('ext:', pg_catalog.quote_ident(CAST((SELECT tn.nspname FROM pg_catalog.pg_namespace tn
+          THEN pg_catalog.concat('ext:', CAST(wt.typcategory AS pg_catalog.text), ':', pg_catalog.quote_ident(CAST((SELECT tn.nspname FROM pg_catalog.pg_namespace tn
             WHERE tn.oid OPERATOR(pg_catalog.=) wt.typnamespace) AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(wt.typname AS pg_catalog.text)))
         WHEN w.t OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x)) OR wt.typtype OPERATOR(pg_catalog.=) 'p'
-          OR wt.typtype OPERATOR(pg_catalog.=) 'c' THEN 'unknown' ELSE 'known' END AS schema
+          OR wt.typtype OPERATOR(pg_catalog.=) 'c' THEN 'unknown'
+        WHEN wt.typcategory OPERATOR(pg_catalog.=) 'S'
+          AND wt.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace) THEN 'string'
+        ELSE 'known' END AS schema
       UNION ALL
       SELECT CAST(op.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
       FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_operator op ON op.oprleft OPERATOR(pg_catalog.=) w.t AND op.oprright OPERATOR(pg_catalog.=) w.t
@@ -2326,12 +2368,29 @@ my $CAST_TYPES_SQL = q{WITH RECURSIVE k(name, spelled) AS (
       WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND c.depth OPERATOR(pg_catalog.<) 16),
     e AS (SELECT c.name, ty.oid, ty.typnamespace, d.refobjid FROM c
       JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
+        AND ty.typcategory OPERATOR(pg_catalog.<>) 'A'
       JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
         AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e')
     SELECT 'typ', e.name, pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
-        pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), NULL
+        pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), CAST(ty.typcategory AS pg_catalog.text)
     FROM e JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) e.oid
     JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) ty.typnamespace
+    UNION ALL
+    SELECT 'xop', e.name,
+      pg_catalog.concat(o.oprname, pg_catalog.chr(31),
+        pg_catalog.quote_ident(CAST(ln.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(lt.typname AS pg_catalog.text)), pg_catalog.chr(31),
+        pg_catalog.quote_ident(CAST(rn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(rt.typname AS pg_catalog.text))),
+      CAST(n.nspname AS pg_catalog.text)
+    FROM e JOIN pg_catalog.pg_operator o ON (o.oprleft OPERATOR(pg_catalog.=) e.oid OR o.oprright OPERATOR(pg_catalog.=) e.oid)
+      AND o.oprleft OPERATOR(pg_catalog.<>) o.oprright
+    JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
+      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace
+    JOIN pg_catalog.pg_type lt ON lt.oid OPERATOR(pg_catalog.=) o.oprleft
+    JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lt.typnamespace
+    JOIN pg_catalog.pg_type rt ON rt.oid OPERATOR(pg_catalog.=) o.oprright
+    JOIN pg_catalog.pg_namespace rn ON rn.oid OPERATOR(pg_catalog.=) rt.typnamespace
+    WHERE o.oprnamespace OPERATOR(pg_catalog.=) e.typnamespace
     UNION ALL
     SELECT 'op', e.name, CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
     FROM e JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) e.oid AND o.oprright OPERATOR(pg_catalog.=) e.oid
@@ -2348,7 +2407,8 @@ sub _pg_cast_types {
     my %entries;
     for my $row (@{$rows // []}) {
         my ($kind, $key, $a, $b) = @$row;
-        if ($kind eq 'typ') { $entries{$key}{"\0type"} = $a }
+        if ($kind eq 'typ') { $entries{$key}{"\0type"} = $a; $entries{$key}{"\0strcat"} = 1 if ($b // '') eq 'S' }
+        elsif ($kind eq 'xop') { $entries{$key}{"\0x"}{(split /\x1f/, $a, 2)[0]}{(split /\x1f/, $a, 2)[1] =~ s/\x1f/\0/r} = '"' . ($b =~ s/"/""/gr) . '"' }
         else { $entries{$key}{$a} = '"' . ($b =~ s/"/""/gr) . '"' }
     }
     return \%entries;
@@ -2401,23 +2461,31 @@ sub _pg_extension_lookup {
         if ($kind eq 'fcol') {
             my $col = $known{$column}{cols}[$rel - 1] //= {};
             $col->{"\0unknown"} = 1 if $b eq 'unknown';
-            $col->{"\0type"} = $1 if $b =~ /\Aext:(.+)\z/s;
+            $col->{"\0string"} = 1 if $b eq 'string';
+            if ($b =~ /\Aext:(.):(.+)\z/s) { $col->{"\0type"} = $2; $col->{"\0strcat"} = 1 if $1 eq 'S' }
             next;
         }
         if ($kind eq 'fop') { $known{$column}{cols}[$rel - 1]{$a} = $quote->($b); next }
         my $columns = $relations{$key->($rel)} //= {};
         my $entry = $columns->{$column} //= {};
         if ($kind eq 'col') { $types{$rel}{$column} = $a; next }
+        if ($kind eq 'str') { $entry->{"\0string"} = 1; next }
         # A domain chain deeper than the walk follows: its base type, and so
         # its operators, are unknown (review LOW).
         Selecto::Error->throw('query_rule_not_evaluable', 'a column is a domain chain too deep to resolve its base type',
             {reason => 'domain_chain_too_deep', relation => $rel, column => $column}) if $kind eq 'deep';
         $extension = 1;
         my $target = $kind =~ /\Ae/ ? ($entry->{"\0elem"} //= {}) : $entry;
-        if ($kind =~ /typ\z/) {
+        if ($kind eq 'xdom') {
+            $target->{"\0extdom"} = 1;
+        } elsif ($kind eq 'xop') {
+            my ($op, $left, $right) = split /\x1f/, $a, 3;
+            $target->{"\0x"}{$op}{"$left\0$right"} = $quote->($b);
+        } elsif ($kind =~ /typ\z/) {
             # The member type's own name: operands of its operators are cast
             # to it (R50).
             $target->{"\0type"} = $a;
+            $target->{"\0strcat"} = 1 if ($b // '') eq 'S';
         } elsif ($kind =~ /op\z/) {
             $target->{$a} = $quote->($b);
         } else {
