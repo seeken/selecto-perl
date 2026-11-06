@@ -139,6 +139,43 @@ is($text->(q{SELECT a.id FROM public.a3_t AS a WHERE (CASE WHEN a.id = 1 THEN a.
 is($text->(q{SELECT a.id FROM public.a3_t AS a WHERE (CASE WHEN a.id = 1 THEN a.ci ELSE a.ci END) ~~ a.tx}), 'query_rule_not_evaluable/operand_type_unknown', 'and ~~');
 unlike($text->(q{SELECT a.id FROM public.a3_t AS a WHERE a.tx ~ (CASE WHEN a.id = 1 THEN a.ci ELSE a.ci END)}), qr/\Aquery_rule/, 'text ~ citext has no member, and is text');
 
+# A CASE with citext results never gets pg_catalog's operator or aggregate
+# where PostgreSQL takes citext's: native 'MIXED' matches case-insensitively,
+# and text's = would narrow the rows silently.
+{
+    my $citext_case = q{(CASE WHEN a.id > 0 THEN a.ci END)};
+    my $unknown = 'query_rule_not_evaluable/operand_type_unknown';
+    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case = 'A\@X'"), $unknown, 'CASE of citext = a literal');
+    is($text->("SELECT a.id FROM public.a3_t AS a WHERE 'A\@X' = $citext_case"), $unknown, 'a literal = CASE of citext');
+    is($text->(q{SELECT a.id FROM public.a3_t AS a WHERE CASE WHEN a.id > 0 THEN a.ci END = $1}), $unknown, 'CASE of citext = a parameter');
+    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case = a.ci2"), $unknown, 'CASE of citext = citext');
+    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case IN ('A\@X')"), $unknown, 'CASE of citext in a list');
+    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case BETWEEN 'a' AND 'b'"), $unknown, 'CASE of citext between');
+    is($text->("SELECT a.id FROM public.a3_t AS a WHERE $citext_case LIKE 'A%'"), $unknown, 'CASE of citext LIKE');
+    is($text->("SELECT max$citext_case FROM public.a3_t AS a"), $unknown, 'max over a CASE of citext');
+    is($text->("SELECT min(COALESCE(a.ci, a.ci2)) FROM public.a3_t AS a"), $unknown, 'min over a COALESCE of citext');
+    is($text->("WITH m AS (SELECT a.id, $citext_case AS v FROM public.a3_t AS a) SELECT m.id FROM m WHERE m.v = 'A\@X'"), $unknown, 'a member output of a CASE of citext');
+    is($text->("SELECT a.id FROM public.a3_t AS a WHERE (SELECT $citext_case) = 'A\@X'"), $unknown, 'a scalar subquery of it');
+    my $max = $rows->($e->query->select($x->max('ci')->as('m')));
+    is($max, 'a@x', "max over the column itself is citext's");
+    is($where->($x->eq('ci_case', 'A@X')), $unknown, 'and through the public API');
+    is($rows->($e->query->select($x->max('ci_case')->as('m'))), $unknown, 'max of a computed CASE through the public API');
+}
+
+# A set operation's output is what its branches resolve to together, not its
+# first branch's type: a literal beside citext is citext, citext beside text is
+# text. Each of these answered wrongly when only the first branch was read.
+{
+    my $unknown = 'query_rule_not_evaluable/operand_type_unknown';
+    is($text->(q{SELECT 1 FROM (SELECT 'a' AS x UNION ALL SELECT s.ci FROM public.a3_t AS s) AS d WHERE d.x = 'A'}), $unknown, 'a literal beside citext');
+    is($text->(q{SELECT 1 FROM (SELECT s.ci AS x FROM public.a3_t AS s UNION ALL SELECT s.tx FROM public.a3_t AS s) AS d WHERE d.x = 'A'}), $unknown, 'citext beside text');
+    like($text->(q{SELECT 1 FROM (SELECT s.ci AS x FROM public.a3_t AS s UNION SELECT t.ci2 FROM public.a3_t AS t) AS d WHERE d.x = 'A'}), qr/OPERATOR\("?\w+"?\.=\)\s*\(CAST/,
+        'citext beside citext stays citext');
+    like($text->(q{WITH RECURSIVE m(id, v) AS (SELECT s.id, s.ci FROM public.a3_t AS s UNION ALL SELECT m.id + 1, m.v FROM m WHERE m.id < 2) SELECT m.id FROM m WHERE m.v = 'A'}),
+        qr/\.=\)\s*\(CAST/, "a recursive step's own reference adds nothing");
+    like($text->(q{SELECT 1 FROM (SELECT s.tx AS x FROM public.a3_t AS s UNION SELECT 'y') AS d WHERE d.x = 'A'}), qr/pg_catalog\.=/, 'text beside a literal is text');
+}
+
 # A refusal says what it refused.
 my $refused = eval { $e->all($e->query->select('id')->where($x->lt('h', 'a=>1'))); 1 } ? undef : $@;
 is($refused->details->{column}, 'h', 'the refusal names the column');
