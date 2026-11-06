@@ -15,6 +15,8 @@ Unreleased
       app.children. A real cross-schema reference or join must now be declared
       with schemas; a namesake ahead of the root's schema refuses
       relation_ambiguous. A TEMP root keeps the reset path.
+    - MySQL and MariaDB: a statement timeout (errors 3024 and 1969) is query_error
+      with details.category query_canceled, as PostgreSQL's is.
     - Reads no longer write (R55). What newly refuses: a read through a view or
       function that writes, such as a view using nextval or an audit function
       that inserts, and a hand-built statement that writes passed to

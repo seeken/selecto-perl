@@ -1576,6 +1576,12 @@ sub normalize_error {
             message => 'The database timed out waiting for a lock; retry the transaction.',
             details => {category => 'lock_timeout', retryable => JSON::PP::true});
     }
+    # max_execution_time (MySQL) and max_statement_time (MariaDB): PostgreSQL's
+    # 57014. The category outlives the read's rollback, which clears the handle.
+    if ($errno == 3024 || $errno == 1969) {
+        return Selecto::Error->new(code => 'query_error', message => 'Execution failed',
+            details => {cause => 'database_error', category => 'query_canceled'});
+    }
     return $self->SUPER::normalize_error($error);
 }
 
