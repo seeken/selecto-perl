@@ -1670,11 +1670,12 @@ sub _grouping_position {
     return 0;
 }
 
-# R60, R62: which overload a bare call means is PostgreSQL's to say. pg_catalog's name
-# is written only where no extension's function of that name could take the
-# arguments: where one could (strpos(ci, 'O') is citext's, and a keyword-named
-# delete(h, 'a') is hstore's), the call stays as written, resolved under the pin.
-# Returns the name to write, or undef for the usual handling.
+# R60, R62: which overload a call means is PostgreSQL's to say. pg_catalog's name is
+# written only where no extension's function of that name could take the arguments.
+# Where one could (strpos(ci, 'O') is citext's, and a keyword-named delete(h, 'a') is
+# hstore's), its schema is named, and PostgreSQL resolves the overload among what is
+# there. With an argument of unknown type, or more than one schema to choose from, the
+# call stays as written, under the pin. Returns the name, or undef for the usual handling.
 sub _resolve_call {
     my ($state, $names, $kinds, $trees) = @_;
     return undef unless $state->{scopes} && @$names == 1;
@@ -1684,9 +1685,13 @@ sub _resolve_call {
     my @classes = map { _tree_class($state, $_) } @$trees;
     my @extension = grep { $_->{schema} ne 'pg_catalog' && defined $_->{extension} && _accepts($_, \@classes) } @{$info->{candidates} // []};
     return undef unless @extension;
-    return $names->[0] if $KEYWORD{uc $names->[0]} || grep { $_->{entry} || $_->{unknown} } @classes;
-    return undef;
+    return undef unless $KEYWORD{uc $names->[0]} || grep { $_->{entry} || $_->{unknown} } @classes;
+    my %homes = map { ($_->{schema} => 1) } @extension;
+    return $names->[0] if keys(%homes) != 1 || grep { $_->{unknown} } @classes;
+    return _quote_name($extension[0]{schema}) . '.' . _quote_name($kinds->[0] eq 'id' ? lc $names->[0] : _unquote($names->[0]));
 }
+
+sub _quote_name { return '"' . ($_[0] =~ s/"/""/gr) . '"' }
 
 # Whether name(...) at $k is a declaration with a column list, not a call: an alias
 # after AS, or a WITH item before AS (. $after is the token after the parenthesis.

@@ -1979,9 +1979,12 @@ sub _pg_hold_relations {
     my $dbh = $self->{dbh};
     my $savepoint = Selecto::SQL::_savepoint_name('selecto_hold');
     my @sql = ("SAVEPOINT $savepoint", (map { "SELECT 1 FROM $_ LIMIT 0" } @{$relations // []}), 'SELECT 1');
-    # A hand-built statement names none: planning it takes what it would lock,
-    # and runs nothing. (Not one that says it writes: it will refuse, holding nothing.)
-    my $plan = _pg_hand_built($source) && Selecto::SQL::_hand_built_text($source->sql) !~ /\b(?:INSERT|UPDATE|DELETE|MERGE)\b(?!\s*\()/i ? 'EXPLAIN (COSTS OFF) ' . $source->sql : undef;
+    # A hand-built statement names none: planning it takes what it would lock, and
+    # runs nothing. The plan, not its text, says whether it writes or locks rows: such
+    # a statement will refuse, so what planning took for it goes back. (Any deadline
+    # the read has is in force here, on this as on the read.)
+    my $plan = _pg_hand_built($source) ? 'EXPLAIN (COSTS OFF, FORMAT JSON) ' . $source->sql : undef;
+    my $writes;
     my $held = eval {
         local $dbh->{PrintError} = 0;
         local $dbh->{RaiseError} = 1;
@@ -1990,9 +1993,11 @@ sub _pg_hold_relations {
             local $self->{_selecto_pg_host_statement} = $plan;
             my $sth = $dbh->prepare($plan);
             $sth->execute(@{$source->params});
+            my ($text) = $sth->fetchrow_array;
             $sth->finish;
+            $writes = _pg_plan_writes(JSON::PP->new->decode($text)->[0]{Plan});
         }
-        $dbh->do("RELEASE SAVEPOINT $savepoint");
+        $dbh->do(($writes ? "ROLLBACK TO SAVEPOINT $savepoint; " : '') . "RELEASE SAVEPOINT $savepoint");
         1;
     };
     return if $held;
@@ -2002,6 +2007,13 @@ sub _pg_hold_relations {
         or die $self->_transaction_control_error($@);
     die $failure unless $state =~ /\A42/;
     return;
+}
+
+# Whether a plan changes rows or locks them, a data-modifying WITH's included.
+sub _pg_plan_writes {
+    my ($node) = @_;
+    return 1 if ($node->{'Node Type'} // '') =~ /\A(?:ModifyTable|LockRows)\z/;
+    return scalar grep { _pg_plan_writes($_) } @{$node->{Plans} // []};
 }
 
 # This transaction's virtual transaction id: setting-independent, and no
@@ -2953,8 +2965,9 @@ too, and a C<FOR UPDATE> in it with them.
 None of this weakens the host's transaction. Before the savepoint the read takes
 the transaction's first snapshot, so a C<SERIALIZABLE> host stays read-write to
 C<SSI>, and the table locks of the relations it names, or for a hand-built
-statement the ones planning it takes, so they last to the host's commit. That is
-one more round trip for a read inside a host transaction. Locks on tables reached
+statement the ones planning it takes, so they last to the host's commit, unless the
+plan shows it writes or locks rows, when it holds nothing and refuses. That is one
+more round trip for a read inside a host transaction. Locks on tables reached
 only inside a function a view calls end with the read.
 
 =head1 SESSION STATE
