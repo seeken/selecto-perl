@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL bounded streams verify their cursor before every fetch (R64).
+      Session code run by anything else on the connection between fetches
+      could close the cursor and declare another of the same name, and a tenant
+      stream then returned another tenant's rows. The stream now refuses,
+      query_rule_not_evaluable with reason stream_cursor_replaced. One extra
+      round trip per batch.
     - DuckDB 2.0: required filters no longer fail with "Could not convert
       string '' to INT32" on columns that are not DECIMAL, and epoch formats
       work on DATE fields (DATE AT TIME ZONE became TIMESTAMPTZ_NS there, which

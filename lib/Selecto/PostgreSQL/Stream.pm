@@ -8,6 +8,12 @@ use Scalar::Util ();
 use Selecto::Error ();
 
 my $SERIAL = 0;
+# R64: session code run by anything else on the connection between fetches can
+# CLOSE this cursor and DECLARE another of the same name, read from pg_cursors.
+# Its statement and creation time identify it: no DECLARE can reproduce the
+# time. Each batch checks them before its FETCH.
+my $CURSOR_SQL = q{SELECT c.statement, CAST(c.creation_time AS pg_catalog.text) FROM pg_catalog.pg_cursors c }
+    . q{WHERE c.name OPERATOR(pg_catalog.=) CAST($1 AS pg_catalog.text)};
 
 sub new {
     my ($class, %args) = @_;
@@ -62,6 +68,11 @@ sub new {
             or die 'cursor declaration failed';
         $self->{declared} = 1;
         $declaration->finish;
+        if ($adapter->_pg_session_checked) {
+            my @cursor = $dbh->selectrow_array($CURSOR_SQL, undef, $name);
+            die 'stream cursor identity is unavailable' unless @cursor && defined $cursor[1];
+            $self->{cursor} = \@cursor;
+        }
         # One FETCH result is all that libpq can buffer, so fetch_size rows
         # (default 1) bound DBD::Pg's eager result allocation. RowCacheSize
         # alone cannot.
@@ -90,6 +101,17 @@ sub next {
         my $sth = $self->{sth};
         require Selecto::QueryBudget;
         Selecto::QueryBudget->before_blocking($self->{dbh});
+        # Before the FETCH: during it the portal is active and cannot be closed,
+        # so nothing can replace it after this check. A replacement of another
+        # width would also crash the driver's fetch (DBI's field count).
+        if ($self->{cursor}) {
+            my @now = $self->{dbh}->selectrow_array($CURSOR_SQL, undef, $self->{name});
+            unless (@now && defined($now[1]) && $now[0] eq $self->{cursor}[0] && $now[1] eq $self->{cursor}[1]) {
+                $self->{cursor_replaced} = 1;
+                Selecto::Error->throw('query_rule_not_evaluable', "the stream's cursor was replaced while it was open",
+                    {reason => 'stream_cursor_replaced'});
+            }
+        }
         defined($sth->execute) or die 'cursor fetch failed';
         $self->{types} //= [$self->{adapter}->_column_types($sth)];
         $rows = $sth->fetchall_arrayref;
@@ -113,7 +135,7 @@ sub next {
         my $error = $self->{adapter}->normalize_error($@);
         # A changed session is the stream's own work to undo: its savepoint
         # or its own transaction is rolled back, which reverts the change.
-        my $origin = $self->{session_changed} ? 'own' : $self->_failure_origin;
+        my $origin = $self->{session_changed} || $self->{cursor_replaced} ? 'own' : $self->_failure_origin;
         $error = eval { Selecto::PostgreSQL::_session_changed(); 1 } ? $error : $@ if $self->{session_changed};
         my $cleanup = eval { $self->_close($origin); 1 } ? undef : $@;
         die _cleanup_error($cleanup) // $error;
