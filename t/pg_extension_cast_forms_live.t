@@ -16,12 +16,17 @@ my $common = Selecto::PostgreSQL::Qualify::_common_entry({"\0unknown" => 1}, {"\
 ok($common->{"\0unknown"}, 'operands of no known type have no common one');
 is_deeply(\@warnings, [], 'and saying so does not warn');
 
-plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
-plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
+unless (($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '' && eval { require DBD::Pg; 1 }) {
+    done_testing;
+    exit 0;
+}
 my $admin = TestPostgreSQL->connect;
 $admin->do('SET client_min_messages TO warning');
 my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
-plan skip_all => 'citext cannot be installed' unless $preinstalled || eval { $admin->do('CREATE EXTENSION citext'); 1 };
+unless ($preinstalled || eval { $admin->do('CREATE EXTENSION citext'); 1 }) {
+    done_testing;
+    exit 0;
+}
 my $schema = ($admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'}))[0];
 my @clean = ('DROP TABLE IF EXISTS public.cf_t');
 END { eval { $admin->do($_) for @clean; $admin->do('DROP EXTENSION IF EXISTS citext CASCADE') unless $preinstalled } }
