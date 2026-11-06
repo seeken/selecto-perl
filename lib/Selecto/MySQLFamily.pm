@@ -17,6 +17,7 @@ use Scalar::Util qw(blessed refaddr);
 # statement the library sends to MariaDB turns the cache off for that
 # statement only (the host's session is unchanged).
 my $MARIADB_STATEMENT = q{SET STATEMENT optimizer_switch='subquery_cache=off' FOR };
+my $CONTROL_ATTEMPTS = 5;
 
 sub _statement_sql {
     my ($self, $sql) = @_;
@@ -2896,27 +2897,93 @@ sub _read_transaction {
     my ($self, $work) = @_;
     my $dbh = $self->{dbh};
     return $work->() unless $dbh->{AutoCommit};
-    my $command = sub {
-        my ($sql) = @_;
+    my $begun = eval {
         local $dbh->{PrintError} = 0;
-        defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
+        for my $sql ('SET TRANSACTION READ ONLY', 'SET autocommit = 0') {
+            defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
+        }
+        1;
     };
-    my $begun = eval { $command->($_) for 'SET TRANSACTION READ ONLY', 'SET autocommit = 0'; 1 };
     unless ($begun) {
+        # SET TRANSACTION lasts until a transaction ends, which a plain statement
+        # that touches no table does not do; and which step failed is not known.
         my $failure = $self->_transaction_control_error($@);
-        # (SET TRANSACTION lasts until a transaction ends, which a plain statement
-        # that touches no table does not do.)
-        eval { $command->('ROLLBACK AND NO CHAIN NO RELEASE') };
+        $self->_finish_read;
         die $failure;
     }
     my $value;
     my $ok = eval { $value = $work->(); 1 };
     my $error = $@;
-    my $ended = eval { $command->($_) for 'ROLLBACK AND NO CHAIN NO RELEASE', 'SET autocommit = 1'; 1 };
-    my $ending = $@;
+    my $finished = $self->_finish_read;
     die $error unless $ok;
-    die $self->_transaction_control_error($ending) unless $ended;
+    die $finished unless $finished eq '1';
     return $value;
+}
+
+# A read may end up READ ONLY or with autocommit off only by accident, and a host
+# whose next write is refused, or never commits, is worse off than one with no
+# connection. So what puts the session back is retried (a KILL QUERY can land on
+# it), and a session that cannot be put back is closed. Returns 1, or the error.
+sub _finish_read {
+    my ($self) = @_;
+    return 1 if $self->_retry_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_retry_control('SET autocommit = 1');
+    return $self->_close_session('the read could not be ended');
+}
+
+sub _retry_control {
+    my ($self, $sql) = @_;
+    my $dbh = $self->{dbh};
+    for my $attempt (1 .. $CONTROL_ATTEMPTS) {
+        return 1 if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; defined($dbh->do($sql)) };
+        select(undef, undef, undef, 0.01);
+    }
+    return 0;
+}
+
+sub _close_session {
+    my ($self, $message, %details) = @_;
+    my $dbh = $self->{dbh};
+    eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
+    return Selecto::Error->new(code => 'transaction_state_unsafe', message => "$message: the connection was closed",
+        details => {state => 'unknown', reason => 'session_not_restored', %details});
+}
+
+# Selecto's own transactions end the same way. The driver's commit and rollback
+# send a bare COMMIT or ROLLBACK, which obeys completion_type: 1 chains a new
+# transaction, and 2 closes the connection after the write. DBI's state follows by
+# hand, as it would after them.
+sub _commit_transaction {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    {
+        local $dbh->{PrintError} = 0;
+        defined($dbh->do('COMMIT AND NO CHAIN NO RELEASE'))
+            or die Selecto::SQL::_dbi_error($dbh, 'database transaction could not commit');
+    }
+    $self->_leave_transaction or die $self->_close_session('the write committed, but its session could not be restored', committed => JSON::PP::true);
+    return;
+}
+
+sub _rollback_transaction {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    # A commit that failed may already have ended it: see the parent.
+    return if eval { $dbh->{AutoCommit} } && !eval { $dbh->{BegunWork} };
+    return if $self->_retry_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_leave_transaction;
+    die $self->_close_session('the write could not be rolled back');
+}
+
+sub _leave_transaction {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    for my $attempt (1 .. $CONTROL_ATTEMPTS) {
+        if (eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->{AutoCommit} = 1; 1 }) {
+            $dbh->{BegunWork} = 0;
+            return 1;
+        }
+        select(undef, undef, undef, 0.01);
+    }
+    return 0;
 }
 
 sub _decode {
