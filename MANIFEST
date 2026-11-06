@@ -224,7 +224,9 @@ t/mysql_family.integration.t
 t/mysql_family.t
 t/mysql_family_cursor.t
 t/mysql_family_date_format.t
+t/mysql_completion_type_live.t
 t/mysql_family_live.t
+t/mysql_kill_query_storm_live.t
 t/mysql_family_session_live.t
 t/mysql_family_sql.t
 t/mysql_family_tenant_collation_live.t

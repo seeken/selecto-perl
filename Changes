@@ -1,6 +1,16 @@
 Revision history for Selecto
 
 Unreleased
+    - MySQL and MariaDB: Selecto's own transactions end with COMMIT or ROLLBACK
+      AND NO CHAIN NO RELEASE, not the driver's commit and rollback, whose bare
+      statements obey completion_type. At 2 a write, batch or graph committed, then
+      the connection closed and the write was reported as failed; a refused write
+      closed it too. At 1 the driver's restore of autocommit happened to commit
+      the chained transaction, so no write was lost.
+      A ROLLBACK or autocommit restore that fails, as KILL QUERY can make it, is
+      retried, and if that fails the connection is closed, transaction_state_unsafe
+      with reason session_not_restored, rather than left read only or with
+      autocommit off. A write that committed before that says committed => true.
     - PostgreSQL: x::citext, x::public.citext and CAST(x AS citext) now type like
       CAST(x AS public.citext): the comparison takes the extension's operator and
       gives the database's answer. These were wrong or refused before.
