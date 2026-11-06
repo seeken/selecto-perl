@@ -467,8 +467,10 @@ sub _required_native_sql {
         $whole =~ s/\A0+(?=[0-9])//;
         $fraction =~ s/0+\z//;
         my ($digits, $scale) = ($whole eq '0' ? 0 : length($whole), length($fraction));
-        my $declared_scale = "CAST(regexp_extract($type, ',([0-9]+)\\)', 1) AS INTEGER)";
-        my $declared_precision = "CAST(regexp_extract($type, '\\(([0-9]+),', 1) AS INTEGER)";
+        # TRY_CAST: DuckDB 2.0 evaluates these for columns of other types, where
+        # a CASE branch used to shield them, and '' is no integer.
+        my $declared_scale = "TRY_CAST(regexp_extract($type, ',([0-9]+)\\)', 1) AS INTEGER)";
+        my $declared_precision = "TRY_CAST(regexp_extract($type, '\\(([0-9]+),', 1) AS INTEGER)";
         $decimal_sql = "(CASE WHEN $declared_scale >= $scale AND $declared_precision - $declared_scale >= $digits"
             . " THEN $native ELSE $REFUSED_LITERAL END)";
     }
@@ -902,6 +904,10 @@ sub _compile_dialect_expression {
             # Group-expression reuse is handled by the shared compiler.
             my $instant_sql = sub {
                 my $sql = $self->_compile_expression($domain, $field, $params);
+                # DuckDB 2.0 makes DATE AT TIME ZONE a TIMESTAMPTZ_NS, which
+                # EPOCH does not take; from TIMESTAMP it is the same instant on
+                # every version.
+                $sql = "CAST($sql AS TIMESTAMP)" if $resolved->{type} eq 'date';
                 if ($resolved->{type} ne 'utc_datetime' && $resolved->{type} ne 'epoch_datetime') {
                     if (defined($timezone) && $timezone ne 'UTC') {
                         push @$params, $timezone;

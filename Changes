@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 Unreleased
+    - DuckDB 2.0: required filters no longer fail with "Could not convert
+      string '' to INT32" on columns that are not DECIMAL, and epoch formats
+      work on DATE fields (DATE AT TIME ZONE became TIMESTAMPTZ_NS there, which
+      EPOCH does not take). The SQL is unchanged in effect on DuckDB 1.5.
     - The remote query route answers a typed refusal at execution
       (query_rule_not_evaluable) with 422 invalid_query, not 500
       internal_failure.
