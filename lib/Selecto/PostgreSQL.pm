@@ -1290,7 +1290,7 @@ sub _refuse_connection_state {
 # What a trigger does beyond this (other settings, role changes, writes to
 # unrelated tables, DDL outside the temp schema) is the schema owner's
 # responsibility, like a trigger's effects on other rows (item 56a).
-my @SESSION_SETTINGS = qw(search_path TimeZone DateStyle IntervalStyle extra_float_digits timezone_abbreviations bytea_output standard_conforming_strings);
+my @SESSION_SETTINGS = qw(search_path TimeZone DateStyle IntervalStyle extra_float_digits timezone_abbreviations bytea_output standard_conforming_strings client_encoding);
 my $TEMP_SCHEMA = 'pg_catalog.pg_my_temp_schema()';
 # The count of enabled deferrable triggers that can run user code at COMMIT
 # (R23, R32, R32a, R37): every user-defined one, and an internal foreign-key
@@ -1786,7 +1786,12 @@ sub _pg_admit_session {
         {reason => 'temporary_shadow'}) if $relations;
     Selecto::Error->throw('query_rule_not_evaluable', 'a temporary type of the session shadows a type name',
         {reason => 'temporary_shadow'}) if $types;
-    return _pg_state_row(\@state);
+    my $session = _pg_state_row(\@state);
+    # R65: bound values are sent as UTF-8. Read as LATIN1 they are other
+    # values: a tenant name with an accent becomes another name, which is another tenant's row.
+    Selecto::Error->throw('query_rule_not_evaluable', "the session's client_encoding must be UTF8",
+        {reason => 'client_encoding'}) unless uc($session->{settings}{client_encoding} // '') eq 'UTF8';
+    return $session;
 }
 
 sub _session_changed {

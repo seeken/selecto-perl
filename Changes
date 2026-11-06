@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: every read, stream and write refuses a session whose
+      client_encoding is not UTF8, query_rule_not_evaluable with reason
+      client_encoding (R65). Bound values are sent as UTF-8; read as LATIN1, a
+      tenant with an accent became another tenant's name, and its rows were read
+      and written. This is a behaviour change: a connection configured for
+      another encoding, including one that worked, now refuses. The setting is
+      also part of the session check, so a change during a statement is seen.
     - PostgreSQL: Selecto's guard, snapshot and post-image statements run
       unnamed, so session code cannot replace them with DEALLOCATE and PREPARE
       (R63); a test pins this. The opt-in statement_cache names business
