@@ -260,8 +260,53 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             ok(!eval { $admin->do('UPDATE r66_doctors SET org = org, oncall = oncall + 1 WHERE id = 1'); 1 }, "$lock: holds after the read");
             is(($d->selectrow_array('SELECT @@autocommit'))[0], 1, "$lock: autocommit is back");
             $d->do('UNLOCK TABLES');
-            ok(eval { $admin->do('UPDATE r66_doctors SET oncall = oncall + 1 WHERE id = 1'); 1 }, "$lock: until the host unlocks");
+            $admin->do('SET SESSION lock_wait_timeout = 10');
+            ok(eval { $admin->do('UPDATE r66_doctors SET oncall = oncall + 1 WHERE id = 1'); 1 }, "$lock: until the host unlocks") or diag $@;
             $d->disconnect;
+        }
+
+        # A read's ROLLBACK ignores completion_type: 1 would leave a transaction open
+        # around the host's next autocommit write, 2 would close the connection.
+        for my $type (1, 2) {
+            $reset->();
+            $admin->do('DELETE FROM r66_log');
+            my ($t, $et) = $open->();
+            $t->do("SET SESSION completion_type = $type");
+            ok(eval { $read->($et); 1 }, "completion_type $type: the read runs") or diag $@;
+            ok(eval { $t->do('INSERT INTO r66_log VALUES (7)'); 1 }, "completion_type $type: the connection stands") or diag $@;
+            is(($admin->selectrow_array('SELECT count(*) FROM r66_log'))[0], 1, "completion_type $type: the host's next write commits by itself");
+            $t->disconnect;
+        }
+
+        $admin->do('DELETE FROM r66_log');
+
+        # The read's READ ONLY ends with it, whatever the read did: the host's next
+        # write works after a read that failed before any table, and one with none.
+        require Selecto::Statement;
+        for my $case (['a read of a missing table', 'SELECT id FROM r66_missing', 0], ['a read with no table', 'SELECT 1 AS id', 1],
+            ['a read that does not parse', 'SELEC 1', 0]) {
+            my ($label, $sql, $works) = @$case;
+            my ($t) = $open->();
+            my $adapter = Selecto->adapter($name => (dbh => $t));
+            my $statement = Selecto::Statement->new(sql => $sql, params => [], columns => ['id'], adapter_name => $name);
+            is(eval { $adapter->execute_query($statement); 1 } // 0, $works, "$label: runs or fails as it should");
+            ok(eval { $t->do('INSERT INTO r66_log VALUES (6)'); 1 }, "$label: the host's next write is not read only") or diag $@;
+            ok(eval { $t->begin_work; $t->do('INSERT INTO r66_log VALUES (6)'); $t->rollback; 1 }, "$label: nor its next transaction") or diag $@;
+            $t->disconnect;
+        }
+        $admin->do('DELETE FROM r66_log');
+
+        # A handle with autocommit off is the host's too.
+        {
+            $reset->();
+            my $dbh = $connect->();
+            $dbh->{AutoCommit} = 0;
+            my $e = Selecto::Engine->new(domain => $domain->('r66_doctors'), adapter => Selecto->adapter($name => (dbh => $dbh)))->with_scope(tenant => 't1');
+            $dbh->do('INSERT INTO r66_log VALUES (8)');
+            is(scalar(@{$read->($e)}), 2, 'a read on an autocommit-off handle runs');
+            is(($dbh->selectrow_array('SELECT count(*) FROM r66_log WHERE id = 8'))[0], 1, 'and leaves the host its pending write');
+            $dbh->rollback;
+            $dbh->disconnect;
         }
 
         # A one-shot SET TRANSACTION is the read's, as it was: the next one is the session's.

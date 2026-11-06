@@ -2885,30 +2885,34 @@ sub execute_query {
 # R55: on its own a read is a READ ONLY transaction that ends in ROLLBACK, so a
 # stored function that writes fails with SQLSTATE 25006. autocommit is what opens
 # it: START TRANSACTION would release the host's LOCK TABLES and FLUSH TABLES ...
-# WITH READ LOCK (R66).
-# Inside the host's transaction the read runs as written, and a write it reaches
-# is the host's to commit or undo. A savepoint cannot be read only, and rolling
-# back to one takes more than the read's writes with it: the transaction's
-# snapshot and shared locks when the read was its first InnoDB access, and the
-# metadata locks that keep its tables from DDL until it ends.
+# WITH READ LOCK (R66). The ROLLBACK is spelled out because a bare one obeys
+# completion_type, which can chain a transaction or close the connection.
+# Inside the host's transaction, or on a handle with autocommit off, the read runs
+# as written, and a write it reaches is the host's to commit or undo. A savepoint
+# cannot be read only, and rolling back to one takes more than the read's writes
+# with it: the transaction's snapshot and shared locks when the read was its first
+# InnoDB access, and the metadata locks that keep its tables from DDL until it ends.
 sub _read_transaction {
     my ($self, $work) = @_;
     my $dbh = $self->{dbh};
     return $work->() unless $dbh->{AutoCommit};
-    eval {
+    my $command = sub {
+        my ($sql) = @_;
         local $dbh->{PrintError} = 0;
-        defined($dbh->do('SET TRANSACTION READ ONLY')) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
-        $dbh->begin_work or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
-        1;
-    } or die $self->_transaction_control_error($@);
+        defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
+    };
+    my $begun = eval { $command->($_) for 'SET TRANSACTION READ ONLY', 'SET autocommit = 0'; 1 };
+    unless ($begun) {
+        my $failure = $self->_transaction_control_error($@);
+        # (SET TRANSACTION lasts until a transaction ends, which a plain statement
+        # that touches no table does not do.)
+        eval { $command->('ROLLBACK AND NO CHAIN NO RELEASE') };
+        die $failure;
+    }
     my $value;
     my $ok = eval { $value = $work->(); 1 };
     my $error = $@;
-    my $ended = eval {
-        local $dbh->{PrintError} = 0;
-        $dbh->rollback or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
-        1;
-    };
+    my $ended = eval { $command->($_) for 'ROLLBACK AND NO CHAIN NO RELEASE', 'SET autocommit = 1'; 1 };
     my $ending = $@;
     die $error unless $ok;
     die $self->_transaction_control_error($ending) unless $ended;
