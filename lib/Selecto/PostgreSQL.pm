@@ -2168,7 +2168,7 @@ sub _pg_catalog_functions {
     my $ok = eval {
         $rows = $dbh->selectall_arrayref(q{SELECT CAST(p.proname AS pg_catalog.text),
             pg_catalog.bool_or(CAST(p.prorettype AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
-                (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray}' AS pg_catalog.regtype[]))
+                (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray,anyarray,anycompatiblearray}' AS pg_catalog.regtype[]))
               AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS a(t)
                 WHERE CAST(a.t AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
                   (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray,anyarray,anycompatiblearray}' AS pg_catalog.regtype[])))),
@@ -2247,7 +2247,8 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
     WHERE c.depth OPERATOR(pg_catalog.=) 16
     UNION ALL
-    SELECT CASE WHEN c.arr THEN 'estr' ELSE 'str' END, CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
+    SELECT CASE WHEN c.arr THEN 'estr' ELSE 'str' END, CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text),
+      CAST(ty.typname AS pg_catalog.text), NULL
     FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
     WHERE ty.typcategory OPERATOR(pg_catalog.=) 'S'
       AND ty.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)
@@ -2264,7 +2265,7 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
       ON b.rel OPERATOR(pg_catalog.=) c.rel AND b.att OPERATOR(pg_catalog.=) c.att AND NOT b.arr
     WHERE NOT c.arr
     UNION ALL
-    SELECT 'xop', CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
+    SELECT CASE WHEN e.arr THEN 'exop' ELSE 'xop' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
       pg_catalog.concat(o.oprname, pg_catalog.chr(31),
         pg_catalog.quote_ident(CAST(ln.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(lt.typname AS pg_catalog.text)), pg_catalog.chr(31),
         pg_catalog.quote_ident(CAST(rn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(rt.typname AS pg_catalog.text))),
@@ -2278,7 +2279,7 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lt.typnamespace
     JOIN pg_catalog.pg_type rt ON rt.oid OPERATOR(pg_catalog.=) o.oprright
     JOIN pg_catalog.pg_namespace rn ON rn.oid OPERATOR(pg_catalog.=) rt.typnamespace
-    WHERE NOT e.arr AND o.oprnamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
+    WHERE o.oprnamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
     UNION ALL
     SELECT CASE WHEN e.arr THEN 'eop' ELSE 'op' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
       CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
@@ -2416,6 +2417,13 @@ sub _pg_extension_operators {
                     && !($j == $k + 2 && $name->($tokens->[$k]) eq 'pg_catalog');
             }
         }
+        # Every call: the functions it can reach, for R58 and R62.
+        if ($tokens->[$k + 1][1] eq '(' && !($k > 0 && $tokens->[$k - 1][1] eq '.' && $k > 1 && uc($tokens->[$k - 2][1]) =~ /\A(?:INTO)\z/) && uc($prev) ne 'INTO'
+            && (!($tokens->[$k][0] eq 'id' && Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1])) || Selecto::PostgreSQL::Qualify::_keyword_call($tokens, $k))) {
+            my $qualified = $k > 1 && $tokens->[$k - 1][1] eq '.' && $tokens->[$k - 2][0] =~ /\A(?:id|qid)\z/;
+            $host{($qualified ? $name->($tokens->[$k - 2]) : '') . "\0" . $name->($tokens->[$k])} = 1
+                unless $qualified && $name->($tokens->[$k - 2]) eq 'pg_catalog';
+        }
         # Any other call, by the last name of its chain: what it returns types
         # an operand (see the qualifier's function atoms).
         if ($tokens->[$k + 1][1] eq '(' && !($tokens->[$k][0] eq 'id' && Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1]))
@@ -2458,6 +2466,32 @@ sub _pg_extension_operators {
             my $bare = $name->($first);
             next if Selecto::PostgreSQL::Qualify::_string_type($bare);
             $casts{$bare} = '"' . ($bare =~ s/"/""/gr) . '"';
+        }
+    }
+    # type 'literal', the same.
+    for my $k (0 .. $#$tokens - 1) {
+        next unless $tokens->[$k + 1][0] eq 'str' && $tokens->[$k][0] =~ /\A(?:id|qid)\z/;
+        next if $tokens->[$k][0] eq 'id' && Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1]);
+        my $qualified = $k > 1 && $tokens->[$k - 1][1] eq '.' && $tokens->[$k - 2][0] =~ /\A(?:id|qid)\z/;
+        my $bare = $name->($tokens->[$k]);
+        if ($qualified) {
+            $casts{$name->($tokens->[$k - 2]) . ".$bare"} = "$tokens->[$k - 2][1].$tokens->[$k][1]" unless $name->($tokens->[$k - 2]) eq 'pg_catalog';
+        } elsif (!Selecto::PostgreSQL::Qualify::_string_type($bare)) {
+            $casts{$bare} = '"' . ($bare =~ s/"/""/gr) . '"';
+        }
+    }
+    # AS alias (column type, ...): a declared extension type is reason enough to
+    # read this statement's columns.
+    for my $k (0 .. $#$tokens - 3) {
+        next unless uc($tokens->[$k][1]) eq 'AS' && $tokens->[$k + 1][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 2][1] eq '(';
+        for (my $j = $k + 3; $j + 1 < @$tokens && $tokens->[$j][1] ne ')'; $j++) {
+            next unless $tokens->[$j][0] =~ /\A(?:id|qid)\z/ && $tokens->[$j + 1][0] =~ /\A(?:id|qid)\z/;
+            my $bare = $name->($tokens->[$j + 1]);
+            if ($j + 3 < @$tokens && $tokens->[$j + 2][1] eq '.') {
+                $casts{"$bare." . $name->($tokens->[$j + 3])} = "$tokens->[$j + 1][1].$tokens->[$j + 3][1]";
+            } elsif (!Selecto::PostgreSQL::Qualify::_string_type($bare)) {
+                $casts{$bare} = '"' . ($bare =~ s/"/""/gr) . '"';
+            }
         }
     }
     return {} unless %rels || %functions || %casts;
@@ -2591,7 +2625,7 @@ sub _pg_extension_lookup {
         my $columns = $relations{$key->($rel)} //= {};
         my $entry = $columns->{$column} //= {};
         if ($kind eq 'col') { $types{$rel}{$column} = $a; next }
-        if ($kind eq 'str') { $entry->{"\0string"} = 1; next }
+        if ($kind eq 'str') { $entry->{"\0string"} = 1; $entry->{"\0bpchar"} = 1 if ($a // '') eq 'bpchar'; next }
         if ($kind eq 'estr') { $entry->{"\0elemstr"} = 1; next }
         # A domain chain deeper than the walk follows: its base type, and so
         # its operators, are unknown (review LOW).
@@ -2604,7 +2638,7 @@ sub _pg_extension_lookup {
             $target->{"\0extdom"}{$a} = 1 if defined $a;
             $target->{"\0extdom"} //= {};
             $target->{"\0extdom_type"} //= $b;
-        } elsif ($kind eq 'xop') {
+        } elsif ($kind =~ /\Ae?xop\z/) {
             my ($op, $left, $right) = split /\x1f/, $a, 3;
             $target->{"\0x"}{$op}{"$left\0$right"} = $quote->($b);
         } elsif ($kind =~ /typ\z/) {

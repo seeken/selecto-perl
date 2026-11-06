@@ -46,7 +46,7 @@ my %FUNCTION_KEYWORD = map { ($_ => 1) } qw(
     UPDATE DELETE INSERT RECURSIVE NOTHING RANGE PARTITION SHARE NOWAIT SKIP LOCKED LEFT RIGHT INNER OUTER FULL
     CROSS NATURAL AT ORDINALITY NULLS FIRST LAST NEXT UNBOUNDED PRECEDING FOLLOWING EXCLUDE TIES OTHERS NO KEY
     DOUBLE WITHOUT DECLARE CURSOR SCROLL HOLD SAVEPOINT RELEASE ROLLBACK BEGIN COMMIT LOCK MODE EXCLUSIVE
-    LIKE ILIKE SIMILAR
+    LIKE ILIKE SIMILAR CUBE ROLLUP SETS GROUPS ROWS OVER FILTER WITHIN CONFLICT ZONE MATERIALIZED
 );
 # Declared column types of a record function's column list that are no
 # extension's (json_rowset and the like).
@@ -70,7 +70,10 @@ sub tokenize {
     while (pos($sql) < length $sql) {
         if ($sql =~ /\G(\s+)/gc) { push @tokens, ['ws', $1] }
         elsif ($sql =~ /\G(--[^\n]*|\/\*.*?\*\/)/gcs) { push @tokens, ['ws', $1] }
-        elsif ($sql =~ /\G((?:[Ee])?'(?:[^']|'')*')/gc) { push @tokens, ['str', $1] }
+        # R60: a Unicode-escaped identifier is that identifier, here as to the server.
+        elsif ($sql =~ /\G[Uu]&("(?:[^"]|"")*")(?:\s+UESCAPE\s+'([^'])')?/gci) { push @tokens, ['qid', _unicode_identifier($1, $2)] }
+        elsif ($sql =~ /\G([Uu]&'(?:[^']|'')*'(?:\s+UESCAPE\s+'[^']')?)/gci) { push @tokens, ['str', $1] }
+        elsif ($sql =~ /\G((?:[EeBbXxNn])?'(?:[^']|'')*')/gc) { push @tokens, ['str', $1] }
         elsif ($sql =~ /\G("(?:[^"]|"")*")/gc) { push @tokens, ['qid', $1] }
         elsif ($sql =~ /\G(\$[0-9]+)/gc) { push @tokens, ['param', $1] }
         # DBD::Pg reads every bare ? as a placeholder.
@@ -100,6 +103,37 @@ sub tokenize {
     return \@significant;
 }
 
+# U&"d\0061t\+000061" as a plain quoted identifier.
+sub _unicode_identifier {
+    my ($quoted, $escape) = @_;
+    $escape //= '\\';
+    Selecto::Error->throw('query_rule_not_evaluable', 'generated SQL could not be tokenized for operator qualification',
+        {reason => 'sql_unqualifiable'}) if $escape =~ /[0-9A-Fa-f+'"\s]/;
+    my $e = quotemeta $escape;
+    my $text = substr($quoted, 1, -1) =~ s/""/"/gr;
+    $text =~ s{$e(?:$e|\+([0-9A-Fa-f]{6})|([0-9A-Fa-f]{4}))}{defined($1) || defined($2) ? chr(hex($1 // $2)) : "\0"}ge;
+    Selecto::Error->throw('query_rule_not_evaluable', 'generated SQL could not be tokenized for operator qualification',
+        {reason => 'sql_unqualifiable'}) if $text =~ /$e/;
+    $text =~ s/\0/$escape/g;
+    return '"' . ($text =~ s/"/""/gr) . '"';
+}
+
+# USING and NATURAL join on an = PostgreSQL looks up through the session, with
+# nothing here to name: public.=(varchar, varchar) would be taken for a varchar pair.
+sub _refuse_implicit_join {
+    my ($tokens) = @_;
+    for my $k (0 .. $#$tokens) {
+        next unless $tokens->[$k][0] eq 'id';
+        my $up = uc $tokens->[$k][1];
+        my $next = $k < $#$tokens ? uc $tokens->[$k + 1][1] : '';
+        my $using = $up eq 'USING' && $next eq '(' && !($k + 2 <= $#$tokens && uc($tokens->[$k + 2][1]) =~ /\A(?:SELECT|WITH|VALUES)\z/);
+        next unless $using || ($up eq 'NATURAL' && $next =~ /\A(?:JOIN|INNER|LEFT|RIGHT|FULL)\z/);
+        Selecto::Error->throw('query_rule_not_evaluable', 'a join on USING or NATURAL has an operator that cannot be named here',
+            {reason => 'implicit_join_operator'});
+    }
+    return;
+}
+
 # ---- Parsing into a light tree --------------------------------------------
 #
 # The token stream is read into nodes: an expression run is a sequence of
@@ -116,6 +150,7 @@ sub qualify {
     my ($sql, $functions, $columns) = @_;
     my $state = new_state($functions, $columns);
     my $tokens = tokenize($sql);
+    _refuse_implicit_join($tokens);
     # $columns: {relations => {"schema.table" => {column => {op => schema}}}}
     # (columns of extension member types, or domains over one, by relation).
     # Every name here is the catalog's exact name: a reference is folded once,
@@ -319,16 +354,19 @@ sub _construct {
             $query = "SELECT CAST((q.v) AS $state->{op_cast_right}) FROM ($query) AS q(v)" if defined $state->{op_cast};
             $sql = '((' . _cast_operand($state, $left) . ") $op " . ($negate ? 'ALL' : 'ANY') . " ($query))";
         } else {
-            my @terms;
+            my (@terms, @elements);
             while (1) {
-                my $element = _read_run($state, $tokens, $pos, undef);
-                my $right = _render($state, $element);
-                my $op = _op_sql($state, {kind => 'op', op => '='}, $operand, $element);
-                push @terms, '((' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . '))';
+                push @elements, _read_run($state, $tokens, $pos, undef);
                 last unless _peek_punct($tokens, $$pos, ',');
                 $$pos++;
             }
             _expect($tokens, $pos, ')');
+            _in_list_common($state, $operand, @elements) if $state->{scopes};
+            for my $element (@elements) {
+                my $right = _render($state, $element);
+                my $op = _op_sql($state, {kind => 'op', op => '='}, $operand, $element);
+                push @terms, '((' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . '))';
+            }
             $sql = '(' . join(' OR ', @terms) . ')';
             $sql = "(NOT $sql)" if $negate;
         }
@@ -353,15 +391,17 @@ sub _construct {
         my $operand = _take_operand($state, $run);
         my $left = _render($state, $operand);
         $$pos = $at + 1;
-        my $pattern = _render($state, _read_run($state, $tokens, $pos, 'ESCAPE'));
+        my $tree = _read_run($state, $tokens, $pos, 'ESCAPE');
+        my $pattern = _render($state, $tree);
         if (_upper($tokens->[$$pos]) eq 'ESCAPE') {
+            $tree = undef;
             $$pos++;
             my $escape = _atom($state, $tokens, $pos);
             Selecto::Error->throw('query_rule_not_evaluable', 'generated SQL could not be parsed for operator qualification',
                 {reason => 'sql_unqualifiable'}) unless defined $escape;
             $pattern = "pg_catalog.like_escape($pattern, $escape->{sql})";
         }
-        my $op = _op_sql($state, {kind => 'op', op => ($negate ? '!' : '') . ($up eq 'LIKE' ? '~~' : '~~*')}, $operand, undef);
+        my $op = _op_sql($state, {kind => 'op', op => ($negate ? '!' : '') . ($up eq 'LIKE' ? '~~' : '~~*')}, $operand, $tree);
         return {kind => 'atom', sql => '((' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $pattern) . '))'};
     }
     if ($up eq 'IS' && $at + 1 < @$tokens) {
@@ -421,6 +461,16 @@ sub _operator {
     return {kind => 'op', op => $op, schema => $schema, explicit => 1};
 }
 
+sub _tokens_at { my ($tokens, $k) = @_; return $k < @$tokens ? $tokens->[$k][1] : '' }
+
+# An array expression cast to a pg_catalog array type: undef, as the operand of
+# ANY has always been read; anything else may hold an extension type.
+sub _array_type_class {
+    my ($text) = @_;
+    return undef if $text =~ /(?:::|AS)(?:"?pg_catalog"?\.)?"?([a-z0-9_]+)"?(?:\(\d+\))?\[\]\)?\z/i && $BUILTIN_TYPE{lc $1};
+    return {unknown => 1, over_extension => 1};
+}
+
 # An atom (literal, parameter, column, function call, parenthesized group,
 # CASE ... END, CAST(...), EXISTS(...), ARRAY[...], ANY/ALL(...), typed
 # literal) with its postfix (::type, [subscript], AT TIME ZONE x, COLLATE x,
@@ -447,6 +497,11 @@ sub _atom {
             # A simple CASE x WHEN v ...: searched, with explicit operators.
             my $subject = _read_run($state, $tokens, $pos, 'WHEN');
             my $left = _render($state, $subject);
+            # An untyped subject is text before anything is compared with it.
+            if ($state->{scopes} && _tree_class($state, $subject)->{untyped}) {
+                $left = "CAST(($left) AS pg_catalog.text)";
+                $subject = {atom => {kind => 'atom', sql => $left, known => 'string', refs => []}};
+            }
             my (@parts, @results);
             while (_upper($tokens->[$$pos]) eq 'WHEN') {
                 $$pos++;
@@ -482,19 +537,33 @@ sub _atom {
             _expect($tokens, $pos, ',');
             my $b = _read_run($state, $tokens, $pos, undef);
             _expect($tokens, $pos, ')');
-            # Its type is its first argument's, resolved against the second:
+            # Its type is its first argument's after the comparison has resolved:
             # read before the comparison consumes their references.
             my ($first, $second) = $state->{scopes} ? map { _tree_class($state, $_) } $a, $b : ({}, {});
             my $left = _render($state, $a);
             my $right = _render($state, $b);
             my $op = _op_sql($state, {kind => 'op', op => '='}, $a, $b);
-            # citext against a string compares as text, so the result is text.
-            my $text_result = $first->{entry} && $first->{entry}{"\0strcat"} && $second->{string};
-            my $result = $text_result ? undef : $first->{entry} // ($first->{untyped} ? $second->{entry} : undef);
-            my $text = '(CASE WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . ") THEN NULL ELSE ($left) END)";
+            # citext against a string compares as text, so PostgreSQL has made the
+            # first argument text: the CASE that stands in for NULLIF must too.
+            my $soft = $first->{entry} ? $first->{entry}{"\0strcat"} : $first->{unknown} && $first->{soft};
+            my $text_result = ($soft && $second->{string}) || ($first->{bpchar} && $second->{string} && !$second->{bpchar});
+            my $same = $first->{entry} && $second->{entry} && ($first->{entry}{"\0type"} // '') eq ($second->{entry}{"\0type"} // "\0");
+            my $result = $text_result ? undef : $first->{entry} && ($second->{untyped} || $same) ? $first->{entry}
+                : $first->{untyped} ? $second->{entry} : undef;
+            # Anything else may have either type: it is not read here.
+            my $class = $text_result || $result || (!$first->{entry} && !$first->{unknown} && !$second->{unknown}) ? undef
+                : $state->{scopes} ? {unknown => 1, soft => $soft ? 1 : 0, over_extension => 1, soft_entry => $first->{entry} // $first->{soft_entry} // $second->{entry} // $second->{soft_entry}} : undef;
+            # So must an untyped first argument, which a CASE would make text.
+            my $value = $text_result ? "CAST(($left) AS pg_catalog.text)" : "($left)";
+            if ($first->{untyped} && $state->{scopes} && !$second->{untyped} && !$second->{string}) {
+                my $type = $second->{entry} ? $second->{entry}{"\0type"} : undef;
+                Selecto::Error->throw('query_rule_not_evaluable', "NULLIF's result type could not be named", {reason => 'operand_type_unknown'}) unless defined $type;
+                $value = "CAST(($left) AS $type)";
+            }
+            my $text = '(CASE WHEN (' . _cast_operand($state, $left) . ") $op (" . _cast_right($state, $right) . ") THEN NULL ELSE $value END)";
             my $atom = _postfix($state, $tokens, $pos, $text, undef,
-                !$result && ($text_result || $first->{string} || $first->{untyped}) ? 'string' : undef, $result, $mark);
-            $atom->{class} = $first if $first->{unknown} && $atom->{sql} eq $text;
+                !$result && !$class && ($text_result || $first->{string} || ($first->{untyped} && $second->{string})) ? 'string' : undef, $result, $mark);
+            $atom->{class} = $class if $class && $atom->{sql} eq $text;
             return $atom;
         }
         my $open = $tokens->[$$pos + 1][1];
@@ -512,6 +581,13 @@ sub _atom {
         if ($up =~ /\A(?:ANY|ALL|SOME)\z/ && $state->{scopes} && $lone_atom && ref($lone_atom->{column}) eq 'HASH') {
             my $array = _resolve_column($state, $lone_atom->{column}{at}, $lone_atom->{column}{names});
             $class = ref($array) ne 'HASH' ? undef : $array->{"\0elem"} ? {entry => $array->{"\0elem"}} : undef;
+        } elsif ($up =~ /\A(?:ANY|ALL|SOME)\z/ && $state->{scopes} && _tokens_at($tokens, $open_at + 1) !~ /\ASELECT\b/i) {
+            # The other side's type, for a bare literal; an array of plain literals
+            # is text[]; a named array type is read by name; else it is not known.
+            my $text = $inner =~ s/\s+//gr;
+            $class = $text =~ /\A(?:'(?:[^']|'')*'|\$\d+|\?)\z/ ? {untyped => 1}
+                : $text =~ /\AARRAY\[(?:(?:'(?:[^']|'')*'|\$\d+|\?|-?[0-9.]+),?)*\]\z/i ? undef
+                : _array_type_class($text);
         }
         # These return a type of their own (pg_catalog's, or the CAST
         # target's; GROUPING's is integer); COALESCE, GREATEST, LEAST, ARRAY, ROW and the
@@ -638,6 +714,15 @@ sub _atom {
             $sql = $quote->($info->{schema}) . '.' . $quote->($fname) . '(' . join(', ', @cast) . ')';
             return _postfix($state, $tokens, $pos, $sql, undef, 1, undef, $mark);
         }
+        # type 'literal': a cast by another name.
+        if ($$pos < @$tokens && $tokens->[$$pos][0] eq 'str' && @names <= 2) {
+            my $literal = $tokens->[$$pos][1];
+            $$pos++;
+            my $named = join '.', map { _unquote($_) } @names;
+            my $cast = ref($state->{columns}{casts}) eq 'HASH' ? $state->{columns}{casts}{$named} : undef;
+            my $is = ref($cast) eq 'HASH' && $cast->{"\0type"};
+            return _postfix($state, $tokens, $pos, join('.', @names) . " $literal", undef, $is ? 0 : _string_type($named) ? 'string' : 1, $is ? $cast : undef, $mark);
+        }
         if (_peek_punct($tokens, $$pos, '(')) {
             $$pos++;
             my $inner = _sequence($state, $tokens, $pos, ')');
@@ -650,6 +735,7 @@ sub _atom {
             # defines for that type (citext's max and min) resolves in the
             # extension's schema, as PostgreSQL resolves it, and its result
             # keeps the type when it returns it.
+            my @arguments = @{$state->{each_tree} // []};
             my $function = @names == 1 && $kinds[0] eq 'id' && $first && $state->{scopes}
                 ? _extension_function($state, $first, lc $names[0]) : undef;
             # An argument that may have that type (a CASE of citext results)
@@ -672,6 +758,12 @@ sub _atom {
                 $name = "$function->{schema}.$names[0]";
                 $inner = "CAST(($inner) AS $member)";
                 if ($function->{self}) { $entry = $function->{entry} } else { $known = 1 }
+            } elsif (my $named = !_declares_columns($tokens, $here, $$pos) && _resolve_call($state, \@names, \@kinds, \@arguments)) {
+                $name = $named;
+                my $info = $state->{columns}{functions}{_unquote($names[-1])};
+                my $returns = ref($info) eq 'HASH' ? $info->{state} // '' : '';
+                $known = $returns eq 'string' ? 'string' : $returns eq 'known' ? 1 : $known;
+                $class = {unknown => 1, over_extension => 1} if $returns eq 'unknown';
             } elsif (@names == 1 && $kinds[0] eq 'id' && $state->{functions}{lc $names[0]}) {
                 $name = "pg_catalog.$names[0]";
                 # A pg_catalog function with no polymorphic overload returns
@@ -701,7 +793,12 @@ sub _atom {
             while ($$pos < @$tokens && _upper($tokens->[$$pos]) =~ /\A(?:FILTER|OVER|WITHIN)\z/) {
                 my $word = $tokens->[$$pos][1];
                 $$pos++;
-                if (_upper($tokens->[$$pos]) eq 'GROUP') { $word .= ' ' . $tokens->[$$pos][1]; $$pos++ }
+                if (_upper($tokens->[$$pos]) eq 'GROUP') {
+                    $word .= ' ' . $tokens->[$$pos][1];
+                    $$pos++;
+                    # mode() and the like follow their ORDER BY, which is not read.
+                    $class = {unknown => 1, over_extension => 1} if !$known && !$entry && $state->{scopes};
+                }
                 if (_peek_punct($tokens, $$pos, '(')) {
                     $$pos++;
                     my $clause = _sequence($state, $tokens, $pos, ')');
@@ -723,7 +820,7 @@ sub _atom {
     # type stays on the atom, unless a postfix changes what the atom is.
     if ($class && !$known && !$entry) {
         ($entry, $class) = ($class->{entry}, undef) if $class->{entry};
-        $known = $class->{string} ? 'string' : 1 if $class && !$class->{unknown};
+        $known = $class->{string} ? 'string' : 1 if $class && !$class->{unknown} && !$class->{untyped};
         $class = undef if $known;
     }
     my $atom = _postfix($state, $tokens, $pos, $sql, $column, $known, $entry, $mark);
@@ -920,6 +1017,33 @@ sub _render {
     return '((' . _cast_operand($state, $left) . ") $op" . ($quantified ? " $right)" : ' (' . _cast_right($state, $right) . '))');
 }
 
+# An IN list with two or more items that hold no column is resolved as one: their
+# common type with the left side, which is not what each = alone would choose
+# (ci IN (tx_expr, 'x') compares as text; ci = 'x' would not). Where that type is
+# an extension's or none is involved, each item's own = gives the same answer.
+sub _in_list_common {
+    my ($state, $left, @elements) = @_;
+    my @constant = grep { !_has_refs($_) } @elements;
+    return unless @constant > 1;
+    my @classes = map { _tree_class($state, $_) } $left, @constant;
+    # char(n) beside another string type: the common type is text, where trailing
+    # spaces count; bc = ' x' alone would not.
+    Selecto::Error->throw('query_rule_not_evaluable', 'an IN list mixes char(n) with another string type', {reason => 'operand_type_unknown'})
+        if grep({ $_->{bpchar} } @classes) && grep { $_->{string} && !$_->{bpchar} } @classes;
+    return unless grep { $_->{entry} || $_->{unknown} } @classes;
+    my $common = _case_class(@classes);
+    return if $common && $common->{entry};
+    Selecto::Error->throw('query_rule_not_evaluable', 'an IN list mixes an extension type with others',
+        {reason => 'operand_type_unknown'});
+}
+
+sub _has_refs {
+    my ($node) = @_;
+    return 0 unless ref($node) eq 'HASH';
+    return @{$node->{atom}{refs} // []} || ref($node->{atom}{column}) eq 'HASH' ? 1 : 0 if $node->{atom};
+    return scalar grep { _has_refs($node->{$_}) } grep { $node->{$_} } qw(left right operand);
+}
+
 # OPERATOR(schema.op). An operator is named in an extension's schema only
 # when it is a member of the extension for these operand types (R51):
 # - T op T, or T against an untyped parameter or literal (which takes T):
@@ -1069,6 +1193,7 @@ sub _operand_class {
         return {ext => 1, entry => $entry, type => $entry->{"\0type"}, schema => $entry->{$op}, string_category => $entry->{"\0strcat"}};
     }
     # x op ANY (...): the quantifier's elements, as PostgreSQL resolves them.
+    return $class if $class->{untyped};
     return {string => 1} if !$class->{unknown} && $side->{atom}{sql} =~ /\A(?:ANY|ALL|SOME)\(/i;
     return $class;
 }
@@ -1153,7 +1278,9 @@ sub _case_class {
     }
     return {string => 1} if $unknown && $soft && $string && !$plain;
     return {unknown => 1, soft => $soft, over_extension => $over, soft_entry => $soft_entry} if $unknown;
-    return $plain ? {} : {string => 1};
+    return {} if $plain;
+    my @strings = grep { $_->{string} } @results;
+    return {string => 1, (@strings && !grep({ !$_->{bpchar} } @strings) ? (bpchar => 1) : ())};
 }
 
 # A scalar subquery's type: its one select item's.
@@ -1176,11 +1303,23 @@ sub _ref_class {
         return {unknown => 1, soft => $entry->{"\0soft"}, over_extension => $entry->{"\0over"}, soft_entry => $entry->{"\0softentry"}}
             if $entry->{"\0unknown"};
         return {entry => $entry} if _is_extension($entry);
-        return $entry->{"\0string"} ? {string => 1} : {};
+        return $entry->{"\0string"} ? {string => 1, ($entry->{"\0bpchar"} ? (bpchar => 1) : ())} : {};
     }
     # No source found: unknown only when an extension-typed column of a
-    # relation the statement names has its name.
+    # relation the statement names has its name, or it names a source nothing
+    # here accounts for.
+    return {unknown => 1} if @{$column->{names}} > 1 && !_alias_known($state, $column);
     return _names_extension_column($state, [$column->{names}[-1]]) ? {unknown => 1} : {};
+}
+
+sub _alias_known {
+    my ($state, $column) = @_;
+    my $info = $state->{scopes} or return 1;
+    my $qualifier = $column->{names}[-2];
+    for (my $s = $info->{scope_of}[$column->{at}] // 0; defined $s; $s = $info->{scopes}[$s]{parent}) {
+        return 1 if $info->{scopes}[$s]{aliases}{$qualifier};
+    }
+    return 0;
 }
 
 # A column entry of an extension type, with or without operators of its own
@@ -1300,6 +1439,7 @@ sub _scopes {
             $k++ if _upper($tokens->[$k]) eq 'MATERIALIZED';
             last unless $k < @$tokens && $tokens->[$k][1] eq '(';
             $cte{$names->[0]} = {scope => $opens{$k}, cols => $cols};
+            $cte{$names->[0]}{values} = _literals_only($tokens, $k, $closes{$k}) ? 'plain' : 'opaque' if !defined($opens{$k}) && _upper($tokens->[$k + 1]) eq 'VALUES';
             $k = ($closes{$k} // last) + 1;
             last unless $k < @$tokens && $tokens->[$k][1] eq ',';
             $k++;
@@ -1316,7 +1456,7 @@ sub _scopes {
         for (; $k < @$tokens; $k++) {
             last if $depth_of[$k] < $depth;
             if ($depth_of[$k] == $depth && $scope_of[$k] == $id) {
-                last if $stop{_upper($tokens->[$k])};
+                last if $stop{_upper($tokens->[$k])} && !(_upper($tokens->[$k]) eq 'GROUP' && _upper($tokens->[$k - 1]) eq 'WITHIN');
                 if ($tokens->[$k][1] eq ',') { push @{$scope->{items}}, [@item]; @item = (); next }
             }
             push @item, $k;
@@ -1331,9 +1471,36 @@ sub _scopes {
         while ($j < @$tokens) {
             $j++ while $j < @$tokens && _upper($tokens->[$j]) =~ /\A(?:LATERAL|ONLY)\z/;
             my ($source, $default);
+            # ROWS FROM (f(), g()) and (VALUES ...): columns that are not read
+            # here, unless the VALUES holds only plain literals.
+            if ($j + 1 < @$tokens && _upper($tokens->[$j]) eq 'ROWS' && _upper($tokens->[$j + 1]) eq 'FROM') {
+                my $close = $closes{$j + 2} // last;
+                $j = _opaque_source(\@scopes, $scope, $tokens, $close + 1, \%closes, {star_unknown => 1});
+                last if !defined $j;
+                last unless $up eq 'FROM' && $j < @$tokens && $tokens->[$j][1] eq ',';
+                $j++;
+                next;
+            }
+            if ($j < @$tokens && $tokens->[$j][1] eq '(' && !defined $opens{$j} && _upper($tokens->[$j + 1]) eq 'VALUES') {
+                my $close = $closes{$j} // last;
+                my $plain = _literals_only($tokens, $j, $close);
+                $j = _opaque_source(\@scopes, $scope, $tokens, $close + 1, \%closes, $plain ? {plain_columns => 1} : {star_unknown => 1});
+                last if !defined $j;
+                last unless $up eq 'FROM' && $j < @$tokens && $tokens->[$j][1] eq ',';
+                $j++;
+                next;
+            }
             # A parenthesised join group, FROM (a JOIN b ON ...): its first
-            # item is registered here, the others by their own JOIN.
+            # item is registered here, the others by their own JOIN. An alias on
+            # the group renames its columns, which are not followed here.
             if ($j < @$tokens && $tokens->[$j][1] eq '(' && !defined $opens{$j}) {
+                if (defined(my $close = $closes{$j})) {
+                    my $k = $close + 1;
+                    $k++ if $k < @$tokens && _upper($tokens->[$k]) eq 'AS';
+                    if ($k < @$tokens && $tokens->[$k][0] =~ /\A(?:id|qid)\z/ && !($tokens->[$k][0] eq 'id' && _keyword($tokens->[$k][1]))) {
+                        $scopes[$scope]{aliases}{_unquote($tokens->[$k][1])} = {star_unknown => 1};
+                    }
+                }
                 $j++;
                 next;
             }
@@ -1391,6 +1558,8 @@ sub _scopes {
             } else {
                 my ($cols, $next) = $cols_at->($j);
                 if ($cols && ($source->{derived} || $source->{cte})) { $source->{cols} = $cols; $j = $next }
+                # Renamed columns of a relation: the catalog here has no order.
+                elsif ($cols && defined $source->{relation}) { $source = {star_unknown => 1}; $j = $next }
             }
             $scopes[$scope]{aliases}{$alias} = $source if defined $alias;
             last unless $up eq 'FROM' && $j < @$tokens && $tokens->[$j][1] eq ',';
@@ -1398,6 +1567,25 @@ sub _scopes {
         }
     }
     return $state;
+}
+
+sub _literals_only {
+    my ($tokens, $open, $close) = @_;
+    return 0 unless defined $close;
+    return !grep { $_->[0] eq 'qid' || ($_->[0] eq 'id' && !$CONSTANT{uc $_->[1]} && uc($_->[1]) ne 'VALUES') || $_->[1] eq '::' } @$tokens[$open + 1 .. $close - 1];
+}
+
+# Registers a FROM item that is not read here, with its alias and column list.
+# Returns the token after them.
+sub _opaque_source {
+    my ($scopes, $scope, $tokens, $j, $closes, $source) = @_;
+    $j++ if $j < @$tokens && _upper($tokens->[$j]) eq 'AS';
+    if ($j < @$tokens && $tokens->[$j][0] =~ /\A(?:id|qid)\z/ && !($tokens->[$j][0] eq 'id' && _keyword($tokens->[$j][1]))) {
+        $scopes->[$scope]{aliases}{_unquote($tokens->[$j][1])} = $source;
+        $j++;
+    }
+    $j = $closes->{$j} + 1 if $j < @$tokens && $tokens->[$j][1] eq '(' && defined $closes->{$j};
+    return $j;
 }
 
 sub _keyword { my ($word) = @_; return $KEYWORD{uc $word} || $CONSTANT{uc $word} }
@@ -1412,6 +1600,15 @@ sub _keyword_call {
     # A name, not a call: a relation, alias or CTE being declared.
     return 0 if $prev =~ /\A(?:\.|FETCH|PRIMARY|FOREIGN|AS|INTO|WITH|RECURSIVE)\z/;
     my $word = uc $tokens->[$k][1];
+    # R60: the positions where the grammar takes these words followed by a
+    # parenthesis; anywhere else they are calls.
+    return 0 if $word =~ /\A(?:CUBE|ROLLUP)\z/ && _grouping_position($tokens, $k);
+    return 0 if $word eq 'SETS' && $prev eq 'GROUPING';
+    return 0 if $word eq 'ZONE' && $prev eq 'TIME';
+    return 0 if $word eq 'CONFLICT' && $prev eq 'ON';
+    return 0 if $word eq 'MATERIALIZED' && $prev eq 'NOT';
+    return 0 if $word =~ /\A(?:OVER|FILTER)\z/ && $prev eq ')';
+    return 0 if $word eq 'OVER' && $k > 0 && $tokens->[$k - 1][0] =~ /\A(?:id|qid)\z/;
     # MERGE ... WHEN NOT MATCHED THEN INSERT (...).
     if ($word eq 'INSERT' && $prev eq 'THEN') {
         my $j = $k - 1;
@@ -1424,10 +1621,127 @@ sub _keyword_call {
         $depth-- if $tokens->[$j][0] eq 'punct' && $tokens->[$j][1] eq ')';
         next if $depth;
         my ($next, $after) = map { $_ < @$tokens ? uc $tokens->[$_][1] : '' } $j + 1, $j + 2;
-        return 0 if $word eq 'RANGE' && $next =~ /\A(?:PRECEDING|FOLLOWING)\z/;
+        return 0 if $word =~ /\A(?:RANGE|ROWS|GROUPS)\z/ && $next =~ /\A(?:PRECEDING|FOLLOWING)\z/;
         # A later CTE of a WITH list: , name (cols) AS (...).
         return 0 if $prev eq ',' && $next eq 'AS' && $after =~ /\A(?:\(|NOT|MATERIALIZED)\z/;
         last;
+    }
+    return 1;
+}
+
+# Whether the token at $k stands where GROUP BY takes a grouping element: right
+# after BY, or as an item of a grouping list. Inside an expression it does not.
+sub _grouping_position {
+    my ($tokens, $k) = @_;
+    while ($k > 0) {
+        my $prev = uc $tokens->[$k - 1][1];
+        return 1 if $prev eq 'BY' && $k > 1 && uc($tokens->[$k - 2][1]) eq 'GROUP';
+        if ($prev eq ',') {
+            my $depth = 0;
+            for (my $j = $k - 2; $j >= 0; $j--) {
+                my $t = uc $tokens->[$j][1];
+                $depth++ if $t eq ')';
+                if ($t eq '(') { last if !$depth; $depth-- }
+                next if $depth;
+                return 1 if $t eq 'BY' && $j > 0 && uc($tokens->[$j - 1][1]) eq 'GROUP';
+                return 0 if $t =~ /\A(?:SELECT|FROM|WHERE|HAVING|ORDER|WINDOW)\z/;
+                if ($t eq ',') { $k = $j + 1 }
+            }
+        }
+        if ($prev eq '(' || $prev eq ',') {
+            my $j = $k - 1;
+            if ($prev eq ',') {
+                my $depth = 0;
+                for ($j = $k - 2; $j >= 0; $j--) {
+                    my $t = $tokens->[$j][1];
+                    $depth++ if $t eq ')';
+                    if ($t eq '(') { last if !$depth; $depth-- }
+                }
+                return 0 if $j < 0;
+            }
+            return 0 unless $j > 0;
+            my $before = uc $tokens->[$j - 1][1];
+            return 1 if $before =~ /\A(?:SETS|ROLLUP|CUBE)\z/;
+            return 0 unless $before eq '(' || $before eq ',' || $before eq 'BY';
+            $k = $j;
+            next;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+# R58, R62: Selecto does not redo PostgreSQL's overload resolution. Of the functions
+# a call can reach by name and argument count, those its arguments could not be
+# given do not count. pg_catalog's stand unless an extension's could take an argument
+# of an extension type too: which one wins is not worked out here, so that refuses
+# (strpos(ci, 'O') is citext's). Outside pg_catalog a function must be an extension's,
+# named or not: one that is not, beside one that is, is a plant until shown otherwise.
+# What is left must be one extension's in one schema, whose overloads PostgreSQL then
+# resolves itself; anything else refuses function_ambiguous. An argument is never
+# cast to fit. Returns the qualified name, or undef for pg_catalog's own handling.
+sub _resolve_call {
+    my ($state, $names, $kinds, $trees) = @_;
+    return undef unless $state->{scopes} && @$names <= 2;
+    my $table = $state->{columns}{host_functions};
+    return undef unless ref($table) eq 'HASH';
+    my $fname = _unquote($names->[-1]);
+    my $schema = @$names == 2 ? _unquote($names->[0]) : '';
+    return undef if $schema eq 'pg_catalog';
+    return undef if @$names == 1 && $kinds->[0] eq 'qid' && !$table->{"\0$fname"};
+    my $info = $table->{"$schema\0$fname"} // return undef;
+    my @all = @{$info->{candidates} // []};
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable', 'a function call must resolve to exactly one function of an extension or of pg_catalog',
+            {reason => $_[0], function => $fname});
+    };
+    return undef unless @all;
+    my @classes = map { _tree_class($state, $_) } @$trees;
+    my @reach = grep {
+        my $c = $_;
+        @classes >= $c->{nargs} - ($c->{defaults} // 0) && (defined($c->{variadic}) || @classes <= $c->{nargs})
+    } @all;
+    my @accept = grep { _accepts($_, \@classes) } @reach;
+    my @catalog = grep { $_->{schema} eq 'pg_catalog' } @accept;
+    my @extension = grep { defined $_->{extension} && $_->{schema} ne 'pg_catalog' } @accept;
+    my @others = grep { !defined($_->{extension}) && $_->{schema} ne 'pg_catalog' } @accept;
+    if (@catalog || (!@accept && grep { $_->{schema} eq 'pg_catalog' } @all)) {
+        $refuse->('function_ambiguous') if @extension && grep { $_->{entry} || $_->{unknown} } @classes;
+        return undef if $state->{functions}{lc $fname};
+        return 'pg_catalog.' . _quote_name($fname);
+    }
+    $refuse->('function_ambiguous') if !@accept || @others;
+    # All of one extension in one schema: naming the schema leaves the overload to
+    # PostgreSQL, among exactly what it would have chosen from.
+    my %homes = map { ("$_->{schema}\0$_->{extension}" => 1) } @extension;
+    $refuse->('function_ambiguous') unless keys(%homes) == 1;
+    return _quote_name($extension[0]{schema}) . '.' . _quote_name($fname);
+}
+
+# Whether name(...) at $k is a declaration with a column list, not a call: an alias
+# after AS, or a WITH item before AS (. $after is the token after the parenthesis.
+sub _declares_columns {
+    my ($tokens, $k, $after) = @_;
+    return 1 if $k > 0 && uc($tokens->[$k - 1][1]) eq 'AS';
+    return $after + 1 < @$tokens && uc($tokens->[$after][1]) eq 'AS' && $tokens->[$after + 1][1] =~ /\A(?:\(|NOT|MATERIALIZED)\z/i ? 1 : 0;
+}
+
+sub _quote_name { return '"' . ($_[0] =~ s/"/""/gr) . '"' }
+
+# Whether a candidate could take these arguments. What is not known counts as yes.
+sub _accepts {
+    my ($candidate, $classes) = @_;
+    my @types = @{$candidate->{args} // []};
+    for my $index (0 .. $#$classes) {
+        my $type = $types[$index < @types ? $index : -1] // next;
+        next if $type =~ /\bany|"any"/i;
+        my $class = $classes->[$index];
+        my $text = $type =~ /\Apg_catalog\."?(?:text|varchar|bpchar|name)"?\z/;
+        if ($class->{string}) {
+            return 0 unless $text;
+        } elsif (my $entry = $class->{entry}) {
+            return 0 if $entry->{"\0strcat"} && !$text && $type ne ($entry->{"\0type"} // '') && $type =~ /\Apg_catalog\./;
+        }
     }
     return 1;
 }
@@ -1477,7 +1791,8 @@ sub _resolve_in {
 sub _source_column {
     my ($state, $source, $column, $guard) = @_;
     my $info = $state->{scopes};
-    return {"\0unknown" => 1} if $source->{star_unknown};
+    return {"\0unknown" => 1, "\0over" => 1} if $source->{star_unknown};
+    return {} if $source->{plain_columns};
     if (defined $source->{relation}) {
         my $relations = $state->{columns}{relations};
         # A relation the statement names: a column of an extension type has
@@ -1492,6 +1807,7 @@ sub _source_column {
     my ($scope, $cols);
     if (defined $source->{cte}) {
         my $cte = $info->{cte}{$source->{cte}} // return undef;
+        return $cte->{values} eq 'plain' ? {} : {"\0unknown" => 1, "\0over" => 1} if defined $cte->{values};
         ($scope, $cols) = ($cte->{scope}, $source->{cols} // $cte->{cols});
     } else {
         ($scope, $cols) = ($source->{derived}, $source->{cols});
