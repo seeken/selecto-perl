@@ -86,6 +86,9 @@ sub compile {
     if ($top && blessed($statement) && $statement->isa('Selecto::Statement')) {
         $statement->{_selecto_relations} = [sort keys %{$self->{_selecto_relation_sink}}];
         $statement->{_selecto_declared_schemas} = [sort keys %{$self->{_selecto_declared_sink}}];
+        # A read that locks rows must run where its locks last: see R55 in
+        # Selecto::PostgreSQL.
+        $statement->{_selecto_row_lock} = 1 if defined $query->row_lock;
     }
     # Selecto::Engine::compile admits these parameters itself, with the same
     # limits, code and label, as soon as this returns.

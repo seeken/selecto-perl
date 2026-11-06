@@ -743,6 +743,9 @@ sub _compile_write_predicate {
 sub _refusal_error {
     my ($self, @texts) = @_;
     for my $text (@texts) {
+        return Selecto::Error->new(code => 'query_error', message => 'Execution failed',
+            details => {cause => 'database_error', category => 'read_only_transaction'})
+            if defined($text) && "$text" =~ /launched in read-only mode/;
         next unless defined($text) && "$text" =~ /selecto-refusal:([a-z_]+):/;
         return Selecto::Error->new(code => 'query_rule_not_evaluable',
             message => 'this comparison cannot be decided exactly on DuckDB', details => {reason => $1});
@@ -1021,6 +1024,46 @@ sub _transaction_statement {
     defined($self->dbh->do($sql))
         or die Selecto::SQL::_dbi_error($self->dbh, "database $sql failed");
     return;
+}
+
+# R55: a read on its own is a READ ONLY transaction that ends in ROLLBACK, so a
+# view's nextval is refused. Inside an open transaction, the host's or a managed
+# write's, there is nothing to wrap the read in, as DuckDB has no savepoints: it
+# runs as written, and has no triggers or procedures to reach, so a sequence is
+# all it can change there. A stream can end at execute: the driver holds the
+# whole result by then. Trying BEGIN to find out would abort the open
+# transaction, so the check is that two statements share a transaction id.
+sub _read_transaction {
+    my ($self, $work) = @_;
+    return $work->() if $self->_read_inside_transaction;
+    eval { $self->_transaction_statement('BEGIN TRANSACTION READ ONLY'); 1 } or die $self->_transaction_control_error($@);
+    my $value;
+    my $ok = eval { $value = $work->(); 1 };
+    my $error = $@;
+    my $ended = eval { $self->_rollback_transaction; 1 };
+    my $ending = $@;
+    die $error unless $ok;
+    die $self->_transaction_control_error($ending) unless $ended;
+    return $value;
+}
+
+sub _read_inside_transaction {
+    my ($self) = @_;
+    my $dbh = $self->dbh;
+    return 1 unless $dbh->{AutoCommit};
+    # (An aborted transaction answers neither: the read will say so itself.)
+    my @ids = eval { local $dbh->{PrintError} = 0; map { $dbh->selectrow_array('SELECT txid_current()') } 1, 2 };
+    return @ids == 2 && defined($ids[0]) && defined($ids[1]) && $ids[0] ne $ids[1] ? 0 : 1;
+}
+
+sub execute_query {
+    my ($self, $statement, @options) = @_;
+    return $self->_read_transaction(sub { $self->SUPER::execute_query($statement, @options) });
+}
+
+sub stream_query {
+    my ($self, $statement, @options) = @_;
+    return $self->_read_transaction(sub { $self->SUPER::stream_query($statement, @options) });
 }
 
 # DuckDB has no savepoints, so a managed write cannot run inside a

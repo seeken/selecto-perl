@@ -71,6 +71,7 @@ our %SQLSTATE_CATEGORIES = (
     '23502' => 'not_null_violation',
     '23514' => 'check_violation',
     '57014' => 'query_canceled',
+    '25006' => 'read_only_transaction',
     '40001' => 'serialization_failure',
     '40P01' => 'deadlock_detected',
 );

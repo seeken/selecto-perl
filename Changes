@@ -1,6 +1,28 @@
 Revision history for Selecto
 
 Unreleased
+    - Reads no longer write (R55). What newly refuses: a read through a view or
+      function that writes, such as a view using nextval or an audit function
+      that inserts, and a hand-built statement that writes passed to
+      execute_query or stream_query. It fails query_error with
+      details.category read_only_transaction, SQLSTATE 25006 where the database
+      has one. Move such writes to execute_write or to the host's own SQL.
+      PostgreSQL: every read and stream is READ ONLY and ends in ROLLBACK or, in
+      the host's transaction, in a rollback to its savepoint, and a bounded
+      stream does so per fetch, so the host can write between fetches. A
+      for_update or for_share read cannot be read only: it ends the same way on
+      its own, and in the host's transaction keeps its work and locks.
+      MySQL and MariaDB: a read on its own is START TRANSACTION READ ONLY and
+      ROLLBACK. An open transaction cannot be made read only there, so in the
+      host's transaction the write is not refused: it runs in a savepoint that
+      is rolled back, and a write to a non-transactional table stays.
+      DuckDB: a read on its own is BEGIN TRANSACTION READ ONLY and ROLLBACK;
+      inside an open transaction it runs as written, as there are no savepoints
+      (only a sequence can change there, with no triggers or procedures).
+      SQLite keeps its PRAGMA query_only. SQL Server is unchanged: a SELECT there
+      cannot write, as its functions cannot.
+      Each read costs two extra statements on MySQL, MariaDB and DuckDB, and a
+      bounded PostgreSQL stream two more per batch inside a host transaction.
     - PostgreSQL: a read, stream or write refuses a session whose
       client_encoding is not UTF8 when the operation starts, before anything
       else is sent, query_rule_not_evaluable with reason client_encoding (R65). Bound values are sent as UTF-8; read as LATIN1, a

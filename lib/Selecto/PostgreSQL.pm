@@ -25,7 +25,6 @@ has canonical_values => 0;
 has canonical_sql => 0;
 # Each compiled statement's outermost SELECT list: see Canonical values in SQL.
 Hash::Util::FieldHash::fieldhash(my %PROJECTION);
-# Opt-in, off by default: see STATEMENT CACHE below.
 # The host declares that its own session TEMP relations may serve as domain
 # relations (R38); otherwise a relation found only in pg_temp is refused.
 has temporary_relations => 0;
@@ -1667,7 +1666,7 @@ sub _relation_sql {
 my @PINNED_SETTINGS = map { [$_ => undef] }
     qw(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings timezone_abbreviations);
 sub _pg_pin_search_path {
-    my ($self, $session, $source) = @_;
+    my ($self, $session, $source, %options) = @_;
     my $local = $session ? 'false' : 'true';
     local $self->{_selecto_relation_schemas} = {};
     my @declared = _pg_declared_schemas($source);
@@ -1692,12 +1691,13 @@ sub _pg_pin_search_path {
         @host = $self->{dbh}->selectrow_array("WITH h AS MATERIALIZED (SELECT $current), "
             . 'r AS MATERIALIZED (SELECT s.name, s.reset_val FROM pg_catalog.pg_settings s '
             . "WHERE s.name OPERATOR(pg_catalog.=) ANY (CAST('$names' AS pg_catalog.text[]))) SELECT "
-            . join(', ', (map { "h.s$_" } 0 .. $#pins), @set) . ' FROM h', undef, $pins[0][1]);
+            . join(', ', (map { "h.s$_" } 0 .. $#pins), @set,
+                $options{read_only} ? q{pg_catalog.set_config('transaction_read_only', 'on', true)} : ()) . ' FROM h', undef, $pins[0][1]);
         1;
     };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_not_evaluable', "the session's reset settings could not be read",
-        {reason => 'session_state_unknown'}) unless @host == 2 * @pins && !grep { !defined } @host;
+        {reason => 'session_state_unknown'}) unless @host == 2 * @pins + ($options{read_only} ? 1 : 0) && !grep { !defined } @host;
     return {host => [map { [$pins[$_][0], $host[$_]] } 0 .. $#pins], pinned => $pinned, session => $session ? 1 : 0};
 }
 
@@ -1868,23 +1868,27 @@ sub _guarded_read {
     local $self->{_selecto_pg_read_guard} = 1;
     my $scope = $self->_read_guard_scope;
     $self->_pg_require_utf8;
-    # In the host's transaction the read runs under its own savepoint, with
-    # search_path pinned for it locally (R30); a rollback to the savepoint
-    # undoes the pin and anything the statement changed. On an idle
-    # (autocommit) handle the pin is set for the session and restored right
-    # after, with every setting the statement changed.
+    # R55: a read is READ ONLY and ends in ROLLBACK, so nothing a statement reaches
+    # can write, and nothing it changes outlasts it. On an idle handle it is a
+    # transaction of its own; in the host's transaction, its own savepoint, whose
+    # rollback also ends the read-only mode and the pin (R30). A read that locks
+    # rows cannot be read-only, and in the host's transaction it keeps its
+    # savepoint's work so its locks last until the host's commit.
+    my $locks = blessed($source) && $source->{_selecto_row_lock};
     my $savepoint;
     if ($scope eq 'host') {
         $savepoint = Selecto::SQL::_savepoint_name('selecto_read');
         eval { $self->_savepoint_command(create => $savepoint); 1 }
             or die $self->_transaction_control_error($@);
+    } else {
+        eval { $self->{dbh}->begin_work; 1 } or die $self->_transaction_control_error($@);
     }
     my ($pin, $before, $result);
     my $ok = eval {
         {
             local $self->{_selecto_reset_operation} = {};
             $self->_pg_check_relations($source);
-            $pin = $self->_pg_pin_search_path(!$savepoint, $source);
+            $pin = $self->_pg_pin_search_path(0, $source, read_only => !$locks);
         }
         $before = $self->_pg_admit_session($source, read => 1);
         $result = $work->();
@@ -1894,25 +1898,13 @@ sub _guarded_read {
     # The after-snapshot and the host's settings again, in one round trip:
     # the snapshot is read before the restore runs.
     my $after = $ok && $before ? eval { $self->_pg_session_state($pin, read => 1) } : undef;
-    my $restored = $after ? 1 : 0;
     my $changed = $ok && $before && !($after && $after->{snapshot} eq $before->{snapshot});
     my $finished = eval {
         if ($savepoint) {
-            if (!$ok || $changed) {
-                $self->_savepoint_command(rollback => $savepoint);
-            } elsif (!$restored) {
-                $self->_pg_restore_search_path($pin);
-            }
+            $self->_savepoint_command(rollback => $savepoint) if !$ok || $changed || !$locks;
             $self->_savepoint_command(release => $savepoint);
         } else {
-            if ($changed) {
-                for my $name (@SESSION_SETTINGS) {
-                    eval { $self->{dbh}->selectrow_array('SELECT pg_catalog.set_config($1, $2, false)', undef,
-                        $name, $before->{settings}{$name}) };
-                }
-                $restored = 0;
-            }
-            $self->_pg_restore_search_path($pin) if $pin && !$restored;
+            $self->{dbh}->rollback or die 'read transaction rollback failed';
         }
         1;
     };
@@ -2785,6 +2777,17 @@ would autocommit. Checking costs one C<pg_ping> round trip where none was
 made before (a stream or a savepoint budget on an C<< AutoCommit => 0 >>
 handle). A bounded stream also refuses, after it opened, to roll back
 anything it cannot prove is its own; see L<Selecto::PostgreSQL::Stream>.
+
+=head1 READS DO NOT WRITE
+
+A read is C<READ ONLY> and ends in C<ROLLBACK>, or in a rollback to its own
+savepoint inside the host's transaction, so a view using C<nextval> or an audit
+function refuses (C<query_error>, C<details.category> C<read_only_transaction>,
+SQLSTATE C<25006>). So does a hand-built statement that writes, given to
+C<execute_query> or C<stream_query>. A bounded stream ends each fetch that way
+inside a host transaction, and the host can write between fetches. A
+C<for_update> or C<for_share> read cannot be read only: it is not, and inside
+the host's transaction it keeps its savepoint's work, so its locks last.
 
 =head1 SESSION STATE
 

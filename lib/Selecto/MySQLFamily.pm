@@ -253,7 +253,8 @@ sub stream_query {
     # check itself until it is drained).
     my $stream = do {
         local $self->{dbh}{mariadb_use_result} = 0;
-        $self->SUPER::stream_query($statement, %options);
+        # (A stored result is complete at execute, so the read can end here.)
+        $self->_read_transaction(sub { $self->SUPER::stream_query($statement, %options) });
     };
     my $ok = eval { $self->_check_session_state($state); 1 };
     unless ($ok) { my $error = $@; $stream->close; die $error }
@@ -2868,11 +2869,51 @@ sub execute_query {
     # driver_values: the values DBD::MariaDB fetched, undecoded, under the same
     # session checks.
     local $self->{_selecto_driver_values} = $options{driver_values} ? 1 : 0;
-    my $result = $self->SUPER::execute_query($statement);
+    my $result = $self->_read_transaction(sub { $self->SUPER::execute_query($statement) });
     # A view's stored function can SET time_zone or sql_mode mid-statement;
     # the rows it shaped are discarded and the read refused.
     $self->_check_session_state($state);
     return $self->_apply_formatters($statement, $result);
+}
+
+# R55: nothing a read reaches outlives it. On its own the read is a READ ONLY
+# transaction that ends in ROLLBACK: a stored function that writes fails with
+# SQLSTATE 25006. MySQL cannot make an open transaction read only, so inside
+# the host's the read runs in a savepoint and is rolled back to it, which is
+# all that can be undone: a write to a non-transactional table stays. The host's
+# work is never touched.
+sub _read_transaction {
+    my ($self, $work) = @_;
+    my $dbh = $self->{dbh};
+    my $savepoint = $dbh->{AutoCommit} ? undef : Selecto::SQL::_savepoint_name('selecto_read');
+    my $command = sub {
+        my ($sql) = @_;
+        local $dbh->{PrintError} = 0;
+        defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
+    };
+    eval {
+        $savepoint ? $self->_savepoint_command(create => $savepoint)
+            : $command->('START TRANSACTION READ ONLY');
+        1;
+    } or die $self->_transaction_control_error($@);
+    my $value;
+    my $ok = eval { $value = $work->(); 1 };
+    my $error = $@;
+    my $ended = eval {
+        if ($savepoint) {
+            $self->_savepoint_command(rollback => $savepoint);
+            $self->_savepoint_command(release => $savepoint);
+        } else {
+            $command->('ROLLBACK');
+        }
+        1;
+    };
+    my $ending = $@;
+    # (A deadlock has already rolled the host's transaction back, savepoint and
+    # all: the read's own error says so.)
+    die $error unless $ok;
+    die $self->_transaction_control_error($ending) unless $ended;
+    return $value;
 }
 
 sub _decode {
