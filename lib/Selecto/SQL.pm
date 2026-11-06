@@ -1256,7 +1256,7 @@ sub _hand_built {
 
 sub _admit_hand_built {
     my ($self, $statement) = @_;
-    return unless _hand_built($statement);
+    return if !_hand_built($statement) || $self->{_sqlite_query_unsafe};
     my $sql = $statement->sql // '';
     my $refuse = sub {
         Selecto::Error->throw('query_rule_not_evaluable', "a hand-built statement on a read path must be one provable read: $_[0]",
