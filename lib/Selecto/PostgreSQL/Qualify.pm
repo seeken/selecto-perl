@@ -37,6 +37,17 @@ my %KEYWORD = map { ($_ => 1) } qw(
     CHARACTER VARYING DOUBLE PRECISION WITHOUT DECLARE CURSOR SCROLL HOLD SAVEPOINT RELEASE ROLLBACK BEGIN
     COMMIT LOCK MODE EXCLUSIVE SYMMETRIC ASYMMETRIC LEADING TRAILING BOTH PLACING NORMALIZE DEFAULT
 );
+# R60: words of the list above that PostgreSQL also takes as a function name
+# (delete, last, hstore's real delete(), ...) and that SQL syntax never follows
+# with a parenthesis in the position an atom starts. Followed by one there, the
+# word is a call, which resolves through the session like any other: it is
+# pg_catalog-qualified (left, right, mode, like) or refused.
+my %FUNCTION_KEYWORD = map { ($_ => 1) } qw(
+    UPDATE DELETE INSERT RECURSIVE NOTHING RANGE PARTITION SHARE NOWAIT SKIP LOCKED LEFT RIGHT INNER OUTER FULL
+    CROSS NATURAL AT ORDINALITY NULLS FIRST LAST NEXT UNBOUNDED PRECEDING FOLLOWING EXCLUDE TIES OTHERS NO KEY
+    DOUBLE WITHOUT DECLARE CURSOR SCROLL HOLD SAVEPOINT RELEASE ROLLBACK BEGIN COMMIT LOCK MODE EXCLUSIVE
+    LIKE ILIKE SIMILAR
+);
 # Declared column types of a record function's column list that are no
 # extension's (json_rowset and the like).
 my %BUILTIN_TYPE = map { ($_ => 1) } map { ($_, "$_\[]") } qw(text varchar character char bpchar name integer int int2 int4 int8
@@ -459,10 +470,14 @@ sub _atom {
         }
         my $open = $tokens->[$$pos + 1][1];
         my $close = $open eq '(' ? ')' : ']';
+        my $open_at = $$pos + 1;
         $$pos += 2;
         my $inner = _sequence($state, $tokens, $pos, $close);
         _expect($tokens, $pos, $close);
         $sql = "$text$open$inner$close";
+        # The comma forms of SUBSTRING and OVERLAY are plain calls, resolved
+        # through the session (R60); the keyword forms are pg_catalog's.
+        $sql = "pg_catalog.$sql" if $up =~ /\A(?:SUBSTRING|OVERLAY)\z/ && _comma_form($tokens, $open_at);
         # These return a type of their own (pg_catalog's, or the CAST
         # target's; GROUPING's is integer); COALESCE, GREATEST, LEAST, ARRAY, ROW and the
         # quantifiers take their arguments' type.
@@ -494,7 +509,7 @@ sub _atom {
         _expect($tokens, $pos, ')');
         $sql = "($inner)";
         ($column, $known, $entry) = ($lone->{column}, $lone->{known}, $lone->{entry}) if $lone;
-    } elsif ($type eq 'id' && !$KEYWORD{$up} || $type eq 'qid') {
+    } elsif ($type eq 'id' && (!$KEYWORD{$up} || _keyword_call($tokens, $$pos)) || $type eq 'qid') {
         # A name chain: a.b.c, possibly a function call.
         my $start = $token->[2];
         # Its position in this token list (a CASE branch is parsed from a slice).
@@ -618,6 +633,9 @@ sub _atom {
                 # a pg_catalog type, whatever its arguments.
                 my $returns = $state->{functions}{lc $names[0]};
                 $known = $returns eq 'string' ? 'string' : 1 if $returns ne 'polymorphic';
+            } elsif (@names == 1 && $kinds[0] eq 'id' && $KEYWORD{uc $names[0]}) {
+                Selecto::Error->throw('query_rule_not_evaluable', 'a function named like an SQL keyword cannot be qualified',
+                    {reason => 'function_keyword', function => lc $names[0]});
             }
             $sql = "$name($inner)";
             # FILTER (WHERE ...) / OVER (...) / WITHIN GROUP (...) follow.
@@ -1196,6 +1214,40 @@ sub _scopes {
 
 sub _keyword { my ($word) = @_; return $KEYWORD{uc $word} || $CONSTANT{uc $word} }
 
+# Whether the token at $k is a keyword used as a function name (R60): one that
+# can be one, followed by a parenthesis, and not in the syntax that takes one
+# there (FETCH FIRST (n) ROWS, PRIMARY KEY (...), a RANGE (x) PRECEDING frame).
+sub _keyword_call {
+    my ($tokens, $k) = @_;
+    return 0 unless $FUNCTION_KEYWORD{uc $tokens->[$k][1]} && $k + 1 < @$tokens && $tokens->[$k + 1][1] eq '(';
+    my $prev = $k > 0 ? uc $tokens->[$k - 1][1] : '';
+    return 0 if $prev eq '.' || $prev eq 'FETCH' || $prev eq 'PRIMARY' || $prev eq 'FOREIGN';
+    if (uc($tokens->[$k][1]) eq 'RANGE') {
+        my $depth = 0;
+        for my $j ($k + 1 .. $#$tokens) {
+            $depth++ if $tokens->[$j][0] eq 'punct' && $tokens->[$j][1] eq '(';
+            $depth-- if $tokens->[$j][0] eq 'punct' && $tokens->[$j][1] eq ')';
+            next if $depth;
+            return uc($tokens->[$j + 1][1] // '') =~ /\A(?:PRECEDING|FOLLOWING)\z/ ? 0 : 1;
+        }
+    }
+    return 1;
+}
+
+# Whether the parenthesis at $open holds a comma at its own level.
+sub _comma_form {
+    my ($tokens, $open) = @_;
+    my $depth = 0;
+    for my $j ($open .. $#$tokens) {
+        next unless $tokens->[$j][0] eq 'punct';
+        $depth++ if $tokens->[$j][1] =~ /\A[(\[]\z/;
+        $depth-- if $tokens->[$j][1] =~ /\A[)\]]\z/;
+        return 0 unless $depth;
+        return 1 if $depth == 1 && $tokens->[$j][1] eq ',';
+    }
+    return 0;
+}
+
 # The extension operators ({op => schema}) of the column a reference at token
 # $at names, or undef.
 sub _resolve_column {
@@ -1402,6 +1454,12 @@ sub lint {
             push @problems, "bare operator $text";
         } elsif ($type eq 'id' && _implicit_construct($tokens, $k)) {
             push @problems, _implicit_construct($tokens, $k);
+        } elsif ($type eq 'id' && _keyword_call($tokens, $k) && $k > 0 && $prev->[1] ne '::' && uc($prev->[1]) ne 'AS') {
+            # R60: a keyword-named function, whatever schema it is in.
+            push @problems, "unqualified function $text";
+        } elsif ($type eq 'id' && uc($text) =~ /\A(?:SUBSTRING|OVERLAY)\z/ && $k + 1 < @$tokens && $tokens->[$k + 1][1] eq '('
+            && $prev->[1] ne '.' && _comma_form($tokens, $k + 1)) {
+            push @problems, "unqualified function $text";
         } elsif ($type eq 'id' && $k + 1 < @$tokens && $tokens->[$k + 1][1] eq '(' && !$KEYWORD{uc $text}
             && $prev->[1] ne '.' && $prev->[1] ne '::' && uc($prev->[1]) ne 'AS' && $functions->{lc $text}) {
             push @problems, "unqualified function $text";
