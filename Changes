@@ -57,7 +57,12 @@ Unreleased
       text CASE, NULLIF, a || b, a scalar subquery of a string) compares as
       text against citext, and a function that can only return a non-extension
       type (similarity, nlevel, ST_Area) is a plain value. Some of those were
-      refused before and now answer, as PostgreSQL does.
+      refused before and now answer, as PostgreSQL does. A CASE or COALESCE
+      with citext results is refused against a value or citext, and under max
+      or min, where it used to compare or aggregate as text and could lose
+      rows. A UNION, INTERSECT or EXCEPT output compared in an outer query is
+      typed from all its branches: citext beside a literal or text is refused
+      there too, where it could give wrong rows.
     - PostgreSQL: catalog facts for the operator qualifier are keyed by the
       exact name, as PostgreSQL folds identifiers (R56). With org text and
       "ORG" citext in one table, org took citext's operators: a tenant read,

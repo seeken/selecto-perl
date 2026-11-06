@@ -635,6 +635,16 @@ sub _atom {
             # keeps the type when it returns it.
             my $function = @names == 1 && $kinds[0] eq 'id' && $first && $state->{scopes}
                 ? _extension_function($state, $first, lc $names[0]) : undef;
+            # An argument that may have that type (a CASE of citext results)
+            # would take pg_catalog's aggregate where PostgreSQL takes the
+            # extension's: refused, never defaulted.
+            if (!$function && @names == 1 && $kinds[0] eq 'id' && $first && $state->{scopes}) {
+                my $class = _class_of($state, $first);
+                my $fn = $class->{unknown} && $class->{soft_entry} ? $class->{soft_entry}{"\0fn"} : undef;
+                Selecto::Error->throw('query_rule_not_evaluable',
+                    "an extension aggregate's argument must be one plain operand of the extension's type",
+                    {reason => 'operand_type_unknown'}) if ref($fn) eq 'HASH' && $fn->{lc $names[0]};
+            }
             if ($function) {
                 # R50: its one argument cast to the member type, so no
                 # aggregate planted beside it over a domain can be chosen.
@@ -1188,6 +1198,15 @@ sub _scopes {
             @stack = ({scope => 0, open => undef}) unless @stack;
         } elsif (_upper($t) eq 'SELECT') {
             push @scopes, {parent => $stack[-1]{scope}, aliases => {}, items => [], depth => scalar(@stack), select => $i};
+            # A later branch of a set operation shares the first's outputs.
+            my $word = $i > 0 ? _upper($tokens->[$i - 1]) : '';
+            $word = _upper($tokens->[$i - 2]) if $i > 1 && $word =~ /\A(?:ALL|DISTINCT)\z/;
+            if ($word =~ /\A(?:UNION|INTERSECT|EXCEPT)\z/) {
+                my $previous = $scopes[$stack[-1]{scope}];
+                my $head = $previous->{branch_of} // $stack[-1]{scope};
+                $scopes[-1]{branch_of} = $head;
+                push @{$scopes[$head]{branches}}, $#scopes;
+            }
             $stack[-1]{scope} = $#scopes;
             $opens{$stack[-1]{open}} //= $#scopes if defined $stack[-1]{open};
         }
@@ -1467,12 +1486,40 @@ sub _select_item {
 sub _item_entry {
     my ($state, $scope, $index, $guard) = @_;
     my $info = $state->{scopes};
+    # A set operation's output has the type its branches resolve to together
+    # (R51 amendment 3): one extension type stays that type, strings are text,
+    # and a mix with an extension type is not resolved here. A recursive
+    # step's reference to its own CTE adds nothing.
+    my $branches = $info->{scopes}[$scope]{branches};
+    if ($branches && !$state->{in_branches}{$scope}) {
+        local $state->{in_branches}{$scope} = 1;
+        local $state->{in_branches}{"$scope.$index"} = 0;
+        my @entries = grep { defined } map { _item_entry($state, $_, $index, $guard + 1) } $scope, @$branches;
+        return _common_entry(@entries);
+    }
+    return undef if $state->{in_branches}{$scope} && $branches && $state->{in_branches}{"$scope.$index"}++;
+    return undef unless $index < @{$info->{scopes}[$scope]{items}};
     my $item = _select_item($info, $scope, $index);
     my $chain = $item->{chain};
     return _resolve_in($state, $scope, @$chain > 1 ? $chain->[-2] : undef, $chain->[-1], $guard + 1) if $chain;
     return undef unless $item->{length};
     my $first = $info->{scopes}[$scope]{items}[$index][0];
     return _computed_entry($state, $first, $first + $item->{length} - 1, $guard);
+}
+
+sub _common_entry {
+    my @entries = @_;
+    return undef unless @entries;
+    my @extension = grep { _is_extension($_) } @entries;
+    if (@extension) {
+        my %types = map { (($_->{"\0type"} // '') => 1) } @extension;
+        return $extension[0] if @extension == @entries && keys(%types) == 1;
+        my $soft = !grep { !$_->{"\0strcat"} } @extension;
+        return {"\0unknown" => 1, "\0soft" => $soft, "\0over" => 1, "\0softentry" => $extension[0]};
+    }
+    my ($unknown) = grep { $_->{"\0unknown"} } @entries;
+    return $unknown if $unknown;
+    return @entries == grep({ $_->{"\0string"} } @entries) ? {"\0string" => 1} : {};
 }
 
 # A computed select item's type, from its tokens $first .. $last.
