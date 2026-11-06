@@ -28,6 +28,7 @@ $admin->do('SET client_min_messages TO warning');
 my %mine;
 END { eval {
     $admin->do('DROP TABLE IF EXISTS r51_t, r51_dt, r51_g, r51_tb3 CASCADE');
+    $admin->do('DROP DOMAIN IF EXISTS r51_txt');
     $admin->do(qq{DROP EXTENSION IF EXISTS "$_" CASCADE}) for grep { $mine{$_} } qw(postgis isn ltree hstore citext);
     $admin->do('DROP SCHEMA IF EXISTS r51ext CASCADE');
 } }
