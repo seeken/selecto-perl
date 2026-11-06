@@ -2882,41 +2882,34 @@ sub execute_query {
     return $self->_apply_formatters($statement, $result);
 }
 
-# R55: nothing a read reaches outlives it. On its own the read is a READ ONLY
-# transaction that ends in ROLLBACK: a stored function that writes fails with
-# SQLSTATE 25006. A savepoint cannot be read only, so inside the host's
-# transaction the write is undone, not refused: the read runs in a savepoint and
-# is rolled back to it. A write to a non-transactional table cannot be undone and
-# stays. The host's work is never touched.
+# R55: on its own a read is a READ ONLY transaction that ends in ROLLBACK, so a
+# stored function that writes fails with SQLSTATE 25006. autocommit is what opens
+# it: START TRANSACTION would release the host's LOCK TABLES and FLUSH TABLES ...
+# WITH READ LOCK (R66).
+# Inside the host's transaction the read runs as written, and a write it reaches
+# is the host's to commit or undo. A savepoint cannot be read only, and rolling
+# back to one takes more than the read's writes with it: the transaction's
+# snapshot and shared locks when the read was its first InnoDB access, and the
+# metadata locks that keep its tables from DDL until it ends.
 sub _read_transaction {
     my ($self, $work) = @_;
     my $dbh = $self->{dbh};
-    my $savepoint = $dbh->{AutoCommit} ? undef : Selecto::SQL::_savepoint_name('selecto_read');
-    my $command = sub {
-        my ($sql) = @_;
-        local $dbh->{PrintError} = 0;
-        defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
-    };
+    return $work->() unless $dbh->{AutoCommit};
     eval {
-        $savepoint ? $self->_savepoint_command(create => $savepoint)
-            : $command->('START TRANSACTION READ ONLY');
+        local $dbh->{PrintError} = 0;
+        defined($dbh->do('SET TRANSACTION READ ONLY')) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
+        $dbh->begin_work or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
         1;
     } or die $self->_transaction_control_error($@);
     my $value;
     my $ok = eval { $value = $work->(); 1 };
     my $error = $@;
     my $ended = eval {
-        if ($savepoint) {
-            $self->_savepoint_command(rollback => $savepoint);
-            $self->_savepoint_command(release => $savepoint);
-        } else {
-            $command->('ROLLBACK');
-        }
+        local $dbh->{PrintError} = 0;
+        $dbh->rollback or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
         1;
     };
     my $ending = $@;
-    # (A deadlock has already rolled the host's transaction back, savepoint and
-    # all: the read's own error says so.)
     die $error unless $ok;
     die $self->_transaction_control_error($ending) unless $ended;
     return $value;

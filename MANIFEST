@@ -238,6 +238,7 @@ t/query_enforcement.t
 t/query_enforcement_scalar_v2.t
 t/query_library.t
 t/query_member.t
+t/read_host_guarantees_live.t
 t/read_only_reads_live.t
 t/reference_tenant_agreement.t
 t/required_filter_exactness_live.t
