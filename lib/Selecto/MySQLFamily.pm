@@ -255,7 +255,7 @@ sub stream_query {
     my $stream = do {
         local $self->{dbh}{mariadb_use_result} = 0;
         # (A stored result is complete at execute, so the read can end here.)
-        $self->_read_transaction(sub { $self->SUPER::stream_query($statement, %options) });
+        $self->_read_transaction($statement, sub { $self->SUPER::stream_query($statement, %options) });
     };
     my $ok = eval { $self->_check_session_state($state); 1 };
     unless ($ok) { my $error = $@; $stream->close; die $error }
@@ -2876,7 +2876,7 @@ sub execute_query {
     # driver_values: the values DBD::MariaDB fetched, undecoded, under the same
     # session checks.
     local $self->{_selecto_driver_values} = $options{driver_values} ? 1 : 0;
-    my $result = $self->_read_transaction(sub { $self->SUPER::execute_query($statement) });
+    my $result = $self->_read_transaction($statement, sub { $self->SUPER::execute_query($statement) });
     # A view's stored function can SET time_zone or sql_mode mid-statement;
     # the rows it shaped are discarded and the read refused.
     $self->_check_session_state($state);
@@ -2893,10 +2893,17 @@ sub execute_query {
 # cannot be read only, and rolling back to one takes more than the read's writes
 # with it: the transaction's snapshot and shared locks when the read was its first
 # InnoDB access, and the metadata locks that keep its tables from DDL until it ends.
+# A hand-built statement inside the host's transaction has nothing to stop a write,
+# and its text cannot prove it makes none: it refuses (see _admit_hand_built).
 sub _read_transaction {
-    my ($self, $work) = @_;
+    my ($self, $statement, $work) = @_;
     my $dbh = $self->{dbh};
-    return $work->() unless $dbh->{AutoCommit};
+    $self->_admit_hand_built($statement);
+    unless ($dbh->{AutoCommit}) {
+        Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement cannot be proved a read inside a host transaction here',
+            {reason => 'hand_built_in_host_transaction'}) if Selecto::SQL::_hand_built($statement);
+        return $work->();
+    }
     my $begun = eval {
         local $dbh->{PrintError} = 0;
         for my $sql ('SET TRANSACTION READ ONLY', 'SET autocommit = 0') {
@@ -2918,6 +2925,14 @@ sub _read_transaction {
     die $error unless $ok;
     die $finished unless $finished eq '1';
     return $value;
+}
+
+# INTO writes a file or a user variable, := a variable, and a conditional comment
+# is SQL this text does not show.
+sub _hand_built_refusal {
+    my ($self, $sql) = @_;
+    return 'it may write' if $sql =~ /\bINTO\b/i || index($sql, ':=') >= 0 || $sql =~ m{/\*M?!};
+    return undef;
 }
 
 # A read may end up READ ONLY or with autocommit off only by accident, and a host

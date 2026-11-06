@@ -407,6 +407,7 @@ sub _query_transport_sql {
 
 sub execute_query {
     my ($self, $statement, @options) = @_;
+    $self->_admit_hand_built($statement);
     $self->_query_transport_sql($statement);
     return $self->_read_only(sub {
         my ($sth, $rows);
@@ -475,8 +476,10 @@ sub _compile_pagination {
 sub explain_query {
     my ($self, $statement) = @_;
     $self->_query_transport_sql($statement);
-    return $self->execute_query(Selecto::Statement->new(sql => 'EXPLAIN QUERY PLAN ' . $statement->sql,
-        params => $statement->params, columns => [qw(id parent notused detail)], adapter_name => $self->name));
+    my $plan = Selecto::Statement->new(sql => 'EXPLAIN QUERY PLAN ' . $statement->sql,
+        params => $statement->params, columns => [qw(id parent notused detail)], adapter_name => $self->name);
+    $plan->{_selecto_relations} = $statement->relations // [];
+    return $self->execute_query($plan);
 }
 
 sub introspect_schema {

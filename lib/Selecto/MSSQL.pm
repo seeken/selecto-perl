@@ -254,6 +254,12 @@ sub _related_collection_text_sql {
 }
 
 
+# Nothing here makes a read read only, so the words that write refuse.
+sub _hand_built_refusal {
+    my ($self, $sql) = @_;
+    return $sql =~ /\b(?:INTO|INSERT|UPDATE|DELETE|MERGE|EXEC|EXECUTE|TRUNCATE|DROP|ALTER|CREATE)\b/i ? 'it may write' : undef;
+}
+
 sub _server_transaction_open {
     my ($self) = @_;
     my $count = $self->_transaction_count;

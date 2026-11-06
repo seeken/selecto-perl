@@ -1030,12 +1030,18 @@ sub _transaction_statement {
 # view's nextval is refused. Inside an open transaction, the host's or a managed
 # write's, there is nothing to wrap the read in, as DuckDB has no savepoints: it
 # runs as written, and has no triggers or procedures to reach, so a sequence is
-# all it can change there. A stream can end at execute: the driver holds the
-# whole result by then. Trying BEGIN to find out would abort the open
-# transaction, so the check is that two statements share a transaction id.
+# all it can change there. A hand-built statement has nothing to stop it there,
+# so it refuses. A stream can end at execute: the driver holds the whole result by
+# then. Trying BEGIN to find out would abort the open transaction, so the check is
+# that two statements share a transaction id.
 sub _read_transaction {
-    my ($self, $work) = @_;
-    return $work->() if $self->_read_inside_transaction;
+    my ($self, $statement, $work) = @_;
+    $self->_admit_hand_built($statement);
+    if ($self->_read_inside_transaction) {
+        Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement cannot be proved a read inside a host transaction here',
+            {reason => 'hand_built_in_host_transaction'}) if Selecto::SQL::_hand_built($statement);
+        return $work->();
+    }
     eval { $self->_transaction_statement('BEGIN TRANSACTION READ ONLY'); 1 } or die $self->_transaction_control_error($@);
     my $value;
     my $ok = eval { $value = $work->(); 1 };
@@ -1058,12 +1064,12 @@ sub _read_inside_transaction {
 
 sub execute_query {
     my ($self, $statement, @options) = @_;
-    return $self->_read_transaction(sub { $self->SUPER::execute_query($statement, @options) });
+    return $self->_read_transaction($statement, sub { $self->SUPER::execute_query($statement, @options) });
 }
 
 sub stream_query {
     my ($self, $statement, @options) = @_;
-    return $self->_read_transaction(sub { $self->SUPER::stream_query($statement, @options) });
+    return $self->_read_transaction($statement, sub { $self->SUPER::stream_query($statement, @options) });
 }
 
 # DuckDB has no savepoints, so a managed write cannot run inside a

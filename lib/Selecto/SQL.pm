@@ -1244,8 +1244,40 @@ sub _single_rollup_grouping_position {
     return undef;
 }
 
+# A host's hand-built statement, which no compile vouches for. A read path takes
+# only a read: one statement, by its first word, and the transaction it runs in
+# then refuses what that statement would write. What cannot be told from that
+# refuses: this is checked on the text as it stands, strings and comments
+# included, so that no lexer has to agree with the server about where they end.
+sub _hand_built {
+    my ($statement) = @_;
+    return blessed($statement) && $statement->can('relations') && !defined($statement->relations) ? 1 : 0;
+}
+
+sub _admit_hand_built {
+    my ($self, $statement) = @_;
+    return unless _hand_built($statement);
+    my $sql = $statement->sql // '';
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable', "a hand-built statement on a read path must be one provable read: $_[0]",
+            {reason => 'hand_built_not_a_read'});
+    };
+    (my $text = $sql) =~ s/[\s;]+\z//;
+    $refuse->('it holds more than one statement') if index($text, ';') >= 0;
+    1 while $text =~ s{\A\s*(?:--[^\n]*(?:\n|\z)|/\*(?:[^*]|\*(?!/))*\*/)}{};
+    $text =~ s/\A[\s(]+//;
+    $refuse->('it does not begin with SELECT, WITH, VALUES or TABLE') unless $text =~ /\A(?:SELECT|WITH|VALUES|TABLE)\b/i;
+    my $reason = $self->_hand_built_refusal($sql);
+    $refuse->($reason) if defined $reason;
+    return;
+}
+
+# Dialect hook: why this text cannot be proved a read here (undef: it can).
+sub _hand_built_refusal { return undef; }
+
 sub execute_query {
     my ($self, $statement) = @_;
+    $self->_admit_hand_built($statement);
     my ($sth, $rows);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
@@ -1284,6 +1316,7 @@ sub stream_query {
         unless $self->supports('stream');
     Selecto::Error->throw('invalid_stream', 'stream_query requires a Selecto statement')
         unless blessed($statement) && $statement->isa('Selecto::Statement');
+    $self->_admit_hand_built($statement);
     Selecto::Error->throw('unsupported_feature', 'adapter cannot bound driver result buffering')
         if $options{bounded} && !$self->bounded_stream_supported;
     my $fetch_size = $options{fetch_size} // 500;
