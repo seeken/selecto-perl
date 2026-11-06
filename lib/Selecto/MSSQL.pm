@@ -301,8 +301,8 @@ sub _savepoint_transaction {
     my $ok = eval { $value = $operation->(); 1 };
     if (!$ok) {
         my $error = $@;
-        eval { $self->_rollback_transaction };
-        die $error;
+        die $error if eval { $self->_rollback_transaction; 1 };
+        die $self->_undo_failed($error);
     }
     return $value;
 }

@@ -46,7 +46,7 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             my $do = \&DBD::MariaDB::db::do;
             local *DBD::MariaDB::db::do = sub {
                 my ($dbh, $statement) = @_;
-                if ($statement eq $sql && $left-- > 0) {
+                if ((ref($sql) ? $statement =~ $sql : $statement eq $sql) && $left-- > 0) {
                     die "DBD::MariaDB::db do failed: Query execution was interrupted\n";
                 }
                 return $do->(@_);
@@ -97,7 +97,53 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             is(($admin->selectrow_array('SELECT note FROM kq_t WHERE id = 2'))[0], 'b', 'and nothing of it stayed');
         }
 
-        my %count;
+        # A write that fails inside the host's transaction must not be there for the
+        # host to commit: rolled back to its savepoint, or the connection is closed.
+        {
+            my $update = Selecto::Write::Command->new(operation => 'update', relation => 'kq_t', assignments => {note => 'held'}, predicate => $x->eq('id', 1), expected_count => undef);
+            my $dbh = $connect->();
+            my $e = $engine_for->($dbh);
+            $admin->do(q{UPDATE kq_t SET note = 'a' WHERE id = 1});
+            $dbh->begin_work;
+            ok(!eval { $fail->(qr/\ARELEASE SAVEPOINT selecto_write/, 1, sub { $e->execute_write($update) }); 1 }, 'a write whose RELEASE fails is reported failed');
+            $dbh->commit;
+            is(($admin->selectrow_array('SELECT note FROM kq_t WHERE id = 1'))[0], 'a', "and the host's COMMIT does not store it");
+            $dbh->disconnect;
+            $dbh = $connect->();
+            $e = $engine_for->($dbh);
+            $dbh->begin_work;
+            ok(!eval { $fail->(qr/\A(?:RELEASE|ROLLBACK TO) SAVEPOINT selecto_write/, 1000, sub { $e->execute_write($update) }); 1 }, 'with no way to undo it either');
+            ok(!$dbh->{Active}, 'the connection is closed');
+            eval { $dbh->commit };
+            is(($admin->selectrow_array('SELECT note FROM kq_t WHERE id = 1'))[0], 'a', 'and nothing can store it');
+        }
+
+        # A KILL on a guard Selecto sends is a cancellation like any other: the budget's
+        # own statements included, and they leave nothing behind to refuse the next write.
+        {
+            my $setting = $name eq 'mysql' ? 'max_execution_time' : 'max_statement_time';
+            my $update = Selecto::Write::Command->new(operation => 'update', relation => 'kq_t', assignments => {note => 'g'}, predicate => $x->eq('id', 1), expected_count => undef);
+            for my $case (['configure', qr/\ASET SESSION \Q$setting\E = [1-9]/, 1, 1], ['restore', qr/\ASET SESSION \Q$setting\E = 0/, 1, 0], ['autocommit restore', qr/\ASET autocommit = 1/, 1, 0]) {
+                my ($label, $sql, $times, $fails) = @$case;
+                my $dbh = $connect->();
+                my $e = $engine_for->($dbh);
+                $admin->do(q{UPDATE kq_t SET note = 'a' WHERE id = 1});
+                my $ok = eval { $fail->($sql, $times, sub { $label eq 'autocommit restore' ? $e->all($e->query->select('id')) : $e->execute_write($update) }); 1 };
+                my $error = $@;
+                if ($fails) {
+                    ok(!$ok, "a killed budget $label fails the write");
+                    is(blessed($error) && $error->details->{category}, 'query_canceled', 'as a cancellation') or diag $error;
+                } else {
+                    ok($ok, "a killed $label is tried again") or diag $error;
+                }
+                ok($dbh->{Active}, "the connection stands after a killed $label");
+                is(($dbh->selectrow_array("SELECT \@\@SESSION.$setting"))[0] + 0, 0, 'and no deadline is left in force');
+                ok(eval { $e->execute_write($update); 1 }, 'and the next write runs') or diag $@;
+                $dbh->disconnect;
+            }
+        }
+
+        my (%count, %types);
         my @bad;
         my $serial = 0;
         my $finish = time + $seconds;
@@ -122,7 +168,13 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
                         assignments => {note => 'x'}, predicate => $x->eq('id', 1), expected_count => undef));
                     1;
                 };
+                my $error = $@;
                 $count{$ok ? 'answered' : 'interrupted'}++;
+                # A KILL on any statement, guards included, keeps its type.
+                unless ($ok) {
+                    my $type = blessed($error) ? join('/', $error->code, $error->details->{category} // $error->details->{reason} // '') : "untyped: $error";
+                    $types{$type}++;
+                }
             }
             waitpid($killer, 0);
             # The storm is over. Closed, or exactly as it was.
@@ -134,6 +186,8 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             push @bad, "autocommit=" . ($auto // 'undef') . " read_only=" . ($mode // 'undef') unless ($auto // '') eq '1' && ($mode // '') eq '0';
             push @bad, 'DBI AutoCommit off' unless $dbh->{AutoCommit};
             push @bad, 'DBI BegunWork on' if $dbh->{BegunWork};
+            # And it still takes commands.
+            push @bad, 'the handle refuses a read: ' . (blessed($@) ? $@->code : $@) unless eval { $engine->all($engine->query->select('id')); 1 };
             my $mark = ++$serial;
             my $wrote = eval { $dbh->do('INSERT INTO kq_log VALUES (?)', undef, $mark); 1 };
             push @bad, 'the next write failed: ' . ($dbh->err // '') unless $wrote;
@@ -143,8 +197,9 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
         }
         is_deeply(\@bad, [], 'no connection was left open in the wrong mode');
         ok($count{checked} // 0, 'and some connections came through to be checked');
-        note explain \%count;
         diag join ' ', map { "$_=$count{$_}" } sort keys %count;
+        diag join ' ', map { "$_=$types{$_}" } sort keys %types;
+        is_deeply([grep { !/\A(?:query_error\/query_canceled|transaction_state_unsafe\/session_not_restored)\z/ } sort keys %types], [], 'every interrupted call kept its type');
         $admin->do('DROP TABLE kq_t, kq_log');
         $admin->disconnect;
     };

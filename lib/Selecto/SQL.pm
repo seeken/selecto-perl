@@ -1246,9 +1246,7 @@ sub _single_rollup_grouping_position {
 
 # A host's hand-built statement, which no compile vouches for. A read path takes
 # only a read: one statement, by its first word, and the transaction it runs in
-# then refuses what that statement would write. What cannot be told from that
-# refuses: this is checked on the text as it stands, strings and comments
-# included, so that no lexer has to agree with the server about where they end.
+# then refuses what that statement would write. Otherwise it runs exactly as written.
 sub _hand_built {
     my ($statement) = @_;
     return blessed($statement) && $statement->can('relations') && !defined($statement->relations) ? 1 : 0;
@@ -1257,23 +1255,55 @@ sub _hand_built {
 sub _admit_hand_built {
     my ($self, $statement) = @_;
     return if !_hand_built($statement) || $self->{_sqlite_query_unsafe};
-    my $sql = $statement->sql // '';
+    my $sql = _hand_built_text($statement->sql // '');
     my $refuse = sub {
         Selecto::Error->throw('query_rule_not_evaluable', "a hand-built statement on a read path must be one provable read: $_[0]",
             {reason => 'hand_built_not_a_read'});
     };
     (my $text = $sql) =~ s/[\s;]+\z//;
     $refuse->('it holds more than one statement') if index($text, ';') >= 0;
-    1 while $text =~ s{\A\s*(?:--[^\n]*(?:\n|\z)|/\*(?:[^*]|\*(?!/))*\*/)}{};
-    $text =~ s/\A[\s(]+//;
-    $refuse->('it does not begin with SELECT, WITH, VALUES or TABLE') unless $text =~ /\A(?:SELECT|WITH|VALUES|TABLE)\b/i;
+    $refuse->('it does not begin with SELECT, WITH, VALUES or TABLE') unless _hand_built_start($text) =~ /\A(?:SELECT|WITH|VALUES|TABLE)\b/i;
     my $reason = $self->_hand_built_refusal($sql);
     $refuse->($reason) if defined $reason;
     return;
 }
 
+# The text with its string literals blanked, so that a word in one is not taken for
+# SQL: but only where there is one way to read them. A comment, a backslash, a dollar
+# quote or a bracket could begin or end one differently for the server, and then the
+# text stands whole, words in literals and all: no lexer has to agree with the server.
+sub _hand_built_text {
+    my ($sql) = @_;
+    return $sql if $sql =~ m{/\*|--|\#|\\|\[|\$(?!\d)};
+    (my $text = $sql) =~ s/('[^']*')|("[^"]*"|`[^`]*`)/defined($1) ? "\x01" : $2/ge;
+    return index($text, q{'}) >= 0 ? $sql : $text;
+}
+
+# Past any comments and opening parentheses.
+sub _hand_built_start {
+    my ($text) = @_;
+    1 while $text =~ s{\A\s*(?:--[^\n]*(?:\n|\z)|\#[^\n]*(?:\n|\z)|/\*(?:[^*]|\*(?!/))*\*/)}{};
+    $text =~ s/\A[\s(]+//;
+    return $text;
+}
+
 # Dialect hook: why this text cannot be proved a read here (undef: it can).
 sub _hand_built_refusal { return undef; }
+
+# Where nothing can stop a write (a host's transaction on MySQL, MariaDB and DuckDB)
+# the text has to show none, and a hand-built read then runs as written. _admit_hand_built
+# leaves two ways for a statement to write there: one that begins WITH can end in a
+# write of its own, and any can take a sequence's next value. REPLACE(, INSERT( and
+# TRUNCATE( are functions. A function the host wrote is the host's, as a view's is.
+sub _refuse_hand_built_write {
+    my ($self, $statement) = @_;
+    return unless _hand_built($statement);
+    my $text = _hand_built_text($statement->sql) =~ s/\bFOR\s+UPDATE\b//gir;
+    my $writes = _hand_built_start($text) =~ /\AWITH\b/i && $text =~ /\b(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b(?!\s*\()/i;
+    Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement that may write cannot run inside a host transaction here',
+        {reason => 'hand_built_in_host_transaction'}) if $writes || $text =~ /\b(?:NEXTVAL|SETVAL)["`]?\s*\(|\bNEXT\s+VALUE\s+FOR\b/i;
+    return;
+}
 
 sub execute_query {
     my ($self, $statement) = @_;
@@ -3449,8 +3479,9 @@ sub _check_typed_insert_admission {
         $self->_savepoint_command(release => $savepoint) if $savepoint;
         1;
     };
-    die $self->normalize_error($@) unless $restored;
+    my $restore_error = $@;
     die $error unless $ok;
+    die $self->normalize_error($restore_error) unless $restored;
 }
 
 sub _typed_insert_admission_probe {
@@ -4180,6 +4211,7 @@ sub _bounded_write_command {
     if (!$restored) {
         eval { $budget->close } if $budget;
         $self->dbh->{private_selecto_query_budget_poisoned} = 1;
+        die $error unless $ok;
         Selecto::Error->throw('query_budget_restore_failed', 'bounded write could not restore its execution scope');
     }
     die $error unless $ok;
@@ -4276,19 +4308,38 @@ sub _own_transaction {
     eval { $self->_begin_transaction; 1 }
         or die $self->_transaction_control_error($@);
     my ($value, $error);
-    # The write unit this transaction owns (see _savepoint_transaction).
-    my $ok = eval { $value = $operation->(); 1 };
-    if ($ok) {
-        $ok = eval { $self->_commit_transaction; 1 };
-        $error = $self->_transaction_control_error($@) unless $ok;
-    } else {
-        $error = $@;
+    my $ok;
+    # (A host's alarm can die between these steps: the outer eval still ends the
+    # transaction, and its error stands.)
+    my $whole = eval {
+        # The write unit this transaction owns (see _savepoint_transaction).
+        $ok = eval { $value = $operation->(); 1 };
+        if ($ok) {
+            $ok = eval { $self->_commit_transaction; 1 };
+            $error = $self->_transaction_control_error($@) unless $ok;
+        } else {
+            $error = $@;
+        }
+        1;
+    };
+    unless ($whole) {
+        ($ok, $error) = (0, $error // $@);
     }
     if (!$ok) {
-        eval { $self->_rollback_transaction };
-        die $error;
+        die $error if eval { $self->_rollback_transaction($error); 1 };
+        die $self->_undo_failed($error);
     }
     return $value;
+}
+
+# What failed first stands, and a host's exception passes through as it came. That
+# it could not be undone is added to it: never dropped, and never in its place.
+sub _undo_failed {
+    my ($self, $error) = @_;
+    return $error unless blessed($error) && $error->isa('Selecto::Error');
+    my $dbh = $self->{dbh};
+    return Selecto::Error->new(code => $error->code, message => $error->message, details => {%{$error->details},
+        transaction_state => 'unknown', connection_closed => (eval { $dbh->{Active} } ? JSON::PP::false : JSON::PP::true)});
 }
 
 # Managed mode inside the host's open transaction: the write commits or
@@ -4309,14 +4360,34 @@ sub _savepoint_transaction {
         $error = $@;
     }
     if (!$ok) {
-        eval {
-            $self->_savepoint_command(rollback => $name);
-            $self->_savepoint_command(release => $name);
-        };
-        die $error;
+        die $self->_undo_savepoint($name, $error) ? $error : $self->_undo_failed($error);
     }
     return $value;
 }
+
+# A write reported failed must not be there for the host to commit. Its savepoint
+# is rolled back, with retries; if that cannot be done the connection is closed,
+# which ends the host's transaction, rather than left holding the write. A deadlock
+# victim's transaction has already gone, savepoint and all (see the dialect hook).
+# Returns whether the write is undone.
+sub _undo_savepoint {
+    my ($self, $name, $cause) = @_;
+    # (Rolled back to, the write is undone: a savepoint left behind holds nothing.)
+    return 1 if $self->_savepoint_gone($cause);
+    for my $attempt (1 .. 5) {
+        if (eval { $self->_savepoint_command(rollback => $name); 1 }) {
+            eval { $self->_savepoint_command(release => $name) };
+            return 1;
+        }
+        select(undef, undef, undef, 0.01);
+    }
+    my $dbh = $self->{dbh};
+    eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
+    return 0;
+}
+
+# Dialect hook: whether this failure has already ended the transaction.
+sub _savepoint_gone { return 0; }
 
 # The host's transaction API runs the write; it must call the work once,
 # inside a transaction. A write can be refused after its statement (an
@@ -4413,9 +4484,14 @@ sub _rollback_transaction {
     my ($self) = @_;
     # A COMMIT that failed (a deferred constraint) has already ended the
     # transaction and turned AutoCommit back on: nothing is left to roll back.
-    return if eval { $self->{dbh}{AutoCommit} } && !eval { $self->{dbh}{BegunWork} };
-    $self->{dbh}->rollback;
-    return;
+    my $dbh = $self->{dbh};
+    return if eval { $dbh->{AutoCommit} } && !eval { $dbh->{BegunWork} };
+    return if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->rollback; 1 };
+    # DBI turns AutoCommit back on after any rollback of begin_work, failed or not,
+    # and that can commit: a connection in this state is not used again.
+    eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
+    Selecto::Error->throw('transaction_state_unsafe', 'the write could not be rolled back: the connection was closed',
+        {state => 'unknown', reason => 'session_not_restored'});
 }
 
 # Dialect hook: the statement that creates (create), releases (release;

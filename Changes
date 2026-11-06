@@ -10,7 +10,23 @@ Unreleased
       A ROLLBACK or autocommit restore that fails, as KILL QUERY can make it, is
       retried, and if that fails the connection is closed, transaction_state_unsafe
       with reason session_not_restored, rather than left read only or with
-      autocommit off. A write that committed before that says committed => true.
+      autocommit off. Autocommit is never restored after a failed ROLLBACK: on
+      MariaDB that committed the refused work, and left later host writes to be
+      lost at close. DBI turns AutoCommit back on after any rollback of begin_work,
+      failed or not, and reports it as true. A write that committed before that
+      says committed => true. What failed first stands: if it could not be undone
+      its details add transaction_state unknown and connection_closed. A begin_work
+      that fails puts autocommit back or closes. A write whose RELEASE SAVEPOINT
+      fails in the host's transaction is rolled back to it, or the connection is
+      closed, so the host's COMMIT cannot store a write reported failed.
+      A read or write interrupted by something other than the database, a host's
+      alarm say, closes the connection, and any statement that fails that way is
+      checked: a die inside the driver, from an unsafe signal handler, leaves a reply
+      on the wire that the host's next statement would take for its own, so a
+      connection out of step is closed. The exception itself passes through
+      unchanged. Statement kills (1317) are query_canceled wherever they land,
+      deadline statements included; those no longer refuse query_budget_unavailable,
+      and a killed restore is tried again rather than poisoning the handle.
     - PostgreSQL: x::citext, x::public.citext and CAST(x AS citext) now type like
       CAST(x AS public.citext): the comparison takes the extension's operator and
       gives the database's answer. These were wrong or refused before.
@@ -34,14 +50,18 @@ Unreleased
       database has one. Move such writes to execute_write or to the host's own SQL.
       A hand-built statement given to execute_query or stream_query must be one
       statement beginning SELECT, WITH, VALUES or TABLE, on every adapter, or it
-      refuses, query_rule_not_evaluable with reason hand_built_not_a_read: the text
-      is checked as it stands, so a semicolon in a literal refuses too, as does
-      INTO, := or a /*! comment on MySQL and MariaDB. It then runs under the same
-      read-only rules, so it cannot write on its own or, on PostgreSQL, in the
-      host's transaction, and FOR UPDATE in one refuses. On MySQL, MariaDB and
-      DuckDB nothing can stop a write inside the host's transaction, so a hand-built
-      statement refuses there, reads included, reason
-      hand_built_in_host_transaction. Before this, all of these ran as written.
+      refuses, query_rule_not_evaluable with reason hand_built_not_a_read, as does
+      INTO, := or a /*! comment on MySQL and MariaDB. A word in a string literal does
+      not count where the text has one reading; where it has a comment, a backslash,
+      a dollar quote or a bracket the text stands whole, so a semicolon in a literal
+      there refuses too. It then runs under the same read-only rules, so it cannot
+      write on its own or, on PostgreSQL, in the host's transaction, and FOR UPDATE
+      in one refuses. Otherwise it runs exactly as written, with no qualification,
+      and the answer is the driver's. On MySQL, MariaDB and DuckDB nothing can stop a
+      write inside the host's transaction, so a statement beginning WITH that ends in
+      a write refuses there, as does any that takes a sequence's value, reason
+      hand_built_in_host_transaction. A read runs as written, and a function it calls
+      is the host's to undo. Before this, all of these ran as written.
       PostgreSQL: every read and stream is READ ONLY and ends in ROLLBACK or, in
       the host's transaction, in a rollback to its savepoint, and a bounded
       stream does so per fetch, so the host can write between fetches. So a

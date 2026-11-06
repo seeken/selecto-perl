@@ -45,6 +45,21 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             graph => sub { $_[0]->execute_graph(Selecto::Write::Graph->new(nodes => [{id => 'a', command => $update->(1, 'one')}, {id => 'b', command => $update->(2, 'one')}])) },
         );
         for my $type (0, 1, 2) {
+            # A read ends the same way, and the host's next write commits by itself.
+            {
+                my $label = "completion_type $type, read";
+                $admin->do($_) for 'DELETE FROM ctp_t', 'DELETE FROM ctp_log', q{INSERT INTO ctp_t VALUES (1, 't1', 'old'), (2, 't1', 'old')};
+                my $dbh = $connect->();
+                $dbh->do("SET SESSION completion_type = $type");
+                my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($name => (dbh => $dbh)))->with_scope(tenant => 't1');
+                ok(eval { $engine->all($engine->query->select('id')); 1 }, "$label: answered") or diag $@;
+                ok($dbh->{Active} && eval { $dbh->ping }, "$label: the connection stands");
+                is(($dbh->selectrow_array('SELECT @@autocommit'))[0], 1, "$label: autocommit is on");
+                ok(eval { $dbh->do('INSERT INTO ctp_log VALUES (1)'); 1 }, "$label: a host write runs") or diag $@;
+                is(($admin->selectrow_array('SELECT count(*) FROM ctp_log'))[0], 1, "$label: and another connection sees it");
+                $dbh->disconnect;
+                is(($admin->selectrow_array('SELECT count(*) FROM ctp_log'))[0], 1, "$label: and it survives close");
+            }
             for my $kind (sort keys %work) {
                 my $label = "completion_type $type, $kind";
                 $admin->do($_) for 'DELETE FROM ctp_t', 'DELETE FROM ctp_log', q{INSERT INTO ctp_t VALUES (1, 't1', 'old'), (2, 't1', 'old')};

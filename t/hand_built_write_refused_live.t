@@ -66,7 +66,10 @@ DELETE FROM hb_t}, q{(SELECT 1); DELETE FROM hb_t}, q{TRUNCATE hb_t}, q{SELECT 1
         }
     }
     for my $sql (q{SELECT id FROM hb_t}, q{WITH c AS (SELECT id FROM hb_t) SELECT * FROM c}, q{VALUES (1)}, q{TABLE hb_t}, q{(SELECT 1)}, q{/* c */ SELECT 1}, q{-- c
-SELECT 1}, q{SELECT 1;}) {
+SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; into' AS b}, q{SELECT note FROM hb_t WHERE note <> 'update; drop'},
+        q{SELECT $tag$;$tag$::text = $tag$;$tag$::text WHERE false}) {
+        # (A dollar quote is not one reading of the text: its semicolon refuses, below.)
+        next if $sql =~ /\$tag/;
         for my $host (0, 1) {
             my $dbh = TestPostgreSQL->connect;
             my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
@@ -76,7 +79,29 @@ SELECT 1}, q{SELECT 1;}) {
             $dbh->disconnect;
         }
     }
-    # A hand-built read in the host's transaction keeps its table's lock.
+    # Where the text has more than one reading, a word in a literal counts: a comment
+    # or a dollar quote could end it, for all this text knows.
+    for my $sql (q{SELECT $$;$$}, q{SELECT ';' /* c */}, q{SELECT E'\\'; DELETE FROM hb_t --'}, q{SELECT 1 /* ' */; DELETE FROM hb_t WHERE note = '1'}) {
+        my $dbh = TestPostgreSQL->connect;
+        is($outcome->(Selecto::PostgreSQL->new(dbh => $dbh), 'postgresql', $sql), 'refused', "refused as it stands: $sql");
+        is($state->(), $clean, 'and nothing written');
+        $dbh->disconnect;
+    }
+    # A hand-built read in the host's transaction keeps its table's lock, literals or not.
+    for my $sql ('SELECT id FROM public.hb_t WHERE id = 1', q{SELECT id FROM public.hb_t WHERE note <> 'update'}) {
+        my $dbh = TestPostgreSQL->connect;
+        my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
+        $dbh->begin_work;
+        is($outcome->($adapter, 'postgresql', $sql), 'answered', "a hand-built read: $sql");
+        $admin->do(q{SET lock_timeout = '150ms'});
+        my $altered = eval { $admin->do('ALTER TABLE hb_t ADD COLUMN extra INT'); 1 };
+        ok(!$altered, 'its table stays locked against DDL');
+        $admin->do('SET lock_timeout = 0');
+        $dbh->rollback;
+        $admin->do('ALTER TABLE hb_t DROP COLUMN extra') if $altered;
+        $dbh->disconnect;
+    }
+    # The same with a parameter.
     {
         my $dbh = TestPostgreSQL->connect;
         my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
@@ -108,14 +133,16 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             return $dbh;
         };
         my $admin = $connect->();
-        my @clean = ('DROP TABLE IF EXISTS hb_t, hb_new', 'DROP PROCEDURE IF EXISTS hb_p', 'DROP FUNCTION IF EXISTS hb_f');
-        $admin->do($_) for @clean, 'CREATE TABLE hb_t (id INT PRIMARY KEY, note VARCHAR(10)) ENGINE=InnoDB', q{INSERT INTO hb_t VALUES (1, 'a')},
+        my @clean = ('DROP TABLE IF EXISTS hb_t, hb_new', 'DROP PROCEDURE IF EXISTS hb_p', 'DROP FUNCTION IF EXISTS hb_f', ($name eq 'mariadb' ? 'DROP SEQUENCE IF EXISTS hb_s' : ()));
+        $admin->do($_) for @clean, ($name eq 'mariadb' ? 'CREATE SEQUENCE hb_s' : ()), 'CREATE TABLE hb_t (id INT PRIMARY KEY, note VARCHAR(10)) ENGINE=InnoDB', q{INSERT INTO hb_t VALUES (1, 'a')},
             q{CREATE PROCEDURE hb_p() MODIFIES SQL DATA INSERT INTO hb_t VALUES (90, 'proc')},
             q{CREATE FUNCTION hb_f() RETURNS INT DETERMINISTIC MODIFIES SQL DATA BEGIN INSERT INTO hb_t VALUES (91, 'fn'); RETURN 1; END};
-        my $state = sub { join '|', map { $_->[0] } @{$admin->selectall_arrayref(q{SELECT CONCAT(id, note) FROM hb_t ORDER BY id})} };
+        my $state = sub { join '|', (map { $_->[0] } @{$admin->selectall_arrayref(q{SELECT CONCAT(id, note) FROM hb_t ORDER BY id})}),
+            ($name eq 'mariadb' ? ($admin->selectrow_array('SELECT next_not_cached_value FROM hb_s'))[0] : ()) };
         my $clean = $state->();
         for my $sql (q{INSERT INTO hb_t VALUES (10, 'x')}, q{UPDATE hb_t SET note = 'x'}, q{DELETE FROM hb_t}, q{REPLACE INTO hb_t VALUES (1, 'x')},
-            q{WITH c AS (SELECT 1 AS id) DELETE hb_t FROM hb_t JOIN c ON c.id = hb_t.id}, q{SELECT 1 INTO @hb_x}, q{SELECT id FROM hb_t INTO OUTFILE '/tmp/hb_never'},
+            ($name eq 'mariadb' ? (q{SELECT NEXTVAL(hb_s)}, q{SELECT NEXT VALUE FOR hb_s}, q{SELECT SETVAL(hb_s, 50)}) : ()),
+            q{WITH c AS (SELECT 1 AS id) DELETE hb_t FROM hb_t JOIN c ON c.id = hb_t.id}, q{WITH c AS (SELECT 'x' AS note) UPDATE hb_t JOIN c SET hb_t.note = c.note}, q{SELECT 1 INTO @hb_x}, q{SELECT id FROM hb_t INTO OUTFILE '/tmp/hb_never'},
             q{SELECT @hb_x := 1}, q{SELECT 1 /*! INTO @hb_x */}, q{SELECT 1 /*M! INTO @hb_x */}, q{CALL hb_p()}, q{TRUNCATE hb_t}, q{CREATE TABLE hb_new (id INT)}, q{SELECT 1; DELETE FROM hb_t}, q{COMMIT},
             q{/* c */ DELETE FROM hb_t}, q{# c
 DELETE FROM hb_t}) {
@@ -135,9 +162,16 @@ DELETE FROM hb_t}) {
             my $adapter = Selecto->adapter($name => (dbh => $dbh));
             $dbh->begin_work if $host;
             my $result = $outcome->($adapter, $name, 'SELECT hb_f()');
-            $dbh->commit if $host;
+            $dbh->rollback if $host;
+            # (In the host's transaction it runs as written, as a view's does: the
+            # host's rollback undoes it.)
             is($state->(), $clean, ($host ? 'host transaction' : 'alone') . ': a function that writes wrote nothing') or diag $result;
-            is($outcome->($adapter, $name, 'SELECT id FROM hb_t'), 'answered', 'a plain read reads on its own') unless $host;
+            for my $sql ('SELECT id FROM hb_t', q{SELECT REPLACE(note, 'a', 'b') FROM hb_t}, q{SELECT INSERT(note, 1, 1, 'z') FROM hb_t}, q{SELECT TRUNCATE(1.55, 1)},
+                q{SELECT note FROM hb_t WHERE note <> 'delete; into := update'}, q{WITH c AS (SELECT 'update' AS a) SELECT a FROM c}) {
+                $dbh->begin_work if $host;
+                is($outcome->($adapter, $name, $sql), 'answered', ($host ? 'in a host transaction' : 'alone') . ": a read reads as written: $sql");
+                $dbh->rollback if $host;
+            }
             $dbh->disconnect;
         }
         $admin->do($_) for @clean;
@@ -153,7 +187,7 @@ subtest duckdb => sub {
     my $state = sub { join '|', map { $_->[0] } @{$dbh->selectall_arrayref(q{SELECT CAST(id AS VARCHAR) || note FROM hb_t ORDER BY id})} };
     my $clean = $state->();
     for my $sql (q{INSERT INTO hb_t VALUES (10, 'x')}, q{UPDATE hb_t SET note = 'x'}, q{DELETE FROM hb_t}, q{WITH c AS (SELECT 1) INSERT INTO hb_t VALUES (11, 'x')},
-        q{CREATE TABLE hb_new AS SELECT 1}, q{COPY hb_t TO '/tmp/hb_never.csv'}, q{SELECT nextval('hb_s')}, q{SELECT 1; DELETE FROM hb_t}, q{COMMIT}) {
+        q{CREATE TABLE hb_new AS SELECT 1}, q{COPY hb_t TO '/tmp/hb_never.csv'}, q{SELECT 1; DELETE FROM hb_t}, q{COMMIT}) {
         for my $mode ('alone', 'BEGIN', 'begin_work') {
             $dbh->do('BEGIN') if $mode eq 'BEGIN';
             $dbh->begin_work if $mode eq 'begin_work';
@@ -163,6 +197,21 @@ subtest duckdb => sub {
         }
     }
     is($outcome->($adapter, 'duckdb', 'SELECT id FROM hb_t'), 'answered', 'a plain read reads on its own');
+    is($outcome->($adapter, 'duckdb', q{SELECT nextval('hb_s')}), 'refused', 'nextval refuses on its own');
+    my $sequence = sub { ($dbh->selectrow_array('SELECT last_value FROM duckdb_sequences() WHERE sequence_name = ?', undef, 'hb_s'))[0] // 'unused' };
+    my $before = $sequence->();
+    for my $mode ('BEGIN', 'begin_work') {
+        for my $sql ('SELECT id FROM hb_t', q{SELECT note FROM hb_t WHERE note <> 'delete; update'}, q{SELECT replace(note, 'a', 'b') FROM hb_t}) {
+            $mode eq 'BEGIN' ? $dbh->do('BEGIN') : $dbh->begin_work;
+            is($outcome->($adapter, 'duckdb', $sql), 'answered', "$mode: a read reads as written: $sql");
+            # (The driver's rollback leaves a transaction open after begin_work: a read wrote nothing to keep.)
+            $mode eq 'BEGIN' ? $dbh->do('ROLLBACK') : $dbh->commit;
+        }
+        $mode eq 'BEGIN' ? $dbh->do('BEGIN') : $dbh->begin_work;
+        is($outcome->($adapter, 'duckdb', q{SELECT nextval('hb_s')}), 'refused', "$mode: nextval refuses");
+        $mode eq 'BEGIN' ? $dbh->do('COMMIT') : $dbh->commit;
+        is($sequence->(), $before, "$mode: and the sequence stands");
+    }
     $dbh->disconnect;
 };
 

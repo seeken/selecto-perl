@@ -10,6 +10,7 @@ use Selecto;
 use Selecto::Engine;
 use Selecto::Domain;
 use Selecto::Expression;
+use Selecto::Write ();
 use Selecto::PostgreSQL ();
 use lib 't/lib';
 use TestPostgreSQL ();
@@ -22,7 +23,8 @@ my $domain = sub {
     my ($table, %options) = @_;
     Selecto::Domain->parse({schema_version => 1, name => "D$table", source => {source_table => $table, primary_key => 'id',
         ($options{untenanted} ? () : (tenant_field => 'org')), fields => [qw(id org oncall)],
-        columns => {id => {type => 'integer'}, org => {type => 'string'}, oncall => {type => 'integer'}}, associations => {}}, schemas => {}, joins => {}});
+        columns => {id => {type => 'integer'}, org => {type => 'string'}, oncall => {type => 'integer'}}, associations => {}}, schemas => {}, joins => {},
+        writes => {scope => {tenant => {field => 'org'}}, operations => {update => {enabled => 1, bulk => 1, expected_cardinality => 'many'}}, fields => {org => {updatable => 1}}}});
 };
 my $state = sub { my ($error) = @_; return blessed($error) && ref($error->details) eq 'HASH' ? ($error->details->{sqlstate} // '') : '' };
 my $category = sub { my ($error) = @_; return blessed($error) && ref($error->details) eq 'HASH' ? ($error->details->{category} // '') : '' };
@@ -30,7 +32,7 @@ my $category = sub { my ($error) = @_; return blessed($error) && ref($error->det
 subtest postgresql => sub {
     plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
     plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
-    my @clean = ('DROP VIEW IF EXISTS r66_slow', 'DROP TABLE IF EXISTS r66_doctors, r66_other');
+    my @clean = ('DROP VIEW IF EXISTS r66_slow, r66_doctors_v, r66_doctors_w', 'DROP TABLE IF EXISTS r66_doctors, r66_other');
     my $admin = TestPostgreSQL->connect;
     $admin->do('SET client_min_messages TO warning');
     $admin->do($_) for @clean, 'CREATE TABLE r66_doctors (id INT PRIMARY KEY, org TEXT NOT NULL, oncall INT NOT NULL)', 'CREATE TABLE r66_other (id INT)',
@@ -93,6 +95,24 @@ subtest postgresql => sub {
         $d->do('ROLLBACK');
         $admin->do('ALTER TABLE r66_doctors DROP COLUMN extra') if $altered;
         $d->disconnect;
+    }
+
+    # R69: a view's read holds the view and the table under it.
+    {
+        $admin->do('CREATE VIEW r66_doctors_v AS SELECT id, org, oncall FROM public.r66_doctors');
+        my ($v, $ev) = $open->('r66_doctors_v');
+        $v->begin_work;
+        $ev->all($ev->query->select('id'));
+        $admin->do(q{SET lock_timeout = '150ms'});
+        for my $ddl ('ALTER TABLE r66_doctors ADD COLUMN extra INT', 'ALTER VIEW r66_doctors_v RENAME TO r66_doctors_w') {
+            my $done = eval { $admin->do($ddl); 1 };
+            ok(!$done, "a read of a view holds against: $ddl");
+        }
+        $admin->do('SET lock_timeout = 0');
+        $v->rollback;
+        $v->disconnect;
+        $admin->do('DROP VIEW IF EXISTS r66_doctors_v, r66_doctors_w');
+        $admin->do('ALTER TABLE r66_doctors DROP COLUMN IF EXISTS extra');
     }
 
     # A relation that cannot be held is the read's to report, and costs the host nothing.
@@ -251,11 +271,17 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
         # (s0 is the alias of a compiled read's root, which a host must lock too: so
         # under FLUSH TABLES t, which cannot name it, the read refuses, as it did.)
         for my $lock ('LOCK TABLES r66_doctors READ, r66_doctors AS s0 READ', 'LOCK TABLES r66_doctors WRITE, r66_doctors AS s0 WRITE',
-            'FLUSH TABLES r66_doctors WITH READ LOCK', 'FLUSH TABLES WITH READ LOCK') {
+            'FLUSH TABLES r66_doctors WITH READ LOCK', ($ENV{SELECTO_PERL_TEST_SERVER_LOCK} ? 'FLUSH TABLES WITH READ LOCK' : ())) {
             $reset->();
             my ($d, $ed) = $open->();
             $admin->do('SET SESSION lock_wait_timeout = 1');
-            $d->do($lock);
+            # (The server-wide form stops every session on the server: only on request.)
+            $d->do('SET SESSION lock_wait_timeout = 2');
+            unless (eval { $d->do($lock); 1 }) {
+                note "$lock: could not be had: $@";
+                $d->disconnect;
+                next;
+            }
             ok(eval { $read->($ed); 1 } || $lock =~ /\AFLUSH TABLES r66/, "$lock: the read runs") or diag $@;
             ok(!eval { $admin->do('UPDATE r66_doctors SET org = org, oncall = oncall + 1 WHERE id = 1'); 1 }, "$lock: holds after the read");
             is(($d->selectrow_array('SELECT @@autocommit'))[0], 1, "$lock: autocommit is back");
@@ -307,6 +333,35 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             is(($dbh->selectrow_array('SELECT count(*) FROM r66_log WHERE id = 8'))[0], 1, 'and leaves the host its pending write');
             $dbh->rollback;
             $dbh->disconnect;
+        }
+
+        # begin_work sends SET autocommit = 0, not START TRANSACTION: raw DBI keeps a host's
+        # LOCK TABLES across it, and so must Selecto's own write.
+        {
+            $reset->();
+            my ($d) = $open->();
+            $d->do('LOCK TABLES r66_doctors WRITE');
+            $d->begin_work;
+            $d->do('UPDATE r66_doctors SET oncall = oncall WHERE id = 1');
+            $d->commit;
+            $admin->do('SET SESSION lock_wait_timeout = 1');
+            ok(!eval { $admin->do('UPDATE r66_doctors SET oncall = 7 WHERE id = 1'); 1 }, 'raw DBI: begin_work and commit keep LOCK TABLES');
+            $d->do('UNLOCK TABLES');
+            $d->disconnect;
+            $admin->do('SET SESSION lock_wait_timeout = 10');
+        }
+        # Selecto's own write under LOCK TABLES: its transaction does not release them.
+        {
+            $reset->();
+            my ($d, $ed) = $open->();
+            $d->do('LOCK TABLES r66_doctors WRITE, r66_doctors AS s0 WRITE');
+            ok(eval { $ed->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r66_doctors', assignments => {org => 't1'},
+                predicate => $x->eq('id', 1), expected_count => undef)); 1 }, 'a governed write under LOCK TABLES runs') or diag $@;
+            $admin->do('SET SESSION lock_wait_timeout = 1');
+            ok(!eval { $admin->do('UPDATE r66_doctors SET oncall = 5 WHERE id = 1'); 1 }, 'and the lock holds after it');
+            $d->do('UNLOCK TABLES');
+            $d->disconnect;
+            $admin->do('SET SESSION lock_wait_timeout = 10');
         }
 
         # A one-shot SET TRANSACTION is the read's, as it was: the next one is the session's.

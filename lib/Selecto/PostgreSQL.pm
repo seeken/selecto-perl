@@ -222,8 +222,8 @@ sub _begin_transaction {
     my $ok = eval { $self->dbh->do('SET TRANSACTION ISOLATION LEVEL READ COMMITTED'); 1 };
     unless ($ok) {
         my $error = $@;
-        eval { $self->dbh->rollback };
-        die $error;
+        die $error if eval { $self->_rollback_transaction; 1 };
+        die $self->_undo_failed($error);
     }
     return;
 }
@@ -698,7 +698,9 @@ sub _rollup_sort_fix_enabled {
     my $version = eval { ($self->dbh->selectrow_array('SHOW server_version_num'))[0] };
     my $major = defined($version) && "$version" =~ /\A\d+\z/
         ? int($version / 10_000) : undef;
-    return $self->{_rollup_sort_fix_enabled} = defined($major) && $major >= 18 ? 0 : 1;
+    # (A failed read is no answer to keep.)
+    return 1 unless defined $major;
+    return $self->{_rollup_sort_fix_enabled} = $major >= 18 ? 0 : 1;
 }
 
 sub write_capabilities {
@@ -1947,7 +1949,8 @@ sub _guarded_read {
     # The after-snapshot and the host's settings again, in one round trip:
     # the snapshot is read before the restore runs.
     my $after = $ok && $before ? eval { $self->_pg_session_state($pin, read => 1) } : undef;
-    my $changed = $ok && $before && !($after && $after->{snapshot} eq $before->{snapshot});
+    my $unknown = $ok && $before && !$after ? ($@ || "the session's state could not be read") : undef;
+    my $changed = $ok && $before && !$unknown && $after->{snapshot} ne $before->{snapshot};
     my $finished = eval {
         if ($savepoint) {
             $self->_savepoint_command(rollback => $savepoint) if !$ok || $changed || !$locks;
@@ -1957,6 +1960,8 @@ sub _guarded_read {
         }
         1;
     };
+    # (A check that could not be made is not a change: it stands as itself.)
+    die $self->_transaction_control_error($unknown) if $unknown;
     die $self->_transaction_control_error($@) if !$finished && $ok && !$changed;
     _session_changed() if $changed;
     die $error unless $ok;
@@ -1976,7 +1981,7 @@ sub _pg_hold_relations {
     my @sql = ("SAVEPOINT $savepoint", (map { "SELECT 1 FROM $_ LIMIT 0" } @{$relations // []}), 'SELECT 1');
     # A hand-built statement names none: planning it takes what it would lock,
     # and runs nothing. (Not one that says it writes: it will refuse, holding nothing.)
-    my $plan = _pg_hand_built($source) && $source->sql !~ /\b(?:INSERT|UPDATE|DELETE|MERGE)\b/i ? 'EXPLAIN (COSTS OFF) ' . $source->sql : undef;
+    my $plan = _pg_hand_built($source) && Selecto::SQL::_hand_built_text($source->sql) !~ /\b(?:INSERT|UPDATE|DELETE|MERGE)\b(?!\s*\()/i ? 'EXPLAIN (COSTS OFF) ' . $source->sql : undef;
     my $held = eval {
         local $dbh->{PrintError} = 0;
         local $dbh->{RaiseError} = 1;
