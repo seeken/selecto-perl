@@ -66,6 +66,7 @@ for my $case ([['SYSTEM', 'UTC'], 'ok'], [['SYSTEM', '+00:00'], 'ok'], [['Etc/UT
     for my $name (qw(mysql mariadb)) {
         my $session = SessionDBH->new({rows => [[1]]});
         $session->{zone} = $zone;
+        $session->{AutoCommit} = 1;
         my $adapter = Selecto->adapter($name => (dbh => $session));
         my $outcome = eval {
             $adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => [], columns => ['x']));

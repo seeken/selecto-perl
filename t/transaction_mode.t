@@ -322,7 +322,7 @@ subtest 'MySQL and MariaDB' => sub {
 
         my $idle = RecordingDBH->new(session => [@session, 1, 0]);
         ok(!$write->(Selecto->adapter($name => (dbh => $idle))), "$name write succeeds");
-        is_deeply($idle->events, ['SESSION', 'SET TRANSACTION READ WRITE', 'begin_work', 'write', 'STATE', 'commit'],
+        is_deeply($idle->events, ['SESSION', 'SET TRANSACTION READ WRITE', 'begin_work', 'write', 'STATE', 'COMMIT AND NO CHAIN NO RELEASE'],
             "$name begins and commits on an idle connection, comparing the session before it commits");
         my $read_only = RecordingDBH->new(session => [@session, 1, 1]);
         ok(!$write->(Selecto->adapter($name => (dbh => $read_only))), "$name write on a read-only session default");

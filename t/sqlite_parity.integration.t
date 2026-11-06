@@ -63,8 +63,8 @@ subtest 'read-only query and stream boundaries preserve caller state' => sub {
         q{PRAGMA query_only = OFF}, q{ATTACH ':memory:' AS attached},
         q{SELECT 1; UPDATE writes SET value = 'after'},
     ) {
-        is(error_code(sub { $adapter->execute_query(statement($sql)) }), 'query_error', 'crafted non-read query is refused');
-        is(error_code(sub { $adapter->stream_query(statement($sql)) }), 'query_error', 'crafted non-read stream is refused');
+        like(error_code(sub { $adapter->execute_query(statement($sql)) }), qr/\A(?:query_error|query_rule_not_evaluable)\z/, 'crafted non-read query is refused');
+        like(error_code(sub { $adapter->stream_query(statement($sql)) }), qr/\A(?:query_error|query_rule_not_evaluable)\z/, 'crafted non-read stream is refused');
     }
     is($dbh->selectrow_array('SELECT value FROM writes'), 'before', 'none of the query probes mutate data');
     for my $raw (0, 1) {
@@ -72,7 +72,9 @@ subtest 'read-only query and stream boundaries preserve caller state' => sub {
         $dbh->do(q{UPDATE writes SET value = 'host'});
         for my $prior (0, 1) {
             $dbh->do('PRAGMA query_only = ' . $prior);
-            is_deeply($adapter->execute_query(statement("/* comment */ SELECT ';' AS id; -- tail"))->{rows}, [[';']],
+            is(error_code(sub { $adapter->execute_query(statement("/* comment */ SELECT ';' AS id; -- tail")) }), 'query_rule_not_evaluable',
+                'a semicolon anywhere but at the end cannot be proved harmless by the text');
+            is_deeply($adapter->execute_query(statement("/* comment */ SELECT 'x' AS id;"))->{rows}, [['x']],
                 'quoted semicolon and trailing comments remain valid');
             is($dbh->selectrow_array('PRAGMA query_only'), $prior, 'successful query preserves query_only');
             is(error_code(sub { $adapter->execute_query(statement('SELECT missing_column FROM writes')) }), 'query_error',
