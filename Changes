@@ -36,7 +36,9 @@ Unreleased
       MySQL and MariaDB: a read on its own is READ ONLY, opened with autocommit
       off so that it keeps the host's LOCK TABLES and FLUSH TABLES WITH READ LOCK,
       and ends in ROLLBACK. A writing view refuses, on non-transactional tables
-      too. In the host's transaction the read runs as written: a write is
+      too. Its ROLLBACK is AND NO CHAIN NO RELEASE, as a bare one obeys
+      completion_type. In the host's transaction, or on a handle with autocommit
+      off, the read runs as written: no savepoint, no read-only mode. A write is
       neither refused nor undone, and is the host's to commit or roll back. A
       savepoint cannot be read only, and rolling back to one would cost the host
       its snapshot, shared locks and metadata locks, while a write to a
