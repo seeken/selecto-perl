@@ -2985,6 +2985,15 @@ row trigger's effects on other rows. Selecto keeps no session variable of
 its own to prove ownership; a bounded stream identifies its own transaction
 by its virtual transaction id.
 
+=head2 What the host must provide
+
+These checks protect Selecto's own SQL. They do not contain code already running
+as the application's role. No untrusted role may have C<CREATE> on a schema the
+application reaches, and the host's triggers, views and row-security policies
+must schema-qualify the functions they call. Planted code reached through them
+can change the session or swap a stream's cursor between statements: Selecto
+catches some of that, and does not promise to.
+
 =head1 SEE ALSO
 
 L<Selecto>, L<Selecto::SQL>, L<Selecto::Adapter>, L<DBD::Pg>
