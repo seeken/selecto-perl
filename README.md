@@ -218,13 +218,6 @@ functions and checks session state only when it executes a statement, so the
 raw text resolves through the session's `search_path`. Run a compiled statement
 with `$engine->adapter->execute_query($statement)`.
 
-The PostgreSQL adapter's opt-in `statement_cache` keeps server-side named
-statements. Session code can replace a named statement with `DEALLOCATE` and
-`PREPARE`, and the replacement persists on the connection, so a planted function
-reached from a view could change what a tenant's read returns. Leave it off
-where untrusted roles can reach code that runs in the session. It is off by
-default, and Selecto's own guard statements never use it.
-
 Filters can also be written as a portable array AST, which is how they
 usually arrive from a client:
 
@@ -586,37 +579,6 @@ always ISO, whatever the session `DateStyle`, and the rest is decoded in
 Perl. The Perl decode measured faster at every result size, so the SQL path
 is off by default. See `perldoc Selecto::PostgreSQL` (RESULT VALUES). The
 other adapters always return canonical values.
-
-#### PostgreSQL statement cache (opt-in)
-
-By default every query and write prepares a new statement handle, which
-DBD::Pg sends unnamed, so PostgreSQL parses and plans each call. With
-`statement_cache => 1` the PostgreSQL adapter reuses one handle per distinct
-SQL text on each connection: DBD::Pg prepares it once as a named statement
-and later calls send only the bound values.
-
-```perl
-my $adapter = Selecto->adapter(postgresql => (
-    dbh => $dbh,
-    statement_cache      => 1,     # default 0 (off)
-    statement_cache_size => 256,   # handles kept per connection (default)
-));
-```
-
-- The cache belongs to the DBI handle (it lives in its `CachedKids`, apart
-  from your own `prepare_cached` entries) and is freed with it. It is keyed
-  by the SQL text only; values, tenant ids included, are always bound.
-- At most `statement_cache_size` handles per connection, least recently
-  used first out; an evicted statement is deallocated.
-- Results, types and errors (including `details.sqlstate`) are the same as
-  with the cache off. A statement the server lost (26000) or whose result
-  type changed after DDL (0A000) is prepared again once outside a
-  transaction; inside one the error stands, as it has aborted it. If you run
-  `DISCARD ALL` or `DEALLOCATE ALL` yourself, call
-  `Selecto::PostgreSQL::StatementCache->forget($dbh)`.
-- Leave it off behind a transaction-mode pooler such as PgBouncer before
-  1.21: named statements must reach the server connection that prepared
-  them. That is why it is opt-in.
 
 ### Security checklist
 
