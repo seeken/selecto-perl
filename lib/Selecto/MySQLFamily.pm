@@ -2884,10 +2884,10 @@ sub execute_query {
 
 # R55: nothing a read reaches outlives it. On its own the read is a READ ONLY
 # transaction that ends in ROLLBACK: a stored function that writes fails with
-# SQLSTATE 25006. MySQL cannot make an open transaction read only, so inside
-# the host's the read runs in a savepoint and is rolled back to it, which is
-# all that can be undone: a write to a non-transactional table stays. The host's
-# work is never touched.
+# SQLSTATE 25006. A savepoint cannot be read only, so inside the host's
+# transaction the write is undone, not refused: the read runs in a savepoint and
+# is rolled back to it. A write to a non-transactional table cannot be undone and
+# stays. The host's work is never touched.
 sub _read_transaction {
     my ($self, $work) = @_;
     my $dbh = $self->{dbh};

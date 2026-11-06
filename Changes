@@ -29,9 +29,10 @@ Unreleased
       for_update or for_share read cannot be read only: it ends the same way on
       its own, and in the host's transaction keeps its work and locks.
       MySQL and MariaDB: a read on its own is START TRANSACTION READ ONLY and
-      ROLLBACK. An open transaction cannot be made read only there, so in the
-      host's transaction the write is not refused: it runs in a savepoint that
-      is rolled back, and a write to a non-transactional table stays.
+      ROLLBACK, and a write refuses. A savepoint cannot be read only there, so
+      in the host's transaction the write is undone, not refused: the read runs
+      in a savepoint and is rolled back to it, and returns its rows. A write to a
+      non-transactional table, such as MyISAM, cannot be undone and stays.
       DuckDB: a read on its own is BEGIN TRANSACTION READ ONLY and ROLLBACK;
       inside an open transaction it runs as written, as there are no savepoints
       (only a sequence can change there, with no triggers or procedures).
