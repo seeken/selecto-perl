@@ -26,7 +26,10 @@ sub new {
     # Refuses a pending result, an aborted transaction or an unknown state
     # before anything is sent.
     my $scope = $adapter->_read_guard_scope;
-    my $name = 'selecto_stream_' . $$ . '_' . ++$SERIAL;
+    # Chosen here and declared explicitly, so the cursor is identified by this
+    # name and never by searching pg_cursors. Not guessable ahead of time; one
+    # that is pre-declared fails the DECLARE, and the stream does not open.
+    my $name = Selecto::SQL::_savepoint_name('selecto_stream_' . $$ . '_' . ++$SERIAL);
     my $fetch_size = int($args{fetch_size} // 1);
     my $self = bless {adapter => $adapter, dbh => $dbh, name => $name,
         columns => $args{statement}->columns, closed => 0, buffer => [],
