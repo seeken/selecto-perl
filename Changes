@@ -1,6 +1,9 @@
 Revision history for Selecto
 
 Unreleased
+    - PostgreSQL: x::citext, x::public.citext and CAST(x AS citext) now type like
+      CAST(x AS public.citext): the comparison takes the extension's operator and
+      gives the database's answer. These were wrong or refused before.
     - PostgreSQL: new adapter attribute schemas, the schemas the host's relations
       live in. Root, reference guard, joined relation, column catalog and
       post-image all resolve there and nowhere else, and they come first after

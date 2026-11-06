@@ -528,7 +528,7 @@ sub _atom {
         # CAST($n AS "public"."citext")).
         if ($up eq 'CAST' && ref($state->{columns}{casts}) eq 'HASH' && $inner =~ /\bAS\s+(\S+)\s*\z/si) {
             my @parts = map { _unquote($_->[1]) } grep { $_->[0] =~ /\A(?:id|qid)\z/ } @{tokenize($1)};
-            my $cast = @parts == 2 ? $state->{columns}{casts}{"$parts[0].$parts[1]"} : undef;
+            my $cast = @parts <= 2 ? $state->{columns}{casts}{join '.', @parts} : undef;
             ($entry, $known) = ($cast, 0) if ref($cast) eq 'HASH' && $cast->{"\0type"};
         }
     } elsif ($type eq 'punct' && $text eq '(') {
@@ -741,6 +741,7 @@ sub _postfix {
             $$pos++;
             while (_peek_punct($tokens, $$pos, '.')) { push @type, $tokens->[$$pos + 1][1]; $$pos += 2 }
             my $cast = join '.', @type;
+            my $named = $cast;
             if (_peek_punct($tokens, $$pos, '(')) {
                 $$pos++;
                 my @args;
@@ -752,6 +753,11 @@ sub _postfix {
             $sql .= "::$cast";
             ($column, $entry) = (undef, undef);
             $known = _string_type($cast) ? 'string' : 1;
+            # The same cast as CAST(x AS type) above: an extension's type has its
+            # operators.
+            my $target = $cast eq $named && ref($state->{columns}{casts}) eq 'HASH'
+                ? $state->{columns}{casts}{join '.', map { _unquote($_) } @type} : undef;
+            ($entry, $known) = ($target, 0) if ref($target) eq 'HASH' && $target->{"\0type"};
         } elsif ($t->[0] eq 'punct' && $t->[1] eq '[') {
             $$pos++;
             my $inner = _sequence($state, $tokens, $pos, ']');
@@ -1593,8 +1599,9 @@ sub _common_entry {
     if (@extension || @unknown) {
         my $soft = !grep({ !$_->{"\0strcat"} } @extension) && !grep { !$_->{"\0soft"} } @unknown;
         return {"\0string" => 1} if $soft && @rest && !@plain;
+        my ($entry) = (@extension, map { $_->{"\0softentry"} // () } @unknown);
         return {"\0unknown" => 1, "\0soft" => $soft, "\0over" => @extension ? 1 : scalar(grep { $_->{"\0over"} } @unknown),
-            "\0softentry" => $extension[0] // (map { $_->{"\0softentry"} // () } @unknown)[0]};
+            "\0softentry" => $entry};
     }
     return @plain ? {} : {"\0string" => 1};
 }
