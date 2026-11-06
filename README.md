@@ -218,6 +218,13 @@ functions and checks session state only when it executes a statement, so the
 raw text resolves through the session's `search_path`. Run a compiled statement
 with `$engine->adapter->execute_query($statement)`.
 
+The PostgreSQL adapter's opt-in `statement_cache` keeps server-side named
+statements. Session code can replace a named statement with `DEALLOCATE` and
+`PREPARE`, and the replacement persists on the connection, so a planted function
+reached from a view could change what a tenant's read returns. Leave it off
+where untrusted roles can reach code that runs in the session. It is off by
+default, and Selecto's own guard statements never use it.
+
 Filters can also be written as a portable array AST, which is how they
 usually arrive from a client:
 

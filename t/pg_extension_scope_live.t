@@ -245,8 +245,10 @@ SKIP: {
         is($outcome->(sub { $ids->($host, $host->query->select('id')) }), "applied $native_ids", 'and as a host required predicate');
     }
     my $coalesce = $engine->($computed->with_required_predicate($x->ne('code2', 'abc')), tenant => 't1');
-    is($outcome->(sub { $ids->($coalesce, $coalesce->query->select('id')) }), 'query_rule_not_evaluable/operand_type_unknown',
-        'a required <> on COALESCE over a citext column is refused, not compared as text');
+    # citext beside a CAST AS TEXT literal is text, PostgreSQL's common type.
+    my $coalesce_native = join ',', @{$admin->selectcol_arrayref(q{SELECT id FROM r49_hc WHERE org = 't1' AND COALESCE(code, CAST('zz' AS TEXT)) <> 'abc' ORDER BY id})};
+    is($outcome->(sub { $ids->($coalesce, $coalesce->query->select('id')) }), "applied $coalesce_native",
+        'a required <> on COALESCE of citext and a literal compares as text, as natively');
 
     $admin->do($_) for 'DROP TABLE r49_hr, r49_hm, r49_hc';
     $admin->do($_) for 'DROP TABLE r49_deep16, r49_deep17, r49_it, r49_acc, r49_lk', 'DROP DOMAIN r49_d1 CASCADE';
