@@ -53,6 +53,15 @@ never part of the SQL text; they are carried separately in C<params> in
 placeholder order. Adapters return statements from C<compile> and accept
 them in C<execute_query> and C<stream_query>.
 
+B<The SQL text is for looking at, not for running.> On PostgreSQL the adapter
+writes operators and functions to their schemas, pins the session and checks
+its state only when it executes a statement, so C<< $dbh->prepare($statement->sql) >>
+resolves every operator through the session: a role with CREATE on a schema on
+the search path can plant one, and a tenant's predicate is then theirs. Run a
+statement with C<execute_query> or C<stream_query> (or
+L<Selecto::Engine/all>, L<Selecto::Engine/stream>), including inside a
+read-only transaction of your own.
+
 =head1 METHODS
 
 =head2 new

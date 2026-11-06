@@ -1,6 +1,8 @@
 Revision history for Selecto
 
 Unreleased
+    - Documented that the SQL text of compile and preview_write is for
+      inspection and not safe to run directly (R52).
     - PostgreSQL: a function named like an SQL keyword is qualified or refused
       (R60): left, right, mode, like and the comma forms of substring and
       overlay are written pg_catalog.name(...); delete, last, key, update and

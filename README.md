@@ -212,6 +212,12 @@ print $statement->sql, "\n";
 print join(', ', @{$statement->params}), "\n";   # the bound values
 ```
 
+That text is for looking at. Don't send `compile` or `preview_write` output to
+the database yourself: on PostgreSQL the adapter qualifies operators and
+functions and checks session state only when it executes a statement, so the
+raw text resolves through the session's `search_path`. Run a compiled statement
+with `$engine->adapter->execute_query($statement)`.
+
 Filters can also be written as a portable array AST, which is how they
 usually arrive from a client:
 
