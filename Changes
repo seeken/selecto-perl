@@ -29,20 +29,28 @@ Unreleased
       with details.category query_canceled, as PostgreSQL's is.
     - Reads no longer write (R55, limited by R66). What newly refuses: a read
       through a view or function that writes, such as a view using nextval or an
-      audit function that inserts, and a hand-built statement that writes passed
-      to execute_query or stream_query, on the connections below. It fails
-      query_error with details.category read_only_transaction, SQLSTATE 25006
-      where the database has one. Move such writes to execute_write or to the
-      host's own SQL.
+      audit function that inserts, on the connections below. It fails query_error
+      with details.category read_only_transaction, SQLSTATE 25006 where the
+      database has one. Move such writes to execute_write or to the host's own SQL.
+      A hand-built statement given to execute_query or stream_query must be one
+      statement beginning SELECT, WITH, VALUES or TABLE, on every adapter, or it
+      refuses, query_rule_not_evaluable with reason hand_built_not_a_read: the text
+      is checked as it stands, so a semicolon in a literal refuses too, as does
+      INTO, := or a /*! comment on MySQL and MariaDB. It then runs under the same
+      read-only rules, so it cannot write on its own or, on PostgreSQL, in the
+      host's transaction, and FOR UPDATE in one refuses. On MySQL, MariaDB and
+      DuckDB nothing can stop a write inside the host's transaction, so a hand-built
+      statement refuses there, reads included, reason
+      hand_built_in_host_transaction. Before this, all of these ran as written.
       PostgreSQL: every read and stream is READ ONLY and ends in ROLLBACK or, in
       the host's transaction, in a rollback to its savepoint, and a bounded
       stream does so per fetch, so the host can write between fetches. So a
-      writing view refuses in a host transaction too. Two exceptions run as
+      writing view refuses in a host transaction too. One exception runs as
       written: a for_update or for_share read, which cannot be read only and
-      keeps its locks, and a hand-built statement in the host's transaction.
-      The host loses nothing: a read in its transaction first takes the snapshot
-      and the table locks of the relations it names, so SERIALIZABLE, REPEATABLE
-      READ and DDL protection hold. That is one more round trip there.
+      keeps its locks. The host loses nothing: a read in its transaction first
+      takes the snapshot and the table locks of its relations, or for a hand-built
+      statement those planning it takes, so SERIALIZABLE, REPEATABLE READ and DDL
+      protection hold. That is one more round trip there.
       MySQL and MariaDB: a read on its own is READ ONLY, opened with autocommit
       off so that it keeps the host's LOCK TABLES and FLUSH TABLES WITH READ LOCK,
       and ends in ROLLBACK. A writing view refuses, on non-transactional tables
