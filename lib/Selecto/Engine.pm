@@ -3511,7 +3511,10 @@ filter/function policy metadata or establish native catalog authority.
 
 =head2 compile
 
-Returns the L<Selecto::Statement> the adapter would execute for a query.
+Returns the L<Selecto::Statement> the adapter would execute for a query. Its
+SQL is for inspection: do not send it to the database yourself, see
+L<Selecto::Statement/DESCRIPTION>. Execute the statement through
+C<< $engine->adapter->execute_query >>, or use L</all> or L</stream>.
 
 =head2 projection_sum
 
@@ -3562,7 +3565,9 @@ execution validates again.
 =head2 preview_write
 
 Validates the command and returns C<< {sql => $sql, params => \@params} >>
-without executing anything.
+without executing anything. The SQL is for inspection only: it is not safe to
+run. Its operators are unqualified and none of the write guards, session
+checks or post-image checks of L</execute_write> apply to it.
 
 Every governed upsert requires a nonempty, duplicate-free C<conflict_target>
 that exactly matches one ordered entry in
