@@ -2165,10 +2165,16 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     WHERE NOT c.arr AND ty.typcategory OPERATOR(pg_catalog.=) 'S'
       AND ty.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)
     UNION ALL
-    SELECT 'xdom', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
+    SELECT 'xdom', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), CAST(o.oprname AS pg_catalog.text),
+      pg_catalog.format_type(ty.oid, NULL)
     FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
     JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
       AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'
+    LEFT JOIN (c b JOIN pg_catalog.pg_type bt ON bt.oid OPERATOR(pg_catalog.=) b.oid AND bt.typtype OPERATOR(pg_catalog.<>) 'd'
+        AND bt.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)
+      JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) bt.oid AND o.oprright OPERATOR(pg_catalog.=) bt.oid
+        AND o.oprnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace))
+      ON b.rel OPERATOR(pg_catalog.=) c.rel AND b.att OPERATOR(pg_catalog.=) c.att AND NOT b.arr
     WHERE NOT c.arr
     UNION ALL
     SELECT 'xop', CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
@@ -2220,7 +2226,10 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
           OR (ot.typtype OPERATOR(pg_catalog.=) 'c' AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
             WHERE ca.attrelid OPERATOR(pg_catalog.=) ot.typrelid AND ca.attnum OPERATOR(pg_catalog.>) 0 AND NOT ca.attisdropped
               AND ca.atttypid OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x))))))
-        THEN 'unknown' ELSE 'known' END
+        THEN 'unknown'
+        WHEN pg_catalog.bool_and(NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(f.outs) AS o(t)
+          WHERE o.t OPERATOR(pg_catalog.<>) ALL (CAST('{pg_catalog.text,pg_catalog.varchar,pg_catalog.bpchar,pg_catalog.name}' AS pg_catalog.regtype[]))))
+        THEN 'string' ELSE 'known' END
     FROM f GROUP BY f.proname
     UNION ALL
     SELECT CASE WHEN o.op IS NULL THEN 'fcol' ELSE 'fop' END, CAST(w.pos AS pg_catalog.text), CAST(f.proname AS pg_catalog.text),
@@ -2319,6 +2328,13 @@ sub _pg_extension_operators {
                         || uc($tokens->[$k][1]) =~ /\A(?:CAST|EXISTS|ARRAY|ANY|ALL|SOME|EXTRACT|COALESCE|GREATEST|LEAST|ROW|TRIM|SUBSTRING|POSITION|OVERLAY|NULLIF)\z/))
                     && !($j == $k + 2 && $name->($tokens->[$k]) eq 'pg_catalog');
             }
+        }
+        # Any other call, by the last name of its chain: what it returns types
+        # an operand (see the qualifier's function atoms).
+        if ($tokens->[$k + 1][1] eq '(' && !($tokens->[$k][0] eq 'id' && Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1]))
+            && !($k > 2 && $tokens->[$k - 1][1] eq '.' && uc($tokens->[$k - 3][1]) eq 'INTO') && uc($prev) ne 'INTO'
+            && !$self->_pg_catalog_functions->{lc $tokens->[$k][1]}) {
+            $functions{$name->($tokens->[$k])} = 1;
         }
         next unless $k + 2 <= $#$tokens && $tokens->[$k + 1][1] eq '.' && $tokens->[$k + 2][0] =~ /\A(?:id|qid)\z/;
         next if $k > 0 && $tokens->[$k - 1][1] eq '.';
@@ -2455,7 +2471,7 @@ sub _pg_extension_lookup {
     for my $row (@{$rows // []}) {
         my ($kind, $rel, $column, $a, $b) = @$row;
         if ($kind eq 'iso') { $isolation = $a; next }
-        if ($kind eq 'fun') { $known{$column}{state} = $b; $extension = 1 if $b ne 'known'; next }
+        if ($kind eq 'fun') { $known{$column}{state} = $b; $extension = 1 if $b eq 'unknown'; next }
         # The one function of that name: each output column's type (review
         # M2), an extension type's operators included.
         if ($kind eq 'fcol') {
@@ -2477,7 +2493,10 @@ sub _pg_extension_lookup {
         $extension = 1;
         my $target = $kind =~ /\Ae/ ? ($entry->{"\0elem"} //= {}) : $entry;
         if ($kind eq 'xdom') {
-            $target->{"\0extdom"} = 1;
+            # The exact operators of its pg_catalog base type, if it has one.
+            $target->{"\0extdom"}{$a} = 1 if defined $a;
+            $target->{"\0extdom"} //= {};
+            $target->{"\0extdom_type"} //= $b;
         } elsif ($kind eq 'xop') {
             my ($op, $left, $right) = split /\x1f/, $a, 3;
             $target->{"\0x"}{$op}{"$left\0$right"} = $quote->($b);
