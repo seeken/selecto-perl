@@ -121,6 +121,12 @@ sub next {
                 {reason => 'stream_cursor_replaced'})
                 if @now && defined($now[1]) && !($now[0] eq $self->{cursor}[0] && $now[1] eq $self->{cursor}[1]);
         }
+        # R55: a stream's own transaction is READ ONLY. Inside the host's, the host
+        # may write between fetches, so each FETCH is read-only under a savepoint
+        # of its own, which is rolled back; a cursor keeps its position through
+        # that.
+        my $batch = ($self->{scope} // '') eq 'host' && $self->{session} ? "$self->{name}_batch" : undef;
+        _do($self->{dbh}, "SAVEPOINT $batch; SET LOCAL transaction_read_only = on") if defined $batch;
         defined($sth->execute) or die 'cursor fetch failed';
         $self->{types} //= [$self->{adapter}->_column_types($sth)];
         $rows = $sth->fetchall_arrayref;
@@ -136,6 +142,7 @@ sub next {
                 die 'session state changed';
             }
         }
+        _do($self->{dbh}, "ROLLBACK TO SAVEPOINT $batch; RELEASE SAVEPOINT $batch") if defined $batch;
         $self->{adapter}->_decode_rows($rows, $self->{types}) if $self->{canonical_values};
         1;
     };

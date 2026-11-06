@@ -84,18 +84,24 @@ my $case = sub {
     my $ok = eval { while (my $row = $stream->next) { push @rows, $row } 1 };
     $error = $@ unless $ok;
     is(scalar(grep { $_->[1] ne 't1' } @rows), 0, "$name: no other tenant's row reaches the caller");
-    ok(blessed($error) && $error->code eq 'query_rule_not_evaluable' && $error->details->{reason} eq 'stream_cursor_replaced', "$name: the stream refuses, typed");
-    is(eval { ($dbh->selectrow_array('SELECT 1'))[0] }, 1, "$name: the handle still works") unless $options{transaction};
-    if ($options{transaction}) { eval { $dbh->rollback } }
+    if ($options{undone}) {
+        # The read's ROLLBACK drops the replacement and not the CLOSE, so the
+        # cursor is simply gone: the stream stops, and leaves the transaction.
+        ok(!$ok && blessed($error), "$name: the cursor is gone, and the stream says so") or diag $error;
+    } else {
+        ok(blessed($error) && $error->code eq 'query_rule_not_evaluable' && $error->details->{reason} eq 'stream_cursor_replaced', "$name: the stream refuses, typed");
+    }
+    is(eval { ($dbh->selectrow_array('SELECT 1'))[0] }, 1, "$name: the handle still works") unless $options{transaction} || $options{undone};
+    if ($options{transaction} || $options{undone}) { eval { $dbh->rollback } }
     $dbh->disconnect;
 };
 my $read = sub { my ($t, $v) = @_; $v->all($v->query->select('id')) };
 my $host = sub { $_[2]->selectrow_array('SELECT count(*) FROM public.r64_v') };
 my $write = sub { my ($t) = @_; $t->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r64_t', assignments => {note => 'seen'},
     predicate => $x->eq('id', 1), expected_count => undef)) };
-$case->('a read between fetches', $read);
+$case->('a read between fetches', $read, undone => 1);
 $case->('a host select between fetches', $host);
-$case->('a read in a host transaction', $read, transaction => 1);
+$case->('a read in a host transaction', $read, transaction => 1, undone => 1);
 $case->('a host select in a host transaction', $host, transaction => 1);
 $case->('a guarded write in a host transaction', $write, transaction => 1);
 
