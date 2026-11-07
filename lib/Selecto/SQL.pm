@@ -1262,7 +1262,8 @@ sub _admit_hand_built {
     };
     (my $text = $sql) =~ s/[\s;]+\z//;
     $refuse->('it holds more than one statement') if index($text, ';') >= 0;
-    $refuse->('it does not begin with SELECT, WITH, VALUES or TABLE') unless _hand_built_start($text) =~ /\A(?:SELECT|WITH|VALUES|TABLE)\b/i;
+    $refuse->('it does not begin with SELECT, WITH, VALUES, TABLE, SHOW, EXPLAIN or DESCRIBE')
+        unless _hand_built_start($text) =~ /\A(?:SELECT|WITH|VALUES|TABLE|SHOW|EXPLAIN|DESCRIBE|DESC)\b/i;
     my $reason = $self->_hand_built_refusal($sql);
     $refuse->($reason) if defined $reason;
     return;
@@ -1302,28 +1303,40 @@ sub _hand_built_start {
 sub _hand_built_refusal { return undef; }
 
 # Where nothing can stop a write (a host's transaction on MySQL, MariaDB and DuckDB)
-# the text has to show none, and a hand-built read then runs as written. _admit_hand_built
-# leaves two ways for a statement to write there. One that begins WITH can go on to
-# write: it must go on to read, by name, not merely not say UPDATE, and where the text
-# has more than one reading it must not hold a writing word either. And any can take
-# a sequence's next value, comments or not. A function the host wrote is the host's, as
-# a view's is, and REPLACE( in a SELECT is a function.
+# what a statement would do has to be known first, and a hand-built read then runs as
+# written. _admit_hand_built leaves three ways to write there: EXPLAIN ANALYZE runs what
+# it explains, one that begins WITH can go on to write, and any can take a sequence's
+# next value, comments or not. A function the host wrote is the host's, as a view's is.
 sub _refuse_hand_built_write {
     my ($self, $statement) = @_;
     return unless _hand_built($statement);
     my $sql = $statement->sql;
     my $text = _hand_built_text($sql);
-    my $start = _hand_built_start($text);
-    my $writes = 0;
-    if ($start =~ /\AWITH\b/i) {
-        my $main = _hand_built_main($start);
-        $writes = !defined($main) || $main !~ /\A(?:SELECT|VALUES|TABLE|\)|)\z/i
-            || (!_hand_built_one_reading($sql) && ($text =~ s/\bFOR\s+UPDATE\b//gir) =~ /\b(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b/i) ? 1 : 0;
-    }
     my $sequence = qr/\b(?:NEXTVAL|SETVAL)["`]?\s*\(|\bNEXT\s+VALUE\s+FOR\b/i;
-    Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement that may write cannot run inside a host transaction here',
-        {reason => 'hand_built_in_host_transaction'}) if $writes || $text =~ $sequence || ($text =~ s{/\*.*?\*/|--[^\n]*|\#[^\n]*}{ }gsr) =~ $sequence;
+    my $refuse = sub {
+        Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement that may write cannot run inside a host transaction here',
+            {reason => 'hand_built_in_host_transaction'});
+    };
+    $refuse->() if $text =~ $sequence || ($text =~ s{/\*.*?\*/|--[^\n]*|\#[^\n]*}{ }gsr) =~ $sequence;
+    my $start = _hand_built_start($sql);
+    my $analyzed = $start =~ s/\A(?:EXPLAIN|DESCRIBE|DESC)\s+ANALY[SZ]E\b\s*(?:FORMAT\s*=\s*\w+\s*)?//i;
+    return if !$analyzed && $start =~ /\A(?:EXPLAIN|DESCRIBE|DESC|SHOW|SELECT|VALUES|TABLE)\b/i;
+    $refuse->() if $self->_hand_built_may_write($start, $statement);
     return;
+}
+
+# Whether this text, past any EXPLAIN ANALYZE, may write. Fails closed. Here it must be
+# a plain read, or a WITH that goes on to read, by name; where the text has more than
+# one reading it must not hold a writing word either.
+sub _hand_built_may_write {
+    my ($self, $sql) = @_;
+    my $text = _hand_built_text($sql);
+    my $start = _hand_built_start($text);
+    return 0 if $start =~ /\A(?:SELECT|VALUES|TABLE)\b/i;
+    return 1 unless $start =~ /\AWITH\b/i;
+    my $main = _hand_built_main($start);
+    return 1 if !defined($main) || $main !~ /\A(?:SELECT|VALUES|TABLE|\)|)\z/i;
+    return !_hand_built_one_reading($sql) && $text =~ /\b(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b/i ? 1 : 0;
 }
 
 sub execute_query {
@@ -4403,9 +4416,14 @@ sub _undo_savepoint {
         select(undef, undef, undef, 0.01);
     }
     my $dbh = $self->{dbh};
+    $self->_forbid_reconnect;
     eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
     return 0;
 }
+
+# Dialect hook: a connection Selecto closes stays closed. A driver that reconnected
+# would run the host's next statement in a new session, and report it as fine.
+sub _forbid_reconnect { return; }
 
 # Dialect hook: whether this failure has already ended the transaction.
 sub _savepoint_gone { return 0; }

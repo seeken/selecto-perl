@@ -203,7 +203,7 @@ DELETE FROM hb_t}) {
             is($state->(), $clean, ($host ? 'host transaction' : 'alone') . ': a function that writes wrote nothing') or diag $result;
             for my $sql ('SELECT id FROM hb_t', q{SELECT REPLACE(note, 'a', 'b') FROM hb_t}, q{SELECT INSERT(note, 1, 1, 'z') FROM hb_t}, q{SELECT TRUNCATE(1.55, 1)},
                 q{SELECT note FROM hb_t WHERE note <> 'delete; into := update'}, q{WITH c AS (SELECT 'update' AS a) SELECT a FROM c},
-                q{WITH c (a) AS (SELECT 1), d AS (SELECT REPLACE('a', 'a', 'b') AS b) SELECT a, REPLACE(b, 'b', 'c') FROM c, d}, q{WITH `update` AS (SELECT 1 AS a) SELECT a FROM `update`}, ($name eq 'mysql' ? q{(WITH c AS (SELECT 1 AS a) SELECT a FROM c)} : ())) {
+                q{WITH c (a) AS (SELECT 1), d AS (SELECT REPLACE('a', 'a', 'b') AS b) SELECT a, REPLACE(b, 'b', 'c') FROM c, d}, q{WITH `update` AS (SELECT 1 AS a) SELECT a FROM `update`}) {
                 $dbh->begin_work if $host;
                 is($outcome->($adapter, $name, $sql), 'answered', ($host ? 'in a host transaction' : 'alone') . ": a read reads as written: $sql");
                 $dbh->rollback if $host;

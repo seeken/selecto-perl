@@ -131,10 +131,13 @@ SKIP: {
     $dbh->do(q{INSERT INTO selecto_mdb_cache VALUES (1, 't7'), (2, 't7'), (3, 'T7')});
     my $adapter = Selecto->adapter(mariadb => (dbh => $dbh));
     my $bytes = sub { "CAST(CONVERT($_[0] USING utf8mb4) AS BINARY)" };
-    my $result = $adapter->execute_query(Selecto::Statement->new(
+    # (Generated SQL: a hand-built statement goes as written, subquery cache and all.)
+    my $statement = Selecto::Statement->new(
         sql => 'SELECT t.id, (SELECT COUNT(*) FROM selecto_mdb_cache AS rs WHERE ' . $bytes->('rs.org_key') . ' = '
             . $bytes->('t.org_key') . ') FROM selecto_mdb_cache AS t ORDER BY t.id',
-        params => [], columns => [qw(id same)]));
+        params => [], columns => [qw(id same)]);
+    $statement->{_selecto_relations} = ['`selecto_mdb_cache`'];
+    my $result = $adapter->execute_query($statement);
     is_deeply($result->{rows}, [[1, 2], [2, 2], [3, 1]], 'each row counts only its byte-equal rows');
     $dbh->do('DROP TABLE selecto_mdb_cache');
 }

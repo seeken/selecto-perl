@@ -1469,21 +1469,16 @@ sub _pg_reset_schemas {
     my $dbh = $self->{dbh};
     my $inside = !$dbh->{AutoCommit} || $self->_connection_state eq 'intrans';
     my $savepoint = $inside ? Selecto::SQL::_savepoint_name('selecto_path') : undef;
-    my ($schemas, $error);
+    my ($schemas, $error, $made, %release);
+    my $finally = _pg_finally(sub { $self->_pg_control("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint", \%release) if $made });
     my $ok = eval {
-        $self->_savepoint_command(create => $savepoint) if $savepoint;
+        _pg_uninterrupted(sub { $self->_savepoint_command(create => $savepoint); $made = 1 }) if $savepoint;
         ($schemas) = $dbh->selectrow_array($RESET_SCHEMAS_SQL);
         1;
     };
     $error = $@ unless $ok;
-    if ($savepoint) {
-        my $restored = eval {
-            $self->_savepoint_command(rollback => $savepoint);
-            $self->_savepoint_command(release => $savepoint);
-            1;
-        };
-        $error //= $@ unless $restored;
-    }
+    $finally->run;
+    $error //= 'the search_path savepoint could not be released' if $made && !$release{done};
     Selecto::Error->throw('query_rule_not_evaluable', "the session's reset search_path could not be resolved",
         {reason => 'relation_unresolved'}) if defined($error) || ref($schemas) ne 'ARRAY';
     my @schemas = grep { defined && !/\Apg_temp/ && $_ ne 'pg_catalog' } @$schemas;
@@ -1923,49 +1918,166 @@ sub _guarded_read {
     # the read's table locks, and read-only mode set before the transaction's first
     # snapshot would register it read-only (a SERIALIZABLE host's SSI stops), so
     # _pg_hold_relations takes both before the savepoint.
+    # A host's alarm can land between any two statements, so what was opened is known
+    # exactly (see _pg_uninterrupted), only that is ended, and it is ended however this
+    # is left (see _pg_finally): ROLLBACK TO a savepoint never made would fail the
+    # host's transaction. The read itself stays interruptible.
+    # R71: a hand-built read runs in the host's session, as the driver would run it: no
+    # pin, no relation or session guard. It is read only all the same (R55).
     $self->_admit_hand_built($source);
     my $locks = blessed($source) && $source->{_selecto_row_lock};
-    my $savepoint;
-    if ($scope eq 'host') {
-        $self->_pg_hold_relations($source) unless $locks;
-        $savepoint = Selecto::SQL::_savepoint_name('selecto_read');
-        eval { $self->_savepoint_command(create => $savepoint); 1 }
-            or die $self->_transaction_control_error($@);
-    } else {
-        eval { $self->{dbh}->begin_work; 1 } or die $self->_transaction_control_error($@);
-    }
-    my ($pin, $before, $result);
-    my $ok = eval {
-        {
-            local $self->{_selecto_reset_operation} = {};
-            $self->_pg_check_relations($source);
-            $pin = $self->_pg_pin_search_path(0, $source, read_only => !$locks);
+    my $hand = _pg_hand_built($source);
+    local $self->{_selecto_pg_interrupted};
+    my ($savepoint, $began, $pin, $before, $result, $ok, $error);
+    my ($after, $unknown, $changed, $finished, $failure, $ran);
+    my $finally = _pg_finally(sub {
+        return unless $began;
+        for my $attempt (1 .. 3) {
+            last if $ran;
+            my $clean = eval {
+                _pg_uninterrupted(sub {
+                    $ran = 1;
+                    if ($ok && $before) {
+                        $after = eval { $self->_pg_session_state($pin, read => 1) };
+                        $unknown = $after ? undef : ($@ || "the session's state could not be read");
+                        $changed = !$unknown && $after->{snapshot} ne $before->{snapshot};
+                    }
+                    $finished = eval {
+                        if ($savepoint) {
+                            $self->_savepoint_command(rollback => $savepoint) if !$ok || $changed || !$locks;
+                            $self->_savepoint_command(release => $savepoint);
+                        } else {
+                            $self->{dbh}->rollback or die 'read transaction rollback failed';
+                        }
+                        1;
+                    };
+                    $failure = $@ unless $finished;
+                });
+                1;
+            };
+            # (The alarm, on its way before this or held back during it, stands once this
+            # is done. What ran is not run again: its savepoint has gone.)
+            $self->{_selecto_pg_interrupted} //= $@ unless $clean;
         }
-        $before = $self->_pg_admit_session($source, read => 1);
+        # What cannot be ended is not left open, and the failure reaches the host (R72):
+        # its savepoint rolled back to, else the connection closed. Never its ROLLBACK.
+        unless ($finished) {
+            my %undo;
+            $self->_pg_control("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint", \%undo) if $savepoint;
+            unless ($undo{done}) {
+                my $dbh = $self->{dbh};
+                eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
+            }
+        }
+    });
+    $ok = eval {
+        if ($scope eq 'host') {
+            $self->_pg_hold_relations($source) unless $locks;
+            my $name = Selecto::SQL::_savepoint_name('selecto_read');
+            _pg_uninterrupted(sub {
+                eval { $self->_savepoint_command(create => $name); 1 } or die $self->_transaction_control_error($@);
+                ($savepoint, $began) = ($name, 1);
+            });
+        } else {
+            _pg_uninterrupted(sub {
+                eval { $self->{dbh}->begin_work; 1 } or die $self->_transaction_control_error($@);
+                $began = 1;
+            });
+        }
+        if ($hand) {
+            $self->{dbh}->do('SET LOCAL transaction_read_only = on');
+        } else {
+            {
+                local $self->{_selecto_reset_operation} = {};
+                $self->_pg_check_relations($source);
+                $pin = $self->_pg_pin_search_path(0, $source, read_only => !$locks);
+            }
+            $before = $self->_pg_admit_session($source, read => 1);
+        }
         $result = $work->();
         1;
     };
-    my $error = $ok ? undef : $@;
-    # The after-snapshot and the host's settings again, in one round trip:
-    # the snapshot is read before the restore runs.
-    my $after = $ok && $before ? eval { $self->_pg_session_state($pin, read => 1) } : undef;
-    my $unknown = $ok && $before && !$after ? ($@ || "the session's state could not be read") : undef;
-    my $changed = $ok && $before && !$unknown && $after->{snapshot} ne $before->{snapshot};
-    my $finished = eval {
-        if ($savepoint) {
-            $self->_savepoint_command(rollback => $savepoint) if !$ok || $changed || !$locks;
-            $self->_savepoint_command(release => $savepoint);
-        } else {
-            $self->{dbh}->rollback or die 'read transaction rollback failed';
-        }
-        1;
-    };
+    $error = $ok ? undef : $@;
+    die $error unless $began;
+    $finally->run;
     # (A check that could not be made is not a change: it stands as itself.)
     die $self->_transaction_control_error($unknown) if $unknown;
-    die $self->_transaction_control_error($@) if !$finished && $ok && !$changed;
+    die $self->_undo_failed($self->_transaction_control_error($failure // 'the read could not be ended')) if !$finished && $ok && !$changed;
     _session_changed() if $changed;
-    die $error unless $ok;
+    die($finished ? $error : $self->_undo_failed($error)) unless $ok;
+    die $self->{_selecto_pg_interrupted} if defined $self->{_selecto_pg_interrupted};
     return $result;
+}
+
+# Runs $work when asked, or when this goes out of scope, as it does when a host's alarm
+# dies between one statement and the next, outside any eval. An alarm can stop $work
+# before it starts, so it is forgotten only once it has returned: it must be safe to
+# run again.
+sub _pg_finally { return bless {work => $_[0]}, 'Selecto::PostgreSQL::Finally'; }
+
+sub Selecto::PostgreSQL::Finally::run {
+    my ($self) = @_;
+    my $work = $self->{work} or return;
+    $work->();
+    delete $self->{work};
+    return;
+}
+
+sub Selecto::PostgreSQL::Finally::DESTROY {
+    my ($self) = @_;
+    # (At exit the connection goes too, and what the work needs may be gone already.)
+    return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
+    local ($@, $?);
+    # (An alarm that dies in here is caught by the eval, and the work is still to do.)
+    for my $attempt (1 .. 3) { last if eval { $self->run; 1 } }
+    return;
+}
+
+# The host's timers wait while $work runs, so a statement that opens or ends something
+# and the knowledge of it cannot be parted by an alarm. A signal Perl has already taken
+# is delivered here, before $work starts, and one that arrives during it right after.
+# For short statements only: nothing here can be timed out by the host's alarm.
+my $HOST_TIMERS;
+sub _pg_uninterrupted {
+    my ($work) = @_;
+    require POSIX;
+    $HOST_TIMERS //= POSIX::SigSet->new(POSIX::SIGALRM(), POSIX::SIGVTALRM(), POSIX::SIGPROF());
+    my $mask = POSIX::SigSet->new;
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), POSIX::SigSet->new, $mask);
+    my $ok = eval {
+        POSIX::sigprocmask(POSIX::SIG_BLOCK(), $HOST_TIMERS);
+        my $turn = 0;
+        $turn++ while $turn < 2;
+        $work->();
+        1;
+    };
+    my $error = $@;
+    POSIX::sigprocmask(POSIX::SIG_SETMASK(), $mask);
+    # One held back arrives now, here, and not on the host's next statement.
+    my $turn = 0;
+    $turn++ while $turn < 2;
+    die $error unless $ok;
+    return;
+}
+
+# One short statement that must run, once, whatever the host's alarm does. $state says
+# so, from inside: an alarm can land the moment this returns, and a savepoint released
+# twice fails the host's transaction.
+sub _pg_control {
+    my ($self, $sql, $state) = @_;
+    my $dbh = $self->{dbh};
+    for my $attempt (1 .. 3) {
+        return if $state->{ran};
+        my $clean = eval {
+            _pg_uninterrupted(sub {
+                $state->{ran} = 1;
+                $state->{done} = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do($sql); 1 };
+            });
+            1;
+        };
+        $self->{_selecto_pg_interrupted} //= $@ unless $clean;
+    }
+    return;
 }
 
 # Inside the host's transaction, before a read's savepoint: the transaction's
@@ -1980,14 +2092,22 @@ sub _pg_hold_relations {
     my $savepoint = Selecto::SQL::_savepoint_name('selecto_hold');
     my @sql = ("SAVEPOINT $savepoint", (map { "SELECT 1 FROM $_ LIMIT 0" } @{$relations // []}), 'SELECT 1');
     # A hand-built statement names none: planning it takes what it would lock, and
-    # runs nothing. The plan, not its text, says whether it writes or locks rows: such
-    # a statement will refuse, so what planning took for it goes back. (Any deadline
-    # the read has is in force here, on this as on the read.)
-    my $plan = _pg_hand_built($source) ? 'EXPLAIN (COSTS OFF, FORMAT JSON) ' . $source->sql : undef;
-    my $writes;
-    my $held = eval {
+    # runs nothing of it (a function declared IMMUTABLE or STABLE may run here, outside
+    # the read-only guard, which is the function's breach of its contract: see the POD).
+    # The plan, not its text, says whether it writes or locks rows: such a statement
+    # refuses, and what planning took for it goes back. (Any deadline the read has is
+    # in force here, on this as on the read.)
+    # (SHOW and EXPLAIN have no plan of their own to read, and run nothing to hold.)
+    my $plan = _pg_hand_built($source) && Selecto::SQL::_hand_built_start($source->sql) =~ /\A(?:SELECT|WITH|VALUES|TABLE)\b/i
+        ? 'EXPLAIN (COSTS OFF, FORMAT JSON) ' . $source->sql : undef;
+    my ($writes, $made, $held, %release);
+    my $finally = _pg_finally(sub {
+        $self->_pg_control(($held && !$writes ? '' : "ROLLBACK TO SAVEPOINT $savepoint; ") . "RELEASE SAVEPOINT $savepoint", \%release) if $made;
+    });
+    $held = eval {
         local $dbh->{PrintError} = 0;
         local $dbh->{RaiseError} = 1;
+        _pg_uninterrupted(sub { $dbh->do(shift @sql); $made = 1 });
         $dbh->do(join '; ', @sql);
         if (defined $plan) {
             local $self->{_selecto_pg_host_statement} = $plan;
@@ -1997,15 +2117,17 @@ sub _pg_hold_relations {
             $sth->finish;
             $writes = _pg_plan_writes(JSON::PP->new->decode($text)->[0]{Plan});
         }
-        $dbh->do(($writes ? "ROLLBACK TO SAVEPOINT $savepoint; " : '') . "RELEASE SAVEPOINT $savepoint");
         1;
     };
-    return if $held;
-    my $failure = $self->normalize_error($@);
-    my $state = eval { $dbh->state } // '';
-    eval { local $dbh->{PrintError} = 0; $dbh->do("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint") }
-        or die $self->_transaction_control_error($@);
-    die $failure unless $state =~ /\A42/;
+    my $failure = $held ? undef : $self->normalize_error($@);
+    my $state = $held ? '' : eval { $dbh->state } // '';
+    die $failure unless $made;
+    $finally->run;
+    die $self->_transaction_control_error($failure // 'the relation hold could not be released') unless $release{done};
+    die $failure if !$held && $state !~ /\A42/;
+    # R72: a host takes row locks through its own driver: a read's would end with it.
+    Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement that writes or locks rows cannot run on a read path',
+        {reason => 'hand_built_not_a_read'}) if $writes;
     return;
 }
 
@@ -2967,7 +3089,14 @@ the transaction's first snapshot, so a C<SERIALIZABLE> host stays read-write to
 C<SSI>, and the table locks of the relations it names, or for a hand-built
 statement the ones planning it takes, so they last to the host's commit, unless the
 plan shows it writes or locks rows, when it holds nothing and refuses. That is one
-more round trip for a read inside a host transaction. Locks on tables reached
+more round trip for a read inside a host transaction.
+
+A hand-built read that takes row locks refuses, on every route, streams included.
+Take row locks through your own driver: a read's savepoint would release them. For
+the same reason a C<pg_advisory_xact_lock> taken by a read inside your transaction
+ends with the read, not with your transaction. A function declared C<IMMUTABLE> or
+C<STABLE> that writes breaks PostgreSQL's contract, and planning a hand-built read
+may run it, outside the read-only guard. Locks on tables reached
 only inside a function a view calls end with the read.
 
 =head1 SESSION STATE

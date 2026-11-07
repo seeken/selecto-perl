@@ -69,7 +69,7 @@ for my $case ([['SYSTEM', 'UTC'], 'ok'], [['SYSTEM', '+00:00'], 'ok'], [['Etc/UT
         $session->{AutoCommit} = 1;
         my $adapter = Selecto->adapter($name => (dbh => $session));
         my $outcome = eval {
-            $adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => [], columns => ['x']));
+            $adapter->execute_query(do { my $s = Selecto::Statement->new(sql => 'SELECT 1', params => [], columns => ['x']); $s->{_selecto_relations} = []; $s });
             'ok';
         } // (ref($@) ? $@->details->{reason} : "died: $@");
         is($outcome, $expected, "$name session time zone @$zone: $expected");
@@ -85,7 +85,7 @@ for my $name (qw(mysql mariadb)) {
         _selecto_server_version => [99, 0, 0]));
     ok(!exists $adapter->{_selecto_session_verified}, "$name drops a preset session flag");
     my $outcome = eval {
-        $adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => [], columns => ['x']));
+        $adapter->execute_query(do { my $s = Selecto::Statement->new(sql => 'SELECT 1', params => [], columns => ['x']); $s->{_selecto_relations} = []; $s });
         'ok';
     } // (ref($@) ? $@->details->{reason} : "died: $@");
     is($outcome, 'session_time_zone', "$name still checks the session");
