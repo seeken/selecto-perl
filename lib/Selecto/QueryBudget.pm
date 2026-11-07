@@ -150,7 +150,7 @@ sub begin {
             };
         } elsif ($name eq 'mysql' || $name eq 'mariadb') {
             my $setting = $name eq 'mysql' ? 'max_execution_time' : 'max_statement_time';
-            my $read = 'SELECT @@SESSION.' . $setting;
+            my $read = 'SELECT @@SESSION.' . $setting . ' LIMIT 1';
             $read = $adapter->_statement_sql($read) if $adapter->can('_statement_sql');
             my ($prior) = $dbh->selectrow_array($read);
             # Literal numbers: DBD::MariaDB binds placeholders client-side as
