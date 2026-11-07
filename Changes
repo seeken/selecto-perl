@@ -12,6 +12,8 @@ Revision history for Selecto
     - Declare with schemas any cross-schema reference or join (relation_unresolved).
     - Check client_encoding is UTF8 on every connection, no MariaDB session sets
       system_versioning_asof, and no MySQL session sets sql_select_limit.
+    - On MySQL, grant SESSION_VARIABLES_ADMIN to the application role if reads may
+      raise more than 1024 warnings; without it such a read refuses (result_unverified).
     - On MariaDB, a generated recursive query with no max_depth now refuses past 10000
       levels, even if the host raised max_recursive_iterations. Declare max_depth.
     - Remove any statement_cache option.
@@ -31,8 +33,9 @@ Revision history for Selecto
       recursion_limit or length_limit, for reads, streams and writes: one collection
       child past max_allowed_packet had come back as [null]. So no cut hides behind
       harmless warnings, generated reads lift max_error_count for the statement, and a
-      read with more warnings than the server kept refuses, reason warnings_unread
-      (past 65535). On MySQL a session with
+      read with more warnings than the server kept refuses as unverified, category
+      result_unverified, reason warnings_unread (past 65535; on MySQL past 1024 for a
+      role without SESSION_VARIABLES_ADMIN, which cannot lift it). On MySQL a session with
       sql_select_limit set refuses, reason session_sql_select_limit; past
       cte_max_recursion_depth the server refuses; JSON_ARRAYAGG is not shortened there.
       Hand-built reads keep the host's settings.

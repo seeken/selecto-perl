@@ -69,7 +69,18 @@ on a server whose system zone is UTC; never `GMT`), the client, connection
 and result character sets utf8mb4, and `sql_mode` strict
 (`STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`). A connection that breaks it
 is refused with `invalid_connection` (`details.reason` names the setting;
-`Selecto::API::error_status` answers it with HTTP 500).
+`Selecto::API::error_status` answers it with HTTP 500). On MySQL a session must
+not set `sql_select_limit` (reason `session_sql_select_limit`); on MariaDB each
+generated statement pins it, `group_concat_max_len`, `max_error_count` and
+`max_recursive_iterations` for itself.
+
+A generated statement never answers short. What the server says it cut (past the
+recursion limit, or a value past `max_allowed_packet`) refuses with `query_error`,
+category `result_incomplete`. To see every warning, a generated read raises
+`max_error_count` for itself. On MySQL that needs `SESSION_VARIABLES_ADMIN`:
+without it the server keeps 1024 warnings, and a read that raises more cannot be
+verified and refuses, category `result_unverified`, reason `warnings_unread`.
+Grant it to the application role if reads may raise more than 1024 warnings.
 
 To install from a git checkout:
 

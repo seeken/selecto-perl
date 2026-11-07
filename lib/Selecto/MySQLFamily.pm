@@ -3495,9 +3495,13 @@ sub _execute_statement {
     my $cut = defined($result) ? $self->_result_cut($sth) : undef;
     my $state = $self->{_selecto_write_session};
     $self->_check_session_state($state) if ref($state) eq 'ARRAY' && (eval { $sth->{Statement} } // '') =~ $DML;
+    # (Only what the server said it cut is called cut. More warnings than the session
+    # could read is a result nobody verified, and is refused as that.)
+    Selecto::Error->throw('query_error', 'the result could not be verified: the statement raised more warnings '
+        . 'than this session can read (on MySQL, raising the limit needs SESSION_VARIABLES_ADMIN)',
+        {cause => 'database_error', category => 'result_unverified', reason => 'warnings_unread'}) if $cut && !$cut->[1];
     Selecto::Error->throw('query_error', 'the server cut the result short', {cause => 'database_error',
-        category => 'result_incomplete', reason => $cut->[1] == $CUT_RECURSION ? 'recursion_limit'
-            : $cut->[1] ? 'length_limit' : 'warnings_unread'}) if $cut;
+        category => 'result_incomplete', reason => $cut->[1] == $CUT_RECURSION ? 'recursion_limit' : 'length_limit'}) if $cut;
     return $result;
 }
 
@@ -3508,7 +3512,9 @@ sub _execute_statement {
 # under the host's settings, and its result is the host's. The warning count comes
 # with the result, so a statement with no warnings costs nothing here. Where the cap
 # was lifted, a count the rows do not reach means one could be hiding: refused. Where
-# it was not, harmless warnings past the cap prove nothing, so they do not refuse.
+# it was not, harmless warnings past the cap prove nothing, so they do not refuse. On
+# MySQL a role without SESSION_VARIABLES_ADMIN cannot lift it (1227, one more warning)
+# and the server keeps 1024: past that the result cannot be verified, and is refused.
 sub _result_cut {
     my ($self, $sth) = @_;
     my $count = eval { $sth->{mariadb_warning_count} } // 0;
