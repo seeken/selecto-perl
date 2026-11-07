@@ -1346,7 +1346,7 @@ sub execute_query {
         defined($self->_execute_statement($sth, $statement->params)) or die _dbi_error($sth, 'query execution failed');
         my @types = $self->_column_types($sth);
         $rows = $sth->fetchall_arrayref;
-        die _dbi_error($sth, 'query fetch failed') if !$rows || $sth->err;
+        die _dbi_error($sth, 'query fetch failed') if !$rows || eval { $sth->err };
         $self->_decode_rows($rows, \@types);
         1;
     };
