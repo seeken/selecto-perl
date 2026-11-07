@@ -127,7 +127,7 @@ SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; int
         my $error = $@;
         ok(!$done, 'a read behind an exclusive lock does not answer');
         cmp_ok(Time::HiRes::time() - $started, '<', 2, 'and it stops at the deadline');
-        is(blessed($error) && $error->details->{sqlstate}, '57014', 'as a cancellation');
+        is(blessed($error) && $error->details->{sqlstate}, q{57014}, q{as a cancellation});
         $dbh->rollback;
         $dbh->disconnect;
         $locker->rollback;

@@ -98,6 +98,17 @@ subtest postgresql => sub {
         }
         $dbh->disconnect;
     }
+    # Without RaiseError a failed read is still a failure, never an empty answer.
+    {
+        my $dbh = TestPostgreSQL->connect;
+        $dbh->{RaiseError} = 0;
+        for my $host (0, 1) {
+            $dbh->begin_work if $host;
+            like($answer->(Selecto::PostgreSQL->new(dbh => $dbh), 'postgresql', 'SELECT 1/0'), qr/\Arefused/, ($host ? 'host: ' : 'alone: ') . 'RaiseError off: SELECT 1/0 fails');
+            $dbh->rollback if $host;
+        }
+        $dbh->disconnect;
+    }
     # Still read only, and still UTF8.
     {
         my $dbh = TestPostgreSQL->connect;
@@ -158,17 +169,77 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
                 is(($admin->selectrow_array('SELECT note FROM hs_t'))[0], 'a', 'or changed');
             }
         }
-        # Row locks are the host's to take: every form refuses, on every route (R72).
-        for my $sql (q{SELECT id FROM hs_t FOR UPDATE}, q{SELECT id FROM hs_t LOCK IN SHARE MODE}, q{SELECT id FROM hs_t FOR /* c */ UPDATE}, ($name eq 'mysql' ? q{SELECT id FROM hs_t FOR SHARE} : ())) {
+        # Row locks answer as the driver's would: held in the host's transaction, and
+        # alone they end with the read, which is a plain transaction ended by ROLLBACK.
+        for my $sql (q{SELECT id FROM hs_t FOR UPDATE}, q{SELECT id FROM hs_t FOR UPDATE NOWAIT}, q{SELECT id FROM hs_t FOR UPDATE SKIP LOCKED}, q{SELECT id FROM hs_t LOCK IN SHARE MODE}, ($name eq 'mysql' ? q{SELECT id FROM hs_t FOR SHARE} : ())) {
             for my $host (0, 1) {
                 my $dbh = $connect->();
                 my $adapter = Selecto->adapter($name => (dbh => $dbh));
                 $dbh->begin_work if $host;
-                like($answer->($adapter, $name, $sql), qr/\Arefused hand_built_not_a_read/, ($host ? 'host: ' : 'alone: ') . "refused: $sql");
-                ok(!eval { $adapter->stream_query(Selecto::Statement->new(sql => $sql, params => [], columns => ['a'], adapter_name => $name)); 1 }, 'and as a stream');
+                is($answer->($adapter, $name, $sql), '1', ($host ? 'host: ' : 'alone: ') . "as the driver: $sql");
+                my $stream = eval { $adapter->stream_query(Selecto::Statement->new(sql => $sql, params => [], columns => ['a'], adapter_name => $name)) };
+                ok($stream, 'and as a stream') or diag $@;
+                $stream->close if $stream;
+                $admin->do('SET SESSION innodb_lock_wait_timeout = 1');
+                my $free = eval { $admin->do('UPDATE hs_t SET note = note, d = d + 0 WHERE id = 1'); 1 };
+                is($free ? 1 : 0, $host ? 0 : 1, $host ? 'the lock holds' : 'and no lock outlasts the read');
+                $admin->do('SET SESSION innodb_lock_wait_timeout = 50');
+                is(($dbh->selectrow_array('SELECT @@autocommit'))[0], 1, 'autocommit is back') unless $host;
                 $dbh->rollback if $host;
                 $dbh->disconnect;
             }
+        }
+        # A write check must not refuse a read of any shape, nor run it twice.
+        $admin->do($_) for 'DROP FUNCTION IF EXISTS hs_bump', 'DROP TABLE IF EXISTS hs_c', 'CREATE TABLE hs_c (n INT) ENGINE=InnoDB', 'INSERT INTO hs_c VALUES (0)',
+            q{CREATE FUNCTION hs_bump() RETURNS INT DETERMINISTIC MODIFIES SQL DATA BEGIN UPDATE hs_c SET n = n + 1; RETURN 1; END};
+        {
+            my $dbh = $connect->();
+            $dbh->begin_work;
+            is($answer->(Selecto->adapter($name => (dbh => $dbh)), $name, 'WITH c AS (SELECT hs_bump() AS a) SELECT a FROM c'), '1', "a read's function answers");
+            is(($dbh->selectrow_array('SELECT n FROM hs_c'))[0], 1, 'having run once');
+            $dbh->rollback;
+            $dbh->disconnect;
+        }
+        $admin->do($_) for 'DROP FUNCTION hs_bump', 'DROP TABLE hs_c';
+        for my $sql (q{SELECT `into` FROM (SELECT 1 AS `into`) x}, q{WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r},
+            q{WITH c AS (SELECT 1 AS a) SELECT a FROM c UNION SELECT 2}, q{(SELECT 1) UNION (SELECT 2)}, q{SELECT 1 AS `analyze`}, q{SELECT 'EXPLAIN ANALYZE DELETE'}) {
+            for my $set (undef, ($name eq 'mysql' ? (q{SET SESSION explain_format = JSON}, q{SET SESSION explain_format = TREE}) : ())) {
+                my $dbh = $connect->();
+                $dbh->do($set) if $set;
+                $dbh->begin_work;
+                unlike($answer->(Selecto->adapter($name => (dbh => $dbh)), $name, $sql), qr/\Arefused/, ($set ? "$set: " : '') . "it answers: $sql");
+                $dbh->rollback;
+                $dbh->disconnect;
+            }
+        }
+        # A session reading the past would see a row since moved to another tenant.
+        if ($name eq 'mariadb') {
+            $admin->do($_) for 'DROP TABLE IF EXISTS hs_v', q{CREATE TABLE hs_v (id INT PRIMARY KEY, org VARCHAR(10)) ENGINE=InnoDB WITH SYSTEM VERSIONING}, q{INSERT INTO hs_v VALUES (1, 't1'), (2, 't1')};
+            select(undef, undef, undef, 1.1);
+            my ($past) = $admin->selectrow_array('SELECT NOW(6)');
+            select(undef, undef, undef, 1.1);
+            $admin->do(q{UPDATE hs_v SET org = 't2' WHERE id = 2});
+            my $versioned = Selecto::Domain->parse({schema_version => 1, name => 'HV', source => {source_table => 'hs_v', primary_key => 'id', tenant_field => 'org',
+                fields => [qw(id org)], columns => {id => {type => 'integer'}, org => {type => 'string'}}, associations => {}}, schemas => {}, joins => {}});
+            my $dbh = $connect->();
+            $dbh->do(q{SET SESSION time_zone = '+00:00', sql_mode = 'STRICT_TRANS_TABLES', NAMES utf8mb4});
+            my $adapter = Selecto->adapter($name => (dbh => $dbh));
+            my $engine = Selecto::Engine->new(domain => $versioned, adapter => $adapter)->with_scope(tenant => 't1');
+            is($flat->($engine->all($engine->query->select('id'))->{rows}), '1', 'a versioned table answers for its present');
+            $dbh->do("SET \@\@system_versioning_asof = '$past'");
+            my $read = eval { $engine->all($engine->query->select('id')); 1 };
+            my $error = $@;
+            ok(!$read && blessed($error) && $error->details->{reason} eq 'session_system_versioning_asof', 'a generated read refuses a session reading the past') or diag $error;
+            is($answer->($adapter, $name, 'SELECT id FROM hs_v ORDER BY id'), '1|2', 'a hand-built read answers as the driver does');
+            $dbh->disconnect;
+            $admin->do('DROP TABLE hs_v');
+        }
+        # Without RaiseError a failed read is still a failure, never an empty answer.
+        {
+            my $dbh = $connect->();
+            $dbh->{RaiseError} = 0;
+            like($answer->(Selecto->adapter($name => (dbh => $dbh)), $name, 'SELECT id FROM hs_no_such_table'), qr/\Arefused/, 'RaiseError off: a failed statement fails');
+            $dbh->disconnect;
         }
         # What the server can tell apart answers: EXPLAIN ANALYZE of a read, in the host's transaction too.
         if ($name eq 'mysql') {

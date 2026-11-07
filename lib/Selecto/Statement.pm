@@ -21,6 +21,18 @@ sub adapter_name ($self) { return $self->{adapter_name}; }
 sub relations ($self) {
     return ref($self->{_selecto_relations}) eq 'ARRAY' ? [@{$self->{_selecto_relations}}] : undef;
 }
+# A statement wrapped around this one: other SQL, the same relations, declared schemas
+# and row lock, so what was generated stays generated, and what was hand-built stays
+# that. Companions that wrap a compiled statement use this, not new.
+sub derive ($self, %args) {
+    my $derived = (ref $self)->new(sql => $args{sql} // $self->{sql}, params => $args{params} // $self->{params},
+        columns => $args{columns} // $self->{columns}, adapter_name => $args{adapter_name} // $self->{adapter_name});
+    for my $key (qw(_selecto_relations _selecto_declared_schemas _selecto_row_lock)) {
+        $derived->{$key} = ref($self->{$key}) eq 'ARRAY' ? [@{$self->{$key}}] : $self->{$key} if exists $self->{$key};
+    }
+    return $derived;
+}
+
 sub to_hash ($self) {
     return {
         sql => $self->{sql},

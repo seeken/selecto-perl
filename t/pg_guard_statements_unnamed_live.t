@@ -17,7 +17,8 @@ use TestPostgreSQL ();
 # snapshot and post-image statements are prepared afresh each time, and DBD::Pg
 # names a statement only on the second execution of one handle
 # (pg_switch_prepared), so they run unnamed. This pins that: if a guard ever
-# moves to a reused handle, it fails here.
+# moves to a reused handle, it fails here. (A pin: this held before it was written, so
+# it passes with or without any later fix.)
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
 my $x = 'Selecto::Expression';

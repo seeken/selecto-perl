@@ -2946,7 +2946,10 @@ sub _read_transaction {
     $self->_admit_hand_built($statement);
     my $hosts = sub { $self->_refuse_hand_built_write($statement); return $work->() };
     return $hosts->() if !$dbh->{AutoCommit} || (ref($state) eq 'ARRAY' && ($state->[2] // '1') ne '1');
-    my ($owned, $interrupted) = $self->_claim_read;
+    # (Nothing makes a read that locks rows read only: its check comes first.)
+    my $locks = $self->_hand_built_locks_rows($statement);
+    $self->_refuse_hand_built_write($statement) if $locks;
+    my ($owned, $interrupted) = $self->_claim_read($locks);
     die $interrupted if !$owned && defined $interrupted;
     return $hosts->() unless $owned;
     my ($value, $ok, $error, $finished);
@@ -2985,11 +2988,12 @@ sub _read_transaction {
 # whether the read is Selecto's to end, and what interrupted it. With no answer it
 # returns false with the interruption: nothing is open, and nothing more is sent.
 sub _claim_read {
-    my ($self) = @_;
+    my ($self, $locks) = @_;
     my $dbh = $self->{dbh};
     my $interrupted;
+    my $claim = 'SET TRANSACTION READ ' . ($locks ? 'WRITE' : 'ONLY');
     for my $attempt (1 .. $CONTROL_ATTEMPTS) {
-        return (1, $interrupted) if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do('SET TRANSACTION READ ONLY'); 1 };
+        return (1, $interrupted) if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do($claim); 1 };
         my $failure = $@;
         return (0, $interrupted) if (eval { $dbh->err } // '') eq '1568' || "$failure" =~ /\bTransaction characteristics can't be changed\b/;
         $interrupted //= $self->normalize_error($failure);
@@ -3031,34 +3035,45 @@ sub _in_step {
 }
 
 # INTO writes a file or a user variable, := a variable, and a conditional comment
-# is SQL this text does not show. A row lock is the host's to take, through its own
-# driver: a read cannot hold one for it (R72).
+# is SQL this text does not show.
 sub _hand_built_refusal {
     my ($self, $sql) = @_;
-    return 'it may write' if $sql =~ /\bINTO\b/i || index($sql, ':=') >= 0 || $sql =~ m{/\*M?!};
-    my $lock = qr/\bFOR\s+(?:UPDATE|SHARE)\b|\bLOCK\s+IN\s+SHARE\s+MODE\b/i;
-    return 'it takes row locks' if $sql =~ $lock || ($sql =~ s{/\*.*?\*/|--[^\n]*|\#[^\n]*}{ }gsr) =~ $lock;
+    # (A column may be called `into`.)
+    my $words = $sql =~ s/`[^`]*`|"[^"]*"/ /gr;
+    return 'it may write' if $words =~ /\bINTO\b/i || index($words, ':=') >= 0 || $sql =~ m{/\*M?!};
     return undef;
 }
 
-# The server says what a statement would do: its parser, its sql_mode and its comments,
-# not a lexer here. EXPLAIN runs nothing of a write, and names one in select_type. What
-# it cannot settle refuses; a kill on it is a kill, and nothing else is sent.
+# A hand-built read that locks rows answers as the driver would (R72 correction): in the
+# host's transaction it runs as written, and alone it cannot be READ ONLY, so it runs in a
+# plain transaction of its own that ends in ROLLBACK, where its locks end too.
+sub _hand_built_locks_rows {
+    my ($self, $statement) = @_;
+    return 0 unless Selecto::SQL::_hand_built($statement);
+    return Selecto::SQL::_hand_built_text($statement->sql) =~ /\bFOR\s+(?:UPDATE|SHARE)\b|\bLOCK\s+IN\s+SHARE\s+MODE\b/i ? 1 : 0;
+}
+
+# MySQL's server says what a WITH would do, from its own parser: EXPLAIN runs nothing of a
+# write, and names one in select_type. A deny-list, so a read of any shape answers, and
+# FORMAT=TRADITIONAL, so a session's explain_format cannot take select_type away. MariaDB
+# has no write after WITH to find, and its EXPLAIN evaluates a table-less CTE, running
+# a read's function twice: the statement simply runs, or fails, as written.
 sub _hand_built_may_write {
     my ($self, $sql, $statement) = @_;
-    return 0 if Selecto::SQL::_hand_built_start($sql) =~ /\A(?:SELECT|VALUES|TABLE)\b/i;
+    my $start = Selecto::SQL::_hand_built_start(Selecto::SQL::_hand_built_text($sql) =~ s{/\*.*?\*/|--[^\n]*|\#[^\n]*}{ }gsr);
+    return 0 if $start eq '' || $start =~ /\A(?:SELECT|VALUES|TABLE)\b/i;
+    return 1 unless $start =~ /\AWITH\b/i;
+    return 0 if $self->name eq 'mariadb' || $sql !~ /\A\s*(?:\/\*.*?\*\/\s*)*WITH\b/is;
     my $dbh = $self->{dbh};
-    my (@types, $found);
+    my @types;
     my $ok = eval {
         local $dbh->{PrintError} = 0;
         local $dbh->{RaiseError} = 1;
-        my $sth = $dbh->prepare("EXPLAIN $sql");
+        my $sth = $dbh->prepare("EXPLAIN FORMAT=TRADITIONAL $sql");
         $sth->execute(@{$statement->params});
         my ($column) = grep { lc($sth->{NAME}[$_]) eq 'select_type' } 0 .. $#{$sth->{NAME}};
-        if (defined $column) {
-            $found = 1;
-            while (my $row = $sth->fetchrow_arrayref) { push @types, $row->[$column] // '' }
-        }
+        die "EXPLAIN gave no select_type\n" unless defined $column;
+        while (my $row = $sth->fetchrow_arrayref) { push @types, $row->[$column] // '' }
         $sth->finish;
         1;
     };
@@ -3067,7 +3082,7 @@ sub _hand_built_may_write {
         die $failure if !blessed($failure) || ($failure->details->{category} // '') eq 'query_canceled';
         return 1;
     }
-    return !$found || !@types || grep { /\A(?:UPDATE|DELETE|INSERT|REPLACE)\b/i } @types;
+    return scalar grep { /\A(?:UPDATE|DELETE|INSERT|REPLACE)\b/i } @types;
 }
 
 # A read may end up READ ONLY or with autocommit off only by accident, and a host
@@ -3333,7 +3348,7 @@ sub _require_session {
         @row = $dbh->selectrow_array($self->_statement_sql('SELECT VERSION(), @@SESSION.time_zone, @@system_time_zone, '
             . '@@SESSION.character_set_client, @@SESSION.character_set_connection, @@SESSION.character_set_results, '
             . q{@@SESSION.sql_mode, CONVERT(X'F09F9880' USING utf8mb4), CAST('2024-03-10 02:30:00.5' AS DATETIME(6))}
-            . ', @@SESSION.autocommit, @@SESSION.transaction_read_only'));
+            . ', @@SESSION.autocommit, @@SESSION.transaction_read_only' . ($mariadb ? ', @@SESSION.system_versioning_asof' : '')));
         1;
     };
     unless ($ok) {
@@ -3346,11 +3361,15 @@ sub _require_session {
         }
         die $self->normalize_error($error);
     }
-    my ($version, $zone, $system, $client, $connection, $results, $mode, $text, $datetime, $autocommit, $read_only) = @row;
+    my ($version, $zone, $system, $client, $connection, $results, $mode, $text, $datetime, $autocommit, $read_only, $asof) = @row;
     # A MySQL adapter on a MariaDB server (or the reverse) would compile the
     # other server's dialect: MariaDB statements without the subquery-cache
     # prefix, MySQL statements with MariaDB-only syntax.
     $family->() unless defined($version) && (("$version" =~ /mariadb/i ? 1 : 0) == ($mariadb ? 1 : 0));
+    # A session reading the past sees yesterday's tenant on a versioned table: a row that
+    # has since moved to another tenant answers as this one's.
+    $refuse->('session_system_versioning_asof', 'MariaDB sessions must not set system_versioning_asof')
+        if defined($asof) && uc("$asof") ne 'DEFAULT';
     $refuse->('session_time_zone', 'MySQL-family sessions must use the UTC time zone')
         unless defined($zone) && ($UTC_ZONES{$zone}
             || ($zone eq 'SYSTEM' && defined($system) && ($system eq 'UTC' || $system eq '+00:00')));
@@ -3525,6 +3544,14 @@ pending before a write on an idle handle is consumed by the write: by the
 open-transaction probe, and otherwise by the adapter's own transaction, to
 which it would apply. Set transaction characteristics inside the host's own
 C<begin_work> transaction, or with C<SET SESSION TRANSACTION>.
+
+A hand-built statement is the host's own code: never build one from end-user input. It
+runs in the host's session as the driver would, and answers with the driver's values.
+A hand-built read that locks rows answers too: in the host's transaction the lock holds,
+and alone it runs in a plain transaction ended by C<ROLLBACK>, where the lock ends.
+Selecto needs handles with C<< RaiseError => 1 >>. Open a host's transaction with
+C<begin_work>: a text C<BEGIN> on a pooled connection is host misuse. A session with
+C<system_versioning_asof> set refuses generated reads and writes on MariaDB.
 
 A connection Selecto cannot put back is closed, never left wrong: a C<ROLLBACK> or
 autocommit restore that still fails after retries, a failed C<RELEASE SAVEPOINT>

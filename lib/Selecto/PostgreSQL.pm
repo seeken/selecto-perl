@@ -109,6 +109,7 @@ sub _with_relations {
     $derived->{_selecto_relations} = [sort keys %names];
     my %declared = map { ($_ => 1) } map { @{$_->{_selecto_declared_schemas} // []} } grep { blessed($_) } @sources;
     $derived->{_selecto_declared_schemas} = [sort keys %declared];
+    $derived->{_selecto_row_lock} = 1 if grep { blessed($_) && $_->{_selecto_row_lock} } @sources;
     return $derived;
 }
 
@@ -342,6 +343,10 @@ sub normalize_error {
 
     my $text = eval { "$error" } // '';
     my $state = eval { $self->dbh->state } // '';
+    # (DBI's restore after a failed rollback clears the handle: the text is what is left.)
+    return Selecto::Error->new(code => 'query_error', message => 'Execution failed',
+        details => {cause => 'database_error', sqlstate => '57014', category => 'query_canceled'})
+        if $state eq '' && $text =~ /\bcanceling statement due to\b/;
     if ($state eq '23502' || $text =~ /null value in column "[^"]+"[^\n]*violates not-null constraint/i) {
         my ($field) = $text =~ /null value in column "([A-Za-z_][A-Za-z0-9_]*)"/i;
         my ($relation) = $text =~ /relation "([A-Za-z_][A-Za-z0-9_]*)"/i;
@@ -1476,8 +1481,10 @@ sub _pg_reset_schemas {
         ($schemas) = $dbh->selectrow_array($RESET_SCHEMAS_SQL);
         1;
     };
-    $error = $@ unless $ok;
+    # (Read at once: the savepoint's rollback clears the handle's error.)
+    $error = $self->normalize_error($@) unless $ok;
     $finally->run;
+    die $error if $self->_pg_cancelled($error);
     $error //= 'the search_path savepoint could not be released' if $made && !$release{done};
     Selecto::Error->throw('query_rule_not_evaluable', "the session's reset search_path could not be resolved",
         {reason => 'relation_unresolved'}) if defined($error) || ref($schemas) ne 'ARRAY';
@@ -1520,10 +1527,21 @@ sub _unquote_identifier {
 # UNICODE as set.
 sub _pg_require_utf8 {
     my ($self) = @_;
-    my ($encoding) = $self->{dbh}->selectrow_array(q{SELECT pg_catalog.current_setting('client_encoding')});
+    # Once per operation (see _selecto_utf8_checked).
+    return if $self->{_selecto_utf8_checked};
+    my $encoding;
+    my $ok = eval { ($encoding) = $self->{dbh}->selectrow_array(q{SELECT pg_catalog.current_setting('client_encoding')}); 1 };
+    die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_not_evaluable', "the session's client_encoding must be UTF8",
         {reason => 'client_encoding'}) unless uc($encoding // '') =~ /\A(?:UTF8|UNICODE)\z/;
+    $self->{_selecto_utf8_checked} = 1 if exists $self->{_selecto_utf8_checked};
     return;
+}
+
+# Whether this failure is a cancel: it stays one, whichever guard it landed on.
+sub _pg_cancelled {
+    my ($self, $error) = @_;
+    return blessed($error) && $error->can('details') && ($error->details->{category} // '') eq 'query_canceled' ? 1 : 0;
 }
 
 sub _pg_declared_schemas {
@@ -1799,6 +1817,7 @@ sub _pg_session_state {
     }
     my @row;
     my $ok = eval { @row = $self->{dbh}->selectrow_array($sql, undef, @binds); 1 };
+    if (!$ok) { my $failure = $self->normalize_error($@); die $failure if $self->_pg_cancelled($failure) }
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
         {reason => 'session_state_unknown'}) unless $ok && @row && defined $row[0];
     return _pg_state_row([@row[0 .. $width - 1]]);
@@ -1812,6 +1831,7 @@ sub _pg_admit_session {
     my $names = _pg_statement_relations($source);
     my @row;
     my $ok = eval { @row = $self->{dbh}->selectrow_array($options{read} ? $READ_SHADOW_SQL : $SHADOW_SQL, undef, $names); 1 };
+    if (!$ok) { my $failure = $self->normalize_error($@); die $failure if $self->_pg_cancelled($failure) }
     Selecto::Error->throw('query_rule_not_evaluable', "the session's state could not be read",
         {reason => 'session_state_unknown'}) unless $ok && @row == 2 + 1 + @SESSION_SETTINGS + 1 && defined $row[2];
     my ($relations, $types, @state) = @row;
@@ -1906,6 +1926,7 @@ sub _guarded_read {
     my ($self, $source, $work) = @_;
     return $work->() if !$self->_pg_session_checked || $self->{_selecto_pg_read_guard};
     local $self->{_selecto_pg_read_guard} = 1;
+    local $self->{_selecto_utf8_checked} = $self->{_selecto_utf8_checked} // 0;
     my $scope = $self->_read_guard_scope;
     $self->_pg_require_utf8;
     # R55: a read is READ ONLY and ends in ROLLBACK, so nothing a statement reaches
@@ -1929,7 +1950,7 @@ sub _guarded_read {
     my $hand = _pg_hand_built($source);
     local $self->{_selecto_pg_interrupted};
     my ($savepoint, $began, $pin, $before, $result, $ok, $error);
-    my ($after, $unknown, $changed, $finished, $failure, $ran);
+    my ($after, $unknown, $changed, $finished, $failure, $ran, %undo);
     my $finally = _pg_finally(sub {
         return unless $began;
         for my $attempt (1 .. 3) {
@@ -1951,7 +1972,8 @@ sub _guarded_read {
                         }
                         1;
                     };
-                    $failure = $@ unless $finished;
+                    # (Read at once: the undo below clears the handle's error.)
+                    $failure = $self->_transaction_control_error($@) unless $finished;
                 });
                 1;
             };
@@ -1962,12 +1984,17 @@ sub _guarded_read {
         # What cannot be ended is not left open, and the failure reaches the host (R72):
         # its savepoint rolled back to, else the connection closed. Never its ROLLBACK.
         unless ($finished) {
-            my %undo;
-            $self->_pg_control("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint", \%undo) if $savepoint;
-            unless ($undo{done}) {
-                my $dbh = $self->{dbh};
-                eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
+            my $dbh = $self->{dbh};
+            if ($savepoint) {
+                $self->_pg_control("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint", \%undo);
+            } elsif ((eval { $dbh->pg_ping } // 0) == 1) {
+                $undo{done} = 1;
+            } else {
+                # (The read's own transaction: DBI has given up on it, the server has not.)
+                $self->_pg_control('ROLLBACK', \%undo);
+                eval { $dbh->{AutoCommit} = 1; $dbh->{BegunWork} = 0 } if $undo{done};
             }
+            eval { local $dbh->{PrintError} = 0; $dbh->disconnect } unless $undo{done};
         }
     });
     $ok = eval {
@@ -1985,7 +2012,15 @@ sub _guarded_read {
             });
         }
         if ($hand) {
-            $self->{dbh}->do('SET LOCAL transaction_read_only = on');
+            # (Not DEFERRABLE: a read of the host's own must not wait for a safe snapshot.)
+            my $dbh = $self->{dbh};
+            my $read_only = eval {
+                local $dbh->{PrintError} = 0;
+                local $dbh->{RaiseError} = 1;
+                $dbh->do($savepoint ? 'SET LOCAL transaction_read_only = on' : 'SET TRANSACTION READ ONLY, NOT DEFERRABLE');
+                1;
+            };
+            die $self->normalize_error($@) unless $read_only;
         } else {
             {
                 local $self->{_selecto_reset_operation} = {};
@@ -1998,13 +2033,18 @@ sub _guarded_read {
         1;
     };
     $error = $ok ? undef : $@;
+    # (Read at once: a driver's error is the handle's until the next statement.)
+    $error = $self->normalize_error($error) if !$ok && !blessed($error) && "$error" =~ /\ADBD::/;
     die $error unless $began;
     $finally->run;
     # (A check that could not be made is not a change: it stands as itself.)
     die $self->_transaction_control_error($unknown) if $unknown;
-    die $self->_undo_failed($self->_transaction_control_error($failure // 'the read could not be ended')) if !$finished && $ok && !$changed;
+    if (!$finished && $ok && !$changed) {
+        my $ending = $self->_transaction_control_error($failure // 'the read could not be ended');
+        die($undo{done} ? $ending : $self->_undo_failed($ending));
+    }
     _session_changed() if $changed;
-    die($finished ? $error : $self->_undo_failed($error)) unless $ok;
+    die($finished || $undo{done} ? $error : $self->_undo_failed($error)) unless $ok;
     die $self->{_selecto_pg_interrupted} if defined $self->{_selecto_pg_interrupted};
     return $result;
 }
@@ -2036,7 +2076,9 @@ sub Selecto::PostgreSQL::Finally::DESTROY {
 # The host's timers wait while $work runs, so a statement that opens or ends something
 # and the knowledge of it cannot be parted by an alarm. A signal Perl has already taken
 # is delivered here, before $work starts, and one that arrives during it right after.
-# For short statements only: nothing here can be timed out by the host's alarm.
+# For short statements only: nothing here can be timed out by the host's alarm, unsafe
+# ones included, so a stalled server holds a host's timer until the statement ends. A
+# statement_timeout still applies, and production uses no alarm around reads.
 my $HOST_TIMERS;
 sub _pg_uninterrupted {
     my ($work) = @_;
@@ -2062,16 +2104,23 @@ sub _pg_uninterrupted {
 
 # One short statement that must run, once, whatever the host's alarm does. $state says
 # so, from inside: an alarm can land the moment this returns, and a savepoint released
-# twice fails the host's transaction.
+# twice fails the host's transaction. A cancel is tried again, by $again if given (a
+# cancelled RELEASE leaves the transaction failed, which only ROLLBACK TO repairs), and
+# stands in $state. 3B001 is a savepoint never taken, or gone already: there is nothing
+# to undo, and no reason to close.
 sub _pg_control {
-    my ($self, $sql, $state) = @_;
+    my ($self, $sql, $state, $again) = @_;
     my $dbh = $self->{dbh};
-    for my $attempt (1 .. 3) {
-        return if $state->{ran};
+    for my $attempt (1 .. 5) {
+        return if $state->{done} || ($state->{ran} && !$state->{cancelled});
         my $clean = eval {
             _pg_uninterrupted(sub {
                 $state->{ran} = 1;
-                $state->{done} = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do($sql); 1 };
+                $state->{done} = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do($state->{cancelled} ? $again // $sql : $sql); 1 };
+                my $code = $state->{done} ? '' : eval { $dbh->state } // '';
+                $state->{cancel} //= $self->normalize_error($@) if $code eq '57014';
+                $state->{done} = 1 if $code eq '3B001';
+                $state->{cancelled} = $code eq '57014' ? 1 : 0;
             });
             1;
         };
@@ -2102,7 +2151,8 @@ sub _pg_hold_relations {
         ? 'EXPLAIN (COSTS OFF, FORMAT JSON) ' . $source->sql : undef;
     my ($writes, $made, $held, %release);
     my $finally = _pg_finally(sub {
-        $self->_pg_control(($held && !$writes ? '' : "ROLLBACK TO SAVEPOINT $savepoint; ") . "RELEASE SAVEPOINT $savepoint", \%release) if $made;
+        $self->_pg_control(($held && !$writes ? '' : "ROLLBACK TO SAVEPOINT $savepoint; ") . "RELEASE SAVEPOINT $savepoint", \%release,
+            "ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint") if $made;
     });
     $held = eval {
         local $dbh->{PrintError} = 0;
@@ -2123,7 +2173,7 @@ sub _pg_hold_relations {
     my $state = $held ? '' : eval { $dbh->state } // '';
     die $failure unless $made;
     $finally->run;
-    die $self->_transaction_control_error($failure // 'the relation hold could not be released') unless $release{done};
+    die $failure // $release{cancel} // $self->_transaction_control_error('the relation hold could not be released') if !$release{done} || $release{cancel};
     die $failure if !$held && $state !~ /\A42/;
     # R72: a host takes row locks through its own driver: a read's would end with it.
     Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement that writes or locks rows cannot run on a read path',
@@ -2283,7 +2333,9 @@ for my $method (qw(compile preview_write execute_write execute_batch execute_gra
         my ($self, @args) = @_;
         return $self->_lint_scope(sub {
             # Before a write opens its transaction or savepoint (R65). A failed
-            # or busy connection is the write's own guard to refuse.
+            # or busy connection is the write's own guard to refuse. Read once for
+            # the whole operation, whatever it runs inside.
+            local $self->{_selecto_utf8_checked} = $self->{_selecto_utf8_checked} // 0;
             $self->_pg_require_utf8 if $method =~ /\Aexecute_/ && $self->_pg_session_checked
                 && $self->_connection_state =~ /\A(?:idle|intrans)\z/;
             return $self->$inherited(@args);
@@ -3078,11 +3130,15 @@ transaction, and the host can write between fetches. C<for_update> and
 C<for_share> reads cannot be read only: they are not, and inside the host's
 transaction they keep their savepoint's work, so their locks last.
 
-A hand-built statement given to C<execute_query> or C<stream_query> must be one
-statement beginning C<SELECT>, C<WITH>, C<VALUES> or C<TABLE>, or it refuses
-(C<query_rule_not_evaluable>, reason C<hand_built_not_a_read>). The transaction
-it runs in refuses anything that statement would write, in the host's transaction
-too, and a C<FOR UPDATE> in it with them.
+A hand-built statement given to C<execute_query> or C<stream_query> is the host's own
+code: never build one from end-user input. It must be one statement beginning
+C<SELECT>, C<WITH>, C<VALUES>, C<TABLE>, C<SHOW> or C<EXPLAIN>, or it refuses
+(C<query_rule_not_evaluable>, reason C<hand_built_not_a_read>). This stops honest
+mistakes, not evasion. It runs in the host's session, as the driver would run it: no
+pin, no relation or session guard, and the host's C<search_path> and settings apply.
+The transaction it runs in refuses anything that statement would write, in the host's
+transaction too, and a row lock in it with them. Only a C<client_encoding> that is not
+UTF8 refuses it besides. Selecto needs handles with C<< RaiseError => 1 >>.
 
 None of this weakens the host's transaction. Before the savepoint the read takes
 the transaction's first snapshot, so a C<SERIALIZABLE> host stays read-write to
