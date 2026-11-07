@@ -24,6 +24,10 @@ $admin->do($_) for @clean, 'CREATE TABLE ra_t (id INT PRIMARY KEY, org TEXT NOT 
 my $domain = Selecto::Domain->parse({schema_version => 1, name => 'RA', source => {source_table => 'ra_t', primary_key => 'id', tenant_field => 'org',
     fields => [qw(id org)], columns => {id => {type => 'integer'}, org => {type => 'string'}}, associations => {}}, schemas => {}, joins => {}});
 my $serial = 0;
+# (A one-shot timer can go off as the host cancels it: that is the host's to allow for,
+# and it must not end this test. It is counted, and it never touches the handle.)
+my $late = 0;
+$SIG{ALRM} = sub { $late++ };
 for my $mode (qw(alone host)) {
     for my $route (qw(read hand-built stream bounded)) {
         my $dbh = TestPostgreSQL->connect;
@@ -61,6 +65,7 @@ for my $mode (qw(alone host)) {
         $dbh->disconnect;
     }
 }
+note "alarms that arrived after the host stopped waiting: $late";
 $admin->do($_) for @clean;
 $admin->disconnect;
 done_testing;
