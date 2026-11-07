@@ -205,15 +205,24 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
         my $noisy_engine = Selecto::Engine->new(adapter => $adapter, domain => $noisy);
         my $flood = Selecto::Domain->new(name => 'Flood', table => 'selecto_limit_flood', fields => {id => 'integer', w => 'integer'});
         my $flood_engine = Selecto::Engine->new(adapter => $adapter, domain => $flood);
+        # MySQL lets only SESSION_VARIABLES_ADMIN set it. A role without that keeps 1024
+        # warnings, so a read past them cannot be verified: refused as that, never as cut.
+        my $lifts = $mariadb || eval { $dbh->do('SET SESSION max_error_count = DEFAULT'); 1 };
+        my $cut = $lifts ? 'query_error/result_incomplete/length_limit' : 'query_error/result_unverified/warnings_unread';
         for my $cap ('DEFAULT', 0) {
-            $dbh->do("SET SESSION max_error_count = $cap");
-            is scalar @{$noisy_engine->all($noisy_engine->query->select('id', 'w'))->{rows}}, $CHAIN, "cap $cap: harmless warnings past the cap do not refuse a read";
-            is failure(sub { $noisy_engine->all($noisy_engine->query->select('id', 'w', 'b')) }), 'query_error/result_incomplete/length_limit',
+            if ($cap ne 'DEFAULT' && !eval { $dbh->do("SET SESSION max_error_count = $cap"); 1 }) {
+                note "cap $cap: this role cannot set max_error_count";
+                next;
+            }
+            is failure(sub { $noisy_engine->all($noisy_engine->query->select('id', 'w')) }),
+                $lifts ? 'ok' : 'query_error/result_unverified/warnings_unread', "cap $cap: harmless warnings past the cap: "
+                . ($lifts ? 'answered' : 'unverified for this role');
+            is failure(sub { $noisy_engine->all($noisy_engine->query->select('id', 'w', 'b')) }), $cut,
                 "cap $cap: a cut behind $CHAIN harmless warnings is refused";
             is failure(sub { my $s = $noisy_engine->stream($noisy_engine->query->select('id', 'w', 'b')); 1 while $s->next; $s->close }),
-                'query_error/result_incomplete/length_limit', "cap $cap: and so is a streamed one";
+                $cut, "cap $cap: and so is a streamed one";
         }
-        $dbh->do('SET SESSION max_error_count = DEFAULT');
+        eval { $dbh->do('SET SESSION max_error_count = DEFAULT') };
         is failure(sub { $flood_engine->all($flood_engine->query->select('id', 'w')) }), 'query_error/result_unverified/warnings_unread',
             'more warnings than any cap can keep cannot be proved clean: refused as unverified';
         unlike eval { $flood_engine->all($flood_engine->query->select('id', 'w')); '' } // $@->message, qr/\bcut\b/,
