@@ -15,15 +15,15 @@ plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
 my $admin = TestPostgreSQL->connect;
 $admin->do('SET client_min_messages TO warning');
 my %mine;
-for my $extension (qw(citext hstore pg_trgm pgcrypto cube)) {
+for my $extension (qw(citext hstore pg_trgm pgcrypto cube lo)) {
     next if ($admin->selectrow_array('SELECT count(*) FROM pg_extension WHERE extname = ?', undef, $extension))[0];
     plan skip_all => "$extension cannot be installed" unless eval { $admin->do(qq{CREATE EXTENSION "$extension"}); 1 };
     $mine{$extension} = 1;
 }
 my @clean = ('DROP TABLE IF EXISTS public.fr_t, public.fr_u CASCADE', 'DROP FUNCTION IF EXISTS public.fr_host(int)');
 END { eval { $admin->do($_) for @clean; $admin->do(qq{DROP EXTENSION IF EXISTS "$_" CASCADE}) for keys %mine } }
-$admin->do($_) for @clean, 'CREATE TABLE public.fr_t (id INT PRIMARY KEY, ci citext, tx TEXT, vc VARCHAR(10), h hstore, n INT)',
-    q{INSERT INTO public.fr_t VALUES (1, 'Gold', 'Gold', 'a', 'a=>1, b=>2', 1), (2, 'GOLD', 'x', 'b', 'a=>3', 2)},
+$admin->do($_) for @clean, 'CREATE TABLE public.fr_t (id INT PRIMARY KEY, ci citext, tx TEXT, vc VARCHAR(10), h hstore, n INT, l lo)',
+    q{INSERT INTO public.fr_t VALUES (1, 'Gold', 'Gold', 'a', 'a=>1, b=>2', 1, 101), (2, 'GOLD', 'x', 'b', 'a=>3', 2, 102)},
     'CREATE TABLE public.fr_u (id INT PRIMARY KEY, vc VARCHAR(10))', q{INSERT INTO public.fr_u VALUES (1, 'a'), (2, 'z')},
     q{CREATE FUNCTION public.fr_host(i int) RETURNS int LANGUAGE sql AS $$ SELECT i $$};
 my $dbh = TestPostgreSQL->connect;
@@ -53,6 +53,8 @@ for my $sql (
     q{SELECT id FROM public.fr_t WHERE strpos(ci, 'O') > 0 ORDER BY 1},
     q{SELECT id FROM public.fr_t WHERE replace(ci, 'O', 'x') = 'gxld' ORDER BY 1},
     q{SELECT min(DISTINCT ci) FROM public.fr_t},
+    q{SELECT min(l) FROM public.fr_t},
+    q{SELECT max(l) FROM public.fr_t},
     q{SELECT public.fr_host(1) FROM public.fr_t WHERE id = 1},
     q{SELECT fr_host(1) FROM public.fr_t WHERE id = 1},
     q{SELECT a.id FROM public.fr_t a JOIN public.fr_u b USING (vc) ORDER BY 1},
