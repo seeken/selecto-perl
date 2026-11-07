@@ -90,6 +90,7 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_limit_rows',
                 assignments => {name => $_[0]}, predicate => $x->lte('id', 5), expected_count => 5));
         };
+        $dbh->do("DROP VIEW IF EXISTS selecto_limit_$_") for qw(noisy flood);
         my $hand = sub {
             scalar @{$adapter->execute_query(Selecto::Statement->new(sql => 'SELECT id FROM selecto_limit_rows',
                 columns => ['id'], adapter_name => $backend))->{rows}};
@@ -170,7 +171,7 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             my $body = 'y' x 100_000;
             $dbh->do('INSERT INTO selecto_limit_items VALUES (?, 2, ?)', undef, 1000 + $_, $body) for 1 .. 1 + int($packet / length $body);
             is failure(sub { $order_engine->all($order_engine->query->select('id', $x->related_collection('items', ['id', 'label'])->as('c'))
-                ->where($x->eq('id', 2))) }), 'query_error/result_incomplete/aggregate_length', 'an aggregate past the packet is refused';
+                ->where($x->eq('id', 2))) }), 'query_error/result_incomplete/length_limit', 'an aggregate past the packet is refused';
         }
         $dbh->do('SET SESSION group_concat_max_len = DEFAULT');
 
@@ -187,8 +188,35 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
                 owner_key => 'id', related_key => 'order_id', cardinality => 'many', join_type => 'left'}});
         my $wide_engine = Selecto::Engine->new(adapter => $adapter, domain => $wide);
         like failure(sub { $wide_engine->all($wide_engine->query->select('id', $x->related_collection('items', ['id', @wide])->as('c'))->where($x->eq('id', 1))) }),
-            $mariadb ? qr{\Aquery_error/result_incomplete/aggregate_length\z} : qr{\Aquery_error/}, 'a collection child past the packet refuses';
+            $mariadb ? qr{\Aquery_error/result_incomplete/length_limit\z} : qr{\Aquery_error/}, 'a collection child past the packet refuses';
         $dbh->do('DROP TABLE selecto_limit_wide');
+
+        # The server keeps max_error_count warnings. A cut must not hide behind harmless
+        # ones, and harmless ones must not refuse a good read, whatever the host's cap.
+        my $big = $packet + 1_000_000;
+        $dbh->do("CREATE VIEW selecto_limit_noisy AS SELECT id, CAST(CONCAT('x', id) AS SIGNED) AS w,
+            CASE WHEN id = $CHAIN THEN REPEAT('y', $big) END AS b FROM selecto_limit_rows");
+        $dbh->do('CREATE VIEW selecto_limit_flood AS SELECT a.id, CAST(CONCAT(\'x\', a.id) AS SIGNED) AS w
+            FROM selecto_limit_rows a CROSS JOIN (SELECT id FROM selecto_limit_rows WHERE id <= 50) b');
+        my $noisy = Selecto::Domain->new(name => 'Noisy', table => 'selecto_limit_noisy', fields => {id => 'integer', w => 'integer', b => 'string'});
+        my $noisy_engine = Selecto::Engine->new(adapter => $adapter, domain => $noisy);
+        my $flood = Selecto::Domain->new(name => 'Flood', table => 'selecto_limit_flood', fields => {id => 'integer', w => 'integer'});
+        my $flood_engine = Selecto::Engine->new(adapter => $adapter, domain => $flood);
+        for my $cap ('DEFAULT', 0) {
+            $dbh->do("SET SESSION max_error_count = $cap");
+            is scalar @{$noisy_engine->all($noisy_engine->query->select('id', 'w'))->{rows}}, $CHAIN, "cap $cap: harmless warnings past the cap do not refuse a read";
+            is failure(sub { $noisy_engine->all($noisy_engine->query->select('id', 'w', 'b')) }), 'query_error/result_incomplete/length_limit',
+                "cap $cap: a cut behind $CHAIN harmless warnings is refused";
+            is failure(sub { my $s = $noisy_engine->stream($noisy_engine->query->select('id', 'w', 'b')); 1 while $s->next; $s->close }),
+                'query_error/result_incomplete/length_limit', "cap $cap: and so is a streamed one";
+        }
+        $dbh->do('SET SESSION max_error_count = DEFAULT');
+        is failure(sub { $flood_engine->all($flood_engine->query->select('id', 'w')) }), 'query_error/result_incomplete/warnings_unread',
+            'more warnings than any cap can keep cannot be proved clean: refused';
+        is +($adapter->execute_query(Selecto::Statement->new(sql => 'SELECT COUNT(b) FROM selecto_limit_noisy', columns => ['n'], adapter_name => $backend))->{rows}[0][0]), 0,
+            'a hand-built read keeps its own warnings';
+        $dbh->do('DROP VIEW selecto_limit_flood');
+        $dbh->do('DROP VIEW selecto_limit_noisy');
 
         # Every pin must be valid where a bad one is an error, and leave the host no warning.
         my ($mode) = $dbh->selectrow_array('SELECT @@SESSION.sql_mode LIMIT 1');
