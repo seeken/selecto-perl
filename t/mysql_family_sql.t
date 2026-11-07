@@ -215,4 +215,19 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
     }
 }
 
+# The hint that lifts max_error_count belongs on the main query block.
+{
+    my $hint = '/*+ SET_VAR(max_error_count=65535) */';
+    my %lifted = (
+        'SELECT 1' => "SELECT $hint 1",
+        'WITH c AS (SELECT 1 AS a) SELECT a FROM c' => "WITH c AS (SELECT 1 AS a) SELECT $hint a FROM c",
+        'WITH RECURSIVE c (n) AS (SELECT 1 UNION ALL SELECT n FROM c) SELECT n FROM c' => "WITH RECURSIVE c (n) AS (SELECT 1 UNION ALL SELECT n FROM c) SELECT $hint n FROM c",
+        '(SELECT 1) UNION ALL (SELECT 2)' => "(SELECT $hint 1) UNION ALL (SELECT 2)",
+        'WITH `select` AS (SELECT 1 AS a) SELECT a FROM `select`' => "WITH `select` AS (SELECT 1 AS a) SELECT $hint a FROM `select`",
+        q{WITH c AS (SELECT ')' AS a) SELECT a FROM c} => qq{WITH c AS (SELECT ')' AS a) SELECT $hint a FROM c},
+        'WITH c AS (SELECT 1 AS a) (SELECT a FROM c)' => 'WITH c AS (SELECT 1 AS a) (SELECT a FROM c)',
+    );
+    is Selecto::MySQLFamily::_lift_warning_cap($_), $lifted{$_}, "lifted: $_" for sort keys %lifted;
+}
+
 done_testing;

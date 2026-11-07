@@ -25,14 +25,35 @@ use Scalar::Util qw(blessed refaddr);
 # there on its own, so the limit fits that depth. One that does not keeps a bound,
 # not the maximum: a cycle in the data would run until something stopped it, and
 # this answers deep hierarchies and stops a cycle in a known number of steps. What
-# is still cut is refused by _result_cut, never answered. (Every value here must be
+# is still cut is refused by _result_cut, never answered: which is why the server
+# must keep every warning, not the 64 it keeps by default. (Every value here must be
 # valid on the server: past its range one is an error under a strict sql_mode.)
+my $WARNING_CAP = 65_535;
 my $MARIADB_STATEMENT = q{SET STATEMENT optimizer_switch='subquery_cache=off', }
     . q{sql_select_limit=18446744073709551615, group_concat_max_len=1073741824, }
-    . q{max_recursive_iterations=};
+    . qq{max_error_count=$WARNING_CAP, max_recursive_iterations=};
+# MySQL's way to the same end, on a generated read's main query block.
+my $MYSQL_LIFT = "/*+ SET_VAR(max_error_count=$WARNING_CAP) */";
 my $MARIADB_RECURSION = 10_000;
 my $MARIADB_RECURSION_MAX = 4_294_967_295;
 my $CONTROL_ATTEMPTS = 5;
+
+# After the main SELECT: the first outside any parentheses past a WITH list, or the
+# very first otherwise (a parenthesized union carries the hint in its first block).
+# With none found the text goes as it is, and _result_cut does not count on the lift.
+sub _lift_warning_cap {
+    my ($sql) = @_;
+    my $with = $sql =~ /\A\s*WITH\b/i;
+    my $depth = 0;
+    while ($sql =~ /\G(?:\s+|`(?:[^`]|``)*`|'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*"|(\()|(\))|(\w+)|.)/gs) {
+        $depth++ if defined $1;
+        $depth-- if defined $2;
+        next unless defined($3) && uc($3) eq 'SELECT' && (!$with || !$depth);
+        substr($sql, pos($sql), 0) = " $MYSQL_LIFT";
+        return $sql;
+    }
+    return $sql;
+}
 
 sub _statement_sql {
     my ($self, $sql, $depth) = @_;
@@ -46,8 +67,9 @@ sub _statement_sql {
 # A host's hand-built statement goes as written (R68).
 sub _query_transport_sql {
     my ($self, $statement) = @_;
-    return Selecto::SQL::_hand_built($statement) ? $statement->sql
-        : $self->_statement_sql($statement->sql, $statement->{_selecto_recursion_depth});
+    return $statement->sql if Selecto::SQL::_hand_built($statement);
+    return _lift_warning_cap($statement->sql) if $self->name eq 'mysql';
+    return $self->_statement_sql($statement->sql, $statement->{_selecto_recursion_depth});
 }
 
 # R71: a hand-built read runs in the host's session, whatever that session's time zone
@@ -3102,7 +3124,9 @@ sub _hand_built_may_write {
     unless ($ok) {
         my $failure = $self->normalize_error($@);
         die $failure if !blessed($failure) || ($failure->details->{category} // '') eq 'query_canceled';
-        return 1;
+        # EXPLAIN cannot answer for every role (1345: a view without SHOW VIEW). The
+        # main verb still can, and that is as far as this check goes (R73).
+        return $self->SUPER::_hand_built_may_write($sql, $statement);
     }
     return scalar grep { /\A(?:UPDATE|DELETE|INSERT|REPLACE)\b/i } @types;
 }
@@ -3472,7 +3496,8 @@ sub _execute_statement {
     my $state = $self->{_selecto_write_session};
     $self->_check_session_state($state) if ref($state) eq 'ARRAY' && (eval { $sth->{Statement} } // '') =~ $DML;
     Selecto::Error->throw('query_error', 'the server cut the result short', {cause => 'database_error',
-        category => 'result_incomplete', reason => $cut->[1] == $CUT_RECURSION ? 'recursion_limit' : 'aggregate_length'}) if $cut;
+        category => 'result_incomplete', reason => $cut->[1] == $CUT_RECURSION ? 'recursion_limit'
+            : $cut->[1] ? 'length_limit' : 'warnings_unread'}) if $cut;
     return $result;
 }
 
@@ -3481,14 +3506,20 @@ sub _execute_statement {
 # max_allowed_packet (1301), which turns one child of a collection into null. A
 # generated statement must not answer with that. A hand-built one goes as written,
 # under the host's settings, and its result is the host's. The warning count comes
-# with the result, so a statement with no warnings costs nothing here.
+# with the result, so a statement with no warnings costs nothing here. Where the cap
+# was lifted, a count the rows do not reach means one could be hiding: refused. Where
+# it was not, harmless warnings past the cap prove nothing, so they do not refuse.
 sub _result_cut {
     my ($self, $sth) = @_;
-    return undef if $self->{_selecto_host_text} || !(eval { $sth->{mariadb_warning_count} } // 0);
+    my $count = eval { $sth->{mariadb_warning_count} } // 0;
+    return undef if $self->{_selecto_host_text} || !$count;
     my $dbh = $self->{dbh};
     my $warnings = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->selectall_arrayref('SHOW WARNINGS') };
     die $self->normalize_error($@) unless $warnings;
-    return (grep { $_->[1] == $CUT_RECURSION || $_->[1] == 1260 || $_->[1] == 1301 } @$warnings)[0];
+    my ($cut) = grep { $_->[1] == $CUT_RECURSION || $_->[1] == 1260 || $_->[1] == 1301 } @$warnings;
+    return $cut if $cut;
+    my $lifted = $self->name eq 'mariadb' || (eval { $sth->{Statement} } // '') =~ /\Q$MYSQL_LIFT\E/;
+    return $lifted && ($count >= $WARNING_CAP || $count > @$warnings) ? ['', 0] : undef;
 }
 
 # Runs $work with the session verified once for the whole call, so reads and
