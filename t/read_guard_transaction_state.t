@@ -213,10 +213,18 @@ subtest 'PostgreSQL 18f: a transaction the host took over is never rolled back' 
     }
 };
 
-subtest 'PostgreSQL 18g: a cleanup that leaves the host transaction aborted always raises' => sub {
+subtest 'PostgreSQL 18g: a cleanup that cannot finish never ends in a false OK' => sub {
     no warnings 'redefine';
-    my $original_do = \&Selecto::PostgreSQL::Stream::_do;
-    my $original_savepoint = \&Selecto::SQL::_savepoint_command;
+    my $native = \&DBD::Pg::db::do;
+    my $timing_out = sub {
+        my ($times) = @_;
+        return sub {
+            my ($handle, $sql) = @_;
+            return $native->(@_) unless defined($sql) && $sql =~ /\ACLOSE / && $times-- > 0;
+            $native->($handle, q{SET LOCAL statement_timeout = '20ms'});
+            return $native->($handle, 'SELECT pg_sleep(0.2)');
+        };
+    };
     # The stream's own close statement times out: its own failure, undone by
     # its savepoint, so the host's transaction and earlier write survive.
     $reset->();
@@ -225,12 +233,7 @@ subtest 'PostgreSQL 18g: a cleanup that leaves the host transaction aborted alwa
     my $open = $stream->();
     $open->next;
     {
-        local *Selecto::PostgreSQL::Stream::_do = sub {
-            my ($handle, $sql) = @_;
-            return $original_do->(@_) unless $sql =~ /\ACLOSE /;
-            $handle->do(q{SET LOCAL statement_timeout = '20ms'});
-            $handle->do('SELECT pg_sleep(0.2)');
-        };
+        local *DBD::Pg::db::do = $timing_out->(1);
         is(code_of(sub { $open->close }), 'ok', 'a close-time timeout of the stream\'s own is recovered');
     }
     is($dbh->pg_ping, 3, 'the host transaction is healthy, not silently aborted');
@@ -238,40 +241,34 @@ subtest 'PostgreSQL 18g: a cleanup that leaves the host transaction aborted alwa
     $dbh->commit;
     is_deeply($committed->(), [1, 2, 100], 'and the host\'s earlier and later writes commit');
 
-    # The same timeout when the savepoint cannot be rolled back: the
-    # transaction stays aborted, so close must say so.
+    # The same timeout when its savepoint cannot be rolled back: the connection goes,
+    # so that a COMMIT fails rather than reports success.
     for my $abandon (0, 1) {
         $reset->();
-        $dbh->begin_work;
-        $insert->(1);
-        $open = $stream->();
-        $open->next;
+        my $own = $connect->();
+        my $own_adapter = Selecto::PostgreSQL->new(dbh => $own);
+        $own->begin_work;
+        $own->do("INSERT INTO $table VALUES (1, 'host 1')");
+        my $held = $own_adapter->stream_query(statement('SELECT n FROM generate_series(1,5) n'), bounded => 1);
+        $held->next;
         my @warnings;
+        my $how = $abandon ? 'abandoned' : 'closed';
         {
             local $SIG{__WARN__} = sub { push @warnings, @_ };
-            local *Selecto::PostgreSQL::Stream::_do = sub {
-                my ($handle, $sql) = @_;
-                return $original_do->(@_) unless $sql =~ /\ACLOSE /;
-                $handle->do(q{SET LOCAL statement_timeout = '20ms'});
-                $handle->do('SELECT pg_sleep(0.2)');
-            };
-            local *Selecto::PostgreSQL::_savepoint_command = sub {
-                die "savepoint rollback refused\n" if $_[1] eq 'rollback';
-                return $original_savepoint->(@_);
+            my $close = $timing_out->(1000);
+            local *DBD::Pg::db::do = sub {
+                die "savepoint rollback refused\n" if defined($_[1]) && $_[1] =~ /\AROLLBACK TO SAVEPOINT selecto_stream/;
+                return $close->(@_);
             };
             if ($abandon) {
-                undef $open;
+                undef $held;
             } else {
-                is(code_of(sub { $open->close }), 'stream_cleanup_failed', 'close raises a typed error');
+                is(code_of(sub { $held->close }), 'stream_cleanup_failed', 'close raises a typed error');
             }
         }
-        my $how = $abandon ? 'abandoned' : 'closed';
         like("@warnings", qr/bounded stream abandoned/, "$how: abandonment warns") if $abandon;
-        is($dbh->pg_ping, 4, "$how: the host can see its transaction is aborted");
-        ok($dbh->{private_selecto_bounded_stream_poisoned}, "$how: the handle refuses further bounded streams");
-        is(code_of(sub { Selecto::BoundedQuery->all($engine, $page) }), 'transaction_state_unsafe',
-            "$how: and every later guard refuses");
-        $dbh->rollback;
+        ok(!$own->{Active}, "$how: the connection is closed");
+        ok(!eval { $own->do('SELECT 1'); 1 }, "$how: the host's next statement fails");
         is_deeply($committed->(), [100], "$how: nothing was committed behind the host's back");
     }
     $reset->();

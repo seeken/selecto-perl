@@ -115,7 +115,7 @@ sub session_row {
     # VERSION() first: a MariaDB adapter's statements carry its SET STATEMENT
     # prefix, and the server family must match the adapter's.
     return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'), 'UTC', 'UTC', 'utf8mb4', 'utf8mb4', 'utf8mb4', 'STRICT_TRANS_TABLES', "\x{1F600}",
-        '2024-03-10 02:30:00.500000', ($sql =~ /\@\@SESSION\.transaction_read_only\z/ ? (1, 0) : ()));
+        '2024-03-10 02:30:00.500000', ($sql =~ /\@\@SESSION\.transaction_read_only(?:, \@\@SESSION\.system_versioning_asof)?\z/ ? (1, 0) : ()));
 }
 sub events     { return [@{$_[0]->{events}}]; }
 

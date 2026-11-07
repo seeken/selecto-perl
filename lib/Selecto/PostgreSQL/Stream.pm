@@ -240,7 +240,7 @@ sub _close {
         $ran = 1;
         $self->{closed} = 1;
         # A disconnected handle has already lost its server cursor/transaction.
-        return unless $dbh->{Active} && $self->{scope};
+        $finished = 1, return unless $dbh->{Active} && $self->{scope};
         if ((defined($failure) && $failure eq 'foreign') || eval { $dbh->{pg_async_status} }) {
             $unsafe = 'the host aborted or took over the transaction while the stream was open';
         } elsif ($self->{scope} eq 'own') {

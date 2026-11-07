@@ -346,7 +346,7 @@ sub normalize_error {
     # (DBI's restore after a failed rollback clears the handle: the text is what is left.)
     return Selecto::Error->new(code => 'query_error', message => 'Execution failed',
         details => {cause => 'database_error', sqlstate => '57014', category => 'query_canceled'})
-        if $state eq '' && $text =~ /\bcanceling statement due to\b/;
+        if $state eq '' && $text =~ /\ADBD::Pg::\w+ \w+ failed: ERROR:\s+canceling statement due to (?:user request|statement timeout)\b/;
     if ($state eq '23502' || $text =~ /null value in column "[^"]+"[^\n]*violates not-null constraint/i) {
         my ($field) = $text =~ /null value in column "([A-Za-z_][A-Za-z0-9_]*)"/i;
         my ($relation) = $text =~ /relation "([A-Za-z_][A-Za-z0-9_]*)"/i;
