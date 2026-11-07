@@ -16,7 +16,18 @@ use Scalar::Util qw(blessed refaddr);
 # result computed for 't7' when the outer row holds 'T7' or 't7 '. Every
 # statement the library sends to MariaDB turns the cache off for that
 # statement only (the host's session is unchanged).
-my $MARIADB_STATEMENT = q{SET STATEMENT optimizer_switch='subquery_cache=off' FOR };
+#
+# The rest are settings that cut an answer short with no error. A host's
+# sql_select_limit stops any statement without a LIMIT of its own, catalog reads
+# included. group_concat_max_len cuts JSON_ARRAYAGG to valid JSON that is merely
+# short (this is the server's maximum; max_allowed_packet still bounds it). The
+# recursion limit is 1000 by default. It is bounded, not the maximum, because a
+# cycle in the data then runs until something stops it: this bound answers deep
+# hierarchies and stops a cycle in a known number of steps. What is still cut at
+# these values is refused by _result_cut, never answered.
+my $MARIADB_STATEMENT = q{SET STATEMENT optimizer_switch='subquery_cache=off', }
+    . q{sql_select_limit=18446744073709551615, group_concat_max_len=1073741824, }
+    . q{max_recursive_iterations=10000 FOR };
 my $CONTROL_ATTEMPTS = 5;
 
 sub _statement_sql {
@@ -36,7 +47,7 @@ sub _hand_built_session {
     my ($self) = @_;
     my $dbh = $self->{dbh};
     my $autocommit;
-    my $ok = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; ($autocommit) = $dbh->selectrow_array('SELECT @@SESSION.autocommit'); 1 };
+    my $ok = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; ($autocommit) = $dbh->selectrow_array('SELECT @@SESSION.autocommit LIMIT 1'); 1 };
     die $self->normalize_error($@) unless $ok;
     return [undef, undef, $autocommit];
 }
@@ -3027,7 +3038,7 @@ sub _in_step {
     return 1 unless eval { $dbh->isa('DBI::db') };
     my $mark = sprintf('selecto_step_%d_%d', $$, int(rand(1e9)));
     for my $attempt (1 .. $CONTROL_ATTEMPTS) {
-        my ($answer) = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->selectrow_array("SELECT '$mark'") };
+        my ($answer) = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->selectrow_array("SELECT '$mark' LIMIT 1") };
         return 1 if defined($answer) && $answer eq $mark;
         return 0 unless (eval { $dbh->err } // 0) eq '1317';
     }
@@ -3348,7 +3359,8 @@ sub _require_session {
         @row = $dbh->selectrow_array($self->_statement_sql('SELECT VERSION(), @@SESSION.time_zone, @@system_time_zone, '
             . '@@SESSION.character_set_client, @@SESSION.character_set_connection, @@SESSION.character_set_results, '
             . q{@@SESSION.sql_mode, CONVERT(X'F09F9880' USING utf8mb4), CAST('2024-03-10 02:30:00.5' AS DATETIME(6))}
-            . ', @@SESSION.autocommit, @@SESSION.transaction_read_only' . ($mariadb ? ', @@SESSION.system_versioning_asof' : '')));
+            . ', @@SESSION.autocommit, @@SESSION.transaction_read_only, @@SESSION.sql_select_limit'
+            . ($mariadb ? ', @@SESSION.system_versioning_asof' : '') . ' LIMIT 1'));
         1;
     };
     unless ($ok) {
@@ -3361,7 +3373,7 @@ sub _require_session {
         }
         die $self->normalize_error($error);
     }
-    my ($version, $zone, $system, $client, $connection, $results, $mode, $text, $datetime, $autocommit, $read_only, $asof) = @row;
+    my ($version, $zone, $system, $client, $connection, $results, $mode, $text, $datetime, $autocommit, $read_only, $select_limit, $asof) = @row;
     # A MySQL adapter on a MariaDB server (or the reverse) would compile the
     # other server's dialect: MariaDB statements without the subquery-cache
     # prefix, MySQL statements with MariaDB-only syntax.
@@ -3370,6 +3382,10 @@ sub _require_session {
     # has since moved to another tenant answers as this one's.
     $refuse->('session_system_versioning_asof', 'MariaDB sessions must not set system_versioning_asof')
         if defined($asof) && uc("$asof") ne 'DEFAULT';
+    # MySQL has no statement pin to hold it off, and a limited session answers a read
+    # short with no error. (On MariaDB the pin is in force and this reads the pin.)
+    $refuse->('session_sql_select_limit', 'MySQL sessions must not set sql_select_limit')
+        if !$mariadb && defined($select_limit) && "$select_limit" ne '18446744073709551615';
     $refuse->('session_time_zone', 'MySQL-family sessions must use the UTC time zone')
         unless defined($zone) && ($UTC_ZONES{$zone}
             || ($zone eq 'SYSTEM' && defined($system) && ($system eq 'UTC' || $system eq '+00:00')));
@@ -3418,7 +3434,7 @@ sub _check_session_state {
     return unless ref($state) eq 'ARRAY';
     my $dbh = $self->{dbh};
     my @now;
-    my $ok = eval { local $dbh->{PrintError} = 0; @now = $dbh->selectrow_array('SELECT @@SESSION.time_zone, @@SESSION.sql_mode'); 1 };
+    my $ok = eval { local $dbh->{PrintError} = 0; @now = $dbh->selectrow_array('SELECT @@SESSION.time_zone, @@SESSION.sql_mode LIMIT 1'); 1 };
     die $self->normalize_error($@) unless $ok;
     # (No row, as from a handle without RaiseError that failed, is a change.)
     return if @now == 2 && defined($now[0]) && defined($now[1]) && $now[0] eq $state->[0] && $now[1] eq $state->[1];
@@ -3439,9 +3455,27 @@ my $DML = qr/\A\s*(?:\Q$MARIADB_STATEMENT\E)?\s*(?:INSERT|UPDATE|DELETE|REPLACE)
 sub _execute_statement {
     my ($self, $sth, $params) = @_;
     my $result = $self->SUPER::_execute_statement($sth, $params);
+    # (Warnings first: the session comparison is a statement, and would clear them.)
+    my $cut = defined($result) ? $self->_result_cut($sth) : undef;
     my $state = $self->{_selecto_write_session};
     $self->_check_session_state($state) if ref($state) eq 'ARRAY' && (eval { $sth->{Statement} } // '') =~ $DML;
+    Selecto::Error->throw('query_error', 'the server cut the result short', {cause => 'database_error',
+        category => 'result_incomplete', reason => $cut->[1] == 1931 ? 'recursion_limit' : 'aggregate_length'}) if $cut;
     return $result;
+}
+
+# MariaDB reports a result it cut only as a warning: 1931 past the recursion limit,
+# 1260 an aggregate past its length. A generated statement must not answer with
+# that. A hand-built one goes as written, under the host's settings, and its result
+# is the host's. A statement with no warnings costs nothing here.
+sub _result_cut {
+    my ($self, $sth) = @_;
+    return undef unless $self->name eq 'mariadb' && (eval { $sth->{mariadb_warning_count} } // 0) > 0;
+    return undef unless (eval { $sth->{Statement} } // '') =~ /\A\Q$MARIADB_STATEMENT\E/;
+    my $dbh = $self->{dbh};
+    my $warnings = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->selectall_arrayref('SHOW WARNINGS') };
+    die $self->normalize_error($@) unless $warnings;
+    return (grep { $_->[1] == 1931 || $_->[1] == 1260 } @$warnings)[0];
 }
 
 # Runs $work with the session verified once for the whole call, so reads and

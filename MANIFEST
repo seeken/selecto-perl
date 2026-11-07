@@ -71,6 +71,7 @@ lib/Selecto/SQLite/UpsertCandidate.pm
 lib/Selecto/SQLite/UpsertIndependence.pm
 t/json_encoders_nonref.t
 t/limits_lookup.t
+t/mysql_session_limits_live.t
 t/scalar_admission_v2_live.t
 t/update_post_image_live.t
 t/update_post_image_tenant_pin_live.t

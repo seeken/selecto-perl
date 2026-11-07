@@ -108,14 +108,14 @@ sub selectrow_array {
 }
 sub session_query { return $_[0] =~ /SELECT VERSION\(\), \@\@SESSION\.time_zone\b/ ? 1 : 0; }
 # The MySQL-family session comparison after reads and writes: unchanged.
-sub state_query { return $_[0] eq 'SELECT @@SESSION.time_zone, @@SESSION.sql_mode' ? 1 : 0; }
+sub state_query { return $_[0] eq 'SELECT @@SESSION.time_zone, @@SESSION.sql_mode LIMIT 1' ? 1 : 0; }
 sub session_state { return ('UTC', 'STRICT_TRANS_TABLES'); }
 sub session_row {
     my ($sql) = @_;
     # VERSION() first: a MariaDB adapter's statements carry its SET STATEMENT
     # prefix, and the server family must match the adapter's.
     return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'), 'UTC', 'UTC', 'utf8mb4', 'utf8mb4', 'utf8mb4', 'STRICT_TRANS_TABLES', "\x{1F600}",
-        '2024-03-10 02:30:00.500000', ($sql =~ /\@\@SESSION\.transaction_read_only(?:, \@\@SESSION\.system_versioning_asof)?\z/ ? (1, 0) : ()));
+        '2024-03-10 02:30:00.500000', ($sql =~ /\@\@SESSION\.transaction_read_only, \@\@SESSION\.sql_select_limit(?:, \@\@SESSION\.system_versioning_asof)? LIMIT 1\z/ ? (1, 0, '18446744073709551615') : ()));
 }
 sub events     { return [@{$_[0]->{events}}]; }
 

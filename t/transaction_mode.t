@@ -183,10 +183,10 @@ package RecordingDBH {
             push @{$self->{events}}, 'SESSION';
             # VERSION() of the adapter's own server family comes first.
             return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'),
-                @{$self->{session}}[0 .. ($sql =~ /\@\@SESSION\.transaction_read_only(?:, \@\@SESSION\.system_versioning_asof)?\z/ ? 9 : 7)]);
+                @{$self->{session}}[0 .. ($sql =~ /\@\@SESSION\.transaction_read_only, \@\@SESSION\.sql_select_limit(?:, \@\@SESSION\.system_versioning_asof)? LIMIT 1\z/ ? 9 : 7)]);
         }
         # The session comparison after reads and writes: unchanged.
-        if (defined($self->{session}) && $sql eq 'SELECT @@SESSION.time_zone, @@SESSION.sql_mode') {
+        if (defined($self->{session}) && $sql eq 'SELECT @@SESSION.time_zone, @@SESSION.sql_mode LIMIT 1') {
             push @{$self->{events}}, 'STATE';
             return @{$self->{session}}[0, 5];
         }
