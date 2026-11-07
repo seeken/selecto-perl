@@ -248,8 +248,22 @@ sub _close {
             if (defined($unsafe) && $unsafe eq 'unknown') {
                 ($unsafe, $broken, $cancelled) = (undef, 1, 1);
             } elsif (!$unsafe) {
-                # A read-only stream never commits work on behalf of its caller.
-                $dbh->rollback or die 'stream transaction rollback failed';
+                # A read-only stream never commits work on behalf of its caller. A cancel
+                # can land on the ROLLBACK itself: DBI then counts the transaction over,
+                # the server does not. So, as a read does, it is tried again as a
+                # statement, and a cancel that stops even that stays a cancel.
+                unless (eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->rollback }) {
+                    my $state = eval { $dbh->state } // '';
+                    my $rolled;
+                    for my $attempt (1 .. 5) {
+                        last if $rolled = (eval { $dbh->pg_ping } // 0) == 1;
+                        last if $rolled = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do('ROLLBACK'); 1 };
+                        $state = eval { $dbh->state } // '';
+                        last unless $state eq '57014';
+                    }
+                    if ($rolled) { eval { $dbh->{AutoCommit} = 1; $dbh->{BegunWork} = 0 } }
+                    else { ($broken, $cancelled) = (1, $state eq '57014' ? 1 : $cancelled) }
+                }
             }
         } elsif ($self->{opening}) {
             # Nothing of the host's can be after this savepoint yet.
