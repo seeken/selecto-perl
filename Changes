@@ -12,8 +12,8 @@ Revision history for Selecto
     - Declare with schemas any cross-schema reference or join (relation_unresolved).
     - Check client_encoding is UTF8 on every connection, no MariaDB session sets
       system_versioning_asof, and no MySQL session sets sql_select_limit.
-    - On MariaDB, a generated recursive query past 10000 levels now refuses, even
-      if the host raised max_recursive_iterations.
+    - On MariaDB, a generated recursive query with no max_depth now refuses past 10000
+      levels, even if the host raised max_recursive_iterations. Declare max_depth.
     - Remove any statement_cache option.
     - Use a transaction handle (begin_work) for a host's transactions. A text BEGIN on
       a pooled connection is host misuse: a pool can reconnect between statements.
@@ -23,14 +23,16 @@ Revision history for Selecto
 
     - MySQL family: a generated statement no longer answers short. On MariaDB each one
       pins sql_select_limit, group_concat_max_len (to the server's maximum) and
-      max_recursive_iterations for that statement alone. The last is 10000, not the
-      maximum: at the maximum a cycle in the data runs until something stops it, and
-      here a cycle with no index on its step costs about 2 seconds at 10000. What is
-      still cut, past that bound or past max_allowed_packet, refuses with query_error,
-      category result_incomplete, reason recursion_limit or aggregate_length, for reads,
-      streams and writes. On MySQL a session with sql_select_limit set refuses,
-      reason session_sql_select_limit; past cte_max_recursion_depth the server refuses;
-      JSON_ARRAYAGG is not shortened there. Hand-built reads keep the host's settings.
+      max_recursive_iterations for that statement alone. The last fits a declared
+      max_depth; with none it is 10000, not the maximum: at the maximum a cycle in the
+      data runs until something stops it, and here a cycle with no index on its step
+      costs about 2 seconds at 10000. What the server warns it cut still refuses, on
+      either server, with query_error, category result_incomplete, reason
+      recursion_limit or aggregate_length, for reads, streams and writes: one collection
+      child past max_allowed_packet had come back as [null]. On MySQL a session with
+      sql_select_limit set refuses, reason session_sql_select_limit; past
+      cte_max_recursion_depth the server refuses; JSON_ARRAYAGG is not shortened there.
+      Hand-built reads keep the host's settings.
     - MariaDB: a generated read or write refuses a session with system_versioning_asof
       set, reason session_system_versioning_asof: it would answer with a row since
       moved to another tenant. Writes to system-versioned tables and to sequences
