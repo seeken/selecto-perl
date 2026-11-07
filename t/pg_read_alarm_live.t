@@ -65,7 +65,7 @@ for my $mode (qw(alone host)) {
         $dbh->disconnect;
     }
 }
-note "alarms that arrived after the host stopped waiting: $late";
+is($late, 0, 'no alarm arrived after the host stopped waiting');
 $admin->do($_) for @clean;
 $admin->disconnect;
 done_testing;

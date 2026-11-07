@@ -1325,18 +1325,14 @@ sub _refuse_hand_built_write {
     return;
 }
 
-# Whether this text, past any EXPLAIN ANALYZE, may write. Fails closed. Here it must be
-# a plain read, or a WITH that goes on to read, by name; where the text has more than
-# one reading it must not hold a writing word either.
+# Whether this text, past any EXPLAIN ANALYZE, may write. This stops honest mistakes
+# (R73): a statement that begins with a writing word, or a WITH that goes on to one.
 sub _hand_built_may_write {
     my ($self, $sql) = @_;
-    my $text = _hand_built_text($sql);
-    my $start = _hand_built_start($text);
-    return 0 if $start =~ /\A(?:SELECT|VALUES|TABLE)\b/i;
+    my $start = _hand_built_start(_hand_built_text($sql) =~ s{/\*.*?\*/|--[^\n]*|\#[^\n]*}{ }gsr);
+    return 0 if $start eq '' || $start =~ /\A(?:SELECT|VALUES|TABLE)\b/i;
     return 1 unless $start =~ /\AWITH\b/i;
-    my $main = _hand_built_main($start);
-    return 1 if !defined($main) || $main !~ /\A(?:SELECT|VALUES|TABLE|\)|)\z/i;
-    return !_hand_built_one_reading($sql) && $text =~ /\b(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b/i ? 1 : 0;
+    return (_hand_built_main($start) // '') =~ /\A(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\z/i ? 1 : 0;
 }
 
 sub execute_query {
@@ -1344,10 +1340,13 @@ sub execute_query {
     $self->_admit_hand_built($statement);
     my ($sth, $rows);
     my $ok = eval {
-        $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
-        $self->_execute_statement($sth, $statement->params);
+        # (Without RaiseError a failure is only a return value: never an empty answer.)
+        $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement))
+            or die _dbi_error($self->{dbh}, 'query could not be prepared');
+        defined($self->_execute_statement($sth, $statement->params)) or die _dbi_error($sth, 'query execution failed');
         my @types = $self->_column_types($sth);
         $rows = $sth->fetchall_arrayref;
+        die _dbi_error($sth, 'query fetch failed') if !$rows || $sth->err;
         $self->_decode_rows($rows, \@types);
         1;
     };
@@ -1388,9 +1387,10 @@ sub stream_query {
         unless defined($fetch_size) && !ref($fetch_size) && "$fetch_size" =~ /\A[1-9]\d*\z/;
     my ($sth, @types);
     my $ok = eval {
-        $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement));
+        $sth = $self->{dbh}->prepare($self->_query_transport_sql($statement))
+            or die _dbi_error($self->{dbh}, 'query could not be prepared');
         eval { $sth->{RowCacheSize} = int($fetch_size) };
-        $self->_execute_statement($sth, $statement->params);
+        defined($self->_execute_statement($sth, $statement->params)) or die _dbi_error($sth, 'query execution failed');
         @types = $self->_column_types($sth);
         1;
     };

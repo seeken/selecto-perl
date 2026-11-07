@@ -15,6 +15,7 @@ use TestPostgreSQL ();
 # is gone, because the host rolled back, committed, aborted or moved on, that is
 # the host's transaction: the stream reports transaction_state_unsafe and leaves
 # the connection alone. Only a cursor of its name that differs is a replacement.
+# (A pin of behaviour that already held: t/pg_stream_host_work_live.t tests the rest.)
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
 my $admin = TestPostgreSQL->connect;

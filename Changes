@@ -1,6 +1,38 @@
 Revision history for Selecto
 
-Unreleased
+0.2.3  Unreleased
+    Before deploying:
+    - Give every handle RaiseError => 1. Without it a failed read is still an error,
+      but a host's own statements around Selecto's are not checked.
+    - Search for reads that write: a view using nextval, an audit function. They now
+      fail read_only_transaction. Move those writes to execute_write.
+    - Search hand-built SQL given to execute_query or stream_query: row locks on
+      PostgreSQL, statements not beginning with a read word, multiple statements.
+      None of it may be built from end-user input.
+    - Declare with schemas any cross-schema reference or join (relation_unresolved).
+    - Check client_encoding is UTF8 on every connection, and no MariaDB session sets
+      system_versioning_asof.
+    - Remove any statement_cache option.
+    - Use a transaction handle (begin_work) for a host's transactions. A text BEGIN on
+      a pooled connection is host misuse: a pool can reconnect between statements.
+    - No alarm or signal timeouts around reads are needed or advised: use
+      statement_timeout. A host's timers wait while a read opens or ends.
+    - Deploy selecto-perl-mcp and every companion at this version together.
+
+    - MariaDB: a generated read or write refuses a session with system_versioning_asof
+      set, reason session_system_versioning_asof: it would answer with a row since
+      moved to another tenant. Writes to system-versioned tables and to sequences
+      already refused.
+    - PostgreSQL: a bounded stream inside the host's transaction holds no savepoint
+      between fetches, so the host can write between fetches, keep its own savepoints
+      and RELEASE or ROLLBACK TO them. A failed fetch ends that fetch and the stream,
+      never the host's work. A generated stream that locks rows holds its locks. A
+      cancel is a cancel on every statement, guards included, and is tried again on
+      an ending. An ending that cannot be finished closes the connection, so a later
+      COMMIT fails rather than reports success. Failures no longer poison the handle.
+    - Without RaiseError a failed read is an error, never an empty answer.
+    - Selecto::Statement::derive wraps a compiled statement and keeps it generated:
+      companions use it, not new.
     - MySQL and MariaDB: Selecto's own transactions end with COMMIT or ROLLBACK
       AND NO CHAIN NO RELEASE, not the driver's commit and rollback, whose bare
       statements obey completion_type. At 2 a write, batch or graph committed, then
@@ -58,30 +90,30 @@ Unreleased
       audit function that inserts, on the connections below. It fails query_error
       with details.category read_only_transaction, SQLSTATE 25006 where the
       database has one. Move such writes to execute_write or to the host's own SQL.
-      A hand-built statement given to execute_query or stream_query must be one
-      statement beginning SELECT, WITH, VALUES or TABLE, on every adapter, or it
-      or SHOW, EXPLAIN or DESCRIBE, or it
-      refuses, query_rule_not_evaluable with reason hand_built_not_a_read, as does
-      INTO, := or a /*! comment on MySQL and MariaDB. A word in a string literal does
-      not count where the text has one reading; where it has a comment, a backslash,
-      a dollar quote or a bracket the text stands whole, so a semicolon in a literal
-      there refuses too. It then runs under the same read-only rules, so it cannot
-      write on its own or, on PostgreSQL, in the host's transaction, and FOR UPDATE
-      in one refuses, on every route, streams included, and on MySQL and MariaDB
-      too: take row locks through your own driver. Otherwise it runs exactly as
-      written, in the host's session:
-      no qualification, no search_path or settings pin, no relation or session
-      guard, so temporary relations and the host's search_path, time zone and
-      sql_mode apply as they do to the driver, and the answer is the driver's.
-      On PostgreSQL only a client_encoding that is not UTF8 still refuses. On
-      MySQL, MariaDB and DuckDB nothing can stop a
-      write inside the host's transaction, so what a statement would do is settled
-      first, by the server's EXPLAIN on MySQL and MariaDB: one that writes, one that
-      cannot be settled, and one that takes a sequence's value refuse there, reason
-      hand_built_in_host_transaction.
-      A read runs as written, and a
-      function it calls is the host's to undo. Before this, all of these ran as
-      written.
+      A hand-built statement given to execute_query or stream_query is the host's
+      own code, and must never be built from end-user input. It must be one statement
+      beginning SELECT, WITH, VALUES, TABLE, SHOW, EXPLAIN or DESCRIBE, or an opening
+      parenthesis, or it refuses, query_rule_not_evaluable with reason
+      hand_built_not_a_read, as does INTO, := or a /*! comment on MySQL and MariaDB.
+      This stops honest mistakes, not evasion. It then runs exactly as written in the
+      host's session: no qualification, no search_path or settings pin, no relation
+      or session guard, so temporary relations and the host's search_path, time zone
+      and sql_mode apply as they do to the driver, and the answer is the driver's.
+      PostgreSQL: it still runs read only, so writes refuse, on its own or in the
+      host's transaction, and a client_encoding that is not UTF8 refuses. A hand-built
+      read that locks rows refuses, on every route, streams included: take row locks
+      through your own driver. A pg_advisory_xact_lock a read takes in the host's
+      transaction ends with the read. A function declared IMMUTABLE or STABLE that
+      writes breaks PostgreSQL's contract, and planning the read may run it.
+      MySQL and MariaDB: alone it runs READ ONLY. A read that locks rows cannot, so
+      it runs in a plain transaction ended by ROLLBACK, and its locks end with it;
+      in the host's transaction it runs as written and its locks hold. Nothing stops
+      a write in the host's transaction, so there MySQL's EXPLAIN settles a statement
+      beginning WITH, and one that writes refuses, reason
+      hand_built_in_host_transaction, as does one that takes a sequence's value.
+      MariaDB has no write after WITH, and no EXPLAIN is run. DuckDB: the same, by the
+      statement's words. A function a read calls is the host's to undo. Before this,
+      all of these ran as written.
       PostgreSQL: every read and stream is READ ONLY and ends in ROLLBACK or, in
       the host's transaction, in a rollback to its savepoint, and a bounded
       stream does so per fetch, so the host can write between fetches. So a
@@ -106,9 +138,13 @@ Unreleased
       (only a sequence can change there, with no triggers or procedures).
       SQLite keeps its PRAGMA query_only. SQL Server is unchanged: a SELECT there
       cannot write, as its functions cannot.
-      A read on its own costs four more statements on MySQL and MariaDB and four
-      on DuckDB, and a bounded PostgreSQL stream two more per batch inside a host
-      transaction.
+      Statements a warm operation sends, measured at the server, compile's catalog
+      reads included (alone, then in the host's transaction):
+      PostgreSQL: read 19, 24; hand-built read 6, 11; write 46, 45; a bounded stream of
+      two batches and the empty one 35, 42. MySQL: read 13, 9; hand-built read 6, 2;
+      write 45, 43. MariaDB: read 12, 8; hand-built read 6, 2; write 45, 43.
+      A read ends in one rollback: of its transaction alone, of its savepoint in the
+      host's. On MySQL and MariaDB a read alone sees @@autocommit as 0.
     - PostgreSQL: a read, stream or write refuses a session whose
       client_encoding is not UTF8 when the operation starts, before anything
       else is sent, query_rule_not_evaluable with reason client_encoding (R65). Bound values are sent as UTF-8; read as LATIN1, a
