@@ -21,24 +21,33 @@ use Scalar::Util qw(blessed refaddr);
 # sql_select_limit stops any statement without a LIMIT of its own, catalog reads
 # included. group_concat_max_len cuts JSON_ARRAYAGG to valid JSON that is merely
 # short (this is the server's maximum; max_allowed_packet still bounds it). The
-# recursion limit is 1000 by default. It is bounded, not the maximum, because a
-# cycle in the data then runs until something stops it: this bound answers deep
-# hierarchies and stops a cycle in a known number of steps. What is still cut at
-# these values is refused by _result_cut, never answered.
+# recursion limit is 1000 by default. A recursion that declares max_depth stops
+# there on its own, so the limit fits that depth. One that does not keeps a bound,
+# not the maximum: a cycle in the data would run until something stopped it, and
+# this answers deep hierarchies and stops a cycle in a known number of steps. What
+# is still cut is refused by _result_cut, never answered. (Every value here must be
+# valid on the server: past its range one is an error under a strict sql_mode.)
 my $MARIADB_STATEMENT = q{SET STATEMENT optimizer_switch='subquery_cache=off', }
     . q{sql_select_limit=18446744073709551615, group_concat_max_len=1073741824, }
-    . q{max_recursive_iterations=10000 FOR };
+    . q{max_recursive_iterations=};
+my $MARIADB_RECURSION = 10_000;
+my $MARIADB_RECURSION_MAX = 4_294_967_295;
 my $CONTROL_ATTEMPTS = 5;
 
 sub _statement_sql {
-    my ($self, $sql) = @_;
-    return $self->name eq 'mariadb' ? $MARIADB_STATEMENT . $sql : $sql;
+    my ($self, $sql, $depth) = @_;
+    return $sql unless $self->name eq 'mariadb';
+    my $iterations = $MARIADB_RECURSION;
+    $iterations = $depth >= $MARIADB_RECURSION_MAX ? $MARIADB_RECURSION_MAX : $depth + 1
+        if defined($depth) && $depth >= $iterations;
+    return "$MARIADB_STATEMENT$iterations FOR $sql";
 }
 
 # A host's hand-built statement goes as written (R68).
 sub _query_transport_sql {
     my ($self, $statement) = @_;
-    return Selecto::SQL::_hand_built($statement) ? $statement->sql : $self->SUPER::_query_transport_sql($statement);
+    return Selecto::SQL::_hand_built($statement) ? $statement->sql
+        : $self->_statement_sql($statement->sql, $statement->{_selecto_recursion_depth});
 }
 
 # R71: a hand-built read runs in the host's session, whatever that session's time zone
@@ -278,6 +287,7 @@ sub stream_query {
     Selecto::Error->throw('unsupported_feature', 'MySQL-family date formats cannot be streamed')
         if blessed($statement) && $statement->{_selecto_formatters};
     my $hand = Selecto::SQL::_hand_built($statement);
+    local $self->{_selecto_host_text} = $hand;
     my $state = $hand ? $self->_hand_built_session : $self->_require_session;
     $self->_refuse_read_temporary_shadows($statement) unless $hand;
     # No row may reach the caller before the session check that covers it
@@ -2922,6 +2932,7 @@ sub execute_query {
     my ($self, $statement, %options) = @_;
     local $self->{_selecto_operation} = 1;
     my $hand = Selecto::SQL::_hand_built($statement);
+    local $self->{_selecto_host_text} = $hand;
     my $state = $hand ? $self->_hand_built_session : $self->_require_session;
     $self->_refuse_read_temporary_shadows($statement) unless $hand;
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
@@ -3451,7 +3462,8 @@ sub _check_session_state {
 # Every write statement is followed at once by the session comparison, so
 # nothing (a re-read, a catalog check, the next command) runs under a
 # changed time zone or sql_mode.
-my $DML = qr/\A\s*(?:\Q$MARIADB_STATEMENT\E)?\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b/i;
+my $CUT_RECURSION = 1931;
+my $DML = qr/\A\s*(?:\Q$MARIADB_STATEMENT\E\d+ FOR )?\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b/i;
 sub _execute_statement {
     my ($self, $sth, $params) = @_;
     my $result = $self->SUPER::_execute_statement($sth, $params);
@@ -3460,22 +3472,23 @@ sub _execute_statement {
     my $state = $self->{_selecto_write_session};
     $self->_check_session_state($state) if ref($state) eq 'ARRAY' && (eval { $sth->{Statement} } // '') =~ $DML;
     Selecto::Error->throw('query_error', 'the server cut the result short', {cause => 'database_error',
-        category => 'result_incomplete', reason => $cut->[1] == 1931 ? 'recursion_limit' : 'aggregate_length'}) if $cut;
+        category => 'result_incomplete', reason => $cut->[1] == $CUT_RECURSION ? 'recursion_limit' : 'aggregate_length'}) if $cut;
     return $result;
 }
 
-# MariaDB reports a result it cut only as a warning: 1931 past the recursion limit,
-# 1260 an aggregate past its length. A generated statement must not answer with
-# that. A hand-built one goes as written, under the host's settings, and its result
-# is the host's. A statement with no warnings costs nothing here.
+# A result the server cut can arrive as a warning and a clean answer: past the
+# recursion limit (1931), a row cut from an aggregate (1260), or a value past
+# max_allowed_packet (1301), which turns one child of a collection into null. A
+# generated statement must not answer with that. A hand-built one goes as written,
+# under the host's settings, and its result is the host's. The warning count comes
+# with the result, so a statement with no warnings costs nothing here.
 sub _result_cut {
     my ($self, $sth) = @_;
-    return undef unless $self->name eq 'mariadb' && (eval { $sth->{mariadb_warning_count} } // 0) > 0;
-    return undef unless (eval { $sth->{Statement} } // '') =~ /\A\Q$MARIADB_STATEMENT\E/;
+    return undef if $self->{_selecto_host_text} || !(eval { $sth->{mariadb_warning_count} } // 0);
     my $dbh = $self->{dbh};
     my $warnings = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->selectall_arrayref('SHOW WARNINGS') };
     die $self->normalize_error($@) unless $warnings;
-    return (grep { $_->[1] == 1931 || $_->[1] == 1260 } @$warnings)[0];
+    return (grep { $_->[1] == $CUT_RECURSION || $_->[1] == 1260 || $_->[1] == 1301 } @$warnings)[0];
 }
 
 # Runs $work with the session verified once for the whole call, so reads and

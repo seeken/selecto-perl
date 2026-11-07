@@ -82,6 +82,7 @@ sub compile {
     # Schemas the host declared for the read (a tenant prefix): its explicit
     # choice, which the PostgreSQL session checks resolve under (R43).
     local $self->{_selecto_declared_sink} = $top ? {} : $self->{_selecto_declared_sink};
+    local $self->{_selecto_recursion_sink} = $top ? {} : $self->{_selecto_recursion_sink};
     # What the read's references resolve beside (see PostgreSQL's _relation_sql).
     local $self->{_selecto_root_relation} = $top && blessed($domain) && defined($domain->table)
         ? {table => '' . $domain->table, (defined($domain->{_read_prefix}) ? (schema => '' . $domain->{_read_prefix}) : ())}
@@ -93,6 +94,9 @@ sub compile {
         # A read that locks rows must run where its locks last: see R55 in
         # Selecto::PostgreSQL.
         $statement->{_selecto_row_lock} = 1 if defined $query->row_lock;
+        # The depth every recursion in the read declares, when all of them declare one.
+        my $recursion = $self->{_selecto_recursion_sink};
+        $statement->{_selecto_recursion_depth} = $recursion->{depth} if defined($recursion->{depth}) && !$recursion->{undeclared};
     }
     # Selecto::Engine::compile admits these parameters itself, with the same
     # limits, code and label, as soon as this returns.
@@ -928,6 +932,10 @@ sub _compile_cte_prefix {
                     $self->_qualified('p_' . $spec->{name}, $join->{related_key}),
                     $self->_member_pair_exact([$spec->{domain}, $join->{owner_key}],
                         [undef, $self->_exact_identity_compare ? $self->_cte_column_type($spec, $join->{related_key}) : undef]));
+            if (my $sink = $self->{_selecto_recursion_sink}) {
+                $sink->{undeclared} = 1 unless defined $spec->{max_depth};
+                $sink->{depth} = $spec->{max_depth} if defined($spec->{max_depth}) && $spec->{max_depth} > ($sink->{depth} // 0);
+            }
             if (defined $spec->{max_depth}) {
                 my $max_depth = "$spec->{max_depth}";
                 Selecto::Error->throw('invalid_query', 'recursive CTE max_depth must be a positive integer')

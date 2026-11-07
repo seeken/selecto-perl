@@ -42,13 +42,14 @@ sub failure {
         ? join('/', $error->code, map { $_ // '' } @{$error->details // {}}{qw(category reason)}) : "died: $error";
 }
 
+# (An inner join: a left one keeps every root row, so a cut chain would count the same.)
 sub tree_query {
-    my ($engine, $domain) = @_;
+    my ($engine, $domain, %options) = @_;
     return $engine->query->with_recursive_cte('tree', $domain,
         Selecto::Query->new->select(qw(id manager_id))->where($x->eq('id', 1)),
         Selecto::Query->new->select(qw(id manager_id)),
-        columns => [qw(id manager_id)], join => {owner_key => 'id', related_key => 'id'},
-        recursive_join => {owner_key => 'manager_id', related_key => 'id', type => 'inner'})
+        columns => [qw(id manager_id)], join => {owner_key => 'id', related_key => 'id', type => 'inner'},
+        recursive_join => {owner_key => 'manager_id', related_key => 'id', type => 'inner'}, %options)
         ->select('id', 'tree.manager_id');
 }
 
@@ -59,7 +60,7 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             unless defined($ENV{$environment}) && $ENV{$environment} ne '';
         my $dbh = open_db($backend, $ENV{$environment});
         my $mariadb = $backend eq 'mariadb';
-        $dbh->do("DROP TABLE IF EXISTS selecto_limit_$_") for qw(items orders rows ring);
+        $dbh->do("DROP TABLE IF EXISTS selecto_limit_$_") for qw(items wide deep orders rows ring);
         $dbh->do("CREATE TABLE selecto_limit_$_ (id int primary key, manager_id int, name varchar(20)) ENGINE=InnoDB") for qw(rows ring);
         # A chain: id 1 starts, and each step finds the row that names the last as its manager.
         $dbh->do('INSERT INTO selecto_limit_rows VALUES ' . join(',', map { "($_," . ($_ - 1) . ",'a')" } 1 .. $CHAIN));
@@ -141,6 +142,18 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
                 'query_error/result_incomplete/recursion_limit', 'and so is a streamed one';
             cmp_ok time - $started, '<', 30, 'a cycle does not hold the connection';
             is $read->(), $CHAIN, 'the connection reads on after the refusal';
+            is scalar @{$ring_engine->all(tree_query($ring_engine, $ring, max_depth => 20))->{rows}}, 20,
+                'a cycle under a declared depth stops there, and is an answer';
+            # Past the bound: the declared depth is what the limit fits.
+            $dbh->do('DROP TABLE IF EXISTS selecto_limit_deep');
+            $dbh->do('CREATE TABLE selecto_limit_deep (id int primary key, manager_id int, name varchar(20)) ENGINE=InnoDB');
+            $dbh->do('INSERT INTO selecto_limit_deep VALUES ' . join(',', map { "($_," . ($_ - 1) . ",'a')" } 1 .. 10_500));
+            my $deep = Selecto::Domain->new(name => 'Deep', table => 'selecto_limit_deep', fields => $fields);
+            my $deep_engine = Selecto::Engine->new(adapter => $adapter, domain => $deep);
+            is scalar @{$deep_engine->all(tree_query($deep_engine, $deep, max_depth => 10_400))->{rows}}, 10_400, 'a declared depth past the bound answers in full';
+            is failure(sub { $deep_engine->all(tree_query($deep_engine, $deep)) }), 'query_error/result_incomplete/recursion_limit',
+                'the same chain with no declared depth is refused at the bound';
+            $dbh->do('DROP TABLE selecto_limit_deep');
         } else {
             like failure($tree), qr{\Aquery_error/}, 'past cte_max_recursion_depth MySQL refuses: never short';
         }
@@ -160,7 +173,32 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
                 ->where($x->eq('id', 2))) }), 'query_error/result_incomplete/aggregate_length', 'an aggregate past the packet is refused';
         }
         $dbh->do('SET SESSION group_concat_max_len = DEFAULT');
-        $dbh->do("DROP TABLE IF EXISTS selecto_limit_$_") for qw(items orders rows ring);
+
+        # One child past the packet: on MariaDB a clean answer of [null] if nothing looks.
+        my ($packet) = $dbh->selectrow_array('SELECT @@max_allowed_packet LIMIT 1');
+        my $width = int($packet / 4);
+        my @wide = qw(a b c d e);
+        $dbh->do('DROP TABLE IF EXISTS selecto_limit_wide');
+        $dbh->do('CREATE TABLE selecto_limit_wide (id int primary key, order_id int, ' . join(', ', map { "$_ longtext" } @wide) . ') ENGINE=InnoDB');
+        $dbh->do('INSERT INTO selecto_limit_wide VALUES (1, 1, ' . join(', ', map { "REPEAT('y', $width)" } @wide) . ')');
+        my $wide = Selecto::Domain->new(name => 'WideOrders', table => 'selecto_limit_orders', fields => {id => 'integer'},
+            associations => {items => {table => 'selecto_limit_wide', target_primary_key => 'id',
+                fields => {id => 'integer', order_id => 'integer', map { ($_ => 'string') } @wide},
+                owner_key => 'id', related_key => 'order_id', cardinality => 'many', join_type => 'left'}});
+        my $wide_engine = Selecto::Engine->new(adapter => $adapter, domain => $wide);
+        like failure(sub { $wide_engine->all($wide_engine->query->select('id', $x->related_collection('items', ['id', @wide])->as('c'))->where($x->eq('id', 1))) }),
+            $mariadb ? qr{\Aquery_error/result_incomplete/aggregate_length\z} : qr{\Aquery_error/}, 'a collection child past the packet refuses';
+        $dbh->do('DROP TABLE selecto_limit_wide');
+
+        # Every pin must be valid where a bad one is an error, and leave the host no warning.
+        my ($mode) = $dbh->selectrow_array('SELECT @@SESSION.sql_mode LIMIT 1');
+        for my $strict ('TRADITIONAL', 'STRICT_ALL_TABLES') {
+            $dbh->do("SET SESSION sql_mode = '$strict'");
+            is $read->(), $CHAIN, "$strict: a generated read answers";
+            is +($dbh->selectrow_array('SELECT @@warning_count LIMIT 1'))[0], 0, "$strict: and leaves the host no warning";
+        }
+        $dbh->do('SET SESSION sql_mode = ?', undef, $mode);
+        $dbh->do("DROP TABLE IF EXISTS selecto_limit_$_") for qw(items wide deep orders rows ring);
         $dbh->disconnect;
     };
 }
