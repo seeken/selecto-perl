@@ -342,12 +342,12 @@ subtest 'R29/R30: relations resolve by the reset search_path; search_path is pin
     is($outcome->(sub { $update->('t2-row', 2) }), 'query_rule_not_evaluable/relation_ambiguous', 'and so is the write');
     is($rows->($admin, 'SELECT note FROM r3q WHERE id = 2'), 'SECRET', "the other tenant's row is unchanged");
     is($rows->($dbh, 'SHOW search_path'), 'r3q_evil, pg_catalog, public', "and the host's search_path is untouched");
-    # R39: a host's hand-built statement (no recorded relations) is held to
-    # the same rule.
+    # R71: a host's hand-built statement (no recorded relations) runs in the host's
+    # session: its search_path decides, as it does for the driver.
     require Selecto::Statement;
     my $raw = Selecto::Statement->new(sql => 'SELECT "id" FROM "r3q" ORDER BY "id"', params => []);
     is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($raw)->{rows}} }),
-        'query_rule_not_evaluable/relation_ambiguous', 'a hand-built statement naming a redirected relation is refused');
+        'applied ' . join(',', map { $_->[0] } @{$dbh->selectall_arrayref($raw->sql)}), 'a hand-built statement answers as the driver does');
     # The evil = operator ahead of pg_catalog alone (no namesake relation)
     # cannot answer the tenant compare: pg_catalog comes first in the pin.
     $dbh->do('SET search_path TO r3q_evil, pg_catalog, public');
@@ -528,26 +528,23 @@ subtest 'R41/R42: every statement rechecks its relations; hand-built SQL never r
     $dbh->do('CREATE TEMP TABLE r3w_tmp (id INT)');
     $dbh->do('INSERT INTO r3w_tmp VALUES (42)');
     my $raw = Selecto::Statement->new(sql => 'SELECT "id" FROM r3w_tmp', params => []);
-    like($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($raw)->{rows}} }),
-        qr{\Aquery_rule_not_evaluable/(?:relation_unresolved|temporary_shadow)\z}, 'a hand-built statement naming an undeclared TEMP relation is refused');
+    # R71: a hand-built read runs in the host's session, its temporary relations included.
+    is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($raw)->{rows}} }), 'applied 42', 'a hand-built statement reads the TEMP relation, as the driver does');
     my $hidden = Selecto::Statement->new(sql => 'SELECT (SELECT max(id) FROM ONLY r3w_tmp) AS id', params => []);
-    like($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($hidden)->{rows}} }),
-        qr{\Aquery_rule_not_evaluable/(?:relation_unresolved|temporary_shadow)\z}, 'however the SQL spells it');
+    is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($hidden)->{rows}} }), 'applied 42', 'however the SQL spells it');
     my $declared = Selecto->adapter(postgresql => (temporary_relations => 1, dbh => $dbh));
     is($outcome->(sub { join ',', map { $_->[0] } @{$declared->execute_query($raw)->{rows}} }), 'applied 42',
         'a declared-temp adapter reads it');
     is($rows->($dbh, 'SHOW timezone_abbreviations'), 'Default', 'timezone_abbreviations is restored after each statement');
-    # R42 FINAL: with any undeclared TEMP relation in the session, a
-    # hand-built statement is refused outright.
     is($outcome->(sub { scalar @{$adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => []))->{rows}} }),
-        'query_rule_not_evaluable/temporary_shadow', 'any hand-built statement is refused while undeclared TEMP relations exist');
+        'applied 1', 'and another hand-built statement runs beside it');
     $dbh->do('DROP TABLE pg_temp.r3w_tmp');
-    # R42: a comma FROM list or a subquery in hand-built SQL is checked too.
+    # R71: the host's search_path decides, as it does for the driver.
     $admin->do($_) for 'DROP SCHEMA IF EXISTS r3w_alt CASCADE', 'CREATE SCHEMA r3w_alt', 'CREATE TABLE r3w_alt.r3w (id INT)';
     $dbh->do('SET search_path TO r3w_alt, public');
     for my $sql ('SELECT 1 FROM pg_catalog.pg_class c, r3w LIMIT 1', 'SELECT (SELECT max(id) FROM r3w) AS id') {
         is($outcome->(sub { scalar @{$adapter->execute_query(Selecto::Statement->new(sql => $sql, params => []))->{rows}} }),
-            'query_rule_not_evaluable/relation_ambiguous', "a redirected relation is refused in: $sql");
+            'applied ' . scalar(@{$dbh->selectall_arrayref($sql)}), "as the driver: $sql");
     }
     $dbh->do('RESET search_path');
     $admin->do('DROP SCHEMA r3w_alt CASCADE');

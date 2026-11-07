@@ -40,17 +40,25 @@ sub new {
     my $ok = eval {
         # The scope is recorded only once the savepoint or transaction exists,
         # so a failed start never rolls back anything.
+        # (Together, whatever a host's alarm does: see _pg_uninterrupted.) A hand-built
+        # statement that locks rows refuses here: its FETCH would hold no lock past the
+        # batch's rollback, and its DECLARE is not under the read-only mode.
+        $adapter->_pg_hold_relations($args{statement}) if $scope eq 'host' && Selecto::PostgreSQL::_pg_hand_built($args{statement});
         if ($scope eq 'host') {
-            $adapter->_savepoint_command(create => $name);
-            $self->{scope} = 'host';
+            Selecto::PostgreSQL::_pg_uninterrupted(sub {
+                $adapter->_savepoint_command(create => $name);
+                $self->{scope} = 'host';
+            });
         } else {
-            $adapter->_begin_transaction;
-            $self->{scope} = 'own';
-            _do($dbh, 'SET TRANSACTION READ ONLY');
             # The transaction's virtual id proves at close that it is still
             # this stream's own before it is rolled back. No statement can
             # forge it, unlike a GUC marker (item 57).
-            $self->{transaction} = $adapter->_virtual_transaction_id;
+            Selecto::PostgreSQL::_pg_uninterrupted(sub {
+                $adapter->_begin_transaction;
+                $self->{scope} = 'own';
+                _do($dbh, 'SET TRANSACTION READ ONLY');
+                $self->{transaction} = $adapter->_virtual_transaction_id;
+            });
             die 'stream transaction identity is unavailable' unless defined $self->{transaction};
         }
         # search_path and the result-affecting settings pinned for the
@@ -58,7 +66,8 @@ sub new {
         # the session snapshot taken before the cursor; every FETCH is
         # compared with it (items 56, 61). While a stream is open inside a
         # host transaction, the host's own statements see the pinned values.
-        if ($adapter->_pg_session_checked) {
+        # (Not a hand-built statement's, which runs in the host's session: R71.)
+        if ($adapter->_pg_session_checked && !Selecto::PostgreSQL::_pg_hand_built($args{statement})) {
             {
                 local $adapter->{_selecto_reset_operation} = {};
                 $adapter->_pg_check_relations($args{statement});
@@ -127,7 +136,7 @@ sub next {
         # may write between fetches, so each FETCH is read-only under a savepoint
         # of its own, which is rolled back; a cursor keeps its position through
         # that.
-        my $batch = ($self->{scope} // '') eq 'host' && $self->{session} ? "$self->{name}_batch" : undef;
+        my $batch = ($self->{scope} // '') eq 'host' && $self->{adapter}->_pg_session_checked ? "$self->{name}_batch" : undef;
         _do($self->{dbh}, "SAVEPOINT $batch; SET LOCAL transaction_read_only = on") if defined $batch;
         defined($sth->execute) or die 'cursor fetch failed';
         $self->{types} //= [$self->{adapter}->_column_types($sth)];
@@ -201,11 +210,13 @@ sub close { return $_[0]->_close(); }
 sub _close {
     my ($self, $failure) = @_;
     return $self if $self->{closed};
-    $self->{closed} = 1;
     my ($dbh, $adapter, $name) = @{$self}{qw(dbh adapter name)};
     eval { $self->{sth}->finish } if $self->{sth};
-    my $unsafe;
-    my $ok = eval {
+    my ($unsafe, $ran);
+    # (Closed only from here: a host's alarm before this leaves it for DESTROY to end.)
+    my $end = sub {
+        $ran = 1;
+        $self->{closed} = 1;
         # A disconnected handle has already lost its server cursor/transaction.
         if ($dbh->{Active} && $self->{scope}) {
             my $foreign = defined($failure) && $failure eq 'foreign';
@@ -234,8 +245,13 @@ sub _close {
                 $adapter->_savepoint_command(release => $name) unless $unsafe;
             }
         }
-        1;
     };
+    # (A host's alarm cannot part these; one already on its way is taken before they start.)
+    my $ok;
+    for my $attempt (1 .. 3) {
+        $ok = eval { Selecto::PostgreSQL::_pg_uninterrupted($end); 1 };
+        last if $ran;
+    }
     delete $dbh->{private_selecto_bounded_stream};
     if ($unsafe) {
         Selecto::Error->throw('transaction_state_unsafe',
@@ -290,7 +306,7 @@ sub _do {
 # later bounded streams), so an abandoned stream never looks clean.
 sub DESTROY {
     my ($self) = @_;
-    return if $self->{closed};
+    return if ${^GLOBAL_PHASE} eq 'DESTRUCT' || $self->{closed};
     local $@;
     return if eval { $self->close; 1 };
     my $error = $@;

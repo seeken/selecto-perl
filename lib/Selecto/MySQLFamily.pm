@@ -24,6 +24,23 @@ sub _statement_sql {
     return $self->name eq 'mariadb' ? $MARIADB_STATEMENT . $sql : $sql;
 }
 
+# A host's hand-built statement goes as written (R68).
+sub _query_transport_sql {
+    my ($self, $statement) = @_;
+    return Selecto::SQL::_hand_built($statement) ? $statement->sql : $self->SUPER::_query_transport_sql($statement);
+}
+
+# R71: a hand-built read runs in the host's session, whatever that session's time zone
+# or sql_mode, with no relation guard. Only whose transaction this is matters to it.
+sub _hand_built_session {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    my $autocommit;
+    my $ok = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; ($autocommit) = $dbh->selectrow_array('SELECT @@SESSION.autocommit'); 1 };
+    die $self->normalize_error($@) unless $ok;
+    return [undef, undef, $autocommit];
+}
+
 sub placeholder {
     my ($self, $index) = @_;
     Selecto::Error->throw('invalid_query', 'placeholder index must be positive')
@@ -249,8 +266,9 @@ sub stream_query {
     local $self->{_selecto_operation} = 1;
     Selecto::Error->throw('unsupported_feature', 'MySQL-family date formats cannot be streamed')
         if blessed($statement) && $statement->{_selecto_formatters};
-    my $state = $self->_require_session;
-    $self->_refuse_read_temporary_shadows($statement);
+    my $hand = Selecto::SQL::_hand_built($statement);
+    my $state = $hand ? $self->_hand_built_session : $self->_require_session;
+    $self->_refuse_read_temporary_shadows($statement) unless $hand;
     # No row may reach the caller before the session check that covers it
     # (items 61, 62): a view's stored function can SET time_zone while the
     # server produces the rows. The stream therefore always uses a stored
@@ -261,9 +279,9 @@ sub stream_query {
     my $stream = do {
         local $self->{dbh}{mariadb_use_result} = 0;
         # (A stored result is complete at execute, so the read can end here.)
-        $self->_read_transaction($statement, sub { $self->SUPER::stream_query($statement, %options) });
+        $self->_read_transaction($statement, sub { $self->SUPER::stream_query($statement, %options) }, $state);
     };
-    my $ok = eval { $self->_check_session_state($state); 1 };
+    my $ok = $hand || eval { $self->_check_session_state($state); 1 };
     unless ($ok) { my $error = $@; $stream->close; die $error }
     return $stream;
 }
@@ -2892,16 +2910,17 @@ sub _column_types {
 sub execute_query {
     my ($self, $statement, %options) = @_;
     local $self->{_selecto_operation} = 1;
-    my $state = $self->_require_session;
-    $self->_refuse_read_temporary_shadows($statement);
+    my $hand = Selecto::SQL::_hand_built($statement);
+    my $state = $hand ? $self->_hand_built_session : $self->_require_session;
+    $self->_refuse_read_temporary_shadows($statement) unless $hand;
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
     # driver_values: the values DBD::MariaDB fetched, undecoded, under the same
-    # session checks.
-    local $self->{_selecto_driver_values} = $options{driver_values} ? 1 : 0;
-    my $result = $self->_read_transaction($statement, sub { $self->SUPER::execute_query($statement) });
+    # session checks. A hand-built read's are always the driver's.
+    local $self->{_selecto_driver_values} = $options{driver_values} || $hand ? 1 : 0;
+    my $result = $self->_read_transaction($statement, sub { $self->SUPER::execute_query($statement) }, $state);
     # A view's stored function can SET time_zone or sql_mode mid-statement;
     # the rows it shaped are discarded and the read refused.
-    $self->_check_session_state($state);
+    $self->_check_session_state($state) unless $hand;
     return $self->_apply_formatters($statement, $result);
 }
 
@@ -2917,23 +2936,27 @@ sub execute_query {
 # InnoDB access, and the metadata locks that keep its tables from DDL until it ends.
 # A hand-built statement there has nothing to stop a write, so one whose text says it
 # writes refuses; a read runs as written (a function it calls is the host's, as a view's is).
+# Whose transaction it is must be known before anything is sent, because everything
+# that ends a read ends the transaction: DBI's AutoCommit knows only begin_work, so the
+# guard's @@autocommit covers a session's SET autocommit = 0, and the first statement
+# here covers a raw START TRANSACTION, which it finds without touching.
 sub _read_transaction {
-    my ($self, $statement, $work) = @_;
+    my ($self, $statement, $work, $state) = @_;
     my $dbh = $self->{dbh};
     $self->_admit_hand_built($statement);
-    unless ($dbh->{AutoCommit}) {
-        $self->_refuse_hand_built_write($statement);
-        return $work->();
-    }
+    my $hosts = sub { $self->_refuse_hand_built_write($statement); return $work->() };
+    return $hosts->() if !$dbh->{AutoCommit} || (ref($state) eq 'ARRAY' && ($state->[2] // '1') ne '1');
+    my ($owned, $interrupted) = $self->_claim_read;
+    die $interrupted if !$owned && defined $interrupted;
+    return $hosts->() unless $owned;
     my ($value, $ok, $error, $finished);
     # A host's alarm can die anywhere in here, between one statement and the next:
     # whatever it interrupts, the finish still runs and its error still stands.
     my $whole = eval {
         my $begun = eval {
+            die $interrupted if defined $interrupted;
             local $dbh->{PrintError} = 0;
-            for my $sql ('SET TRANSACTION READ ONLY', 'SET autocommit = 0') {
-                defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
-            }
+            defined($dbh->do('SET autocommit = 0')) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
             1;
         };
         if ($begun) {
@@ -2954,6 +2977,26 @@ sub _read_transaction {
     die($finished eq '1' ? $error : $self->_undo_failed($error)) unless $ok;
     die $finished unless $finished eq '1';
     return $value;
+}
+
+# Claims the read's transaction, if the session has none open: SET TRANSACTION is
+# refused (1568) while one is, and changes nothing either way. Anything else that
+# stops it says nothing about whose transaction this is, so it is asked again. Returns
+# whether the read is Selecto's to end, and what interrupted it. With no answer it
+# returns false with the interruption: nothing is open, and nothing more is sent.
+sub _claim_read {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    my $interrupted;
+    for my $attempt (1 .. $CONTROL_ATTEMPTS) {
+        return (1, $interrupted) if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do('SET TRANSACTION READ ONLY'); 1 };
+        my $failure = $@;
+        return (0, $interrupted) if (eval { $dbh->err } // '') eq '1568' || "$failure" =~ /\bTransaction characteristics can't be changed\b/;
+        $interrupted //= $self->normalize_error($failure);
+        last unless eval { $dbh->{Active} };
+        select(undef, undef, undef, 0.01);
+    }
+    return (0, $interrupted);
 }
 
 # A failure the database did not report: a host's alarm or an exception that may
@@ -2988,11 +3031,43 @@ sub _in_step {
 }
 
 # INTO writes a file or a user variable, := a variable, and a conditional comment
-# is SQL this text does not show.
+# is SQL this text does not show. A row lock is the host's to take, through its own
+# driver: a read cannot hold one for it (R72).
 sub _hand_built_refusal {
     my ($self, $sql) = @_;
     return 'it may write' if $sql =~ /\bINTO\b/i || index($sql, ':=') >= 0 || $sql =~ m{/\*M?!};
+    my $lock = qr/\bFOR\s+(?:UPDATE|SHARE)\b|\bLOCK\s+IN\s+SHARE\s+MODE\b/i;
+    return 'it takes row locks' if $sql =~ $lock || ($sql =~ s{/\*.*?\*/|--[^\n]*|\#[^\n]*}{ }gsr) =~ $lock;
     return undef;
+}
+
+# The server says what a statement would do: its parser, its sql_mode and its comments,
+# not a lexer here. EXPLAIN runs nothing of a write, and names one in select_type. What
+# it cannot settle refuses; a kill on it is a kill, and nothing else is sent.
+sub _hand_built_may_write {
+    my ($self, $sql, $statement) = @_;
+    return 0 if Selecto::SQL::_hand_built_start($sql) =~ /\A(?:SELECT|VALUES|TABLE)\b/i;
+    my $dbh = $self->{dbh};
+    my (@types, $found);
+    my $ok = eval {
+        local $dbh->{PrintError} = 0;
+        local $dbh->{RaiseError} = 1;
+        my $sth = $dbh->prepare("EXPLAIN $sql");
+        $sth->execute(@{$statement->params});
+        my ($column) = grep { lc($sth->{NAME}[$_]) eq 'select_type' } 0 .. $#{$sth->{NAME}};
+        if (defined $column) {
+            $found = 1;
+            while (my $row = $sth->fetchrow_arrayref) { push @types, $row->[$column] // '' }
+        }
+        $sth->finish;
+        1;
+    };
+    unless ($ok) {
+        my $failure = $self->normalize_error($@);
+        die $failure if !blessed($failure) || ($failure->details->{category} // '') eq 'query_canceled';
+        return 1;
+    }
+    return !$found || !@types || grep { /\A(?:UPDATE|DELETE|INSERT|REPLACE)\b/i } @types;
 }
 
 # A read may end up READ ONLY or with autocommit off only by accident, and a host
@@ -3021,9 +3096,17 @@ sub _retry_control {
     return 0;
 }
 
+sub _forbid_reconnect {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    eval { $dbh->{mariadb_auto_reconnect} = 0 };
+    return;
+}
+
 sub _close_session {
     my ($self, $message, %details) = @_;
     my $dbh = $self->{dbh};
+    $self->_forbid_reconnect;
     eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
     return Selecto::Error->new(code => 'transaction_state_unsafe', message => "$message: the connection was closed",
         details => {state => 'unknown', reason => 'session_not_restored', %details});
@@ -3250,7 +3333,7 @@ sub _require_session {
         @row = $dbh->selectrow_array($self->_statement_sql('SELECT VERSION(), @@SESSION.time_zone, @@system_time_zone, '
             . '@@SESSION.character_set_client, @@SESSION.character_set_connection, @@SESSION.character_set_results, '
             . q{@@SESSION.sql_mode, CONVERT(X'F09F9880' USING utf8mb4), CAST('2024-03-10 02:30:00.5' AS DATETIME(6))}
-            . ($open_check ? ', @@SESSION.autocommit, @@SESSION.transaction_read_only' : '')));
+            . ', @@SESSION.autocommit, @@SESSION.transaction_read_only'));
         1;
     };
     unless ($ok) {
@@ -3297,7 +3380,7 @@ sub _require_session {
             die $self->normalize_error($error);
         }
     }
-    return [$zone, $mode];
+    return [$zone, $mode, $autocommit];
 }
 
 # Items 59 and 62: a trigger (SET time_zone in a BEFORE/AFTER row trigger)
@@ -3322,7 +3405,7 @@ sub _check_session_state {
     return if @now == 2 && defined($now[0]) && defined($now[1]) && $now[0] eq $state->[0] && $now[1] eq $state->[1];
     my $restored = eval {
         local $dbh->{PrintError} = 0;
-        defined($dbh->do('SET SESSION time_zone = ?, sql_mode = ?', undef, @$state)) or die "restore failed\n";
+        defined($dbh->do('SET SESSION time_zone = ?, sql_mode = ?', undef, @$state[0, 1])) or die "restore failed\n";
         1;
     };
     Selecto::Error->throw('query_rule_violation',

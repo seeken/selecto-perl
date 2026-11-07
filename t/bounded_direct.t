@@ -65,7 +65,7 @@ subtest 'PostgreSQL direct bounded execution' => sub {
     ok !grep({ /\b(?:DECLARE|FETCH)\b/ } @sql), 'no cursor for a one-batch page';
     is scalar(grep { /\ASAVEPOINT \w+; SELECT .*set_config\('statement_timeout'/s } @sql), 1,
         'its savepoint opens with its timeout, in one round trip';
-    is scalar(grep { /\AROLLBACK TO SAVEPOINT (\w+); RELEASE SAVEPOINT \1\z/ } @sql), 1,
+    is scalar(grep { /\AROLLBACK TO SAVEPOINT (selecto_budget\w+); RELEASE SAVEPOINT \1\z/ } @sql), 1,
         'and is rolled back and released in one more';
     is $timeout->(), '0', 'the timeout ends with the page';
     ok eval { $dbh->do('SELECT pg_sleep(0.05)'); 1 }, 'the host transaction runs on under its own timeout';
