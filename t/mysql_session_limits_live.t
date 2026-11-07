@@ -90,7 +90,7 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
             $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_limit_rows',
                 assignments => {name => $_[0]}, predicate => $x->lte('id', 5), expected_count => 5));
         };
-        $dbh->do("DROP VIEW IF EXISTS selecto_limit_$_") for qw(noisy flood);
+        $dbh->do("DROP VIEW IF EXISTS selecto_limit_$_") for qw(noisy flood quiet loud);
         my $hand = sub {
             scalar @{$adapter->execute_query(Selecto::Statement->new(sql => 'SELECT id FROM selecto_limit_rows',
                 columns => ['id'], adapter_name => $backend))->{rows}};
@@ -176,7 +176,9 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
         $dbh->do('SET SESSION group_concat_max_len = DEFAULT');
 
         # One child past the packet: on MariaDB a clean answer of [null] if nothing looks.
+        # (MySQL refuses it itself; the row would be written for nothing.)
         my ($packet) = $dbh->selectrow_array('SELECT @@max_allowed_packet LIMIT 1');
+        if ($mariadb) {
         my $width = int($packet / 4);
         my @wide = qw(a b c d e);
         $dbh->do('DROP TABLE IF EXISTS selecto_limit_wide');
@@ -188,8 +190,9 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
                 owner_key => 'id', related_key => 'order_id', cardinality => 'many', join_type => 'left'}});
         my $wide_engine = Selecto::Engine->new(adapter => $adapter, domain => $wide);
         like failure(sub { $wide_engine->all($wide_engine->query->select('id', $x->related_collection('items', ['id', @wide])->as('c'))->where($x->eq('id', 1))) }),
-            $mariadb ? qr{\Aquery_error/result_incomplete/length_limit\z} : qr{\Aquery_error/}, 'a collection child past the packet refuses';
+            qr{\Aquery_error/result_incomplete/length_limit\z}, 'a collection child past the packet refuses';
         $dbh->do('DROP TABLE selecto_limit_wide');
+        }
 
         # The server keeps max_error_count warnings. A cut must not hide behind harmless
         # ones, and harmless ones must not refuse a good read, whatever the host's cap.
@@ -211,12 +214,46 @@ for my $specification (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SE
                 'query_error/result_incomplete/length_limit', "cap $cap: and so is a streamed one";
         }
         $dbh->do('SET SESSION max_error_count = DEFAULT');
-        is failure(sub { $flood_engine->all($flood_engine->query->select('id', 'w')) }), 'query_error/result_incomplete/warnings_unread',
-            'more warnings than any cap can keep cannot be proved clean: refused';
+        is failure(sub { $flood_engine->all($flood_engine->query->select('id', 'w')) }), 'query_error/result_unverified/warnings_unread',
+            'more warnings than any cap can keep cannot be proved clean: refused as unverified';
+        unlike eval { $flood_engine->all($flood_engine->query->select('id', 'w')); '' } // $@->message, qr/\bcut\b/,
+            'and the refusal does not say the server cut it';
         is +($adapter->execute_query(Selecto::Statement->new(sql => 'SELECT COUNT(b) FROM selecto_limit_noisy', columns => ['n'], adapter_name => $backend))->{rows}[0][0]), 0,
             'a hand-built read keeps its own warnings';
         $dbh->do('DROP VIEW selecto_limit_flood');
         $dbh->do('DROP VIEW selecto_limit_noisy');
+
+        # A plain application role: on MariaDB it can set every pin; on MySQL it cannot
+        # lift max_error_count, so past 1024 warnings a read cannot be verified.
+        subtest 'plain role' => sub {
+            (my $variable = $environment) =~ s/_URL\z/_PLAIN_URL/;
+            plan skip_all => "$variable is not configured" unless defined($ENV{$variable}) && $ENV{$variable} ne '';
+            my $plain = open_db($backend, $ENV{$variable});
+            my $plain_adapter = Selecto->adapter($backend => (dbh => $plain));
+            my ($grants) = join ' ', map { $_->[0] } @{$plain->selectall_arrayref('SHOW GRANTS')};
+            unlike $grants, qr/SESSION_VARIABLES_ADMIN|SYSTEM_VARIABLES_ADMIN|SUPER|ALL PRIVILEGES ON \*\.\*/, 'the role is a plain one';
+            $dbh->do("CREATE VIEW selecto_limit_quiet AS SELECT id, CAST(CONCAT('x', id) AS SIGNED) AS w FROM selecto_limit_rows WHERE id <= 800");
+            $dbh->do("CREATE VIEW selecto_limit_loud AS SELECT id, CAST(CONCAT('x', id) AS SIGNED) AS w FROM selecto_limit_rows");
+            my $engine_for = sub {
+                Selecto::Engine->new(adapter => $plain_adapter, domain => Selecto::Domain->new(name => "Plain$_[0]",
+                    table => "selecto_limit_$_[0]", fields => {id => 'integer', w => 'integer'}));
+            };
+            my $rows_engine = Selecto::Engine->new(adapter => $plain_adapter, domain => $rows);
+            is scalar @{$rows_engine->all($rows_engine->query->select('id'))->{rows}}, $CHAIN, 'a generated read runs with its pins';
+            my $quiet = $engine_for->('quiet');
+            is scalar @{$quiet->all($quiet->query->select('id', 'w'))->{rows}}, 800, '800 harmless warnings: answered';
+            my $loud = $engine_for->('loud');
+            my $refused = failure(sub { $loud->all($loud->query->select('id', 'w')) });
+            if ($mariadb) {
+                is $refused, 'ok', '1500 harmless warnings: answered, the role lifted the cap';
+            } else {
+                is $refused, 'query_error/result_unverified/warnings_unread', '1500 harmless warnings: refused as unverified, never as cut';
+            }
+            is scalar @{$plain_adapter->execute_query(Selecto::Statement->new(sql => 'SELECT id, w FROM selecto_limit_loud',
+                columns => [qw(id w)], adapter_name => $backend))->{rows}}, $CHAIN, 'a hand-built read keeps the host session and its answer';
+            $dbh->do("DROP VIEW selecto_limit_$_") for qw(quiet loud);
+            $plain->disconnect;
+        };
 
         # Every pin must be valid where a bad one is an error, and leave the host no warning.
         my ($mode) = $dbh->selectrow_array('SELECT @@SESSION.sql_mode LIMIT 1');
