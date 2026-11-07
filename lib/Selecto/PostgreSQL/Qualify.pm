@@ -1686,6 +1686,13 @@ sub _resolve_call {
     my @extension = grep { $_->{schema} ne 'pg_catalog' && defined $_->{extension} && _accepts($_, \@classes) } @{$info->{candidates} // []};
     return undef unless @extension;
     return undef unless $KEYWORD{uc $names->[0]} || grep { $_->{entry} || $_->{unknown} } @classes;
+    # An argument of a known extension type takes a candidate declared with that type,
+    # or none here: citext's min is no answer for a lo (R62: exact, or left alone).
+    my @typed = grep { $classes[$_]{entry} } 0 .. $#classes;
+    if (@typed) {
+        @extension = grep { my $c = $_; !grep { ($c->{args}[$_] // '') ne ($classes[$_]{entry}{"\0type"} // "\0") } @typed } @extension;
+        return undef unless @extension;
+    }
     my %homes = map { ($_->{schema} => 1) } @extension;
     return $names->[0] if keys(%homes) != 1 || grep { $_->{unknown} } @classes;
     return _quote_name($extension[0]{schema}) . '.' . _quote_name($kinds->[0] eq 'id' ? lc $names->[0] : _unquote($names->[0]));
