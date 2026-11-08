@@ -14,6 +14,14 @@ my $SERIAL = 0;
 # Its statement and creation time identify it: no DECLARE can reproduce the
 # time. Each batch checks them before its FETCH. The time is read as an epoch, so
 # a changed TimeZone is the session check's to report, not a replacement.
+# The host's session as the stream's close compares it: its settings (but
+# statement_timeout, which a query budget sets for the session), and its advisory
+# locks.
+my $ADVISORY_SQL = q{SELECT pg_catalog.count(*) FROM pg_catalog.pg_locks l WHERE l.pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid() }
+    . q{AND l.locktype OPERATOR(pg_catalog.=) 'advisory'};
+my $HOST_MARK = q{(SELECT pg_catalog.md5(pg_catalog.string_agg(t.name OPERATOR(pg_catalog.||) '=' OPERATOR(pg_catalog.||) t.setting, ',' ORDER BY t.name)) }
+    . q{FROM pg_catalog.pg_settings t WHERE t.name OPERATOR(pg_catalog.<>) 'statement_timeout'), }
+    . "($ADVISORY_SQL)";
 my $CURSOR_SQL = q{SELECT c.statement, CAST(EXTRACT(EPOCH FROM c.creation_time) AS pg_catalog.text) FROM pg_catalog.pg_cursors c }
     . q{WHERE c.name OPERATOR(pg_catalog.=) CAST($1 AS pg_catalog.text)};
 
@@ -116,8 +124,16 @@ sub new {
         }) if $self->{opening};
         # In its own transaction too, what the host runs on the handle between fetches
         # sees the host's settings: they are put back now, and each FETCH pins again.
-        Selecto::PostgreSQL::_pg_uninterrupted(sub { _do($dbh, _settings_sql($dbh, $self->{pin}{host})) })
-            if $self->{pin} && $self->{scope} eq 'own';
+        # The handle is the stream's until it closes, and whatever the host does on it
+        # in between is rolled back with the stream's transaction: what the host's
+        # session looks like now is noted, so the close can say so rather than end in
+        # a silent OK.
+        Selecto::PostgreSQL::_pg_uninterrupted(sub {
+            my $restore = $self->{pin} ? _settings_sql($dbh, $self->{pin}{host}) : 'SELECT 1';
+            my @mark = $dbh->selectrow_array("WITH s AS MATERIALIZED ($restore) SELECT $HOST_MARK FROM s");
+            die "the host's session could not be noted\n" unless @mark == 2 && defined $mark[0];
+            $self->{host_mark} = {settings => $mark[0], advisory => $mark[1]};
+        }) if $self->{scope} eq 'own' && $adapter->_pg_session_checked;
         1;
     };
     if (!$ok) {
@@ -223,7 +239,11 @@ sub next {
         my $origin = $self->{session_changed} ? 'own' : $self->_failure_origin;
         $error = eval { Selecto::PostgreSQL::_session_changed(); 1 } ? $error : $@ if $self->{session_changed};
         my $cleanup = eval { $self->_close($origin); 1 } ? undef : $@;
-        die _cleanup_error($cleanup) // $error;
+        my $raised = _cleanup_error($cleanup) // $error;
+        # (The host's work between fetches went with it: the error says so too.)
+        $raised->{details}{host_work_discarded} = [@{$self->{discarded}}]
+            if $self->{discarded} && Scalar::Util::blessed($raised) && $raised->isa('Selecto::Error') && ref($raised->{details}) eq 'HASH';
+        die $raised;
     }
     if (!@$rows) {
         $self->close;
@@ -284,6 +304,7 @@ sub _close {
             if (defined($unsafe) && $unsafe eq 'unknown') {
                 ($unsafe, $broken, $cancelled) = (undef, 1, 1);
             } elsif (!$unsafe) {
+                my @discarded = $self->_host_work_seen;
                 # A read-only stream never commits work on behalf of its caller. A cancel
                 # can land on the ROLLBACK itself: DBI then counts the transaction over,
                 # the server does not. So, as a read does, it is tried again as a
@@ -300,10 +321,22 @@ sub _close {
                     if ($rolled) { eval { $dbh->{AutoCommit} = 1; $dbh->{BegunWork} = 0 } }
                     else { ($broken, $cancelled) = (1, $state eq '57014' ? 1 : $cancelled) }
                 }
+                # A transaction-level advisory lock ends with the rollback; a session one
+                # stays. (pg_locks shows both alike: the count after the rollback tells.)
+                push @discarded, 'a transaction-level advisory lock'
+                    if !$broken && defined($self->{advisory_before}) && $self->{advisory_before} > $self->{host_mark}{advisory}
+                    && (eval { ($dbh->selectrow_array($ADVISORY_SQL))[0] } // $self->{advisory_before}) < $self->{advisory_before};
+                $self->{discarded} = \@discarded if @discarded;
             }
         } elsif ($self->{opening}) {
             # Nothing of the host's can be after this savepoint yet.
             $self->_savepoint_undone($name) or $broken = 1;
+        } elsif ((eval { $dbh->pg_ping } // 0) == 1) {
+            # The host ended its own transaction (COMMIT or ROLLBACK, by handle or by
+            # text): the cursor, the savepoints and the pin went with it, and nothing of
+            # the stream's is left to end. The connection is the host's and stays.
+            delete $self->{batch};
+            $unsafe = 'the host ended its transaction while the stream was open';
         } else {
             # Only the batch is the stream's: a refusal never undoes the host's work
             # between fetches. That savepoint is the one it holds.
@@ -347,8 +380,36 @@ sub _close {
         Selecto::Error->throw('stream_cleanup_failed', 'database stream could not restore its transaction scope: the connection was closed',
             {state => 'unknown', connection_closed => JSON::PP::true, ($cancelled ? (category => 'query_canceled') : ())});
     }
+    # Last, as nothing else went wrong: the host's work between fetches went with the
+    # stream's own transaction. (On a failure the stream's own error stands, and says it.)
+    if ($self->{discarded} && !defined $failure) {
+        Selecto::Error->throw('stream_host_work_discarded',
+            "the host's work on the handle between fetches was rolled back with the stream's own transaction ("
+            . join(', ', @{$self->{discarded}}) . "): on a handle with no transaction open, the handle is the stream's "
+            . 'until it closes; call begin_work to use it between fetches',
+            {discarded => [@{$self->{discarded}}]});
+    }
     die $alarm if defined $alarm && !defined $failure;
     return $self;
+}
+
+# What the host did on the handle since the stream opened in a transaction of its own,
+# read before that transaction is rolled back: a write (temporary tables included: an
+# id is assigned) and a setting changed. (A LISTEN or NOTIFY leaves no trace until the
+# commit, and a rolled-back one cannot be seen.)
+sub _host_work_seen {
+    my ($self) = @_;
+    my $mark = $self->{host_mark} or return;
+    my $dbh = $self->{dbh};
+    my @now;
+    for my $attempt (1 .. 3) {
+        last if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1;
+            @now = $dbh->selectrow_array("SELECT pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL, $HOST_MARK"); 1 };
+        last unless (eval { $dbh->state } // '') eq '57014';
+    }
+    return unless @now == 3;
+    $self->{advisory_before} = $now[2];
+    return ($now[0] ? ('a write') : ()), (defined($now[1]) && $now[1] ne $mark->{settings} ? ('a setting') : ());
 }
 
 # Rolls back to a savepoint of the stream's and releases it. A cancel is tried again.
@@ -511,9 +572,17 @@ batch only after it has been fetched. Rows hold the driver's values; with
 C<< canonical_values => 1 >> each batch is decoded to canonical values column
 by column (see L<Selecto::PostgreSQL/RESULT VALUES>).
 
-The stream owns an idle handle's read-only transaction and rolls it back on
-close. A generated stream that locks rows (C<for_update>, C<for_share>) is not read
-only there, and its locks end with it.
+On a handle with no transaction open the stream begins a read-only transaction of
+its own and rolls it back at the close, and the handle is the stream's until then:
+anything run on it between fetches runs in that transaction and is rolled back with
+it. A write fails (the transaction is read only), and the rest (a temporary table's
+rows, a C<SET> or C<set_config(..., false)>, a transaction-level advisory lock) is
+undone at the close, which then ends with C<stream_host_work_discarded> naming what
+was rolled back, rather than in a silent OK (on a dropped stream, a warning; on a
+failed fetch, the error's C<host_work_discarded> detail). A C<LISTEN> or C<NOTIFY>
+leaves no trace before a commit and is lost unseen. Call C<begin_work> first to use
+the handle between fetches. A stream that locks rows (C<for_update>, C<for_share>)
+refuses there (C<row_lock_needs_transaction>): it needs the host's transaction.
 
 Inside an existing transaction the host can write between fetches. A savepoint guards
 the opening and is released at once; after that the stream holds no savepoint between
@@ -523,9 +592,12 @@ generated stream that locks rows keeps its locks instead, to the host's commit. 
 failed fetch ends only that fetch, and then the stream: nothing the host did between
 fetches is undone, and the error reaches the host. A hand-built statement that locks
 rows refuses. A C<ROLLBACK TO> that takes the cursor away ends the stream at its next
-fetch, with the transaction intact. The stream's search_path and result settings are
-pinned for its own statements only: between fetches the host's statements run under
-the host's settings, and what the host sets there is still in force after the close.
+fetch, with the transaction intact. A host that ends its transaction mid-stream
+(C<COMMIT> or C<ROLLBACK>) ends the stream with C<transaction_state_unsafe>, and keeps
+its connection. The stream's search_path and result settings are pinned for its own
+statements only: between fetches the host's statements run under the host's settings,
+and in the host's transaction what the host sets there is still in force after the
+close.
 
 A stream does not open on a connection with a pending host result, an aborted
 transaction or an unknown state (C<transaction_state_unsafe>; see
