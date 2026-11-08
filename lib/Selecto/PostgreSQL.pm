@@ -1236,6 +1236,12 @@ sub _refuse_pending_result {
 sub _connection_state {
     my ($self) = @_;
     my $dbh = $self->{dbh};
+    # A bounded stream that runs in a transaction of its own holds the handle until it
+    # closes: Selecto's own reads, writes and streams on it refuse too.
+    Selecto::Error->throw('handle_owned_by_stream',
+        'the handle belongs to an open bounded stream until it closes: call begin_work before the stream to use the '
+        . 'handle between fetches', {method => 'selecto'})
+        if !$Selecto::PostgreSQL::Stream::PASS && eval { $dbh->{private_selecto_stream_owned} };
     return 'active' if eval { $dbh->{pg_async_status} };
     my $status = eval { $dbh->pg_ping };
     return 'unknown' unless defined $status;
@@ -1478,6 +1484,8 @@ sub _pg_reset_schemas {
     my $finally = _pg_finally(sub { $self->_pg_control("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint", \%release) if $made });
     my $ok = eval {
         _pg_uninterrupted(sub { $self->_savepoint_command(create => $savepoint); $made = 1 }) if $savepoint;
+        local $dbh->{RaiseError} = 1;
+        local $dbh->{PrintError} = 0;
         ($schemas) = $dbh->selectrow_array($RESET_SCHEMAS_SQL);
         1;
     };
@@ -1554,7 +1562,8 @@ sub _pg_catalog_row {
     my ($self, $sql, $binds, $inside) = @_;
     my $dbh = $self->{dbh};
     my @binds = @{$binds // []};
-    return $dbh->selectrow_array($sql, undef, @binds)
+    # (Raised, whatever the handle's RaiseError: a cancel must reach the caller typed.)
+    return do { local $dbh->{RaiseError} = 1; local $dbh->{PrintError} = 0; $dbh->selectrow_array($sql, undef, @binds) }
         unless $self->_pg_session_checked && (!$dbh->{AutoCommit} || ($inside // $self->_connection_state eq 'intrans'));
     my $savepoint = Selecto::SQL::_savepoint_name('selecto_catalog');
     my ($made, $ok, @row, $error, %undo);
@@ -1564,6 +1573,8 @@ sub _pg_catalog_row {
     });
     $ok = eval {
         _pg_uninterrupted(sub { $self->_savepoint_command(create => $savepoint); $made = 1 });
+        local $dbh->{RaiseError} = 1;
+        local $dbh->{PrintError} = 0;
         @row = $dbh->selectrow_array($sql, undef, @binds);
         1;
     };
@@ -1591,7 +1602,9 @@ sub _pg_compile_inside {
 # Whether this failure is a cancel: it stays one, whichever guard it landed on.
 sub _pg_cancelled {
     my ($self, $error) = @_;
-    return blessed($error) && $error->can('details') && ($error->details->{category} // '') eq 'query_canceled' ? 1 : 0;
+    return 1 if blessed($error) && $error->can('details') && ($error->details->{category} // '') eq 'query_canceled';
+    # (An untyped failure, as RaiseError off leaves it: the handle still says.)
+    return !blessed($error) && defined($error) && (eval { $self->{dbh}->state } // '') eq '57014' ? 1 : 0;
 }
 
 sub _pg_declared_schemas {

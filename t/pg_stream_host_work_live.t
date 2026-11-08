@@ -172,7 +172,15 @@ subtest 'a cancel on its ending is tried again, and costs nothing' => sub {
             $dbh->do('INSERT INTO sw_l VALUES (1)');
             my $s = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 1);
             $s->next;
-            ok(eval { $failing->($match, 1, sub { $how eq 'close' ? $s->close : undef($s); 1 }) }, "$how, $match: ended") or diag $@;
+            # (R66(d): a cancel that landed is reported, once the retry has ended the
+            # stream; a dropped stream cannot raise and says nothing.)
+            my $ended = eval { $failing->($match, 1, sub { $how eq 'close' ? $s->close : undef($s); 1 }) };
+            my $error = $@;
+            if ($how eq 'close') {
+                ok(!$ended && blessed($error) && ($error->details->{category} // '') eq 'query_canceled', "$how, $match: ended, and the cancel is reported") or diag $error;
+            } else {
+                ok($ended, "$how, $match: ended") or diag $error;
+            }
             is_deeply(\@warnings, [], 'without a warning');
             is($dbh->pg_ping, 3, 'the transaction is healthy');
             my $next = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 1);

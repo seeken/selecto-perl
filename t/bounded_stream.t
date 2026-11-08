@@ -34,10 +34,15 @@ subtest 'PostgreSQL server cursor lifecycle' => sub {
     isa_ok($stream,'Selecto::Stream');
     is_deeply($stream->columns,['id','amount'],'cursor keeps statement columns');
     ok(!$dbh->{AutoCommit},'idle handle enters owned transaction');
-    is(($dbh->selectrow_array('SHOW transaction_read_only'))[0],'on','owned transaction is read only');
-    is(($dbh->selectrow_array(q{SELECT COUNT(*) FROM pg_cursors WHERE name LIKE 'selecto_stream_%'}))[0],1,'cursor exists while stream open');
+    is(code(sub {$dbh->selectrow_array('SELECT 1')}),'handle_owned_by_stream','the owned handle refuses the host while the stream is open');
+    {
+        # (Looked at as the stream itself: its own transaction.)
+        local $Selecto::PostgreSQL::Stream::PASS = 1;
+        is(($dbh->selectrow_array('SHOW transaction_read_only'))[0],'on','owned transaction is read only');
+        is(($dbh->selectrow_array(q{SELECT COUNT(*) FROM pg_cursors WHERE name LIKE 'selecto_stream_%'}))[0],1,'cursor exists while stream open');
+    }
     is_deeply($stream->next,[1,'2.5'],'bound parameters and native decoding survive cursor transport');
-    is(code(sub {$adapter->stream_query(statement('SELECT 1'),bounded=>1)}),'stream_busy','overlapping stream on same handle refused');
+    like(code(sub {$adapter->stream_query(statement('SELECT 1'),bounded=>1)}),qr/\A(?:stream_busy|handle_owned_by_stream)\z/,'overlapping stream on same handle refused');
     $stream->close;
     $stream->close;
     ok($stream->closed,'explicit early close is idempotent');
