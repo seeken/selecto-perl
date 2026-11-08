@@ -66,10 +66,13 @@ sub new {
             die 'stream transaction identity is unavailable' unless defined $self->{transaction};
         }
         # search_path and the result-affecting settings pinned for the
-        # stream (R30, R35) until it closes; then temp shadows refused and
-        # the session snapshot taken before the cursor; every FETCH is
-        # compared with it (items 56, 61). While a stream is open inside a
-        # host transaction, the host's own statements see the pinned values.
+        # stream (R30, R35); then temp shadows refused and the session snapshot
+        # taken before the cursor; every FETCH is compared with it (items 56,
+        # 61). In its own transaction the pin lasts to the end. Inside the
+        # host's, it lasts only while the stream's own statements run: the host's
+        # values are back before the opening savepoint is released, and each
+        # FETCH sets the pin again under its batch savepoint. The host's own
+        # statements between fetches run under the host's settings.
         # (Not a hand-built statement's, which runs in the host's session: R71.)
         if ($adapter->_pg_session_checked && !Selecto::PostgreSQL::_pg_hand_built($args{statement})) {
             {
@@ -96,11 +99,14 @@ sub new {
         # alone cannot.
         $self->{sth} = $dbh->prepare("FETCH FORWARD $fetch_size FROM $name")
             or die 'cursor fetch could not be prepared';
-        # The savepoint only guards the opening. The cursor and the pin outlive it, and
-        # from here the stream holds nothing the host could release or roll back to,
-        # and nothing a failure could take the host's own work back to.
-        Selecto::PostgreSQL::_pg_uninterrupted(sub { _do($dbh, "RELEASE SAVEPOINT $name"); delete $self->{opening} })
-            if $self->{opening};
+        # The savepoint only guards the opening. The cursor outlives it; the pin does
+        # not, since a RELEASE keeps what SET LOCAL set and the host's values are put
+        # back first. From here the stream holds nothing the host could release or
+        # roll back to, and nothing a failure could take the host's own work back to.
+        Selecto::PostgreSQL::_pg_uninterrupted(sub {
+            _do($dbh, ($self->{pin} ? _settings_sql($dbh, $self->{pin}{host}) . '; ' : '') . "RELEASE SAVEPOINT $name");
+            delete $self->{opening};
+        }) if $self->{opening};
         1;
     };
     if (!$ok) {
@@ -144,13 +150,18 @@ sub next {
         # R55: a stream's own transaction is READ ONLY. Inside the host's, the host
         # may write between fetches, so each FETCH is read-only under a savepoint
         # of its own, which is rolled back; a cursor keeps its position through
-        # that. One that locks rows is not read only, and its savepoint is released,
-        # so the locks last to the host's commit.
+        # that. The pin is set again under it, and the rollback takes it away. One
+        # that locks rows is not read only, and its savepoint is released, so the
+        # locks last to the host's commit: the host's values are put back first.
         my $batch = ($self->{scope} // '') eq 'host' && $self->{adapter}->_pg_session_checked ? "$self->{name}_batch" : undef;
         if (defined $batch) {
             Selecto::PostgreSQL::_pg_uninterrupted(sub {
+                my $dbh = $self->{dbh};
+                my $pin = $self->{pin};
                 $self->{batch} = $batch;
-                _do($self->{dbh}, "SAVEPOINT $batch" . ($self->{locks} ? '' : '; SET LOCAL transaction_read_only = on'));
+                _do($dbh, "SAVEPOINT $batch" . ($pin && !$self->{locks} ? '; ' . _settings_sql($dbh, $pin->{applied}) : '')
+                    . ($self->{locks} ? '' : '; SET LOCAL transaction_read_only = on'));
+                $self->{batch_host} = $self->_pin_capturing_host if $pin && $self->{locks};
             });
         }
         defined($sth->execute) or die 'cursor fetch failed';
@@ -172,8 +183,10 @@ sub next {
         }
         if (defined $batch) {
             Selecto::PostgreSQL::_pg_uninterrupted(sub {
-                _do($self->{dbh}, ($self->{locks} ? '' : "ROLLBACK TO SAVEPOINT $batch; ") . "RELEASE SAVEPOINT $batch");
-                delete $self->{batch};
+                my $host = $self->{batch_host};
+                _do($self->{dbh}, ($self->{locks} ? ($host ? _settings_sql($self->{dbh}, $host) . '; ' : '')
+                    : "ROLLBACK TO SAVEPOINT $batch; ") . "RELEASE SAVEPOINT $batch");
+                delete @{$self}{qw(batch batch_host)};
             });
         }
         $self->{adapter}->_decode_rows($rows, $self->{types}) if $self->{canonical_values};
@@ -330,7 +343,8 @@ sub _savepoint_undone {
     return 0;
 }
 
-# The end of a stream in the host's transaction: its cursor and its pin go, under a
+# The end of a stream in the host's transaction: its cursor goes (the pin went with
+# the opening and with each batch), under a
 # savepoint of their own, so a cancel costs the host nothing. A cursor already gone
 # went with a host's ROLLBACK TO, which is legal. Returns whether it is done.
 sub _end_in_transaction {
@@ -346,7 +360,6 @@ sub _end_in_transaction {
                 my @cursor = $dbh->selectrow_array($CURSOR_SQL, undef, $name);
                 $dbh->do("CLOSE $name") if @cursor;
             }
-            $adapter->_pg_restore_search_path($self->{pin}) if $self->{pin};
             $dbh->do("RELEASE SAVEPOINT $end");
             1;
         };
@@ -401,6 +414,28 @@ sub _cleanup_error {
             message => 'database stream could not restore its transaction scope');
 }
 
+# The statement that sets each setting to its value for the transaction. Values are
+# literals: one round trip with the statements around it.
+sub _settings_sql {
+    my ($dbh, $pairs) = @_;
+    return 'SELECT ' . join(', ', map { "pg_catalog.set_config('$_->[0]', " . $dbh->quote($_->[1]) . ', true)' } @$pairs);
+}
+
+# A locking batch: sets the pin and returns the host's values it replaced, read first
+# in the same statement, for its RELEASE to put back.
+sub _pin_capturing_host {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    my @pairs = @{$self->{pin}{applied}};
+    my $sql = 'WITH h AS MATERIALIZED (SELECT '
+        . join(', ', map { "pg_catalog.current_setting('$pairs[$_][0]') AS s$_" } 0 .. $#pairs) . ') SELECT '
+        . join(', ', (map { "h.s$_" } 0 .. $#pairs),
+            map { "pg_catalog.set_config('$pairs[$_][0]', " . $dbh->quote($pairs[$_][1]) . ', true)' } 0 .. $#pairs) . ' FROM h';
+    my @row = $dbh->selectrow_array($sql);
+    die "the host's settings could not be read\n" unless @row == 2 * @pairs && !grep { !defined } @row;
+    return [map { [$pairs[$_][0], $row[$_]] } 0 .. $#pairs];
+}
+
 sub _do {
     my ($dbh, $sql) = @_;
     defined($dbh->do($sql)) or die 'stream transaction control failed';
@@ -453,8 +488,9 @@ generated stream that locks rows keeps its locks instead, to the host's commit. 
 failed fetch ends only that fetch, and then the stream: nothing the host did between
 fetches is undone, and the error reaches the host. A hand-built statement that locks
 rows refuses. A C<ROLLBACK TO> that takes the cursor away ends the stream at its next
-fetch, with the transaction intact. While the stream is open the host's own statements
-see its pinned settings.
+fetch, with the transaction intact. The stream's search_path and result settings are
+pinned for its own statements only: between fetches the host's statements run under
+the host's settings, and what the host sets there is still in force after the close.
 
 A stream does not open on a connection with a pending host result, an aborted
 transaction or an unknown state (C<transaction_state_unsafe>; see

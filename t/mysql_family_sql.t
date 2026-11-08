@@ -226,6 +226,9 @@ for my $case (['mysql', '8.4.11'], ['mariadb', '11.4.13-MariaDB-ubu2404']) {
         'WITH `select` AS (SELECT 1 AS a) SELECT a FROM `select`' => "WITH `select` AS (SELECT 1 AS a) SELECT $hint a FROM `select`",
         q{WITH c AS (SELECT ')' AS a) SELECT a FROM c} => qq{WITH c AS (SELECT ')' AS a) SELECT $hint a FROM c},
         'WITH c AS (SELECT 1 AS a) (SELECT a FROM c)' => 'WITH c AS (SELECT 1 AS a) (SELECT a FROM c)',
+        '/* selecto:query_id=AB001 */ WITH c AS (SELECT 1 AS a) SELECT a FROM c' => "/* selecto:query_id=AB001 */ WITH c AS (SELECT 1 AS a) SELECT $hint a FROM c",
+        "-- select first\nWITH c AS (SELECT 1 AS a) SELECT a FROM c" => "-- select first\nWITH c AS (SELECT 1 AS a) SELECT $hint a FROM c",
+        '/* select */ SELECT 1' => "/* select */ SELECT $hint 1",
     );
     is Selecto::MySQLFamily::_lift_warning_cap($_), $lifted{$_}, "lifted: $_" for sort keys %lifted;
 }

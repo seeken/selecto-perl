@@ -1756,7 +1756,9 @@ sub _pg_pin_search_path {
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_not_evaluable', "the session's reset settings could not be read",
         {reason => 'session_state_unknown'}) unless @host == 2 * @pins + ($options{read_only} ? 1 : 0) && !grep { !defined } @host;
-    return {host => [map { [$pins[$_][0], $host[$_]] } 0 .. $#pins], pinned => $pinned, session => $session ? 1 : 0};
+    # (applied: what set_config set, so a bounded stream can set the same again per FETCH.)
+    return {host => [map { [$pins[$_][0], $host[$_]] } 0 .. $#pins], pinned => $pinned, session => $session ? 1 : 0,
+        applied => [map { [$pins[$_][0], $host[@pins + $_]] } 0 .. $#pins]};
 }
 
 sub _pg_restore_search_path {
