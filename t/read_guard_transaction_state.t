@@ -184,15 +184,15 @@ subtest 'PostgreSQL 18b/18e: a host failure mid-stream is never rolled back by t
     $dbh->commit;
     is_deeply($committed->(), [100], 'and nothing of it commits');
 
-    # The stream's own transaction, aborted by a host statement run inside it.
+    # The stream's own transaction: a host statement on its handle refuses before it
+    # is sent (the handle is the stream's until it closes), and the stream reads on.
     $reset->();
     my $own = $stream->();
     $own->next;
-    $fail->();
-    is(code_of(sub { $own->next }), 'transaction_state_unsafe', 'own transaction aborted by the host: typed failure');
-    is($dbh->pg_ping, 4, 'and the connection is left for the host to roll back');
-    $dbh->rollback;
-    $healthy->('own transaction aborted by the host');
+    is(code_of(sub { $dbh->do('SELECT 1/0') }), 'handle_owned_by_stream', "a host statement in the stream's own transaction refuses");
+    is(code_of(sub { 1 while $own->next; $own->close }), 'ok', 'and the stream reads on');
+    is($dbh->pg_ping, 1, 'the handle is idle and the host\'s again');
+    $healthy->('host statement refused in the stream\'s own transaction');
 };
 
 subtest 'PostgreSQL 18f: a transaction the host took over is never rolled back' => sub {
@@ -204,11 +204,11 @@ subtest 'PostgreSQL 18f: a transaction the host took over is never rolled back' 
         $reset->();
         my $open = $stream->();
         is_deeply($open->next, [1], "$name: the stream reads in its own transaction");
-        $take->();
-        is(code_of(sub { $open->close }), 'transaction_state_unsafe', "$name: close reports the lost transaction");
+        # (The handle is the stream's until it closes: a takeover refuses before it is sent.)
+        is(code_of($take), 'handle_owned_by_stream', "$name: the host cannot take the stream's transaction over");
+        is(code_of(sub { $open->close }), 'ok', "$name: the stream closes as usual");
         ok($open->closed, "$name: the stream is closed");
-        $commit->();
-        is_deeply($committed->(), [5, 100], "$name: the host's new transaction and its write survive");
+        is_deeply($committed->(), [100], "$name: nothing of the attempt ran");
         $healthy->($name);
     }
 };
@@ -234,7 +234,8 @@ subtest 'PostgreSQL 18g: a cleanup that cannot finish never ends in a false OK' 
     $open->next;
     {
         local *DBD::Pg::db::do = $timing_out->(1);
-        is(code_of(sub { $open->close }), 'ok', 'a close-time timeout of the stream\'s own is recovered');
+        # (A statement timeout is 57014, as a cancel is: recovered, and reported, R66(d).)
+        is(code_of(sub { $open->close }), 'query_error', 'a close-time timeout of the stream\'s own is recovered, and reported');
     }
     is($dbh->pg_ping, 3, 'the host transaction is healthy, not silently aborted');
     $insert->(2);
@@ -297,7 +298,11 @@ subtest 'PostgreSQL: healthy guards behave as before' => sub {
     $reset->();
     my $own = $stream->();
     ok(!$dbh->{AutoCommit}, 'an idle handle gets the stream\'s own transaction');
-    is(($dbh->selectrow_array('SHOW transaction_read_only'))[0], 'on', 'which is read only');
+    {
+        # (Looked at as the stream itself: the handle is the stream's until it closes.)
+        local $Selecto::PostgreSQL::Stream::PASS = 1;
+        is(($dbh->selectrow_array('SHOW transaction_read_only'))[0], 'on', 'which is read only');
+    }
     is_deeply([map { $own->next } 1 .. 5], [[1], [2], [3], [4], [5]], 'every row');
     is($own->next, undef, 'exhaustion closes it');
     ok($dbh->{AutoCommit} && $dbh->pg_ping == 1, 'and rolls its own transaction back');

@@ -24,17 +24,20 @@ Revision history for Selecto
     - Expect more round trips on PostgreSQL. Measured per operation against 0.2.2
       (messages, then statements): a read on an idle handle +29%, +36%; a read inside
       the host's transaction +60%, +75% (its catalog reads now run under savepoints);
-      bounded streams +60% to +124%, +130% to +229%, as each FETCH batch takes 4
-      round trips (5 for a stream that locks rows) where 0.2.2 took 2. Hand-built
-      reads in the host's transaction are unchanged; on an idle handle they take 5
-      messages where 0.2.2 took 9, plus one ROLLBACK. Governed writes: +18% messages
-      on an idle handle, +28% in the host's transaction (+25%, +37% statements).
-      Adjust monitoring and capacity before the rollout.
+      a bounded stream on an idle handle +40%, +43%; inside the host's transaction
+      +84% to +125%, +142% to +230%, as each FETCH batch there takes 4 round trips (5
+      for a stream that locks rows) where 0.2.2 took 2. Hand-built reads in the host's
+      transaction are unchanged; on an idle handle they take 5 messages, their ROLLBACK
+      included, where 0.2.2 took 9. Governed writes: +18% messages on an idle handle,
+      +28% in the host's transaction (+25%, +37% statements). Adjust monitoring and
+      capacity before the rollout.
     - On a handle with no transaction open, a bounded stream holds the handle until it
-      closes: anything run on it between fetches is rolled back with the stream's
-      transaction, and the close then fails with stream_host_work_discarded (a LISTEN
-      or NOTIFY is lost unseen). Search for code that uses a handle between fetches
-      of a bounded stream without begin_work, and add begin_work.
+      closes: anything else sent on the handle meanwhile (a statement, a prepared
+      statement's execute, begin_work, commit, rollback, a ping, Selecto's own reads
+      and writes) fails at once with handle_owned_by_stream. Search for code that uses
+      a handle between fetches of a bounded stream, or shares one handle across
+      requests while an export streams, and call begin_work before the stream (or give
+      the stream a handle of its own).
     - On an idle handle a read now ends in a ROLLBACK of its own, so
       pg_stat_database.xact_rollback rises by one per such read. Inside the host's
       transaction a read ends with ROLLBACK TO a savepoint, which does not move it.
@@ -97,16 +100,22 @@ Revision history for Selecto
       statements: the host's values are back after the DECLARE, and each FETCH sets
       the pin again under a savepoint whose rollback takes it away. The host's reads
       between fetches see the host's settings.
-    - PostgreSQL: on a handle with no transaction open, what the host does on the
-      handle between fetches of a bounded stream (a temporary table's rows, a SET or
-      set_config, a transaction-level advisory lock) was rolled back with the stream's
-      own transaction and the close reported OK. The close now fails with
-      stream_host_work_discarded, naming what was rolled back; a dropped stream warns,
-      and a failed fetch adds host_work_discarded to its error.
+    - PostgreSQL: on a handle with no transaction open, a bounded stream runs in a
+      transaction of its own, and what the host did on the handle between fetches ran
+      in it and was rolled back at the close, which reported OK (temporary tables, SET
+      and set_config, SET ROLE, advisory locks, LISTEN). The handle is now the stream's
+      until it closes, drains, is dropped or fails: everything else that would reach
+      the server through it refuses with handle_owned_by_stream, before it is sent,
+      statement handles prepared earlier included, and the host's own DBI callbacks
+      still run and are restored as they were. A forked child's copy of a stream ends
+      nothing on the server.
     - PostgreSQL: a host that ends its own transaction mid-stream now gets
-      transaction_state_unsafe and keeps its connection; the stream had closed it.
+      transaction_state_unsafe and keeps its connection, on an AutoCommit-off handle
+      too; the stream had closed it, or raised the raw cursor error.
     - PostgreSQL: a cancel that lands on the end of a catalog read's or the
-      search_path's savepoint stays a cancel; it had been retried and swallowed.
+      search_path's savepoint, or of a bounded stream's own end in the host's
+      transaction, stays a cancel; it had been retried and swallowed. With RaiseError
+      off, a cancel on a catalog read is typed as one.
     - PostgreSQL (R72): Selecto's catalog reads inside the host's transaction (the
       encoding check, a relation's qualification and quoted name, a root's schema)
       run under a savepoint of their own, and each FETCH's cursor check is sent with

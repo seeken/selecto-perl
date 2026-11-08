@@ -48,34 +48,42 @@ my $run = sub {
 };
 my $commit = sub { $_[0]->commit };
 for my $raise (1, 0) {
-    # The FETCH of the missing cursor aborts the transaction the host opened, as
-    # it always has: its COMMIT rolls back, and the host is told. Nothing is
-    # rolled back or un-aborted on its behalf.
-    $run->("own stream, host rollback, begin, insert (RaiseError $raise)", $raise, undef,
-        sub { $_[0]->rollback; $_[0]->begin_work; $insert->($_[0]) }, $commit, '');
-    $run->("own stream, host commit, begin, insert (RaiseError $raise)", $raise, undef,
-        sub { $_[0]->commit; $_[0]->begin_work; $insert->($_[0]) }, $commit, '');
+    # On a handle with no transaction open the stream's own transaction cannot be
+    # taken over: the host's ROLLBACK, COMMIT, begin_work and INSERT refuse before
+    # anything is sent (handle_owned_by_stream), and the stream reads on.
+    for my $end (qw(rollback commit)) {
+        my ($dsn, @auth) = TestPostgreSQL->connection;
+        my $dbh = DBI->connect($dsn, @auth, {RaiseError => $raise, PrintError => 0, AutoCommit => 1});
+        my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 't1');
+        my $stream = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 2);
+        $stream->next for 1 .. 4;
+        my @refused = map { my $call = $_; eval { $call->(); 1 } ? 'ran' : (blessed($@) ? $@->code : 'died') }
+            sub { $dbh->$end }, sub { $dbh->begin_work }, sub { $insert->($dbh) };
+        is_deeply(\@refused, [('handle_owned_by_stream') x 3], "own stream, host $end, begin, insert (RaiseError $raise): each refuses");
+        ok(eval { 1 while $stream->next; 1 }, "own stream, host $end (RaiseError $raise): the stream reads on") or diag $@;
+        is(join(',', @{$admin->selectcol_arrayref('SELECT who FROM r64h_log ORDER BY id')}), '', "own stream, host $end (RaiseError $raise): nothing ran");
+        $dbh->disconnect;
+    }
     # An aborted transaction stays aborted: its COMMIT rolls back.
     $run->("host transaction aborted between fetches (RaiseError $raise)", $raise, sub { $_[0]->begin_work; $insert->($_[0]) },
         sub { local $_[0]->{RaiseError} = 0; $_[0]->do('SELECT 1/0') }, $commit, '');
 }
 
-# A TimeZone the host sets between fetches, in the stream's own transaction: the stream
-# pins its own for each FETCH and reads every row, calling nothing replaced, and the
-# close says the host's setting went with the stream's transaction.
+# A TimeZone the host would set between fetches, in the stream's own transaction: it
+# refuses before it is sent, and the stream reads every row.
 {
     my $dbh = TestPostgreSQL->connect;
     my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 't1');
     my $all = scalar @{$e->all($e->query->select('id')->order_by('id'))->{rows}};
+    my $before = $dbh->selectrow_array(q{SELECT pg_catalog.current_setting('TimeZone')});
     my $stream = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 2);
     my $n = 0;
     $n++, $stream->next for 1 .. 2;
-    $dbh->do(q{SET LOCAL TimeZone = 'Asia/Tokyo'});
-    my $ok = eval { $n++ while $stream->next; 1 };
-    my $error = $@;
-    is($n, $all, 'a setting the host changes between fetches does not stop the stream: it reads every row');
-    ok(!$ok && ref($error) && $error->code eq 'stream_host_work_discarded', 'and the close says the setting was rolled back')
-        or diag $error;
+    my $set = eval { $dbh->do(q{SET LOCAL TimeZone = 'Asia/Tokyo'}); 'ran' } // (blessed($@) ? $@->code : 'died');
+    is($set, 'handle_owned_by_stream', "a host SET in the stream's own transaction refuses");
+    ok(eval { $n++ while $stream->next; 1 }, 'the stream reads on') or diag $@;
+    is($n, $all, 'every row');
+    is($dbh->selectrow_array(q{SELECT pg_catalog.current_setting('TimeZone')}), $before, "after it the host's setting is as it was");
     $dbh->disconnect;
 }
 

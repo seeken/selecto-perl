@@ -55,7 +55,7 @@ subtest 'a stream that locks rows needs the host transaction' => sub {
     $dbh->disconnect;
 };
 
-subtest "on an idle handle the host's statements between fetches see the host's settings" => sub {
+subtest "on an idle handle the handle is the stream's until it closes, and the host's again after" => sub {
     my $snap = q{SELECT pg_catalog.current_setting('TimeZone') || '|' || pg_catalog.current_setting('search_path') || '|' || (SELECT v FROM ic_k)};
     my $dbh = TestPostgreSQL->connect;
     $dbh->do($_) for q{SET TimeZone = 'Asia/Tokyo'}, 'SET search_path = ic_app, public';
@@ -64,12 +64,12 @@ subtest "on an idle handle the host's statements between fetches see the host's 
     my $all = [map { $_->[0] } @{$e->all($e->query->select('id')->order_by('id'))->{rows}}];
     my $s = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 1);
     my @ids = map { $_->[0] } grep { defined } $s->next;
-    my $between = $dbh->selectrow_array($snap);
+    my $between = eval { $dbh->selectrow_array($snap); 'ran' } // kind($@);
     my $ok = eval { while (my $row = $s->next) { push @ids, $row->[0] } $s->close; 1 };
     ok($ok, 'the stream answers') or diag $@;
-    is($between, $before, "between fetches the host sees its own zone, path and tables");
-    is_deeply(\@ids, $all, 'and the stream reads what a read reads');
-    is($dbh->selectrow_array($snap), $before, 'and after it');
+    is($between, 'handle_owned_by_stream/', 'between fetches the host statement refuses');
+    is_deeply(\@ids, $all, 'the stream reads what a read reads');
+    is($dbh->selectrow_array($snap), $before, "after it the host's zone, path and tables are its own");
     $dbh->disconnect;
 };
 

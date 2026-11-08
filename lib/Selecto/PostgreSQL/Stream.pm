@@ -14,14 +14,15 @@ my $SERIAL = 0;
 # Its statement and creation time identify it: no DECLARE can reproduce the
 # time. Each batch checks them before its FETCH. The time is read as an epoch, so
 # a changed TimeZone is the session check's to report, not a replacement.
-# The host's session as the stream's close compares it: its settings (but
-# statement_timeout, which a query budget sets for the session), and its advisory
-# locks.
-my $ADVISORY_SQL = q{SELECT pg_catalog.count(*) FROM pg_catalog.pg_locks l WHERE l.pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid() }
-    . q{AND l.locktype OPERATOR(pg_catalog.=) 'advisory'};
-my $HOST_MARK = q{(SELECT pg_catalog.md5(pg_catalog.string_agg(t.name OPERATOR(pg_catalog.||) '=' OPERATOR(pg_catalog.||) t.setting, ',' ORDER BY t.name)) }
-    . q{FROM pg_catalog.pg_settings t WHERE t.name OPERATOR(pg_catalog.<>) 'statement_timeout'), }
-    . "($ADVISORY_SQL)";
+# While a stream runs in a transaction of its own (a handle with none open), the handle
+# is the stream's until it closes: anything else run on it would run in that
+# transaction and be rolled back with it. So nothing else may reach the server through
+# it (handle_owned_by_stream). $PASS is set while the stream's own code runs.
+our $PASS = 0;
+my %OWNED_ALLOWED = map { ($_ => 1) } qw(FETCH EXISTS FIRSTKEY NEXTKEY err errstr state set_err trace trace_msg
+    parse_trace_flag parse_trace_flags quote quote_identifier can disconnect clone DESTROY private_attribute_info
+    visit_child_handles debug);
+my %CHILD_BLOCKED = map { ($_ => 1) } qw(execute execute_array execute_for_fetch);
 my $CURSOR_SQL = q{SELECT c.statement, CAST(EXTRACT(EPOCH FROM c.creation_time) AS pg_catalog.text) FROM pg_catalog.pg_cursors c }
     . q{WHERE c.name OPERATOR(pg_catalog.=) CAST($1 AS pg_catalog.text)};
 
@@ -122,18 +123,6 @@ sub new {
             _do($dbh, ($self->{pin} ? _settings_sql($dbh, $self->{pin}{host}) . '; ' : '') . "RELEASE SAVEPOINT $name");
             delete $self->{opening};
         }) if $self->{opening};
-        # In its own transaction too, what the host runs on the handle between fetches
-        # sees the host's settings: they are put back now, and each FETCH pins again.
-        # The handle is the stream's until it closes, and whatever the host does on it
-        # in between is rolled back with the stream's transaction: what the host's
-        # session looks like now is noted, so the close can say so rather than end in
-        # a silent OK.
-        Selecto::PostgreSQL::_pg_uninterrupted(sub {
-            my $restore = $self->{pin} ? _settings_sql($dbh, $self->{pin}{host}) : 'SELECT 1';
-            my @mark = $dbh->selectrow_array("WITH s AS MATERIALIZED ($restore) SELECT $HOST_MARK FROM s");
-            die "the host's session could not be noted\n" unless @mark == 2 && defined $mark[0];
-            $self->{host_mark} = {settings => $mark[0], advisory => $mark[1]};
-        }) if $self->{scope} eq 'own' && $adapter->_pg_session_checked;
         1;
     };
     if (!$ok) {
@@ -143,11 +132,15 @@ sub new {
         my $cleanup = eval { $self->_close($origin); 1 } ? undef : $@;
         die _cleanup_error($cleanup) // $error;
     }
+    # In its own transaction, the handle is the stream's until it closes (see $PASS).
+    $self->{pid} = $$;
+    $self->_own_handle if $self->{scope} eq 'own';
     return $self;
 }
 
 sub next {
     my ($self) = @_;
+    local $PASS = 1;
     return undef if $self->{closed};
     # Under SELECTO_PG_SQL_LINT, the stream's own statements are Selecto's.
     local $self->{dbh}{private_selecto_lint_depth} = 1 if $ENV{SELECTO_PG_SQL_LINT};
@@ -176,8 +169,7 @@ sub next {
         # The cursor check is in the same message, under the savepoint (R72): a cancel
         # on it is rolled back to. (The SAVEPOINT itself can still be cancelled; the
         # transaction is then aborted and the cancel reaches the host as one.)
-        my $batch = $self->{adapter}->_pg_session_checked && (($self->{scope} // '') eq 'host' || $self->{pin})
-            ? "$self->{name}_batch" : undef;
+        my $batch = $self->{adapter}->_pg_session_checked && ($self->{scope} // '') eq 'host' ? "$self->{name}_batch" : undef;
         my @now;
         if (defined $batch) {
             Selecto::PostgreSQL::_pg_uninterrupted(sub {
@@ -233,6 +225,8 @@ sub next {
     };
     if (!$ok) {
         # Capture PostgreSQL's error state before transaction recovery clears it.
+        # (Read first: what follows clears the handle's state.)
+        my $gone = ($self->{scope} // '') eq 'host' && (eval { $self->{dbh}->state } // '') =~ /\A(?:34000|25P01)\z/;
         my $error = $self->{adapter}->normalize_error($@);
         # A changed session is the stream's own work to undo: its savepoint
         # or its own transaction is rolled back, which reverts the change.
@@ -240,9 +234,11 @@ sub next {
         $error = eval { Selecto::PostgreSQL::_session_changed(); 1 } ? $error : $@ if $self->{session_changed};
         my $cleanup = eval { $self->_close($origin); 1 } ? undef : $@;
         my $raised = _cleanup_error($cleanup) // $error;
-        # (The host's work between fetches went with it: the error says so too.)
-        $raised->{details}{host_work_discarded} = [@{$self->{discarded}}]
-            if $self->{discarded} && Scalar::Util::blessed($raised) && $raised->isa('Selecto::Error') && ref($raised->{details}) eq 'HASH';
+        # The cursor or the transaction is gone because the host ended its transaction
+        # (or rolled back past the stream): that is the host's transaction, not a fault.
+        $raised = Selecto::Error->new(code => 'transaction_state_unsafe',
+            message => 'the host ended its transaction while the stream was open; nothing was left for the stream to end',
+            details => {state => 'ownership_lost'}) if $gone && !defined $cleanup;
         die $raised;
     }
     if (!@$rows) {
@@ -288,6 +284,7 @@ sub close { return $_[0]->_close(); }
 sub _close {
     my ($self, $failure) = @_;
     return $self if $self->{closed};
+    local $PASS = 1;
     my ($dbh, $adapter, $name) = @{$self}{qw(dbh adapter name)};
     eval { $self->{sth}->finish } if $self->{sth};
     my ($unsafe, $ran, $broken, $cancelled, $finished);
@@ -304,7 +301,6 @@ sub _close {
             if (defined($unsafe) && $unsafe eq 'unknown') {
                 ($unsafe, $broken, $cancelled) = (undef, 1, 1);
             } elsif (!$unsafe) {
-                my @discarded = $self->_host_work_seen;
                 # A read-only stream never commits work on behalf of its caller. A cancel
                 # can land on the ROLLBACK itself: DBI then counts the transaction over,
                 # the server does not. So, as a read does, it is tried again as a
@@ -321,12 +317,6 @@ sub _close {
                     if ($rolled) { eval { $dbh->{AutoCommit} = 1; $dbh->{BegunWork} = 0 } }
                     else { ($broken, $cancelled) = (1, $state eq '57014' ? 1 : $cancelled) }
                 }
-                # A transaction-level advisory lock ends with the rollback; a session one
-                # stays. (pg_locks shows both alike: the count after the rollback tells.)
-                push @discarded, 'a transaction-level advisory lock'
-                    if !$broken && defined($self->{advisory_before}) && $self->{advisory_before} > $self->{host_mark}{advisory}
-                    && (eval { ($dbh->selectrow_array($ADVISORY_SQL))[0] } // $self->{advisory_before}) < $self->{advisory_before};
-                $self->{discarded} = \@discarded if @discarded;
             }
         } elsif ($self->{opening}) {
             # Nothing of the host's can be after this savepoint yet.
@@ -351,6 +341,7 @@ sub _close {
                 # A cancel on its very first statement failed the transaction, with no
                 # savepoint yet to go back to. An exception tells the host; DESTROY cannot.
                 if ($ended eq '0 cancelled' && !$self->{destroying}) { $cancelled = 1 }
+                elsif ($ended eq '1 cancelled') { $cancelled = 1 unless $self->{destroying} }
                 elsif ($ended ne '1') { $broken = 1 }
             }
         }
@@ -365,6 +356,8 @@ sub _close {
         last if $ran;
     }
     my $ok = $finished;
+    # The handle is the host's again, however this ends.
+    $self->_release_handle;
     delete $dbh->{private_selecto_bounded_stream};
     if ($unsafe) {
         Selecto::Error->throw('transaction_state_unsafe',
@@ -380,36 +373,73 @@ sub _close {
         Selecto::Error->throw('stream_cleanup_failed', 'database stream could not restore its transaction scope: the connection was closed',
             {state => 'unknown', connection_closed => JSON::PP::true, ($cancelled ? (category => 'query_canceled') : ())});
     }
-    # Last, as nothing else went wrong: the host's work between fetches went with the
-    # stream's own transaction. (On a failure the stream's own error stands, and says it.)
-    if ($self->{discarded} && !defined $failure) {
-        Selecto::Error->throw('stream_host_work_discarded',
-            "the host's work on the handle between fetches was rolled back with the stream's own transaction ("
-            . join(', ', @{$self->{discarded}}) . "): on a handle with no transaction open, the handle is the stream's "
-            . 'until it closes; call begin_work to use it between fetches',
-            {discarded => [@{$self->{discarded}}]});
-    }
     die $alarm if defined $alarm && !defined $failure;
     return $self;
 }
 
-# What the host did on the handle since the stream opened in a transaction of its own,
-# read before that transaction is rolled back: a write (temporary tables included: an
-# id is assigned) and a setting changed. (A LISTEN or NOTIFY leaves no trace until the
-# commit, and a rolled-back one cannot be seen.)
-sub _host_work_seen {
+# The handle becomes the stream's: DBI callbacks refuse anything that would reach the
+# server through it, on it and on every statement handle prepared from it, before or
+# during the stream (handle_owned_by_stream). The host's own callbacks still run after
+# the check, and are what is restored.
+sub _own_handle {
     my ($self) = @_;
-    my $mark = $self->{host_mark} or return;
     my $dbh = $self->{dbh};
-    my @now;
-    for my $attempt (1 .. 3) {
-        last if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1;
-            @now = $dbh->selectrow_array("SELECT pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL, $HOST_MARK"); 1 };
-        last unless (eval { $dbh->state } // '') eq '57014';
+    return unless eval { $dbh->isa('DBI::db') };
+    local $PASS = 1;
+    my $owner = {owned => 1};
+    my $refuse = sub {
+        my ($what) = @_;
+        Selecto::Error->throw('handle_owned_by_stream',
+            "the handle belongs to an open bounded stream until it closes ($what): with no transaction open, the stream "
+            . 'runs one of its own on it, and anything else run there would be rolled back with it. Call begin_work '
+            . 'before the stream to use the handle between fetches', {method => "$what"});
+    };
+    my $on_handle = sub {
+        return if $PASS || !$owner->{owned} || $OWNED_ALLOWED{$_};
+        return if $_ eq 'STORE' && ($_[1] // '') !~ /\A(?:AutoCommit|BegunWork)\z/;
+        $refuse->($_);
+    };
+    my $on_statement = sub {
+        return if $PASS || !$owner->{owned} || !($CHILD_BLOCKED{$_} || /\Apg_/);
+        $refuse->("statement $_");
+    };
+    my $merge = sub {
+        my ($check, $host) = @_;
+        my %merged = ref($host) eq 'HASH' ? %$host : ();
+        for my $key (grep { $_ ne 'ChildCallbacks' } keys %merged) {
+            my $theirs = $merged{$key};
+            $merged{$key} = ref($theirs) eq 'CODE' ? sub { $check->(@_); goto &$theirs } : $check;
+        }
+        $merged{'*'} //= $check;
+        return \%merged;
+    };
+    my $host = $dbh->{Callbacks};
+    my $mine = $merge->($on_handle, $host);
+    $mine->{ChildCallbacks} = $merge->($on_statement, ref($host) eq 'HASH' ? $host->{ChildCallbacks} : undef);
+    my @children;
+    for my $sth (grep { defined } @{$dbh->{ChildHandles} // []}) {
+        my $before = $sth->{Callbacks};
+        push @children, [$sth, $before];
+        Scalar::Util::weaken($children[-1][0]);
+        $sth->{Callbacks} = $merge->($on_statement, $before);
     }
-    return unless @now == 3;
-    $self->{advisory_before} = $now[2];
-    return ($now[0] ? ('a write') : ()), (defined($now[1]) && $now[1] ne $mark->{settings} ? ('a setting') : ());
+    $self->{owned} = {owner => $owner, callbacks => $host, children => \@children};
+    $dbh->{Callbacks} = $mine;
+    $dbh->{private_selecto_stream_owned} = 1;
+    return;
+}
+
+sub _release_handle {
+    my ($self) = @_;
+    my $owned = delete $self->{owned} or return;
+    $owned->{owner}{owned} = 0;
+    local $PASS = 1;
+    my $dbh = $self->{dbh};
+    # (Exactly as they were: undef where the host had none, which DBI stores with a warning.)
+    no warnings 'uninitialized';
+    eval { $dbh->{Callbacks} = $owned->{callbacks}; delete $dbh->{private_selecto_stream_owned} };
+    for my $child (@{$owned->{children}}) { eval { $child->[0]{Callbacks} = $child->[1] } if defined $child->[0] }
+    return;
 }
 
 # Rolls back to a savepoint of the stream's and releases it. A cancel is tried again.
@@ -447,9 +477,11 @@ sub _end_in_transaction {
             $dbh->do("RELEASE SAVEPOINT $end");
             1;
         };
-        return 1 if $done;
+        # (A cancel that landed on an earlier try is still a cancel: R66(d).)
+        return $self->{end_cancelled} ? '1 cancelled' : 1 if $done;
         my $state = eval { $dbh->state } // '';
         my $cancelled = $state eq '57014' || (Scalar::Util::blessed($@) && ($@->details->{category} // '') eq 'query_canceled');
+        $self->{end_cancelled} = 1 if $cancelled;
         return 0 unless $self->_savepoint_undone($end);
         return $cancelled ? '0 cancelled' : 0 unless (eval { $dbh->pg_ping } // 0) == 3;
         return 0 unless $cancelled;
@@ -544,6 +576,9 @@ sub _do {
 sub DESTROY {
     my ($self) = @_;
     return if ${^GLOBAL_PHASE} eq 'DESTRUCT' || $self->{closed};
+    # A forked copy ends nothing on the server: the connection is the parent's. It only
+    # gives its copy of the handle back.
+    if (defined($self->{pid}) && $self->{pid} != $$) { $self->_release_handle; $self->{closed} = 1; return }
     local $@;
     $self->{destroying} = 1;
     return if eval { $self->close; 1 };
@@ -573,15 +608,15 @@ C<< canonical_values => 1 >> each batch is decoded to canonical values column
 by column (see L<Selecto::PostgreSQL/RESULT VALUES>).
 
 On a handle with no transaction open the stream begins a read-only transaction of
-its own and rolls it back at the close, and the handle is the stream's until then:
-anything run on it between fetches runs in that transaction and is rolled back with
-it. A write fails (the transaction is read only), and the rest (a temporary table's
-rows, a C<SET> or C<set_config(..., false)>, a transaction-level advisory lock) is
-undone at the close, which then ends with C<stream_host_work_discarded> naming what
-was rolled back, rather than in a silent OK (on a dropped stream, a warning; on a
-failed fetch, the error's C<host_work_discarded> detail). A C<LISTEN> or C<NOTIFY>
-leaves no trace before a commit and is lost unseen. Call C<begin_work> first to use
-the handle between fetches. A stream that locks rows (C<for_update>, C<for_share>)
+its own and rolls it back at the close, and the handle is the stream's until then.
+Anything else that would reach the server through it (a statement, a prepared
+statement's C<execute>, C<begin_work>, C<commit>, C<rollback>, a C<ping>, a driver
+method, Selecto's own reads and writes) fails at once with C<handle_owned_by_stream>,
+before it is sent; quoting, C<err>, C<state> and attributes still work. The handle is
+the host's again once the stream drains, closes, fails or is dropped, with the host's
+own DBI callbacks as they were (they run after the check meanwhile). A forked child's
+copy of the stream ends nothing on the server. Call C<begin_work> first to use the
+handle between fetches. A stream that locks rows (C<for_update>, C<for_share>)
 refuses there (C<row_lock_needs_transaction>): it needs the host's transaction.
 
 Inside an existing transaction the host can write between fetches. A savepoint guards
