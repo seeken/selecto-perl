@@ -60,8 +60,9 @@ for my $raise (1, 0) {
         sub { local $_[0]->{RaiseError} = 0; $_[0]->do('SELECT 1/0') }, $commit, '');
 }
 
-# A TimeZone the host sets between fetches, in the stream's own transaction, is the
-# host's: the stream pins its own for each FETCH, reads on, and calls nothing replaced.
+# A TimeZone the host sets between fetches, in the stream's own transaction: the stream
+# pins its own for each FETCH and reads every row, calling nothing replaced, and the
+# close says the host's setting went with the stream's transaction.
 {
     my $dbh = TestPostgreSQL->connect;
     my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 't1');
@@ -72,8 +73,9 @@ for my $raise (1, 0) {
     $dbh->do(q{SET LOCAL TimeZone = 'Asia/Tokyo'});
     my $ok = eval { $n++ while $stream->next; 1 };
     my $error = $@;
-    ok($ok, 'a setting the host changes between fetches does not stop the stream') or diag $error;
-    is($n, $all, 'it reads every row a read gives');
+    is($n, $all, 'a setting the host changes between fetches does not stop the stream: it reads every row');
+    ok(!$ok && ref($error) && $error->code eq 'stream_host_work_discarded', 'and the close says the setting was rolled back')
+        or diag $error;
     $dbh->disconnect;
 }
 

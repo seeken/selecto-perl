@@ -1485,6 +1485,8 @@ sub _pg_reset_schemas {
     $error = $self->normalize_error($@) unless $ok;
     $finally->run;
     die $error if $self->_pg_cancelled($error);
+    # (A cancel on the savepoint's end stays one, even once a retry ended it.)
+    die $release{cancel} if $release{cancel};
     $error //= 'the search_path savepoint could not be released' if $made && !$release{done};
     Selecto::Error->throw('query_rule_not_evaluable', "the session's reset search_path could not be resolved",
         {reason => 'relation_unresolved'}) if defined($error) || ref($schemas) ne 'ARRAY';
@@ -1569,6 +1571,8 @@ sub _pg_catalog_row {
     $error = $self->normalize_error($@) unless $ok;
     $finally->run;
     die $error unless $ok;
+    # A cancel that landed on the savepoint's end is a cancel, even once a retry ended it.
+    die $undo{cancel} if $undo{cancel};
     die($undo{cancel} // Selecto::Error->new(code => 'query_rule_not_evaluable',
         message => "a catalog read's savepoint could not be released", details => {reason => 'session_state_unknown'}))
         if $made && !$undo{done};

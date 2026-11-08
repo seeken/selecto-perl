@@ -26,7 +26,15 @@ Revision history for Selecto
       the host's transaction +60%, +75% (its catalog reads now run under savepoints);
       bounded streams +60% to +124%, +130% to +229%, as each FETCH batch takes 4
       round trips (5 for a stream that locks rows) where 0.2.2 took 2. Hand-built
-      reads are unchanged. Adjust monitoring and capacity before the rollout.
+      reads in the host's transaction are unchanged; on an idle handle they take 5
+      messages where 0.2.2 took 9, plus one ROLLBACK. Governed writes: +18% messages
+      on an idle handle, +28% in the host's transaction (+25%, +37% statements).
+      Adjust monitoring and capacity before the rollout.
+    - On a handle with no transaction open, a bounded stream holds the handle until it
+      closes: anything run on it between fetches is rolled back with the stream's
+      transaction, and the close then fails with stream_host_work_discarded (a LISTEN
+      or NOTIFY is lost unseen). Search for code that uses a handle between fetches
+      of a bounded stream without begin_work, and add begin_work.
     - On an idle handle a read now ends in a ROLLBACK of its own, so
       pg_stat_database.xact_rollback rises by one per such read. Inside the host's
       transaction a read ends with ROLLBACK TO a savepoint, which does not move it.
@@ -89,6 +97,16 @@ Revision history for Selecto
       statements: the host's values are back after the DECLARE, and each FETCH sets
       the pin again under a savepoint whose rollback takes it away. The host's reads
       between fetches see the host's settings.
+    - PostgreSQL: on a handle with no transaction open, what the host does on the
+      handle between fetches of a bounded stream (a temporary table's rows, a SET or
+      set_config, a transaction-level advisory lock) was rolled back with the stream's
+      own transaction and the close reported OK. The close now fails with
+      stream_host_work_discarded, naming what was rolled back; a dropped stream warns,
+      and a failed fetch adds host_work_discarded to its error.
+    - PostgreSQL: a host that ends its own transaction mid-stream now gets
+      transaction_state_unsafe and keeps its connection; the stream had closed it.
+    - PostgreSQL: a cancel that lands on the end of a catalog read's or the
+      search_path's savepoint stays a cancel; it had been retried and swallowed.
     - PostgreSQL (R72): Selecto's catalog reads inside the host's transaction (the
       encoding check, a relation's qualification and quoted name, a root's schema)
       run under a savepoint of their own, and each FETCH's cursor check is sent with

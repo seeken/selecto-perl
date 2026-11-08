@@ -73,6 +73,7 @@ t/json_encoders_nonref.t
 t/limits_lookup.t
 t/mysql_hand_built_explain_fallback.t
 t/mysql_session_limits_live.t
+t/pg_stream_handle_ownership_live.t
 t/pg_stream_host_settings_live.t
 t/pg_stream_idle_and_catalog_cancel_live.t
 t/pg_stream_rollback_cancel_live.t
