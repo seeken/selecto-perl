@@ -79,19 +79,24 @@ my $case = sub {
     $dbh->begin_work if $options{transaction};
     my $stream = $t->stream($t->query->select('id', 'org')->order_by('id'), bounded => 1, fetch_size => 2);
     my @rows = ($stream->next, $stream->next);
-    eval { $between->($t, $v, $dbh) };
+    my $between_error = eval { $between->($t, $v, $dbh); 1 } ? undef : $@;
     my $error;
     my $ok = eval { while (my $row = $stream->next) { push @rows, $row } 1 };
     $error = $@ unless $ok;
     is(scalar(grep { $_->[1] ne 't1' } @rows), 0, "$name: no other tenant's row reaches the caller");
-    if ($options{undone}) {
+    if (!$options{transaction}) {
+        # On a handle with no transaction open the handle is the stream's: whatever would
+        # have replaced its cursor refuses before it is sent, and the stream reads on.
+        is(blessed($between_error) ? $between_error->code : $between_error, 'handle_owned_by_stream', "$name: refused before it is sent");
+        ok($ok, "$name: the stream reads on") or diag $error;
+    } elsif ($options{undone}) {
         # The read's ROLLBACK drops the replacement and not the CLOSE, so the
         # cursor is simply gone: the stream stops, and leaves the transaction.
         ok(!$ok && blessed($error), "$name: the cursor is gone, and the stream says so") or diag $error;
     } else {
         ok(blessed($error) && $error->code eq 'query_rule_not_evaluable' && $error->details->{reason} eq 'stream_cursor_replaced', "$name: the stream refuses, typed");
     }
-    is(eval { ($dbh->selectrow_array('SELECT 1'))[0] }, 1, "$name: the handle still works") unless $options{transaction} || $options{undone};
+    is(eval { ($dbh->selectrow_array('SELECT 1'))[0] }, 1, "$name: the handle still works") unless $options{transaction};
     if ($options{transaction} || $options{undone}) { eval { $dbh->rollback } }
     $dbh->disconnect;
 };
