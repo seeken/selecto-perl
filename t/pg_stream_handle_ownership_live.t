@@ -69,6 +69,10 @@ for my $end (qw(drain close drop error)) {
         my $host = {do => sub { $calls++; return }};
         $dbh->{Callbacks} = $host;
         my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+        # (A read first: under SELECTO_PG_SQL_LINT the lint wraps the host's callbacks on
+        # the handle's first use. What the stream must give back is what it found.)
+        $e->all($e->query->select('id'));
+        my $found = $dbh->{Callbacks};
         my $ok = eval {
             if ($end eq 'error') {
                 my $s = $e->adapter->stream_query(Selecto::Statement->new(sql => 'SELECT ho_fail(id) FROM ho_t ORDER BY id', columns => ['id'], adapter_name => 'postgresql'), bounded => 1, fetch_size => 1);
@@ -81,7 +85,7 @@ for my $end (qw(drain close drop error)) {
             1;
         };
         ok($end eq 'error' ? !$ok : $ok, "the stream ended ($end)") or diag $@;
-        is(refaddr($dbh->{Callbacks}), refaddr($host), "the host's own callbacks are back, the same");
+        is(refaddr($dbh->{Callbacks}), refaddr($found), "the host's own callbacks are back, the same");
         my $before = $calls;
         is(try(sub { $dbh->do('SELECT 1') }), 'ok', 'the host uses the handle');
         is($calls, $before + 1, "and its own callback runs");

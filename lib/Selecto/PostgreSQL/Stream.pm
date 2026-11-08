@@ -19,7 +19,7 @@ my $SERIAL = 0;
 # transaction and be rolled back with it. So nothing else may reach the server through
 # it (handle_owned_by_stream). $PASS is set while the stream's own code runs.
 our $PASS = 0;
-my %OWNED_ALLOWED = map { ($_ => 1) } qw(FETCH EXISTS FIRSTKEY NEXTKEY err errstr state set_err trace trace_msg
+my %OWNED_ALLOWED = map { ($_ => 1) } qw(FETCH EXISTS FIRSTKEY NEXTKEY DELETE CLEAR err errstr state set_err trace trace_msg
     parse_trace_flag parse_trace_flags quote quote_identifier can disconnect clone DESTROY private_attribute_info
     visit_child_handles debug);
 my %CHILD_BLOCKED = map { ($_ => 1) } qw(execute execute_array execute_for_fetch);
@@ -225,9 +225,11 @@ sub next {
     };
     if (!$ok) {
         # Capture PostgreSQL's error state before transaction recovery clears it.
-        # (Read first: what follows clears the handle's state.)
+        # (Read first, the failure before anything that could clear it: an eval resets $@,
+        # and what follows clears the handle's state.)
+        my $failed = $@;
         my $gone = ($self->{scope} // '') eq 'host' && (eval { $self->{dbh}->state } // '') =~ /\A(?:34000|25P01)\z/;
-        my $error = $self->{adapter}->normalize_error($@);
+        my $error = $self->{adapter}->normalize_error($failed);
         # A changed session is the stream's own work to undo: its savepoint
         # or its own transaction is rolled back, which reverts the change.
         my $origin = $self->{session_changed} ? 'own' : $self->_failure_origin;

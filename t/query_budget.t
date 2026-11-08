@@ -67,7 +67,8 @@ subtest 'PostgreSQL server timeout bounds blocking execution' => sub {
     # Deferred re-arm: per-row checks between buffered rows send nothing; the
     # stream refreshes the server timeout right before its next FETCH.
     $dbh->do(q{SET statement_timeout=0});
-    my $timeout=sub {($dbh->selectrow_array(q{SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'}))[0]};
+    # (Read as the stream itself: while it is open the handle is the stream's.)
+    my $timeout=sub {local $Selecto::PostgreSQL::Stream::PASS=1; ($dbh->selectrow_array(q{SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'}))[0]};
     $guard=$adapter->begin_query_budget(timeout_ms=>5000);
     my $armed=$timeout->();
     my $stream=$adapter->stream_query(Selecto::Statement->new(sql=>'SELECT n FROM generate_series(1,6) n',params=>[],
