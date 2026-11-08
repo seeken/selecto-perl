@@ -51,10 +51,12 @@ subtest 'a generated stream that locks rows holds them' => sub {
     ok($locked->(), 'and after it, to the host\'s commit');
     $dbh->rollback;
     ok(!$locked->(), 'and no further');
-    my $alone = $e->stream($e->query->select('id')->order_by('id')->for_share, bounded => 1, fetch_size => 2);
-    my $n = 0;
-    $n++ while $alone->next;
-    is($n, 5, 'on its own it answers too');
+    # On an idle handle its transaction would be Selecto's, rolled back at the close,
+    # with whatever the host wrote between fetches: it refuses instead.
+    my $alone = eval { $e->stream($e->query->select('id')->order_by('id')->for_share, bounded => 1, fetch_size => 2); 1 };
+    my $refusal = $@;
+    ok(!$alone, 'on its own it refuses');
+    is(ref($refusal) ? $refusal->details->{reason} : $refusal, 'row_lock_needs_transaction', "and says it needs the host's transaction");
     # A statement built on it keeps it.
     $dbh->begin_work;
     my $wrapped = $adapter->bounded_result_statement($e->compile($e->query->select('id')->order_by('id')->for_share), max_cell_bytes => 1000, max_rows => 10);

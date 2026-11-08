@@ -77,8 +77,11 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             }
         }
         for my $route ('safe') {
-            local $SIG{ALRM} = sub { die "alarm\n" };
+            # The host's handler dies only while the host waits on the read. Outside it an
+            # alarm held back until a guard lets go (the read's own end, or a handle's
+            # cleanup) is only counted: it cannot fail the test after its checks pass.
             my (%count, %reported);
+            local $SIG{ALRM} = sub { $count{late}++ };
             my $serial = 0;
             my $finish = time + $seconds;
             while (time < $finish) {
@@ -86,6 +89,7 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
                 my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($name => (dbh => $dbh)))->with_scope(tenant => 't1');
                 my $query = $engine->query->select('id');
                 my $done = eval {
+                    local $SIG{ALRM} = sub { die "alarm\n" };
                     setitimer(ITIMER_REAL, 0.0001 + rand(0.006));
                     $engine->all($query);
                     setitimer(ITIMER_REAL, 0);
@@ -98,7 +102,9 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
                 my $mark = ++$serial;
                 if ($dbh->{Active}) { $reported{$mark} = 1 if eval { $dbh->do('INSERT INTO al_log VALUES (?)', undef, $mark); 1 } } else { $count{closed}++ }
                 eval { $dbh->disconnect };
+                undef $engine;
             }
+            setitimer(ITIMER_REAL, 0);
             my %stored = map { ($_->[0] => 1) } @{$admin->selectall_arrayref('SELECT hit FROM al_log')};
             is_deeply([grep { !$stored{$_} } sort { $a <=> $b } keys %reported], [], "$route alarm: every write reported stored was stored");
             ok($count{interrupted}, "$route alarm: some reads were interrupted");
