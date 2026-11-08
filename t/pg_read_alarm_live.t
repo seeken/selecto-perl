@@ -27,6 +27,7 @@ my $serial = 0;
 # (A one-shot timer can go off as the host cancels it: that is the host's to allow for,
 # and it must not end this test. It is counted, and it never touches the handle.)
 my $late = 0;
+my $ALARM = POSIX::SigSet->new(POSIX::SIGALRM());
 $SIG{ALRM} = sub { $late++ };
 for my $mode (qw(alone host)) {
     for my $route (qw(read hand-built stream bounded)) {
@@ -45,8 +46,21 @@ for my $mode (qw(alone host)) {
             eval {
                 local $SIG{ALRM} = sub { die "alarm\n" };
                 eval { setitimer(ITIMER_REAL, 0.00002 + rand($span * 1.2)); $work{$route}->(); setitimer(ITIMER_REAL, 0); 1 };
+                # The host stops waiting, still under its handler: its timer is cancelled with
+                # SIGALRM blocked, and one the timer raised as it was cancelled is discarded
+                # (IGNORE drops a pending signal). Otherwise Perl could run it only as this
+                # block ends, under the handler restored there. One that arrives after this is
+                # one Selecto held back.
+                my $before = POSIX::SigSet->new;
+                POSIX::sigprocmask(POSIX::SIG_BLOCK(), $ALARM, $before);
                 setitimer(ITIMER_REAL, 0);
+                { local $SIG{ALRM} = 'IGNORE'; }
+                POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $ALARM);
             };
+            # (An alarm that cut that short: the one-shot timer has gone off, and nothing is
+            # left of it but the block.)
+            setitimer(ITIMER_REAL, 0);
+            POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $ALARM);
             my $held = POSIX::SigSet->new;
             POSIX::sigprocmask(POSIX::SIG_BLOCK(), POSIX::SigSet->new, $held);
             push @bad, 'the alarm is left blocked' if $held->ismember(POSIX::SIGALRM());
