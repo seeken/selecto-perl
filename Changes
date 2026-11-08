@@ -21,6 +21,17 @@ Revision history for Selecto
       a pooled connection is host misuse: a pool can reconnect between statements.
     - No alarm or signal timeouts around reads are needed or advised: use
       statement_timeout. A host's timers wait while a read opens or ends.
+    - Expect about one ROLLBACK per read and roughly 45% more statements than 0.2.2:
+      pg_stat_database.xact_rollback rises by about one per read. Adjust monitoring
+      and capacity before the rollout.
+    - Search host code for Selecto::Statement->new wrapped around a compiled
+      statement's sql: such a statement now runs as hand-built, in the host's session
+      without the guards. Use $statement->derive(...) to keep it generated.
+    - Install DBD::Pg 3.21.2 or newer.
+    - Check reports that compare citext values: with the citext typing fix their
+      answers can change (x::citext now takes the extension's operator).
+    - selecto-perl-kit has not had its transaction fixes yet; do not rely on its
+      bare commit or rollback under completion_type 2.
     - Deploy selecto-perl-mcp and every companion at this version together.
 
     - MySQL family: a generated statement no longer answers short. On MariaDB each one
@@ -52,6 +63,14 @@ Revision history for Selecto
       cancel is a cancel on every statement, guards included, and is tried again on
       an ending. An ending that cannot be finished closes the connection, so a later
       COMMIT fails rather than reports success. Failures no longer poison the handle.
+      Its search_path and result settings hold only for its own statements: the
+      host's values are back before the opening savepoint is released, each FETCH
+      sets the pin again under its batch savepoint, and a locking batch puts the
+      host's values back before its RELEASE. Before, a host's INSERT between fetches
+      ran under Selecto's search_path, TimeZone and DateStyle, and could land in
+      another schema at another time, reporting OK.
+    - MySQL: the max_error_count hint goes on the outer statement's verb even when a
+      comment comes before the WITH.
     - Without RaiseError a failed read is an error, never an empty answer.
     - Selecto::Statement::derive wraps a compiled statement and keeps it generated:
       companions use it, not new.

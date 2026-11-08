@@ -43,12 +43,15 @@ my $CONTROL_ATTEMPTS = 5;
 # With none found the text goes as it is, and _result_cut does not count on the lift.
 sub _lift_warning_cap {
     my ($sql) = @_;
-    my $with = $sql =~ /\A\s*WITH\b/i;
-    my $depth = 0;
-    while ($sql =~ /\G(?:\s+|`(?:[^`]|``)*`|'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*"|(\()|(\))|(\w+)|.)/gs) {
+    my ($depth, $with) = (0, undef);
+    # (Comments are skipped like space: one before the WITH, a query_id say, must not
+    # hide it, and one that says SELECT is not the verb.)
+    while ($sql =~ m{\G(?:\s+|/\*.*?\*/|--[^\n]*|\#[^\n]*|`(?:[^`]|``)*`|'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*"|(\()|(\))|(\w+)|.)}gs) {
         $depth++ if defined $1;
         $depth-- if defined $2;
-        next unless defined($3) && uc($3) eq 'SELECT' && (!$with || !$depth);
+        next unless defined $3;
+        $with //= uc($3) eq 'WITH' ? 1 : 0;
+        next unless uc($3) eq 'SELECT' && (!$with || !$depth);
         substr($sql, pos($sql), 0) = " $MYSQL_LIFT";
         return $sql;
     }

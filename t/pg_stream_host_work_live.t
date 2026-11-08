@@ -65,7 +65,9 @@ subtest 'a generated stream that locks rows holds them' => sub {
 };
 
 subtest 'a stream that fails leaves what the host wrote between fetches' => sub {
-    for my $case (['an error row', 'sw_bad', sub {}], ['a changed session', 'sw_t', sub { $_[0]->do(q{SET TimeZone = 'Asia/Tokyo'}) }]) {
+    # (A temporary relation that shadows the stream's is a changed session: the pin does
+    # not reach it. A setting the host changes does not change what the stream reads.)
+    for my $case (['an error row', 'sw_bad', sub {}], ['a changed session', 'sw_t', sub { $_[0]->do('CREATE TEMP TABLE sw_t (id INT)') }]) {
         my ($label, $table, $between) = @$case;
         $admin->do('DELETE FROM sw_l');
         my ($dbh, $adapter, $e) = $open->($table);
@@ -83,6 +85,23 @@ subtest 'a stream that fails leaves what the host wrote between fetches' => sub 
         is($stored->(), '1,2,3', "$label: all of the host's work is there");
         $dbh->disconnect;
     }
+};
+
+subtest "a host's setting changed between fetches does not change what the stream reads" => sub {
+    $admin->do('DELETE FROM sw_l');
+    my ($dbh, $adapter, $e) = $open->();
+    my $all = [map { $_->[0] } @{$e->all($e->query->select('id')->order_by('id'))->{rows}}];
+    $dbh->begin_work;
+    my $s = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 1);
+    my @ids = map { $_->[0] } grep { defined } $s->next;
+    $dbh->do(q{SET TimeZone = 'Asia/Tokyo'});
+    $dbh->do('INSERT INTO sw_l VALUES (1)');
+    ok(eval { while (my $row = $s->next) { push @ids, $row->[0] } $s->close; 1 }, 'the stream answers') or diag $@;
+    is_deeply(\@ids, $all, 'every row, as a read gives them');
+    is($dbh->selectrow_array(q{SELECT pg_catalog.current_setting('TimeZone')}), 'Asia/Tokyo', "the host's setting stands");
+    ok($dbh->commit, 'and the host commits');
+    is($stored->(), '1', "with its write");
+    $dbh->disconnect;
 };
 
 subtest "a host's own savepoints are its own" => sub {
