@@ -21,9 +21,19 @@ Revision history for Selecto
       a pooled connection is host misuse: a pool can reconnect between statements.
     - No alarm or signal timeouts around reads are needed or advised: use
       statement_timeout. A host's timers wait while a read opens or ends.
-    - Expect about one ROLLBACK per read and roughly 45% more statements than 0.2.2:
-      pg_stat_database.xact_rollback rises by about one per read. Adjust monitoring
-      and capacity before the rollout.
+    - Expect more round trips on PostgreSQL. Measured per operation against 0.2.2
+      (messages, then statements): a read on an idle handle +29%, +36%; a read inside
+      the host's transaction +60%, +75% (its catalog reads now run under savepoints);
+      bounded streams +60% to +124%, +130% to +229%, as each FETCH batch takes 4
+      round trips (5 for a stream that locks rows) where 0.2.2 took 2. Hand-built
+      reads are unchanged. Adjust monitoring and capacity before the rollout.
+    - On an idle handle a read now ends in a ROLLBACK of its own, so
+      pg_stat_database.xact_rollback rises by one per such read. Inside the host's
+      transaction a read ends with ROLLBACK TO a savepoint, which does not move it.
+    - A bounded stream that locks rows (for_update, for_share) needs the host's
+      transaction: on a handle with none open it refuses, query_rule_not_evaluable,
+      reason row_lock_needs_transaction. 0.2.2 refused it too, as a read-only error
+      (25006). Call begin_work before such a stream.
     - Search host code for Selecto::Statement->new wrapped around a compiled
       statement's sql: such a statement now runs as hand-built, in the host's session
       without the guards. Use $statement->derive(...) to keep it generated.
@@ -71,6 +81,21 @@ Revision history for Selecto
       another schema at another time, reporting OK.
     - MySQL: the max_error_count hint goes on the outer statement's verb even when a
       comment comes before the WITH.
+    - PostgreSQL: a bounded stream that locks rows refuses on an idle handle. It ran in
+      a transaction of Selecto's, not read only, which was rolled back at the close:
+      the host's writes on the handle between fetches joined it and were lost, each
+      reporting OK, and Selecto's own governed writes too.
+    - PostgreSQL: on an idle handle too, a bounded stream's pin holds only for its own
+      statements: the host's values are back after the DECLARE, and each FETCH sets
+      the pin again under a savepoint whose rollback takes it away. The host's reads
+      between fetches see the host's settings.
+    - PostgreSQL (R72): Selecto's catalog reads inside the host's transaction (the
+      encoding check, a relation's qualification and quoted name, a root's schema)
+      run under a savepoint of their own, and each FETCH's cursor check is sent with
+      its batch SAVEPOINT, so a cancel that lands on them is rolled back to and the
+      host's transaction goes on. A cancel can still land on a SAVEPOINT itself:
+      PostgreSQL then aborts the transaction, and the host learns it as
+      query_canceled.
     - Without RaiseError a failed read is an error, never an empty answer.
     - Selecto::Statement::derive wraps a compiled statement and keeps it generated:
       companions use it, not new.

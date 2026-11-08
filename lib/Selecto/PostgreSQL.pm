@@ -1470,9 +1470,9 @@ sub _pg_reset_schemas {
     return @{$operation->{schemas}} if ref($operation) eq 'HASH' && $operation->{schemas};
     my $cache = $self->{_selecto_relation_schemas};
     return @{$cache->{"\0reset"}} if ref($cache) eq 'HASH' && $cache->{"\0reset"};
-    $self->_pg_require_utf8;
     my $dbh = $self->{dbh};
     my $inside = !$dbh->{AutoCommit} || $self->_connection_state eq 'intrans';
+    $self->_pg_require_utf8($inside ? 'intrans' : 'idle');
     my $savepoint = $inside ? Selecto::SQL::_savepoint_name('selecto_path') : undef;
     my ($schemas, $error, $made, %release);
     my $finally = _pg_finally(sub { $self->_pg_control("ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint", \%release) if $made });
@@ -1526,16 +1526,62 @@ sub _unquote_identifier {
 # this. The server's own value is read, never the driver's belief; it reports
 # UNICODE as set.
 sub _pg_require_utf8 {
-    my ($self) = @_;
+    my ($self, $state) = @_;
     # Once per operation (see _selecto_utf8_checked).
     return if $self->{_selecto_utf8_checked};
     my $encoding;
-    my $ok = eval { ($encoding) = $self->{dbh}->selectrow_array(q{SELECT pg_catalog.current_setting('client_encoding')}); 1 };
+    my $ok = eval { ($encoding) = $self->_pg_catalog_row(q{SELECT pg_catalog.current_setting('client_encoding')}, [],
+        defined($state) ? ($state =~ /\A(?:host|intrans)\z/ ? 1 : 0) : undef); 1 };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_not_evaluable', "the session's client_encoding must be UTF8",
         {reason => 'client_encoding'}) unless uc($encoding // '') =~ /\A(?:UTF8|UNICODE)\z/;
     $self->{_selecto_utf8_checked} = 1 if exists $self->{_selecto_utf8_checked};
     return;
+}
+
+# R72: a catalog read Selecto sends inside the host's transaction (the encoding
+# check, a relation's qualification) runs under a savepoint of its own, so a cancel
+# that lands on it is rolled back to and stays a cancel, and the host's transaction
+# goes on. Its SAVEPOINT, sent alone, can itself be cancelled: PostgreSQL then aborts
+# the transaction, and the cancel reaches the host as one. Nothing in the savepoint
+# sets a setting, so rolling back to it restores none (R65's reason to check the
+# encoding first does not apply). Outside a transaction it is a plain read.
+# $inside, when the caller already knows (its read guard's scope, the compile's state),
+# spares a ping: on an idle handle DBD::Pg's ping is a query of its own.
+sub _pg_catalog_row {
+    my ($self, $sql, $binds, $inside) = @_;
+    my $dbh = $self->{dbh};
+    my @binds = @{$binds // []};
+    return $dbh->selectrow_array($sql, undef, @binds)
+        unless $self->_pg_session_checked && (!$dbh->{AutoCommit} || ($inside // $self->_connection_state eq 'intrans'));
+    my $savepoint = Selecto::SQL::_savepoint_name('selecto_catalog');
+    my ($made, $ok, @row, $error, %undo);
+    my $finally = _pg_finally(sub {
+        $self->_pg_control($ok ? "RELEASE SAVEPOINT $savepoint" : "ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint",
+            \%undo, "ROLLBACK TO SAVEPOINT $savepoint; RELEASE SAVEPOINT $savepoint") if $made;
+    });
+    $ok = eval {
+        _pg_uninterrupted(sub { $self->_savepoint_command(create => $savepoint); $made = 1 });
+        @row = $dbh->selectrow_array($sql, undef, @binds);
+        1;
+    };
+    # (Read at once: the savepoint's rollback clears the handle's error.)
+    $error = $self->normalize_error($@) unless $ok;
+    $finally->run;
+    die $error unless $ok;
+    die($undo{cancel} // Selecto::Error->new(code => 'query_rule_not_evaluable',
+        message => "a catalog read's savepoint could not be released", details => {reason => 'session_state_unknown'}))
+        if $made && !$undo{done};
+    return @row;
+}
+
+# Whether this compile runs inside a transaction, as the compile's own state says
+# (undef: not known yet).
+sub _pg_compile_inside {
+    my ($self) = @_;
+    my $cache = $self->{_selecto_relation_schemas};
+    return undef unless ref($cache) eq 'HASH' && defined $cache->{"\0state"};
+    return $cache->{"\0state"} eq 'intrans' ? 1 : 0;
 }
 
 # Whether this failure is a cancel: it stays one, whichever guard it landed on.
@@ -1660,7 +1706,7 @@ sub _relation_sql {
     @schemas = ($home) if defined $home;
     my ($pinned, $temp, $current, $name);
     my $ok = eval {
-        ($pinned, $temp, $current) = $self->{dbh}->selectrow_array($QUALIFY_SQL, undef, \@schemas, "$table", $plain);
+        ($pinned, $temp, $current) = $self->_pg_catalog_row($QUALIFY_SQL, [\@schemas, "$table", $plain], $state eq 'intrans' ? 1 : 0);
         1;
     };
     die $self->normalize_error($@) unless $ok;
@@ -1683,7 +1729,7 @@ sub _relation_sql {
     # decide that (R43).
     $refuse->('relation_ambiguous', "the host's search_path resolves the relation differently from Selecto's pinned resolution")
         if !@declared && defined($current) && "$current" ne "$target" && !(defined($temp) && "$current" eq "$temp");
-    $ok = eval { ($name) = $self->{dbh}->selectrow_array($NAME_SQL, undef, $target); 1 };
+    $ok = eval { ($name) = $self->_pg_catalog_row($NAME_SQL, [$target], $state eq 'intrans' ? 1 : 0); 1 };
     die $self->normalize_error($@) unless $ok && defined $name;
     $cache->{$plain} = $name if ref($cache) eq 'HASH';
     return $name;
@@ -1697,10 +1743,10 @@ sub _pg_root_schema {
     my $name = do { local $self->{_selecto_root_relation}; $self->_relation_sql(undef, $root->{table}) };
     my ($schema, $temporary);
     my $ok = eval {
-        ($schema, $temporary) = $self->{dbh}->selectrow_array('SELECT CAST(n.nspname AS pg_catalog.text), '
+        ($schema, $temporary) = $self->_pg_catalog_row('SELECT CAST(n.nspname AS pg_catalog.text), '
             . "CAST(n.oid OPERATOR(pg_catalog.=) $TEMP_SCHEMA AS pg_catalog.int4) "
             . 'FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace '
-            . 'WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)', undef, $name);
+            . 'WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)', [$name], $self->_pg_compile_inside);
         1;
     };
     die $self->normalize_error($@) unless $ok;
@@ -1930,7 +1976,7 @@ sub _guarded_read {
     local $self->{_selecto_pg_read_guard} = 1;
     local $self->{_selecto_utf8_checked} = $self->{_selecto_utf8_checked} // 0;
     my $scope = $self->_read_guard_scope;
-    $self->_pg_require_utf8;
+    $self->_pg_require_utf8($scope);
     # R55: a read is READ ONLY and ends in ROLLBACK, so nothing a statement reaches
     # can write, and nothing it changes outlasts it. On an idle handle it is a
     # transaction of its own; in the host's transaction, its own savepoint, whose
@@ -2338,8 +2384,8 @@ for my $method (qw(compile preview_write execute_write execute_batch execute_gra
             # or busy connection is the write's own guard to refuse. Read once for
             # the whole operation, whatever it runs inside.
             local $self->{_selecto_utf8_checked} = $self->{_selecto_utf8_checked} // 0;
-            $self->_pg_require_utf8 if $method =~ /\Aexecute_/ && $self->_pg_session_checked
-                && $self->_connection_state =~ /\A(?:idle|intrans)\z/;
+            my $state = $method =~ /\Aexecute_/ && $self->_pg_session_checked ? $self->_connection_state : '';
+            $self->_pg_require_utf8($state) if $state =~ /\A(?:idle|intrans)\z/;
             return $self->$inherited(@args);
         });
     };

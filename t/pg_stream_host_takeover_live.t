@@ -60,18 +60,20 @@ for my $raise (1, 0) {
         sub { local $_[0]->{RaiseError} = 0; $_[0]->do('SELECT 1/0') }, $commit, '');
 }
 
-# A changed TimeZone is the session check's, not a replaced cursor.
+# A TimeZone the host sets between fetches, in the stream's own transaction, is the
+# host's: the stream pins its own for each FETCH, reads on, and calls nothing replaced.
 {
     my $dbh = TestPostgreSQL->connect;
     my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 't1');
+    my $all = scalar @{$e->all($e->query->select('id')->order_by('id'))->{rows}};
     my $stream = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 2);
-    $stream->next for 1 .. 2;
+    my $n = 0;
+    $n++, $stream->next for 1 .. 2;
     $dbh->do(q{SET LOCAL TimeZone = 'Asia/Tokyo'});
-    my $ok = eval { 1 while $stream->next; 1 };
+    my $ok = eval { $n++ while $stream->next; 1 };
     my $error = $@;
-    ok(!$ok, 'a changed session stops the stream');
-    isnt(ref($error->details) eq 'HASH' ? $error->details->{reason} // '' : '', 'stream_cursor_replaced', 'and is not called a replaced cursor');
-    is($error->code, 'query_rule_violation', 'it is the session check that reports it');
+    ok($ok, 'a setting the host changes between fetches does not stop the stream') or diag $error;
+    is($n, $all, 'it reads every row a read gives');
     $dbh->disconnect;
 }
 

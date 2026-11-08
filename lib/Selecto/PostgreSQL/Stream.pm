@@ -28,7 +28,7 @@ sub new {
     # Refuses a pending result, an aborted transaction or an unknown state
     # before anything is sent.
     my $scope = $adapter->_read_guard_scope;
-    $adapter->_pg_require_utf8 if $adapter->_pg_session_checked;
+    $adapter->_pg_require_utf8($scope) if $adapter->_pg_session_checked;
     # Chosen here and declared explicitly, so the cursor is identified by this
     # name and never by searching pg_cursors. Not guessable ahead of time; one
     # that is pre-declared fails the DECLARE, and the stream does not open.
@@ -38,6 +38,13 @@ sub new {
         locks => Scalar::Util::blessed($args{statement}) && $args{statement}{_selecto_row_lock} ? 1 : 0,
         columns => $args{statement}->columns, closed => 0, buffer => [],
         canonical_values => $args{canonical_values} ? 1 : 0}, $class;
+    # A stream that locks rows is not read only, and on an idle handle it would run in a
+    # transaction of Selecto's that is rolled back at the close: whatever the host wrote
+    # on the handle between fetches would join it and be lost, each write reporting OK.
+    # Its locks need the host's transaction, as they would last no longer than the read.
+    Selecto::Error->throw('query_rule_not_evaluable',
+        "a bounded stream that locks rows needs the host's transaction: begin one, then stream",
+        {reason => 'row_lock_needs_transaction'}) if $self->{locks} && $scope ne 'host';
     $dbh->{private_selecto_bounded_stream} = $name;
     my $ok = eval {
         # The scope is recorded only once the savepoint or transaction exists,
@@ -107,6 +114,10 @@ sub new {
             _do($dbh, ($self->{pin} ? _settings_sql($dbh, $self->{pin}{host}) . '; ' : '') . "RELEASE SAVEPOINT $name");
             delete $self->{opening};
         }) if $self->{opening};
+        # In its own transaction too, what the host runs on the handle between fetches
+        # sees the host's settings: they are put back now, and each FETCH pins again.
+        Selecto::PostgreSQL::_pg_uninterrupted(sub { _do($dbh, _settings_sql($dbh, $self->{pin}{host})) })
+            if $self->{pin} && $self->{scope} eq 'own';
         1;
     };
     if (!$ok) {
@@ -138,32 +149,44 @@ sub next {
         # FETCH then fails and _failure_origin says whose failure that is (the
         # host may have rolled back, aborted or moved on). It is never ours to
         # assume, because the cleanup would act on the host's transaction.
-        if ($self->{cursor}) {
-            # (An error here is the same: it fails this batch, as the FETCH would.)
-            my @now;
-            eval { local $self->{dbh}{RaiseError} = 1; local $self->{dbh}{PrintError} = 0;
-                @now = $self->{dbh}->selectrow_array($CURSOR_SQL, undef, $self->{name}); 1 } or die $@;
-            Selecto::Error->throw('query_rule_not_evaluable', "the stream's cursor was replaced while it was open",
-                {reason => 'stream_cursor_replaced'})
-                if @now && defined($now[1]) && !($now[0] eq $self->{cursor}[0] && $now[1] eq $self->{cursor}[1]);
-        }
         # R55: a stream's own transaction is READ ONLY. Inside the host's, the host
         # may write between fetches, so each FETCH is read-only under a savepoint
         # of its own, which is rolled back; a cursor keeps its position through
-        # that. The pin is set again under it, and the rollback takes it away. One
-        # that locks rows is not read only, and its savepoint is released, so the
-        # locks last to the host's commit: the host's values are put back first.
-        my $batch = ($self->{scope} // '') eq 'host' && $self->{adapter}->_pg_session_checked ? "$self->{name}_batch" : undef;
+        # that. The pin is set again under it, and the rollback takes it away: in the
+        # stream's own transaction too, so the host's statements between fetches see
+        # the host's settings. One that locks rows is not read only, and its savepoint
+        # is released, so the locks last to the host's commit: the host's values are
+        # put back first.
+        # The cursor check is in the same message, under the savepoint (R72): a cancel
+        # on it is rolled back to. (The SAVEPOINT itself can still be cancelled; the
+        # transaction is then aborted and the cancel reaches the host as one.)
+        my $batch = $self->{adapter}->_pg_session_checked && (($self->{scope} // '') eq 'host' || $self->{pin})
+            ? "$self->{name}_batch" : undef;
+        my @now;
         if (defined $batch) {
             Selecto::PostgreSQL::_pg_uninterrupted(sub {
                 my $dbh = $self->{dbh};
                 my $pin = $self->{pin};
                 $self->{batch} = $batch;
-                _do($dbh, "SAVEPOINT $batch" . ($pin && !$self->{locks} ? '; ' . _settings_sql($dbh, $pin->{applied}) : '')
-                    . ($self->{locks} ? '' : '; SET LOCAL transaction_read_only = on'));
+                my $open = "SAVEPOINT $batch" . ($pin && !$self->{locks} ? '; ' . _settings_sql($dbh, $pin->{applied}) : '')
+                    . ($self->{locks} ? '' : '; SET LOCAL transaction_read_only = on');
+                if ($self->{cursor}) { @now = $self->_cursor_now($open) } else { _do($dbh, $open) }
                 $self->{batch_host} = $self->_pin_capturing_host if $pin && $self->{locks};
             });
+        } elsif ($self->{cursor}) {
+            @now = $self->_cursor_now;
         }
+        # Before the FETCH: during it the portal is active and cannot be closed,
+        # so nothing can replace it after this check. A replacement of another
+        # width would also crash the driver's fetch (DBI's field count).
+        # Only a cursor of this name that differs is a replacement. No answer,
+        # or no such cursor, is the transaction's state, not a replacement: the
+        # FETCH then fails and _failure_origin says whose failure that is (the
+        # host may have rolled back, aborted or moved on). It is never ours to
+        # assume, because the cleanup would act on the host's transaction.
+        Selecto::Error->throw('query_rule_not_evaluable', "the stream's cursor was replaced while it was open",
+            {reason => 'stream_cursor_replaced'})
+            if $self->{cursor} && @now && defined($now[1]) && !($now[0] eq $self->{cursor}[0] && $now[1] eq $self->{cursor}[1]);
         defined($sth->execute) or die 'cursor fetch failed';
         $self->{types} //= [$self->{adapter}->_column_types($sth)];
         $rows = $sth->fetchall_arrayref;
@@ -412,6 +435,18 @@ sub _cleanup_error {
     return Scalar::Util::blessed($error) && $error->isa('Selecto::Error') ? $error
         : Selecto::Error->new(code => 'stream_cleanup_failed',
             message => 'database stream could not restore its transaction scope');
+}
+
+# This stream's cursor as pg_cursors has it now, read after $prefix in one message
+# when there is one. (An error here fails this batch, as the FETCH would.)
+sub _cursor_now {
+    my ($self, $prefix) = @_;
+    my $dbh = $self->{dbh};
+    (my $sql = $CURSOR_SQL) =~ s/\$1/$dbh->quote($self->{name})/e;
+    my @now;
+    eval { local $dbh->{RaiseError} = 1; local $dbh->{PrintError} = 0;
+        @now = $dbh->selectrow_array(defined($prefix) ? "$prefix; $sql" : $sql); 1 } or die $@;
+    return @now;
 }
 
 # The statement that sets each setting to its value for the transaction. Values are
