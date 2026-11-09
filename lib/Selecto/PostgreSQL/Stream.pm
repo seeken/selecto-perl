@@ -6,6 +6,7 @@ use warnings;
 use parent 'Selecto::Stream';
 use JSON::PP ();
 use Scalar::Util ();
+use Hash::Util ();
 use Selecto::Error ();
 
 my $SERIAL = 0;
@@ -19,19 +20,42 @@ my $SERIAL = 0;
 # transaction and be rolled back with it. So nothing else may reach the server through
 # it (handle_owned_by_stream). $PASS is set while the stream's own code runs.
 our $PASS = 0;
+# Which handles a stream owns, and which have one open, by the handle's identity: a
+# handle cloned from one copies its attributes, and must not be owned or busy for that.
+our (%OWNED, %STREAMING);
 my %OWNED_ALLOWED = map { ($_ => 1) } qw(FETCH EXISTS FIRSTKEY NEXTKEY DELETE CLEAR err errstr state set_err trace trace_msg
-    parse_trace_flag parse_trace_flags quote quote_identifier can disconnect clone DESTROY private_attribute_info
-    visit_child_handles debug);
+    parse_trace_flag parse_trace_flags quote quote_identifier can disconnect clone DESTROY private_attribute_info debug);
 my %CHILD_BLOCKED = map { ($_ => 1) } qw(execute execute_array execute_for_fetch);
+# DBI runs the '*' callback only for a call that is not nested in another DBI call (a
+# HandleError handler, say), so each method that can reach the server has its own key
+# too. visit_child_handles sends nothing, but runs host code where no callback fires:
+# it is refused as well.
+my @HANDLE_KEYS = qw(do prepare prepare_cached selectrow_array selectrow_arrayref selectrow_hashref selectall_arrayref
+    selectall_hashref selectall_array selectcol_arrayref begin_work commit rollback ping func table_info column_info
+    primary_key_info primary_key foreign_key_info statistics_info tables type_info type_info_all get_info
+    last_insert_id STORE visit_child_handles take_imp_data);
+my @STATEMENT_KEYS = qw(execute execute_array execute_for_fetch FETCH STORE);
+sub _driver_methods {
+    my ($kind) = @_;
+    no strict 'refs';
+    my %seen;
+    return grep { /\Apg_/ && !$seen{$_}++ } map { keys %{"${_}::"} } ("DBD::Pg::$kind", "DBI::$kind");
+}
 my $CURSOR_SQL = q{SELECT c.statement, CAST(EXTRACT(EPOCH FROM c.creation_time) AS pg_catalog.text) FROM pg_catalog.pg_cursors c }
     . q{WHERE c.name OPERATOR(pg_catalog.=) CAST($1 AS pg_catalog.text)};
+# At the opening, with the transaction's virtual id: a cursor gone later went with a
+# ROLLBACK TO in the same transaction, or with the transaction itself.
+my $OPEN_CURSOR_SQL = q{SELECT c.statement, CAST(EXTRACT(EPOCH FROM c.creation_time) AS pg_catalog.text), }
+    . q{(SELECT l.virtualxid FROM pg_catalog.pg_locks l WHERE l.locktype OPERATOR(pg_catalog.=) 'virtualxid' }
+    . q{AND l.pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid() AND l.granted AND l.mode OPERATOR(pg_catalog.=) 'ExclusiveLock') }
+    . q{FROM pg_catalog.pg_cursors c WHERE c.name OPERATOR(pg_catalog.=) CAST($1 AS pg_catalog.text)};
 
 sub new {
     my ($class, %args) = @_;
     my $adapter = $args{adapter};
     my $dbh = $adapter->dbh;
     Selecto::Error->throw('stream_busy', 'database handle already has an active bounded stream')
-        if $dbh->{private_selecto_bounded_stream};
+        if $STREAMING{Scalar::Util::refaddr($dbh)};
     Selecto::Error->throw('stream_unavailable', 'database handle requires recovery after stream cleanup failed')
         if $dbh->{private_selecto_bounded_stream_poisoned};
     # Refuses a pending result, an aborted transaction or an unknown state
@@ -54,7 +78,7 @@ sub new {
     Selecto::Error->throw('query_rule_not_evaluable',
         "a bounded stream that locks rows needs the host's transaction: begin one, then stream",
         {reason => 'row_lock_needs_transaction'}) if $self->{locks} && $scope ne 'host';
-    $dbh->{private_selecto_bounded_stream} = $name;
+    $STREAMING{Scalar::Util::refaddr($dbh)} = $name;
     my $ok = eval {
         # The scope is recorded only once the savepoint or transaction exists,
         # so a failed start never rolls back anything.
@@ -106,9 +130,10 @@ sub new {
         $self->{declared} = 1;
         $declaration->finish;
         if ($adapter->_pg_session_checked) {
-            my @cursor = $dbh->selectrow_array($CURSOR_SQL, undef, $name);
+            my @cursor = $dbh->selectrow_array($OPEN_CURSOR_SQL, undef, $name);
             die 'stream cursor identity is unavailable' unless @cursor && defined $cursor[1];
-            $self->{cursor} = \@cursor;
+            $self->{transaction} //= $cursor[2] if $self->{scope} eq 'host';
+            $self->{cursor} = [@cursor[0, 1]];
         }
         # One FETCH result is all that libpq can buffer, so fetch_size rows
         # (default 1) bound DBD::Pg's eager result allocation. RowCacheSize
@@ -238,9 +263,18 @@ sub next {
         my $raised = _cleanup_error($cleanup) // $error;
         # The cursor or the transaction is gone because the host ended its transaction
         # (or rolled back past the stream): that is the host's transaction, not a fault.
-        $raised = Selecto::Error->new(code => 'transaction_state_unsafe',
-            message => 'the host ended its transaction while the stream was open; nothing was left for the stream to end',
-            details => {state => 'ownership_lost'}) if $gone && !defined $cleanup;
+        # Which, the transaction's virtual id says: the same one, and a ROLLBACK TO a
+        # savepoint the host took before the stream took the cursor away, legally.
+        if ($gone && !defined $cleanup) {
+            my $now = eval { $self->{adapter}->_virtual_transaction_id };
+            $raised = defined($now) && defined($self->{transaction}) && $now eq $self->{transaction}
+                ? Selecto::Error->new(code => 'query_rule_not_evaluable',
+                    message => "the stream's cursor is gone: a ROLLBACK TO a savepoint taken before the stream ended it; "
+                        . "the host's transaction goes on", details => {reason => 'stream_cursor_gone'})
+                : Selecto::Error->new(code => 'transaction_state_unsafe',
+                    message => 'the host ended its transaction while the stream was open; nothing was left for the stream to end',
+                    details => {state => 'ownership_lost'});
+        }
         die $raised;
     }
     if (!@$rows) {
@@ -360,7 +394,7 @@ sub _close {
     my $ok = $finished;
     # The handle is the host's again, however this ends.
     $self->_release_handle;
-    delete $dbh->{private_selecto_bounded_stream};
+    delete $STREAMING{Scalar::Util::refaddr($dbh)};
     if ($unsafe) {
         Selecto::Error->throw('transaction_state_unsafe',
             "$unsafe; its savepoint or transaction was left for the host to roll back",
@@ -396,40 +430,62 @@ sub _own_handle {
             . 'runs one of its own on it, and anything else run there would be rolled back with it. Call begin_work '
             . 'before the stream to use the handle between fetches', {method => "$what"});
     };
+    # (Callbacks too: a host's own, set while the stream holds the handle, would lift
+    # the check, and the release would drop them.)
     my $on_handle = sub {
         return if $PASS || !$owner->{owned} || $OWNED_ALLOWED{$_};
-        return if $_ eq 'STORE' && ($_[1] // '') !~ /\A(?:AutoCommit|BegunWork)\z/;
+        return if $_ eq 'STORE' && ($_[1] // '') !~ /\A(?:AutoCommit|BegunWork|Callbacks)\z/;
         $refuse->($_);
     };
+    # A statement handle reaches the server by executing, by a driver method, or by
+    # reading NULLABLE (a catalog query).
     my $on_statement = sub {
-        return if $PASS || !$owner->{owned} || !($CHILD_BLOCKED{$_} || /\Apg_/);
+        return if $PASS || !$owner->{owned};
+        return if $_ eq 'FETCH' && ($_[1] // '') ne 'NULLABLE';
+        return if $_ eq 'STORE' && ($_[1] // '') ne 'Callbacks';
+        return unless $_ eq 'FETCH' || $_ eq 'STORE' || $CHILD_BLOCKED{$_} || /\Apg_/;
         $refuse->("statement $_");
     };
     my $merge = sub {
-        my ($check, $host) = @_;
-        my %merged = ref($host) eq 'HASH' ? %$host : ();
-        for my $key (grep { $_ ne 'ChildCallbacks' } keys %merged) {
-            my $theirs = $merged{$key};
-            $merged{$key} = ref($theirs) eq 'CODE' ? sub { $check->(@_); goto &$theirs } : $check;
+        my ($check, $host, @keys) = @_;
+        my %theirs = ref($host) eq 'HASH' ? %$host : ();
+        my %merged;
+        for my $key (grep { $_ ne 'ChildCallbacks' } keys(%theirs), @keys, '*') {
+            next if $merged{$key};
+            # A key of ours the host has none for still runs the host's '*': DBI runs
+            # only the most specific callback.
+            my $chained = $theirs{$key} // ($key ne '*' ? $theirs{'*'} : undef);
+            $merged{$key} = ref($chained) eq 'CODE' ? sub { $check->(@_); goto &$chained } : $check;
         }
-        $merged{'*'} //= $check;
         return \%merged;
     };
     my $host = $dbh->{Callbacks};
-    my $mine = $merge->($on_handle, $host);
-    $mine->{ChildCallbacks} = $merge->($on_statement, ref($host) eq 'HASH' ? $host->{ChildCallbacks} : undef);
+    my $mine = $merge->($on_handle, $host, @HANDLE_KEYS, _driver_methods('db'));
+    my @statement_keys = (@STATEMENT_KEYS, _driver_methods('st'));
+    $mine->{ChildCallbacks} = $merge->($on_statement, ref($host) eq 'HASH' ? $host->{ChildCallbacks} : undef, @statement_keys);
+    # $dbh->{Callbacks} hands out these very hashes: an edit in place would replace a
+    # check, so each of their values is read-only (the edit dies; DBI still looks up
+    # keys that are not there). The release puts the host's back.
+    _lock_values($mine->{ChildCallbacks});
+    _lock_values($mine);
     my @children;
     for my $sth (grep { defined } @{$dbh->{ChildHandles} // []}) {
         my $before = $sth->{Callbacks};
-        push @children, [$sth, $before];
+        my $ours = $merge->($on_statement, $before, @statement_keys);
+        _lock_values($ours);
+        push @children, [$sth, $before, $ours];
         Scalar::Util::weaken($children[-1][0]);
-        $sth->{Callbacks} = $merge->($on_statement, $before);
+        $sth->{Callbacks} = $ours;
     }
-    $self->{owned} = {owner => $owner, callbacks => $host, children => \@children};
+    $self->{owned} = {owner => $owner, callbacks => $host, mine => $mine, children => \@children, key => Scalar::Util::refaddr($dbh)};
     $dbh->{Callbacks} = $mine;
-    $dbh->{private_selecto_stream_owned} = 1;
+    $OWNED{Scalar::Util::refaddr($dbh)} = 1;
     return;
 }
+
+# Read-only values in an open hash (DBI reads absent keys, which a locked hash refuses).
+# Hash::Util carps that this is not useful; it is what is wanted here.
+sub _lock_values { my ($hash) = @_; no warnings; Hash::Util::lock_value(%$hash, $_) for keys %$hash; return }
 
 sub _release_handle {
     my ($self) = @_;
@@ -437,10 +493,16 @@ sub _release_handle {
     $owned->{owner}{owned} = 0;
     local $PASS = 1;
     my $dbh = $self->{dbh};
-    # (Exactly as they were: undef where the host had none, which DBI stores with a warning.)
+    delete $OWNED{$owned->{key}};
+    # (Exactly as they were: undef where the host had none, which DBI stores with a
+    # warning. Only where the stream's are still in place.)
     no warnings 'uninitialized';
-    eval { $dbh->{Callbacks} = $owned->{callbacks}; delete $dbh->{private_selecto_stream_owned} };
-    for my $child (@{$owned->{children}}) { eval { $child->[0]{Callbacks} = $child->[1] } if defined $child->[0] }
+    eval { $dbh->{Callbacks} = $owned->{callbacks} if Scalar::Util::refaddr($dbh->{Callbacks} // 0) == Scalar::Util::refaddr($owned->{mine}) };
+    for my $child (@{$owned->{children}}) {
+        my ($sth, $before, $ours) = @$child;
+        next unless defined $sth;
+        eval { $sth->{Callbacks} = $before if Scalar::Util::refaddr($sth->{Callbacks} // 0) == Scalar::Util::refaddr($ours) };
+    }
     return;
 }
 
@@ -613,11 +675,16 @@ On a handle with no transaction open the stream begins a read-only transaction o
 its own and rolls it back at the close, and the handle is the stream's until then.
 Anything else that would reach the server through it (a statement, a prepared
 statement's C<execute>, C<begin_work>, C<commit>, C<rollback>, a C<ping>, a driver
-method, Selecto's own reads and writes) fails at once with C<handle_owned_by_stream>,
-before it is sent; quoting, C<err>, C<state> and attributes still work. The handle is
-the host's again once the stream drains, closes, fails or is dropped, with the host's
-own DBI callbacks as they were (they run after the check meanwhile). A forked child's
-copy of the stream ends nothing on the server. Call C<begin_work> first to use the
+method, a statement handle's C<NULLABLE> (a catalog query), Selecto's own reads and
+writes, and C<connect_cached> of the handle) fails at once with
+C<handle_owned_by_stream>, before it is sent, also from inside a DBI call (a
+C<HandleError> handler); C<visit_child_handles>, which runs host code where no callback
+can see it, refuses too. Quoting, C<err>, C<state> and other attributes still work. The
+handle's C<Callbacks> cannot be set meanwhile, and the stream's are read-only. The
+handle is the host's again once the stream drains, closes, fails or is dropped, with
+the host's own DBI callbacks as they were (they run after the check meanwhile). A
+clone of the handle is a handle of its own. A forked child's copy of the stream ends
+nothing on the server. Call C<begin_work> first to use the
 handle between fetches. A stream that locks rows (C<for_update>, C<for_share>)
 refuses there (C<row_lock_needs_transaction>): it needs the host's transaction.
 
@@ -628,10 +695,12 @@ Each fetch runs read only under a savepoint of its own, rolled back afterwards; 
 generated stream that locks rows keeps its locks instead, to the host's commit. A
 failed fetch ends only that fetch, and then the stream: nothing the host did between
 fetches is undone, and the error reaches the host. A hand-built statement that locks
-rows refuses. A C<ROLLBACK TO> that takes the cursor away ends the stream at its next
-fetch, with the transaction intact. A host that ends its transaction mid-stream
-(C<COMMIT> or C<ROLLBACK>) ends the stream with C<transaction_state_unsafe>, and keeps
-its connection. The stream's search_path and result settings are pinned for its own
+rows refuses. A C<ROLLBACK TO> a savepoint the host took before the stream takes the
+cursor away: the stream ends at its next fetch with C<query_rule_not_evaluable>
+(C<stream_cursor_gone>), and the transaction goes on. A host that ends its transaction
+mid-stream (C<COMMIT> or C<ROLLBACK>) ends the stream with C<transaction_state_unsafe>,
+and keeps its connection. (The transaction's virtual id, read at the opening, tells
+the two apart.) The stream's search_path and result settings are pinned for its own
 statements only: between fetches the host's statements run under the host's settings,
 and in the host's transaction what the host sets there is still in force after the
 close.

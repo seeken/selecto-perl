@@ -1241,7 +1241,7 @@ sub _connection_state {
     Selecto::Error->throw('handle_owned_by_stream',
         'the handle belongs to an open bounded stream until it closes: call begin_work before the stream to use the '
         . 'handle between fetches', {method => 'selecto'})
-        if !$Selecto::PostgreSQL::Stream::PASS && eval { $dbh->{private_selecto_stream_owned} };
+        if !$Selecto::PostgreSQL::Stream::PASS && $Selecto::PostgreSQL::Stream::OWNED{Scalar::Util::refaddr($dbh) // 0};
     return 'active' if eval { $dbh->{pg_async_status} };
     my $status = eval { $dbh->pg_ping };
     return 'unknown' unless defined $status;
