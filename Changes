@@ -38,8 +38,8 @@ Revision history for Selecto
       a handle between fetches of a bounded stream, or shares one handle across
       requests while an export streams, and call begin_work before the stream (or give
       the stream a handle of its own).
-      DBI->connect_cached of a handle a stream holds refuses (its ping is refused)
-      rather than hand that handle out.
+      DBI->connect_cached with the held handle's arguments does not hand it out: its
+      ping is refused, so DBI opens a new connection and caches that instead.
     - On an idle handle a read now ends in a ROLLBACK of its own, so
       pg_stat_database.xact_rollback rises by one per such read. Inside the host's
       transaction a read ends with ROLLBACK TO a savepoint, which does not move it.
@@ -114,8 +114,13 @@ Revision history for Selecto
     - PostgreSQL: the handle a bounded stream holds is known by its identity, so a clone
       of it is never owned; each method that can reach the server has its own callback
       key, so host code running inside a DBI call (a HandleError handler) is refused
-      too, and visit_child_handles refuses; the handle's Callbacks cannot be set while
-      the stream holds it, the stream's are read-only, and the release restores the
+      too, and visit_child_handles refuses (quote_identifier still works: DBI's own
+      get_info inside it is not refused; a top-level get_info is); the handle's
+      Callbacks cannot be set while the stream holds it, the stream's entries are
+      read-only (assigning one dies with Perl's "Modification of a read-only value
+      attempted"; deleting entries is a deliberate bypass that lifts the check, after
+      which the host's statements run in the stream's READ ONLY transaction), and the
+      release restores the
       host's only where the stream's are still in place; a statement handle's NULLABLE
       (a catalog query) refuses; a query budget's check reports handle_owned_by_stream
       as itself. A ROLLBACK TO a savepoint taken before the stream now ends it with

@@ -32,7 +32,7 @@ my %CHILD_BLOCKED = map { ($_ => 1) } qw(execute execute_array execute_for_fetch
 # it is refused as well.
 my @HANDLE_KEYS = qw(do prepare prepare_cached selectrow_array selectrow_arrayref selectrow_hashref selectall_arrayref
     selectall_hashref selectall_array selectcol_arrayref begin_work commit rollback ping func table_info column_info
-    primary_key_info primary_key foreign_key_info statistics_info tables type_info type_info_all get_info
+    primary_key_info primary_key foreign_key_info statistics_info tables type_info type_info_all
     last_insert_id STORE visit_child_handles take_imp_data);
 my @STATEMENT_KEYS = qw(execute execute_array execute_for_fetch FETCH STORE);
 sub _driver_methods {
@@ -676,11 +676,19 @@ its own and rolls it back at the close, and the handle is the stream's until the
 Anything else that would reach the server through it (a statement, a prepared
 statement's C<execute>, C<begin_work>, C<commit>, C<rollback>, a C<ping>, a driver
 method, a statement handle's C<NULLABLE> (a catalog query), Selecto's own reads and
-writes, and C<connect_cached> of the handle) fails at once with
-C<handle_owned_by_stream>, before it is sent, also from inside a DBI call (a
-C<HandleError> handler); C<visit_child_handles>, which runs host code where no callback
-can see it, refuses too. Quoting, C<err>, C<state> and other attributes still work. The
-handle's C<Callbacks> cannot be set meanwhile, and the stream's are read-only. The
+writes) fails at once with C<handle_owned_by_stream>, before it is sent, also from
+inside a DBI call (a C<HandleError> handler); C<visit_child_handles>, which runs host
+code where no callback can see it, refuses too. A top-level C<get_info> refuses; the
+C<get_info> that C<quote_identifier> makes inside DBI does not, so quoting works, as do
+C<err>, C<state> and other attributes. C<< DBI->connect_cached >> with the handle's
+arguments does not hand the held handle out: its ping is refused, so DBI opens a new
+connection and caches that instead. The handle's C<Callbacks> cannot be set meanwhile,
+and the stream's entries are read-only: assigning one dies with Perl's own
+C<Modification of a read-only value attempted>, before anything is sent. Deleting
+entries from the handle's C<Callbacks> (or the C<Callbacks> attribute's hash itself)
+lifts the check: that is a deliberate bypass, not something Selecto guards against,
+and the host's statements then run inside the stream's own READ ONLY transaction, where
+writes fail and the stream's rollback discards the rest. The
 handle is the host's again once the stream drains, closes, fails or is dropped, with
 the host's own DBI callbacks as they were (they run after the check meanwhile). A
 clone of the handle is a handle of its own. A forked child's copy of the stream ends

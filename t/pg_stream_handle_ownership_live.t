@@ -288,6 +288,22 @@ subtest "a query budget's check says the handle is the stream's" => sub {
     $dbh->disconnect;
 };
 
+# DBI's quote_identifier asks get_info inside DBI: quoting keeps working while a
+# top-level get_info, and the ones that send SQL, refuse.
+subtest 'quoting works on a handle a stream owns; get_info does not' => sub {
+    my $dbh = TestPostgreSQL->connect;
+    my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+    my $s = open_stream($e);
+    is(eval { $dbh->quote_identifier('a"b') } // kind($@), '"a""b"', 'quote_identifier');
+    is(eval { $dbh->quote_identifier(undef, 'public', 'ho_t') } // kind($@), '"public"."ho_t"', 'a qualified name');
+    is(try(sub { $dbh->get_info($_) }), 'handle_owned_by_stream/', "get_info($_) refuses") for 29, 25, 10005;
+    my $n = 1;
+    $n++ while $s->next;
+    ok($n > 1, 'the stream drains');
+    is($dbh->get_info(29), '"', 'get_info works once the stream ends');
+    $dbh->disconnect;
+};
+
 subtest 'connect_cached never hands out a handle a stream owns' => sub {
     my ($dsn, @auth) = TestPostgreSQL->connection;
     my %attributes = (RaiseError => 1, PrintError => 0, AutoCommit => 1, private_selecto_test_cache => 1);
@@ -295,7 +311,7 @@ subtest 'connect_cached never hands out a handle a stream owns' => sub {
     my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
     my $s = open_stream($e);
     my $again = eval { DBI->connect_cached($dsn, @auth, \%attributes) };
-    ok(!$again || refaddr($again) != refaddr($dbh), 'it refuses, or gives another handle') or diag 'the owned handle came back';
+    ok($again && refaddr($again) != refaddr($dbh), 'it opens another connection') or diag 'the owned handle came back, or none';
     eval { 1 while $s->next };
     $again->disconnect if $again && refaddr($again) != refaddr($dbh);
     $dbh->disconnect;
