@@ -24,7 +24,7 @@ Revision history for Selecto
     - Expect more round trips on PostgreSQL. Measured per operation against 0.2.2
       (messages, then statements): a read on an idle handle +29%, +36%; a read inside
       the host's transaction +60%, +75% (its catalog reads now run under savepoints);
-      a bounded stream on an idle handle +40%, +43%; inside the host's transaction
+      a bounded stream on an idle handle +40% to +45%, +43% to +47%; inside the host's transaction
       +84% to +125%, +142% to +230%, as each FETCH batch there takes 4 round trips (5
       for a stream that locks rows) where 0.2.2 took 2. Hand-built reads in the host's
       transaction are unchanged; on an idle handle they take 5 messages, their ROLLBACK
@@ -38,6 +38,8 @@ Revision history for Selecto
       a handle between fetches of a bounded stream, or shares one handle across
       requests while an export streams, and call begin_work before the stream (or give
       the stream a handle of its own).
+      DBI->connect_cached of a handle a stream holds refuses (its ping is refused)
+      rather than hand that handle out.
     - On an idle handle a read now ends in a ROLLBACK of its own, so
       pg_stat_database.xact_rollback rises by one per such read. Inside the host's
       transaction a read ends with ROLLBACK TO a savepoint, which does not move it.
@@ -109,6 +111,16 @@ Revision history for Selecto
       statement handles prepared earlier included, and the host's own DBI callbacks
       still run and are restored as they were. A forked child's copy of a stream ends
       nothing on the server.
+    - PostgreSQL: the handle a bounded stream holds is known by its identity, so a clone
+      of it is never owned; each method that can reach the server has its own callback
+      key, so host code running inside a DBI call (a HandleError handler) is refused
+      too, and visit_child_handles refuses; the handle's Callbacks cannot be set while
+      the stream holds it, the stream's are read-only, and the release restores the
+      host's only where the stream's are still in place; a statement handle's NULLABLE
+      (a catalog query) refuses; a query budget's check reports handle_owned_by_stream
+      as itself. A ROLLBACK TO a savepoint taken before the stream now ends it with
+      stream_cursor_gone, the transaction going on; transaction_state_unsafe is for a
+      transaction that ended (the virtual transaction id, read at the opening, tells).
     - PostgreSQL: a host that ends its own transaction mid-stream now gets
       transaction_state_unsafe and keeps its connection, on an AutoCommit-off handle
       too; the stream had closed it, or raised the raw cursor error.

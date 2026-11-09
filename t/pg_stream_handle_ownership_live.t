@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use POSIX ();
 use Scalar::Util qw(blessed refaddr);
+use DBI ();
 use Selecto;
 use Selecto::Engine;
 use Selecto::Domain;
@@ -12,6 +13,10 @@ use Selecto::Write ();
 use Selecto::PostgreSQL ();
 use lib 't/lib';
 use TestPostgreSQL ();
+
+# Owning a handle must not write to the host's log.
+my @WARNINGS;
+$SIG{__WARN__} = sub { push @WARNINGS, $_[0] };
 
 # On a handle with no transaction open a bounded stream runs in a transaction of its
 # own, so the handle is the stream's until it closes: anything else sent on it would run
@@ -204,5 +209,98 @@ subtest 'a cancel on a catalog read with RaiseError off is a cancel' => sub {
     $dbh->rollback;
     $dbh->disconnect;
 };
+
+# The handle's identity, not its attributes, says it is owned: a clone is never owned.
+subtest 'a handle cloned during the stream is its own' => sub {
+    my $dbh = TestPostgreSQL->connect;
+    my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+    my $s = open_stream($e);
+    my $clone = $dbh->clone;
+    my $ce = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $clone));
+    is(try(sub { $ce->all($ce->query->select('id')) }), 'ok', 'a Selecto read on the clone runs while the stream is open');
+    eval { 1 while $s->next };
+    is(try(sub { $ce->all($ce->query->select('id')) }), 'ok', 'and after it');
+    is(try(sub { my $c = open_stream($ce); 1 while $c->next; 1 }), 'ok', 'a bounded stream on the clone runs');
+    $clone->disconnect;
+    $dbh->disconnect;
+};
+
+# DBI runs no '*' callback for a call nested in another DBI call: each sending method
+# has its own key, and visit_child_handles (which runs host code where none fires) is
+# refused.
+subtest 'host code running inside a DBI call is refused too' => sub {
+    $admin->do('DELETE FROM ho_l');
+    my $dbh = TestPostgreSQL->connect;
+    my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+    my $s = open_stream($e);
+    my $inner = 'not run';
+    {
+        # (An error set on the handle runs the host's HandleError inside DBI's set_err.)
+        local $dbh->{HandleError} = sub { $inner = try(sub { $dbh->do('INSERT INTO ho_l VALUES (5)') }); return 0 };
+        eval { $dbh->set_err(1, 'host error'); 1 };
+    }
+    is($inner, 'handle_owned_by_stream/', "a statement in the host's HandleError refuses");
+    is(try(sub { $dbh->visit_child_handles(sub { 1 }) }), 'handle_owned_by_stream/', 'visit_child_handles refuses');
+    eval { 1 while $s->next };
+    is(stored(), '', 'nothing of it reached the server');
+    $dbh->disconnect;
+};
+
+subtest "the host's callbacks cannot be changed under the stream" => sub {
+    my $dbh = TestPostgreSQL->connect;
+    my $sth = $dbh->prepare('INSERT INTO ho_l VALUES (?)');
+    my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+    my $s = open_stream($e);
+    is(try(sub { $dbh->{Callbacks} = {} }), 'handle_owned_by_stream/', 'a STORE of the handle\'s Callbacks refuses');
+    is(try(sub { $sth->{Callbacks} = {} }), 'handle_owned_by_stream/', "and of a statement handle's");
+    ok(!eval { $dbh->{Callbacks}{do} = sub { return }; 1 }, 'an edit of them in place dies');
+    is(try(sub { $sth->{NULLABLE} }), 'handle_owned_by_stream/', 'NULLABLE, a catalog query, refuses');
+    eval { 1 while $s->next };
+    my $mine = {do => sub { return }};
+    $dbh->{Callbacks} = $mine;
+    is(refaddr($dbh->{Callbacks}), refaddr($mine), 'after the stream the host sets its own');
+    $dbh->disconnect;
+};
+
+subtest "a ROLLBACK TO a savepoint taken before the stream is not the host's transaction ending" => sub {
+    my $dbh = TestPostgreSQL->connect;
+    my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+    $dbh->begin_work;
+    $dbh->do('SAVEPOINT host_sp');
+    my $s = open_stream($e);
+    $dbh->do('ROLLBACK TO SAVEPOINT host_sp');
+    my $outcome = eval { 1 while $s->next; 1 } ? 'ok' : (blessed($@) ? join('/', $@->code, $@->details->{reason} // $@->details->{state} // '') : "$@");
+    is($outcome, 'query_rule_not_evaluable/stream_cursor_gone', 'the stream says its cursor is gone');
+    is($dbh->pg_ping, 3, "and the host's transaction goes on");
+    $dbh->rollback;
+    $dbh->disconnect;
+};
+
+subtest "a query budget's check says the handle is the stream's" => sub {
+    my $dbh = TestPostgreSQL->connect;
+    my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
+    my $e = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+    my $budget = $adapter->begin_query_budget(timeout_ms => 5000);
+    my $s = open_stream($e);
+    is(try(sub { $budget->check }), 'handle_owned_by_stream/', 'a check that would re-arm says so, not unavailable');
+    eval { 1 while $s->next };
+    $budget->close;
+    $dbh->disconnect;
+};
+
+subtest 'connect_cached never hands out a handle a stream owns' => sub {
+    my ($dsn, @auth) = TestPostgreSQL->connection;
+    my %attributes = (RaiseError => 1, PrintError => 0, AutoCommit => 1, private_selecto_test_cache => 1);
+    my $dbh = DBI->connect_cached($dsn, @auth, \%attributes);
+    my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
+    my $s = open_stream($e);
+    my $again = eval { DBI->connect_cached($dsn, @auth, \%attributes) };
+    ok(!$again || refaddr($again) != refaddr($dbh), 'it refuses, or gives another handle') or diag 'the owned handle came back';
+    eval { 1 while $s->next };
+    $again->disconnect if $again && refaddr($again) != refaddr($dbh);
+    $dbh->disconnect;
+};
+
+is_deeply \@WARNINGS, [], 'opening, using and closing streams warns nothing';
 
 done_testing;

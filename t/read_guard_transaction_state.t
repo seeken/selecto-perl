@@ -300,6 +300,7 @@ subtest 'PostgreSQL: healthy guards behave as before' => sub {
     ok(!$dbh->{AutoCommit}, 'an idle handle gets the stream\'s own transaction');
     {
         # (Looked at as the stream itself: the handle is the stream's until it closes.)
+        no warnings 'once';
         local $Selecto::PostgreSQL::Stream::PASS = 1;
         is(($dbh->selectrow_array('SHOW transaction_read_only'))[0], 'on', 'which is read only');
     }

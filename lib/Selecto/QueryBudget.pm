@@ -240,8 +240,12 @@ sub _rearm {
     my ($self, $remaining) = @_;
     my $ms = int($remaining * 1000);
     $ms = 1 if $ms < 1;
-    eval { $self->{rearm}->($ms); 1 }
-        or Selecto::Error->throw('query_budget_unavailable', 'database query deadline could not be refreshed');
+    unless (eval { $self->{rearm}->($ms); 1 }) {
+        my $error = $@;
+        # A handle a bounded stream holds says so itself: the deadline is not unavailable.
+        die $error if Scalar::Util::blessed($error) && $error->isa('Selecto::Error') && $error->code eq 'handle_owned_by_stream';
+        Selecto::Error->throw('query_budget_unavailable', 'database query deadline could not be refreshed');
+    }
     $self->{rearm_pending} = 0;
     return;
 }
