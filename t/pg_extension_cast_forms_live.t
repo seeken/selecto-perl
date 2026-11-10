@@ -45,6 +45,24 @@ for my $sql (q{SELECT id AS citext FROM public.cf_t WHERE id = 1}, q{SELECT x.se
     $statement->{_selecto_relations} = ['public.cf_t'];
     is_deeply(eval { $adapter->execute_query($statement)->{rows} }, [[1]], $sql) or diag $@;
 }
+# The bounded guard's CTE around a scalar column (a canned page's total) is no
+# column definition list: its "selecto_rows.*" is not a type to look up.
+{
+    my $rows = Selecto::Statement->new(sql => 'SELECT id FROM public.cf_t WHERE id = 1', params => [],
+        adapter_name => 'postgresql', columns => ['id']);
+    $rows->{_selecto_relations} = ['public.cf_t'];
+    my $total = Selecto::Statement->new(sql => 'SELECT count(*) FROM public.cf_t', params => [],
+        adapter_name => 'postgresql', columns => ['total']);
+    $total->{_selecto_relations} = ['public.cf_t'];
+    my $statement = $adapter->scalar_column_statement($rows, $total, 'total');
+    my $bounded = Selecto::Statement->new(
+        sql => 'WITH selecto_bounded AS MATERIALIZED (SELECT * FROM (' . $statement->sql
+            . ') AS selecto_page) SELECT * FROM selecto_bounded',
+        params => [], adapter_name => 'postgresql', columns => $statement->columns);
+    $bounded->{_selecto_relations} = ['public.cf_t'];
+    is_deeply(eval { $adapter->execute_query($bounded)->{rows} }, [[1, 2]],
+        'a bounded statement over rows.* and a scalar column runs') or diag $@;
+}
 is_deeply(\@warnings, [], 'nothing warned');
 $dbh->disconnect;
 done_testing;
