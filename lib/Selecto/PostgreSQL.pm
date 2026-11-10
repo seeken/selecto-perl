@@ -2486,12 +2486,15 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
         AND ty.typcategory OPERATOR(pg_catalog.<>) 'A'
       JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
         AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'),
+    l(oid, parent) AS MATERIALIZED (
+      SELECT t.oid, t.typbasetype FROM pg_catalog.pg_type t WHERE t.typbasetype OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)
+      UNION ALL
+      SELECT t.oid, t.typelem FROM pg_catalog.pg_type t WHERE t.typelem OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)),
     x(oid, depth) AS (
       SELECT d.objid, 0 FROM pg_catalog.pg_depend d
       WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
       UNION ALL
-      SELECT t.oid, x.depth OPERATOR(pg_catalog.+) 1 FROM pg_catalog.pg_type t
-      JOIN x ON t.typbasetype OPERATOR(pg_catalog.=) x.oid OR t.typelem OPERATOR(pg_catalog.=) x.oid
+      SELECT l.oid, x.depth OPERATOR(pg_catalog.+) 1 FROM l JOIN x ON l.parent OPERATOR(pg_catalog.=) x.oid
       WHERE x.depth OPERATOR(pg_catalog.<) 16),
     f AS (SELECT p.oid, p.proname, CASE WHEN p.proallargtypes IS NULL THEN ARRAY[p.prorettype]
         ELSE ARRAY(SELECT u.t FROM ROWS FROM (pg_catalog.unnest(p.proallargtypes), pg_catalog.unnest(p.proargmodes)) AS u(t, m)
@@ -2563,13 +2566,13 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
     UNION ALL
     SELECT 'fun', NULL, CAST(f.proname AS pg_catalog.text), NULL,
       CASE WHEN pg_catalog.bool_or(EXISTS (SELECT 1 FROM pg_catalog.unnest(f.outs) AS o(t)
-        JOIN pg_catalog.pg_type ot ON ot.oid OPERATOR(pg_catalog.=) o.t
         WHERE o.t OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x))
-          OR (ot.typtype OPERATOR(pg_catalog.=) 'p' AND ot.oid OPERATOR(pg_catalog.<>) CAST('pg_catalog.record' AS pg_catalog.regtype)
-            AND EXISTS (SELECT 1 FROM x))
-          OR (ot.typtype OPERATOR(pg_catalog.=) 'c' AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
-            WHERE ca.attrelid OPERATOR(pg_catalog.=) ot.typrelid AND ca.attnum OPERATOR(pg_catalog.>) 0 AND NOT ca.attisdropped
-              AND ca.atttypid OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x))))))
+          OR EXISTS (SELECT 1 FROM pg_catalog.pg_type ot WHERE ot.oid OPERATOR(pg_catalog.=) o.t
+            AND ((ot.typtype OPERATOR(pg_catalog.=) 'p' AND ot.oid OPERATOR(pg_catalog.<>) CAST('pg_catalog.record' AS pg_catalog.regtype)
+                AND EXISTS (SELECT 1 FROM x))
+              OR (ot.typtype OPERATOR(pg_catalog.=) 'c' AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
+                WHERE ca.attrelid OPERATOR(pg_catalog.=) ot.typrelid AND ca.attnum OPERATOR(pg_catalog.>) 0 AND NOT ca.attisdropped
+                  AND ca.atttypid OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x))))))))
         THEN 'unknown'
         WHEN pg_catalog.bool_and(NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(f.outs) AS o(t)
           WHERE o.t OPERATOR(pg_catalog.<>) ALL (CAST('{pg_catalog.text,pg_catalog.varchar,pg_catalog.bpchar,pg_catalog.name}' AS pg_catalog.regtype[]))))
@@ -2606,7 +2609,7 @@ my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
 # function): far less to plan (review LOW 3).
 my $EXTENSION_OPERATORS_NO_FUNCTIONS_SQL = do {
     my $sql = $EXTENSION_OPERATORS_SQL;
-    $sql =~ s/\),\n    x\(oid, depth\) AS \(.*?\n    SELECT 'col'/)\n    SELECT 'col'/s or die 'extension SQL: no function CTEs';
+    $sql =~ s/\),\n    l\(oid, parent\) AS MATERIALIZED \(.*?\n    SELECT 'col'/)\n    SELECT 'col'/s or die 'extension SQL: no function CTEs';
     $sql =~ s/\n    UNION ALL\n    SELECT 'fun'.*?\n    UNION ALL\n    SELECT 'iso'/\n    UNION ALL\n    SELECT 'iso'/s or die 'extension SQL: no function rows';
     $sql;
 };
@@ -2758,8 +2761,9 @@ sub _pg_extension_operators {
     my @rels = sort keys %rels;
     my @functions = sort keys %functions;
     # Within one write (its statements run under the write's relation lock),
-    # the same relations and functions are read once (review LOW 3).
-    my $shared = $self->{_selecto_write_catalog};
+    # the same relations and functions are read once (review LOW 3); so are a
+    # host transaction's reads (_read_catalog_cache).
+    my $shared = $self->{_selecto_write_catalog} // $self->_read_catalog_cache;
     my $key = join("\0", @rels) . "\x1f" . join("\0", @functions) . "\x1f" . join("\0", sort keys %host)
         . "\x1f" . join("\0", @{$self->{_selecto_qualify_declared} // []}) . "\x1f" . join("\0", sort keys %casts);
     return $shared->{$key} if ref($shared) eq 'HASH' && $shared->{$key};
@@ -2828,6 +2832,30 @@ sub _pg_cast_types {
         else { $entries{$key}{$a} = '"' . ($b =~ s/"/""/gr) . '"' }
     }
     return \%entries;
+}
+
+# The extension lookups of the host transaction in progress, keyed as
+# _pg_extension_operators keys them; undef outside one, so a statement in a
+# transaction of its own looks its catalog up afresh. On a large catalog (a
+# partitioned database: hundreds of thousands of types) one lookup costs a
+# scan of pg_type, and a page's statements read the same relations. A
+# transaction is known by its backend and start time; the cache holds only the
+# current one's. Every statement still rechecks its relations (R41).
+my $TRANSACTION_IDENTITY_SQL = q{SELECT pg_catalog.pg_backend_pid(),
+    CAST(pg_catalog.transaction_timestamp() AS pg_catalog.text)};
+sub _read_catalog_cache {
+    my ($self) = @_;
+    return undef unless $self->_transaction_open;
+    # A failure (a cancel among them) is the statement's, as any catalog read's.
+    my ($pid, $started);
+    my $ok = eval { ($pid, $started) = $self->{dbh}->selectrow_array($TRANSACTION_IDENTITY_SQL); 1 };
+    die $self->normalize_error($@) unless $ok;
+    return undef unless defined($pid) && defined($started);
+    my $id = "$pid\0$started";
+    my $cache = $self->{_selecto_read_catalog};
+    $self->{_selecto_read_catalog} = $cache = {id => $id, entries => {}}
+        unless ref($cache) eq 'HASH' && $cache->{id} eq $id;
+    return $cache->{entries};
 }
 
 sub _pg_extension_lookup {
