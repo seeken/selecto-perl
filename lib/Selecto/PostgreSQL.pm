@@ -2737,13 +2737,17 @@ sub _pg_extension_operators {
         }
     }
     # AS alias (column type, ...): a declared extension type is reason enough to
-    # read this statement's columns.
+    # read this statement's columns. AS MATERIALIZED ( opens a CTE's body (the
+    # bounded guard's), whose "SELECT rows.*" is no column and type.
     for my $k (0 .. $#$tokens - 3) {
         next unless uc($tokens->[$k][1]) eq 'AS' && $tokens->[$k + 1][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 2][1] eq '(';
+        next if $tokens->[$k + 1][0] eq 'id' && uc($tokens->[$k + 1][1]) eq 'MATERIALIZED';
         for (my $j = $k + 3; $j + 1 < @$tokens && $tokens->[$j][1] ne ')'; $j++) {
             next unless $tokens->[$j][0] =~ /\A(?:id|qid)\z/ && $tokens->[$j + 1][0] =~ /\A(?:id|qid)\z/;
             my $bare = $name->($tokens->[$j + 1]);
             if ($j + 3 < @$tokens && $tokens->[$j + 2][1] eq '.') {
+                # schema.type only: to_regtype refuses a spelling such as "rows.*".
+                next unless $tokens->[$j + 3][0] =~ /\A(?:id|qid)\z/;
                 $casts{"$bare." . $name->($tokens->[$j + 3])} = "$tokens->[$j + 1][1].$tokens->[$j + 3][1]";
             } elsif (!Selecto::PostgreSQL::Qualify::_string_type($bare)) {
                 $casts{$bare} = '"' . ($bare =~ s/"/""/gr) . '"';
