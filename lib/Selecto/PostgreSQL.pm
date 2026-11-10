@@ -31,6 +31,9 @@ has temporary_relations => 0;
 # The schemas the host declares its relations live in, in order: every relation
 # resolves there and nowhere else. See Declared schemas below.
 has schemas => sub { [] };
+# 'domain': the host vouches for its catalog (What the host must provide), so a
+# compiled read takes the domain's word for it. See catalog_trust below.
+has catalog_trust => '';
 
 sub new {
     my ($class, @args) = @_;
@@ -38,8 +41,13 @@ sub new {
     my $schemas = $self->schemas;
     Selecto::Error->throw('invalid_adapter', 'schemas must be a list of schema names')
         unless ref($schemas) eq 'ARRAY' && !grep { !defined($_) || ref($_) || !length($_) } @$schemas;
+    my $trust = $self->catalog_trust;
+    Selecto::Error->throw('invalid_adapter', q{catalog_trust must be '' or 'domain'})
+        unless defined($trust) && !ref($trust) && ($trust eq '' || $trust eq 'domain');
     return $self;
 }
+
+sub _domain_trusted { return $_[0]->catalog_trust eq 'domain' ? 1 : 0 }
 
 sub name    { return 'postgresql'; }
 sub dialect { return __PACKAGE__; }
@@ -2087,12 +2095,19 @@ sub _guarded_read {
             };
             die $self->normalize_error($@) unless $read_only;
         } else {
+            # catalog_trust => 'domain': a compiled read that locks no rows takes the
+            # domain's word for its relations and the session, so neither the recheck
+            # (R41) nor the snapshot around it runs; without a snapshot before, none is
+            # read after. Its pin, read-only mode and rollback stand (R30, R55). A
+            # locking read keeps its savepoint's work, and the snapshot after it is
+            # what restores the host's settings, so it is checked in full.
+            my $trusted = $self->_domain_trusted && !$locks;
             {
                 local $self->{_selecto_reset_operation} = {};
-                $self->_pg_check_relations($source);
+                $self->_pg_check_relations($source) unless $trusted;
                 $pin = $self->_pg_pin_search_path(0, $source, read_only => !$locks);
             }
-            $before = $self->_pg_admit_session($source, read => 1);
+            $before = $self->_pg_admit_session($source, read => 1) unless $trusted;
         }
         $result = $work->();
         1;
@@ -2762,8 +2777,9 @@ sub _pg_extension_operators {
     my @functions = sort keys %functions;
     # Within one write (its statements run under the write's relation lock),
     # the same relations and functions are read once (review LOW 3); so are a
-    # host transaction's reads (_read_catalog_cache).
-    my $shared = $self->{_selecto_write_catalog} // $self->_read_catalog_cache;
+    # host transaction's reads (_read_catalog_cache), and under catalog_trust a
+    # process's reads (_trusted_catalog_cache).
+    my $shared = $self->{_selecto_write_catalog} // $self->_trusted_catalog_cache // $self->_read_catalog_cache;
     my $key = join("\0", @rels) . "\x1f" . join("\0", @functions) . "\x1f" . join("\0", sort keys %host)
         . "\x1f" . join("\0", @{$self->{_selecto_qualify_declared} // []}) . "\x1f" . join("\0", sort keys %casts);
     return $shared->{$key} if ref($shared) eq 'HASH' && $shared->{$key};
@@ -2843,6 +2859,24 @@ sub _pg_cast_types {
 # current one's. Every statement still rechecks its relations (R41).
 my $TRANSACTION_IDENTITY_SQL = q{SELECT pg_catalog.pg_backend_pid(),
     CAST(pg_catalog.transaction_timestamp() AS pg_catalog.text)};
+# Under catalog_trust => 'domain', a compiled read's extension lookups are the
+# process's for a database and login (relations resolve by the login's
+# search_path) for $TRUSTED_CATALOG_SECONDS: the host vouches for its catalog,
+# and an extension type or a column's type changes only with a migration,
+# which this bounds how long to see.
+my %TRUSTED_CATALOG;
+our $TRUSTED_CATALOG_SECONDS = 300;
+sub _trusted_catalog_cache {
+    my ($self) = @_;
+    return undef unless $self->_domain_trusted;
+    my $dbh = $self->{dbh};
+    my $database = join "\0", $dbh->{Name} // '', $dbh->{Username} // '';
+    my $bucket = $TRUSTED_CATALOG{$database};
+    $TRUSTED_CATALOG{$database} = $bucket = {at => time, entries => {}}
+        unless $bucket && time - $bucket->{at} < $TRUSTED_CATALOG_SECONDS;
+    return $bucket->{entries};
+}
+
 sub _read_catalog_cache {
     my ($self) = @_;
     return undef unless $self->_transaction_open;
@@ -3189,6 +3223,23 @@ types, and dates and timestamps follow the session C<DateStyle>. C<1>
 (opt-in): canonical decimal, date and timestamp fields are formatted by
 PostgreSQL, always in the ISO form (see L</Canonical values in SQL (opt-in)>).
 
+=head2 catalog_trust
+
+  Selecto->adapter(postgresql => (dbh => $dbh, catalog_trust => 'domain'));
+
+C<''> (the default): every read and write checks the catalog and the session
+around its statement (see L</SESSION STATE>). C<'domain'> (opt-in): the host
+vouches that it meets L</What the host must provide>, and a compiled read that
+locks no rows takes the domain's word for its relations: it skips the relation
+recheck and the session snapshot before and after it, and its extension-type
+lookup is kept for the process, per database and login, for five minutes
+(C<$Selecto::PostgreSQL::TRUSTED_CATALOG_SECONDS>). Its pinned settings,
+read-only mode and rollback stand, and so do tenant predicates and query
+budgets. Writes, row-locking reads, bounded streams and a host's hand-built
+statements are checked in full. On a database with a large catalog (heavy
+partitioning: hundreds of thousands of relations and types) those checks cost
+far more than a page's own query.
+
 =head1 ERRORS
 
 Constraint failures are reported with portable codes and without the
@@ -3380,7 +3431,9 @@ as the application's role. No untrusted role may have C<CREATE> on a schema the
 application reaches, and the host's triggers, views and row-security policies
 must schema-qualify the functions they call. Planted code reached through them
 can change the session or swap a stream's cursor between statements: Selecto
-catches some of that, and does not promise to.
+catches some of that, and does not promise to. A host that meets this may say
+so with C<< catalog_trust => 'domain' >> (see L</catalog_trust>), and its
+compiled reads then catch none of it.
 
 =head1 SEE ALSO
 
