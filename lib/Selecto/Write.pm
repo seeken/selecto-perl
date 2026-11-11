@@ -361,7 +361,7 @@ Selecto::Write - portable write commands, batches, graphs and results
 
   use Selecto;
 
-  # Usually built and checked by the engine:
+  # A write is an intent: the engine builds and checks the command.
   my $command = $engine->write_command(
       operation   => 'update',
       assignments => {
@@ -373,17 +373,20 @@ Selecto::Write - portable write commands, batches, graphs and results
   my $result = $engine->execute_write($command);
   print $result->affected_rows;
 
-  # Or constructed directly:
-  my $insert = Selecto::Write::Command->new(
-      operation   => 'insert',
-      relation    => 'orders',          # must be the engine domain's table
-      assignments => {order_no => 'PO-41'},
-      metadata    => {returning => ['id']},
-  );
+  # The fluent builder compiles to the same intent:
+  $engine->write->update->assignments(status => 'closed')->filter(['id', 42])->execute;
 
-  my $results = $engine->execute_batch(Selecto::Write::Batch->new($insert, $command));
+  # Nested or cross-table writes: a portable Selecto::Write::Operation,
+  # compiled to a command or graph that the engine then governs.
 
 =head1 DESCRIPTION
+
+Write through intents: C<< $engine->write_command(...) >> for one table, the
+fluent builder (C<< $engine->write >>), or
+L<Selecto::Write::Operation> for nested and cross-table writes, which
+L<Selecto::Write::PortableCommand> compiles. These are the portable write model
+every Selecto runtime shares. The packages below are the layer those compile
+to: adapters, tooling and hand-assembled batches and graphs use them directly.
 
 Writes in Selecto are data. A L</Selecto::Write::Command> says what to
 change; the L<Selecto::Engine> checks it against the domain's C<writes>
