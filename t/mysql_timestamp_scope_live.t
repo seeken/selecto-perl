@@ -10,12 +10,10 @@ use Selecto::Domain;
 use Selecto::Expression;
 use Selecto::Write ();
 
-# Items 59 and 62: a row trigger or a view's stored function can SET
-# time_zone or sql_mode. MySQL then compares later rows' TIMESTAMPs (and a
-# write's post-image re-read) under the new zone, and the session stays
-# changed for the host. Every write and read compares the session with its
-# verified state: on a change it is restored and the operation refused (a
-# write rolls back). Ordinary triggers (updated_at) keep working.
+# TIMESTAMP scope compares are zone independent (UNIX_TIMESTAMP against an
+# exact epoch), so a scope holds whatever zone the session has when the
+# statement runs. Ordinary triggers (updated_at) keep working. (A trigger or
+# view function that changes the session is planted code: out of scope.)
 my $x = 'Selecto::Expression';
 my @backends;
 for my $spec (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_PERL_TEST_MARIADB_URL']) {
@@ -67,20 +65,6 @@ for my $backend (@backends) {
     my $engine = Selecto::Engine->new(adapter => $adapter, domain => domain('selecto_session_items', 1));
     my $write = sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_session_items',
         assignments => {note => 'x'}, predicate => $x->eq('id', 1), scope_predicate => $x->lt('ts', '2024-01-01 00:00:00')))->affected_rows };
-    # (A stored program's own SET sql_mode is undone when it returns, so only
-    # the time zone can leak out of a trigger.)
-    for my $change ([q{SET NEW.ts = '2024-01-01 03:00:00'; SET time_zone = '-05:00';}, 'moving time_zone'],
-        [q{SET time_zone = '-05:00';}, 'time_zone']) {
-        for my $host (0, 1) {
-            my $label = "$name $change->[1] trigger" . ($host ? ' in a host transaction' : '');
-            $reset->($change->[0]);
-            $dbh->begin_work if $host;
-            is(outcome($write), 'query_rule_violation/session_state_changed', "$label: the write is refused");
-            $dbh->commit if $host;
-            is($session->(), $verified, "$label: the session is restored");
-            is($state->(), '1:2023-06-01 00:00:00:open', "$label: the write is rolled back");
-        }
-    }
     # An ordinary updated_at trigger keeps working.
     $reset->('SET NEW.touched = CURRENT_TIMESTAMP;');
     is(outcome($write), 'ok 1', "$name: an updated_at trigger keeps working");
@@ -107,13 +91,8 @@ for my $backend (@backends) {
     for my $kind (sort keys %reads) {
         $dbh->do('SET @selecto_arm = 0');
         is(outcome($reads{$kind}), 'ok in,in3', "$name $kind: an unarmed function changes nothing");
-        $dbh->do('SET @selecto_arm = 1');
-        is(outcome($reads{$kind}), 'query_rule_violation/session_state_changed', "$name $kind: a zone switch mid-read is refused");
-        $dbh->do('SET @selecto_arm = 0');
-        is($session->(), $verified, "$name $kind: and the session is restored");
         # Item 62a: switched and switched back within the statement, the
-        # before/after compare sees nothing; the TIMESTAMP scope compare is
-        # zone independent, so row 2 (03:00 UTC) stays out.
+        # TIMESTAMP scope compare is zone independent, so row 2 (03:00 UTC) stays out.
         $dbh->do('SET @selecto_arm = 2');
         is(outcome($reads{$kind}), 'ok in,in3', "$name $kind: a zone switched and back mid-read cannot widen the scope");
         $dbh->do('SET @selecto_arm = 0');
