@@ -146,82 +146,12 @@ failure then refuses the plan if no later resource error occurs. Refused INPUT,
 unknown prospective values and unavailable storage still stop admission. Protected
 stored UPDATE and DELETE batch deltas require a prospective whole-plan provider
 and remain pending here, as does a protected INSERT beside an ordinary
-non-INSERT command. Individual SQLite upserts with stored rules use the native unique arbiter
-inside the actual transaction to select the insert or conflict branch. Conflict
-candidates overlay only the command's exact update mask on the physical stored
-row; an empty mask compiles to `DO NOTHING` and retains the command's declared
-cardinality. A zero-row no-op still fails an exact-one request. Only this
-protected SQLite path admits an empty mask. Other adapters, SQLite engines
-without stored UPSERT rules and upsert actions there still refuse it
-(`invalid_write`, or `invalid_action_plan` for actions), and the HTTP write
-API keeps requiring a non-empty `upsert_update_fields`.
+non-INSERT command.
+An UPSERT under stored rules is refused before anything runs
+(`write_capability_missing`), as on every adapter: no adapter offers protected
+UPSERT candidates. An empty update mask is refused too (`invalid_write`, or
+`invalid_action_plan` for actions).
 
-Protected upsert receipts are private and expire when the transaction callback
-exits. They bind the actual adapter, connection, command, context, arbiter,
-schema and prior physical row, and are rechecked immediately before dispatch.
-The engine opens the candidate scope with its live trusted write context. A
-receipt is minted only when its request context matches that live context, and
-the dispatch recheck compares the receipt with the context of the scope that is
-running then, so a nested scope with another context cannot dispatch it.
-The strategy reports serializable snapshot protection. It does not claim a
-write lock for caller-owned deferred transactions. Native stale-snapshot write
-upgrades retain SQLite's failure behavior. That claim needs SQLite's locking
-reads: with `PRAGMA read_uncommitted` a shared-cache connection takes no table
-read locks, so a peer on the same cache could roll back a row the proof read,
-or commit one it did not see, before the business DML. The scope, every
-projection and the dispatch recheck therefore refuse a connection whose
-`read_uncommitted` is on as `required_data_rule_pending` (reason
-`read_uncommitted_isolation`) before business DML, leaving the caller's
-transaction, savepoints and pragma unchanged. The adapter cannot observe
-whether a cache is or will become shared, so a private connection with the
-pragma on refuses too. Shared-cache connections with the default locking reads
-keep their table read locks until the transaction ends and remain admitted. Ordinary UNIQUE NULLs select the
-insert branch; builtin BINARY, NOCASE and RTRIM arbiters and complete ordinary
-unique indexes are supported. Partial/expression arbiters and ambiguous matching
-index collations remain pending. Consumed literal defaults are projected through
-actual native affinity; consumed generated identities and nonliteral defaults
-remain unavailable.
-
-Candidate normalization runs once, then native reprojection tests the realized
-values. TRANSACTION and EVIDENCE normalizers must leave those realized values
-unchanged; otherwise the upsert remains pending instead of storing a value its
-rule never tested. Genuine portable compilation may add permitted normalized fields to its
-update mask; an explicit native mask cannot widen. Choice membership uses only
-actual persisted fields and the complete final canonical root row. Compilation
-defers these callbacks until native branch projection. A no-op consumes no
-unused choice provider, and required stored failures prevent external callbacks.
-Every dispatch path (write, preview, batch and graph) refuses a genuine
-protected portable origin with `compiled_upsert_mismatch` on a host whose
-domain, trusted context or stored UPSERT rules differ from the compiler's,
-including a host with no stored rules, so deferred membership is never skipped.
-
-A SQLite batch may combine protected UPSERTs with ordinary inserts, updates,
-deletes and upserts, and with protected inserts, only when each protected
-candidate is proved independent of every other command on its table. Every
-candidate was projected before any of the plan's DML, so the proof covers both
-orders, and two protected candidates are checked in both directions:
-
-- Another protected candidate's final row must not carry this candidate's
-  arbiter key, and the two must not select the same stored row.
-- An INSERT's row, with consumed literal defaults, must not carry the key.
-- An ordinary UPSERT is projected through its own arbiter and stored branch. It
-  must not select the candidate's stored row, its insertion row and its final
-  row must not carry the candidate's key, and the candidate's final row must
-  not carry the other UPSERT's key (the different-unique-key hazard).
-- An UPDATE or DELETE predicate must select neither the stored row the
-  candidate chose nor the row it will leave behind; an UPDATE must not write
-  every arbiter field to the candidate's key.
-
-Keys and predicates are compared by SQLite, through each column's affinity and
-collation; NULL keys never collide. An unknown generated rowid on the protected
-arbiter refuses any other same-table command, and an omitted rowid or volatile
-default that a comparison needs is unknown. Owned-set cleanup on the same
-table, unsupported predicates and operations, and plans beyond 4,096 pair
-checks remain pending (`required_data_rule_pending`, reasons
-`plan_independence_unavailable`, `ambiguous_candidate_identity` or
-`generated_identity_unavailable`) before business DML. Unique constraints other
-than the arbiters compared here keep their native errors, which roll back the
-whole batch. Protected UPSERTs in write graphs still refuse as pending.
 External evidence requires its exact
 authoritative stage. Unknown defaults or generated fields consumed by a rule,
 database-computed assignments and unmaterialized normalizer changes remain
