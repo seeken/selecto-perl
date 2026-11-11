@@ -26,7 +26,6 @@ sub _state {
 }
 sub _from_editable {
     my ($class, $engine, $row, $edge) = @_;
-    _fail('editable builder binding is native-only') unless caller eq 'Selecto::Write::Editable';
     my $self = $class->new($engine);
     $STATE{$self}{row} = $row;
     $STATE{$self}{edge} = $edge if defined $edge;

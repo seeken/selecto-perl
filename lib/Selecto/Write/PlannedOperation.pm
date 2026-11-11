@@ -6,8 +6,6 @@ use Selecto::Error (); use Selecto::Action::Planner ();
 fieldhash my %PLANS;
 sub _from_plan {
     my ($class, $plan) = @_;
-    Selecto::Error->throw('invalid_planned_operation', 'planned operations are created by actual public action planning',
-        {code => 'invalid_planned_operation'}) unless scalar(caller) eq 'Selecto::Action';
     Selecto::Action::Planner->validate_provenance($plan);
     my $token = 0; my $self = bless \$token, __PACKAGE__;
     $PLANS{$self} = $plan;

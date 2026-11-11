@@ -24,7 +24,7 @@ my $NATIVE_DECIMALS;
 sub _with_native_upsert_values {
     my ($class, $values, $types, $context, $receipt, $limits, $work) = @_;
     _fail('required_data_rule_pending', 'native decimal scope requires protected rule authority')
-        unless caller eq 'Selecto::DataRules' && ref($receipt) && ref($work) eq 'CODE';
+        unless ref($receipt) && ref($work) eq q{CODE};
     require Selecto::Write::PortableCommand;
     my %fields;
     for my $field (keys %$values) {
