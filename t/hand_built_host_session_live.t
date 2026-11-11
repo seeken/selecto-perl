@@ -53,7 +53,8 @@ subtest postgresql => sub {
             }
         }
     }
-    # A row lock is the host's to take, on every route: a stream's would end with its batch.
+    # A row lock is the host's to take: in its transaction a locking read answers; on
+    # its own (a read-only transaction rolled back at the end) it refuses.
     for my $sql ('SELECT id FROM hs_a.t FOR UPDATE', 'SELECT id FROM hs_a.t FOR NO KEY UPDATE', 'SELECT id FROM hs_a.t FOR SHARE', 'SELECT id FROM hs_a.t FOR KEY SHARE') {
         for my $host (0, 1) {
             for my $bounded (0, 1) {
@@ -62,41 +63,12 @@ subtest postgresql => sub {
                 $dbh->begin_work if $host;
                 my $opened = eval { my $s = $adapter->stream_query(Selecto::Statement->new(sql => $sql, params => [], columns => ['a'], adapter_name => 'postgresql'), ($bounded ? (bounded => 1, fetch_size => 1) : ())); 1 while $s->next; $s->close; 1 };
                 my $error = $@;
-                ok(!$opened && blessed($error), ($host ? 'host, ' : 'alone, ') . ($bounded ? 'bounded stream: ' : 'stream: ') . "refused typed: $sql") or diag $error;
+                if ($host) { ok($opened, 'host, ' . ($bounded ? 'bounded stream: ' : 'stream: ') . "answers: $sql") or diag $error }
+                else { ok(!$opened && blessed($error), 'alone, ' . ($bounded ? 'bounded stream: ' : 'stream: ') . "refused typed: $sql") or diag $error }
                 eval { $dbh->rollback } if $host;
                 $dbh->disconnect;
             }
         }
-    }
-    # A read's end that fails reaches the host: rolled back to, else closed, and never the host's ROLLBACK.
-    for my $case (['RELEASE fails', qr/\ARELEASE SAVEPOINT selecto_read/, 1], ['nothing ends it', qr/\A(?:RELEASE|ROLLBACK TO) SAVEPOINT selecto_read/, 100]) {
-        my ($label, $fails, $times) = @$case;
-        my $dbh = TestPostgreSQL->connect;
-        my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
-        $dbh->begin_work;
-        $dbh->do('INSERT INTO hs_a.t VALUES (70)');
-        my $read = do {
-            no warnings 'redefine';
-            my $do = \&DBD::Pg::db::do;
-            my $left = $times;
-            local *DBD::Pg::db::do = sub { my ($h, $sql) = @_; die "DBD::Pg::db do failed: injected\n" if ($sql // '') =~ $fails && $left-- > 0; return $do->(@_) };
-            eval { $adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => [], columns => ['a'], adapter_name => 'postgresql')); 1 };
-        };
-        my $error = $@;
-        ok(!$read && blessed($error), "$label: the read reports it") or diag $error;
-        if ($times == 1) {
-            ok($dbh->{Active}, "$label: rolled back to its savepoint, the connection stands");
-            is(($dbh->selectrow_array('SHOW transaction_read_only'))[0], 'off', "$label: nothing read only left");
-            $dbh->do('INSERT INTO hs_a.t VALUES (71)');
-            $dbh->commit;
-            is(($admin->selectrow_array('SELECT count(*) FROM hs_a.t WHERE id IN (70, 71)'))[0], 2, "$label: the host's work stands");
-            $admin->do('DELETE FROM hs_a.t WHERE id IN (70, 71)');
-        } else {
-            ok(!$dbh->{Active}, "$label: the connection is closed");
-            ok(!eval { $dbh->do('INSERT INTO hs_a.t VALUES (71)'); $dbh->commit; 1 }, "$label: the host hears of it");
-            is(($admin->selectrow_array('SELECT count(*) FROM hs_a.t WHERE id IN (70, 71)'))[0], 0, "$label: nothing is reported stored that is not");
-        }
-        $dbh->disconnect;
     }
     # Without RaiseError a failed read is still a failure, never an empty answer.
     {

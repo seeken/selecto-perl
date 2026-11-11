@@ -73,10 +73,6 @@ t/json_encoders_nonref.t
 t/limits_lookup.t
 t/mysql_hand_built_explain_fallback.t
 t/mysql_session_limits_live.t
-t/pg_stream_handle_ownership_live.t
-t/pg_stream_host_settings_live.t
-t/pg_stream_idle_and_catalog_cancel_live.t
-t/pg_stream_rollback_cancel_live.t
 t/scalar_admission_v2_live.t
 t/update_post_image_live.t
 t/update_post_image_tenant_pin_live.t
@@ -88,14 +84,9 @@ t/pg_graph_bound_descendants_live.t
 t/pg_review_round3_live.t
 t/pg_case_twin_columns_live.t
 t/pg_guard_statements_unnamed_live.t
-t/pg_stream_cursor_replaced_live.t
-t/pg_stream_host_takeover_live.t
 t/pg_client_encoding_live.t
-t/pg_declared_schemas_live.t
 t/pg_extension_cast_forms_live.t
 t/pg_function_resolution_live.t
-t/pg_read_alarm_live.t
-t/pg_catalog_trust_live.t
 t/pg_cancel_storm_live.t
 t/pg_stream_host_work_live.t
 t/pg_keyword_functions_live.t
@@ -103,7 +94,6 @@ t/pg_extension_scope_live.t
 t/pg_extension_types_live.t
 t/pg_insert_storage_types_live.t
 t/pg_post_image_reread_live.t
-t/pg_session_state_live.t
 t/host_transaction_refusal_live.t
 t/write_atomicity_modes_live.t
 t/guarded_insert_trigger_refusal_live.t

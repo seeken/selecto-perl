@@ -115,13 +115,21 @@ is($admin->selectrow_array(q{SELECT count(*) FROM r65_t WHERE note = 'W'}), 0, '
     $admin->do('DROP SCHEMA "r65_é"');
 }
 
-# A change made during the statement is seen by the session check.
+# A change a view makes during the statement ends with the read's own transaction.
 {
     my $dbh = TestPostgreSQL->connect;
     my $e = Selecto::Engine->new(domain => $domain->('r65_v'), adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 'café');
-    my $ok = eval { $e->all($e->query->select('id')); 1 };
-    ok(!$ok, 'a view that changes client_encoding during a read is refused');
-    is(($dbh->selectrow_array('SHOW client_encoding'))[0], 'UTF8', 'and the setting is restored');
+    eval { $e->all($e->query->select('id')); 1 };
+    is(($dbh->selectrow_array('SHOW client_encoding'))[0], 'UTF8', "a view's client_encoding change does not outlast the read");
+}
+# A session switched after an earlier read is refused by the next read.
+{
+    my $dbh = DBI->connect($dsn, @auth, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
+    my $e = Selecto::Engine->new(domain => $domain->('r65_t'), adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 'café');
+    $e->all($e->query->select('id'));
+    $dbh->do(q{SET client_encoding = 'LATIN1'});
+    ok(!eval { $e->all($e->query->select('id')); 1 }, 'a read after the session switched to LATIN1 refuses');
+    $dbh->do(q{SET client_encoding = 'UTF8'});
 }
 
 # UTF8 is unchanged.

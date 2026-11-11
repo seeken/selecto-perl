@@ -12,9 +12,10 @@ use Selecto::PostgreSQL ();
 use lib 't/lib';
 use TestPostgreSQL ();
 
-# R55: a read is READ ONLY or ends in ROLLBACK, on every path, so nothing it
-# reaches outlives it. What that newly refuses is a view that writes: one using
-# nextval, or an audit function.
+# R55: a read in a transaction of Selecto's is READ ONLY and ends in ROLLBACK,
+# on every path, so nothing it reaches outlives it: a view that writes (one using
+# nextval, or an audit function) refuses. In the host's transaction it runs as
+# written.
 my $domain = sub {
     my ($table, %options) = @_;
     Selecto::Domain->parse({schema_version => 1, name => "D$table", source => {source_table => $table, primary_key => 'id', ($options{untenanted} ? () : (tenant_field => 'org')),
@@ -51,17 +52,19 @@ subtest postgresql => sub {
         ok(!eval { $e->all($query); 1 } && $read_only->($@), "$table: a read through a view that writes refuses");
         ok(!eval { my $s = $e->stream($query); while ($s->next) { } 1 } && $read_only->($@), "$table: so does a stream");
         ok(!eval { my $s = $e->stream($query, bounded => 1, fetch_size => 2); while ($s->next) { } 1 } && $read_only->($@), "$table: so does a bounded stream");
-        $dbh->begin_work;
-        $dbh->do(q{INSERT INTO r55_log VALUES ('host')});
-        ok(!eval { $e->all($query); 1 } && $read_only->($@), "$table: in a host transaction it refuses too");
-        my $s = $e->stream($query, bounded => 1, fetch_size => 2);
-        ok(!eval { $s->next; 1 } && $read_only->($@), "$table: a bounded stream in one refuses");
-        is(($dbh->selectrow_array(q{SELECT count(*) FROM public.r55_log WHERE note = 'host'}))[0], 1, "$table: the host's transaction lives on, with its write");
-        is(($dbh->selectrow_array(q{SELECT count(*) FROM public.r55_log WHERE note = 'n'}))[0], 0, "$table: the read wrote nothing");
-        $dbh->rollback;
     }
     is($count->(), 0, 'nothing a read did is left');
     is($next->(), $seq, 'and the sequence did not move');
+    # In the host's transaction a read runs as written: what a view does there
+    # is the host's transaction's, to commit or roll back.
+    for my $table (qw(r55_seq_v r55_audit_v)) {
+        my $e = $engine->($table);
+        $dbh->begin_work;
+        $dbh->do(q{INSERT INTO r55_log VALUES ('host')});
+        ok(eval { $e->all($e->query->select('id', 'note')->order_by('id')); 1 }, "$table: in a host transaction it runs as written") or diag $@;
+        is(($dbh->selectrow_array(q{SELECT count(*) FROM public.r55_log WHERE note = 'host'}))[0], 1, "$table: the host's transaction lives on, with its write");
+        $dbh->rollback;
+    }
     # Between a bounded stream's fetches the host writes as it pleases.
     {
         my $e = $engine->('r55_t');

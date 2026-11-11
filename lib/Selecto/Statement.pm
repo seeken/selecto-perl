@@ -27,7 +27,7 @@ sub relations ($self) {
 sub derive ($self, %args) {
     my $derived = (ref $self)->new(sql => $args{sql} // $self->{sql}, params => $args{params} // $self->{params},
         columns => $args{columns} // $self->{columns}, adapter_name => $args{adapter_name} // $self->{adapter_name});
-    for my $key (qw(_selecto_relations _selecto_declared_schemas _selecto_row_lock _selecto_recursion_depth)) {
+    for my $key (qw(_selecto_relations _selecto_row_lock _selecto_recursion_depth)) {
         $derived->{$key} = ref($self->{$key}) eq 'ARRAY' ? [@{$self->{$key}}] : $self->{$key} if exists $self->{$key};
     }
     return $derived;

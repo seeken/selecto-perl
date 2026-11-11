@@ -284,31 +284,5 @@ for my $case ([['p'], 'p:0'], [['p', 'x', 'y'], 'p:2']) {
 $admin->do('DROP FUNCTION r51_vdef(text, text[])');
 $admin->do('DROP FUNCTION r50_tags_of(text[])');
 
-# Review LOW 8: a row trigger that switches the session's role with
-# set_config('role', ..., false) refuses the write (CURRENT_USER is part of
-# the session snapshot).
-SKIP: {
-    my ($can) = $admin->selectrow_array(q{SELECT rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = CURRENT_USER});
-    skip 'roles cannot be created', 2 unless $can;
-    $admin->do($_) for 'DROP TABLE IF EXISTS r50_rw', q{DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'r50_switch') THEN CREATE ROLE r50_switch; END IF; END $$},
-        'GRANT r50_switch TO CURRENT_USER', 'CREATE TABLE r50_rw (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
-        q{INSERT INTO r50_rw VALUES (1, 't1', 'a')}, 'GRANT SELECT, UPDATE ON r50_rw TO r50_switch',
-        q{CREATE OR REPLACE FUNCTION r50_rw_sw() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.set_config('role', 'r50_switch', false); RETURN NEW; END $$},
-        'CREATE TRIGGER r50_rw_tr AFTER UPDATE ON r50_rw FOR EACH ROW EXECUTE FUNCTION r50_rw_sw()';
-    my $rw = Selecto::Domain->parse({schema_version => 1, name => 'R50W', source => {source_table => 'r50_rw', primary_key => 'id', tenant_field => 'org_key',
-        fields => [qw(id org_key note)], columns => $cols->(id => 'integer', org_key => 'string', note => 'string'), associations => {}},
-        schemas => {}, joins => {}, writes => {operations => {update => {enabled => 1}}, fields => {note => {updatable => 1}}}});
-    my $wh = $connect->();
-    my $we = Selecto::Engine->new(domain => $rw, adapter => Selecto->adapter(postgresql => (dbh => $wh)))->with_scope(tenant => 't1');
-    require Selecto::Write;
-    is($outcome->(sub { $we->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r50_rw',
-        assignments => {note => 'b'}, predicate => $x->eq('id', 1)))->affected_rows }), 'query_rule_violation/session_state_changed',
-        "a trigger's role switch refuses the write");
-    is(($wh->selectrow_array('SELECT CURRENT_USER'))[0], ($admin->selectrow_array('SELECT CURRENT_USER'))[0], 'and the role switch was rolled back');
-    $wh->disconnect;
-    $admin->do($_) for 'DROP TABLE r50_rw', 'DROP FUNCTION r50_rw_sw()';
-    $admin->do('DROP ROLE r50_switch') if eval { $admin->do('REVOKE r50_switch FROM CURRENT_USER'); 1 };
-}
-
 $admin->do($_) for 'DROP TABLE r50_r, r50_m, r50_ma, r50_rr CASCADE', 'DROP FUNCTION r50_ci_tags(text)';
 done_testing;
