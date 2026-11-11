@@ -67,6 +67,15 @@ Revision history for Selecto
       A stream proves its own transaction (its cursor) before rolling back, so a host
       that took the handle over keeps its transaction.
 
+    - Domain schema 2 (certification specification 3.0): one top-level tenant
+      declaration, columns as the field list with an optional field_order,
+      capability entries implied by their action, and a computed RFC 8785 +
+      SHA-256 fingerprint. Domain->parse accepts it; a schema 1 domain still
+      parses, and schema_diagnostics reports domain_schema_deprecated with its
+      schema 2 document. A schema 1 domain that declared tenancy only in
+      writes.scope.tenant did not scope reads by the engine tenant; its schema 2
+      form does. Selecto::Domain::SchemaV2 holds the rules and the migration;
+      the Perl targets certify domain_schema_v2 (DS201-DS203).
     - An engine tenant is a public write boundary on a tenant_field domain, with or
       without writes.scope.tenant: the API write handler no longer refuses such a
       write with missing_tenant_scope, and the write binder confines it to the
