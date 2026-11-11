@@ -36,7 +36,6 @@ my $MARIADB_STATEMENT = q{SET STATEMENT optimizer_switch='subquery_cache=off', }
 my $MYSQL_LIFT = "/*+ SET_VAR(max_error_count=$WARNING_CAP) */";
 my $MARIADB_RECURSION = 10_000;
 my $MARIADB_RECURSION_MAX = 4_294_967_295;
-my $CONTROL_ATTEMPTS = 5;
 
 # After the main SELECT: the first outside any parentheses past a WITH list, or the
 # very first otherwise (a parenthesized union carries the hint in its first block).
@@ -1603,14 +1602,10 @@ sub normalize_error {
         ? eval { $dbh->err } : undef;
     # (The handle's error can be gone by now: the text is what is left.)
     $errno //= 1317 if $text =~ /\bQuery execution was interrupted\b/;
-    # Not the database's: an exception that passed through, a host's alarm say. An
-    # unsafe signal handler's dies inside the driver with a reply unread, whichever
-    # statement it was, and this is where every failure comes. Inside Selecto's own
-    # operations it stands as it came, so a host's timeout stays the host's.
-    if (!defined($errno) && !blessed($error) && eval { $dbh->isa('DBI::db') } && $text !~ /\bDBD::|\bDBI\b|database/) {
-        $self->_close_session('the connection lost its place') if eval { $dbh->{Active} } && !$self->_in_step;
-        return $error if $self->{_selecto_operation};
-    }
+    # Not the database's: an exception that passed through. Inside Selecto's own
+    # operations it stands as it came, so a host's own exception stays the host's.
+    return $error if !defined($errno) && !blessed($error) && $self->{_selecto_operation}
+        && eval { $dbh->isa('DBI::db') } && $text !~ /\bDBD::|\bDBI\b|database/;
     return $self->SUPER::normalize_error($error) unless defined($errno) && "$errno" =~ /\A\d+\z/;
     if ($errno == 1062) {
         return Selecto::Error->new(code => 'database_unique_violation',
@@ -2875,89 +2870,34 @@ sub _read_transaction {
     # (Nothing makes a read that locks rows read only: its check comes first.)
     my $locks = $self->_hand_built_locks_rows($statement);
     $self->_refuse_hand_built_write($statement) if $locks;
-    my ($owned, $interrupted) = $self->_claim_read($locks);
-    die $interrupted if !$owned && defined $interrupted;
-    return $hosts->() unless $owned;
-    my ($value, $ok, $error, $finished);
-    # A host's alarm can die anywhere in here, between one statement and the next:
-    # whatever it interrupts, the finish still runs and its error still stands.
-    my $whole = eval {
-        my $begun = eval {
-            die $interrupted if defined $interrupted;
-            local $dbh->{PrintError} = 0;
-            defined($dbh->do('SET autocommit = 0')) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
-            1;
-        };
-        if ($begun) {
-            $ok = eval { $value = $work->(); 1 };
-            $error = $@ unless $ok;
-        } else {
-            # SET TRANSACTION lasts until a transaction ends, which a plain statement
-            # that touches no table does not do; and which step failed is not known.
-            $error = $self->_transaction_control_error($@);
-        }
-        $finished = !$ok && $self->_foreign_failure($error) ? $self->_close_session('the read was interrupted') : $self->_finish_read;
+    return $hosts->() unless $self->_claim_read($locks);
+    my ($value, $error);
+    my $begun = eval {
+        local $dbh->{PrintError} = 0;
+        defined($dbh->do('SET autocommit = 0')) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
         1;
     };
-    unless ($whole) {
-        ($ok, $error) = (0, $error // $@);
-        $finished = $self->_close_session('the read was interrupted');
-    }
+    # (SET TRANSACTION lasts until a transaction ends, which a plain statement that
+    # touches no table does not do: the finish runs either way.)
+    my $ok = $begun && eval { $value = $work->(); 1 };
+    $error = $begun ? $@ : $self->_transaction_control_error($@) unless $ok;
+    my $finished = $self->_finish_read;
     die($finished eq '1' ? $error : $self->_undo_failed($error)) unless $ok;
     die $finished unless $finished eq '1';
     return $value;
 }
 
 # Claims the read's transaction, if the session has none open: SET TRANSACTION is
-# refused (1568) while one is, and changes nothing either way. Anything else that
-# stops it says nothing about whose transaction this is, so it is asked again. Returns
-# whether the read is Selecto's to end, and what interrupted it. With no answer it
-# returns false with the interruption: nothing is open, and nothing more is sent.
+# refused (1568) while one is, and changes nothing either way. Returns whether the
+# read is Selecto's to end; any other failure is the read's.
 sub _claim_read {
     my ($self, $locks) = @_;
     my $dbh = $self->{dbh};
-    my $interrupted;
     my $claim = 'SET TRANSACTION READ ' . ($locks ? 'WRITE' : 'ONLY');
-    for my $attempt (1 .. $CONTROL_ATTEMPTS) {
-        return (1, $interrupted) if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do($claim); 1 };
-        my $failure = $@;
-        return (0, $interrupted) if (eval { $dbh->err } // '') eq '1568' || "$failure" =~ /\bTransaction characteristics can't be changed\b/;
-        $interrupted //= $self->normalize_error($failure);
-        last unless eval { $dbh->{Active} };
-        select(undef, undef, undef, 0.01);
-    }
-    return (0, $interrupted);
-}
-
-# A failure the database did not report: a host's alarm or an exception that may
-# have left the driver's call part way through. A reply still on the wire would
-# answer the host's next INSERT, which reports success for a row never stored, and
-# a half-read one can hang the next statement, so nothing more is sent on it: the
-# connection is closed, which also ends the read. Inside the host's transaction the
-# read has opened nothing of its own, and the connection stays the host's.
-sub _foreign_failure {
-    my ($self, $error) = @_;
-    return eval { $self->{dbh}->err } ? 0 : 1 unless blessed($error) && $error->isa('Selecto::Error');
-    return 0 unless $error->code eq 'query_error' && !grep { defined $error->details->{$_} } qw(sqlstate category);
-    # (The server's own answer leaves its number on the handle: it is in step.)
-    return eval { $self->{dbh}->err } ? 0 : 1;
-}
-
-# Whether the next reply on the connection is the answer to the next statement. A
-# reply left unread would otherwise answer the host's next INSERT, which then
-# reports success for a row that was never stored. (A KILL QUERY landing here says
-# nothing either way, so it is asked again.)
-sub _in_step {
-    my ($self) = @_;
-    my $dbh = $self->{dbh};
-    return 1 unless eval { $dbh->isa('DBI::db') };
-    my $mark = sprintf('selecto_step_%d_%d', $$, int(rand(1e9)));
-    for my $attempt (1 .. $CONTROL_ATTEMPTS) {
-        my ($answer) = eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->selectrow_array("SELECT '$mark' LIMIT 1") };
-        return 1 if defined($answer) && $answer eq $mark;
-        return 0 unless (eval { $dbh->err } // 0) eq '1317';
-    }
-    return 0;
+    return 1 if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->do($claim); 1 };
+    my $failure = $@;
+    return 0 if (eval { $dbh->err } // '') eq '1568' || "$failure" =~ /\bTransaction characteristics can't be changed\b/;
+    die $self->normalize_error($failure);
 }
 
 # INTO writes a file or a user variable, := a variable, and a conditional comment
@@ -3013,30 +2953,19 @@ sub _hand_built_may_write {
     return scalar grep { /\A(?:UPDATE|DELETE|INSERT|REPLACE)\b/i } @types;
 }
 
-# A read may end up READ ONLY or with autocommit off only by accident, and a host
-# whose next write is refused, or never commits, is worse off than one with no
-# connection. So what puts the session back is retried (a KILL QUERY can land on
-# it), and a session that cannot be put back is closed. A killed ROLLBACK can leave
-# the one-shot READ ONLY armed where no variable shows it, so a retry is the only
-# proof. Returns 1, or the error.
+# A read that cannot put the session back (READ ONLY armed, autocommit off) would
+# leave the host a connection whose next write is refused or never commits: it is
+# closed instead. Returns 1, or the error.
 sub _finish_read {
     my ($self) = @_;
-    local $self->{_selecto_control_retried} = 0;
-    return $self->_close_session('the read could not be ended')
-        unless $self->_retry_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_retry_control('SET autocommit = 1');
-    return $self->_close_session('the connection lost its place') if $self->{_selecto_control_retried} && !$self->_in_step;
-    return 1;
+    return 1 if $self->_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_control('SET autocommit = 1');
+    return $self->_close_session('the read could not be ended');
 }
 
-sub _retry_control {
+sub _control {
     my ($self, $sql) = @_;
     my $dbh = $self->{dbh};
-    for my $attempt (1 .. $CONTROL_ATTEMPTS) {
-        return 1 if eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; defined($dbh->do($sql)) };
-        $self->{_selecto_control_retried} = 1;
-        select(undef, undef, undef, 0.01);
-    }
-    return 0;
+    return eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; defined($dbh->do($sql)) } ? 1 : 0;
 }
 
 sub _forbid_reconnect {
@@ -3064,16 +2993,15 @@ sub _savepoint_gone {
 # begin_work sends SET autocommit = 0, which can fail like anything else, and leaves
 # nothing for a rollback to end. Whether it took is not known from here, and a host
 # whose autocommit went quietly off loses its next write at close: so it is put back,
-# with retries, or the connection is closed. The failure stands either way.
+# or the connection is closed. The failure stands either way.
 sub _begin_transaction {
     my ($self) = @_;
     my $dbh = $self->{dbh};
     return if eval { $self->SUPER::_begin_transaction; 1 };
     my $cause = $@;
     my $failure = $self->normalize_error(eval { $dbh->err } ? ($dbh->errstr // $cause) : $cause);
-    $self->_close_session('the write was interrupted') if $self->_foreign_failure($failure);
     $self->_close_session('the write could not begin') unless !eval { $dbh->{Active} }
-        || ($self->_retry_control('SET autocommit = 1') && $self->_leave_transaction);
+        || ($self->_control('SET autocommit = 1') && $self->_leave_transaction);
     die $self->_undo_failed($failure) unless eval { $dbh->{Active} };
     die $failure;
 }
@@ -3090,9 +3018,8 @@ sub _commit_transaction {
         defined($dbh->do('COMMIT AND NO CHAIN NO RELEASE'))
             or die Selecto::SQL::_dbi_error($dbh, 'database transaction could not commit');
     }
-    local $self->{_selecto_control_retried} = 0;
     die $self->_close_session('the write committed, but its session could not be restored', committed => JSON::PP::true)
-        unless $self->_leave_transaction && (!$self->{_selecto_control_retried} || $self->_in_step);
+        unless $self->_leave_transaction;
     return;
 }
 
@@ -3104,26 +3031,17 @@ sub _rollback_transaction {
     return if eval { $dbh->{AutoCommit} } && !eval { $dbh->{BegunWork} };
     return if blessed($cause) && $cause->isa('Selecto::Error') && $cause->code eq 'transaction_state_unsafe' && !eval { $dbh->{Active} };
     # Autocommit is restored only after a ROLLBACK that worked: restored after one
-    # that did not, it would commit what was refused (a KILL QUERY on MariaDB).
-    die $self->_close_session('the write was interrupted') if defined($cause) && $self->_foreign_failure($cause);
-    local $self->{_selecto_control_retried} = 0;
-    return if $self->_retry_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_leave_transaction
-        && (!$self->{_selecto_control_retried} || $self->_in_step);
+    # that did not, it would commit what was refused.
+    return if $self->_control('ROLLBACK AND NO CHAIN NO RELEASE') && $self->_leave_transaction;
     die $self->_close_session('the write could not be rolled back');
 }
 
 sub _leave_transaction {
     my ($self) = @_;
     my $dbh = $self->{dbh};
-    for my $attempt (1 .. $CONTROL_ATTEMPTS) {
-        if (eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->{AutoCommit} = 1; 1 }) {
-            $dbh->{BegunWork} = 0;
-            return 1;
-        }
-        $self->{_selecto_control_retried} = 1;
-        select(undef, undef, undef, 0.01);
-    }
-    return 0;
+    return 0 unless eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; $dbh->{AutoCommit} = 1; 1 };
+    $dbh->{BegunWork} = 0;
+    return 1;
 }
 
 sub _decode {
