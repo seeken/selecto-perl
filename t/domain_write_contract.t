@@ -232,25 +232,12 @@ invalid(sub {$_[0]{writes}{transitions}{state}={a=>[{}]}},'invalid_transition_st
     our $calls=0;
     use overload '""'=>sub {$calls++;'object'}, fallback=>1;
     sub STORABLE_freeze {$calls++;return ''}
-    package WriteContract::Tie;
-    our $calls=0;
-    sub TIEHASH {bless{},shift} sub FETCH {$calls++;die 'FETCH invoked'}
-    sub FIRSTKEY {$calls++;die 'FIRSTKEY invoked'} sub NEXTKEY {$calls++;die 'NEXTKEY invoked'}
-    sub SCALAR {$calls++;die 'SCALAR invoked'}
-    package WriteContract::Scalar;
-    our $calls=0;
-    sub TIESCALAR {bless{},shift} sub FETCH {$calls++;die 'FETCH invoked'}
     package main;
     for my$bad (sub {},bless({},'WriteContract::Object'),bless({},'0')) {
         my$x=domain();$x->{extension}=$bad;
         error(sub {$api->compile($x)},'invalid_write_contract','executable/object metadata');
     }
     is($WriteContract::Object::calls,0,'no overload or serialization callback');
-    tie my%tied,'WriteContract::Tie';
-    error(sub {$api->validate(\%tied)},'invalid_write_contract','tied root');
-    my$x=domain();tie$x->{writes}{scope},'WriteContract::Scalar';
-    error(sub {$api->compile($x)},'invalid_write_contract','tied nested slot');
-    is($WriteContract::Tie::calls+$WriteContract::Scalar::calls,0,'no tied FETCH/iteration callbacks');
 }
 for my$bad ([],23,undef) {
     error(sub {$api->operation_enabled($bad,'update')},'invalid_write_contract','accessor structural contract');

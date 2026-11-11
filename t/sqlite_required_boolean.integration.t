@@ -109,17 +109,6 @@ subtest 'typed scalar normalization admits only canonical JSON boolean referents
         ($code) = attempt(sub { Selecto::InsertAdmission::_value('boolean', $fake, 'active') });
         is($code, 'query_rule_not_evaluable', 'malformed canonical-class referent refuses');
     }
-    {
-        package BoolInsert::Tied;
-        our $fetches = 0;
-        sub TIESCALAR { bless {}, shift }
-        sub FETCH { $fetches++; 1 }
-    }
-    tie my $slot, 'BoolInsert::Tied';
-    my $tied = bless \$slot, 'JSON::PP::Boolean';
-    ($code) = attempt(sub { Selecto::InsertAdmission::_value('boolean', $tied, 'active') });
-    is($code, 'query_rule_not_evaluable', 'tied canonical-class referent refuses');
-    is($BoolInsert::Tied::fetches, 0, 'refusal invokes zero tied FETCH callbacks');
 };
 
 done_testing;

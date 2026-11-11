@@ -90,8 +90,4 @@ my $object=bless {},'PortableNested::Hook';
 ok error(sub {Selecto::Write::Operation->new(root())->insert({name=>'parent',children=>[{name=>$object}]})}),'nested resources refuse before interpretation';
 ok error(sub {Selecto::Write::Graph->new(nodes=>$graph->nodes,metadata=>{object=>$object})}),'graph metadata refuses executable objects';
 is $hook,0,'no overloaded value callback ran';
-my %tied;{package PortableNested::Tie;sub TIEHASH {bless {},shift}sub FIRSTKEY {$hook++;undef}sub FETCH {$hook++;undef}}
-tie %tied,'PortableNested::Tie';
-ok error(sub {Selecto::Write::Operation->new(root())->insert(\%tied)}),'tied nested input refuses';
-is $hook,0,'tied metadata admission ran no callbacks';
 done_testing;

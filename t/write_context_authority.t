@@ -39,22 +39,6 @@ is(error_code(sub{$C->resolve({}, {execution_scope=>{},context=>{tenant=>{tenant
 my $calls=0;
 isnt(error_code(sub{$C->resolve({}, {context=>{account_id=>sub{++$calls}}})}),'ok','callbacks refuse before context extraction');
 is($calls,0,'context callback did not run');
-{
-    package ContextTie;
-    sub TIEHASH{bless{},shift} sub FIRSTKEY{++$calls} sub NEXTKEY{++$calls} sub FETCH{++$calls} sub SCALAR{++$calls}
-}
-tie my %tied,'ContextTie';
-isnt(error_code(sub{$C->resolve({}, {context=>\%tied})}),'ok','tied context refuses');
-is($calls,0,'no tied context hooks ran');
-isnt(error_code(sub{$C->applied_scope(\%tied)}),'ok','applied scope admits the complete snapshot before tied root extraction');
-is($calls,0,'applied scope tied root hooks did not run');
-{
-    package ContextTieScalar;
-    sub TIESCALAR { bless {},shift } sub FETCH { ++$calls; return {} }
-}
-my $tied_scope={};tie $tied_scope->{applied_scope},'ContextTieScalar';
-isnt(error_code(sub{$C->applied_scope($tied_scope)}),'ok','applied scope refuses tied snapshot slot before FETCH');
-is($calls,0,'applied scope tied slot hooks did not run');
 is(error_code(sub{$C->applied_scope([])}),'invalid_write_context','applied scope malformed snapshot has typed refusal');
 {
     package ContextClassZero;

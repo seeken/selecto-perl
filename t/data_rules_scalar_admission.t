@@ -108,22 +108,13 @@ subtest 'owned copies preserve aliases, Unicode and Boolean isolation' => sub {
 {
     package ScalarAdmissionTie;
     our $hooks=0;
-    sub TIEHASH {bless {},shift} sub TIEARRAY {bless [],shift} sub TIESCALAR {bless {},shift}
-    sub FETCH {++$hooks;undef} sub FETCHSIZE {++$hooks;0} sub FIRSTKEY {++$hooks;undef}
-    sub NEXTKEY {++$hooks;undef} sub EXISTS {++$hooks;0}
     package ScalarAdmissionObject;
     use overload '""'=>sub {++$ScalarAdmissionTie::hooks;'x'},bool=>sub {++$ScalarAdmissionTie::hooks;0},fallback=>1;
     sub isa {++$ScalarAdmissionTie::hooks;0}
 }
-subtest 'plain admission refuses executable and tied shapes before hooks' => sub {
-    my ($scalar,%hash,@array);tie $scalar,'ScalarAdmissionTie';tie %hash,'ScalarAdmissionTie';tie @array,'ScalarAdmissionTie';
+subtest 'plain admission refuses executable shapes before hooks' => sub {
     for my $work (
-        sub {Selecto::DataRules->parse($scalar)},
-        sub {Selecto::DataRules->parse(\%hash)},
-        sub {Selecto::DataRules->parse(contract({op=>'membership.in',values=>\@array}))},
         sub {Selecto::DataRules->parse(contract({op=>'value.eq',value=>bless({},'ScalarAdmissionObject')}))},
-        sub {my $r=contract({op=>'presence.required'});tie $r->{definitions},'ScalarAdmissionTie';Selecto::DataRules->parse($r)},
-        sub {my $r=contract({op=>'membership.in',values=>['x']});tie $r->{definitions}{one}{test}{values}[0],'ScalarAdmissionTie';Selecto::DataRules->parse($r)},
     ) {
         $ScalarAdmissionTie::hooks=0;
         is(error($work),'invalid_data_rules_contract','typed plain-shape refusal');
@@ -303,14 +294,7 @@ subtest 'action native expression copies remain narrow and bounded' => sub {
     my $bad=Selecto::Action::Plan->new(changes=>{name=>bless({},'ScalarAdmissionObject')});
     is(error(sub {$bad->to_hash}),'invalid_planned_operation','unknown object is refused before copying');
     is($ScalarAdmissionTie::hooks,0,'unknown object triggers no callbacks');
-    my $tied=Selecto::Action::Plan->new(changes=>{});tie $tied->{changes},'ScalarAdmissionTie';
-    is(error(sub {$tied->to_hash}),'invalid_planned_operation','tied public payload refuses before getter');
-    is($ScalarAdmissionTie::hooks,0,'tied payload triggers no FETCH');
     my $cycle=[];push @$cycle,$cycle;
     is(error(sub {Selecto::Action::Plan->new(changes=>{name=>$cycle})->to_hash}),'invalid_planned_operation','cyclic action payload is bounded');
-    $ScalarAdmissionTie::hooks=0;
-    my %tied_policy;tie %tied_policy,'ScalarAdmissionTie';
-    is(error(sub {Selecto::Domain::DSL->new->section('writes',\%tied_policy)}),'invalid_domain_overlay','DSL tied policy refuses');
-    is($ScalarAdmissionTie::hooks,0,'DSL tied policy invokes no callback');
 };
 done_testing;

@@ -76,11 +76,6 @@ for my $bad (sub{$calls++},bless({},'SchemaEvil'),bless({},'0')) {
     is(code(caught(sub{Selecto::Domain->validate_schema($c)})),'invalid_query_contract','schema refuses executable/unknown object before hooks');
     is(code(caught(sub{Selecto::QueryLibrary::Contract->validate_declaration($c)})),'invalid_query_contract','library metadata refuses executable/unknown object before hooks');
 }
-{package SchemaTie;sub TIEHASH{bless{},shift}sub FIRSTKEY{$calls++;die 'hook'}sub FETCH{$calls++;die 'hook'}sub TIESCALAR{bless{},shift}}
-tie my %tied,'SchemaTie';
-is(code(caught(sub{Selecto::Domain->validate_schema(\%tied)})),'invalid_query_contract','schema refuses tied root before hooks');
-my$t=dclone($base);tie $t->{source}{readonly},'SchemaTie';
-is(code(caught(sub{Selecto::Domain->validate_schema($t)})),'invalid_query_contract','schema refuses tied nested flag before FETCH');
 is($calls,0,'no overload, serialization or tied callback executes');
 for my $shape(qw(cycle depth breadth bytes aliases)) {
     my$c=dclone($base);

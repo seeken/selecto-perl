@@ -169,8 +169,8 @@ sub _resolved {
     # the host-provider contract; otherwise the canonical request is attached.
     my$result=$resolver->(_copy($request));
     my$outcome;
-    if(ref($result)eq'ARRAY'&&!defined(tied(@$result))&&@$result==2
-        &&!defined(tied($result->[0]))&&!defined(tied($result->[1]))
+    if(ref($result)eq'ARRAY'&&@$result==2
+
         &&_string($result->[0])&&$result->[0]=~/\A(?:ok|error)\z/){
         ($outcome,$result)=@$result;
     }

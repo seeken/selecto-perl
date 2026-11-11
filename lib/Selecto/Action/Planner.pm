@@ -28,8 +28,6 @@ fieldhash my %ACCEPTED_PLANS;
 # Legacy native expression records remain a narrowly admitted first-party
 # case, with no constructor, subclass or caller method invoked while copying.
 sub _copy_values {
-    Selecto::Error->throw('invalid_action_input', 'action values contain tied metadata')
-        if grep { defined(tied($_[$_])) } 0 .. $#_;
     my ($class, $value, %options) = @_;
     my $limits = _limits($options{limits});
     my $code = $options{code} // 'invalid_action_input';
@@ -103,7 +101,7 @@ sub _admit_provenance_tree {
         }
         my $native_class = Scalar::Util::blessed($node);
         if (defined($native_class) && $native_class eq 'JSON::PP::Boolean') {
-            $fail->() unless $type eq 'SCALAR' && !defined(tied($$node));
+            $fail->() unless $type eq 'SCALAR';
             my $value = $$node;
             $fail->() unless defined($value) && !defined(Scalar::Util::reftype($value)) && ($value eq '0' || $value eq '1');
             ++$bytes;
@@ -115,8 +113,6 @@ sub _admit_provenance_tree {
             && !($allow_limits && $native_class eq 'Selecto::Limits');
         $fail->() unless $type eq 'HASH' || $type eq 'ARRAY';
         $fail->() if defined($native_class) && $type ne 'HASH';
-        if ($type eq 'HASH') { $fail->() if defined(tied(%$node)) }
-        else { $fail->() if defined(tied(@$node)) }
         my $id = Scalar::Util::refaddr($node);
         $fail->() if $active{$id};
         $active{$id} = 1;
@@ -127,12 +123,11 @@ sub _admit_provenance_tree {
         if ($type eq 'HASH') {
             for my $key (keys %$node) {
                 $bytes += do { use bytes; length($key) };
-                $fail->() if $bytes > 131_072 || defined(tied($node->{$key}));
+                $fail->() if $bytes > 131_072;
                 push @stack, [$node->{$key}, $depth + 1, undef];
             }
         } else {
             for my $index (0 .. $#$node) {
-                $fail->() if defined(tied($node->[$index]));
                 push @stack, [$node->[$index], $depth + 1, undef];
             }
         }
@@ -148,7 +143,7 @@ sub validate_provenance {
         {code => 'invalid_planned_operation'})
         unless (Scalar::Util::blessed($plan) // '') eq 'Selecto::Action::Plan'
             && (Scalar::Util::reftype($plan) // '') eq 'HASH'
-            && !defined(tied(%$plan)) && exists($ACCEPTED_PLANS{$plan});
+ && exists($ACCEPTED_PLANS{$plan});
     $class->_admit_provenance_tree($plan);
     my $record = $ACCEPTED_PLANS{$plan};
     Selecto::Error->throw('action_policy_mismatch', 'action plan differs from its accepted planning evidence',

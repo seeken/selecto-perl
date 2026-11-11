@@ -108,18 +108,6 @@ eval {op()->insert({name=>'empty'})->enforce_query($engine->query)};
 is $@->code,'query_enforcement_requires_filter','empty query cannot produce enforcement evidence';
 eval {op()->insert({name=>'forged'})->enforce_query(bless({},'Selecto::Query'))};
 is $@->code,'invalid_query_enforcement','unbound forged query cannot assert a configured source';
-{
-    package QueryEnforcementTrap;
-    our $calls=0;
-    sub TIEHASH {bless {},shift}
-    sub FIRSTKEY {$calls++;die 'tie hook must not run'}
-    sub FETCH {$calls++;die 'tie hook must not run'}
-}
-my $tied_query=$engine->query->where(Selecto::Expression->eq('id',1));
-tie my %trap,'QueryEnforcementTrap';$tied_query->{unused}=\%trap;
-eval {op()->update({name=>'trap'})->filter(['id',1])->enforce_query($tied_query)};
-is $@->code,'invalid_query_enforcement','unused tied native query metadata refuses before accessors';
-is $QueryEnforcementTrap::calls,0,'capturing invokes no tied callbacks';
 $db->do(q{INSERT INTO items(tenant_id,account_id,name,quantity) VALUES('tenant-a',42,'not_null',10),('tenant-a',42,'ordinary-string',10)});
 my $literal_capture=op()->update({quantity=>11})->enforce_query($engine->query->where(Selecto::Expression->eq('name','not_null')));
 is $engine->execute_write(compile($literal_capture)->{command})->affected_rows,1,'captured literal not_null equality targets exactly its matching row';

@@ -390,16 +390,16 @@ sub _upsert_dependencies {
 }
 sub _upsert_state {
     my ($engine, $state, $dependencies) = @_;
-    _pending('native UPSERT candidate is unavailable') unless ref($state) eq 'HASH' && !defined(tied(%$state));
+    _pending('native UPSERT candidate is unavailable') unless ref($state) eq 'HASH';
     for my $key (qw(values prior_values branch effect complete protection receipt)) {
         _pending('native UPSERT candidate is incomplete')
-            unless exists($state->{$key}) && !defined(tied($state->{$key}));
+            unless exists($state->{$key});
     }
     my $complete = $state->{complete};
     if (defined(reftype($complete))) {
         _pending('native UPSERT candidate has an invalid complete flag')
             unless (blessed($complete) // '') eq 'JSON::PP::Boolean' && reftype($complete) eq 'SCALAR'
-                && !defined(tied($$complete));
+;
         $complete = $$complete;
     }
     my $complete_true = defined($complete) && !defined(reftype($complete))

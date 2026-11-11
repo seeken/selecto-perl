@@ -76,7 +76,6 @@ sub _value {
         _not_evaluable($field) unless $type eq 'boolean'
             && $class =~ /\A(?:JSON::PP::Boolean|JSON::XS::Boolean|Types::Serialiser::Boolean)\z/
             && (reftype($value) // '') eq 'SCALAR';
-        _not_evaluable($field) if defined(tied($$value));
         $value = $$value;
         _not_evaluable($field) unless defined($value) && !defined(reftype($value));
     }

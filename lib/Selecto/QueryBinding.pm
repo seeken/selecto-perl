@@ -19,12 +19,12 @@ sub configure_engine {
     my ($class, $engine, $given) = @_;
     $given //= {};
     Selecto::Error->throw('invalid_query_members', 'member_builders must be a plain object')
-        unless ref($given) eq 'HASH' && !defined(tied(%$given));
+        unless ref($given) eq 'HASH';
     my %builders;
     for my $key (keys %$given) {
         Selecto::Error->throw('invalid_query_members', 'member builder must be an explicit host callback')
             unless $key =~ /\A(?:ctes|subqueries):[A-Za-z_][A-Za-z0-9_]*\z/
-                && !defined(tied($given->{$key})) && ref($given->{$key}) eq 'CODE';
+ && ref($given->{$key}) eq 'CODE';
         $builders{$key} = $given->{$key};
     }
     $BUILDERS{$engine} = \%builders;

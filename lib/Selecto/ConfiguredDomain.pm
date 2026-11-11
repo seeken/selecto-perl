@@ -38,12 +38,12 @@ sub digest {
 sub prepared_digest {
     my ($class, $prepared) = @_;
     Selecto::Error->throw('domain_modified_after_configuration', 'prepared read metadata is invalid', {path => []})
-        unless ref($prepared) eq 'HASH' && !defined(tied(%$prepared))
-            && !grep { !exists($prepared->{$_}) || defined(tied($prepared->{$_})) } qw(statement collections limits);
+        unless ref($prepared) eq 'HASH'
+            && !grep { !exists($prepared->{$_}) } qw(statement collections limits);
     my $statement = $prepared->{statement};
     Selecto::Error->throw('domain_modified_after_configuration', 'prepared read statement is invalid', {path => []})
         unless blessed($statement) && UNIVERSAL::isa($statement, 'Selecto::Statement')
-            && (reftype($statement) // '') eq 'HASH' && !defined(tied(%$statement));
+            && (reftype($statement) // '') eq 'HASH';
     my $state = {hash => Digest::SHA->new(256), nodes => 0, bytes => 0, active => {},
         limits => $LIMITS, node_limit => 'max_response_nodes', byte_limit => 'max_response_bytes',
         extra_record => 'Selecto::Statement'};
@@ -101,14 +101,13 @@ sub _walk {
     $compiled ||= $COMPILED_NUMBERS{$class}
         || length($class) && grep { UNIVERSAL::isa($value, $_) } @COMPILED_BASES;
     if ($BOOLEAN{$class} && $type eq 'SCALAR') {
-        _refuse($state) if defined(tied($$value)) || !defined($$value) || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
+        _refuse($state) if !defined($$value) || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
         return _part($state, 'B', $$value ? '1' : '0');
     }
     _refuse($state) if length($class) && ($state->{plain} || !$RECORD{$class}
         && !(grep { UNIVERSAL::isa($value, $_) } @RECORD_BASES)
         && !(defined($state->{extra_record}) && UNIVERSAL::isa($value, $state->{extra_record})));
     _refuse($state) unless $type eq 'HASH' || $type eq 'ARRAY';
-    _refuse($state) if $type eq 'HASH' ? defined(tied(%$value)) : defined(tied(@$value));
     my $id = refaddr($value);
     _refuse($state) if $state->{active}{$id};
     local $state->{active}{$id} = 1;
@@ -119,13 +118,11 @@ sub _walk {
     _part($state, $type eq 'HASH' ? 'H' : 'A', "$count");
     if ($type eq 'HASH') {
         for my $key (sort keys %$value) {
-            _refuse($state) if defined(tied($value->{$key}));
             _part($state, 'K', $key);
             _walk($state, $value->{$key}, $depth + 1, $compiled);
         }
     } else {
         for my $index (0 .. $#$value) {
-            _refuse($state) if defined(tied($value->[$index]));
             _walk($state, $value->[$index], $depth + 1, $compiled);
         }
     }

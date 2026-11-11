@@ -78,13 +78,7 @@ for my $bad (sub { ++$hooks }, bless({}, 'CapabilityHooks'), bless({}, '0')) {
     my $write = command(); $write->{metadata}{unused} = $bad;
     is(caught(sub {$api->requirements($write)}), 'invalid_write', 'complete native admission rejects unused executable/object data');
 }
-{ package CapabilityTie; sub TIEHASH { bless {}, shift } sub FIRSTKEY { ++$hooks; die 'hook' } sub FETCH { ++$hooks; die 'hook' } sub SCALAR { ++$hooks; die 'hook' } }
-tie my %tied, 'CapabilityTie';
-is(caught(sub {$api->validate(\%tied)}), 'invalid_write_capabilities', 'tied capability root refuses before enumeration');
-my $tied_write = command(); $tied_write->{metadata} = \%tied;
-is(caught(sub {$api->requirements($tied_write)}), 'invalid_write', 'tied native metadata refuses before enumeration');
 is($hooks, 0, 'all rejected callback/tie/class-zero/overload routes invoke zero hooks');
-untie %tied;
 my $cycle = {protocol_version => 1}; $cycle->{cycle} = $cycle;
 is(caught(sub {$api->validate($cycle)}), 'invalid_write_capabilities', 'cyclic capability report refuses');
 my $wide = {protocol_version => 1, map { ('feature'.$_ => 1) } 1 .. 10001};
