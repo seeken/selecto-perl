@@ -33,54 +33,8 @@ database you use:
 | Microsoft SQL Server | `mssql`      | `DBD::ODBC` 1.61+ (Unicode build) and an ODBC driver |
 | DuckDB               | `duckdb`     | `DBD::DuckDB` 0.16+                         |
 
-SQLite checks the connected library for CTEs (3.8.3), modern window frames
-(3.28.0), RETURNING/write graphs and bounded materialization (3.35.0), JSON1
-and FTS5. It supports typed computed values, JSON extraction and structural
-containment, JSON/array rowsets, UTC calendar formats and buckets, streaming,
-schema introspection and query plans. JSON containment distinguishes missing
-keys, null, booleans, numbers and strings recursively. JSON-backed typed
-arrays use the existing array builders.
-
-SQLite related collections support stable ordering, per-parent limits/cursors,
-scoped through relations and bounded API subtables. A child overflow refuses
-the whole response; successful subtable metadata includes `limit` and
-`complete=true`. Query execution and streaming preserve the supplied DBI
-handle's transaction and `query_only` state. Trusted adapter tools may use
-the explicitly named `execute_query_unsafe` method.
-
-FTS5 queries require a supplied root virtual table with fields declared
-`fts5` or `text_search_document`; plain/phrase modes quote input, while
-boolean/websearch modes use FTS5 query grammar. SQLite named timezones,
-LATERAL, rollups and row locks remain unsupported. Decimal calculations use
-SQLite floating-point semantics, with no fixed-scale guarantee.
-
-MySQL and MariaDB compare tenant and site identity exactly, as PostgreSQL
-does: a text tenant column is compared byte for byte as well as under its
-collation, so tenant `t1` never reads or writes the rows of `T1` or `t1 `
-whatever the column's (case-insensitive or PAD SPACE) collation is.
-Exact comparison applies to columns declared as text (`string`, `text`,
-`char`, `varchar`) and to undeclared columns that hold text; a tenant uuid
-declared `string` and stored as `CHAR(36)` therefore compares case-sensitively
-(store it in one case). Columns declared temporal, decimal, json, uuid or
-binary compare as PostgreSQL compares them.
-Every MySQL/MariaDB read, stream and write first checks its session, per
-call: the time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`, or `SYSTEM`
-on a server whose system zone is UTC; never `GMT`), the client, connection
-and result character sets utf8mb4, and `sql_mode` strict
-(`STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`). A connection that breaks it
-is refused with `invalid_connection` (`details.reason` names the setting;
-`Selecto::API::error_status` answers it with HTTP 500). On MySQL a session must
-not set `sql_select_limit` (reason `session_sql_select_limit`); on MariaDB each
-generated statement pins it, `group_concat_max_len`, `max_error_count` and
-`max_recursive_iterations` for itself.
-
-A generated statement never answers short. What the server says it cut (past the
-recursion limit, or a value past `max_allowed_packet`) refuses with `query_error`,
-category `result_incomplete`. To see every warning, a generated read raises
-`max_error_count` for itself. On MySQL that needs `SESSION_VARIABLES_ADMIN`:
-without it the server keeps 1024 warnings, and a read that raises more cannot be
-verified and refuses, category `result_unverified`, reason `warnings_unread`.
-Grant it to the application role if reads may raise more than 1024 warnings.
+See [Database notes](#database-notes) for what each database supports and what
+its sessions must be set to.
 
 To install from a git checkout:
 
@@ -411,6 +365,57 @@ if (!$ok) {
 
 Database errors are wrapped as `query_error` without the driver's message, so
 connection strings and SQL fragments do not leak into responses.
+
+## Database notes
+
+SQLite checks the connected library for CTEs (3.8.3), modern window frames
+(3.28.0), RETURNING/write graphs and bounded materialization (3.35.0), JSON1
+and FTS5. It supports typed computed values, JSON extraction and structural
+containment, JSON/array rowsets, UTC calendar formats and buckets, streaming,
+schema introspection and query plans. JSON containment distinguishes missing
+keys, null, booleans, numbers and strings recursively. JSON-backed typed
+arrays use the existing array builders.
+
+SQLite related collections support stable ordering, per-parent limits/cursors,
+scoped through relations and bounded API subtables. A child overflow refuses
+the whole response; successful subtable metadata includes `limit` and
+`complete=true`. Query execution and streaming preserve the supplied DBI
+handle's transaction and `query_only` state. Trusted adapter tools may use
+the explicitly named `execute_query_unsafe` method.
+
+FTS5 queries require a supplied root virtual table with fields declared
+`fts5` or `text_search_document`; plain/phrase modes quote input, while
+boolean/websearch modes use FTS5 query grammar. SQLite named timezones,
+LATERAL, rollups and row locks remain unsupported. Decimal calculations use
+SQLite floating-point semantics, with no fixed-scale guarantee.
+
+MySQL and MariaDB compare tenant and site identity exactly, as PostgreSQL
+does: a text tenant column is compared byte for byte as well as under its
+collation, so tenant `t1` never reads or writes the rows of `T1` or `t1 `
+whatever the column's (case-insensitive or PAD SPACE) collation is.
+Exact comparison applies to columns declared as text (`string`, `text`,
+`char`, `varchar`) and to undeclared columns that hold text; a tenant uuid
+declared `string` and stored as `CHAR(36)` therefore compares case-sensitively
+(store it in one case). Columns declared temporal, decimal, json, uuid or
+binary compare as PostgreSQL compares them.
+Every MySQL/MariaDB read, stream and write first checks its session, per
+call: the time zone must be UTC (`UTC`, `+00:00`, `Etc/UTC`, or `SYSTEM`
+on a server whose system zone is UTC; never `GMT`), the client, connection
+and result character sets utf8mb4, and `sql_mode` strict
+(`STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES`). A connection that breaks it
+is refused with `invalid_connection` (`details.reason` names the setting;
+`Selecto::API::error_status` answers it with HTTP 500). On MySQL a session must
+not set `sql_select_limit` (reason `session_sql_select_limit`); on MariaDB each
+generated statement pins it, `group_concat_max_len`, `max_error_count` and
+`max_recursive_iterations` for itself.
+
+A generated statement never answers short. What the server says it cut (past the
+recursion limit, or a value past `max_allowed_packet`) refuses with `query_error`,
+category `result_incomplete`. To see every warning, a generated read raises
+`max_error_count` for itself. On MySQL that needs `SESSION_VARIABLES_ADMIN`:
+without it the server keeps 1024 warnings, and a read that raises more cannot be
+verified and refuses, category `result_unverified`, reason `warnings_unread`.
+Grant it to the application role if reads may raise more than 1024 warnings.
 
 ## Integration
 
