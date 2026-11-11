@@ -12,18 +12,14 @@ use Selecto::Write ();
 use lib 't/lib';
 use TestPostgreSQL ();
 
-# PostgreSQL findings of the round-3 review (R2, R8, R9, R10, R13, item 58):
-# - every relation a statement names, including a through-association
-#   bridge inside a parenthesised join and an INSERT target, is checked for
-#   temp shadows (the list is recorded while compiling);
-# - a deferred constraint trigger cannot change the session after the
-#   write's own check: in Selecto's own transaction it is fired before
-#   COMMIT and checked, in a host's transaction the write is refused;
+# PostgreSQL findings of the round-3 review (R9, R13, R17, R33, item 58):
 # - post-image re-reads name the written rows by (tableoid, ctid), so a key
 #   renumbering trigger with a decoy cannot pass and keys of any type work;
 # - guarded inserts keep ordinary row triggers (updated_at, audit) and are
 #   re-read under their full guard;
-# - catalog checks resolve their operators in pg_catalog only.
+# - catalog checks resolve their operators in pg_catalog only;
+# - deferred foreign keys keep their deferral, and a CTE named like a real
+#   relation never hides it.
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
 my $connect = sub {
@@ -57,93 +53,6 @@ my $writable = sub {
         schemas => {}, joins => {},
         writes => {operations => {insert => {enabled => 1}, update => {enabled => 1}},
             fields => {map { ($_ => {insertable => 1, ($_ eq 'note' ? (updatable => 1) : ())}) } keys %columns}}});
-};
-
-subtest 'R2/R38a: a temp relation shadowing a through-association bridge never answers for it' => sub {
-    $admin->do($_) for 'DROP TABLE IF EXISTS r3b_items, r3b_link, r3b_acc CASCADE',
-        'CREATE TABLE r3b_items (id INT PRIMARY KEY, org_key TEXT)', q{INSERT INTO r3b_items VALUES (1, 't1'), (2, 't2')},
-        'CREATE TABLE r3b_acc (id INT PRIMARY KEY, label TEXT)', q{INSERT INTO r3b_acc VALUES (10, 't1-acc'), (20, 't2-SECRET')},
-        'CREATE TABLE r3b_link (item_id INT, acc_id INT)', 'INSERT INTO r3b_link VALUES (1, 10), (2, 20)';
-    my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Bridge',
-        source => {source_table => 'r3b_items', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key)],
-            columns => {id => {type => 'integer'}, org_key => {type => 'string'}},
-            associations => {accs => {queryable => 'acc', owner_key => 'id', related_key => 'id', cardinality => 'many',
-                through => {table => 'r3b_link', owner_key => 'item_id', related_key => 'acc_id'}}}},
-        schemas => {acc => {source_table => 'r3b_acc', primary_key => 'id', fields => [qw(id label)],
-            columns => {id => {type => 'integer'}, label => {type => 'string'}}, associations => {}}},
-        joins => {accs => {type => 'left'}}});
-    my $dbh = $connect->();
-    my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)))
-        ->with_scope(tenant => 't1');
-    my $query = $engine->query->select('id', 'accs.label')->order_by('id');
-    my $statement = $engine->compile($query);
-    is_deeply($statement->can("relations") ? $statement->relations : undef, [sort 'public.r3b_acc', 'public.r3b_items', 'public.r3b_link'],
-        'the compiled statement records the bridge among its relations, schema-qualified');
-    my $flat = sub { join ',', map { $_->[1] // 'NULL' } @{$engine->all($query)->{rows}} };
-    my $stream = sub { my $s = $engine->stream($query); my @l; while (my $r = $s->next) { push @l, $r->[1] } join ',', @l };
-    is($outcome->($flat), 'applied t1-acc', 'control: the bridge read');
-    $dbh->do('CREATE TEMP VIEW r3b_link AS SELECT 1 AS item_id, acc_id FROM public.r3b_link');
-    # R38a: the bridge is named by its schema, so the TEMP namesake cannot
-    # answer for it (reads and streams return only t1's row).
-    is($outcome->($flat), 'applied t1-acc', 'a TEMP view shadowing the bridge never answers a read');
-    is($outcome->($stream), 'applied t1-acc', 'nor a stream');
-    # Even with the session's TEMP relations declared, resolution never
-    # prefers pg_temp over the reset path's relation.
-    my $declared = Selecto::Engine->new(domain => $domain,
-        adapter => Selecto->adapter(postgresql => (temporary_relations => 1, dbh => $dbh)))->with_scope(tenant => 't1');
-    is($outcome->(sub { join ',', map { $_->[1] // 'NULL' } @{$declared->all($query)->{rows}} }), 'applied t1-acc',
-        'a declared-temp adapter still reads the real bridge');
-    $dbh->do('DROP VIEW pg_temp.r3b_link');
-    is($outcome->($flat), 'applied t1-acc', 'and reads again once the shadow is gone');
-};
-
-subtest 'R10/R38a: a temp table shadowing an INSERT target never takes the row' => sub {
-    $admin->do($_) for 'DROP TABLE IF EXISTS r3i CASCADE',
-        'CREATE TABLE r3i (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)', q{INSERT INTO r3i VALUES (1, 't1', 'a')};
-    my $dbh = $connect->();
-    my $engine = Selecto::Engine->new(domain => $writable->('r3i', 'id', id => 'integer', org_key => 'string', note => 'string'),
-        adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
-    my $insert = sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'r3i',
-        assignments => {id => $_[0], org_key => 't1', note => 'n'}))->affected_rows };
-    $dbh->do('CREATE TEMP TABLE r3i (id INT PRIMARY KEY, org_key TEXT, note TEXT)');
-    is($outcome->(sub { $insert->(10) }), 'applied 1', 'the insert goes to the real relation');
-    is($rows->($dbh, 'SELECT count(*) FROM pg_temp.r3i'), '0', 'nothing went into the temp table');
-    is($rows->($admin, 'SELECT count(*) FROM public.r3i WHERE id = 10'), '1', 'the row is in the real table');
-    $dbh->do('DROP TABLE pg_temp.r3i');
-    is($outcome->(sub { $insert->(11) }), 'applied 1', 'an unshadowed insert applies');
-};
-
-subtest 'R8: a deferred constraint trigger cannot change the session after the check' => sub {
-    $admin->do($_) for 'DROP SCHEMA IF EXISTS r3d_evil CASCADE', 'DROP TABLE IF EXISTS r3d_w, r3d_items CASCADE',
-        'DROP FUNCTION IF EXISTS r3d_f() CASCADE',
-        'CREATE TABLE r3d_items (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
-        q{INSERT INTO r3d_items VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
-        'CREATE SCHEMA r3d_evil', q{CREATE VIEW r3d_evil.r3d_items AS SELECT id, 't1'::text AS org_key, note FROM public.r3d_items},
-        'CREATE TABLE r3d_w (id INT PRIMARY KEY, note TEXT)', q{INSERT INTO r3d_w VALUES (1, 'n')},
-        q{CREATE FUNCTION r3d_f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
-            PERFORM set_config('search_path', 'r3d_evil,public', false); RETURN NULL; END $$},
-        'CREATE CONSTRAINT TRIGGER r3d_t AFTER UPDATE ON r3d_w DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION r3d_f()';
-    my $reads = Selecto::Domain->parse({schema_version => 1, name => 'R',
-        source => {source_table => 'r3d_items', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
-            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
-        schemas => {}, joins => {}});
-    for my $mode (qw(own host)) {
-        my $dbh = $connect->();
-        my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
-        my $writer = Selecto::Engine->new(domain => $writable->('r3d_w', 'id', id => 'integer', note => 'string'), adapter => $adapter);
-        my $reader = Selecto::Engine->new(domain => $reads, adapter => $adapter)->with_scope(tenant => 't1');
-        my $read = sub { join ',', map { $_->[1] } @{$reader->all($reader->query->select('id', 'note')->order_by('id'))->{rows}} };
-        $dbh->begin_work if $mode eq 'host';
-        is($outcome->(sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3d_w',
-            assignments => {note => 'u'}, predicate => $x->eq('id', 1)))->affected_rows }),
-            'query_rule_not_evaluable/deferred_triggers',
-            "$mode transaction: the unscoped write is refused");
-        $dbh->commit if $mode eq 'host';
-        is($rows->($dbh, 'SHOW search_path'), '"$user", public', "$mode transaction: the session keeps its search_path");
-        is($outcome->($read), 'applied mine', "$mode transaction: the next tenant read sees only its own rows");
-        is($rows->($admin, 'SELECT note FROM r3d_w'), 'n', "$mode transaction: and the write was rolled back");
-    }
-    $admin->do($_) for 'DROP TABLE r3d_w CASCADE', 'DROP FUNCTION r3d_f() CASCADE';
 };
 
 # citext in its own schema, off the search path, unless it is installed
@@ -242,48 +151,6 @@ subtest 'item 58: catalog checks resolve operators in pg_catalog only' => sub {
     $admin->do($_) for 'DROP TABLE r3o CASCADE', 'DROP FUNCTION r3o_stmt() CASCADE', 'DROP SCHEMA r3o_evil CASCADE';
 };
 
-subtest 'R14: a deferrable trigger created during the write cannot fire after the check' => sub {
-    $admin->do($_) for 'DROP SCHEMA IF EXISTS r3m_evil CASCADE', 'DROP TABLE IF EXISTS r3m_w, r3m_audit, r3m_items CASCADE',
-        'DROP FUNCTION IF EXISTS r3m_mk() CASCADE', 'DROP FUNCTION IF EXISTS r3m_evilf() CASCADE',
-        'CREATE TABLE r3m_items (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
-        q{INSERT INTO r3m_items VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
-        'CREATE SCHEMA r3m_evil', q{CREATE VIEW r3m_evil.r3m_items AS SELECT id, 't1'::text AS org_key, note FROM public.r3m_items},
-        'CREATE TABLE r3m_audit (id SERIAL PRIMARY KEY, item INT)',
-        'CREATE TABLE r3m_w (id INT PRIMARY KEY, note TEXT)', q{INSERT INTO r3m_w VALUES (1, 'n')},
-        q{CREATE FUNCTION r3m_evilf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
-            PERFORM set_config('search_path', 'r3m_evil,public', false); RETURN NULL; END $$},
-        q{CREATE FUNCTION r3m_mk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgname = 'r3m_def') THEN
-              EXECUTE 'CREATE CONSTRAINT TRIGGER r3m_def AFTER INSERT ON public.r3m_audit DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION r3m_evilf()';
-            END IF;
-            INSERT INTO public.r3m_audit (item) VALUES (NEW.id); RETURN NEW; END $$},
-        'CREATE TRIGGER r3m_a AFTER UPDATE ON r3m_w FOR EACH ROW EXECUTE FUNCTION r3m_mk()';
-    my $reads = Selecto::Domain->parse({schema_version => 1, name => 'R',
-        source => {source_table => 'r3m_items', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
-            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
-        schemas => {}, joins => {}});
-    for my $mode (qw(own host)) {
-        my $dbh = $connect->();
-        my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
-        my $writer = Selecto::Engine->new(domain => $writable->('r3m_w', 'id', id => 'integer', note => 'string'), adapter => $adapter);
-        my $reader = Selecto::Engine->new(domain => $reads, adapter => $adapter)->with_scope(tenant => 't1');
-        my $read = sub { join ',', map { $_->[1] } @{$reader->all($reader->query->select('id', 'note')->order_by('id'))->{rows}} };
-        $dbh->begin_work if $mode eq 'host';
-        my $result = $outcome->(sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3m_w',
-            assignments => {note => 'u'}, predicate => $x->eq('id', 1)))->affected_rows });
-        like($result, qr{\Aquery_rule_not_evaluable/deferred_triggers\z},
-            "$mode transaction: the write is refused ($result)");
-        $dbh->commit if $mode eq 'host';
-        is($rows->($dbh, 'SHOW search_path'), '"$user", public', "$mode transaction: the session keeps its search_path");
-        is($outcome->($read), 'applied mine', "$mode transaction: the next tenant read sees only its own rows");
-        is($rows->($admin, 'SELECT note FROM r3m_w'), 'n', "$mode transaction: and the write was rolled back");
-        is($rows->($admin, q{SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgname = 'r3m_def'}), '0',
-            "$mode transaction: the trigger the write created was rolled back with it");
-    }
-    $admin->do($_) for 'DROP TABLE r3m_w, r3m_audit, r3m_items CASCADE', 'DROP SCHEMA r3m_evil CASCADE',
-        'DROP FUNCTION r3m_mk() CASCADE', 'DROP FUNCTION r3m_evilf() CASCADE';
-};
-
 subtest 'R17: deferred foreign keys keep their deferral around Selecto writes' => sub {
     $admin->do($_) for 'DROP TABLE IF EXISTS r3f_child, r3f_parent, r3f_w CASCADE',
         'CREATE TABLE r3f_parent (id INT PRIMARY KEY)',
@@ -303,135 +170,6 @@ subtest 'R17: deferred foreign keys keep their deferral around Selecto writes' =
     is($rows->($admin, 'SELECT note FROM r3f_w'), 'own', 'both writes applied');
     $admin->do('DROP TABLE r3f_child, r3f_parent, r3f_w CASCADE');
 };
-subtest 'R29/R30: relations resolve by the reset search_path' => sub {
-    $admin->do($_) for 'DROP SCHEMA IF EXISTS r3q_evil CASCADE', 'DROP TABLE IF EXISTS r3q CASCADE',
-        'CREATE TABLE r3q (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
-        q{INSERT INTO r3q VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
-        'CREATE SCHEMA r3q_evil', q{CREATE VIEW r3q_evil.r3q AS SELECT id, 't1'::text AS org_key, note FROM public.r3q};
-    my $dbh = $connect->();
-    my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
-    my $tenanted = Selecto::Domain->parse({schema_version => 1, name => 'R3T',
-        source => {source_table => 'r3q', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
-            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
-        schemas => {}, joins => {},
-        writes => {operations => {update => {enabled => 1}}, fields => {note => {updatable => 1}}}});
-    my $writer = Selecto::Engine->new(domain => $tenanted, adapter => $adapter)->with_scope(tenant => 't1');
-    my $update = sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
-        assignments => {note => $_[0]}, predicate => $x->eq('id', $_[1] // 1)))->affected_rows };
-    my $reads = Selecto::Domain->parse({schema_version => 1, name => 'R',
-        source => {source_table => 'r3q', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
-            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
-        schemas => {}, joins => {}});
-    my $reader = Selecto::Engine->new(domain => $reads, adapter => $adapter)->with_scope(tenant => 't1');
-    my $query = $reader->query->select('id', 'note')->order_by('id');
-    my $ids = sub { join ',', map { $_->[0] } @{$reader->all($query)->{rows}} };
-    like($reader->compile($query)->sql, qr/ FROM public\.r3q AS /, 'a read names its relation by schema');
-    like($adapter->preview_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
-        assignments => {note => 'x'}, predicate => $x->eq('id', 1)))->{sql}, qr/\AUPDATE public\.r3q SET /,
-        'a write names its target by schema');
-    is($outcome->($ids), 'applied 1', 'control: the tenant read');
-    # A session-level switch made before Selecto's call: the relation still
-    # resolves through the reset search_path.
-    $dbh->do('SET search_path TO r3q_evil, pg_catalog, public');
-    # R38: the host's search_path now names another relation: refused rather
-    # than silently read either way.
-    is($outcome->($ids), 'query_rule_not_evaluable/relation_ambiguous', 'a persisted search_path switch to a namesake is refused');
-    is($outcome->(sub { $update->('t2-row', 2) }), 'query_rule_not_evaluable/relation_ambiguous', 'and so is the write');
-    is($rows->($admin, 'SELECT note FROM r3q WHERE id = 2'), 'SECRET', "the other tenant's row is unchanged");
-    is($rows->($dbh, 'SHOW search_path'), 'r3q_evil, pg_catalog, public', "and the host's search_path is untouched");
-    # R71: a host's hand-built statement (no recorded relations) runs in the host's
-    # session: its search_path decides, as it does for the driver.
-    require Selecto::Statement;
-    my $raw = Selecto::Statement->new(sql => 'SELECT "id" FROM "r3q" ORDER BY "id"', params => []);
-    is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($raw)->{rows}} }),
-        'applied ' . join(',', map { $_->[0] } @{$dbh->selectall_arrayref($raw->sql)}), 'a hand-built statement answers as the driver does');
-    $dbh->do('RESET search_path');
-    # R36: PostgreSQL parses the reset search_path: a quoted schema with a
-    # comma is one schema, not a decoy split at the comma.
-    $admin->do($_) for 'DROP SCHEMA IF EXISTS "r3q,a" CASCADE', 'DROP SCHEMA IF EXISTS r3q_a CASCADE',
-        'CREATE SCHEMA "r3q,a"', 'CREATE TABLE "r3q,a".r3q_only (id INT PRIMARY KEY)', 'INSERT INTO "r3q,a".r3q_only VALUES (5)';
-    my $path_dbh = $connect->();
-    $path_dbh->do(q{SET search_path TO "r3q,a", public});
-    my $only = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $path_dbh)),
-        domain => Selecto::Domain->parse({schema_version => 1, name => 'O', source => {source_table => 'r3q_only', primary_key => 'id',
-            fields => ['id'], columns => {id => {type => 'integer'}}, associations => {}}, schemas => {}, joins => {}}));
-    is($outcome->(sub { join ',', map { $_->[0] } @{$only->all($only->query->select('id'))->{rows}} }),
-        'query_rule_not_evaluable/relation_unresolved', 'a relation the reset search_path cannot see is refused, never guessed');
-    $admin->do('DROP SCHEMA "r3q,a" CASCADE');
-    for my $level ('REPEATABLE READ', 'SERIALIZABLE') {
-        $dbh->begin_work;
-        $dbh->do("SET TRANSACTION ISOLATION LEVEL $level");
-        my $plain = Selecto::Engine->new(domain => $writable->('r3q', 'id', id => 'integer', org_key => 'string', note => 'string'),
-            adapter => $adapter);
-        is($outcome->(sub { $plain->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3q',
-            assignments => {note => 'rr'}, predicate => $x->eq('id', 1)))->affected_rows }), 'applied 1',
-            "an unscoped write in a host $level transaction applies (no R19 isolation refusal)");
-        $dbh->rollback;
-    }
-    $admin->do($_) for 'DROP SCHEMA r3q_evil CASCADE', 'DROP TABLE r3q CASCADE';
-};
-
-subtest 'R32: internal deferrable rechecks count unless they run only pg_catalog code' => sub {
-    $admin->do($_) for 'DROP TABLE IF EXISTS r3u_w, r3u_parent, r3u_child, r3u_x CASCADE',
-        'DROP OPERATOR CLASS IF EXISTS r3u_ops USING btree CASCADE',
-        'CREATE TABLE r3u_w (id INT PRIMARY KEY, note TEXT)', q{INSERT INTO r3u_w VALUES (1, 'n')},
-        'CREATE TABLE r3u_parent (id INT PRIMARY KEY)',
-        'CREATE TABLE r3u_child (id INT PRIMARY KEY, p INT REFERENCES r3u_parent (id) DEFERRABLE INITIALLY DEFERRED,'
-            . ' k INT, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
-    my $dbh = $connect->();
-    my $writer = Selecto::Engine->new(domain => $writable->('r3u_w', 'id', id => 'integer', note => 'string'),
-        adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
-    my $update = sub { $writer->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3u_w',
-        assignments => {note => $_[0]}, predicate => $x->eq('id', 1)))->affected_rows };
-    is($outcome->(sub { $update->('a') }), 'applied 1', 'deferred foreign keys and pg_catalog unique rechecks do not block writes');
-    $admin->do($_) for q{CREATE OPERATOR CLASS r3u_ops FOR TYPE int4 USING btree AS OPERATOR 1 <, OPERATOR 2 <=,
-            OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >, FUNCTION 1 btint4cmp(int4, int4)},
-        'CREATE TABLE r3u_x (k INT, CONSTRAINT r3u_x_k EXCLUDE USING btree (k r3u_ops WITH =) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('b') }), 'query_rule_not_evaluable/deferred_triggers',
-        'a deferrable exclusion recheck under a user operator class refuses writes');
-    is($rows->($admin, 'SELECT note FROM r3u_w'), 'a', 'and the refused write left nothing');
-    # R32a: an expression index, or a user collation, in a pg_catalog opclass
-    # recheck can run user code too.
-    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP FUNCTION IF EXISTS r3u_f(int)',
-        q{CREATE FUNCTION r3u_f(int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN $1; END $$},
-        'CREATE TABLE r3u_x (k INT, CONSTRAINT r3u_x_k EXCLUDE USING btree ((r3u_f(k)) WITH =) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('c') }), 'query_rule_not_evaluable/deferred_triggers',
-        'a deferrable exclusion recheck over a user function expression refuses writes');
-    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP COLLATION IF EXISTS r3u_c',
-        q{CREATE COLLATION r3u_c (provider = icu, locale = 'und')},
-        'CREATE TABLE r3u_x (k TEXT, CONSTRAINT r3u_x_k EXCLUDE USING btree ((k COLLATE r3u_c) WITH =) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('d') }), 'query_rule_not_evaluable/deferred_triggers',
-        'and so does one under a user collation');
-    # R37: a deferred foreign key over a key type that is not a pg_catalog
-    # base type (an enum, a range, a composite) counts as user code.
-    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP TYPE IF EXISTS r3u_e CASCADE', q{CREATE TYPE r3u_e AS ENUM ('a', 'b')},
-        'CREATE TABLE r3u_x (k r3u_e PRIMARY KEY)',
-        'CREATE TABLE r3u_y (k r3u_e REFERENCES r3u_x (k) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('e') }), 'query_rule_not_evaluable/deferred_triggers',
-        'a deferred foreign key over a user enum key refuses writes');
-    # R37b: a pg_catalog range or multirange key (pg_catalog subtype,
-    # operator class and collation) is pg_catalog's own; a range type
-    # defined outside pg_catalog still counts (its subtype's operator class,
-    # canonical and subtype-difference functions can be user code).
-    $admin->do($_) for 'DROP TABLE r3u_y, r3u_x', 'CREATE TABLE r3u_x (k int4range, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('r') }), 'applied 1', 'a deferrable unique recheck over an int4range key does not block writes');
-    $admin->do($_) for 'DROP TABLE r3u_x', 'CREATE TABLE r3u_x (k int4multirange, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('m') }), 'applied 1', 'nor one over an int4multirange key');
-    $admin->do($_) for 'DROP TABLE r3u_x', 'CREATE TABLE r3u_x (k tstzrange, CONSTRAINT r3u_x_k EXCLUDE USING gist (k WITH &&) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('t') }), 'applied 1', 'nor a deferrable gist exclusion over a tstzrange key');
-    $admin->do($_) for 'DROP TABLE r3u_x', 'CREATE TABLE r3u_x (k int4range PRIMARY KEY)',
-        'CREATE TABLE r3u_y (k int4range REFERENCES r3u_x (k) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('k') }), 'applied 1', 'nor a deferred foreign key over an int4range key');
-    $admin->do($_) for 'DROP TABLE r3u_y, r3u_x', 'DROP TYPE IF EXISTS r3u_rng CASCADE', 'CREATE TYPE r3u_rng AS RANGE (subtype = int4)',
-        'CREATE TABLE r3u_x (k r3u_rng, UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)';
-    is($outcome->(sub { $update->('u') }), 'query_rule_not_evaluable/deferred_triggers',
-        'a deferrable unique recheck over a range type defined outside pg_catalog refuses writes');
-    $admin->do($_) for 'DROP TABLE r3u_x', 'DROP TYPE r3u_rng', 'DROP TYPE r3u_e', 'DROP COLLATION r3u_c', 'DROP FUNCTION r3u_f(int)',
-        'CREATE TABLE r3u_x (k INT)';
-    is($outcome->(sub { $update->('f') }), 'applied 1', 'and writes apply again once only pg_catalog-typed deferred keys remain');
-    $admin->do($_) for 'DROP TABLE r3u_w, r3u_parent, r3u_child, r3u_x CASCADE', 'DROP OPERATOR CLASS r3u_ops USING btree CASCADE';
-};
-
 subtest 'R33: a CTE named like a real relation never hides it' => sub {
     $admin->do($_) for 'DROP TABLE IF EXISTS r3c, r3c_other CASCADE',
         'CREATE TABLE r3c (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)', q{INSERT INTO r3c VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
@@ -457,90 +195,6 @@ subtest 'R33: a CTE named like a real relation never hides it' => sub {
     # either way the root never reads the CTE's rows.
     is($result, 'invalid_query', 'a CTE named like the root relation is refused, never read in its place');
     $admin->do('DROP TABLE r3c, r3c_other CASCADE');
-};
-
-subtest 'R35: result-affecting settings are pinned to their reset values for every statement' => sub {
-    my ($database) = $admin->selectrow_array('SELECT pg_catalog.current_database()');
-    $admin->do($_) for 'DROP TABLE IF EXISTS r3z CASCADE',
-        'CREATE TABLE r3z (id INT PRIMARY KEY, ts TIMESTAMPTZ NOT NULL, d DATE NOT NULL)',
-        q{INSERT INTO r3z VALUES (1, '2024-01-02 00:00:00+00', '2024-03-01'), (2, '2023-12-31 12:00:00+00', '2024-01-02'),
-            (3, '2023-12-31 20:00:00+00', '2024-01-02')},
-        qq{ALTER DATABASE "$database" SET TimeZone = 'Asia/Kolkata'};
-    # A database-level TimeZone that is not UTC: the configured zone holds.
-    my $dbh = $connect->();
-    my $domain = Selecto::Domain->parse({schema_version => 1, name => 'Z',
-        source => {source_table => 'r3z', primary_key => 'id', fields => [qw(id ts d)],
-            columns => {id => {type => 'integer'}, ts => {type => 'utc_datetime'}, d => {type => 'date'}}, associations => {}},
-        schemas => {}, joins => {}});
-    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
-    my $ids = sub {
-        my ($required) = @_;
-        my $engine = Selecto::Engine->new(domain => $domain->with_required_predicate($required), adapter => $adapter);
-        return join ',', map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}};
-    };
-    my $instant = $x->gte('ts', '2024-01-01 00:00:00');
-    is($outcome->(sub { $ids->($instant) }), 'applied 1,3', 'a timestamptz scope literal is read in the configured zone (Asia/Kolkata)');
-    # A setting switched for the session before Selecto's call (a masked
-    # set_config in an earlier trigger, say) cannot change what it means.
-    $dbh->do(q{SET TimeZone = 'Pacific/Kiritimati'});
-    is($outcome->(sub { $ids->($instant) }), 'applied 1,3', 'a session TimeZone switch does not change it');
-    $dbh->do(q{SET DateStyle = 'SQL, DMY'});
-    is($outcome->(sub { $ids->($x->gte('d', '02/01/2024')) }), 'applied 1', 'nor does a session DateStyle switch');
-    is($rows->($dbh, 'SHOW TimeZone'), 'Pacific/Kiritimati', "the host's TimeZone is restored");
-    is($rows->($dbh, 'SHOW DateStyle'), 'SQL, DMY', "and its DateStyle");
-    $dbh->disconnect;
-    $admin->do($_) for qq{ALTER DATABASE "$database" RESET TimeZone}, 'DROP TABLE r3z CASCADE';
-};
-
-subtest 'R41/R42: every statement rechecks its relations; hand-built SQL never reaches an undeclared TEMP relation' => sub {
-    $admin->do($_) for 'DROP TABLE IF EXISTS r3w CASCADE', 'DROP SCHEMA IF EXISTS r3w_role CASCADE',
-        q{DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'r3w_role') THEN DROP OWNED BY r3w_role; DROP ROLE r3w_role; END IF; END $$},
-        'CREATE TABLE r3w (id INT PRIMARY KEY, org_key TEXT NOT NULL)', q{INSERT INTO r3w VALUES (1, 't1'), (2, 't2')},
-        'CREATE ROLE r3w_role', 'CREATE SCHEMA r3w_role AUTHORIZATION r3w_role',
-        'CREATE TABLE r3w_role.r3w (id INT PRIMARY KEY, org_key TEXT NOT NULL)', q{INSERT INTO r3w_role.r3w VALUES (9, 't1')},
-        'GRANT USAGE ON SCHEMA public TO r3w_role', 'GRANT SELECT ON r3w TO r3w_role', 'GRANT SELECT ON r3w_role.r3w TO r3w_role';
-    my $dbh = $connect->();
-    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
-    my $reader = Selecto::Engine->new(adapter => $adapter, domain => Selecto::Domain->parse({schema_version => 1, name => 'W',
-        source => {source_table => 'r3w', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key)],
-            columns => {id => {type => 'integer'}, org_key => {type => 'string'}}, associations => {}}, schemas => {}, joins => {}}))
-        ->with_scope(tenant => 't1');
-    my $statement = $reader->compile($reader->query->select('id'));
-    my $run = sub { $outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($statement)->{rows}} }) };
-    is($run->(), 'applied 1', 'control: the compiled statement reads public.r3w');
-    # After SET ROLE, "$user" in the reset search_path names r3w_role first:
-    # the long-lived statement no longer matches the pinned resolution.
-    $dbh->do('SET ROLE r3w_role');
-    is($run->(), 'query_rule_not_evaluable/relation_ambiguous', 'after SET ROLE a stale compiled statement is refused');
-    $dbh->do('RESET ROLE');
-    is($run->(), 'applied 1', 'and runs again once the role is reset');
-    # R42: a hand-built statement naming an undeclared TEMP relation.
-    require Selecto::Statement;
-    $dbh->do('CREATE TEMP TABLE r3w_tmp (id INT)');
-    $dbh->do('INSERT INTO r3w_tmp VALUES (42)');
-    my $raw = Selecto::Statement->new(sql => 'SELECT "id" FROM r3w_tmp', params => []);
-    # R71: a hand-built read runs in the host's session, its temporary relations included.
-    is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($raw)->{rows}} }), 'applied 42', 'a hand-built statement reads the TEMP relation, as the driver does');
-    my $hidden = Selecto::Statement->new(sql => 'SELECT (SELECT max(id) FROM ONLY r3w_tmp) AS id', params => []);
-    is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($hidden)->{rows}} }), 'applied 42', 'however the SQL spells it');
-    my $declared = Selecto->adapter(postgresql => (temporary_relations => 1, dbh => $dbh));
-    is($outcome->(sub { join ',', map { $_->[0] } @{$declared->execute_query($raw)->{rows}} }), 'applied 42',
-        'a declared-temp adapter reads it');
-    is($rows->($dbh, 'SHOW timezone_abbreviations'), 'Default', 'timezone_abbreviations is restored after each statement');
-    is($outcome->(sub { scalar @{$adapter->execute_query(Selecto::Statement->new(sql => 'SELECT 1', params => []))->{rows}} }),
-        'applied 1', 'and another hand-built statement runs beside it');
-    $dbh->do('DROP TABLE pg_temp.r3w_tmp');
-    # R71: the host's search_path decides, as it does for the driver.
-    $admin->do($_) for 'DROP SCHEMA IF EXISTS r3w_alt CASCADE', 'CREATE SCHEMA r3w_alt', 'CREATE TABLE r3w_alt.r3w (id INT)';
-    $dbh->do('SET search_path TO r3w_alt, public');
-    for my $sql ('SELECT 1 FROM pg_catalog.pg_class c, r3w LIMIT 1', 'SELECT (SELECT max(id) FROM r3w) AS id') {
-        is($outcome->(sub { scalar @{$adapter->execute_query(Selecto::Statement->new(sql => $sql, params => []))->{rows}} }),
-            'applied ' . scalar(@{$dbh->selectall_arrayref($sql)}), "as the driver: $sql");
-    }
-    $dbh->do('RESET search_path');
-    $admin->do('DROP SCHEMA r3w_alt CASCADE');
-    $dbh->disconnect;
-    $admin->do($_) for 'DROP TABLE r3w CASCADE', 'DROP SCHEMA r3w_role CASCADE', 'DROP OWNED BY r3w_role', 'DROP ROLE r3w_role';
 };
 
 done_testing;

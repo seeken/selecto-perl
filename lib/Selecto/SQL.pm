@@ -78,19 +78,10 @@ sub compile {
     # while compiling (see _note_relation and Selecto::Statement relations).
     my $top = ref($self->{_selecto_relation_sink}) ne 'HASH';
     local $self->{_selecto_relation_sink} = $top ? {} : $self->{_selecto_relation_sink};
-    local $self->{_selecto_relation_schemas} = $top ? {} : $self->{_selecto_relation_schemas};
-    # Schemas the host declared for the read (a tenant prefix): its explicit
-    # choice, which the PostgreSQL session checks resolve under (R43).
-    local $self->{_selecto_declared_sink} = $top ? {} : $self->{_selecto_declared_sink};
     local $self->{_selecto_recursion_sink} = $top ? {} : $self->{_selecto_recursion_sink};
-    # What the read's references resolve beside (see PostgreSQL's _relation_sql).
-    local $self->{_selecto_root_relation} = $top && blessed($domain) && defined($domain->table)
-        ? {table => '' . $domain->table, (defined($domain->{_read_prefix}) ? (schema => '' . $domain->{_read_prefix}) : ())}
-        : $self->{_selecto_root_relation};
     my $statement = $self->_compile_query($domain, $query);
     if ($top && blessed($statement) && $statement->isa('Selecto::Statement')) {
         $statement->{_selecto_relations} = [sort keys %{$self->{_selecto_relation_sink}}];
-        $statement->{_selecto_declared_schemas} = [sort keys %{$self->{_selecto_declared_sink}}];
         # A read that locks rows must run where its locks last: see R55 in
         # Selecto::PostgreSQL.
         $statement->{_selecto_row_lock} = 1 if defined $query->row_lock;
@@ -659,7 +650,6 @@ sub _nullif_sql { my ($self, $value, $null) = @_; return "NULLIF($value, $null)"
 # (PostgreSQL names the schema it resolves to, R23b).
 sub _relation_sql {
     my ($self, $prefix, $table) = @_;
-    $self->{_selecto_declared_sink}{"$prefix"} = 1 if defined($prefix) && ref($self->{_selecto_declared_sink}) eq 'HASH';
     return (defined($prefix) ? $self->quote_identifier($prefix) . '.' : '') . $self->quote_identifier($table);
 }
 
@@ -1436,11 +1426,6 @@ sub preview_write {
 
 sub _admit_plan_storage { return; }
 
-# Dialect hooks: a snapshot of the session state a write's DML could change
-# (undef: nothing to compare), and its comparison after the DML.
-sub _write_session_open { return undef; }
-sub _write_session_check { return; }
-sub _write_session_close { return; }
 # Dialect hook: true when post-statement re-reads name the written rows by
 # their physical row id (PostgreSQL: RETURNING tableoid, ctid) instead of
 # their key value. _with_row_ids appends the row ids to a compiled write.
@@ -3142,16 +3127,9 @@ sub _compile_write {
     my ($self, $command) = @_;
     # The relations the write's SQL names: its target and every reference
     # guard's parent (the session checks refuse temp shadows of them).
-    local $self->{_selecto_relation_schemas} = {};
-    local $self->{_selecto_root_relation} = {table => '' . $command->relation};
     local $self->{_selecto_relation_sink} = {};
     my $compiled = $self->_compile_write_sql($command);
-    if (ref($compiled) eq 'HASH') {
-        $compiled->{relations} = [sort keys %{$self->{_selecto_relation_sink}}];
-        # The target as the statement names it (schema-qualified where the
-        # dialect resolves one), for the write's own lock and catalog reads.
-        $compiled->{target_sql} = $self->_relation_sql(undef, Selecto::Identifier::checked($command->relation));
-    }
+    $compiled->{relations} = [sort keys %{$self->{_selecto_relation_sink}}] if ref($compiled) eq 'HASH';
     return $compiled;
 }
 
@@ -3614,25 +3592,11 @@ sub _check_write_cardinality {
     return 1;
 }
 
-# The write's target as its compiled statement names it, for SQL the write
-# sends about its own relation (locks, catalog lookups); the bare quoted name
-# outside a compiled write.
-sub _write_relation_sql {
-    my ($self, $table) = @_;
-    my $known = $self->{_selecto_write_relations};
-    return ref($known) eq 'HASH' && defined($known->{$table}) ? $known->{$table} : $self->quote_identifier($table);
-}
-
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
-    # Session state around the DML (dialect hook; PostgreSQL, brief items 54,
-    # 56, 59): read before any of the write's own SQL, compared by the first
-    # statement after the DML. The write's relation as resolved before the
-    # DML (item 51) lives for this write only.
-    my $session = $self->_write_session_open($command, $compiled);
+    # The write's relation as resolved before the DML (item 51) lives for
+    # this write only.
     local $self->{_selecto_write_target} = {};
-    local $self->{_selecto_write_relations} = ref($compiled) eq 'HASH' && defined($compiled->{target_sql})
-        ? {'' . $command->relation => $compiled->{target_sql}} : {};
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
@@ -3710,8 +3674,6 @@ sub _execute_compiled_write_in_transaction {
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    # The first statement after the DML (item 54a).
-    $self->_write_session_check($session);
     $self->_check_write_cardinality($command, $affected, $bounds);
     $self->_bound_target_check($command, $bound_event, 'after') if $bound_event;
     if ($post_image) {
@@ -3723,9 +3685,6 @@ sub _execute_compiled_write_in_transaction {
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
-    # The session as the host had it (PostgreSQL restores its search_path,
-    # pinned for the write, R30); a refusal above rolls the pin back instead.
-    $self->_write_session_close($session);
     return Selecto::Write::Result->new(operation => $command->operation, affected_rows => $affected, values => \%values);
 }
 
@@ -3858,7 +3817,7 @@ sub _admit_post_image_target {
             # and child too) conflicts with CREATE TRIGGER, ALTER TABLE ...
             # ENABLE TRIGGER and CREATE RULE on them: the catalog read below
             # stays true for these relations until commit.
-            $dbh->do('LOCK TABLE ' . $self->_write_relation_sql($table) . ' IN ROW EXCLUSIVE MODE');
+            $dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
             $self->_require_read_committed($table);
             # Resolved under the lock, before the statement (item 51).
             @row = $self->_pg_post_image_catalog($self->_pg_resolve_write_target($table)->{oid});
@@ -4069,7 +4028,7 @@ sub _bound_target_check {
     my $ok = eval {
         my $oid;
         if ($phase eq 'before') {
-            $self->dbh->do('LOCK TABLE ' . $self->_write_relation_sql($table) . ' IN ROW EXCLUSIVE MODE');
+            $self->dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
             $self->_require_read_committed($table);
             $oid = $self->_pg_resolve_write_target($table)->{oid};
         } else {

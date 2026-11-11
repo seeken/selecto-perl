@@ -34,13 +34,9 @@ subtest 'PostgreSQL server cursor lifecycle' => sub {
     isa_ok($stream,'Selecto::Stream');
     is_deeply($stream->columns,['id','amount'],'cursor keeps statement columns');
     ok(!$dbh->{AutoCommit},'idle handle enters owned transaction');
-    is(code(sub {$dbh->selectrow_array('SELECT 1')}),'handle_owned_by_stream','the owned handle refuses the host while the stream is open');
-    {
-        # (Looked at as the stream itself: its own transaction.)
-        local $Selecto::PostgreSQL::Stream::PASS = 1;
-        is(($dbh->selectrow_array('SHOW transaction_read_only'))[0],'on','owned transaction is read only');
-        is(($dbh->selectrow_array(q{SELECT COUNT(*) FROM pg_cursors WHERE name LIKE 'selecto_stream_%'}))[0],1,'cursor exists while stream open');
-    }
+    is(code(sub {$adapter->execute_query(statement('SELECT 1'))}),'handle_owned_by_stream',"Selecto's own reads refuse while the stream holds the handle");
+    is(($dbh->selectrow_array('SHOW transaction_read_only'))[0],'on','owned transaction is read only');
+    is(($dbh->selectrow_array(q{SELECT COUNT(*) FROM pg_cursors WHERE name LIKE 'selecto_stream_%'}))[0],1,'cursor exists while stream open');
     is_deeply($stream->next,[1,'2.5'],'bound parameters and native decoding survive cursor transport');
     like(code(sub {$adapter->stream_query(statement('SELECT 1'),bounded=>1)}),qr/\A(?:stream_busy|handle_owned_by_stream)\z/,'overlapping stream on same handle refused');
     $stream->close;
@@ -116,18 +112,19 @@ subtest 'PostgreSQL server cursor lifecycle' => sub {
         $stream=$adapter->stream_query(statement('SELECT pg_sleep(0.2)'),bounded=>1);
         is(code(sub {$stream->next}),'query_error','server timeout during FETCH is normalized');
         ok($stream->closed,'timed-out fetch closes stream');
-        $guard->close;
-        is(($dbh->selectrow_array(q{SHOW statement_timeout}))[0],'2s','timeout restored after cursor transaction recovery');
-        is(($dbh->selectrow_array(q{SELECT COUNT(*) FROM pg_cursors WHERE name LIKE 'selecto_stream_%'}))[0],0,'timed-out cursor released');
         if ($host_transaction) {
-            is(($dbh->selectrow_array('SELECT COUNT(*) FROM bounded_stream_host'))[0],1,'timeout preserves earlier host write');
-            $dbh->do('INSERT INTO bounded_stream_host VALUES (2)');
-            ok($adapter->_transaction_open,'host can continue transaction after timeout');
+            # The host's transaction: the timed-out FETCH aborts it, as any failed
+            # statement does, and it is the host's to roll back.
+            is($dbh->pg_ping,4,'in the host transaction the timeout leaves it aborted');
+            eval {$guard->close};
             $dbh->rollback;
-            is(($dbh->selectrow_array('SELECT COUNT(*) FROM bounded_stream_host'))[0],0,'host rollback still owns previous work');
+            is(($dbh->selectrow_array('SELECT COUNT(*) FROM bounded_stream_host'))[0],0,'the host rolls its work back');
         } else {
+            $guard->close;
+            is(($dbh->selectrow_array(q{SHOW statement_timeout}))[0],'2s','timeout restored after cursor transaction recovery');
             ok($dbh->{AutoCommit},'timeout restores owned transaction state');
         }
+        is(($dbh->selectrow_array(q{SELECT COUNT(*) FROM pg_cursors WHERE name LIKE 'selecto_stream_%'}))[0],0,'timed-out cursor released');
     }
     {
         package Local::BoundedDecodeFailure;

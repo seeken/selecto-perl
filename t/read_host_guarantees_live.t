@@ -115,13 +115,14 @@ subtest postgresql => sub {
         $admin->do('ALTER TABLE r66_doctors DROP COLUMN IF EXISTS extra');
     }
 
-    # A relation that cannot be held is the read's to report, and costs the host nothing.
+    # A read in the host's transaction is the host's statement: one that fails
+    # leaves the transaction aborted for the host, as any failed statement does.
     {
         my ($h, $eh) = $open->('r66_gone');
         $h->begin_work;
         $h->do('INSERT INTO r66_other VALUES (1)');
-        ok(!eval { $eh->all($eh->query->select('id')); 1 }, 'a read of a missing relation refuses in a host transaction');
-        is(($h->selectrow_array('SELECT count(*) FROM r66_other'))[0], 1, 'and the host transaction lives on');
+        ok(!eval { $eh->all($eh->query->select('id')); 1 }, 'a read of a missing relation fails in a host transaction');
+        is($h->pg_ping, 4, 'and leaves it aborted for the host');
         $h->rollback;
         # A lock wait while holding stands, as the read's would.
         my ($l, $el) = $open->();
@@ -132,14 +133,13 @@ subtest postgresql => sub {
         $l->do(q{SET LOCAL lock_timeout = '100ms'});
         ok(!eval { $el->all($el->query->select('id')); 1 }, 'a lock timeout in a read fails');
         is($state->($@), '55P03', 'as 55P03');
-        is(($l->selectrow_array('SELECT count(*) FROM r66_other'))[0], 1, 'and the host keeps its write');
         $l->rollback;
         $admin->rollback;
         $_->disconnect for $h, $l;
     }
 
     # (d) A cancellation and a deadlock keep their SQLSTATE, on their own and in a
-    # host transaction, which survives what can be survived.
+    # host transaction.
     my ($a, $ea) = $open->('r66_slow');
     $a->do(q{SET statement_timeout = '150ms'});
     my $query = $ea->query->select('id');
@@ -150,7 +150,6 @@ subtest postgresql => sub {
     $a->do(q{INSERT INTO r66_other VALUES (1)});
     ok(!eval { $ea->all($query); 1 }, 'in a host transaction too');
     is($state->($@), '57014', 'with 57014');
-    is(($a->selectrow_array('SELECT count(*) FROM r66_other'))[0], 1, 'and the host keeps its write');
     $a->rollback;
     $a->do('SET statement_timeout = 0');
     my $pid = ($a->selectrow_array('SELECT pg_backend_pid()'))[0];

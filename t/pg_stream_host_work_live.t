@@ -13,7 +13,7 @@ use lib 't/lib';
 use TestPostgreSQL ();
 
 # A bounded stream inside the host's transaction: the host writes between fetches, and
-# keeps its own savepoints. A stream's failure ends the stream, never the host's work.
+# keeps its own savepoints. A stream's failure leaves the transaction to the host.
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
 my $admin = TestPostgreSQL->connect;
@@ -66,27 +66,22 @@ subtest 'a generated stream that locks rows holds them' => sub {
     $dbh->disconnect;
 };
 
-subtest 'a stream that fails leaves what the host wrote between fetches' => sub {
-    # (A temporary relation that shadows the stream's is a changed session: the pin does
-    # not reach it. A setting the host changes does not change what the stream reads.)
-    for my $case (['an error row', 'sw_bad', sub {}], ['a changed session', 'sw_t', sub { $_[0]->do('CREATE TEMP TABLE sw_t (id INT)') }]) {
-        my ($label, $table, $between) = @$case;
-        $admin->do('DELETE FROM sw_l');
-        my ($dbh, $adapter, $e) = $open->($table);
-        $dbh->begin_work;
-        $dbh->do('INSERT INTO sw_l VALUES (1)');
-        my $s = $e->stream($e->query->select('id'), bounded => 1, fetch_size => 1);
-        $s->next;
-        $dbh->do('INSERT INTO sw_l VALUES (2)');
-        $between->($dbh);
-        ok(!eval { 1 while $s->next; 1 }, "$label: the stream fails");
-        ok(blessed($@), "$label: typed");
-        is($dbh->pg_ping, 3, "$label: the transaction is healthy");
-        $dbh->do('INSERT INTO sw_l VALUES (3)');
-        ok($dbh->commit, "$label: and commits");
-        is($stored->(), '1,2,3', "$label: all of the host's work is there");
-        $dbh->disconnect;
-    }
+subtest "a stream that fails in the host's transaction leaves it to the host" => sub {
+    # The cursor is the host's like any statement: a failed fetch aborts the
+    # transaction, which the stream never rolls back or reopens.
+    $admin->do('DELETE FROM sw_l');
+    my ($dbh, $adapter, $e) = $open->('sw_bad');
+    $dbh->begin_work;
+    $dbh->do('INSERT INTO sw_l VALUES (1)');
+    my $s = $e->stream($e->query->select('id'), bounded => 1, fetch_size => 1);
+    $s->next;
+    $dbh->do('INSERT INTO sw_l VALUES (2)');
+    ok(!eval { 1 while $s->next; 1 }, 'the stream fails');
+    ok(blessed($@), 'typed');
+    is($dbh->pg_ping, 4, 'the transaction is left aborted for the host');
+    ok($dbh->rollback, 'the host rolls it back');
+    is($stored->(), '', 'and nothing of it was stored');
+    $dbh->disconnect;
 };
 
 subtest "a host's setting changed between fetches does not change what the stream reads" => sub {
@@ -122,8 +117,16 @@ subtest "a host's own savepoints are its own" => sub {
                     : $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 1);
                 $s->next;
                 $host{$label}->($dbh);
-                eval { $how eq 'close' ? $s->close : $how eq 'drain' ? do { 1 while $s->next; $s->close } : undef($s) };
+                my $ended = eval { $how eq 'close' ? $s->close : $how eq 'drain' ? do { 1 while $s->next; $s->close } : undef($s); 1 };
                 my $case = "$label, $how" . ($hand ? ', hand-built' : '');
+                if (!$ended && $label =~ /ROLLBACK TO/) {
+                    # The host rolled back past the cursor: its next FETCH fails, as any
+                    # statement on a cursor that is gone does, and the host rolls back.
+                    is($dbh->pg_ping, 4, "$case: the FETCH on the cursor the host took away failed");
+                    $dbh->rollback;
+                    $dbh->disconnect;
+                    next;
+                }
                 is($dbh->pg_ping, 3, "$case: the transaction is healthy");
                 is_deeply(\@warnings, [], "$case: nothing to warn of");
                 $dbh->do('INSERT INTO sw_l VALUES (2)');
@@ -143,70 +146,6 @@ subtest "a host's own savepoints are its own" => sub {
     ok(eval { $dbh->do('ROLLBACK TO SAVEPOINT late'); 1 }, "a savepoint opened during the stream survives its close") or diag $@;
     $dbh->rollback;
     $dbh->disconnect;
-};
-
-my $failing = sub {
-    my ($match, $times, $work) = @_;
-    no warnings 'redefine';
-    my $do = \&DBD::Pg::db::do;
-    my $left = $times;
-    local *DBD::Pg::db::do = sub {
-        my ($h, $sql) = @_;
-        if (defined($sql) && $sql =~ $match && $left-- > 0) {
-            eval { local $h->{PrintError} = 0; local $h->{RaiseError} = 1; $do->($h, q{DO $$ BEGIN RAISE EXCEPTION 'cancelled' USING ERRCODE = '57014'; END $$}) };
-            die "DBD::Pg::db do failed: ERROR:  canceling statement due to user request\n";
-        }
-        return $do->(@_);
-    };
-    return $work->();
-};
-
-subtest 'a cancel on its ending is tried again, and costs nothing' => sub {
-    for my $match (qr/\ACLOSE selecto_stream/, qr/\ARELEASE SAVEPOINT selecto_stream\w+_end/) {
-        for my $how (qw(close drop)) {
-            $admin->do('DELETE FROM sw_l');
-            my ($dbh, $adapter, $e) = $open->();
-            my @warnings;
-            local $SIG{__WARN__} = sub { push @warnings, @_ };
-            $dbh->begin_work;
-            $dbh->do('INSERT INTO sw_l VALUES (1)');
-            my $s = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 1);
-            $s->next;
-            # (R66(d): a cancel that landed is reported, once the retry has ended the
-            # stream; a dropped stream cannot raise and says nothing.)
-            my $ended = eval { $failing->($match, 1, sub { $how eq 'close' ? $s->close : undef($s); 1 }) };
-            my $error = $@;
-            if ($how eq 'close') {
-                ok(!$ended && blessed($error) && ($error->details->{category} // '') eq 'query_canceled', "$how, $match: ended, and the cancel is reported") or diag $error;
-            } else {
-                ok($ended, "$how, $match: ended") or diag $error;
-            }
-            is_deeply(\@warnings, [], 'without a warning');
-            is($dbh->pg_ping, 3, 'the transaction is healthy');
-            my $next = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 1);
-            ok($next->next, 'and the next bounded stream opens: the handle is not poisoned');
-            $next->close;
-            $dbh->commit;
-            is($stored->(), '1', "the host's work is there");
-            $dbh->disconnect;
-        }
-    }
-};
-
-subtest 'an ending that cannot be finished never ends in a false OK' => sub {
-    for my $how (qw(close drop)) {
-        $admin->do('DELETE FROM sw_l');
-        my ($dbh, $adapter, $e) = $open->();
-        local $SIG{__WARN__} = sub {};
-        $dbh->begin_work;
-        $dbh->do('INSERT INTO sw_l VALUES (1)');
-        my $s = $e->stream($e->query->select('id')->order_by('id'), bounded => 1, fetch_size => 1);
-        $s->next;
-        my $closed = eval { $failing->(qr/selecto_stream\w*_end/, 1000, sub { $how eq 'close' ? $s->close : undef($s); 1 }) };
-        ok(!$dbh->{Active}, "$how: the connection is closed");
-        ok(!eval { $dbh->commit; 1 } || !$dbh->{Active} && !$stored->(), "$how: no commit reports the host's work stored");
-        is($stored->(), '', "$how: and nothing is claimed that is not there");
-    }
 };
 
 subtest 'a read of its own does not wait for a safe snapshot' => sub {

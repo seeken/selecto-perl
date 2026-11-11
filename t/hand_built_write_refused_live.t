@@ -12,8 +12,11 @@ use Selecto::PostgreSQL ();
 use lib 't/lib';
 use TestPostgreSQL ();
 
-# No permissive writes: a hand-built statement on a read path writes nothing, on
-# its own or inside the host's transaction. A read may run as written.
+# No permissive writes: a hand-built statement on a read path writes nothing.
+# A statement that is not one read refuses by its words, everywhere; on a handle
+# with no transaction open a read runs READ ONLY, so one that writes some other
+# way (a data-modifying CTE, SELECT INTO, a function) refuses there. Inside the
+# host's transaction a read runs as written, as the host's own statement would.
 my $outcome = sub {
     my ($adapter, $name, $sql, @params) = @_;
     my $statement = Selecto::Statement->new(sql => $sql, params => [@params], columns => ['a'], adapter_name => $name);
@@ -50,21 +53,12 @@ DELETE FROM hb_t}, q{(SELECT 1); DELETE FROM hb_t}, q{TRUNCATE hb_t}, q{SELECT 1
         [($admin->selectrow_array(q{SELECT count(*) FROM pg_class WHERE relname IN ('hb_new', 'hb_new2')}))[0]] };
     my $clean = $state->();
     for my $sql (@writes) {
-        for my $host (0, 1) {
-            my $dbh = TestPostgreSQL->connect;
-            $dbh->do('SET client_min_messages TO error');
-            my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
-            my $where = $host ? 'host transaction' : 'alone';
-            $dbh->begin_work if $host;
-            $dbh->do('CREATE TEMP TABLE hb_mine (id INT)') if $host;
-            is($outcome->($adapter, 'postgresql', $sql), 'refused', "$where: refused: " . ($sql =~ s/\n/ /gr));
-            if ($host) {
-                ok(eval { $dbh->selectrow_array('SELECT count(*) FROM hb_mine'); 1 }, "$where: the host's transaction lives on") or diag $@;
-                $dbh->commit;
-            }
-            is($state->(), $clean, "$where: nothing written");
-            $dbh->disconnect;
-        }
+        my $dbh = TestPostgreSQL->connect;
+        $dbh->do('SET client_min_messages TO error');
+        my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
+        is($outcome->($adapter, 'postgresql', $sql), 'refused', 'refused: ' . ($sql =~ s/\n/ /gr));
+        is($state->(), $clean, 'nothing written');
+        $dbh->disconnect;
     }
     for my $sql (q{SELECT id FROM hb_t}, q{WITH c AS (SELECT id FROM hb_t) SELECT * FROM c}, q{VALUES (1)}, q{TABLE hb_t}, q{(SELECT 1)}, q{/* c */ SELECT 1}, q{-- c
 SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; into' AS b}, q{SELECT note FROM hb_t WHERE note <> 'update; drop'},
@@ -89,7 +83,7 @@ SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; int
         $dbh->disconnect;
     }
     # A hand-built read in the host's transaction keeps its table's lock, whatever its
-    # words: the plan says what it does, not the text.
+    # words.
     $admin->do('ALTER TABLE hb_t ADD COLUMN "delete" TEXT, ADD COLUMN "update" TEXT');
     for my $sql ('SELECT id FROM public.hb_t WHERE id = 1', q{SELECT id FROM public.hb_t WHERE note <> 'update'}, q{SELECT "delete" FROM public.hb_t}, q{SELECT id, "update" FROM public.hb_t},
         q{SELECT id AS "merge" FROM public.hb_t}, q{SELECT id FROM public.hb_t WHERE note <> 'delete' /* c */}, q{WITH "update" AS (SELECT id FROM public.hb_t) SELECT id FROM "update"}) {
@@ -105,16 +99,7 @@ SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; int
         $admin->do('ALTER TABLE hb_t DROP COLUMN extra') if $altered;
         $dbh->disconnect;
     }
-    # One that will refuse keeps nothing: planning it took a lock, which goes back.
-    for my $sql (q{WITH w AS (DELETE FROM public.hb_t RETURNING id) SELECT id FROM w}, 'SELECT id FROM public.hb_t FOR UPDATE', 'SELECT id FROM public.hb_t FOR SHARE') {
-        my $dbh = TestPostgreSQL->connect;
-        $dbh->begin_work;
-        is($outcome->(Selecto::PostgreSQL->new(dbh => $dbh), 'postgresql', $sql), 'refused', "refused: $sql");
-        is(($admin->selectrow_array(q{SELECT count(*) FROM pg_locks WHERE relation = 'hb_t'::regclass AND mode <> 'AccessShareLock' AND pid = ?}, undef, $dbh->{pg_pid}))[0], 0, 'and no lock of a writer stays');
-        $dbh->rollback;
-        $dbh->disconnect;
-    }
-    # The host's deadline covers the plan: a table another session holds cannot keep a read past it.
+    # The host's deadline holds: a table another session holds cannot keep a read past it.
     {
         my $locker = TestPostgreSQL->connect;
         $locker->begin_work;
