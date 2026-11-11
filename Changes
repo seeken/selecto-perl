@@ -2,66 +2,65 @@ Revision history for Selecto
 
 0.2.3  Unreleased
     Before deploying:
-    - PostgreSQL statements Selecto generates now write operators and functions
-      plainly, and search_path stays the host's: they resolve as the host's own
-      queries do on the same connection. An extension (citext, hstore) installed in a
-      schema that is not on a connection's search_path no longer lends its operators
-      to Selecto's statements: put that schema on the path, as the host's own queries
-      need. No untrusted role may have CREATE in a schema on the path.
+    - PostgreSQL: Selecto's statements run in the host's session and resolve names as
+      the host's own queries do. Check that every connection's search_path names the
+      application's schemas (and the schema of any extension such as citext), that no
+      untrusted role has CREATE in a schema on the path, and that client_encoding is
+      UTF8. The schemas adapter option is refused: put those schemas on the path.
+      temporary_relations and catalog_trust are accepted and ignored.
+    - PostgreSQL: canonical values decoded in Perl need DateStyle ISO (the default);
+      under another style a result with a date or timestamp refuses (date_style).
+      Result settings are no longer pinned to their reset values.
+    - PostgreSQL: a read with no transaction open is a READ ONLY transaction of its own,
+      rolled back, so a view that writes (nextval, an audit function) refuses there
+      (read_only_transaction); pg_stat_database.xact_rollback rises by one per such
+      read. Inside the host's transaction a read or bounded stream is the host's own
+      statement: what a view writes is the host's to commit, and a read that fails
+      leaves the transaction aborted for the host to roll back.
+    - PostgreSQL: on a handle with no transaction open a bounded stream holds the handle
+      until it closes. Selecto's own reads, writes and streams on it refuse
+      (handle_owned_by_stream); the host's own DBI calls run inside the stream's read-
+      only transaction. Call begin_work before the stream to use the handle between
+      fetches. A stream that locks rows needs the host's transaction
+      (row_lock_needs_transaction).
     - Give every handle RaiseError => 1. Without it a failed read is still an error,
       but a host's own statements around Selecto's are not checked.
-    - Search for reads that write: a view using nextval, an audit function. They now
-      fail read_only_transaction. Move those writes to execute_write.
-    - Search hand-built SQL given to execute_query or stream_query: row locks on
-      PostgreSQL, statements not beginning with a read word, multiple statements.
-      None of it may be built from end-user input.
-    - Declare with schemas any cross-schema reference or join (relation_unresolved).
-    - Check client_encoding is UTF8 on every connection, no MariaDB session sets
-      system_versioning_asof, and no MySQL session sets sql_select_limit.
+    - Search hand-built SQL given to execute_query or stream_query: statements not
+      beginning with a read word, multiple statements. None of it may be built from
+      end-user input.
+    - Check no MariaDB session sets system_versioning_asof, and no MySQL session sets
+      sql_select_limit.
     - On MySQL, grant SESSION_VARIABLES_ADMIN to the application role if reads may
       raise more than 1024 warnings; without it such a read refuses (result_unverified).
     - On MariaDB, a generated recursive query with no max_depth now refuses past 10000
       levels, even if the host raised max_recursive_iterations. Declare max_depth.
     - Remove any statement_cache option.
-    - Use a transaction handle (begin_work) for a host's transactions. A text BEGIN on
-      a pooled connection is host misuse: a pool can reconnect between statements.
-    - No alarm or signal timeouts around reads are needed or advised: use
-      statement_timeout. A host's timers wait while a read opens or ends.
-    - Expect more round trips on PostgreSQL. Measured per operation against 0.2.2
-      (messages, then statements): a read on an idle handle +29%, +36%; a read inside
-      the host's transaction +60%, +75% (its catalog reads now run under savepoints);
-      a bounded stream on an idle handle +40% to +45%, +43% to +47%; inside the host's transaction
-      +84% to +125%, +142% to +230%, as each FETCH batch there takes 4 round trips (5
-      for a stream that locks rows) where 0.2.2 took 2. Hand-built reads in the host's
-      transaction are unchanged; on an idle handle they take 5 messages, their ROLLBACK
-      included, where 0.2.2 took 9. Governed writes: +18% messages on an idle handle,
-      +28% in the host's transaction (+25%, +37% statements). Adjust monitoring and
-      capacity before the rollout.
-    - On a handle with no transaction open, a bounded stream holds the handle until it
-      closes: anything else sent on the handle meanwhile (a statement, a prepared
-      statement's execute, begin_work, commit, rollback, a ping, Selecto's own reads
-      and writes) fails at once with handle_owned_by_stream. Search for code that uses
-      a handle between fetches of a bounded stream, or shares one handle across
-      requests while an export streams, and call begin_work before the stream (or give
-      the stream a handle of its own).
-      DBI->connect_cached with the held handle's arguments does not hand it out: its
-      ping is refused, so DBI opens a new connection and caches that instead.
-    - On an idle handle a read now ends in a ROLLBACK of its own, so
-      pg_stat_database.xact_rollback rises by one per such read. Inside the host's
-      transaction a read ends with ROLLBACK TO a savepoint, which does not move it.
-    - A bounded stream that locks rows (for_update, for_share) needs the host's
-      transaction: on a handle with none open it refuses, query_rule_not_evaluable,
-      reason row_lock_needs_transaction. 0.2.2 refused it too, as a read-only error
-      (25006). Call begin_work before such a stream.
+    - Use a transaction handle (begin_work) for a host's transactions. A text BEGIN is
+      seen and respected, but a pool can reconnect between statements.
+    - Use statement_timeout, not alarm or signal timeouts, to bound reads.
     - Search host code for Selecto::Statement->new wrapped around a compiled
-      statement's sql: such a statement now runs as hand-built, in the host's session
-      without the guards. Use $statement->derive(...) to keep it generated.
+      statement's sql: such a statement now runs as hand-built. Use
+      $statement->derive(...) to keep it generated.
     - Install DBD::Pg 3.21.2 or newer.
-    - Check reports that compare citext values: with the citext typing fix their
-      answers can change (x::citext now takes the extension's operator).
     - selecto-perl-kit has not had its transaction fixes yet; do not rely on its
       bare commit or rollback under completion_type 2.
     - Deploy selecto-perl-mcp and every companion at this version together.
+
+    - PostgreSQL: the adapter no longer defends against roles with CREATE in the
+      application's schemas or against code planted in triggers and views, which are
+      outside the threat model. Removed: the operator and function qualifier, the
+      catalog lookups behind it and the SQL lint; relation pinning to the reset
+      search_path, its per-statement rechecks and temp-shadow refusals; the session
+      snapshot and result-settings pin around every read and write; the database-wide
+      deferrable-trigger refusal; the savepoint read guard inside the host's
+      transaction, its relation hold and EXPLAIN write check; the alarm-proof
+      cleanup; and the bounded stream's DBI-callback interception, cursor identity
+      checks and per-batch savepoints. Entries further down that describe those
+      guards are superseded. One joined read on a local server now sends no statement
+      at compile (7 before) and 5 messages at execute (15 before): ping, BEGIN, one
+      statement that sets READ ONLY and checks client_encoding, the query, ROLLBACK.
+      A stream proves its own transaction (its cursor) before rolling back, so a host
+      that took the handle over keeps its transaction.
 
     - MySQL family: a generated statement no longer answers short. On MariaDB each one
       pins sql_select_limit, group_concat_max_len (to the server's maximum) and

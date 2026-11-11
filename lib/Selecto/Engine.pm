@@ -3622,13 +3622,10 @@ who installs such triggers on governed tables must make them respect the
 tenant boundary themselves.
 
 The same holds for a trigger's (or a domain view function's) other side
-effects: settings other than those below, role changes, writes to unrelated
-tables, and DDL. They are host-owned schema behaviour and the schema owner's
-responsibility. On PostgreSQL, Selecto does refuse (and roll back) a write
-or read whose statement changed C<search_path>, C<TimeZone>, C<DateStyle>,
-C<IntervalStyle>, C<extra_float_digits> or the session's temporary
-relations, rules or types, since those would steer Selecto's own later SQL;
-see L<Selecto::PostgreSQL/SESSION STATE>.
+effects: settings, role changes, writes to unrelated tables, and DDL. They
+are host-owned schema behaviour and the schema owner's responsibility. On
+PostgreSQL, Selecto's statements run under the host's session; see
+L<Selecto::PostgreSQL/WHAT THE HOST MUST PROVIDE>.
 
 =head2 execute_batch
 

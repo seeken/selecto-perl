@@ -301,7 +301,7 @@ so never use it around writes or locking reads. Its savepoint name is
 unique, and it starts only inside the host's healthy transaction: an
 aborted transaction, a pending asynchronous result or an unknown connection
 state is refused with C<transaction_state_unsafe> before anything is sent
-(see L<Selecto::PostgreSQL/TRANSACTION STATE>), and outside a transaction
+(see L<Selecto::PostgreSQL/READS>), and outside a transaction
 with C<invalid_query_budget>. Other PostgreSQL budgets refuse a pending
 asynchronous result the same way.
 Keep it alive through execution and fetch, call C<check> between application
