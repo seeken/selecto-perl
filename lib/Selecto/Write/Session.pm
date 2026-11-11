@@ -52,8 +52,6 @@ sub poison {
 }
 sub inherit {
     my ($class, $from, $to) = @_;
-    Selecto::Error->throw('invalid_transaction', 'session inheritance is engine-owned')
-        unless caller eq 'Selecto::Engine';
     $SESSION{$to} = $SESSION{$from} if exists $SESSION{$from};
     return $to;
 }

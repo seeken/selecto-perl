@@ -46,17 +46,16 @@ sub _read_authority {
     return [$self->{scope}, $self->{write_context}, $self->{tenant_context}, $self->{tenant_required_filters}, $self->{query_mode}];
 }
 
-# Whether engines re-verify their domain's identity (a digest of the whole domain) when
-# used, refusing a domain modified after configuration. Off by default: hosts that build
-# their domains in code and never modify them don't need it, and on a large domain it
-# was most of the time a query took. An engine turns it on with verify_domain_identity
-# => 1, or a host for all engines with $Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1.
+# A configured engine: one made by new or a checked transition. The domain and its
+# trusted scope are the host's own objects; changing them after configuration is the
+# host's business, as with any object it holds. An engine made with
+# verify_domain_identity => 1 (or every engine, with $VERIFY_DOMAIN_IDENTITY) re-walks
+# its domain at every assertion and refuses one that changed: a certification case
+# (D022) asks for it, and no host in this workspace turns it on.
 our $VERIFY_DOMAIN_IDENTITY //= 0;
 
 sub _verifies_identity { return $_[0]->{verify_domain_identity} // $VERIFY_DOMAIN_IDENTITY }
 
-# Without verification the configured digest is computed only when something asks for
-# the engine's read policy identity (_read_policy_identity), then kept.
 my $seal_domain = sub {
     my ($self) = @_;
     $CONFIGURED_DOMAIN{$self} = $self->_verifies_identity
@@ -65,35 +64,19 @@ my $seal_domain = sub {
     return $self;
 };
 
-# Engines (by refaddr) inside an outermost method call: {verified => 0|1}. Every engine
-# method asserts the domain's identity, and one call reaches many of them; walking a large
-# domain each time made identity checks most of the time a query took (Load: 27 walks,
-# about 1 s, per Explorer query). So the first assertion in an outermost call verifies and
-# the nested ones within it reuse that; the scope ends when the call returns or dies, and
-# the next call verifies again, so a domain changed between calls is still refused.
-# Nothing outside the engine runs between a call's nested assertions.
-my %IDENTITY_SCOPE;
-
 sub assert_domain_identity {
     my ($self) = @_;
     my $record = $CONFIGURED_DOMAIN{$self};
-    unless ($self->_verifies_identity) {
-        # Still only a genuinely configured engine.
-        Selecto::Error->throw('domain_modified_after_configuration',
-            'configured domain identity has changed', {path => []}) unless $record;
-        return $self;
+    my $changed = !$record;
+    if ($record && $self->_verifies_identity) {
+        $changed = !defined($record->{domain})
+            || $record->{domain} ne Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority)
+            || exists($record->{read}) != exists($self->{_read_domain})
+            || exists($record->{read}) && $record->{read} ne
+                Selecto::ConfiguredDomain->digest($self->{_read_domain}, $self->_read_authority);
     }
-    my $scope = $IDENTITY_SCOPE{refaddr($self)};
-    return $self if $scope && $scope->{verified};
     Selecto::Error->throw('domain_modified_after_configuration',
-        'configured domain identity has changed', {path => []})
-        unless $record
-            && defined($record->{domain})
-            && $record->{domain} eq Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority)
-            && (exists($record->{read}) == exists($self->{_read_domain}))
-            && (!exists($record->{read}) || $record->{read} eq
-                Selecto::ConfiguredDomain->digest($self->{_read_domain}, $self->_read_authority));
-    $scope->{verified} = 1 if $scope;
+        'configured domain identity has changed', {path => []}) if $changed;
     return $self;
 }
 
@@ -101,8 +84,7 @@ sub assert_domain_identity {
 # and admitting the contract (a full validating copy and walk of every validator) took
 # most of a governed write. A successful admission is remembered for the exact domain
 # and limits objects it covered; a failure is never remembered, so an invalid contract is
-# refused on every command. With domain identity verification on, assert_domain_identity
-# has already refused a changed domain before this runs.
+# refused on every command.
 sub _admit_write_contract {
     my ($self) = @_;
     # The memo holds the admitted objects themselves, so a freed object's address can
@@ -169,8 +151,6 @@ sub new {
     Selecto::Error->throw('invalid_domain_ref', 'engine domain_ref must be a Selecto domain reference')
         if defined($args{domain_ref})
             && !(blessed($args{domain_ref}) && $args{domain_ref}->isa('Selecto::Domain::Ref'));
-    # Admit the raw structure before domain validation can inspect metadata.
-    Selecto::ConfiguredDomain->digest($args{domain}, {});
     my $scope=_trusted_scope($args{scope});
     my $write_context=Selecto::Write::Context->resolve({}, {context=>$args{write_context}//{},
         (defined($scope->{tenant}) ? (tenant_id=>$scope->{tenant}) : ())});
@@ -406,8 +386,7 @@ sub _has_read_tenant_policy {
     $self->assert_domain_identity;
     return $self->{domain}->tenant_required || keys(%{$self->{tenant_context} // {}}) || @{$self->{tenant_required_filters} // []};
 }
-# The configured digest: verified unchanged just now when verification is on (so the
-# sealed value is the current one), else computed on first use and kept.
+# The configured digest, computed on first use and kept.
 sub _read_policy_identity {
     my ($self) = @_;
     $self->assert_domain_identity;
@@ -3241,28 +3220,6 @@ sub _relationship_policy {
         requires_owned_set=>($owned_sync && keys(%modes)==1 && $modes{full_set})?1:0};
 }
 
-# Each engine method opens the identity scope above when it is the outermost call on its
-# engine (subclass overrides that call SUPER:: are covered by the method they reach).
-# Class-method calls and the identity machinery itself are left as they are.
-{
-    no strict 'refs';
-    no warnings 'redefine';
-    my %unscoped = map { $_ => 1 } qw(new assert_domain_identity _read_authority _verifies_identity DESTROY import can isa VERSION);
-    for my $name (sort keys %Selecto::Engine::) {
-        next if $unscoped{$name} || $name =~ /\A[A-Z_]+\z/;
-        my $code = defined(&{"Selecto::Engine::$name"}) ? \&{"Selecto::Engine::$name"} : next;
-        my $cv = B::svref_2object($code);
-        my $stash = $cv->can('STASH') ? $cv->STASH : undef;
-        next unless $stash && $stash->can('NAME') && $stash->NAME eq 'Selecto::Engine' && !$cv->XSUB;
-        *{"Selecto::Engine::$name"} = sub {
-            my $id = blessed($_[0]) ? refaddr($_[0]) : undef;
-            return $code->(@_) if !defined($id) || $IDENTITY_SCOPE{$id};
-            local $IDENTITY_SCOPE{$id} = {verified => 0};
-            return $code->(@_);
-        };
-    }
-}
-
 1;
 
 __END__
@@ -3467,8 +3424,7 @@ Row scope requires a matching single trusted required value. Missing,
 contradictory and ambiguous scope produce typed errors before compilation or
 execution. C<require_tenant_filter($field, $value)> adds an obligation through
 an approved copy. C<required_filters> and C<tenant_context> return isolated
-plain metadata copies. Scope and read-cache structures join the engine's
-private configured-domain identity; mutating their public records is refused.
+plain metadata copies.
 
 A prefix names a separately quoted schema identifier. Prefix/compound reads
 support declared associations, native CTEs/subqueries and set operations.
@@ -3496,12 +3452,11 @@ C<< canonical_values => 1 >> for canonical values from PostgreSQL.
 
 =head2 assert_domain_identity
 
-Recheck the private structural identity retained when this engine was configured.
-Changing the domain, trusted scope or cached read domain throws
-C<domain_modified_after_configuration> with C<path> C<[]> before compilation or
-execution. The public fingerprint does not authorize changes. Prepared bounded
-queries recheck this identity before dispatch. Raw adapter tooling has its own
-independent contract.
+Throws C<domain_modified_after_configuration> (C<path> C<[]>) unless this engine
+was made by C<new> or a checked transition: a raw copy of an engine is not one.
+The domain and trusted scope are the host's own objects; changing them after
+configuration is not detected. Raw adapter tooling has its own independent
+contract.
 
 C<with_scope>, C<without_action_prerequisites> and C<with_limits> are checked
 host transitions. C<with_limits> intersects a trusted C<Selecto::Limits> with

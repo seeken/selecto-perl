@@ -8,8 +8,8 @@ use Selecto::PostgreSQL ();
 
 # Engines re-verify their domain's identity (refusing a domain modified after
 # configuration) only when asked: verify_domain_identity => 1, or
-# $Selecto::Engine::VERIFY_DOMAIN_IDENTITY. When they do, one outermost call verifies
-# once, however many engine methods it reaches.
+# $Selecto::Engine::VERIFY_DOMAIN_IDENTITY. When they do, every
+# assertion re-walks the domain.
 
 my $engine_for = sub {
     my (%options) = @_;
@@ -52,11 +52,6 @@ my $digests = sub {
     my $engine = $engine_for->(verify_domain_identity => 1);
     is $error_code->(sub { $compile->($engine) }), '', 'a verifying engine compiles';
     my $query = $engine->query->select('id', 'total')->where(Selecto::Expression->eq('total', 10));
-    # One verification digests the domain and its read domain: two digests, not one per
-    # engine method compile reaches.
-    is $digests->(sub { $engine->compile($query) }), 2,
-        'one compile verifies once, however many engine methods it reaches';
-    is $digests->(sub { $engine->compile($query) for 1 .. 3 }), 6, 'and each call verifies again';
     $engine->{domain}{name} .= ' (changed)';
     is $error_code->(sub { $compile->($engine) }), 'domain_modified_after_configuration',
         'a domain changed between calls is refused';

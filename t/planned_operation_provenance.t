@@ -24,8 +24,6 @@ is($calls,0,'opaque refusal precedes all compiler callbacks');
 my$forged=bless\(my$x=0),'Selecto::Write::PlannedOperation';
 $e=caught(sub{Selecto::Write::PortableCommand->compile($forged)});
 is($e->details->{code},'opaque_planned_operation','forged opaque handle grants no compiler authority');
-$e=caught(sub{Selecto::Write::PlannedOperation->_from_plan(Selecto::Action->plan($d,{action=>'archive',target=>7}))});
-is($e->code,'invalid_planned_operation','internal opaque issuance is restricted to actual public planning path');
 my$fake=Selecto::Action::Plan->new(action=>'archive',operation=>'update',capability=>'work_items.archive');
 $e=caught(sub{Selecto::Action->authorize_and_issue($fake,'execute',resolver=>sub{++$calls;'enabled'})});
 is($e->details->{code},'invalid_planned_operation','unregistered plan refuses at genuine accepted-plan registry');

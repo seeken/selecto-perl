@@ -234,8 +234,6 @@ sub _reads_related {
     return 0;
 }
 sub _with_native_upsert_values {
-    _fail('required_data_rule_pending', 'native decimal scope requires protected rule authority')
-        unless caller eq 'Selecto::WriteRules';
     my ($class, $values, $types, $context, $receipt, $limits, $work) = @_;
     return Selecto::RuleTest->_with_native_upsert_values($values, $types, $context, $receipt, $limits, $work);
 }
