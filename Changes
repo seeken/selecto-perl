@@ -40,7 +40,8 @@ Revision history for Selecto
     - Remove any statement_cache option.
     - Use a transaction handle (begin_work) for a host's transactions. A text BEGIN is
       seen and respected, but a pool can reconnect between statements.
-    - Use statement_timeout, not alarm or signal timeouts, to bound reads.
+    - Use statement_timeout (PostgreSQL) or max_execution_time (MySQL family), not alarm
+      or signal timeouts, to bound reads.
     - Search host code for Selecto::Statement->new wrapped around a compiled
       statement's sql: such a statement now runs as hand-built. Use
       $statement->derive(...) to keep it generated.
@@ -65,6 +66,18 @@ Revision history for Selecto
       statement that sets READ ONLY and checks client_encoding, the query, ROLLBACK.
       A stream proves its own transaction (its cursor) before rolling back, so a host
       that took the handle over keeps its transaction.
+
+    - MySQL family: the same threat model, applied. Removed: the checks for a session
+      TEMPORARY table shadowing a relation a read or write uses; the session
+      comparison after every read, stream and DML statement (a trigger or a view's
+      function that changes time_zone or sql_mode); the retries, the echo query and
+      the connection closing that guarded against a host's alarm or a KILL QUERY
+      landing on Selecto's own transaction control; and MySQL's EXPLAIN probe for a
+      hand-built WITH in the host's transaction, now judged by its main verb. The
+      session check before each operation stays. A joined read now sends 6
+      statements on either server (10 on MySQL and 8 on MariaDB before). A guarded
+      update through a view is refused by the InnoDB check (write_capability_missing)
+      rather than as a temporary shadow.
 
     - MySQL family: a generated statement no longer answers short. On MariaDB each one
       pins sql_select_limit, group_concat_max_len (to the server's maximum) and
