@@ -314,7 +314,6 @@ sub stream_query {
     my $hand = Selecto::SQL::_hand_built($statement);
     local $self->{_selecto_host_text} = $hand;
     my $state = $hand ? $self->_hand_built_session : $self->_require_session;
-    $self->_refuse_read_temporary_shadows($statement) unless $hand;
     # No row may reach the caller before the session check that covers it
     # (items 61, 62): a view's stored function can SET time_zone while the
     # server produces the rows. The stream therefore always uses a stored
@@ -2289,9 +2288,6 @@ sub _admit_upsert_conflict {
             && !grep { !$entry->{columns}{$_} } keys %target
     } sort keys %index;
     $refuse->('no_matching_unique_index') unless defined $matched;
-    # The index was read from information_schema, which describes the base
-    # table even when a session TEMPORARY table shadows it.
-    $self->_refuse_temporary_shadow($table);
     return lc $matched;
 }
 
@@ -2444,14 +2440,11 @@ sub _execute_compiled_write_unchecked {
     # that SIGNALs), and in a batch or graph a later command's refusal must
     # undo the earlier ones; only a transactional engine can roll that back:
     # MEMORY, MyISAM and Aria apply each statement at once. The table is read
-    # first so its metadata lock holds until commit, a session TEMPORARY
-    # table shadowing it is refused (information_schema describes only the
-    # base table, and MySQL 8.4 does not list temporary tables), then the
-    # base table must be InnoDB. A catalog that cannot answer is refused too.
+    # first so its metadata lock holds until commit, then it must be InnoDB.
+    # A catalog that cannot answer is refused too.
     my $ok = eval {
         my $table = Selecto::Identifier::checked($command->relation);
         $self->dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
-        $self->_refuse_temporary_shadow($table);
         $self->_require_transactional_table($table);
         1;
     };
@@ -2537,9 +2530,7 @@ sub _verify_inserted_row {
     # effects the candidate cast cannot see (CHAR(n) and TEXT-family
     # trailing blanks) are decided here alone, so without such a key the
     # insert is refused whatever the column type. Read in this write's
-    # transaction, never cached; a session TEMPORARY table shadowing the
-    # relation is refused (information_schema describes the base table).
-    $self->_refuse_temporary_shadow($table);
+    # transaction.
     Selecto::Error->throw('query_rule_not_evaluable', 'guarded insert verification requires a unique primary key')
         unless $self->_unique_key_columns($table, \@keys);
     my $identity = @keys == 1 ? $self->_inserted_identity($command, $keys[0])
@@ -2594,9 +2585,7 @@ sub _unique_key_columns {
 
 # Refuse a RETURNING insert or upsert on a table with any BEFORE INSERT
 # trigger. The table is read first in the write's transaction, so its shared
-# metadata lock keeps a concurrent CREATE TRIGGER out until commit; a
-# session TEMPORARY table shadowing it is refused (information_schema
-# describes the base table).
+# metadata lock keeps a concurrent CREATE TRIGGER out until commit.
 sub _refuse_before_insert_triggers {
     my ($self, $table) = @_;
     my $dbh = $self->dbh;
@@ -2609,98 +2598,9 @@ sub _refuse_before_insert_triggers {
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    $self->_refuse_temporary_shadow($table);
     Selecto::Error->throw('write_capability_missing',
         'MySQL-family RETURNING cannot follow a row a BEFORE INSERT trigger may rewrite', {relation => $table})
         if !defined($triggers) || $triggers;
-    return;
-}
-
-# Reads refuse a relation a session TEMPORARY table shadows, as writes do
-# (item 27): the statement would read the temporary table while every
-# catalog lookup (column types, keys, engines) describes the base table or
-# view of that name. A temporary table that is itself the domain relation
-# (no base table or view of its name) is the host's own and stays readable.
-# The relations checked are those the statement names: the ones its compile
-# recorded (Selecto::Statement relations: root, joins, through bridges,
-# members, retargets, collections, correlated subqueries), and every name in
-# a relation position of its SQL (after FROM or JOIN, through any opening
-# parentheses, so a parenthesised bridge join counts), quoted or unquoted (a
-# host's authored SQL). Column and alias identifiers are never relation
-# names (R28). A statement without SQL fails closed.
-# MariaDB lists the session's temporary tables in information_schema.TABLES;
-# MySQL 8.4 does not, so each base name is checked with SHOW CREATE TABLE.
-sub _read_relation_names {
-    my ($sql, $recorded) = @_;
-    Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
-        {reason => 'relations_unknown'}) unless defined($sql) && !ref($sql) && length($sql);
-    my $name = qr/`((?:``|[^`])+)`/;
-    my %names;
-    for my $relation (ref($recorded) eq 'ARRAY' ? @$recorded : ()) {
-        next unless defined($relation) && !ref($relation);
-        my @parts = map { s/``/`/gr } "$relation" =~ /$name/g;
-        $names{$parts[-1]} = 1 if @parts;
-    }
-    my $text = $sql =~ s/'(?:''|\\.|[^'\\])*'/''/gr;
-    while ($text =~ /\b(?:FROM|JOIN)[\s(]+$name(?:\s*\.\s*$name)?/gi) {
-        $names{(defined($2) ? $2 : $1) =~ s/``/`/gr} = 1;
-    }
-    while ($text =~ /\b(?:FROM|JOIN)[\s(]+([A-Za-z_][A-Za-z0-9_\$]*)\b(?!\s*[(.])/gi) {
-        my $word = $1;
-        $names{$word} = 1 unless $word =~ /\A(?:SELECT|LATERAL|DUAL|JSON_TABLE|VALUES|WITH|UNNEST)\z/i;
-    }
-    return \%names;
-}
-
-sub _refuse_read_temporary_shadows {
-    my ($self, $statement) = @_;
-    Selecto::Error->throw('query_rule_not_evaluable', 'the statement has no relation list to check',
-        {reason => 'relations_unknown'}) unless blessed($statement) && $statement->can('sql');
-    my %names = %{_read_relation_names($statement->sql, $statement->can('relations') ? $statement->relations : undef)};
-    return unless %names;
-    my $dbh = $self->{dbh};
-    my @names = sort keys %names;
-    my $refuse = sub {
-        Selecto::Error->throw('query_rule_not_evaluable', 'a temporary table shadows a relation the read uses',
-            {reason => 'temporary_shadow', relation => $_[0]});
-    };
-    my $rows;
-    my $ok = eval {
-        $rows = $dbh->selectall_arrayref($self->_statement_sql('SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES'
-            . ' WHERE TABLE_SCHEMA = DATABASE() AND ' . ($self->_table_names_case_sensitive ? 'BINARY TABLE_NAME' : 'TABLE_NAME')
-            . ' IN (' . join(', ', ($self->_table_names_case_sensitive ? 'BINARY ?' : '?') x @names) . ')'), undef, @names);
-        defined($rows) or die Selecto::SQL::_dbi_error($dbh, 'catalog read failed');
-        1;
-    };
-    die $self->normalize_error($@) unless $ok;
-    my (%base, %temporary);
-    for my $row (@$rows) {
-        my ($name, $type) = @$row;
-        next unless defined $name;
-        my $key = $self->_table_key($name);
-        if (uc($type // '') eq 'TEMPORARY') { $temporary{$key} = $name } else { $base{$key} = $name }
-    }
-    for my $key (sort keys %base) {
-        $refuse->($base{$key}) if $temporary{$key};
-        next if $self->name eq 'mariadb';
-        my @shown;
-        $ok = eval { @shown = $dbh->selectrow_array($self->_statement_sql('SHOW CREATE TABLE ' . $self->quote_identifier($base{$key}))); 1 };
-        die $self->normalize_error($@) unless $ok;
-        $refuse->($base{$key}) if !defined($shown[1]) || $shown[1] =~ /\A\s*CREATE\s+TEMPORARY\b/i;
-    }
-    return;
-}
-
-# A session TEMPORARY table of the same name shadows the base table for this
-# connection's DML, while information_schema describes the base table: the
-# storage and key checks would read another table's definition.
-sub _refuse_temporary_shadow {
-    my ($self, $table) = @_;
-    my @row;
-    my $ok = eval { @row = $self->dbh->selectrow_array($self->_statement_sql('SHOW CREATE TABLE ' . $self->quote_identifier($table))); 1 };
-    die $self->normalize_error($@) unless $ok;
-    Selecto::Error->throw('query_rule_not_evaluable', 'a temporary table shadows the guarded relation')
-        unless defined($row[1]) && $row[1] =~ /\A\s*CREATE\s+TABLE\b/i;
     return;
 }
 
@@ -2875,7 +2775,6 @@ sub insert_admission_storage {
     my $dbh = $self->dbh;
     $fail->() unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'MariaDB' };
     my $table = Selecto::Identifier::checked($command->relation);
-    $self->_refuse_temporary_shadow($table);
     my ($mode, $kind, $triggers, $rows);
     my $ok = eval {
         $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' WHERE 1 = 0'));
@@ -2959,7 +2858,6 @@ sub execute_query {
     my $hand = Selecto::SQL::_hand_built($statement);
     local $self->{_selecto_host_text} = $hand;
     my $state = $hand ? $self->_hand_built_session : $self->_require_session;
-    $self->_refuse_read_temporary_shadows($statement) unless $hand;
     local $self->{_selecto_export_scalars} = $options{export_scalars} ? 1 : 0;
     # driver_values: the values DBD::MariaDB fetched, undecoded, under the same
     # session checks. A hand-built read's are always the driver's.

@@ -15,8 +15,7 @@ use Selecto::Write ();
 # mismatch, a later batch or graph command) could not be rolled back: the
 # moved or changed rows stayed. Every write now requires an InnoDB table,
 # checked after the table's metadata lock, on the single, batch, graph,
-# delete and unsafe paths; a session TEMPORARY table shadowing the base
-# table is refused too.
+# delete and unsafe paths.
 my @backends;
 for my $spec (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_PERL_TEST_MARIADB_URL']) {
     my ($kind, $env) = @$spec;
@@ -58,61 +57,23 @@ for my $backend (@backends) {
         'an unsafe delete expecting 1 that matches 2' => sub { $adapter->execute_write_unsafe(Selecto::Write::Command->new(operation => 'delete',
             relation => 'selecto_engine_rows', predicate => $x->eq('org_key', 't1'), expected_count => 1)) },
     );
-    for my $storage ($name eq 'mariadb' ? qw(InnoDB MyISAM MEMORY Aria) : qw(InnoDB MyISAM MEMORY), 'temporary MEMORY shadow') {
+    for my $storage ($name eq 'mariadb' ? qw(InnoDB MyISAM MEMORY Aria) : qw(InnoDB MyISAM MEMORY)) {
         for my $case (sort keys %cases) {
-            $dbh->do('DROP TEMPORARY TABLE IF EXISTS selecto_engine_rows');
-            $dbh->do('DROP TABLE IF EXISTS selecto_engine_rows');
-            my $engine_name = $storage =~ /shadow/ ? 'InnoDB' : $storage;
-            $dbh->do("CREATE TABLE selecto_engine_rows (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16)) ENGINE=$engine_name");
-            if ($storage =~ /shadow/) {
-                $dbh->do('CREATE TEMPORARY TABLE selecto_engine_rows (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16)) ENGINE=MEMORY');
-            }
+            $dbh->do(q{DROP TABLE IF EXISTS selecto_engine_rows});
+            $dbh->do("CREATE TABLE selecto_engine_rows (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16)) ENGINE=$storage");
             $dbh->do(q{INSERT INTO selecto_engine_rows VALUES (1, 't1', 'x', 'n'), (2, 't1', 'x', 'n'), (3, 't2', 'x', 'n')});
             $dbh->do(q{CREATE TRIGGER selecto_engine_tr BEFORE UPDATE ON selecto_engine_rows FOR EACH ROW
-                BEGIN IF NEW.note = 'evil' THEN SET NEW.org_key = 't2'; END IF; END}) if $storage !~ /shadow/;
+                BEGIN IF NEW.note = 'evil' THEN SET NEW.org_key = 't2'; END IF; END});
             my $code = eval { $cases{$case}->(); 'applied' } // (blessed($@) ? $@->code : "died: $@");
             my $state = join ' ', map { join ':', @$_ } @{$dbh->selectall_arrayref('SELECT id, org_key, note FROM selecto_engine_rows ORDER BY id')};
             if ($storage eq 'InnoDB') {
                 isnt($code, 'applied', "$name InnoDB: $case is refused after its statement ($code)");
             } else {
-                like($code, $storage =~ /shadow/ ? qr/\A(?:write_capability_missing|query_rule_not_evaluable)\z/ : qr/\Awrite_capability_missing\z/,
+                like($code, qr/\Awrite_capability_missing\z/,
                     "$name $storage: $case is refused before any DML");
             }
             is($state, '1:t1:n 2:t1:n 3:t2:n', "$name $storage: $case leaves every row unchanged");
         }
-    }
-    # Item 27: MySQL 8.4 does not list TEMPORARY tables in
-    # information_schema, so a TEMPORARY MEMORY table shadowing an InnoDB
-    # base table would pass a catalog-only engine check. Inserts and upserts
-    # (guarded, RETURNING, upsert) are refused, or cannot leave a refused
-    # row, against such a shadow too.
-    my $tenant_engine = Selecto::Engine->new(adapter => $adapter, scope => {tenant => 't1'}, domain => Selecto::Domain->parse({
-        schema_version => 1, name => 'EnginesInsert',
-        source => {source_table => 'selecto_engine_rows', primary_key => 'id', fields => [qw(id name note org_key)],
-            columns => {id => {type => 'integer'}, org_key => {type => 'string'}, name => {type => 'string'}, note => {type => 'string'}},
-            associations => {}, tenant_field => 'org_key'},
-        schemas => {}, joins => {},
-        writes => {operations => {insert => {enabled => 1}, upsert => {enabled => 1, conflict_targets => [['org_key', 'id']]}},
-            fields => {id => {insertable => 1}, name => {insertable => 1}, note => {insertable => 1, updatable => 1}, org_key => {insertable => 1}}}}));
-    my %inserts = (
-        'a guarded insert' => sub { $tenant_engine->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_engine_rows',
-            assignments => {id => 9, org_key => 't1', name => 'y', note => 'i'})) },
-        'a RETURNING insert' => sub { $adapter->execute_write_unsafe(Selecto::Write::Command->new(operation => 'insert', relation => 'selecto_engine_rows',
-            assignments => {id => 9, org_key => 't1', name => 'y', note => 'i'},
-            metadata => {returning => ['id'], __selecto_primary_key => 'id', __selecto_tenant_fields => []})) },
-        'a guarded upsert' => sub { $tenant_engine->execute_write(Selecto::Write::Command->new(operation => 'upsert', relation => 'selecto_engine_rows',
-            assignments => {id => 1, org_key => 't1', name => 'y', note => 'u'}, metadata => {conflict_target => ['org_key', 'id'], upsert_update_fields => ['note']})) },
-    );
-    for my $case (sort keys %inserts) {
-        $dbh->do('DROP TEMPORARY TABLE IF EXISTS selecto_engine_rows');
-        $dbh->do('DROP TABLE IF EXISTS selecto_engine_rows');
-        $dbh->do('CREATE TABLE selecto_engine_rows (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16), UNIQUE KEY (org_key, id)) ENGINE=InnoDB');
-        $dbh->do('CREATE TEMPORARY TABLE selecto_engine_rows (id INT NOT NULL PRIMARY KEY, org_key VARCHAR(16), name VARCHAR(16), note VARCHAR(16), UNIQUE KEY (org_key, id)) ENGINE=MEMORY');
-        $dbh->do(q{INSERT INTO selecto_engine_rows VALUES (1, 't1', 'x', 'n')});
-        my $code = eval { $inserts{$case}->(); 'applied' } // (blessed($@) ? $@->code : "died: $@");
-        isnt($code, 'applied', "$name temporary MEMORY shadow: $case is refused ($code)");
-        is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_engine_rows ORDER BY id'), [[1, 'n']],
-            "$name temporary MEMORY shadow: $case changes nothing");
     }
     # Item 32: lone inserts and upserts too. An insert expecting 2 rows, a
     # RETURNING insert with an unassigned non-AUTO_INCREMENT key, and an
@@ -157,7 +118,6 @@ for my $backend (@backends) {
         }
     }
     $dbh->do('DROP TABLE IF EXISTS selecto_engine_lone');
-    $dbh->do('DROP TEMPORARY TABLE IF EXISTS selecto_engine_rows');
     $dbh->do('DROP TABLE IF EXISTS selecto_engine_rows');
 }
 done_testing;
