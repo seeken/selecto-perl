@@ -16,7 +16,8 @@ use TestPostgreSQL ();
 # A statement that is not one read refuses by its words, everywhere; on a handle
 # with no transaction open a read runs READ ONLY, so one that writes some other
 # way (a data-modifying CTE, SELECT INTO, a function) refuses there. Inside the
-# host's transaction a read runs as written, as the host's own statement would.
+# host's transaction a read runs as written, as the host's own statement would,
+# once its words show it does not write (a function the host wrote is the host's).
 my $outcome = sub {
     my ($adapter, $name, $sql, @params) = @_;
     my $statement = Selecto::Statement->new(sql => $sql, params => [@params], columns => ['a'], adapter_name => $name);
@@ -74,6 +75,52 @@ SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; int
             $dbh->disconnect;
         }
     }
+    # In the host's transaction nothing would stop these: they refuse by their words,
+    # before anything is sent, and the host's transaction goes on.
+    for my $sql (q{WITH w AS (INSERT INTO hb_t VALUES (12, 'x') RETURNING id) SELECT id FROM w},
+        q{WITH w AS (DELETE FROM hb_t RETURNING id) SELECT count(*) FROM w}, q{WITH w AS (UPDATE hb_t SET note = 'x' RETURNING id) SELECT id FROM w},
+        q{WITH s AS (SELECT id FROM hb_t) SELECT id INTO hb_new FROM s}, q{SELECT id INTO hb_new FROM hb_t}, q{SELECT id INTO TEMP hb_new FROM hb_t},
+        q{EXPLAIN ANALYZE WITH w AS (DELETE FROM hb_t RETURNING id) SELECT 1}, q{EXPLAIN (ANALYZE, COSTS OFF) SELECT id INTO hb_new FROM hb_t},
+        q{/* c */ WITH w AS (DELETE FROM hb_t RETURNING id) SELECT 1}) {
+        for my $stream (0, 1, 2) {
+            my $dbh = TestPostgreSQL->connect;
+            my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
+            $dbh->begin_work;
+            my $statement = Selecto::Statement->new(sql => $sql, params => [], columns => ['a'], adapter_name => 'postgresql');
+            my $done = eval {
+                if ($stream) { my $s = $adapter->stream_query($statement, ($stream == 2 ? (bounded => 1) : ())); $s->next; $s->close }
+                else { $adapter->execute_query($statement) }
+                1;
+            };
+            my $error = $@;
+            my $label = (qw(read stream bounded))[$stream];
+            is(!$done && blessed($error) && $error->details->{reason}, 'hand_built_in_host_transaction', "host transaction, $label: refused: $sql");
+            is(($dbh->selectrow_array('SELECT 1'))[0], 1, 'and the host goes on');
+            $dbh->commit;
+            is($state->(), $clean, 'nothing written');
+            $dbh->disconnect;
+        }
+    }
+    # With a comment the text has more than one reading, and a word in a literal counts.
+    {
+        my $dbh = TestPostgreSQL->connect;
+        $dbh->begin_work;
+        is($outcome->(Selecto::PostgreSQL->new(dbh => $dbh), 'postgresql', q{SELECT id FROM hb_t WHERE note <> 'delete' /* c */}), 'refused',
+            'host transaction: a write word in a literal counts beside a comment');
+        $dbh->rollback;
+        $dbh->disconnect;
+    }
+    # The host's own function, a row lock and a sequence are the host's; EXPLAIN
+    # without ANALYZE runs nothing.
+    for my $sql (q{SELECT 1 FROM hb_t FOR UPDATE}, q{SELECT pg_catalog.nextval('public.hb_s')},q{SELECT 1 FROM hb_t FOR NO KEY UPDATE}, q{EXPLAIN WITH w AS (DELETE FROM hb_t RETURNING id) SELECT 1},
+        q{SELECT 'insert into' AS a}, q{SELECT public.hb_f()}) {
+        my $dbh = TestPostgreSQL->connect;
+        my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
+        $dbh->begin_work;
+        is($outcome->($adapter, 'postgresql', $sql), 'answered', "host transaction: answers: $sql");
+        $dbh->rollback;
+        $dbh->disconnect;
+    }
     # Where the text has more than one reading, a word in a literal counts: a comment
     # or a dollar quote could end it, for all this text knows.
     for my $sql (q{SELECT $$;$$}, q{SELECT ';' /* c */}, q{SELECT E'\\'; DELETE FROM hb_t --'}, q{SELECT 1 /* ' */; DELETE FROM hb_t WHERE note = '1'}) {
@@ -86,7 +133,7 @@ SELECT 1}, q{SELECT 1;}, q{SELECT 'x;y'}, q{SELECT 'a; delete' AS a, 'it''s; int
     # words.
     $admin->do('ALTER TABLE hb_t ADD COLUMN "delete" TEXT, ADD COLUMN "update" TEXT');
     for my $sql ('SELECT id FROM public.hb_t WHERE id = 1', q{SELECT id FROM public.hb_t WHERE note <> 'update'}, q{SELECT "delete" FROM public.hb_t}, q{SELECT id, "update" FROM public.hb_t},
-        q{SELECT id AS "merge" FROM public.hb_t}, q{SELECT id FROM public.hb_t WHERE note <> 'delete' /* c */}, q{WITH "update" AS (SELECT id FROM public.hb_t) SELECT id FROM "update"}) {
+        q{SELECT id AS "merge" FROM public.hb_t}, q{SELECT id FROM public.hb_t WHERE note <> 'x' /* c */},q{WITH "update" AS (SELECT id FROM public.hb_t) SELECT id FROM "update"}) {
         my $dbh = TestPostgreSQL->connect;
         my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
         $dbh->begin_work;

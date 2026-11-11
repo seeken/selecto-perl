@@ -16,7 +16,10 @@ Revision history for Selecto
       (read_only_transaction); pg_stat_database.xact_rollback rises by one per such
       read. Inside the host's transaction a read or bounded stream is the host's own
       statement: what a view writes is the host's to commit, and a read that fails
-      leaves the transaction aborted for the host to roll back.
+      leaves the transaction aborted for the host to roll back. A hand-built one whose
+      words could write (a data-modifying WITH, SELECT INTO, EXPLAIN ANALYZE of one)
+      refuses there first (hand_built_in_host_transaction), by its text, with nothing
+      sent; a write word in a string literal beside a comment counts.
     - PostgreSQL: on a handle with no transaction open a bounded stream holds the handle
       until it closes. Selecto's own reads, writes and streams on it refuse
       (handle_owned_by_stream); the host's own DBI calls run inside the stream's read-
@@ -53,7 +56,8 @@ Revision history for Selecto
       search_path, its per-statement rechecks and temp-shadow refusals; the session
       snapshot and result-settings pin around every read and write; the database-wide
       deferrable-trigger refusal; the savepoint read guard inside the host's
-      transaction, its relation hold and EXPLAIN write check; the alarm-proof
+      transaction, its relation hold and EXPLAIN write check (a text check replaces
+      it, above); the alarm-proof
       cleanup; and the bounded stream's DBI-callback interception, cursor identity
       checks and per-batch savepoints. Entries further down that describe those
       guards are superseded. One joined read on a local server now sends no statement

@@ -25,8 +25,11 @@ sub new {
     # 'own' (AutoCommit on): a READ ONLY transaction of the stream's, rolled back
     # at the close. 'host': the host's transaction, which the cursor ends with.
     my $scope = $adapter->_read_guard_scope;
-    $adapter->_pg_require_utf8 if $scope eq 'host';
     $adapter->_admit_hand_built($args{statement});
+    if ($scope eq 'host') {
+        $adapter->_refuse_hand_built_write($args{statement});
+        $adapter->_pg_require_utf8;
+    }
     my $locks = Scalar::Util::blessed($args{statement}) && $args{statement}{_selecto_row_lock} ? 1 : 0;
     # Locks taken in a transaction rolled back at the close would protect nothing.
     Selecto::Error->throw('query_rule_not_evaluable',
