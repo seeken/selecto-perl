@@ -67,6 +67,16 @@ Revision history for Selecto
       A stream proves its own transaction (its cursor) before rolling back, so a host
       that took the handle over keeps its transaction.
 
+    - The host's own process is trusted too. Removed: the rewrite of every Engine
+      method that scoped domain-identity checks, the digest walk in Engine->new,
+      the caller-package checks on private methods, and the refusal of tied
+      hashes, arrays and scalars in every input walker. verify_domain_identity
+      stays opt-in; with it on, every assertion re-walks the domain.
+    - SQLite: an UPSERT under stored data rules is refused before anything runs
+      (write_capability_missing), as on every other adapter. The protected
+      candidate projection and batch-independence proof are removed, and with
+      them the empty update mask (DO NOTHING) they admitted.
+
     - MySQL family: the same threat model, applied. Removed: the checks for a session
       TEMPORARY table shadowing a relation a read or write uses; the session
       comparison after every read, stream and DML statement (a trigger or a view's
