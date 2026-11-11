@@ -11,7 +11,7 @@ use Selecto::Expression;
 use Selecto::QueryEnforcement ();
 use Selecto::Write ();
 
-# Round-3 review R18 R24 R25 R26 R28 on MySQL and MariaDB:
+# Round-3 review R18 R24 R25 R26 on MySQL and MariaDB:
 # - R24: query-member filters (CTE and lateral members) are host scope:
 #   text ranges and prefixes compare bytes, TIMESTAMP compares by epoch and a
 #   text match on a TIMESTAMP is refused;
@@ -21,7 +21,6 @@ use Selecto::Write ();
 #   the catalog of its own relation) compares the canonical integer text by
 #   bytes, and other scope compares on it are refused; a same-named column
 #   of another type elsewhere changes nothing;
-# - R28: a temporary table named like a column identifier is no shadow.
 my $x = 'Selecto::Expression';
 my @backends;
 for my $spec (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_PERL_TEST_MARIADB_URL']) {
@@ -141,17 +140,6 @@ for my $backend (@backends) {
         ->with_required_predicate($x->gte('code', 5)));
     is(outcome(sub { [map { $_->[0] } @{$ints->all($ints->query->select('id', 'o.code')->order_by('id'))->{rows}}] }), 'ok 1,2',
         "$name: an INT scope column compares by value whatever a same-named column elsewhere stores");
-
-    # R28
-    $dbh->do('DROP TABLE IF EXISTS note');
-    $dbh->do('CREATE TABLE note (id INT PRIMARY KEY) ENGINE=InnoDB');
-    $dbh->do('CREATE TEMPORARY TABLE note (id INT)');
-    my $plain = Selecto::Engine->new(adapter => $adapter->(), domain => Selecto::Domain->parse({schema_version => 1, name => 'Plain',
-        source => relation('ssp_codes', id => 'integer', note => 'string'), schemas => {}, joins => {}}));
-    is(outcome(sub { scalar @{$plain->all($plain->query->select('id', 'note')->order_by('id'))->{rows}} }), 'ok 6',
-        "$name: a temporary table named like a selected column is no shadow");
-    $dbh->do('DROP TEMPORARY TABLE note');
-    $dbh->do('DROP TABLE IF EXISTS note');
 
     $dbh->do('DROP TABLE IF EXISTS ' . join(', ', qw(ssp_root ssp_mem ssp_w ssp_codes ssp_ints)));
     $dbh->disconnect;

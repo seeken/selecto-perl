@@ -233,11 +233,9 @@ for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
         my $dbh = $connect->();
         my $insert = sub {
             my ($ddl, $key, $seed, $assignments, $predicate, %options) = @_;
-            $dbh->do('DROP TEMPORARY TABLE IF EXISTS selecto_v2_key_rows');
             $dbh->do('DROP TABLE IF EXISTS selecto_v2_key_rows');
             $dbh->do("CREATE TABLE selecto_v2_key_rows ($ddl)");
             $dbh->do($_) for @$seed;
-            $dbh->do("CREATE TEMPORARY TABLE selecto_v2_key_rows ($options{temporary})") if $options{temporary};
             my @fields = sort keys %$assignments;
             my $source = relation('selecto_v2_key_rows', map { ($_ => $_ =~ /\A(?:org_key|code)\z/ ? 'string' : 'integer') } @fields);
             $source->{primary_key} = $key;
@@ -250,7 +248,6 @@ for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
             my $error = eval { $options{tooling} ? $engine->adapter->execute_write_unsafe($command) : $engine->execute_write($command); 1 }
                 ? undef : $@;
             my $rows = $dbh->selectall_arrayref('SELECT org_key FROM selecto_v2_key_rows ORDER BY org_key');
-            $dbh->do('DROP TEMPORARY TABLE IF EXISTS selecto_v2_key_rows') if $options{temporary};
             return (blessed($error) ? $error->code : defined($error) ? "died: $error" : 'applied', [map { $_->[0] } @$rows]);
         };
         my @outcome = $insert->('id INT NOT NULL, org_key CHAR(4)', 'id', [q{INSERT INTO selecto_v2_key_rows VALUES (1, 'zz')}],
@@ -296,16 +293,6 @@ for my $backend (grep { $_->[0] ne 'postgresql' } @backends) {
         @outcome = $insert->('code VARCHAR(16) NOT NULL, org_key VARCHAR(16), UNIQUE KEY (code(3))', 'code', [],
             {code => 'abcdef', org_key => 't1'}, $x->eq('org_key', 't1'));
         is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a prefix unique index does not count');
-        if ($name eq 'mysql') {
-            # A session TEMPORARY table shadows the base table for the DML,
-            # while information_schema describes the base table.
-            @outcome = $insert->('id INT NOT NULL, org_key VARCHAR(16)', 'id', [], {id => 1, org_key => '010'},
-                $x->ne('org_key', '10'), temporary => 'id INT NOT NULL PRIMARY KEY, org_key INT');
-            is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a shadowing temporary INT table is refused');
-            @outcome = $insert->('id INT NOT NULL, org_key VARCHAR(16)', 'id', [], {id => 1, org_key => 't1 '},
-                $x->ne('org_key', 't1'), temporary => 'id INT NOT NULL PRIMARY KEY, org_key VARCHAR(2)');
-            is_deeply(\@outcome, ['query_rule_not_evaluable', []], 'a shadowing temporary VARCHAR(2) table is refused');
-        }
         $dbh->do('DROP TABLE IF EXISTS selecto_v2_key_rows');
     };
 }

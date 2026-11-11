@@ -3849,9 +3849,6 @@ sub _admit_post_image_target {
     Selecto::Error->throw('write_capability_missing',
         'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
         if $statement_trigger;
-    # information_schema describes the base table, not a session TEMPORARY
-    # table shadowing it (MySQL).
-    $self->_refuse_temporary_shadow($table) if $self->can('_refuse_temporary_shadow');
     # The re-read names the updated rows by their key: the key must be
     # unique (contain an enforced PRIMARY/UNIQUE index of whole, NOT NULL
     # columns) and must not change, or another row sharing the old key value

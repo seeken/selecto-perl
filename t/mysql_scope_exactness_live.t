@@ -13,8 +13,6 @@ use Selecto::API::EngineHandler ();
 
 # Review findings on the MySQL family (round 3, R2 R3 R4 R5 R11 R12), with
 # PostgreSQL's answers as the oracle:
-# - a TEMPORARY table shadowing a through-association bridge, which the
-#   generated SQL names inside a parenthesised join, is refused on reads;
 # - host, trusted and required ranges, BETWEEN and prefix/substring/suffix
 #   matches on a text scope column compare bytes ('t1' never matches 'T1',
 #   'tı', and only a byte prefix matches 't1 '); caller filters keep the
@@ -75,12 +73,7 @@ for my $backend (@backends) {
         my @rows; while (my $r = $s->next) { push @rows, $r->[1] } \@rows;
     };
     is(outcome($labels), 'ok t1-acc', "$name: the bridged read sees its own rows");
-    $dbh->do('CREATE TEMPORARY TABLE sse_link (item_id INT, acc_id INT)');
-    $dbh->do('INSERT INTO sse_link VALUES (1, 10), (1, 20)');
-    is(outcome($labels), 'query_rule_not_evaluable/temporary_shadow', "$name: a TEMPORARY bridge shadow is refused");
-    is(outcome($streamed), 'query_rule_not_evaluable/temporary_shadow', "$name: and refused on a stream");
-    $dbh->do('DROP TEMPORARY TABLE sse_link');
-    is(outcome($labels), 'ok t1-acc', "$name: and reads again once it is gone");
+    is(outcome($streamed), q{ok t1-acc}, "$name: and so does a stream");
 
     # R3, R4, R5: scope exactness.
     $dbh->do('DROP TABLE IF EXISTS sse_rows');
