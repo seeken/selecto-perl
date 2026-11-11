@@ -71,6 +71,10 @@ Revision history for Selecto
       without writes.scope.tenant: the API write handler no longer refuses such a
       write with missing_tenant_scope, and the write binder confines it to the
       tenant. Certification TB007 and TKC002-005 now pass on every Perl target.
+    - The verification models and the contract compatibility checker move to
+      selecto-perl-certification (Selecto::Certification::Verification::*,
+      Selecto::Certification::ContractVerification). Domain no longer has
+      contract_snapshot, verify_contract_compatibility or diff_contract_snapshots.
     - The host's own process is trusted too. Removed: the rewrite of every Engine
       method that scoped domain-identity checks, the digest walk in Engine->new,
       the caller-package checks on private methods, and the refusal of tied
