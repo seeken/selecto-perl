@@ -3421,8 +3421,7 @@ context does not authorize writes; all engine write dispatch refuses it.
 Existing C<with_scope> and declared C<writes.scope.tenant> remain the separate
 trusted write-authority lifecycle. This API does not execute declared UDFs or
 portable callback markers. Explicit host member builders use the separate
-constructor registry above. See L<Selecto::Verification::QuerySafety> for the
-finite read-scope model.
+constructor registry above.
 
 =head2 stream
 

@@ -2,9 +2,9 @@ use 5.034;use strict;use warnings;
 use Test::More;use Scalar::Util qw(blessed);use JSON::PP ();
 $Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use Selecto::Action ();use Selecto::Action::Plan ();use Selecto::Write::Operation ();use Selecto::Write::PortableCommand ();
-use Selecto::Verification::WriteModel ();
+use lib "t/lib"; use TestWorkItems ();
 sub caught {my($fn)=@_;my$e;{local$@;my$ok=eval{$fn->();1};$e=$@ unless$ok;}return$e;}
-my$d=Selecto::Verification::WriteModel::work_items();
+my$d=TestWorkItems::work_items();
 require Selecto::Domain;
 my$projected=Selecto::Domain->project($d,'write');
 is_deeply($projected->{rules},{},'actual public write projection has empty absent-rules registry');
