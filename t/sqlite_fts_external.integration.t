@@ -3,7 +3,6 @@ use strict;
 use warnings;
 use utf8;
 use Test::More;
-$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use JSON::PP ();
 use Storable qw(dclone);
 use Selecto;
@@ -114,9 +113,6 @@ subtest 'index declaration is copied, fingerprinted and sealed' => sub { memory(
     my $simple = Selecto::Domain->new(name => 'Items', table => 'items', fields => {id => 'integer', title => 'string'}, primary_key => 'id');
     my $indexed = Selecto::Domain->new(name => 'Items', table => 'items', fields => {id => 'integer', title => 'string'}, primary_key => 'id', fts5_index => {table => 'items_search', key => 'id'});
     isnt($simple->fingerprint, $indexed->fingerprint, 'native domain fingerprint includes supplied index');
-    my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
-    $domain->{fts5_index}{table} = 'other';
-    is(error_code(sub { ids($engine, $x->text_search(['title'], 'Oak')) }), 'domain_modified_after_configuration', 'private seal detects edited index declaration');
     {
         package FtsTest::CloneHook;
         our $calls = 0;

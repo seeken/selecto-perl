@@ -78,8 +78,10 @@ Revision history for Selecto
     - The host's own process is trusted too. Removed: the rewrite of every Engine
       method that scoped domain-identity checks, the digest walk in Engine->new,
       the caller-package checks on private methods, and the refusal of tied
-      hashes, arrays and scalars in every input walker. verify_domain_identity
-      stays opt-in; with it on, every assertion re-walks the domain.
+      hashes, arrays and scalars in every input walker. The opt-in
+      verify_domain_identity and $Selecto::Engine::VERIFY_DOMAIN_IDENTITY are
+      removed too, with certification case D022 (spec 2.38.0): a domain changed
+      after configuration is the host's own business.
     - SQLite: an UPSERT under stored data rules is refused before anything runs
       (write_capability_missing), as on every other adapter. The protected
       candidate projection and batch-independence proof are removed, and with

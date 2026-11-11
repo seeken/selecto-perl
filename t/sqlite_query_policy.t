@@ -2,7 +2,6 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
-$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use DBI;
 use JSON::PP ();
 use Storable qw(dclone);
@@ -35,12 +34,6 @@ is_deeply($engine->all($engine->query->select('state',Selecto::Expression->count
 like($engine->compile($engine->query->select(Selecto::Expression->count->as('total'))->group_by('id'))->sql,qr/\ASELECT\s+"?[a-z0-9]+"?\."id"/i,'required field that is a grouping key is still selected');
 my$q=$engine->query->select('title')->where(Selecto::Expression->eq('tenant_id',8));
 is_deeply($engine->all($q)->{rows},[],'optional contradictory tenant filter cannot erase required tenant predicate');
-my$updated=Selecto::Domain->parse(dclone($base));my$e=Selecto::Engine->new(domain=>$updated,adapter=>$adapter);
-$e->domain->{contract}{source}{source_table}='alternate';
-my$error=refusal('original D022 contract source tamper','domain_modified_after_configuration',sub{$e->compile($e->query->select('id'))});
-is_deeply($error->details->{path},[],'original D022 path is canonical');
-$e=Selecto::Engine->new(domain=>Selecto::Domain->parse(dclone($base)),adapter=>$adapter);$e->domain->{table}='alternate';
-refusal('actual native target table tamper','domain_modified_after_configuration',sub{$e->all($e->query->select('id'))});
 my$udf=Selecto::Expression->new('udf','normalize_title',[Selecto::Expression->field('title')]);
 refusal('native UDF execution remains a concrete unsupported boundary','invalid_query',sub{$engine->all($engine->query->select($udf))});
 my$full=do{open my$fh,'<:raw','t/fixtures/query_policy.json'or die$!;local$/;JSON::PP->new->utf8->decode(<$fh>)};

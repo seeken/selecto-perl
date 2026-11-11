@@ -2,7 +2,6 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
-$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use JSON::PP ();
 use DBI ();
 use Selecto;
@@ -118,12 +117,6 @@ subtest 'identity, provenance and capability refusals' => sub {
         my $editable = $tx->query->where(Selecto::Expression->all(Selecto::Expression->eq('id', $id), Selecto::Expression->eq('name', 'updated')))
             ->select_for_update(qw(id name))->execute;
         isa_ok(error(sub { $editable->row->write->with_tenant(9) }), 'Selecto::Error', 'live handle cannot change tenant');
-        my $configured = $tx->domain;
-        my $table = $configured->{table};
-        $configured->{table} = 'different_domain';
-        my $changed_domain = error(sub { $editable->row->write });
-        $configured->{table} = $table;
-        is($changed_domain->code, 'domain_modified_after_configuration', 'changed domain cannot reuse issued identity');
         isa_ok(error(sub { $editable->row->related_write('items')->insert->assignments(parent_id => 999, name => 'bad')->execute }), 'Selecto::Error', 'parent reassignment refuses');
     }) });
     isa_ok($failure, 'Selecto::Error', 'caught parent-binding failure poisons transaction');

@@ -2,7 +2,6 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
-$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use JSON::PP ();
 use DBI;
 use Storable qw(dclone);
@@ -217,8 +216,6 @@ my $no_builder = engine(domain => $domain, mode => 'strict')->with_tenant({tenan
 refusal('inert portable marker never becomes an executable callback', 'unsupported_query_member', sub {
     $no_builder->all($no_builder->query->with_cte('scoped')->select('id'));
 });
-my $mutated_mode = configured('strict', 'row', 'tenant-a'); $mutated_mode->{query_mode} = 'permissive';
-refusal('public policy mutation cannot replace configured authority', 'domain_modified_after_configuration', sub { $mutated_mode->query });
 refusal('strict raw source plan refuses before SQL', 'ad_hoc_join_forbidden', sub {
     my $q = $strict_scope->query->_copy(subqueries => [{name => 'forged'}])->select('id'); $strict_scope->all($q);
 });

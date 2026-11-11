@@ -2,7 +2,6 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
-$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use JSON::PP ();
 use Scalar::Util qw(blessed);
 use Selecto;
@@ -130,8 +129,6 @@ subtest 'native trusted authority and atomic references' => sub {
     is(error_code(sub{$tight->execute_write(command('items',id=>3,name=>'denied'))}),'query_rule_violation','trusted required filter checks inserted candidate');
     is(scalar(@updates),0,'required-filter refusal writes nothing');
     is(error_code(sub{$tight->execute_write(command('items',id=>3,name=>'allowed'))}),'ok','trusted required filter admits matching candidate');
-    my $mutated=$new_engine->('items',{tenant_id=>'tenant-a',account_id=>42});$mutated->{write_context}{account_id}=43;
-    $zero->('mutated configured context','domain_modified_after_configuration',sub{$mutated->execute_write(command('items',id=>4,name=>'bad'))});
     $zero->('conflicting immutable context','tenant_mismatch',sub{$engine->with_write_context({tenant_id=>'tenant-b'})});
     my $other=$new_engine->('other_items',{tenant_id=>'tenant-a',account_id=>42});
     my $batch=Selecto::Write::Batch->new(command('items',id=>10,name=>'batch'),command('other_items',id=>10,name=>'batch'));
