@@ -223,11 +223,9 @@ print $statement->sql, "\n";
 print join(', ', @{$statement->params}), "\n";   # the bound values
 ```
 
-That text is for looking at. Don't send `compile` or `preview_write` output to
-the database yourself: on PostgreSQL the adapter qualifies operators and
-functions and checks session state only when it executes a statement, so the
-raw text resolves through the session's `search_path`. Run a compiled statement
-with `$engine->adapter->execute_query($statement)`.
+The text is what the adapter sends. Run a compiled statement with
+`$engine->adapter->execute_query($statement)`, which adds the read-only
+transaction and decodes the results.
 
 Filters can also be written as a portable array AST, which is how they
 usually arrive from a client:
@@ -579,9 +577,9 @@ my $adapter = Selecto->adapter(postgresql => (
 
 The API handler (`Selecto::API::EngineHandler`), canned pages, co-domain
 lookups and `export_scalars` ask for canonical values themselves, so their
-JSON is unchanged. Canonical values are decoded in Perl by default, exactly
-as before: dates and timestamps follow the session `DateStyle`, so a non-ISO
-`DateStyle` (`SQL`, `Postgres`, `German`) shows through as it always has.
+JSON is unchanged. Canonical values are decoded in Perl by default, from the
+session's `ISO` `DateStyle` (the default); under another style a result with
+a date or timestamp refuses (`date_style`).
 `canonical_sql => 1` (opt-in, default 0) has PostgreSQL format the canonical
 values of fields declared `decimal` (PostgreSQL 13 and newer), `date`,
 `naive_datetime` and `utc_datetime` in the outermost select list with

@@ -60,10 +60,10 @@ admit it); an omitted value is filled from the scope. The storage check then
 compares the candidate with the column's own semantics, and the post-image
 re-read verifies the stored row.
 
-Threat model for this profile: in scope is a role with CREATE on a pinned
-schema (planted functions, operators and overloads) and session-state changes;
-out of scope are extension installers and owners, superusers, and concurrent
-DDL by table owners.
+Threat model for this profile: out of scope are roles with CREATE in the
+application's schemas (planted functions, operators and overloads), code
+planted in triggers and views, extension installers and owners, superusers,
+and concurrent DDL by table owners.
 
 PostgreSQL holds a table lock across metadata inspection and DML; SQLite's
 transaction keeps the inspected schema stable. A five-second database query

@@ -238,7 +238,7 @@ sub insert_admission_storage {
         FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(CAST(? AS pg_catalog.text))
     }, undef, $table);
     # A guarded insert is re-read by row id under its full guard after the
-    # statement (R13), so ordinary row triggers (updated_at, audit) stay
+    # statement, so ordinary row triggers (updated_at, audit) stay
     # allowed; statement-level and deferrable triggers are refused by its
     # target contract. An upsert has no such re-read.
     my $triggers_checked = $command->operation eq 'insert' && $self->_rereads_by_row_id;
@@ -308,8 +308,8 @@ sub insert_admission_storage {
             $profile = 'uuid';
         } else {
             if ($column->{base_citext}) {
-                # citext: compared with the extension's own operators (the
-                # qualifier types the cast and casts its operands, R50).
+                # citext: compared with the extension's own operators, which
+                # PostgreSQL chooses for the citext-typed cast.
                 $cast = $qualified;
             } else {
                 $fail->() unless $builtin && $name =~ /\A(?:text|varchar)\z/
@@ -400,7 +400,7 @@ sub supports {
 # value; every other value is canonical. Export scalars are decoded in Perl.
 sub execute_query {
     my ($self, $statement, %options) = @_;
-    # Session state around the read: see SESSION STATE.
+    # See READS in the POD.
     return $self->_guarded_read($statement, sub { return $self->_execute_raw($statement, %options) });
 }
 
@@ -1309,7 +1309,7 @@ sub _pg_begin_read {
     return;
 }
 
-# Post-statement re-reads name the written rows by (tableoid, ctid) (R9).
+# Post-statement re-reads name the written rows by (tableoid, ctid).
 sub _rereads_by_row_id { return $_[0]->_pg_session_checked; }
 
 sub _with_row_ids {
@@ -1320,7 +1320,7 @@ sub _with_row_ids {
         sql => $compiled->{sql} . (@{$compiled->{returning} // []} ? ', ' : ' RETURNING ') . $columns};
 }
 
-# Reads (R55). On a handle with AutoCommit on, a read is a READ ONLY
+# Reads. With no transaction open, a read is a READ ONLY
 # transaction of its own, rolled back: nothing it reaches can write, and
 # nothing it changes outlasts it. One that locks rows is not read-only (its
 # locks end with it). In the host's transaction it runs as written: the host
@@ -1357,7 +1357,7 @@ sub _guarded_read {
     return $result;
 }
 
-# Item 51/51a: the relation a write's post-statement SQL addresses, resolved
+# The relation a write's post-statement SQL addresses, resolved
 # before the statement (under its lock): its oid, its schema-qualified name
 # and the oids its rows may live in (itself and its partitions). Rechecks
 # use the oid and re-reads the qualified name with tableoid = ANY(oids),
@@ -1399,7 +1399,7 @@ sub _pg_hand_built {
     return blessed($statement) && $statement->can('relations') && !defined($statement->relations) ? 1 : 0;
 }
 
-# Before a write sends anything, the session must send UTF-8 (R65; once per
+# Before a write sends anything, the session must send UTF-8 (once per
 # connection). A busy connection is the write's own guard to refuse.
 for my $method (qw(execute_write execute_batch execute_graph execute_transaction
     execute_write_unsafe execute_batch_unsafe execute_graph_unsafe)) {
@@ -1509,9 +1509,9 @@ driver value.
 
 By default (C<< canonical_sql => 0 >>) canonical values are decoded in Perl
 from the driver's values and result types, exactly as up to 0.2.2. Dates and
-timestamps are therefore the session C<DateStyle>'s text: under the default
-C<ISO> they are the forms above, and under a non-ISO C<DateStyle> (C<SQL>,
-C<Postgres>, C<German>) that style shows through, as it always has.
+timestamps are decoded from the session's C<ISO> C<DateStyle> (the default);
+under another style (C<SQL>, C<Postgres>, C<German>) a result holding one
+refuses (C<query_rule_not_evaluable>, reason C<date_style>).
 
 =head2 Canonical values in SQL (opt-in)
 
@@ -1593,18 +1593,6 @@ are C<1> or C<0> and JSON columns are text.
 
 =head1 ATTRIBUTES
 
-=head2 schemas
-
-  Selecto->adapter(postgresql => (dbh => $dbh, schemas => ['app', 'shared']));
-
-The schemas the host's relations live in, in order. Every relation, root,
-reference guard, joined relation, column catalog and post-image alike, resolves
-in the first of them that has it, whatever the reset C<search_path> or the host's
-current one say, and refuses C<relation_unresolved> otherwise. A tenant prefix on the engine
-still decides a read's own schema. Declare them to reach a schema the reset path
-does not name, and for a relation that refers across schemas: with nothing
-declared, a reference resolves only in the root's schema.
-
 =head2 rollup_sort_fix
 
 Selecto sorts rollup results so the grand total precedes the values of a
@@ -1623,24 +1611,15 @@ L</RESULT VALUES>.
 =head2 canonical_sql
 
 C<0> (the default): every canonical value is decoded in Perl from the result
-types, and dates and timestamps follow the session C<DateStyle>. C<1>
-(opt-in): canonical decimal, date and timestamp fields are formatted by
-PostgreSQL, always in the ISO form (see L</Canonical values in SQL (opt-in)>).
+types, which needs the session C<DateStyle> to be C<ISO>. C<1> (opt-in):
+canonical decimal, date and timestamp fields are formatted by PostgreSQL,
+always in the ISO form (see L</Canonical values in SQL (opt-in)>).
 
-=head2 catalog_trust
+=head2 Removed in 0.2.3
 
-  Selecto->adapter(postgresql => (dbh => $dbh, catalog_trust => 'domain'));
-
-C<''> (the default): every read and write checks the catalog and the session
-around its statement (see L</SESSION STATE>). C<'domain'> (opt-in): the host
-vouches that it meets L</What the host must provide>, and a compiled read that
-locks no rows takes the domain's word for its relations: it skips the relation
-recheck and the session snapshot before and after it. Its pinned settings,
-read-only mode and rollback stand, and so do tenant predicates and query
-budgets. Writes, row-locking reads, bounded streams and a host's hand-built
-statements are checked in full. On a database with a large catalog (heavy
-partitioning: hundreds of thousands of relations and types) those checks cost
-far more than a page's own query.
+C<schemas> is refused (C<invalid_adapter>): put the schemas on the
+connection's C<search_path>, or use the engine's tenant prefix.
+C<temporary_relations> and C<catalog_trust> are accepted and ignored.
 
 =head1 ERRORS
 
@@ -1650,194 +1629,87 @@ known), C<database_unique_violation> (with the key fields),
 C<database_foreign_key_violation> and C<database_check_violation>. Other
 failures become C<query_error>.
 
-=head1 TRANSACTION STATE
+=head1 READS
 
-Selecto opens a transaction or savepoint (a bounded stream, a savepoint
-query budget, a direct bounded read, a managed write) only on a connection
-whose state it can account for: idle (it then owns the transaction), or
-inside the host's healthy transaction (it then owns a uniquely named
-savepoint). A connection with the host's pending asynchronous result
-(C<pg_async>, before C<pg_result>), busy with another statement, inside an
-already aborted transaction, or in an unknown state is refused with
-C<transaction_state_unsafe> (details C<state>: C<active>, C<inerror> or
-C<unknown>) before anything is sent. A read inside the host's transaction
-runs under its own savepoint (see L</SESSION STATE>): a read that fails is
-rolled back to it, so the host's transaction stays healthy and keeps its
-earlier work, and the read's error is raised. Otherwise a rollback could discard the
-host's pending result and its transaction, and the host's next statement
-would autocommit. Checking costs one C<pg_ping> round trip where none was
-made before (a stream or a savepoint budget on an C<< AutoCommit => 0 >>
-handle). A bounded stream also refuses, after it opened, to roll back
-anything it cannot prove is its own; see L<Selecto::PostgreSQL::Stream>.
+With no transaction open, a read is a transaction of its own:
+C<BEGIN>, one statement that makes it C<READ ONLY> and checks that
+C<client_encoding> is UTF8, the query, C<ROLLBACK>. Nothing it reaches can
+write, and nothing it changes outlasts it: a view using C<nextval> or an
+audit function refuses (C<query_error>, C<details.category>
+C<read_only_transaction>, SQLSTATE C<25006>). A read that locks rows
+(C<for_update>, C<for_share>) is not read-only; its locks end with it.
 
-=head1 READS DO NOT WRITE
+Inside the host's transaction a read runs as the host's own statement would:
+its locks, snapshot and any write a view makes belong to that transaction,
+and a read that fails leaves it aborted for the host to roll back. libpq's
+transaction status decides which case applies, so a transaction opened with
+a raw C<BEGIN> is the host's too. A connection with a pending asynchronous
+result (C<pg_async>, before C<pg_result>), busy with another statement or
+inside an aborted transaction is refused with C<transaction_state_unsafe>
+(details C<state>: C<active>, C<inerror> or C<unknown>) before anything is
+sent.
 
-A read is C<READ ONLY> and ends in C<ROLLBACK>, or in a rollback to its own
-savepoint inside the host's transaction, so a view using C<nextval> or an audit
-function refuses (C<query_error>, C<details.category> C<read_only_transaction>,
-SQLSTATE C<25006>). A bounded stream ends each fetch that way inside a host
-transaction, and the host can write between fetches. C<for_update> and
-C<for_share> reads cannot be read only: they are not, and inside the host's
-transaction they keep their savepoint's work, so their locks last.
+A hand-built statement given to C<execute_query> or C<stream_query> is the
+host's own code: never build one from end-user input. It must be one
+statement beginning C<SELECT>, C<WITH>, C<VALUES>, C<TABLE>, C<SHOW> or
+C<EXPLAIN>, or it refuses (C<query_rule_not_evaluable>, reason
+C<hand_built_not_a_read>). This stops honest mistakes, not evasion. It runs
+exactly as written: with no transaction open, under C<READ ONLY>; in the
+host's transaction, as the host's. Selecto needs handles with
+C<< RaiseError => 1 >>.
 
-A hand-built statement given to C<execute_query> or C<stream_query> is the host's own
-code: never build one from end-user input. It must be one statement beginning
-C<SELECT>, C<WITH>, C<VALUES>, C<TABLE>, C<SHOW> or C<EXPLAIN>, or it refuses
-(C<query_rule_not_evaluable>, reason C<hand_built_not_a_read>). This stops honest
-mistakes, not evasion. It runs in the host's session, as the driver would run it: no
-pin, no relation or session guard, and the host's C<search_path> and settings apply.
-The transaction it runs in refuses anything that statement would write, in the host's
-transaction too, and a row lock in it with them. Only a C<client_encoding> that is not
-UTF8 refuses it besides. Selecto needs handles with C<< RaiseError => 1 >>.
+A bounded stream follows the same rules; see L<Selecto::PostgreSQL::Stream>.
 
-None of this weakens the host's transaction. Before the savepoint the read takes
-the transaction's first snapshot, so a C<SERIALIZABLE> host stays read-write to
-C<SSI>, and the table locks of the relations it names, or for a hand-built
-statement the ones planning it takes, so they last to the host's commit, unless the
-plan shows it writes or locks rows, when it holds nothing and refuses. That is one
-more round trip for a read inside a host transaction.
+=head1 WRITES
 
-A hand-built read that takes row locks refuses, on every route, streams included.
-Take row locks through your own driver: a read's savepoint would release them. For
-the same reason a C<pg_advisory_xact_lock> taken by a read inside your transaction
-ends with the read, not with your transaction. A function declared C<IMMUTABLE> or
-C<STABLE> that writes breaks PostgreSQL's contract, and planning a hand-built read
-may run it, outside the read-only guard. Locks on tables reached
-only inside a function a view calls end with the read.
+A governed write's post-statement SQL (the post-image re-read and the
+trigger, rule and deferrable rechecks) addresses its relation by the oid
+and schema-qualified name resolved under its lock before the DML, with
+C<tableoid = ANY(...)>. A bound-scope update locks its rows and names them
+by (tableoid, ctid), and both a bound-scope update and a guarded insert
+return the (tableoid, ctid) of every row they wrote and re-read exactly
+those rows after every trigger has run, under the update's trusted scope or
+the insert's full guard. No key is needed, so keys of any type (composite,
+temporal, float, citext, partitioned) work, and a trigger that renumbers a
+row behind a decoy cannot pass; a row a later trigger updates again has a new
+row id and is refused. A guarded insert therefore keeps ordinary row triggers
+(C<updated_at>, audit); statement-level triggers, rules and deferrable
+triggers for the event stay refused.
 
-=head1 SESSION STATE
+=head1 WHAT THE HOST MUST PROVIDE
 
-PostgreSQL resolves names through the session: C<search_path>, then the
-session's temporary schema, which is searched first for relations and types
-whatever C<search_path> says. Literals parse through C<TimeZone>,
-C<DateStyle>, C<IntervalStyle> and C<extra_float_digits>. A row trigger on
-a written table, or a function a domain view calls, can change all of these
-(C<set_config(..., true|false)>, C<CREATE TEMP VIEW>, C<CREATE TYPE pg_temp...>),
-and the change would steer Selecto's own later SQL: a re-read could count
-another relation's rows, and the next read in the host's transaction could
-read another tenant's rows through a TEMP view.
+Selecto's statements run in the host's session, under its settings, and
+resolve names as the host's own queries do. The host provides:
 
 =over 4
 
-=item *
+=item * C<client_encoding> UTF8. Bound values are UTF-8; read as another
+encoding a tenant name with an accent is another tenant's. It is checked on
+every read with no transaction open, and otherwise once per connection.
 
-Every Selecto write (bound or not, single, batch or graph, in every
-transaction mode) reads a snapshot of that state before its DML: the
-settings above, and the (oid, xmin, name) of every relation, rewrite rule
-and type of the temporary schema. The first statement after each DML reads
-it again. Any change rolls the write back (its own transaction, or its
-savepoint in a host's transaction) and refuses it with
-C<query_rule_violation>, reason C<session_state_changed>. Both reads name
-only C<pg_catalog> objects. Behaviour change: a row trigger that creates or
-alters any temporary relation or type (including
-C<CREATE TEMP TABLE IF NOT EXISTS>, on every call, since the table it
-creates is dropped with the refused write) or changes any of those settings
-makes every write to its table refuse.
+=item * A C<search_path> that names the application's schemas. Generated
+statements name relations by the engine's tenant prefix when it has one, and
+otherwise plainly; operators, functions and types are written plainly too.
+An extension (C<citext>) must be in a schema on the path for its operators
+to apply.
 
-=item *
+=item * No untrusted role with C<CREATE> on a schema on the path. An
+operator or function created there (an exact-type C<=> over C<varchar>, a
+C<lower(varchar)>) would be chosen over C<pg_catalog>'s, for Selecto's
+statements as for any other. Triggers, views and row-security policies must
+schema-qualify the functions they call.
 
-A deferrable constraint trigger fires at COMMIT, after that check, and one
-can even be created during the write (by its own row trigger, or by another
-session while the write waits for a lock). So every write (own or host
-transaction, guarded or not) is refused while any enabled deferrable
-trigger that can run user code exists in the database (every user-defined
-one, and internal unique or exclusion rechecks with a non-pg_catalog
-operator class or operator), checked before
-the DML and in the first statement after it (C<query_rule_not_evaluable>,
-reason C<deferred_triggers>). Selecto never runs C<SET CONSTRAINTS>.
-Internal foreign-key triggers are not counted: deferred foreign keys keep
-working. A database with user-defined deferrable triggers cannot take
-Selecto writes.
+=item * C<DateStyle> C<ISO> (the default) for canonical values decoded in
+Perl. Under another style a result with a date or timestamp refuses
+(C<query_rule_not_evaluable>, reason C<date_style>) rather than return that
+style's text; C<< canonical_sql => 1 >> formats them as ISO whatever the
+style.
 
-=item *
-
-Every relation a generated read or write names is schema-qualified, with
-the schema resolved when the statement is compiled from the engine's tenant
-prefix or else the session's C<search_path> reset value
-(C<pg_settings.reset_val>, parsed by PostgreSQL itself), never from the
-current C<search_path>. A relation found in neither is refused
-(C<query_rule_not_evaluable>, reason C<relation_unresolved>); so is one
-found only in the session's temporary schema unless the adapter is built
-with C<< temporary_relations => 1 >>. What the root refers to, a reference
-guard's relation or a joined relation, resolves in the root's own schema or
-refuses the same way, never at whatever comes first on the path; the schemas
-attribute below declares more. A relation the host's current
-C<search_path> resolves to a different relation is refused (reason
-C<relation_ambiguous>), for compiled statements and a host's hand-built
-statements alike. Each Selecto statement runs with C<TimeZone>,
-C<DateStyle>, C<IntervalStyle>, C<extra_float_digits>, C<bytea_output> and
-C<standard_conforming_strings> pinned to their reset values (server,
-database, role or connection configuration), inside its own transaction or
-savepoint (on an idle autocommit handle, a read sets them for the session),
-and the host's values are restored afterwards: a host that C<SET>s one of
-them for its session loses that inside Selecto statements. C<search_path>
-stays the host's. Hosts that C<SET search_path> to reach other schemas must
-declare the schema (see L</schemas>) for relations to resolve there. Selecto's own catalog and
-guard SQL qualifies what it calls with C<pg_catalog>; generated statements
-write operators and functions plainly, so they resolve as PostgreSQL resolves
-them for any query (see L</What the host must provide>).
-
-=item *
-
-Every read (C<all>, streams, bounded results, canned pages, co-domain
-lookups, retargets, anchors) does the same around its statement. Inside a
-host transaction it runs under its own savepoint, rolled back on a change;
-in autocommit the settings it saw are restored. A bounded stream compares
-after every C<FETCH> before it hands out the batch.
-
-=item *
-
-The relations a statement names are recorded while it is compiled (the
-root, joined and through-association bridge relations, member, retarget
-and co-domain sources, collection and C<association_exists> subqueries, a
-write's target and reference-guard parents; see
-L<Selecto::Statement/relations>), and its SQL text is scanned as well. A
-relation a statement names that resolves into the temporary schema while
-a same-named relation exists in a schema of C<search_path> is refused
-(C<query_rule_not_evaluable>, reason C<temporary_shadow>), on reads and
-writes; so is a temporary type named like a type of C<pg_catalog> or of the
-search path. A TEMP table that is itself the domain relation (no namesake)
-is the host's own and works.
-
-=item *
-
-Post-statement SQL of a governed write (the post-image re-read and the
-trigger, rule and deferrable rechecks) addresses the relation by the oid
-and schema-qualified name resolved under its lock before the DML, with
-C<tableoid = ANY(...)>. A bound-scope update locks its rows and names
-them by (tableoid, ctid), and both a bound-scope update and a guarded
-insert return the (tableoid, ctid) of every row they wrote and re-read
-exactly those rows after every trigger has run, under the update's trusted
-scope or the insert's full guard. No key is needed, so keys of any type
-(composite, temporal, float, citext, partitioned) work, and a trigger that
-renumbers a row behind a decoy cannot pass; a row a later trigger updates
-again has a new row id and is refused. A guarded insert therefore keeps
-ordinary row triggers (C<updated_at>, audit); statement-level triggers,
-rules and deferrable triggers for the event stay refused.
+=item * Transactions through DBI (C<begin_work>, C<commit>, C<rollback>).
+A raw text C<BEGIN> is seen and respected, but a pooled connection can
+reconnect between statements.
 
 =back
-
-What a trigger or view function does beyond this (other settings, role
-changes, writes to unrelated tables, DDL outside the temporary schema) is
-host-owned schema behaviour and the schema owner's responsibility, like a
-row trigger's effects on other rows. Selecto keeps no session variable of
-its own to prove ownership; a bounded stream identifies its own transaction
-by its virtual transaction id.
-
-=head2 What the host must provide
-
-These checks protect Selecto's own SQL. They do not contain code already running
-as the application's role. No untrusted role may have C<CREATE> on a schema the
-application reaches: generated statements write operators and functions plainly,
-so an operator or function created in such a schema (an exact-type C<=> over
-C<varchar>, a C<lower(varchar)>) would be chosen over C<pg_catalog>'s, as it
-would for any query the application runs (and extension types such as
-C<citext> keep their own operators the same way). The host's triggers, views
-and row-security policies must schema-qualify the functions they call. Planted code reached through them
-can change the session or swap a stream's cursor between statements: Selecto
-catches some of that, and does not promise to. A host that meets this may say
-so with C<< catalog_trust => 'domain' >> (see L</catalog_trust>), and its
-compiled reads then catch none of it.
 
 =head1 SEE ALSO
 
