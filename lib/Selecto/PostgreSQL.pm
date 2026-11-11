@@ -1332,6 +1332,7 @@ sub _guarded_read {
     my $scope = $self->_read_guard_scope;
     $self->_admit_hand_built($source);
     if ($scope eq 'host') {
+        $self->_refuse_hand_built_write($source);
         $self->_pg_require_utf8;
         return $work->();
     }
@@ -1392,11 +1393,29 @@ sub _pg_write_target {
 
 sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
 
-# A host's hand-built Statement (one with no recorded relations) is the host's
-# own SQL.
-sub _pg_hand_built {
-    my ($statement) = @_;
-    return blessed($statement) && $statement->can('relations') && !defined($statement->relations) ? 1 : 0;
+# In the host's transaction nothing stops a write, so a hand-built read that would
+# write refuses by its words first (R73: this stops honest mistakes, not evasion):
+# a data-modifying WITH, SELECT INTO, EXPLAIN ANALYZE of either. A function the
+# host wrote is the host's, as a view's is; a row lock or a sequence's next value
+# in the host's transaction is the host's to take.
+sub _refuse_hand_built_write {
+    my ($self, $statement) = @_;
+    return unless Selecto::SQL::_hand_built($statement);
+    Selecto::Error->throw('query_rule_not_evaluable', 'a hand-built statement that may write cannot run inside a host transaction here',
+        {reason => 'hand_built_in_host_transaction'}) if $self->_hand_built_may_write($statement->sql // '');
+    return;
+}
+
+sub _hand_built_may_write {
+    my ($self, $sql) = @_;
+    # (Literals are blanked where they read one way only; '#' is an operator here.)
+    my $text = Selecto::SQL::_hand_built_text($sql) =~ s{/\*.*?\*/|--[^\n]*}{ }gsr;
+    $text =~ s/"[^"]*"/ /g;
+    my $start = Selecto::SQL::_hand_built_start($text);
+    return 0 if $start =~ /\ASHOW\b/i;
+    return 0 if $start =~ /\AEXPLAIN\b/i && $start !~ /\bANALY[SZ]E\b/i;
+    $text =~ s/\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/ /gi;
+    return $text =~ /\b(?:INSERT|UPDATE|DELETE|MERGE|TRUNCATE|INTO)\b/i ? 1 : 0;
 }
 
 # Before a write sends anything, the session must send UTF-8 (once per
@@ -1653,9 +1672,16 @@ A hand-built statement given to C<execute_query> or C<stream_query> is the
 host's own code: never build one from end-user input. It must be one
 statement beginning C<SELECT>, C<WITH>, C<VALUES>, C<TABLE>, C<SHOW> or
 C<EXPLAIN>, or it refuses (C<query_rule_not_evaluable>, reason
-C<hand_built_not_a_read>). This stops honest mistakes, not evasion. It runs
-exactly as written: with no transaction open, under C<READ ONLY>; in the
-host's transaction, as the host's. Selecto needs handles with
+C<hand_built_not_a_read>). With no transaction open it runs as written,
+under C<READ ONLY>. In the host's transaction nothing would stop a write, so
+one whose words could write (C<INSERT>, C<UPDATE>, C<DELETE>, C<MERGE>,
+C<TRUNCATE> or C<INTO>, as a data-modifying C<WITH> or C<SELECT INTO> uses,
+and C<EXPLAIN ANALYZE> of one) refuses first (reason
+C<hand_built_in_host_transaction>); a row lock (C<FOR UPDATE>) is allowed. The
+check reads words, not meaning: a function or view the host wrote is the host's,
+and beside a comment or dollar quote a word inside a string literal counts
+too. Otherwise it runs as written. This stops honest mistakes, not evasion.
+Selecto needs handles with
 C<< RaiseError => 1 >>.
 
 A bounded stream follows the same rules; see L<Selecto::PostgreSQL::Stream>.
