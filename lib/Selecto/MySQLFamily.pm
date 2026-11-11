@@ -981,7 +981,7 @@ sub _constant_join_predicates {
 
 # Whether $table.$column is a TIMESTAMP column, from the catalog (once per
 # relation per compile). A relation or column the catalog does not describe
-# (a temporary table, a view's derived column) is refused for a declared
+# (a view's derived column) is refused for a declared
 # datetime field: an unchecked comparison could be zone dependent.
 sub _timestamp_column {
     my ($self, $table, $column, $declared) = @_;
@@ -3335,8 +3335,7 @@ reason C<inexact_text>).
 =item *
 
 On a C<TIMESTAMP> column, comparisons use C<UNIX_TIMESTAMP(col)> against the
-literal's UTC epoch, so a function that switches C<time_zone> during a
-statement cannot widen them. The literal must be C<YYYY-MM-DD>, optionally
+literal's UTC epoch, so they do not depend on the session's C<time_zone>. The literal must be C<YYYY-MM-DD>, optionally
 with C< HH:MM[:SS[.ffffff]]> (or C<T>) and C<Z> or C<+HH:MM>; any other
 spelling, a number or a NULL comparison is refused (reason
 C<timestamp_literal>), and a prefix, substring or suffix match is refused
@@ -3366,13 +3365,25 @@ C<begin_work>: a text C<BEGIN> on a pooled connection is host misuse. A session 
 C<system_versioning_asof> set refuses generated reads and writes on MariaDB.
 
 A connection Selecto cannot put back is closed, never left wrong: a C<ROLLBACK> or
-autocommit restore that still fails after retries, a failed C<RELEASE SAVEPOINT>
-that cannot be rolled back to, or a failure that left the connection out of step
-with its replies, which is what an unsafe signal handler's C<die> inside the driver
-does. What failed first is still what is raised; details C<connection_closed> and
-C<transaction_state> say so. Only a C<die> from a safe signal, a plain C<alarm>,
-keeps the handle: it arrives between statements, or is lost in a C<DESTROY>, as
-Perl does with any C<die> there.
+autocommit restore that fails, or a failed C<RELEASE SAVEPOINT> that cannot be
+rolled back to. What failed first is still what is raised; details
+C<connection_closed> and C<transaction_state> say so. Bound reads with
+C<max_execution_time>, not C<alarm>: a C<die> inside the driver can leave a reply
+unread on the connection, and Selecto does not detect that.
+
+=head1 WHAT THE HOST MUST PROVIDE
+
+Every read and write checks the session once before it sends anything, and refuses
+(C<invalid_connection>) a session that is not: the server family the adapter names,
+time zone UTC, utf8mb4 client, connection and result character sets, a strict
+C<sql_mode>, and (on MySQL) no C<sql_select_limit>, (on MariaDB) no
+C<system_versioning_asof>. Writes need InnoDB tables.
+
+What the session does during a statement is the host's: a trigger or a view's function
+that changes C<time_zone> or C<sql_mode> is not detected, and a session C<TEMPORARY>
+table of a domain relation's name is read and written in its place while the catalog
+describes the base table. Do not give untrusted roles C<CREATE> or C<TRIGGER> on the
+application's database.
 
 This module is an internal part of the L<Selecto> distribution. Its interface
 may change without notice; applications should use the public entry points
