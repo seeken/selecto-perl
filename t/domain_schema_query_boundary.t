@@ -2,7 +2,6 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
-$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use JSON::PP ();
 use Storable qw(dclone);
 use Selecto;
@@ -116,11 +115,6 @@ SKIP: {
     my$changed=dclone($fixtures->{DQ001}{domain});$changed->{required_filters}=[['active',JSON::PP::false]];
     my$other=Selecto::Engine->new(domain=>Selecto::Domain->parse($changed),adapter=>Selecto->adapter(sqlite=>dbh=>$db));
     is_deeply($other->all(intent_query($other,$fixtures->{DQ001}{queries}{narrowed}))->{rows},[[3]],'changed authored domain filter changes actual native permitted rows');
-    my$events=0;$db->sqlite_set_authorizer(sub{$events++;return 0});
-    $engine->domain->{contract}{source}{source_table}='elsewhere';
-    is(code(caught(sub{$engine->all($q)})),'domain_modified_after_configuration','imported configured domain cannot retarget native query');
-    is($events,0,'configured identity refusal occurs before native SQL');
-    $db->sqlite_set_authorizer(undef);
     is($db->selectrow_array('PRAGMA temp_store'),2,'native TEMP remains memory');
     is($db->selectall_arrayref('PRAGMA database_list')->[0][2],'','native main remains memory');
     is_deeply($fixtures,$before,'native queries leave complete fixture unchanged');

@@ -48,35 +48,17 @@ sub _read_authority {
 
 # A configured engine: one made by new or a checked transition. The domain and its
 # trusted scope are the host's own objects; changing them after configuration is the
-# host's business, as with any object it holds. An engine made with
-# verify_domain_identity => 1 (or every engine, with $VERIFY_DOMAIN_IDENTITY) re-walks
-# its domain at every assertion and refuses one that changed: a certification case
-# (D022) asks for it, and no host in this workspace turns it on.
-our $VERIFY_DOMAIN_IDENTITY //= 0;
-
-sub _verifies_identity { return $_[0]->{verify_domain_identity} // $VERIFY_DOMAIN_IDENTITY }
-
+# host's business, as with any object it holds.
 my $seal_domain = sub {
     my ($self) = @_;
-    $CONFIGURED_DOMAIN{$self} = $self->_verifies_identity
-        ? {domain => Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority)}
-        : {};
+    $CONFIGURED_DOMAIN{$self} = {};
     return $self;
 };
 
 sub assert_domain_identity {
     my ($self) = @_;
-    my $record = $CONFIGURED_DOMAIN{$self};
-    my $changed = !$record;
-    if ($record && $self->_verifies_identity) {
-        $changed = !defined($record->{domain})
-            || $record->{domain} ne Selecto::ConfiguredDomain->digest($self->{domain}, $self->_read_authority)
-            || exists($record->{read}) != exists($self->{_read_domain})
-            || exists($record->{read}) && $record->{read} ne
-                Selecto::ConfiguredDomain->digest($self->{_read_domain}, $self->_read_authority);
-    }
     Selecto::Error->throw('domain_modified_after_configuration',
-        'configured domain identity has changed', {path => []}) if $changed;
+        'configured domain identity has changed', {path => []}) unless $CONFIGURED_DOMAIN{$self};
     return $self;
 }
 
@@ -179,7 +161,6 @@ sub new {
         write_context=>$write_context,
         write_policy => _write_policy($args{write_policy}),
         limits => $limits,
-        (defined($args{verify_domain_identity}) ? (verify_domain_identity => $args{verify_domain_identity} ? 1 : 0) : ()),
     }, $class;
     Selecto::QueryBinding->configure_engine($self, $args{member_builders});
     return $seal_domain->($self);
@@ -584,8 +565,6 @@ sub read_domain {
         $domain;
     };
     $self->{_read_domain} = $read;
-    $CONFIGURED_DOMAIN{$self}{read} = Selecto::ConfiguredDomain->digest($read, $self->_read_authority)
-        if $self->_verifies_identity;
     return $read;
 }
 

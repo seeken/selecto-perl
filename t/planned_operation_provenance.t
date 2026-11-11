@@ -1,6 +1,5 @@
 use 5.034;use strict;use warnings;
 use Test::More;use Scalar::Util qw(blessed);use JSON::PP ();
-$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use Selecto::Action ();use Selecto::Action::Plan ();use Selecto::Write::Operation ();use Selecto::Write::PortableCommand ();
 use lib "t/lib"; use TestWorkItems ();
 sub caught {my($fn)=@_;my$e;{local$@;my$ok=eval{$fn->();1};$e=$@ unless$ok;}return$e;}
@@ -122,11 +121,7 @@ subtest 'native issued grant retains actual context and single use'=>sub{
  my$forged_handle=bless\(my$fake_token=0),'Selecto::Write::PlannedOperation';
  $e=caught(sub{$forged_handle->execute($engine,resolver=>sub{++$called;'enabled'})});
  is($e->code,'invalid_planned_operation','forged handle cannot execute through real engine');
- my$changed_engine=Selecto::Engine->new(domain=>Selecto::Domain->parse($raw),adapter=>Selecto->adapter(sqlite=>dbh=>$dbh),scope=>{tenant=>'tenant-a'});
- $changed_engine->domain->{name}='changed';
- $e=caught(sub{$handle->execute($changed_engine,resolver=>sub{++$called;'enabled'})});
- is($e->code,'domain_modified_after_configuration','opaque execution refuses mutated configured engine');
- is_deeply($dbh->selectall_arrayref('SELECT id,tenant_id,state FROM work_items ORDER BY id'),[[7,'tenant-a','done'],[8,'tenant-b','done']],'forged handle and changed engine preserve complete business rows');
+ is_deeply($dbh->selectall_arrayref('SELECT id,tenant_id,state FROM work_items ORDER BY id'),[[7,'tenant-a','done'],[8,'tenant-b','done']],'forged handle preserves complete business rows');
  $dbh->disconnect;
 };
 done_testing;

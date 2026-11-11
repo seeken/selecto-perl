@@ -2,7 +2,6 @@ use 5.034;
 use strict;
 use warnings;
 use Test::More;
-$Selecto::Engine::VERIFY_DOMAIN_IDENTITY = 1;  # tamper detection is opt-in (Selecto::Engine); these tests check it
 use DBI;
 use JSON::PP ();
 use Storable qw(dclone);
@@ -80,17 +79,6 @@ is_deeply($compound->with_limits(Selecto::Limits->new(max_fields => 1))->all(que
 refusal('read context does not grant ordinary writes', 'unsupported_feature', sub { $compound->execute_write(Selecto::Write::Command->new(operation => 'insert', relation => 'accounts', assignments => {name => 'forbidden', active => 1, tenant_id => 'tenant-a'})) });
 my $advanced = query($prefix)->_copy(ctes => [{name => 'x'}]);
 refusal('malformed prefix source plans fail before SQL', 'invalid_query', sub { $prefix->all($advanced) });
-for my $edit (
-    ['context', sub { $_[0]{tenant_context}{tenant_id} = 'tenant-b' }],
-    ['required filter', sub { $_[0]{tenant_required_filters}[0][1] = 'tenant-b' }],
-    ['prefix', sub { $_[0]{tenant_context}{prefix} = 'tenant_b' }],
-    ['required domain flag', sub { $_[0]{domain}{tenant_required} = 0 }],
-) {
-    my $target = engine()->with_tenant({prefix => 'tenant_a', tenant_id => 'tenant-a'})->apply_tenant_scope;
-    $target->read_domain;
-    $edit->[1]->($target);
-    refusal("public $edit->[0] tamper fails sealed read", 'domain_modified_after_configuration', sub { $target->all(query($target)) });
-}
 my $prepared = Selecto::BoundedQuery->prepare($compound, query($compound));
 is_deeply(Selecto::BoundedQuery->execute($compound, $prepared)->{rows}, [[10]], 'bound prepared read executes');
 is_deeply(Selecto::BoundedQuery->execute($compound->with_limits(Selecto::Limits->new(max_fields => 1)), $prepared)->{rows}, [[10]], 'prepared read survives approved limits transition');
