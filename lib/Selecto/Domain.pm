@@ -313,6 +313,18 @@ sub parse {
             unless $ok;
     }
     _object($raw, 'domain');
+    # Domain schema 2 (certification specification 3.0): its rules first, then the
+    # version 1 form the rest of this parser reads. The fingerprint is computed.
+    require Selecto::Domain::SchemaV2;
+    if (Selecto::Domain::SchemaV2->is_version_2($raw->{schema_version})) {
+        my $errors = Selecto::Domain::SchemaV2->validate($raw);
+        Selecto::Error->throw(q{invalid_domain}, "domain schema 2: $errors->[0]{code}",
+            {reason => $errors->[0]{code}, path => $errors->[0]{path}, errors => $errors}) if @$errors;
+        my $domain = $class->parse(Selecto::Domain::SchemaV2->to_version_1($raw), %options);
+        $domain->{schema_version} = 2;
+        $domain->{fingerprint} = Selecto::Domain::SchemaV2->fingerprint($raw);
+        return $domain;
+    }
     require Selecto::Tenant::Context;
     Selecto::Tenant::Context->boolean($raw->{$_}, "domain $_") for grep { defined $raw->{$_} } qw(tenant_required require_tenant);
     Selecto::Error->throw('invalid_tenant_context', 'domain requirement aliases conflict')
@@ -2527,6 +2539,15 @@ sub _normalize_fts5_index {
 sub fields       { return { %{$_[0]->{fields}} }; }
 sub associations { return { %{$_[0]->{associations}} }; }
 sub fingerprint  { return $_[0]->{fingerprint}; }
+sub schema_version { return $_[0]->{schema_version} // 1; }
+# A version 1 domain reports its deprecation with the version 2 document to store.
+sub schema_diagnostics {
+    my ($self) = @_;
+    return [] if $self->schema_version == 2 || ref($self->{contract}) ne q{HASH};
+    require Selecto::Domain::SchemaV2;
+    my $migrated = Selecto::Domain::SchemaV2->migrate($self->{contract});
+    return [{code => q{domain_schema_deprecated}, ($migrated->{document} ? (document => $migrated->{document}) : ())}];
+}
 sub primary_key  { my $key = $_[0]->{primary_key}; return ref($key) eq 'ARRAY' ? [@$key] : $key; }
 sub primary_keys { my $key = $_[0]->{primary_key}; return ref($key) eq 'ARRAY' ? [@$key] : [$key]; }
 sub required_predicate { return $_[0]->{required_predicate}; }
@@ -3050,6 +3071,24 @@ Parses and validates a domain document. Strict mode, the default, rejects
 unknown keys at every level with C<unknown_domain_key>;
 C<< strict => 0 >> ignores them. Other problems throw C<invalid_domain> with
 a message and details describing the first one found.
+
+Both domain schema versions parse. Schema 2 (certification specification 3.0)
+declares tenancy once in a top-level C<tenant> (C<field>, C<write_field>,
+C<satisfied_by>, equality C<pins>), lists a relation's fields as its C<columns>
+in an optional C<field_order>, implies a capability entry that only restates
+its action, and computes the fingerprint (RFC 8785 + SHA-256); a document
+breaking its rules throws C<invalid_domain> with C<reason> naming the rule. A
+schema 1 domain is deprecated: it parses as before, and C<schema_diagnostics>
+reports C<domain_schema_deprecated> with the schema 2 document to store. One
+difference to know before storing it: a schema 1 domain that declared tenancy
+only in C<writes.scope.tenant> did not scope reads by the engine tenant; its
+schema 2 form does. See L<Selecto::Domain::SchemaV2>.
+
+=head2 schema_version, schema_diagnostics
+
+C<schema_version> is 1 or 2. C<schema_diagnostics> is empty for schema 2, and
+for schema 1 a list holding C<{code => 'domain_schema_deprecated', document =>
+$schema_2_document}>.
 
 =head2 new
 
