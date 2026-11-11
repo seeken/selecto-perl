@@ -82,8 +82,7 @@ subtest 'autocommit handlers are refused; transactional handlers carry every wri
     my $e = $engine->(1, $transactional);
     is(code_of(sub { $e->execute_write($insert->(4)) }), 'ok', 'transactional handler carries a stored-rule insert');
     is(code_of(sub { $e->execute_write($update->(4)) }), 'ok', 'transactional handler carries a stored-rule update');
-    is(code_of(sub { $e->execute_write($upsert->(1)) }), 'ok', 'transactional handler carries a protected upsert');
-    is_deeply($db->selectall_arrayref('SELECT * FROM items ORDER BY id'), [[1, 'z'], [3, 'y'], [4, 'y']], 'admitted writes stored');
+    is_deeply($db->selectall_arrayref(q{SELECT * FROM items ORDER BY id}), [[1, q{stored}], [3, 'y'], [4, 'y']], 'admitted writes stored');
 };
 
 $db->sqlite_update_hook(undef);

@@ -7,51 +7,10 @@ use Scalar::Util qw(blessed);
 use POSIX qw(isfinite);
 use DBI qw(SQL_INTEGER SQL_DOUBLE SQL_VARCHAR);
 use Selecto::SQLite::Ownership ();
-use Selecto::SQLite::UpsertCandidate ();
 use Cpanel::JSON::XS ();
 use JSON::PP ();
 use Selecto::SQL::RollupEmulation ();
 
-sub rule_upsert_scope {
-    Selecto::SQLite::UpsertCandidate::_check_args(@_);
-    my ($self, $work, %options) = @_;
-    Selecto::Error->throw('required_data_rule_pending', 'SQLite candidate scope requires a callback')
-        unless ref($work) eq 'CODE';
-    Selecto::Error->throw('required_data_rule_pending', 'SQLite candidate scope accepts only a trusted context')
-        if grep { $_ ne 'context' } keys %options;
-    # Existing compiler/test providers can still serve ordinary stored-rule
-    # requests. Native UPSERT projection separately requires the real scope.
-    my $native = Selecto::SQLite::UpsertCandidate::_native_handle($self->dbh);
-    return $work->() unless $native;
-    return Selecto::SQLite::UpsertCandidate->scope($self, $work, $options{context});
-}
-sub rule_upsert_candidate {
-    Selecto::SQLite::UpsertCandidate::_check_args(@_);
-    my ($self, $command, $request) = @_;
-    return Selecto::SQLite::UpsertCandidate->project($self, $command, $request);
-}
-sub rule_upsert_validate_command {
-    Selecto::SQLite::UpsertCandidate::_check_args(@_);
-    my ($self, $command) = @_;
-    return Selecto::SQLite::UpsertCandidate->validate_command($self, $command);
-}
-sub rule_upsert_validate_plan {
-    Selecto::SQLite::UpsertCandidate::_check_args(@_);
-    my ($self, $commands, $cleanup) = @_;
-    return Selecto::SQLite::UpsertCandidate->validate_plan($self, $commands, $cleanup);
-}
-# Engine governance adds this capability only on the protected path, and
-# dispatch then requires the command's private candidate receipt.
-sub _admits_empty_upsert_mask {
-    my ($self, $command) = @_;
-    return scalar grep { !ref($_) && $_ eq 'protected_upsert_candidates' }
-        @{$command->metadata->{required_capabilities} // []};
-}
-sub _execute_compiled_write_in_transaction {
-    my ($self, $command, $compiled) = @_;
-    $self->rule_upsert_validate_command($command);
-    return $self->SUPER::_execute_compiled_write_in_transaction($command, $compiled);
-}
 
 sub ownership_storage {
     my ($self, @edge) = @_;
@@ -75,8 +34,7 @@ sub preview_write {
 
 sub _admit_plan_storage {
     my ($self, $commands, $cleanup) = @_;
-    Selecto::SQLite::Ownership->plan_storage($self, [@$commands, @{$cleanup // []}]);
-    return $self->rule_upsert_validate_plan($commands, $cleanup);
+    return Selecto::SQLite::Ownership->plan_storage($self, [@$commands, @{$cleanup // []}]);
 }
 
 sub rule_project_subject {
@@ -322,12 +280,6 @@ sub write_capabilities {
     my ($self) = @_;
     my $capabilities = $self->SUPER::write_capabilities;
     $capabilities->{typed_insert_admission} = 1;
-    my $native_upsert = eval {
-        my $dbh = $self->dbh;
-        Selecto::SQLite::UpsertCandidate::_native_handle($dbh)
-            && $dbh->can('sqlite_get_autocommit') && $dbh->can('sqlite_table_column_metadata');
-    };
-    $capabilities->{protected_upsert_candidates} = $native_upsert && $self->_sqlite_version_at_least(3, 37, 0) ? 1 : 0;
     if ($self->_returning_available) {
         $capabilities->{returning} = 1;
         $capabilities->{generated_keys} = 1;

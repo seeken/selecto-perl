@@ -739,11 +739,7 @@ sub _rules_transaction {
     my ($self, $work) = @_;
     Selecto::Error->throw('required_data_rule_pending', 'adapter cannot protect stored candidates')
         unless $self->{adapter}->can('execute_transaction');
-    my $protected_work = sub {
-        return $self->{adapter}->rule_upsert_scope($work, context => $self->write_context)
-            if $self->{adapter}->can('rule_upsert_scope');
-        return $work->();
-    };
+    my $protected_work = $work;
     my $request = bless {work => sub {
         Selecto::DataRules->_with_proof_budget($protected_work, limits => $self->{limits});
     }}, 'Selecto::Write::Transaction';
@@ -2339,15 +2335,7 @@ sub _action_upsert_metadata {
         {action => $plan->action}) unless @updates || $self->_admits_empty_upsert_mask;
     return (conflict_target => [map { "$_" } @$target], upsert_update_fields => \@updates);
 }
-# An empty update mask compiles to DO NOTHING only where the native branch is
-# proved: a SQLite engine whose domain has stored UPSERT rules, so the command
-# is governed through the protected candidate and its receipt. Every other
-# adapter and unprotected path keeps requiring a non-empty mask.
-sub _admits_empty_upsert_mask {
-    my ($self) = @_;
-    return $self->{adapter}->name eq 'sqlite' && $self->{adapter}->can('rule_upsert_candidate')
-        && Selecto::WriteRules->has_stored_rules($self->{domain}, 'upsert') ? 1 : 0;
-}
+sub _admits_empty_upsert_mask { return 0 }
 
 sub preview_action {
     my ($self,$plan,%options)=@_;

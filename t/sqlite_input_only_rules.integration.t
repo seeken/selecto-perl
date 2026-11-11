@@ -153,25 +153,12 @@ subtest 'native existing and new upserts preserve submitted-only intent' => sub 
 subtest 'stored-stage dependencies remain protected and operation-filtered' => sub { memory(sub {
     my ($db, $a, $engine, $snapshot, $observe) = @_;
     for my $stage (qw(candidate transaction evidence)) {
-        for my $enforcement ('required', 'advisory') {
-            my $raw = stored_binding(document(), $stage, enforcement => $enforcement);
-            my $e = $engine->($raw); my $before = $snapshot->();
-            my $seen = $observe->(sub { $e->execute_write(upsert(1, 'mixed')) });
-            my $expected_code = $stage eq 'evidence' && $enforcement eq 'required'
-                ? 'required_data_rule_pending' : 'ok';
-            my $allowed = $expected_code eq 'ok';
-            is($seen->{code}, $expected_code, "$enforcement $stage upsert respects actual native stage authority");
-            is(scalar(grep {$_->[1] eq 'main'} @{$seen->{hooks}}), $allowed ? 1 : 0,
-                'protected branch has exactly the admitted MAIN mutation count');
-            is(scalar @{$seen->{dispatched}}, $allowed ? 1 : 0,
-                'only admitted branch dispatches its business statement');
-            my $expected = copy($before);
-            $expected->{items}[0][2] = 'mixed' if $allowed;
-            is_deeply($snapshot->(), $expected, 'full rows change only the admitted conflict name');
-            is($db->selectrow_array('SELECT name FROM items WHERE id=1'),
-                $allowed ? 'mixed' : $before->{items}[0][2], 'actual stored name agrees with stage outcome');
-            cmp_ok($seen->{upsert_projections}, '>=', 2,
-                'active stored binding uses native initial and final candidate proof');
+        for my $enforcement (q{required}, q{advisory}) {
+            my $e = $engine->(stored_binding(document(), $stage, enforcement => $enforcement)); my $before = $snapshot->();
+            my $seen = $observe->(sub { $e->execute_write(upsert(1, q{mixed})) });
+            is($seen->{code}, q{write_capability_missing}, "$enforcement $stage: an upsert under stored rules is refused");
+            is(scalar @{$seen->{dispatched}}, 0, q{before any business statement});
+            is_deeply($snapshot->(), $before, q{and nothing changes});
         }
         my $filtered = stored_binding(document(), $stage, operations => ['delete']);
         my $seen = $observe->(sub { $engine->($filtered)->execute_write(upsert(1, 'filtered')) });
@@ -203,10 +190,6 @@ subtest 'atomic native batch validates all INPUT before any prefix' => sub { mem
     is($blocked->{code}, 'required_data_rule_pending', 'dependent stored-stage batch retains whole-plan refusal');
     is(scalar(grep { $_->[1] eq 'main' } @{$blocked->{hooks}}), 0, 'protected batch has no native mutation prefix');
     is_deeply($snapshot->(), $before, 'protected batch leaves all rows intact');
-    my $disjoint = $observe->(sub { $protected->execute_batch(Selecto::Write::Batch->new(upsert(1, 'kept'), upsert(6, 'added'))) });
-    is($disjoint->{code}, 'ok', 'independent stored-stage upserts are admitted as one batch');
-    is_deeply($db->selectall_arrayref('SELECT id,name FROM items WHERE id IN (1,6) ORDER BY id'), [[1, 'kept'], [6, 'added']],
-        'both independent branches store');
 }) };
 
 subtest 'native graph prepares parent and child once before dispatch' => sub { memory(sub {
