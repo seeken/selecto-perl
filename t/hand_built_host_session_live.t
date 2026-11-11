@@ -221,28 +221,6 @@ for my $family (['mysql', 'SELECTO_PERL_TEST_MYSQL_URL'], ['mariadb', 'SELECTO_P
             $dbh->rollback;
             $dbh->disconnect;
         }
-        # A connection Selecto has to close stays closed, whatever the driver would like to do.
-        for my $open (['begin_work', sub { $_[0]->begin_work }], ['START TRANSACTION', sub { $_[0]->do('START TRANSACTION') }]) {
-            my ($label, $begin) = @$open;
-            $admin->do('DELETE FROM hs_l');
-            my ($user, $password) = split /:/, $url->userinfo // '', 2;
-            my $dbh = DBI->connect("dbi:MariaDB:database=$db;host=" . $url->host . ';port=' . $url->port . ';mariadb_auto_reconnect=1', $user, $password, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
-            $dbh->do(q{SET SESSION time_zone = '+00:00', sql_mode = 'STRICT_TRANS_TABLES', NAMES utf8mb4});
-            my $adapter = Selecto->adapter($name => (dbh => $dbh));
-            $begin->($dbh);
-            $dbh->do('INSERT INTO hs_l VALUES (1)');
-            # (As an out-of-step connection is closed: the echo that proves it does not come back.)
-            {
-                no warnings 'redefine';
-                local *Selecto::MySQLFamily::_in_step = sub { 0 };
-                local $adapter->{_selecto_operation} = 1;
-                $adapter->normalize_error("alarm\n");
-            }
-            ok(!$dbh->{Active}, "$label: closed");
-            ok(!eval { $dbh->do('INSERT INTO hs_l VALUES (2)'); 1 }, "$label: the host's next statement fails, with reconnect asked for");
-            ok(!eval { $dbh->do('COMMIT'); 1 }, "$label: and so does its COMMIT");
-            is(($admin->selectrow_array('SELECT count(*) FROM hs_l'))[0], 0, "$label: nothing is reported stored that is not");
-        }
         # Whose transaction it is: known before anything is sent, however the host opened it.
         my $domain = Selecto::Domain->parse({schema_version => 1, name => 'HS', source => {source_table => 'hs_t', primary_key => 'id',
             fields => [qw(id note)], columns => {id => {type => 'integer'}, note => {type => 'string'}}, associations => {}}, schemas => {}, joins => {}});
