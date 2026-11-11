@@ -648,11 +648,7 @@ Input accepts only constructed Operation values and complete bounded plain
 metadata. Native objects, callbacks and resources are not write values.
 C<choice_membership_resolver> is a separate explicit trusted host callback;
 its results must come through the public choice-result API.
-Protected UPSERTs defer membership to native execution, after SQLite proves
-the actual branch and canonical candidate. Only the fields actually persisted
-are checked; a conflict with an empty update mask performs C<DO NOTHING> and
-retains the caller's cardinality requirement. Other adapters and unprotected
-engines refuse an empty update mask. Reconstructed commands do not
-inherit the compiler's private trusted resolver or portable normalization origin.
+An empty upsert update mask is refused. Reconstructed commands do not inherit
+the compiler's private trusted resolver or portable normalization origin.
 
 =cut
