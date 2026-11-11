@@ -221,10 +221,6 @@ sub _reads_related {
     }
     return 0;
 }
-sub _with_native_upsert_values {
-    my ($class, $values, $types, $context, $receipt, $limits, $work) = @_;
-    return Selecto::RuleTest->_with_native_upsert_values($values, $types, $context, $receipt, $limits, $work);
-}
 # Resource admission is shared with native replay of compiler-owned INPUT
 # evidence. It inspects every applicable binding, including advisory and false
 # conditions, without running a normalizer, condition or rule test.

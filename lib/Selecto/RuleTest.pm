@@ -18,33 +18,6 @@ use Selecto::Pattern ();
 sub _fail { Selecto::Error->throw(@_) }
 my $NATIVE_DECIMALS;
 
-# Native SQLite NUMERIC values are delivered as NVs, whereas the highest
-# adapter returns Decimal values. Only an actual protected candidate may lend
-# its proved decimal operands this interpretation; raw requests cannot opt in.
-sub _with_native_upsert_values {
-    my ($class, $values, $types, $context, $receipt, $limits, $work) = @_;
-    _fail('required_data_rule_pending', 'native decimal scope requires protected rule authority')
-        unless ref($receipt) && ref($work) eq q{CODE};
-    require Selecto::Write::PortableCommand;
-    my %fields;
-    for my $field (keys %$values) {
-        next unless ($types->{$field} // '') =~ /\A(?:decimal|numeric)\z/;
-        my $value = $values->{$field};
-        next if !defined($value) || defined(reftype($value)) || JSON::PP::is_bool($value);
-        my $flags = B::svref_2object(\$value)->FLAGS;
-        next unless ($flags & B::SVf_NOK()) && !($flags & B::SVf_POK());
-        _fail('required_data_rule_pending', 'native decimal candidate is nonfinite') unless POSIX::isfinite($value);
-        $fields{$field} = pack('F', $value);
-    }
-    my $previous = $NATIVE_DECIMALS;
-    $NATIVE_DECIMALS = {fields => \%fields, origin => $receipt,
-        subject => Selecto::Write::PortableCommand::_receipt_digest($values),
-        context => Selecto::Write::PortableCommand::_receipt_digest($context)};
-    my $guard = bless {restore => sub {$NATIVE_DECIMALS = $previous}}, 'Selecto::RuleTest::_NativeDecimalScope';
-    my $want = wantarray;
-    return $work->() unless defined $want;
-    return $want ? $work->() : scalar $work->();
-}
 sub spend {
     my ($limits, $work, $amount) = @_;
     $$work += $amount // 1;

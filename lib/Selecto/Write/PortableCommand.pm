@@ -212,84 +212,12 @@ sub _protected_upsert_record {
         eq _receipt_digest($engine->write_context);
     return $record;
 }
-sub _protected_upsert_declaration {
-    my ($record, $engine) = @_;
-    return ($record->{domain}, $record->{contract}) if $record;
-    my $domain = $engine->domain->as_contract;
-    # A native Domain may use the older native write shape. Its Engine has
-    # already governed that policy; reading choice bindings must not require
-    # importing it through the separate portable authoring contract.
-    return ($domain, {source => $domain->{source}, rules => $domain->{rules} // {},
-        fields => $engine->domain->writes->{fields} // {}});
-}
 sub _choice_fields {
     my ($contract, $values) = @_;
     return [grep {
         my $spec = $contract->{source}{columns}{$_} // {};
         defined($spec->{choice_source}) || ref($spec->{reference}) eq 'HASH' && defined($spec->{reference}{choice_source});
     } sort keys %$values];
-}
-sub _candidate_normalizer {
-    my ($contract) = @_;
-    return scalar(grep {
-        my $binding = $_;
-        ref($binding) eq 'HASH' && defined($binding->{normalizer})
-            && ($binding->{subject}{scope} // '') eq 'candidate'
-            && (!@{$binding->{operations} // []} || grep { $_ eq 'upsert' } @{$binding->{operations}})
-    } values %{$contract->{rules}{bindings} // {}});
-}
-sub _protected_upsert_dependencies {
-    my ($class, $proof, $engine, $state) = @_;
-    my $record = _protected_upsert_record($proof, $engine);
-    my ($domain, $contract) = _protected_upsert_declaration($record, $engine);
-    my $fields = _fields($contract);
-    return [] unless @{_choice_fields($contract, $fields)};
-    return [] if ($state->{effect} // '') eq 'nothing' && !_candidate_normalizer($contract);
-    return [sort keys %$fields];
-}
-sub _regovern_protected_upsert {
-    my ($class, $proof, $engine, $original, $realized, $state) = @_;
-    my $record = _protected_upsert_record($proof, $engine);
-    _receipt_digest([$original, $realized]);
-    _upsert_mismatch('operation_changed') unless $original->operation eq 'upsert'
-        && $realized->operation eq 'upsert' && $original->relation eq $realized->relation;
-    my $metadata = $original->metadata;
-    my $assignments = $realized->assignments;
-    if ($record) {
-        my %updates = map { $_ => 1 } @{$metadata->{upsert_update_fields} // []};
-        my $before = $original->assignments;
-        for my $field (sort keys %$assignments) {
-            next if exists $before->{$field};
-            my $spec = $record->{contract}{fields}{$field} // {};
-            $updates{$field} = 1 if _true($spec->{updatable})
-                && !grep { _true($spec->{$_}) } qw(immutable write_once server_managed);
-        }
-        $metadata->{upsert_update_fields} = [sort keys %updates];
-    }
-    # Fresh host governance owns types, scope, field grants and FK guards.
-    # Original executable intent is retained; only realized assignments and
-    # a genuine portable origin's newly assigned eligible mask can change.
-    return $engine->governed_write($original->with_assignments($assignments)->with_metadata($metadata));
-}
-sub _validate_protected_upsert_choices {
-    my ($class, $proof, $engine, $command, $state) = @_;
-    my $record = _protected_upsert_record($proof, $engine);
-    return 1 if ($state->{effect} // '') eq 'nothing';
-    my ($domain, $contract) = _protected_upsert_declaration($record, $engine);
-    my $values = _copy($state->{values});
-    _upsert_mismatch('candidate_changed') unless ref($values) eq 'HASH';
-    my @persisted = ($state->{branch} // '') eq 'conflict'
-        ? @{$command->metadata->{upsert_update_fields} // []} : keys %{$command->assignments};
-    my %persisted = map { $_ => 1 } @persisted;
-    my %attrs;
-    for my $field (@{_choice_fields($contract, \%persisted)}) {
-        _fail('required_data_rule_pending', 'realized choice assignment lacks a canonical storage value', {field => $field})
-            unless exists $values->{$field};
-        $attrs{$field} = $values->{$field};
-    }
-    _choices_now($domain, $contract, \%attrs, $record ? $record->{context} : $engine->write_context,
-        $record ? $record->{resolver} : undef, 'upsert', $record ? $record->{filters} : [], $values);
-    return 1;
 }
 
 # Nested lowering records original compiler-owned child identities, then seals
