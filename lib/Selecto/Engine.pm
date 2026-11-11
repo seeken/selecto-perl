@@ -2585,12 +2585,10 @@ sub enforce_query_evidence {
 # True when execution will add the trusted tenant for this field itself.
 sub _scopes_tenant_field {
     my ($self, $field) = @_;
-    # Public API authorization remains an explicit domain opt-in. The newer
-    # engine write binder is still an additional confinement check; it cannot
-    # grant this public-surface authority by itself.
-    my $scope = $self->{domain}->write_tenant_scope;
+    # An engine tenant bounds the write: the write binder confines every write to
+    # it on the tenant column (lesson 47), with or without writes.scope.tenant.
     my $column = $self->_write_tenant_column;
-    return $scope && defined($column) && $column eq $field && defined($self->{scope}{tenant});
+    return defined($column) && $column eq $field && defined($self->{scope}{tenant});
 }
 
 # A scope counts as tenant-scoped only when a positive conjunct (eq or in over

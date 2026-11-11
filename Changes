@@ -67,6 +67,10 @@ Revision history for Selecto
       A stream proves its own transaction (its cursor) before rolling back, so a host
       that took the handle over keeps its transaction.
 
+    - An engine tenant is a public write boundary on a tenant_field domain, with or
+      without writes.scope.tenant: the API write handler no longer refuses such a
+      write with missing_tenant_scope, and the write binder confines it to the
+      tenant. Certification TB007 and TKC002-005 now pass on every Perl target.
     - The host's own process is trusted too. Removed: the rewrite of every Engine
       method that scoped domain-identity checks, the digest walk in Engine->new,
       the caller-package checks on private methods, and the refusal of tied
