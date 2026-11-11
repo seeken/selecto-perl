@@ -105,8 +105,8 @@ sub new {
             });
             die 'stream transaction identity is unavailable' unless defined $self->{transaction};
         }
-        # search_path and the result-affecting settings pinned for the
-        # stream (R30, R35); then temp shadows refused and the session snapshot
+        # The result-affecting settings pinned for the
+        # stream (R35); then temp shadows refused and the session snapshot
         # taken before the cursor; every FETCH is compared with it (items 56,
         # 61). In its own transaction the pin lasts to the end. Inside the
         # host's, it lasts only while the stream's own statements run: the host's
@@ -118,7 +118,7 @@ sub new {
             {
                 local $adapter->{_selecto_reset_operation} = {};
                 $adapter->_pg_check_relations($args{statement});
-                $self->{pin} = $adapter->_pg_pin_search_path(0, $args{statement});
+                $self->{pin} = $adapter->_pg_pin_settings(0, $args{statement});
             }
             $self->{session} = $adapter->_pg_admit_session($args{statement}, read => 1);
         }
@@ -167,8 +167,6 @@ sub next {
     my ($self) = @_;
     local $PASS = 1;
     return undef if $self->{closed};
-    # Under SELECTO_PG_SQL_LINT, the stream's own statements are Selecto's.
-    local $self->{dbh}{private_selecto_lint_depth} = 1 if $ENV{SELECTO_PG_SQL_LINT};
     return shift @{$self->{buffer}} if @{$self->{buffer}};
     my $rows;
     my $ok = eval {
@@ -708,7 +706,7 @@ cursor away: the stream ends at its next fetch with C<query_rule_not_evaluable>
 (C<stream_cursor_gone>), and the transaction goes on. A host that ends its transaction
 mid-stream (C<COMMIT> or C<ROLLBACK>) ends the stream with C<transaction_state_unsafe>,
 and keeps its connection. (The transaction's virtual id, read at the opening, tells
-the two apart.) The stream's search_path and result settings are pinned for its own
+the two apart.) The stream's result settings are pinned for its own
 statements only: between fetches the host's statements run under the host's settings,
 and in the host's transaction what the host sets there is still in force after the
 close.

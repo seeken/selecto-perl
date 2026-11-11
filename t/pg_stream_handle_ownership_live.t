@@ -74,8 +74,7 @@ for my $end (qw(drain close drop error)) {
         my $host = {do => sub { $calls++; return }};
         $dbh->{Callbacks} = $host;
         my $e = Selecto::Engine->new(domain => $domain, adapter => Selecto::PostgreSQL->new(dbh => $dbh));
-        # (A read first: under SELECTO_PG_SQL_LINT the lint wraps the host's callbacks on
-        # the handle's first use. What the stream must give back is what it found.)
+        # (A read first. What the stream must give back is what it found.)
         $e->all($e->query->select('id'));
         my $found = $dbh->{Callbacks};
         my $ok = eval {

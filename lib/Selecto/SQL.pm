@@ -1477,36 +1477,12 @@ sub execute_transaction {
         Selecto::Error->throw('invalid_adapter', 'protected rules require an open host transaction')
             unless $self->_transaction_open;
         my $external = $request->{work};
-        return $self->_savepoint_transaction(sub { return $self->_in_host_code($external, @_) });
+        return $self->_savepoint_transaction($external);
     }
     my $work = $request->{work};
-    return $self->_transaction(sub { return $self->_in_host_code($work, @_) });
+    return $self->_transaction($work);
 }
 
-# Dialect hooks around host code Selecto calls into (a transaction callback,
-# a transaction_handler): PostgreSQL's SQL lint never inspects the host's
-# own statements (R48). Every begin is paired with an end, on success and on
-# failure, so Selecto's own statements after the host code are linted again.
-sub _host_code_begin { return undef; }
-sub _host_code_end { return; }
-
-# Runs host code in the caller's context between the two hooks.
-sub _in_host_code {
-    my ($self, $code, @args) = @_;
-    my $want = wantarray;
-    my $depth = $self->_host_code_begin;
-    my @result;
-    my $ok = eval {
-        if ($want) { @result = $code->(@args) }
-        elsif (defined $want) { $result[0] = $code->(@args) }
-        else { $code->(@args) }
-        1;
-    };
-    my $error = $@;
-    $self->_host_code_end($depth);
-    die $error unless $ok;
-    return $want ? @result : $result[0];
-}
 
 sub execute_write_unsafe {
     my ($self, $command) = @_;
@@ -3170,7 +3146,12 @@ sub _compile_write {
     local $self->{_selecto_root_relation} = {table => '' . $command->relation};
     local $self->{_selecto_relation_sink} = {};
     my $compiled = $self->_compile_write_sql($command);
-    $compiled->{relations} = [sort keys %{$self->{_selecto_relation_sink}}] if ref($compiled) eq 'HASH';
+    if (ref($compiled) eq 'HASH') {
+        $compiled->{relations} = [sort keys %{$self->{_selecto_relation_sink}}];
+        # The target as the statement names it (schema-qualified where the
+        # dialect resolves one), for the write's own lock and catalog reads.
+        $compiled->{target_sql} = $self->_relation_sql(undef, Selecto::Identifier::checked($command->relation));
+    }
     return $compiled;
 }
 
@@ -3633,6 +3614,15 @@ sub _check_write_cardinality {
     return 1;
 }
 
+# The write's target as its compiled statement names it, for SQL the write
+# sends about its own relation (locks, catalog lookups); the bare quoted name
+# outside a compiled write.
+sub _write_relation_sql {
+    my ($self, $table) = @_;
+    my $known = $self->{_selecto_write_relations};
+    return ref($known) eq 'HASH' && defined($known->{$table}) ? $known->{$table} : $self->quote_identifier($table);
+}
+
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
     # Session state around the DML (dialect hook; PostgreSQL, brief items 54,
@@ -3641,10 +3631,8 @@ sub _execute_compiled_write_in_transaction {
     # DML (item 51) lives for this write only.
     my $session = $self->_write_session_open($command, $compiled);
     local $self->{_selecto_write_target} = {};
-    # Catalog facts a dialect reads per statement may be shared by this
-    # write's statements, all run under its relation lock (PostgreSQL's
-    # extension-operator types).
-    local $self->{_selecto_write_catalog} = {};
+    local $self->{_selecto_write_relations} = ref($compiled) eq 'HASH' && defined($compiled->{target_sql})
+        ? {'' . $command->relation => $compiled->{target_sql}} : {};
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
@@ -3870,7 +3858,7 @@ sub _admit_post_image_target {
             # and child too) conflicts with CREATE TRIGGER, ALTER TABLE ...
             # ENABLE TRIGGER and CREATE RULE on them: the catalog read below
             # stays true for these relations until commit.
-            $dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
+            $dbh->do('LOCK TABLE ' . $self->_write_relation_sql($table) . ' IN ROW EXCLUSIVE MODE');
             $self->_require_read_committed($table);
             # Resolved under the lock, before the statement (item 51).
             @row = $self->_pg_post_image_catalog($self->_pg_resolve_write_target($table)->{oid});
@@ -4081,7 +4069,7 @@ sub _bound_target_check {
     my $ok = eval {
         my $oid;
         if ($phase eq 'before') {
-            $self->dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
+            $self->dbh->do('LOCK TABLE ' . $self->_write_relation_sql($table) . ' IN ROW EXCLUSIVE MODE');
             $self->_require_read_committed($table);
             $oid = $self->_pg_resolve_write_target($table)->{oid};
         } else {
@@ -4444,11 +4432,8 @@ sub _savepoint_gone { return 0; }
 sub _handler_transaction {
     my ($self, $handler, $operation) = @_;
     my ($ran, $value, $failure) = (0);
-    my $depth = $self->_host_code_begin;
     my $handled = eval {
         $handler->(sub {
-            # Selecto's own write inside the handler, then back to host code.
-            $self->_host_code_end($depth);
             $ran = 1;
             my $ok = eval {
                 Selecto::Error->throw('transaction_unavailable',
@@ -4461,14 +4446,12 @@ sub _handler_transaction {
                 1;
             };
             $failure = $@ unless $ok;
-            $self->_host_code_begin;
             die $failure unless $ok;
             return $value;
         });
         1;
     };
     my $handler_error = $@;
-    $self->_host_code_end($depth);
     die $handler_error unless $handled;
     Selecto::Error->throw('invalid_adapter', 'transaction handler did not run the write')
         unless $ran;

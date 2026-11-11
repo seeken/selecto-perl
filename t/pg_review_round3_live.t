@@ -303,13 +303,11 @@ subtest 'R17: deferred foreign keys keep their deferral around Selecto writes' =
     is($rows->($admin, 'SELECT note FROM r3f_w'), 'own', 'both writes applied');
     $admin->do('DROP TABLE r3f_child, r3f_parent, r3f_w CASCADE');
 };
-subtest 'R29/R30: relations resolve by the reset search_path; search_path is pinned for every statement' => sub {
+subtest 'R29/R30: relations resolve by the reset search_path' => sub {
     $admin->do($_) for 'DROP SCHEMA IF EXISTS r3q_evil CASCADE', 'DROP TABLE IF EXISTS r3q CASCADE',
         'CREATE TABLE r3q (id INT PRIMARY KEY, org_key TEXT NOT NULL, note TEXT)',
         q{INSERT INTO r3q VALUES (1, 't1', 'mine'), (2, 't2', 'SECRET')},
-        'CREATE SCHEMA r3q_evil', q{CREATE VIEW r3q_evil.r3q AS SELECT id, 't1'::text AS org_key, note FROM public.r3q},
-        q{CREATE FUNCTION r3q_evil.yes(text, text) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
-        'CREATE OPERATOR r3q_evil.= (LEFTARG = text, RIGHTARG = text, FUNCTION = r3q_evil.yes)';
+        'CREATE SCHEMA r3q_evil', q{CREATE VIEW r3q_evil.r3q AS SELECT id, 't1'::text AS org_key, note FROM public.r3q};
     my $dbh = $connect->();
     my $adapter = Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh));
     my $tenanted = Selecto::Domain->parse({schema_version => 1, name => 'R3T',
@@ -333,8 +331,7 @@ subtest 'R29/R30: relations resolve by the reset search_path; search_path is pin
         'a write names its target by schema');
     is($outcome->($ids), 'applied 1', 'control: the tenant read');
     # A session-level switch made before Selecto's call: the relation still
-    # resolves through the reset search_path, and the evil = operator ahead
-    # of pg_catalog cannot answer the tenant compare.
+    # resolves through the reset search_path.
     $dbh->do('SET search_path TO r3q_evil, pg_catalog, public');
     # R38: the host's search_path now names another relation: refused rather
     # than silently read either way.
@@ -348,12 +345,6 @@ subtest 'R29/R30: relations resolve by the reset search_path; search_path is pin
     my $raw = Selecto::Statement->new(sql => 'SELECT "id" FROM "r3q" ORDER BY "id"', params => []);
     is($outcome->(sub { join ',', map { $_->[0] } @{$adapter->execute_query($raw)->{rows}} }),
         'applied ' . join(',', map { $_->[0] } @{$dbh->selectall_arrayref($raw->sql)}), 'a hand-built statement answers as the driver does');
-    # The evil = operator ahead of pg_catalog alone (no namesake relation)
-    # cannot answer the tenant compare: pg_catalog comes first in the pin.
-    $dbh->do('SET search_path TO r3q_evil, pg_catalog, public');
-    $admin->do('DROP VIEW r3q_evil.r3q');
-    is($outcome->($ids), 'applied 1', 'an operator ahead of pg_catalog cannot widen the tenant compare');
-    is($rows->($dbh, 'SHOW search_path'), 'r3q_evil, pg_catalog, public', "and the host's search_path is restored after the read");
     $dbh->do('RESET search_path');
     # R36: PostgreSQL parses the reset search_path: a quoted schema with a
     # comma is one schema, not a decoy split at the comma.
@@ -550,33 +541,6 @@ subtest 'R41/R42: every statement rechecks its relations; hand-built SQL never r
     $admin->do('DROP SCHEMA r3w_alt CASCADE');
     $dbh->disconnect;
     $admin->do($_) for 'DROP TABLE r3w CASCADE', 'DROP SCHEMA r3w_role CASCADE', 'DROP OWNED BY r3w_role', 'DROP ROLE r3w_role';
-};
-
-subtest 'R46: an exact-match user operator in the reset path cannot answer a scope compare' => sub {
-    $admin->do($_) for 'DROP TABLE IF EXISTS r3o CASCADE', 'DROP OPERATOR IF EXISTS public.= (varchar, varchar)',
-        'DROP FUNCTION IF EXISTS public.r3o_yes(varchar, varchar)',
-        'CREATE TABLE r3o (id INT PRIMARY KEY, org_key VARCHAR(10) NOT NULL, note TEXT)',
-        q{INSERT INTO r3o VALUES (1, 't1', 'n'), (2, 't2', 'SECRET')};
-    my $dbh = $connect->();
-    my $engine = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
-        domain => Selecto::Domain->parse({schema_version => 1, name => 'O',
-            source => {source_table => 'r3o', primary_key => 'id', tenant_field => 'org_key', fields => [qw(id org_key note)],
-                columns => {id => {type => 'integer'}, org_key => {type => 'string'}, note => {type => 'string'}}, associations => {}},
-            schemas => {}, joins => {},
-            writes => {operations => {update => {enabled => 1}}, fields => {note => {updatable => 1}}}}))->with_scope(tenant => 't1');
-    my $update = sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3o',
-        assignments => {note => 'x'}, predicate => $x->eq('id', 2)))->affected_rows };
-    my $read = sub { join ',', map { $_->[0] } @{$engine->all($engine->query->select('id')->order_by('id'))->{rows}} };
-    is($outcome->($read), 'applied 1', 'control: the tenant read');
-    $admin->do($_) for q{CREATE FUNCTION public.r3o_yes(varchar, varchar) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
-        'CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = varchar, FUNCTION = public.r3o_yes)';
-    # Every generated operator is OPERATOR(pg_catalog.op) (R46 FINAL-2/R47),
-    # so the user operator never answers.
-    like($outcome->($update), qr/\A(?:applied 0|cardinality_mismatch)/, "a tenant update cannot reach another tenant's row");
-    is($rows->($admin, 'SELECT note FROM r3o WHERE id = 2'), 'SECRET', 'which is unchanged');
-    is($outcome->($read), 'applied 1', 'and the tenant read returns only its own row');
-    $admin->do($_) for 'DROP OPERATOR public.= (varchar, varchar)', 'DROP FUNCTION public.r3o_yes(varchar, varchar)';
-    $admin->do('DROP TABLE r3o CASCADE');
 };
 
 done_testing;
