@@ -2919,40 +2919,6 @@ sub _hand_built_locks_rows {
     return Selecto::SQL::_hand_built_text($statement->sql) =~ /\bFOR\s+(?:UPDATE|SHARE)\b|\bLOCK\s+IN\s+SHARE\s+MODE\b/i ? 1 : 0;
 }
 
-# MySQL's server says what a WITH would do, from its own parser: EXPLAIN runs nothing of a
-# write, and names one in select_type. A deny-list, so a read of any shape answers, and
-# FORMAT=TRADITIONAL, so a session's explain_format cannot take select_type away. MariaDB
-# has no write after WITH to find, and its EXPLAIN evaluates a table-less CTE, running
-# a read's function twice: the statement simply runs, or fails, as written.
-sub _hand_built_may_write {
-    my ($self, $sql, $statement) = @_;
-    my $start = Selecto::SQL::_hand_built_start(Selecto::SQL::_hand_built_text($sql) =~ s{/\*.*?\*/|--[^\n]*|\#[^\n]*}{ }gsr);
-    return 0 if $start eq '' || $start =~ /\A(?:SELECT|VALUES|TABLE)\b/i;
-    return 1 unless $start =~ /\AWITH\b/i;
-    return 0 if $self->name eq 'mariadb' || $sql !~ /\A\s*(?:\/\*.*?\*\/\s*)*WITH\b/is;
-    my $dbh = $self->{dbh};
-    my @types;
-    my $ok = eval {
-        local $dbh->{PrintError} = 0;
-        local $dbh->{RaiseError} = 1;
-        my $sth = $dbh->prepare("EXPLAIN FORMAT=TRADITIONAL $sql");
-        $sth->execute(@{$statement->params});
-        my ($column) = grep { lc($sth->{NAME}[$_]) eq 'select_type' } 0 .. $#{$sth->{NAME}};
-        die "EXPLAIN gave no select_type\n" unless defined $column;
-        while (my $row = $sth->fetchrow_arrayref) { push @types, $row->[$column] // '' }
-        $sth->finish;
-        1;
-    };
-    unless ($ok) {
-        my $failure = $self->normalize_error($@);
-        die $failure if !blessed($failure) || ($failure->details->{category} // '') eq 'query_canceled';
-        # EXPLAIN cannot answer for every role (1345: a view without SHOW VIEW). The
-        # main verb still can, and that is as far as this check goes (R73).
-        return $self->SUPER::_hand_built_may_write($sql, $statement);
-    }
-    return scalar grep { /\A(?:UPDATE|DELETE|INSERT|REPLACE)\b/i } @types;
-}
-
 # A read that cannot put the session back (READ ONLY armed, autocommit off) would
 # leave the host a connection whose next write is refused or never commits: it is
 # closed instead. Returns 1, or the error.

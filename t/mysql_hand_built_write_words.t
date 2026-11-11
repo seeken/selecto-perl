@@ -7,24 +7,9 @@ use TestSelecto;
 use Selecto;
 use Selecto::Statement;
 
-# EXPLAIN cannot answer for every role: without SHOW VIEW it is error 1345 on a
-# view. The main verb past the WITH list then decides (R73): a read that EXPLAIN
-# could not describe still runs, and a write is not let through by the failure.
-
-package NoExplainDBH {
-    our @ISA = ('TestSelecto::DBH');
-    sub prepare {
-        my ($self, $sql) = @_;
-        die "EXPLAIN/SHOW can not be issued; lacking privileges for underlying table\n" if $sql =~ /\AEXPLAIN/;
-        return $self->SUPER::prepare($sql);
-    }
-    sub err { return 1345; }
-    sub state { return '42000'; }
-}
-
-package main;
-
-my $adapter = Selecto->adapter(mysql => (dbh => NoExplainDBH->new));
+# In the host's transaction nothing stops a hand-built write, so its words decide
+# (R73): the main verb past a WITH list. This stops honest mistakes, not evasion.
+my $adapter = Selecto->adapter(mysql => (dbh => TestSelecto::DBH->new));
 my %cases = (
     'WITH x AS (SELECT 1) UPDATE vt SET a = 1' => 1,
     'WITH x AS (SELECT 1) DELETE FROM vt' => 1,
