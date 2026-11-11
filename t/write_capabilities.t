@@ -6,10 +6,8 @@ use JSON::PP ();
 use Selecto::Write;
 use Selecto::Write::Expression;
 use Selecto::Write::Capabilities;
-use Selecto::Verification::WriteCapabilitySafety;
 
 my $api = 'Selecto::Write::Capabilities';
-my $model = 'Selecto::Verification::WriteCapabilitySafety';
 sub caught {
     my ($work) = @_; my $ok = eval { $work->(); 1 }; my $error = $@;
     return $ok ? 'ok' : Scalar::Util::blessed($error) && UNIVERSAL::isa($error, 'Selecto::Error') ? $error->code : die $error;
@@ -86,21 +84,4 @@ is(caught(sub {$api->validate($wide)}), 'invalid_write_capabilities', 'broad cap
 my $large = 'x' x 70000;
 is(caught(sub {$api->validate({protocol_version => 1, unused => [$large,$large]})}), 'invalid_write_capabilities', 'repeated input occurrences consume cumulative bytes');
 
-my $states = $model->states;
-is(scalar(@$states), 30, 'all original five-by-six states exist');
-my %profiles; $profiles{$_->{profile}}{$_->{shape}} = 1 for @$states;
-is_deeply([sort keys %profiles], [sort qw(full no_returning flat_only missing_version wrong_version)], 'all original adapter profiles exist');
-is_deeply([sort keys %{$profiles{full}}], [sort qw(insert insert_returning update batch graph generated_graph)], 'all original write shapes exist');
-my ($plain_graph) = map { $_->{write} } grep { $_->{profile} eq 'full' && $_->{shape} eq 'graph' } @$states;
-is(scalar(@{$plain_graph->nodes}), 2, 'plain graph is the actual two-row original shape');
-is_deeply([map { $_->{bindings} } @{$plain_graph->nodes}], [[],[]], 'plain graph retains both independent original rows');
-my $report = $model->verify;
-is_deeply($report, {proof_level => 'bounded_exhaustive', model => 'selecto.write_capability_preflight.v1', state_count => 30,
-    check_count => 90, invariant_count => 3, counterexamples => []}, 'genuine full public preflight model passes all original invariants');
-my $fault = $model->verify(preflight => sub { 1 });
-ok(@{$fault->{counterexamples}} > 0, 'independent model detects a permissive preflight implementation');
-ok(grep($_->{invariant} eq 'protocol_mismatch_never_dispatches', @{$fault->{counterexamples}}), 'model specifically detects protocol dispatch faults');
-$fault = $model->verify(preflight => sub { Selecto::Error->throw('write_capability_missing','injected denial') });
-ok(grep($_->{invariant} eq 'dispatch_matches_independent_matrix' && $_->{state}{profile} eq 'full', @{$fault->{counterexamples}}), 'model detects blanket refusal of supported writes');
-is(caught(sub {$model->verify(preflight => bless({}, '0'))}), 'invalid_argument', 'model callback boundary rejects false-named objects');
 done_testing;

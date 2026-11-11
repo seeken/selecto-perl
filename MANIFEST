@@ -192,6 +192,7 @@ t/importer.t
 t/input_compare_path_recheck.t
 t/in_list_golden.t
 t/lib/TestSelecto.pm
+t/lib/TestWorkItems.pm
 t/manifest.t
 t/mssql.integration.t
 t/mssql.t
@@ -317,11 +318,7 @@ t/sqlite_native_projection.integration.t
 t/sqlite_action_proof.integration.t
 t/sqlite_replace_authority.integration.t
 t/sqlite_rollup.t
-lib/Selecto/Domain/ContractVerification.pm
-lib/Selecto/Verification/ContractSafety.pm
-t/contract_compatibility.t
 t/fixtures/contract_compatibility.json
-docs/contract-compatibility.md
 t/sqlite_numeric_parameters.t
 lib/Selecto/Domain/Identity.pm
 t/domain_identity.t
@@ -345,7 +342,6 @@ t/sqlite_fts_external.integration.t
 t/sqlite_projection_fts.integration.t
 t/sqlite_prefix_fts.integration.t
 lib/Selecto/Tenant/Context.pm
-lib/Selecto/Verification/QuerySafety.pm
 t/sqlite_query_safety.t
 t/sqlite_required_boolean.integration.t
 lib/Selecto/Domain/Schema.pm
@@ -369,7 +365,6 @@ t/fixtures/choice_sources.json
 t/fixtures/choice_sources_expected.json
 t/fixtures/choice_sources_case_metadata.json
 lib/Selecto/Domain/WriteContract.pm
-lib/Selecto/Verification/WriteCapabilitySafety.pm
 lib/Selecto/Write/Capabilities.pm
 lib/Selecto/Write/Operation.pm
 lib/Selecto/Write/Policy.pm
@@ -381,18 +376,10 @@ t/write_capabilities.t
 t/write_policy_bounds.t
 t/sqlite_write_policy_owned_cleanup.integration.t
 lib/Selecto/QueryBinding.pm
-lib/Selecto/Verification/GovernedQueryComposition.pm
 t/sqlite_query_members_composition.t
 t/fixtures/query_members.json
 t/fixtures/query_members_expected.json
 t/query_member_metadata.t
-lib/Selecto/Verification/MultiAtomicitySafety.pm
-lib/Selecto/Verification/NestedGraphSafety.pm
-lib/Selecto/Verification/PortableCommandSafety.pm
-lib/Selecto/Verification/TenantNonInterferenceSafety.pm
-lib/Selecto/Verification/TrustBoundarySafety.pm
-lib/Selecto/Verification/WriteModel.pm
-lib/Selecto/Verification/WriteSafety.pm
 lib/Selecto/Write/Context.pm
 lib/Selecto/Write/Multi.pm
 lib/Selecto/Write/NestedGraph.pm
@@ -402,7 +389,6 @@ lib/Selecto/Write/QueryEnforcement.pm
 t/planned_operation_provenance.t
 t/portable_command.t
 t/portable_nested_multi.t
-t/portable_write_models.t
 t/sqlite_portable_command.integration.t
 t/sqlite_portable_nested_multi.integration.t
 t/write_context_authority.t

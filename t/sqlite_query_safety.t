@@ -8,7 +8,6 @@ use JSON::PP ();
 use Storable qw(dclone);
 use Selecto;
 use Selecto::BoundedQuery;
-use Selecto::Verification::QuerySafety;
 plan skip_all => 'DBD::SQLite is required' unless eval { require DBD::SQLite; 1 };
 
 my $db = DBI->connect('dbi:SQLite:dbname=:memory:', undef, undef, {RaiseError => 1, PrintError => 0});
@@ -133,17 +132,6 @@ my $insert = $legacy->execute_write(Selecto::Write::Command->new(operation => 'i
 ok($insert, 'existing trusted scope still authorizes declared write');
 is($db->selectrow_array(q{SELECT tenant_id FROM accounts WHERE name='Legacy'}), 'tenant-a', 'legacy write retains native tenant authority');
 
-my $report = Selecto::Verification::QuerySafety->verify;
-is_deeply($report, {proof_level => 'bounded_exhaustive', model => 'selecto.query_scope.v1', state_count => 48,
-    check_count => 240, invariant_count => 5, counterexamples => []}, 'original D060 finite public/native model passes');
-{
-    no warnings 'redefine';
-    local *Selecto::Engine::validate_tenant_scope = sub { {valid => JSON::PP::true} };
-    my $fault = Selecto::Verification::QuerySafety->verify;
-    ok(@{$fault->{counterexamples}} > 0, 'actual broken validator produces counterexamples');
-    ok(grep($_->{invariant} eq 'required_scope_fails_closed', @{$fault->{counterexamples}}), 'counterexamples report the observed violated invariant');
-    is($fault->{check_count}, 240, 'faulty model still performs every check');
-}
 is($db->selectrow_array('PRAGMA temp_store'), 2, 'TEMP memory');
 my $databases = $db->selectall_arrayref('PRAGMA database_list');
 ok(@$databases >= 3 && !grep(length($_->[2]), @$databases), 'all main, TEMP and attached databases are memory');

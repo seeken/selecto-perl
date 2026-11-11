@@ -2654,10 +2654,6 @@ sub validate_query_library {
 }
 sub co_domains   { return dclone($_[0]->{co_domains} // {}); }
 sub domain_dependencies { return dclone($_[0]->{domain_dependencies} // []); }
-sub contract_snapshot {
-    require Selecto::Domain::ContractVerification;
-    return Selecto::Domain::ContractVerification->snapshot($_[0]);
-}
 sub normalize_identity {
     my ($invocant, @args) = @_;
     require Selecto::Domain::Identity;
@@ -2678,14 +2674,6 @@ sub query_identity {
     my ($invocant, @args) = @_;
     require Selecto::Domain::Identity;
     return Selecto::Domain::Identity->query_identity(ref($invocant) ? $invocant : $args[0]);
-}
-sub verify_contract_compatibility {
-    require Selecto::Domain::ContractVerification;
-    return Selecto::Domain::ContractVerification->verify($_[0], $_[1]);
-}
-sub diff_contract_snapshots {
-    require Selecto::Domain::ContractVerification;
-    return Selecto::Domain::ContractVerification->diff_snapshots($_[1], $_[2]);
 }
 sub operations   { return dclone($_[0]->{operations} // {}); }
 sub experiences  { return dclone($_[0]->{experiences} // {}); }

@@ -7,7 +7,6 @@ use JSON::PP ();
 use DBI;
 use Storable qw(dclone);
 use Selecto;
-use Selecto::Verification::GovernedQueryComposition;
 plan skip_all => 'DBD::SQLite is required' unless eval { require DBD::SQLite; 1 };
 
 sub load_json { open my $h, '<:raw', $_[0] or die $!; local $/; JSON::PP->new->utf8->decode(<$h>) }
@@ -235,16 +234,6 @@ refusal('recursive callback source expansion is bounded before SQL', 'invalid_qu
 });
 ok($recursive_calls > 0 && $recursive_calls < 100, 'finite expansion work refuses a compact recursive host declaration');
 
-my $report = Selecto::Verification::GovernedQueryComposition->verify;
-is_deeply($report, $oracles->{D061}[1], 'D061 unchanged finite two-event public model passes all original checks');
-{
-    no warnings 'redefine';
-    local *Selecto::QueryBinding::compose = sub { 1 };
-    my $fault = Selecto::Verification::GovernedQueryComposition->verify;
-    ok(grep($_->{invariant} eq 'strict_mode_rejects_ad_hoc_composition', @{$fault->{counterexamples}}), 'broken actual composition validator produces finite counterexamples');
-    is($fault->{state_count}, 220, 'fault control still derives all states');
-    is($fault->{check_count}, 1320, 'fault control still runs every check');
-}
 is($db->selectrow_array('PRAGMA temp_store'), 2, 'TEMP memory');
 ok(!grep(length($_->[2]), @{$db->selectall_arrayref('PRAGMA database_list')}), 'main and every attached database are memory');
 $db->disconnect;

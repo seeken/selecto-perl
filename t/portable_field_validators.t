@@ -180,8 +180,8 @@ subtest 'native Multi run shares compiler and execution work' => sub {
     $db->disconnect;
 };
 subtest 'opaque action provenance is not an alternate authored compile route' => sub {
-    require Selecto::Action;require Selecto::Verification::WriteModel;
-    my $raw=Selecto::Verification::WriteModel::work_items();
+    require Selecto::Action;use lib q{t/lib};require TestWorkItems;
+    my $raw=TestWorkItems::work_items();
     $raw->{writes}{fields}{state}{validators}=[['inclusion',['archived']]];
     my $handle=Selecto::Action->planned_operation($raw,{action=>'archive',target=>7});
     refuses('opaque_planned_operation',sub {Selecto::Write::PortableCommand->compile($handle)},'actual planned action remains an opaque native-execution handle');
