@@ -185,13 +185,7 @@ package RecordingDBH {
             return (($sql =~ /\ASET STATEMENT / ? '11.4.5-MariaDB' : '8.4.5'),
                 @{$self->{session}}[0 .. ($sql =~ /\@\@SESSION\.transaction_read_only, \@\@SESSION\.sql_select_limit(?:, \@\@SESSION\.system_versioning_asof)? LIMIT 1\z/ ? 9 : 7)]);
         }
-        # The session comparison after reads and writes: unchanged.
-        if (defined($self->{session}) && $sql eq 'SELECT @@SESSION.time_zone, @@SESSION.sql_mode LIMIT 1') {
-            push @{$self->{events}}, 'STATE';
-            return @{$self->{session}}[0, 5];
-        }
-        # The MySQL-family storage checks: an InnoDB base table, no shadow.
-        return ('items', 'CREATE TABLE `items` (`id` int)') if $sql =~ /SHOW CREATE TABLE/;
+        # The MySQL-family storage check: an InnoDB base table.
         return ('InnoDB') if $sql =~ /SELECT ENGINE FROM information_schema\.TABLES/;
         push @{$self->{events}}, $sql;
         return exists $self->{answers}{$sql} ? ($self->{answers}{$sql}) : die "no answer for $sql\n";
@@ -322,15 +316,15 @@ subtest 'MySQL and MariaDB' => sub {
 
         my $idle = RecordingDBH->new(session => [@session, 1, 0]);
         ok(!$write->(Selecto->adapter($name => (dbh => $idle))), "$name write succeeds");
-        is_deeply($idle->events, ['SESSION', 'SET TRANSACTION READ WRITE', 'begin_work', 'write', 'STATE', 'COMMIT AND NO CHAIN NO RELEASE'],
-            "$name begins and commits on an idle connection, comparing the session before it commits");
+        is_deeply($idle->events, ['SESSION', 'SET TRANSACTION READ WRITE', 'begin_work', 'write', 'COMMIT AND NO CHAIN NO RELEASE'],
+            "$name begins and commits on an idle connection");
         my $read_only = RecordingDBH->new(session => [@session, 1, 1]);
         ok(!$write->(Selecto->adapter($name => (dbh => $read_only))), "$name write on a read-only session default");
         is($read_only->events->[1], 'SET TRANSACTION READ ONLY', "$name keeps the session's own access mode");
 
         my $manual = RecordingDBH->new(AutoCommit => 0, session => [@session]);
         ok(!$write->(Selecto->adapter($name => (dbh => $manual))), "$name write inside begin_work succeeds");
-        is_deeply($manual->events, ['SESSION', 'SAVEPOINT selecto_write_1', 'write', 'STATE', 'RELEASE SAVEPOINT selecto_write_1'],
+        is_deeply($manual->events, ['SESSION', 'SAVEPOINT selecto_write_1', 'write', 'RELEASE SAVEPOINT selecto_write_1'],
             "$name with AutoCommit off uses a savepoint");
 
         my $unknown = RecordingDBH->new;

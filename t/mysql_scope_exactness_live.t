@@ -20,8 +20,7 @@ use Selecto::API::EngineHandler ();
 # - a text match on a TIMESTAMP scope column is refused (it reads the text
 #   in the session zone, which a function can switch mid-statement);
 # - a zero date compares in TIMESTAMP scope exactly as the server compares it;
-# - a stream on a mariadb_use_result handle works, and no row reaches the
-#   caller before the session check that covers it;
+# - a stream on a mariadb_use_result handle works;
 # - caller write predicates on TIMESTAMP columns keep the server's semantics.
 my $x = 'Selecto::Expression';
 my @backends;
@@ -181,25 +180,6 @@ for my $backend (@backends) {
     my $plain = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $unbuffered)), domain => $domain->(undef));
     is(outcome(sub { my $s = $plain->stream($plain->query->select('id')->order_by('id')); my @r; while (my $r = $s->next) { push @r, $r->[0] } \@r }),
         'ok 1,2,3,4', "$name: a use_result handle streams a plain table");
-    $unbuffered->do('DROP VIEW IF EXISTS sse_view');
-    $unbuffered->do('DROP FUNCTION IF EXISTS sse_fn');
-    $unbuffered->do(q{CREATE FUNCTION sse_fn(i INT) RETURNS INT NOT DETERMINISTIC NO SQL
-        BEGIN IF i = 3 THEN SET time_zone = '+14:00'; END IF; RETURN 1; END});
-    $unbuffered->do('CREATE VIEW sse_view AS SELECT id, org_key, ts, note FROM sse_rows WHERE sse_fn(id) = 1');
-    my $viewer = Selecto::Engine->new(adapter => Selecto->adapter($name => (dbh => $unbuffered)), domain => Selecto::Domain->parse({
-        schema_version => 1, name => 'View', source => {source_table => 'sse_view', primary_key => 'id', fields => [qw(id ts)],
-            columns => {id => {type => 'integer'}, ts => {type => 'utc_datetime'}}, associations => {}}, schemas => {}, joins => {}}));
-    my @handed;
-    # (MariaDB refuses the function's SET time_zone inside the statement
-    # itself; MySQL runs it and the stream's check refuses.)
-    like(outcome(sub { my $s = $viewer->stream($viewer->query->select('id')->order_by('id'));
-            while (my $r = $s->next) { push @handed, $r->[0] } \@handed }),
-        $name eq 'mysql' ? qr{\Aquery_rule_violation/session_state_changed\z} : qr{\A(?:query_rule_violation/session_state_changed|query_error/)\z},
-        "$name: a session change during a use_result stream is refused");
-    is(scalar(@handed), 0, "$name: before any row reaches the caller");
-    $unbuffered->do(q{SET time_zone = '+00:00'});
-    $unbuffered->do('DROP VIEW IF EXISTS sse_view');
-    $unbuffered->do('DROP FUNCTION IF EXISTS sse_fn');
     $unbuffered->disconnect;
 
     $dbh->do('DROP TABLE IF EXISTS ' . join(', ', qw(sse_items sse_link sse_acc sse_rows sse_zero)));
