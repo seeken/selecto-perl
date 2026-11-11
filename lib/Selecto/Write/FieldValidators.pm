@@ -29,11 +29,6 @@ sub _fail {
     });
 }
 sub _unsupported { _fail('unsupported_write_rule', 'write field validator is unsupported', @_) }
-sub _check_args {
-    # Called with & so Perl preserves the original argument aliases; copying
-    # a tied root scalar into a lexical would already invoke FETCH.
-    for my $index (0 .. $#_) { _unsupported() if defined(tied($_[$index])) }
-}
 sub _limits {
     my ($limits) = @_;
     return Selecto::Limits->new unless defined $limits;
@@ -46,7 +41,6 @@ sub _limits {
 # Bundles retain no consumed counter, so repeating a standalone public request
 # cannot inherit state from an earlier request.
 sub with_budget {
-    &_check_args;
     my ($class, $callback, %opts) = @_;
     _unsupported() unless ref($callback) eq 'CODE' && !grep { $_ ne 'limits' } keys %opts;
     my $limits = _limits($opts{limits});
@@ -81,12 +75,11 @@ sub _walk {
     unless (defined $type) { _bytes($state, defined($value) ? $value : ''); return }
     my $class = blessed($value) // '';
     if ($BOOL{$class} && $type eq 'SCALAR') {
-        _unsupported() if defined(tied($$value)) || !defined($$value)
+        _unsupported() if !defined($$value)
             || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
         return;
     }
     _unsupported() if length($class) || ($type ne 'HASH' && $type ne 'ARRAY');
-    _unsupported() if $type eq 'HASH' ? defined(tied(%$value)) : defined(tied(@$value));
     my $address = refaddr($value);
     _unsupported() if $state->{active}{$address};
     local $state->{active}{$address} = 1;
@@ -95,12 +88,10 @@ sub _walk {
         if $state->{nodes} + $count > $limits->get('max_expression_nodes');
     if ($type eq 'HASH') {
         for my $key (keys %$value) {
-            _unsupported() if defined(tied($value->{$key}));
             _bytes($state, $key); _walk($state, $value->{$key}, $depth + 1);
         }
     } else {
         for my $index (0 .. $#$value) {
-            _unsupported() if defined(tied($value->[$index]));
             _walk($state, $value->[$index], $depth + 1);
         }
     }
@@ -129,7 +120,6 @@ sub _copy {
     return {map { $_ => _copy($value->{$_}) } keys %$value};
 }
 sub _plain {
-    &_check_args;
     my ($value) = @_;
     _walk({nodes => 0, bytes => 0, active => {}}, $value, 0);
     return _copy($value);
@@ -161,14 +151,13 @@ sub _binary_scalar {
 # Unsupported validators on wholly unassigned fields are not interpreted by
 # the highest runtime either. Nested domains are covered by the same walk.
 sub prepare_contract {
-    &_check_args;
     my ($class, $contract, %opts) = @_;
     _options(\%opts, 'limits');
     return $class->with_budget(sub {
         my $copy = _plain($contract); _unsupported() unless ref($copy) eq 'HASH'; return $copy;
     }, limits => $opts{limits});
 }
-sub admit_domain { &_check_args; shift->prepare_contract(@_) }
+sub admit_domain { shift->prepare_contract(@_) }
 
 sub _portable_literal {
     my ($value, $field, $index) = @_;
@@ -289,7 +278,6 @@ sub _fields {
     return $fields;
 }
 sub admit {
-    &_check_args;
     my ($class, $specs, %opts) = @_;
     _options(\%opts, qw(limits fields assigned_fields));
     return $class->with_budget(sub {
@@ -302,19 +290,16 @@ sub admit {
     }, limits => $opts{limits});
 }
 sub tests {
-    &_check_args;
     my ($class, $bundle) = @_;
     _unsupported() unless ref($bundle) eq 'Selecto::Write::FieldValidators::Bundle' && exists $BUNDLES{$bundle};
     return _copy($BUNDLES{$bundle}{tests});
 }
 sub compile {
-    &_check_args;
     my ($class, $validators, %opts) = @_;
     my $bundle = $class->admit({value => {validators => $validators}}, %opts);
     return $class->tests($bundle)->{value} // [];
 }
 sub validate_values {
-    &_check_args;
     my ($class, $given, $values, %opts) = @_;
     _options(\%opts, qw(limits nonliteral_fields));
     return $class->with_budget(sub {
@@ -353,7 +338,7 @@ sub validate_values {
         return $values;
     }, limits => $opts{limits});
 }
-sub evaluate { &_check_args; shift->validate_values(@_) }
+sub evaluate { shift->validate_values(@_) }
 
 package Selecto::Write::FieldValidators::_Scope;
 sub DESTROY { Selecto::Write::FieldValidators::_scope_end() }

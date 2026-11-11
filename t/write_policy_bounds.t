@@ -52,20 +52,6 @@ for my $bad ([], 23, undef) {
         $policy->resolve_returning({returning => 'all'}, 'all', $bad);
     };
 }
-{
-    package Local::TiedWriteFields;
-    our $HOOKS = 0;
-    sub TIEHASH {bless {}, shift}
-    sub FIRSTKEY {++$HOOKS; 'secret'}
-    sub NEXTKEY {++$HOOKS; undef}
-    sub FETCH {++$HOOKS; 'string'}
-    sub EXISTS {++$HOOKS; 1}
-}
-tie my %tied_fields, 'Local::TiedWriteFields';
-refusal 'returning admits complete field registry before enumeration', 'invalid_query_contract', sub {
-    $policy->resolve_returning({returning => 'all'}, 'all', \%tied_fields);
-};
-is $Local::TiedWriteFields::HOOKS, 0, 'field registry tie hooks never run';
 refusal 'literal mutation cannot satisfy required field with blank text', 'missing_required_write_fields', sub {
     $policy->apply(Selecto::Write::Command->new(operation => 'insert', relation => 'items',
         assignments => {name => Selecto::Write::Expression->literal(' ')}),

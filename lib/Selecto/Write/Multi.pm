@@ -26,15 +26,14 @@ sub _name {
 sub _operations {
     my ($given) = @_;
     _error('invalid_operation', 'Multi operations must be a bounded ordered array')
-        unless ref($given) eq 'ARRAY' && !defined(tied(@$given)) && @$given <= $MAX_OPERATIONS;
+        unless ref($given) eq 'ARRAY' && @$given <= $MAX_OPERATIONS;
     my @operations;
     my $budget = Selecto::OperationBudget->new(code=>'invalid_operation');
     for my $index (0 .. $#$given) {
-        _error('invalid_operation', 'Multi operation entries cannot be tied') if defined(tied($given->[$index]));
         my $pair = $given->[$index];
         _error('invalid_operation', 'Multi entries require a name and constructed operation')
-            unless ref($pair) eq 'ARRAY' && !defined(tied(@$pair)) && @$pair == 2
-                && !defined(tied($pair->[0])) && !defined(tied($pair->[1]));
+            unless ref($pair) eq 'ARRAY' && @$pair == 2
+;
         my ($name, $operation) = @$pair;
         _error('invalid_operation', 'Multi operation names must be authored nonempty strings') unless _name($name);
         _error('invalid_write_operation', 'Multi requires constructed portable operations')

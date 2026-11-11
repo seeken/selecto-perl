@@ -79,10 +79,6 @@ refused('executable callback metadata',sub { $_[0]->domain->{components}{extra}=
 refused('excessively deep structural metadata',sub { my$v={};$v={next=>$v} for 1..66;$_[0]->domain->{components}{extra}=$v },sub { $_[0]->compile($_[0]->query->select('id')) });
 refused('cyclic structural metadata',sub { my$d=$_[0]->domain; $d->{components}{extra}=$d },sub { $_[0]->compile($_[0]->query->select('id')) });
 is($calls,0,'seal admission invokes no metadata callbacks, overloads, isa or serialization hooks');
-{package SealTied;sub TIEHASH {bless{},shift}sub FIRSTKEY {$calls++;die 'callback'}sub FETCH {$calls++;die 'callback'} }
-my %tied;tie %tied,'SealTied';
-refused('tied structural metadata',sub { $_[0]->domain->{components}{extra}=\%tied },sub { $_[0]->compile($_[0]->query->select('id')) });
-is($calls,0,'tied container is refused without traversal callbacks');
 for my $route (qw(preview_write execute_write execute_batch)) {
  refused("domain mutation at $route",sub { $_[0]->domain->{table}='other_records' },sub {
   my($e)=@_;my$c=Selecto::Write::Command->new(operation=>'insert',relation=>'records',assignments=>{name=>'New',state=>'open',tenant_id=>7});

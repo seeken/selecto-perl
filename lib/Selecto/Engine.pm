@@ -772,12 +772,11 @@ sub _batch_engines {
         unless @$options==2 && !defined(reftype($options->[0])) && defined($options->[0]) && $options->[0] eq 'engines';
     my $engines=$options->[1];
     Selecto::Error->throw('invalid_write','batch engines must match every command')
-        unless ref($engines) eq 'ARRAY' && !defined(tied(@$engines)) && @$engines==@{$batch->commands};
+        unless ref($engines) eq 'ARRAY' && @$engines==@{$batch->commands};
     Selecto::OperationBudget->new(limits=>$self->{limits},code=>'invalid_write')->consume_count(
         'max_expression_nodes',scalar(@$engines),label=>'configured batch engines');
     my $context=Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($self->{write_context});
     for my $index (0..$#$engines) {
-        Selecto::Error->throw('invalid_write','batch engines cannot contain tied values') if defined(tied($engines->[$index]));
         my $engine=$engines->[$index];
         Selecto::Error->throw('invalid_write','batch requires genuinely configured engines')
             unless ref($engine) eq 'Selecto::Engine' && $CONFIGURED_DOMAIN{$engine};

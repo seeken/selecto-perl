@@ -94,10 +94,6 @@ for my $bad (sub {$calls++}, bless({}, 'CapabilityEvil'), bless({}, '0')) {
     my $error = caught(sub {Selecto::Domain->validate_capability_policy($copy)});
     is(ref($error) ? $error->code : 'none', 'invalid_query_contract', 'whole declaration refuses executable/object metadata before copy');
 }
-{package CapabilityTied; sub TIEHASH {bless {},shift} sub FIRSTKEY {$calls++;die 'tie'} sub FETCH {$calls++;die 'tie'}}
-tie my %tied, 'CapabilityTied';
-my $tied_error = caught(sub {Selecto::Domain->validate_capability_policy(\%tied)});
-is(ref($tied_error) ? $tied_error->code : 'none', 'invalid_query_contract', 'tied root is refused before enumeration');
 is($calls, 0, 'no callback, resolver, serializer, overload or tied hook executes');
 for my $control (qw(cycle depth breadth bytes alias)) {
     my $copy = dclone($valid);

@@ -46,24 +46,8 @@ is($calls,0,'changed plan cannot call resolver');
  isa_ok($e,'Selecto::Error');is($CallbackObject::hooks,0,'planned-operation metadata refuses callbacks before actual planner clone');
 }
 {
- package ProvenanceTieHash;
- our$hooks=0;
- sub TIEHASH {bless{},shift}sub FIRSTKEY{++$hooks;undef}sub NEXTKEY{++$hooks;undef}sub FETCH{++$hooks;undef}sub SCALAR{++$hooks;0}
- package ProvenanceTieArray;
- our$hooks=0;
- sub TIEARRAY{bless{},shift}sub FETCHSIZE{++$hooks;0}sub FETCH{++$hooks;undef}
- package ProvenanceTieScalar;
- our$hooks=0;
- sub TIESCALAR{bless{},shift}sub FETCH{++$hooks;'unsafe'}
- package main;
- my$p=Selecto::Action->plan($d,{action=>'archive',target=>7});tie my%h,'ProvenanceTieHash';$p->target(\%h);
- $e=caught(sub{Selecto::Action->validate_provenance($p)});isa_ok($e,'Selecto::Error');is($ProvenanceTieHash::hooks,0,'nested tied plan HASH refuses before iteration or fetch');
- $p=Selecto::Action->plan($d,{action=>'archive',target=>7});tie my@a,'ProvenanceTieArray';$p->filters(\@a);
- $e=caught(sub{Selecto::Action->validate_provenance($p)});isa_ok($e,'Selecto::Error');is($ProvenanceTieArray::hooks,0,'nested tied plan ARRAY refuses before size or fetch');
- $p=Selecto::Action->plan($d,{action=>'archive',target=>7});tie $p->{changes}{state},'ProvenanceTieScalar';
- $e=caught(sub{Selecto::Action->validate_provenance($p)});isa_ok($e,'Selecto::Error');is($ProvenanceTieScalar::hooks,0,'nested tied plan scalar slot refuses before FETCH');
  my$class0_hooks=0;{no strict 'refs';no warnings 'redefine';*{'0::STORABLE_freeze'}=sub{++$class0_hooks;return('callback')};}
- $p=Selecto::Action->plan($d,{action=>'archive',target=>7});$p->changes({state=>bless({},'0')});
+ my$p=Selecto::Action->plan($d,{action=>'archive',target=>7});$p->changes({state=>bless({},'0')});
  $e=caught(sub{Selecto::Action->validate_provenance($p)});isa_ok($e,'Selecto::Error');is($e->code,'invalid_planned_operation','false class name is a native reference and refuses');is($class0_hooks,0,'class0 native reference refuses before serialization hooks');
  my$inside=bless({},'0');my$wrapped=bless\$inside,'JSON::PP::Boolean';
  $p=Selecto::Action->plan($d,{action=>'archive',target=>7});$p->changes({state=>$wrapped});

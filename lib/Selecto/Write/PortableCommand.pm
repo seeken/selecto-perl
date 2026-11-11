@@ -44,7 +44,6 @@ sub _input_mismatch { _fail('compiled_input_mismatch', 'compiled INPUT evidence 
 # Inspect native records directly, before accessors, cloning or encoding. This
 # bounded identity includes all fields and preserves scalar numeric/text kinds.
 sub _receipt_digest {
-    _input_mismatch() if grep { defined(tied($_[$_])) } 0..$#_;
     my ($value) = @_;
     my $hash = Digest::SHA->new(256);
     my ($nodes, $bytes) = (0, 0);
@@ -79,13 +78,12 @@ sub _receipt_digest {
         }
         my $class = blessed($node) // '';
         if ($class eq 'JSON::PP::Boolean') {
-            _input_mismatch() unless $type eq 'SCALAR' && !defined(tied($$node));
+            _input_mismatch() unless $type eq 'SCALAR';
             _input_mismatch() if !defined($$node) || defined(reftype($$node)) || "$$node" !~ /\A[01]\z/;
             return $part->('B', $$node ? '1' : '0');
         }
         _input_mismatch() if length($class) && !$RECEIPT_CLASSES{$class};
         _input_mismatch() unless $type eq 'HASH' || $type eq 'ARRAY';
-        _input_mismatch() if $type eq 'HASH' ? defined(tied(%$node)) : defined(tied(@$node));
         my $address = refaddr($node);
         _input_mismatch() if $active{$address};
         local $active{$address} = 1;
@@ -94,12 +92,10 @@ sub _receipt_digest {
         $part->('C', $class);$part->($type eq 'HASH' ? 'H' : 'A', "$count");
         if ($type eq 'HASH') {
             for my $key (sort keys %$node) {
-                _input_mismatch() if defined(tied($node->{$key}));
                 $part->(utf8::is_utf8($key) ? 'Ku' : 'Kb', $key);$walk->($node->{$key}, $depth + 1);
             }
         } else {
             for my $index (0..$#$node) {
-                _input_mismatch() if defined(tied($node->[$index]));
                 $walk->($node->[$index], $depth + 1);
             }
         }

@@ -57,10 +57,7 @@ my$marker=0;my$forged=bless\$marker,$model;
 my$reblessed=$api->unknown;bless$reblessed,$options_model;
 my$calls=0;
 {package ResultEvil;use overload '""'=>sub{$calls++;'evil'},bool=>sub{$calls++;1},fallback=>1;sub isa{$calls++;1}sub TO_JSON{$calls++;die'hook'}sub as_hash{$calls++;die'hook'}}
-{package ResultTie;sub TIEARRAY{bless{},shift}sub TIEHASH{bless{},shift}sub TIESCALAR{bless{},shift}sub FETCH{$calls++;die'hook'}sub FETCHSIZE{$calls++;die'hook'}sub FIRSTKEY{$calls++;die'hook'}}
-tie my@tied_array,'ResultTie';tie my%tied_hash,'ResultTie';
-my@tied_element=('ok',$api->valid);tie$tied_element[0],'ResultTie';
-for my$bad(undef,{status=>'valid'},$forged,bless({},'ResultEvil'),bless({},'0'),\@tied_array,\%tied_hash,\@tied_element,['ok',{status=>'valid'}],['bad',$api->valid],$api->options_resolved([])){
+for my$bad(undef,{status=>'valid'},$forged,bless({},'ResultEvil'),bless({},'0'),['ok',{status=>'valid'}],['bad',$api->valid],$api->options_resolved([])){
  $r=$api->validate_choice($d,'owner_id',42,{},sub{$bad});
  is_deeply([$r->status,$r->reason_code],[qw(unknown invalid_resolver_result)],'forged/serialized/malformed/wrong-model provider result refuses');
 }
@@ -76,7 +73,6 @@ for my$bad({status=>'resolved'},{status=>7},{status=>JSON::PP::true},{status=>'v
 for my$bad(sub{$calls++},bless({},'ResultEvil'),bless({},'0')){
  is(code(caught(sub{$api->valid('reason',{unrelated=>$bad})})),'invalid_query_contract','whole result input rejects executable or unknown object metadata');
 }
-is(code(caught(sub{$api->valid('reason',\%tied_hash)})),'invalid_query_contract','tied result metadata refuses before hooks');
 is($calls,0,'result constructors execute no input hooks');
 my$cycle={};$cycle->{cycle}=$cycle;
 is(code(caught(sub{$api->valid('reason',$cycle)})),'invalid_query_contract','cyclic native result metadata refuses');

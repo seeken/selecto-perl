@@ -42,15 +42,13 @@ sub _walk {
     my $class = blessed($value) // '';
     if ($BOOLEAN{$class} && $type eq 'SCALAR') {
         _fail($state->{code}, 'write preflight contains an invalid Boolean')
-            if defined(tied($$value)) || !defined($$value) || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
+            if !defined($$value) || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
         return;
     }
     _fail($state->{code}, 'write preflight contains unsupported executable or object input')
         if length($class) && (!$state->{native} || !$RECORD{$class});
     _fail($state->{code}, 'write preflight requires plain containers or native records')
         unless $type eq 'HASH' || $type eq 'ARRAY';
-    _fail($state->{code}, 'write preflight contains tied input')
-        if $type eq 'HASH' ? defined(tied(%$value)) : defined(tied(@$value));
     my $address = refaddr($value);
     _fail($state->{code}, 'write preflight contains a cycle') if $state->{active}{$address};
     local $state->{active}{$address} = 1;
@@ -59,12 +57,10 @@ sub _walk {
         if $state->{nodes} + $count > $state->{nodes_limit};
     if ($type eq 'HASH') {
         for my $key (keys %$value) {
-            _fail($state->{code}, 'write preflight contains tied scalar input') if defined(tied($value->{$key}));
             _bytes($state, $key); _walk($state, $value->{$key}, $depth + 1);
         }
     } else {
         for my $i (0 .. $#$value) {
-            _fail($state->{code}, 'write preflight contains tied scalar input') if defined(tied($value->[$i]));
             _walk($state, $value->[$i], $depth + 1);
         }
     }

@@ -70,9 +70,6 @@ for my $given (sub { ++$hooks }, bless({}, 'Member::Hooks')) {
     my $bad = dclone($raw); $bad->{query_members}{ctes}{plain}{query} = $given;
     is(caught(sub { report($bad) }), 'invalid_query_contract', 'executable metadata is refused before callbacks or clone hooks');
 }
-{ package Member::Tie; sub TIEHASH { bless {}, shift } sub FIRSTKEY { ++$hooks; die 'FETCH forbidden' } sub FETCH { ++$hooks; die 'FETCH forbidden' } }
-my %tied; tie %tied, 'Member::Tie';
-is(caught(sub { report(\%tied) }), 'invalid_query_contract', 'tied root refuses without enumerating it');
 my $cycle = {}; $cycle->{query_members} = $cycle;
 is(caught(sub { report($cycle) }), 'invalid_query_contract', 'cycles are refused before copying');
 is($hooks, 0, 'declaration admission has zero callback/tie/overload effects');

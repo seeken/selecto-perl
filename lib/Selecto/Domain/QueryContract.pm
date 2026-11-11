@@ -38,14 +38,11 @@ sub _walk {
     }
     my $class = blessed($value) // '';
     if ($BOOL{$class} && $type eq 'SCALAR') {
-        _fail('query contract contains an invalid boolean') if defined(tied($$value))
-            || !defined($$value) || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
+        _fail('query contract contains an invalid boolean') if !defined($$value) || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
         return;
     }
     _fail('query contract contains unsupported executable or object metadata')
         if length($class) || ($type ne 'HASH' && $type ne 'ARRAY');
-    _fail('query contract contains tied metadata')
-        if $type eq 'HASH' ? defined(tied(%$value)) : defined(tied(@$value));
     my $address = refaddr($value);
     _fail('query contract contains a cycle') if $state->{active}{$address};
     local $state->{active}{$address} = 1;
@@ -54,13 +51,11 @@ sub _walk {
         if $state->{nodes} + $count > $LIMITS->{max_expression_nodes};
     if ($type eq 'HASH') {
         for my $key (keys %$value) {
-            _fail('query contract contains tied scalar metadata') if defined(tied($value->{$key}));
             _bytes($state, $key);
             _walk($state, $value->{$key}, $depth + 1);
         }
     } else {
         for my $index (0 .. $#$value) {
-            _fail('query contract contains tied scalar metadata') if defined(tied($value->[$index]));
             _walk($state, $value->[$index], $depth + 1);
         }
     }

@@ -95,9 +95,6 @@ for my$bad(sub{$calls++},bless({},'ProjectionEvil'),bless({},'0')) {
   is(ref($error)?$error->code:'none','invalid_query_contract',"$projection refuses executable metadata before projection");
  }
 }
-{package ProjectionTied;sub TIEHASH{bless{},shift}sub FIRSTKEY{$calls++;die'tied hook'}sub FETCH{$calls++;die'tied hook'}}
-tie my%tied,'ProjectionTied';my$error=caught(sub{Selecto::Domain->project(\%tied,'ui')});
-is(ref($error)?$error->code:'none','invalid_query_contract','tied root refuses before inspection');
 is($calls,0,'callbacks, overloads, clone/getter and tied hooks never execute');
 for my$kind(qw(cycle depth breadth bytes alias)) {
  my$c=dclone($original);

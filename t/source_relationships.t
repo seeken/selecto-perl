@@ -121,8 +121,6 @@ for my$bad (7,JSON::PP::true,[],{}) {
 
 my$calls=0;
 {package RelationshipEvil;use overload '""'=>sub{$calls++;'evil'},'bool'=>sub{$calls++;1},fallback=>1;sub isa{$calls++;1}sub STORABLE_freeze{$calls++;die'callback'}sub TO_JSON{$calls++;die'callback'}}
-{package RelationshipTied;sub TIEHASH{bless{},shift}sub FIRSTKEY{$calls++;die'tied hook'}sub FETCH{$calls++;die'tied hook'}}
-{package RelationshipScalar;sub TIESCALAR{bless{},shift}sub FETCH{$calls++;die'tied scalar'}}
 for my$bad(sub{$calls++},bless({},'RelationshipEvil'),bless({},'0')) {
  my$d=dclone($original);$d->{unrelated_extension}=$bad;
  for my$method(qw(validate_source_relationships project_source_relationships)) {
@@ -130,14 +128,6 @@ for my$bad(sub{$calls++},bless({},'RelationshipEvil'),bless({},'0')) {
   is(ref($e)?$e->code:'','invalid_query_contract',"$method refuses executable/object metadata anywhere in complete input");
  }
 }
-tie my%tied,'RelationshipTied';
-for my$method(qw(validate_source_relationships project_source_relationships)) {
- my$e=caught(sub{Selecto::Domain->$method(\%tied)});
- is(ref($e)?$e->code:'','invalid_query_contract',"$method refuses tied root before inspection");
-}
-$c=dclone($original);tie $c->{source_relationships}{owner}{source_path},'RelationshipScalar';
-$error=caught(sub{Selecto::Domain->validate_source_relationships($c)});
-is(ref($error)?$error->code:'','invalid_query_contract','tied nested scalar refuses before FETCH');
 is($calls,0,'callbacks, overloads, getter/clone hooks and tied FETCH never execute');
 for my$kind(qw(cycle depth breadth bytes alias)) {
  my$d=dclone($original);

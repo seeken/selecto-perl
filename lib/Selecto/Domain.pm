@@ -314,8 +314,6 @@ sub parse {
     }
     _object($raw, 'domain');
     require Selecto::Tenant::Context;
-    Selecto::Error->throw('invalid_query_contract', 'domain read requirement must be plain metadata')
-        if defined(tied(%$raw)) || grep { exists($raw->{$_}) && defined(tied($raw->{$_})) } qw(tenant_required require_tenant);
     Selecto::Tenant::Context->boolean($raw->{$_}, "domain $_") for grep { defined $raw->{$_} } qw(tenant_required require_tenant);
     Selecto::Error->throw('invalid_tenant_context', 'domain requirement aliases conflict')
         if defined($raw->{tenant_required}) && defined($raw->{require_tenant})

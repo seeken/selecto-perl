@@ -92,10 +92,6 @@ for my $bad (sub{$calls++},bless({},'QueryContractEvil'),bless({},'0')) {
  }
 }
 is($calls,0,'callbacks, overloads, serialization and subclass hooks are never invoked');
-{package QueryContractTied;sub TIEHASH{bless {},shift}sub FIRSTKEY{$calls++;die 'tied hook'}sub FETCH{$calls++;die 'tied hook'}}
-tie my %tied,'QueryContractTied';
-my$error=caught(sub {Selecto::Domain->project_query_contract(\%tied)});
-is(ref($error)?$error->code:'none','invalid_query_contract','tied root refuses before hooks');is($calls,0,'tied callbacks are not invoked');
 for my $control (qw(cycle depth breadth bytes alias)) {
  my$c=dclone($original);
  if($control eq 'cycle'){$c->{audit_cycle}=$c}

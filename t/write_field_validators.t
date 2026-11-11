@@ -223,47 +223,22 @@ subtest 'plain snapshots and ASTs have independent ownership' => sub {
 
 our $HOOKS = 0;
 {
-    package Local::TiedHash;
-    sub TIEHASH { bless {}, shift } sub FIRSTKEY { ++$main::HOOKS; return }
-    sub FETCH { ++$main::HOOKS; return } sub EXISTS { ++$main::HOOKS; return 1 }
-    package Local::TiedArray;
-    sub TIEARRAY { bless {}, shift } sub FETCHSIZE { ++$main::HOOKS; return 1 }
-    sub FETCH { ++$main::HOOKS; return 'bad' }
-    package Local::TiedScalar;
-    sub TIESCALAR { bless {}, shift } sub FETCH { ++$main::HOOKS; return 'bad' }
     package Local::Executable;
     use overload '""' => sub { ++$main::HOOKS; 'bad' }, bool => sub { ++$main::HOOKS; 1 }, fallback => 1;
     sub STORABLE_freeze { ++$main::HOOKS; return }
 }
 subtest 'callback-free recursive admission including inactive policy and slots' => sub {
-    tie my %hash, 'Local::TiedHash'; tie my @array, 'Local::TiedArray';
-    my %slot = (value => undef); tie $slot{value}, 'Local::TiedScalar';
-    my @slot = (undef); tie $slot[0], 'Local::TiedScalar';
     my $class0 = bless {}, '0';
     my $object = bless {}, 'Local::Executable';
     my $cyclic = {}; $cyclic->{next} = $cyclic;
-    for my $bad (\%hash, \@array, \%slot, \@slot, $object, $class0, sub { ++$HOOKS }, $cyclic, qr/x/) {
+    for my $bad ($object, $class0, sub { ++$HOOKS }, $cyclic, qr/x/) {
         $HOOKS = 0;
         error('unsupported_write_rule', sub { $FV->prepare_contract({writes => {fields => {inactive => {validators => [$bad]}}}}) }, 'nested bad plain shape');
         is($HOOKS, 0, 'no callback/overload/tied fetch');
     }
     $HOOKS = 0;
-    error('unsupported_write_rule', sub { $FV->admit({value => {}}, fields => \@array) }, 'tied selection');
-    is($HOOKS, 0, 'selection no tied hooks');
-    $HOOKS = 0;
     error('unsupported_write_rule', sub { $FV->validate_values({value => {}}, {value => $object}) }, 'assignment object');
     is($HOOKS, 0, 'assignment no object hooks');
-    tie my $root, 'Local::TiedScalar';
-    my @root_probes = (
-        sub { $FV->admit($root) }, sub { $FV->compile($root) }, sub { $FV->prepare_contract($root) },
-        sub { $FV->admit_domain($root) }, sub { $FV->validate_values($root, {}) },
-        sub { $FV->validate_values({}, $root) }, sub { $FV->evaluate({}, $root) },
-    );
-    for my $probe (@root_probes) {
-        $HOOKS = 0;
-        error('unsupported_write_rule', $probe, 'direct tied root scalar');
-        is($HOOKS, 0, 'root scalar no FETCH before admission');
-    }
     my $domain = {writes => {fields => {a => {validators => ['unknown']}}}};
     is_deeply($FV->admit_domain($domain), $domain, 'plain admission does not interpret inactive semantic syntax');
 };

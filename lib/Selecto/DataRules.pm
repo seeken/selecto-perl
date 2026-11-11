@@ -25,7 +25,6 @@ my %BOOLEAN = map { $_ => 1 } qw(JSON::PP::Boolean JSON::XS::Boolean Types::Seri
 # repeated aliases and allocation; active-path references distinguish cycles
 # from repeated, independently copied values.
 sub _copy_plain {
-    _fail($_[2], 'rule input contains tied metadata') if defined(tied($_[0]));
     my ($value, $limits, $code, $label) = @_;
     my $budget = Selecto::OperationBudget->new(limits => $limits, code => $code);
     $budget->consume_count('max_expression_nodes', 1, label => "$label nodes");
@@ -35,7 +34,6 @@ sub _copy_plain {
         my ($source, $target, $depth, $leave) = @{pop @stack};
         if ($leave) { delete $active{$leave}; next }
         $limits->check_count('max_expression_depth', $depth, $code, "$label depth");
-        _fail($code, "$label contains tied metadata") if defined(tied($$source));
         my $node = $$source;
         my $type = reftype($node);
         unless (defined $type) {
@@ -57,8 +55,7 @@ sub _copy_plain {
         }
         my $class = blessed($node) // '';
         if ($BOOLEAN{$class} && $type eq 'SCALAR') {
-            _fail($code, "$label contains an invalid Boolean") if defined(tied($$node))
-                || !defined($$node) || defined(reftype($$node))
+            _fail($code, "$label contains an invalid Boolean") if !defined($$node) || defined(reftype($$node))
                 || do { use bytes; length($$node) } != 1 || "$$node" !~ /\A[01]\z/;
             my $bit = $$node ? 1 : 0;
             $budget->consume_count('max_state_bytes', 1, label => "$label bytes");
@@ -67,8 +64,6 @@ sub _copy_plain {
         }
         _fail($code, "$label contains an unsupported reference")
             if length($class) || ($type ne 'ARRAY' && $type ne 'HASH');
-        _fail($code, "$label contains tied metadata")
-            if $type eq 'HASH' ? defined(tied(%$node)) : defined(tied(@$node));
         my $address = refaddr($node);
         _fail($code, "$label contains a cycle") if $active{$address};
         $active{$address} = 1;
@@ -79,22 +74,16 @@ sub _copy_plain {
             my $result = {}; $$target = $result;
             for my $key (keys %$node) {
                 $budget->consume_count('max_state_bytes', do { use bytes; length($key) }, label => "$label bytes");
-                _fail($code, "$label contains tied metadata") if defined(tied($node->{$key}));
                 push @stack, [\$node->{$key}, \$result->{$key}, $depth + 1];
             }
         } else {
             my $result = []; $$target = $result;
             for my $index (reverse 0 .. $#$node) {
-                _fail($code, "$label contains tied metadata") if defined(tied($node->[$index]));
                 push @stack, [\$node->[$index], \$result->[$index], $depth + 1];
             }
         }
     }
     return $copy;
-}
-sub _check_untied_arguments {
-    _fail('invalid_data_rules_contract', 'rule input contains tied metadata')
-        if grep { defined(tied($_[$_])) } 0 .. $#_;
 }
 
 # Only the native engine opens this scope. It is not a request option or
@@ -163,7 +152,6 @@ sub _measure_proof_work {
 
 
 sub parse {
-    &_check_untied_arguments;
     my ($class, $raw, %options) = @_;
     my $limits = $options{limits} // Selecto::Limits->new;
     $raw = _copy_plain($raw, $limits, 'invalid_data_rules_contract', 'data rules contract');

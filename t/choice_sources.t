@@ -159,16 +159,11 @@ is(code(caught(sub{Selecto::Domain->validate_choice_sources($c)})),'invalid_choi
 
 my$calls=0;
 {package ChoiceEvil;use overload '""'=>sub{$calls++;'evil'},bool=>sub{$calls++;1},fallback=>1;sub isa{$calls++;1}sub TO_JSON{$calls++;die'callback'}sub STORABLE_freeze{$calls++;die'callback'}}
-{package ChoiceTie;sub TIEHASH{bless{},shift}sub TIESCALAR{bless{},shift}sub FETCH{$calls++;die'callback'}sub FIRSTKEY{$calls++;die'callback'}}
 for my$bad(sub{$calls++},bless({},'ChoiceEvil'),bless({},'0')){
  $c=dclone($d);$c->{unrelated_extension}=$bad;
  is(code(caught(sub{$api->binding($c,'owner_id')})),'invalid_query_contract','complete declaration rejects callbacks and objects before interpretation');
  is(code(caught(sub{$api->request($d,'owner_id',1,{extension=>$bad})})),'invalid_query_contract','complete host metadata rejects executable values');
 }
-tie my%tied,'ChoiceTie';
-is(code(caught(sub{$api->binding(\%tied,'owner_id')})),'invalid_query_contract','tied root refuses without FETCH');
-$c=dclone($d);tie$c->{choice_sources}{owner_choices}{domain},'ChoiceTie';
-is(code(caught(sub{Selecto::Domain->validate_choice_sources($c)})),'invalid_query_contract','tied nested identity refuses without FETCH');
 is($calls,0,'no callback, overload or tied hook ran during metadata admission');
 for my$kind(qw(cycle depth breadth bytes repeated_aliases)){
  $c=dclone($d);

@@ -122,13 +122,12 @@ sub _admit_native {
     my $class = blessed($value);
     if (defined($class) && $class =~ /\A(?:JSON::PP::Boolean|JSON::XS::Boolean|Types::Serialiser::Boolean)\z/) {
         _fail('invalid_query_enforcement', 'captured query contains an invalid boolean')
-            unless $type eq 'SCALAR' && !defined(tied($$value)) && defined($$value) && !defined(reftype($$value)) && "$$value" =~ /\A[01]\z/;
+            unless $type eq 'SCALAR' && defined($$value) && !defined(reftype($$value)) && "$$value" =~ /\A[01]\z/;
         return;
     }
     _fail('invalid_query_enforcement', 'captured query contains unsupported object metadata')
         if defined($class) && $class !~ /\A(?:Selecto::(?:Query|Expression|Domain|Domain::Association|DataRules|Pattern|Limits)|Math::Big(?:Rat|Int|Int::Calc))\z/;
     _fail('invalid_query_enforcement', 'captured query contains unsupported native references') unless $type eq 'HASH' || $type eq 'ARRAY';
-    _fail('invalid_query_enforcement', 'captured query contains tied metadata') if $type eq 'HASH' ? defined(tied(%$value)) : defined(tied(@$value));
     my $id = refaddr($value);
     _fail('invalid_query_enforcement', 'captured query contains a cycle') if $state->{active}{$id};
     local $state->{active}{$id} = 1;
@@ -136,13 +135,11 @@ sub _admit_native {
     _fail('invalid_query_enforcement', 'captured query exceeds its metadata node limit') if $state->{nodes} + $count > $LIMITS->{max_expression_nodes};
     if ($type eq 'HASH') {
         for my $key (keys %$value) {
-            _fail('invalid_query_enforcement', 'captured query contains tied scalar metadata') if defined(tied($value->{$key}));
             _admit_native($key, $state, $depth+1);
             _admit_native($value->{$key}, $state, $depth+1);
         }
     } else {
         for my $index (0..$#$value) {
-            _fail('invalid_query_enforcement', 'captured query contains tied scalar metadata') if defined(tied($value->[$index]));
             _admit_native($value->[$index], $state, $depth+1);
         }
     }

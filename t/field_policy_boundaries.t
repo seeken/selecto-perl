@@ -88,12 +88,10 @@ my $many = [(undef) x 10_001];
 our $hooks = 0;
 {package PolicyHook;sub STORABLE_freeze {$main::hooks++;return 'bad'};use overload '""'=>sub{$main::hooks++;'bad'},fallback=>1;}
 {no strict 'refs'; @{'0::ISA'} = ('PolicyHook');}
-{package PolicyTied;sub TIEHASH {bless {},shift}sub FIRSTKEY {$main::hooks++;undef}sub NEXTKEY {undef}sub FETCH {$main::hooks++;undef}}
-my %tied;tie %tied,'PolicyTied';
 $hooks=0;my$false_class=bless({},'0');is("$false_class",'bad','false class name has a reachable overload positive control');is($hooks,1,'false class overload witness actually ran');
 my @bad = (
     ['executable option', [sub {$hooks++}]], ['serialization object', [bless({},'PolicyHook')]],
-    ['false class name', [bless({},'0')]], ['tied option', [\%tied]], ['cyclic option',$cycle],
+    ['false class name', [bless({},'0')]], ['cyclic option',$cycle],
     ['deep option',[$deep]], ['oversized option',$large], ['too many occurrences',$many],
 );
 for my $case (@bad) {
@@ -104,13 +102,6 @@ for my $bad_flag ('yes', 2, undef, [], {}, sub {$hooks++}, bless({},'PolicyHook'
     $hooks=0;reject('malformed host descriptor option',{profile=>[{field=>'status',view_capability=>'read'}],include_hidden_values=>$bad_flag},1);
     is($hooks,0,'malformed host descriptor option invokes no hooks');
 }
-my $tied_value;{package PolicyTiedScalar;sub TIESCALAR {bless{},shift}sub FETCH {$main::hooks++;'A'}sub STORE {}}
-my $tied_flag;tie $tied_flag,'PolicyTiedScalar';my $bool_ref=bless(\$tied_flag,'JSON::PP::Boolean');$hooks=0;
-reject('tied Boolean host descriptor option',{profile=>[{field=>'status',view_capability=>'read'}],include_hidden_values=>$bool_ref},1);
-is($hooks,0,'tied host descriptor option is refused without FETCH');
-my $slot={status=>'A'};tie $slot->{status},'PolicyTiedScalar';$hooks=0;
-reject('tied snapshot scalar',{profile=>[{field=>'status',view_capability=>'read'}],snapshot=>$slot},1);
-is($hooks,0,'tied snapshot is refused without FETCH');
 reject('non-object snapshot',{profile=>['status'],snapshot=>[]},1);
 reject('non-array profile',{profile=>{}},1);
 

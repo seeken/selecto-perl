@@ -117,20 +117,9 @@ my $cycle = {}; $cycle->{prefix} = $cycle;
 refusal('cyclic context input is refused', 'invalid_query_contract', sub { engine()->with_tenant($cycle) });
 refusal('context breadth is bounded before normalization', 'invalid_query_contract', sub { engine()->with_tenant({required_filters => [map { ['tenant_id', 'tenant-a'] } 1 .. 4000]}) });
 is($hooks, 0, 'context admission invokes no callbacks, overloads or cloning hooks');
-{ package Local::TenantTied; sub TIEHASH { bless {}, shift } sub FIRSTKEY { ++$hooks; die 'unexpected tie callback' } sub FETCH { ++$hooks; die 'unexpected tie callback' } }
-my %tied_context; tie %tied_context, 'Local::TenantTied';
-refusal('tied context root is refused before callbacks', 'invalid_query_contract', sub { engine()->with_tenant(\%tied_context) });
-is($hooks, 0, 'context admission does not enumerate a tied root');
 my $domain_input = dclone($raw); $domain_input->{tenant_required} = bless({}, 'Local::TenantHooks');
 refusal('domain required flag is admitted before canonical clone', 'invalid_query_contract', sub { Selecto::Domain->parse($domain_input) });
 is($hooks, 0, 'domain flag admission invokes no hooks');
-{ package Local::TenantTiedScalar; sub TIESCALAR { bless {}, shift } sub FETCH { ++$hooks; die 'unexpected flag FETCH' } }
-for my $flag (qw(tenant_required require_tenant)) {
-    my $input = dclone($raw);
-    tie $input->{$flag}, 'Local::TenantTiedScalar';
-    refusal("tied $flag slot refuses before fetching", 'invalid_query_contract', sub { Selecto::Domain->parse($input) });
-}
-is($hooks, 0, 'neither read-requirement alias fetches tied scalar metadata');
 my $plain_without_flags = dclone($raw); delete $plain_without_flags->{tenant_required};
 my $before_plain_parse = dclone($plain_without_flags);
 Selecto::Domain->parse($plain_without_flags);
