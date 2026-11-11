@@ -2,6 +2,12 @@ Revision history for Selecto
 
 0.2.3  Unreleased
     Before deploying:
+    - PostgreSQL statements Selecto generates now write operators and functions
+      plainly, and search_path stays the host's: they resolve as the host's own
+      queries do on the same connection. An extension (citext, hstore) installed in a
+      schema that is not on a connection's search_path no longer lends its operators
+      to Selecto's statements: put that schema on the path, as the host's own queries
+      need. No untrusted role may have CREATE in a schema on the path.
     - Give every handle RaiseError => 1. Without it a failed read is still an error,
       but a host's own statements around Selecto's are not checked.
     - Search for reads that write: a view using nextval, an audit function. They now

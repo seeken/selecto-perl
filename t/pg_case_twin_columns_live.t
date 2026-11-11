@@ -21,7 +21,6 @@ use TestPostgreSQL ();
 # own for the same comparison.
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
-local $ENV{SELECTO_PG_SQL_LINT} = 1;
 my $x = 'Selecto::Expression';
 my $admin = TestPostgreSQL->connect;
 $admin->do('SET client_min_messages TO warning');
@@ -127,19 +126,5 @@ for my $case (['r56_cv', 'ORG', 'org'], ['r56_cw', 'org', 'ORG']) {
     is($member->('r', $x->eq('r.o', 'T1')), '', 'a renamed member output of the text twin compares as text');
 }
 
-# Hand-built references follow PostgreSQL's folding, and relation twins stay
-# two relations within one statement.
-{
-    my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
-    my $q = sub { local $ENV{SELECTO_PG_SQL_LINT} = 0; $adapter->_statement_sql($_[0]) };
-    unlike($q->(q{SELECT id FROM public.r56_cv AS c WHERE c.ORG = 'x'}), qr/CAST/, 'an unquoted ORG is org, the text twin');
-    like($q->(q{SELECT id FROM public.r56_cv AS c WHERE c."ORG" = 'x'}), qr/CAST/, 'a quoted "ORG" is the citext twin');
-    unlike($q->(q{SELECT a.id FROM public.r56_rt AS a JOIN public."R56_RT" AS b ON b.id = a.id WHERE a.org = 'x'}), qr/CAST/,
-        'a relation keeps its own columns beside its case twin');
-    like($q->(q{SELECT a.id FROM public.r56_rt AS a JOIN public."R56_RT" AS b ON b.id = a.id WHERE b.org = 'x'}), qr/CAST/,
-        'the case twin relation keeps its citext column');
-    unlike($q->(q{SELECT "A".id FROM public."R56_RT" AS a JOIN public.r56_rt AS "A" ON "A".id = a.id WHERE "A".org = 'x'}), qr/CAST/,
-        'alias case twins stay two aliases');
-}
 
 done_testing;

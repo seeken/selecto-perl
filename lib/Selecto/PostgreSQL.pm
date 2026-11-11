@@ -123,17 +123,6 @@ sub _with_relations {
 
 sub stream_query {
     my ($self, $statement, %options) = @_;
-    if ($ENV{SELECTO_PG_SQL_LINT} && _pg_hand_built($statement)) {
-        local $self->{_selecto_pg_host_statement} = $statement->sql;
-        return $self->_lint_scope(sub { $self->_stream_query_linted($statement, %options) });
-    }
-    return $self->_lint_scope(sub { $self->_stream_query_linted($statement, %options) })
-        if $ENV{SELECTO_PG_SQL_LINT} && !$self->{dbh}{private_selecto_lint_depth};
-    return $self->_stream_query_linted($statement, %options);
-}
-
-sub _stream_query_linted {
-    my ($self, $statement, %options) = @_;
     unless ($options{bounded}) {
         # DBD::Pg runs the whole statement and buffers its rows at execute,
         # so the session check right after it covers every row.
@@ -243,7 +232,7 @@ sub insert_admission_storage {
     my $fail = sub { Selecto::Error->throw('query_rule_not_evaluable',
         'PostgreSQL cannot establish the guarded insert storage contract'); };
     $fail->() unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' };
-    my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
+    my $table = $self->_write_relation_sql(Selecto::Identifier::checked($command->relation));
     # Keep the inspected table and trigger/type definitions stable until DML.
     $dbh->do("LOCK TABLE ONLY $table IN ROW EXCLUSIVE MODE");
     # The trigger and rule checks below need READ COMMITTED (see
@@ -421,25 +410,11 @@ sub supports {
 # value; every other value is canonical. Export scalars are decoded in Perl.
 sub execute_query {
     my ($self, $statement, %options) = @_;
-    if ($ENV{SELECTO_PG_SQL_LINT} && _pg_hand_built($statement)) {
-        # The host's own statement: Selecto's guard SQL around it is still
-        # linted, the host's SQL is not (see _query_transport_sql).
-        local $self->{_selecto_pg_host_statement} = $statement->sql;
-        return $self->_lint_scope(sub { $self->_execute_query_linted($statement, %options) });
-    }
-    return $self->_lint_scope(sub { $self->_execute_query_linted($statement, %options) })
-        if $ENV{SELECTO_PG_SQL_LINT} && !$self->{dbh}{private_selecto_lint_depth};
-    return $self->_execute_query_linted($statement, %options);
+    # Session state around the read: see SESSION STATE.
+    return $self->_guarded_read($statement, sub { return $self->_execute_raw($statement, %options) });
 }
 
-sub _execute_query_linted {
-    my ($self, $statement, %options) = @_;
-    # Session state around the read (items 56, 61): see Session state.
-    return $self->_guarded_read($statement,
-        sub { return $self->_execute_query_unguarded($statement, %options) });
-}
-
-sub _execute_query_unguarded {
+sub _execute_raw {
     my ($self, $statement, %options) = @_;
     if ($options{export_scalars}) {
         local $self->{_selecto_export_scalars} = 1;
@@ -1778,41 +1753,29 @@ sub _pg_root_schema {
     return $root->{schema} = $temporary ? undef : $schema;
 }
 
-# R30, R35: Selecto pins search_path, and every setting that changes how
-# its SQL parses literals or renders results, for each of its statements,
-# inside its own transaction or savepoint: search_path is pg_catalog first
-# (operators, functions and types resolve there before anything else), then
-# the reset search path's schemas, pg_temp last; TimeZone, DateStyle,
-# IntervalStyle, extra_float_digits, bytea_output and
-# standard_conforming_strings take their reset values (pg_settings.reset_val:
-# server, database, role or connection configuration), so the host's
-# configured semantics hold while a session-level switch does not. A switch that persisted
-# before the call (including one masked by a local set_config) cannot
-# redirect a name or change a scope literal's meaning. The host's values
-# are restored with set_config(..., true) before control returns (a
-# rollback reverts them too); on an idle autocommit handle a read sets them
-# for the session and restores them right after.
+# R35: Selecto pins every setting that changes how its SQL parses literals
+# or renders results, for each of its statements, inside its own transaction
+# or savepoint: TimeZone, DateStyle, IntervalStyle, extra_float_digits,
+# bytea_output and standard_conforming_strings take their reset values
+# (pg_settings.reset_val: server, database, role or connection
+# configuration), so a session-level switch cannot change a scope literal's
+# meaning. The host's values are restored with set_config(..., true) before
+# control returns (a rollback reverts them too); on an idle autocommit handle
+# a read sets them for the session and restores them right after.
+# search_path stays the host's: relations are schema-qualified when compiled,
+# and operators, functions and types resolve as for the host's own queries.
 my @PINNED_SETTINGS = map { [$_ => undef] }
     qw(TimeZone DateStyle IntervalStyle extra_float_digits bytea_output standard_conforming_strings timezone_abbreviations);
-sub _pg_pin_search_path {
+sub _pg_pin_settings {
     my ($self, $session, $source, %options) = @_;
     my $local = $session ? 'false' : 'true';
-    local $self->{_selecto_relation_schemas} = {};
-    my @declared = $self->_pg_declared_schemas($source);
-    my %seen;
-    my @schemas = grep { !$seen{$_}++ } @declared, $self->_pg_reset_schemas;
-    my $pinned = join(', ', 'pg_catalog', (map { _quote_path_schema($_) } @schemas), 'pg_temp');
-    my @pins = (['search_path' => $pinned], @PINNED_SETTINGS);
-    # search_path takes the resolved pin; every other setting its reset
-    # value (R35 amendment), read through pg_catalog in the same statement,
-    # from one scan of pg_settings (each scan builds every setting's row).
-    my @reset = map { $_->[0] } grep { !defined $_->[1] } @pins;
+    my @pins = @PINNED_SETTINGS;
+    # Each setting takes its reset value, read through pg_catalog in the same
+    # statement, from one scan of pg_settings (each scan builds every setting's row).
+    my @reset = map { $_->[0] } @pins;
     my @set = map {
-        my $name = $pins[$_][0];
-        defined($pins[$_][1])
-            ? "pg_catalog.set_config('$name', \$" . ($_ + 1) . ", $local)"
-            : "pg_catalog.set_config('$name', (SELECT r.reset_val FROM r WHERE r.name OPERATOR(pg_catalog.=) '$name'), $local)"
-    } 0 .. $#pins;
+        "pg_catalog.set_config('$_', (SELECT r.reset_val FROM r WHERE r.name OPERATOR(pg_catalog.=) '$_'), $local)"
+    } @reset;
     my $current = join ', ', map { "pg_catalog.current_setting('$pins[$_][0]') AS s$_" } 0 .. $#pins;
     my $names = '{' . join(',', @reset) . '}';
     my @host;
@@ -1821,18 +1784,18 @@ sub _pg_pin_search_path {
             . 'r AS MATERIALIZED (SELECT s.name, s.reset_val FROM pg_catalog.pg_settings s '
             . "WHERE s.name OPERATOR(pg_catalog.=) ANY (CAST('$names' AS pg_catalog.text[]))) SELECT "
             . join(', ', (map { "h.s$_" } 0 .. $#pins), @set,
-                $options{read_only} ? q{pg_catalog.set_config('transaction_read_only', 'on', true)} : ()) . ' FROM h', undef, $pins[0][1]);
+                $options{read_only} ? q{pg_catalog.set_config('transaction_read_only', 'on', true)} : ()) . ' FROM h');
         1;
     };
     die $self->normalize_error($@) unless $ok;
     Selecto::Error->throw('query_rule_not_evaluable', "the session's reset settings could not be read",
         {reason => 'session_state_unknown'}) unless @host == 2 * @pins + ($options{read_only} ? 1 : 0) && !grep { !defined } @host;
     # (applied: what set_config set, so a bounded stream can set the same again per FETCH.)
-    return {host => [map { [$pins[$_][0], $host[$_]] } 0 .. $#pins], pinned => $pinned, session => $session ? 1 : 0,
+    return {host => [map { [$pins[$_][0], $host[$_]] } 0 .. $#pins], session => $session ? 1 : 0,
         applied => [map { [$pins[$_][0], $host[@pins + $_]] } 0 .. $#pins]};
 }
 
-sub _pg_restore_search_path {
+sub _pg_restore_settings {
     my ($self, $pin) = @_;
     return unless ref($pin) eq 'HASH';
     my ($set, @binds) = _pg_restore_columns($pin);
@@ -1850,11 +1813,6 @@ sub _pg_restore_columns {
         map { $_->[1] } @host);
 }
 
-sub _quote_path_schema {
-    my ($name) = @_;
-    (my $quoted = $name) =~ s/"/""/g;
-    return qq{"$quoted"};
-}
 
 # True when the handle is a live DBD::Pg handle (the session checks need
 # one; adapter tests with other handles run unchecked).
@@ -1875,7 +1833,7 @@ sub _pg_state_row {
 # The session snapshot, or a typed refusal when it cannot be read.
 #
 # With a pin, the same statement then restores the host's settings (see
-# _pg_restore_search_path): the snapshot is materialized before any
+# _pg_restore_settings): the snapshot is materialized before any
 # set_config in the outer list runs.
 sub _pg_session_state {
     my ($self, $pin, %options) = @_;
@@ -1943,12 +1901,12 @@ sub _write_session_open {
     my ($self, $command, $compiled) = @_;
     return undef unless $self->_pg_session_checked;
     # The write runs inside its own transaction or savepoint: check its
-    # relations (R41), pin search_path for it (R30), then snapshot under the
-    # pin.
+    # relations (R41), pin the result settings for it (R35), then snapshot
+    # under the pin.
     my $pin = do {
         local $self->{_selecto_reset_operation} = {};
         $self->_pg_check_relations($compiled) if ref($compiled) eq 'HASH';
-        $self->_pg_pin_search_path;
+        $self->_pg_pin_settings;
     };
     my $state = $self->_pg_admit_session(ref($compiled) eq 'HASH' ? $compiled : undef);
     $state->{pin} = $pin;
@@ -1956,10 +1914,10 @@ sub _write_session_open {
     return $state;
 }
 
-# After the write's last post-statement check: the host's search_path again.
+# After the write's last post-statement check: the host's settings again.
 sub _write_session_close {
     my ($self, $state) = @_;
-    $self->_pg_restore_search_path($state->{pin}) if ref($state) eq 'HASH';
+    $self->_pg_restore_settings($state->{pin}) if ref($state) eq 'HASH';
     return;
 }
 
@@ -2105,7 +2063,7 @@ sub _guarded_read {
             {
                 local $self->{_selecto_reset_operation} = {};
                 $self->_pg_check_relations($source) unless $trusted;
-                $pin = $self->_pg_pin_search_path(0, $source, read_only => !$locks);
+                $pin = $self->_pg_pin_settings(0, $source, read_only => !$locks);
             }
             $before = $self->_pg_admit_session($source, read => 1) unless $trusted;
         }
@@ -2240,7 +2198,6 @@ sub _pg_hold_relations {
         _pg_uninterrupted(sub { $dbh->do(shift @sql); $made = 1 });
         $dbh->do(join '; ', @sql);
         if (defined $plan) {
-            local $self->{_selecto_pg_host_statement} = $plan;
             my $sth = $dbh->prepare($plan);
             $sth->execute(@{$source->params});
             my ($text) = $sth->fetchrow_array;
@@ -2292,7 +2249,7 @@ sub _pg_resolve_write_target {
           ARRAY(SELECT CAST(t.relid AS pg_catalog.oid) FROM pg_catalog.pg_partition_tree(c.oid) t
                 UNION SELECT c.oid)
         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
-        WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)}, undef, $self->quote_identifier($table));
+        WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)}, undef, $self->_write_relation_sql($table));
     Selecto::Error->throw('query_rule_not_evaluable', 'the written relation could not be resolved',
         {reason => 'relation_unresolved', relation => $table}) unless @row && defined $row[0];
     my $target = {oid => $row[0], qualified => $row[1], oids => $row[2]};
@@ -2313,97 +2270,16 @@ sub _pg_write_target {
 
 sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
 
-# A statement Selecto compiled (or derived from one) carries its recorded
-# relations and is qualified; a host's hand-built Statement is the host's
-# own SQL and is sent exactly as written (R48), outside the lint.
-sub _query_transport_sql {
-    my ($self, $statement) = @_;
-    return $statement->sql if _pg_hand_built($statement);
-    local $self->{_selecto_qualify_declared} = [$self->_pg_declared_schemas($statement)];
-    return $self->_statement_sql($statement->sql);
-}
-
+# A host's hand-built Statement (one with no recorded relations) is the host's
+# own SQL.
 sub _pg_hand_built {
     my ($statement) = @_;
     return blessed($statement) && $statement->can('relations') && !defined($statement->relations) ? 1 : 0;
 }
 
-# The statement as executed: every operator and pg_catalog function
-# qualified (R46/R47). SELECTO_PG_SQL_LINT=1 makes any construct left to the
-# session's lookup a hard error (the lint the test suite runs under).
-sub _statement_sql {
-    my ($self, $sql) = @_;
-    return $sql unless defined($sql) && !ref($sql) && $self->_pg_session_checked;
-    require Selecto::PostgreSQL::Qualify;
-    my $functions = $self->_pg_catalog_functions;
-    my $qualified = Selecto::PostgreSQL::Qualify::qualify($sql, $functions, $self->_pg_extension_operators($sql));
-    if ($ENV{SELECTO_PG_SQL_LINT}) {
-        my @problems = Selecto::PostgreSQL::Qualify::lint($qualified, $functions);
-        die "SELECTO_PG_SQL_LINT: @problems in: $qualified\n" if @problems;
-    }
-    return $qualified;
-}
-
-# ---- SQL lint (SELECTO_PG_SQL_LINT=1, the test suite's corpus check) ------
-#
-# Under the lint, every statement Selecto itself executes on the handle,
-# business SQL and its guard and catalog SQL alike (R48), must resolve no
-# operator or pg_catalog function through the session; any that does dies.
-# Only Selecto's own work is inspected: the host's statements, including
-# those a transaction callback or transaction_handler runs, never are.
-my %LINT_SKIP = map { ($_ => 1) } qw(SAVEPOINT RELEASE ROLLBACK BEGIN COMMIT SET LOCK DECLARE FETCH CLOSE DEALLOCATE);
-sub _lint_scope {
-    my ($self, $work) = @_;
-    my $dbh = $self->{dbh};
-    return $work->() unless $ENV{SELECTO_PG_SQL_LINT} && $self->_pg_session_checked;
-    unless ($dbh->{private_selecto_lint_hooked}) {
-        $dbh->{private_selecto_lint_hooked} = 1;
-        my $adapter = $self;
-        Scalar::Util::weaken($adapter);
-        my $check = sub {
-            my ($handle, $sql) = @_;
-            return unless $handle->{private_selecto_lint_depth};
-            return unless defined($sql) && !ref($sql) && $adapter;
-            my ($first) = $sql =~ /\A\s*([A-Za-z]+)/;
-            return if $first && $LINT_SKIP{uc $first};
-            # The host's own statement (raw, or inside a stream's cursor).
-            my $host = $adapter->{_selecto_pg_host_statement};
-            return if defined($host) && index($sql, $host) >= 0;
-            require Selecto::PostgreSQL::Qualify;
-            local $handle->{private_selecto_lint_depth} = 0;
-            my @problems = Selecto::PostgreSQL::Qualify::lint($sql, $adapter->_pg_catalog_functions);
-            die "SELECTO_PG_SQL_LINT: @problems in: $sql\n" if @problems;
-        };
-        # prepare sees every statement (selectrow_array and friends prepare
-        # internally; a ChildCallbacks execute hook would miss those), and do
-        # without parameters runs without one.
-        my %callbacks = %{$dbh->{Callbacks} // {}};
-        for my $method (qw(prepare do)) {
-            my $prior = $callbacks{$method};
-            $callbacks{$method} = sub { $check->($_[0], $_[1]); return $prior ? $prior->(@_) : () };
-        }
-        $dbh->{Callbacks} = \%callbacks;
-    }
-    local $dbh->{private_selecto_lint_depth} = 1;
-    return $work->();
-}
-
-sub _host_code_begin {
-    my ($self) = @_;
-    my $dbh = $self->{dbh};
-    return undef unless eval { $dbh->isa('DBI::db') };
-    my $depth = $dbh->{private_selecto_lint_depth};
-    $dbh->{private_selecto_lint_depth} = 0;
-    return $depth;
-}
-
-sub _host_code_end {
-    my ($self, $depth) = @_;
-    my $dbh = $self->{dbh};
-    $dbh->{private_selecto_lint_depth} = $depth if eval { $dbh->isa('DBI::db') };
-    return;
-}
-
+# Before a write opens its transaction or savepoint, the session must send
+# UTF-8 (R65); checked once for the whole operation, whatever it runs inside.
+# A failed or busy connection is the write's own guard to refuse.
 for my $method (qw(compile preview_write execute_write execute_batch execute_graph execute_transaction
     execute_write_unsafe execute_batch_unsafe execute_graph_unsafe)) {
     no strict 'refs';
@@ -2411,601 +2287,11 @@ for my $method (qw(compile preview_write execute_write execute_batch execute_gra
     next if defined &{"Selecto::PostgreSQL::$method"};
     *{"Selecto::PostgreSQL::$method"} = sub {
         my ($self, @args) = @_;
-        return $self->_lint_scope(sub {
-            # Before a write opens its transaction or savepoint (R65). A failed
-            # or busy connection is the write's own guard to refuse. Read once for
-            # the whole operation, whatever it runs inside.
-            local $self->{_selecto_utf8_checked} = $self->{_selecto_utf8_checked} // 0;
-            my $state = $method =~ /\Aexecute_/ && $self->_pg_session_checked ? $self->_connection_state : '';
-            $self->_pg_require_utf8($state) if $state =~ /\A(?:idle|intrans)\z/;
-            return $self->$inherited(@args);
-        });
+        local $self->{_selecto_utf8_checked} = $self->{_selecto_utf8_checked} // 0;
+        my $state = $method =~ /\Aexecute_/ && $self->_pg_session_checked ? $self->_connection_state : '';
+        $self->_pg_require_utf8($state) if $state =~ /\A(?:idle|intrans)\z/;
+        return $self->$inherited(@args);
     };
-}
-
-# pg_catalog's function names, once per connection (pg_catalog is fixed for
-# a server; nothing a session does can change it).
-sub _pg_catalog_functions {
-    my ($self) = @_;
-    my $dbh = $self->{dbh};
-    return $dbh->{private_selecto_pg_functions} if ref($dbh->{private_selecto_pg_functions}) eq 'HASH';
-    my $rows;
-    # Each name, and whether an overload returns a scalar polymorphic type
-    # taken from a scalar or array argument (its result can then be an
-    # extension type, as unnest(citext[]) or a polymorphic aggregate's: see
-    # Qualify's operand classes). A range's or enum's element alone does not
-    # count (upper(anyrange)). 'string': every overload over strings returns a
-    # pg_catalog string type.
-    my $ok = eval {
-        $rows = $dbh->selectall_arrayref(q{SELECT CAST(p.proname AS pg_catalog.text),
-            pg_catalog.bool_or(CAST(p.prorettype AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
-                (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray,anyarray,anycompatiblearray}' AS pg_catalog.regtype[]))
-              AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS a(t)
-                WHERE CAST(a.t AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
-                  (CAST('{anyelement,anynonarray,anycompatible,anycompatiblenonarray,anyarray,anycompatiblearray}' AS pg_catalog.regtype[])))),
-            pg_catalog.bool_and(CAST(p.prorettype AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
-                (CAST('{pg_catalog.text,pg_catalog.varchar,pg_catalog.bpchar,pg_catalog.name}' AS pg_catalog.regtype[]))
-              OR EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS a(t, i)
-                WHERE a.i OPERATOR(pg_catalog.=) CAST(1 AS pg_catalog.int8) AND CAST(a.t AS pg_catalog.regtype) OPERATOR(pg_catalog.=) ANY
-                  (CAST('{anyrange,anymultirange,pg_catalog.bytea,pg_catalog.bit,pg_catalog.varbit}' AS pg_catalog.regtype[])))),
-            pg_catalog.bool_or(p.pronargs OPERATOR(pg_catalog.=) CAST(1 AS pg_catalog.int2)
-              AND CAST(p.prorettype AS pg_catalog.regtype) OPERATOR(pg_catalog.=) CAST('pg_catalog.text' AS pg_catalog.regtype)
-              AND p.proargtypes[0] OPERATOR(pg_catalog.=) CAST(CAST('pg_catalog.text' AS pg_catalog.regtype) AS pg_catalog.oid))
-            FROM pg_catalog.pg_proc p
-            WHERE p.pronamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace) GROUP BY 1});
-        1;
-    };
-    die $self->normalize_error($@) unless $ok;
-    # 'follows': a text overload returns text, so a string argument gives a
-    # string (max, min).
-    my %names = map { (lc($_->[0]) => ($_->[1] ? 'polymorphic' : $_->[2] ? 'string' : $_->[3] ? 'follows' : 1)) } @{$rows // []};
-    $dbh->{private_selecto_pg_functions} = \%names;
-    return \%names;
-}
-
-# What the qualifier needs to type operands (R48, R49, review M1-M4), read
-# per statement, nothing cached:
-# - every column of each relation the statement names (one missing from the
-#   list was not there when the types were read);
-# - for a column of an extension member type (citext and the like), a
-#   domain over one (the typbasetype chain is followed to the base type) or
-#   an array of one: the schema of each operator and of each function the
-#   type's own extension defines for it (never a user object someone added
-#   beside them: each must be a pg_depend member of the type's extension),
-#   and, for the aggregates that extension defines over the type alone
-#   (citext's max and min), whether they return the type; every other
-#   function stays pg_catalog's, whatever is planted beside it;
-# - for each function the statement reads rows from: whether its outputs can
-#   be an extension type ("unknown") or not ("known");
-# - the transaction's isolation level (see _pg_verify_column_types).
-# - for an extension type: whether it is in the string category, and the
-#   cross-type members of its extension (R51: isbn13 = ean13, citext ~~ text);
-# - which columns are pg_catalog string types, or a domain over one, and which
-#   are a domain an extension owns over a type it does not;
-# A column whose domain chain is still a domain after 16 steps is refused.
-my $EXTENSION_OPERATORS_SQL = q{WITH RECURSIVE
-    a AS (SELECT r.rel, at.attname, at.atttypid FROM pg_catalog.unnest(CAST($1 AS pg_catalog.text[])) AS r(rel)
-      JOIN pg_catalog.pg_attribute at ON at.attrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(r.rel)
-        AND at.attnum OPERATOR(pg_catalog.>) 0 AND NOT at.attisdropped),
-    c(rel, att, oid, depth, arr) AS (
-      SELECT a.rel, a.attname, a.atttypid, 0, false FROM a
-      UNION ALL
-      SELECT c.rel, c.att, CASE WHEN t.typtype OPERATOR(pg_catalog.=) 'd' THEN t.typbasetype ELSE t.typelem END,
-        c.depth OPERATOR(pg_catalog.+) 1, c.arr OR t.typtype OPERATOR(pg_catalog.<>) 'd'
-      FROM c JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.oid
-      WHERE c.depth OPERATOR(pg_catalog.<) 16 AND (t.typtype OPERATOR(pg_catalog.=) 'd' OR (NOT c.arr
-        AND t.typtype OPERATOR(pg_catalog.=) 'b' AND t.typcategory OPERATOR(pg_catalog.=) 'A'
-        AND t.typelem OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid) AND t.typlen OPERATOR(pg_catalog.<) 0))),
-    e AS (SELECT c.rel, c.att, c.arr, ty.oid, d.refobjid FROM c
-      JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
-        AND ty.typcategory OPERATOR(pg_catalog.<>) 'A'
-      JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
-        AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'),
-    l(oid, parent) AS MATERIALIZED (
-      SELECT t.oid, t.typbasetype FROM pg_catalog.pg_type t WHERE t.typbasetype OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)
-      UNION ALL
-      SELECT t.oid, t.typelem FROM pg_catalog.pg_type t WHERE t.typelem OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.oid)),
-    x(oid, depth) AS (
-      SELECT d.objid, 0 FROM pg_catalog.pg_depend d
-      WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
-      UNION ALL
-      SELECT l.oid, x.depth OPERATOR(pg_catalog.+) 1 FROM l JOIN x ON l.parent OPERATOR(pg_catalog.=) x.oid
-      WHERE x.depth OPERATOR(pg_catalog.<) 16),
-    f AS (SELECT p.oid, p.proname, CASE WHEN p.proallargtypes IS NULL THEN ARRAY[p.prorettype]
-        ELSE ARRAY(SELECT u.t FROM ROWS FROM (pg_catalog.unnest(p.proallargtypes), pg_catalog.unnest(p.proargmodes)) AS u(t, m)
-          WHERE u.m OPERATOR(pg_catalog.=) ANY (CAST('{o,b,t}' AS "char"[]))) END AS outs
-      FROM pg_catalog.pg_proc p WHERE CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY (CAST($2 AS pg_catalog.text[])))
-    SELECT 'col', CAST(a.rel AS pg_catalog.text), CAST(a.attname AS pg_catalog.text), CAST(a.atttypid AS pg_catalog.text), NULL FROM a
-    UNION ALL
-    SELECT 'deep', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), NULL, NULL
-    FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
-    WHERE c.depth OPERATOR(pg_catalog.=) 16
-    UNION ALL
-    SELECT CASE WHEN c.arr THEN 'estr' ELSE 'str' END, CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text),
-      CAST(ty.typname AS pg_catalog.text), NULL
-    FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
-    WHERE ty.typcategory OPERATOR(pg_catalog.=) 'S'
-      AND ty.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)
-    UNION ALL
-    SELECT 'xdom', CAST(c.rel AS pg_catalog.text), CAST(c.att AS pg_catalog.text), CAST(o.oprname AS pg_catalog.text),
-      pg_catalog.format_type(ty.oid, NULL)
-    FROM c JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.=) 'd'
-    JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
-      AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e'
-    LEFT JOIN (c b JOIN pg_catalog.pg_type bt ON bt.oid OPERATOR(pg_catalog.=) b.oid AND bt.typtype OPERATOR(pg_catalog.<>) 'd'
-        AND bt.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace)
-      JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) bt.oid AND o.oprright OPERATOR(pg_catalog.=) bt.oid
-        AND o.oprnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace))
-      ON b.rel OPERATOR(pg_catalog.=) c.rel AND b.att OPERATOR(pg_catalog.=) c.att AND NOT b.arr
-    WHERE NOT c.arr
-    UNION ALL
-    SELECT CASE WHEN e.arr THEN 'exop' ELSE 'xop' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
-      pg_catalog.concat(o.oprname, pg_catalog.chr(31),
-        pg_catalog.quote_ident(CAST(ln.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(lt.typname AS pg_catalog.text)), pg_catalog.chr(31),
-        pg_catalog.quote_ident(CAST(rn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(rt.typname AS pg_catalog.text))),
-      CAST(n.nspname AS pg_catalog.text)
-    FROM e JOIN pg_catalog.pg_operator o ON (o.oprleft OPERATOR(pg_catalog.=) e.oid OR o.oprright OPERATOR(pg_catalog.=) e.oid)
-      AND o.oprleft OPERATOR(pg_catalog.<>) o.oprright
-    JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
-      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
-    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace
-    JOIN pg_catalog.pg_type lt ON lt.oid OPERATOR(pg_catalog.=) o.oprleft
-    JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lt.typnamespace
-    JOIN pg_catalog.pg_type rt ON rt.oid OPERATOR(pg_catalog.=) o.oprright
-    JOIN pg_catalog.pg_namespace rn ON rn.oid OPERATOR(pg_catalog.=) rt.typnamespace
-    WHERE o.oprnamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
-    UNION ALL
-    SELECT CASE WHEN e.arr THEN 'eop' ELSE 'op' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
-      CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
-    FROM e JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) e.oid AND o.oprright OPERATOR(pg_catalog.=) e.oid
-    JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
-      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
-    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace
-    WHERE o.oprnamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
-    UNION ALL
-    SELECT CASE WHEN e.arr THEN 'etyp' ELSE 'typ' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
-      pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))),
-      CAST(ty.typcategory AS pg_catalog.text)
-    FROM e JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) e.oid
-    JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) ty.typnamespace
-    UNION ALL
-    SELECT CASE WHEN e.arr THEN 'efn' ELSE 'fn' END, CAST(e.rel AS pg_catalog.text), CAST(e.att AS pg_catalog.text),
-      CAST(p.proname AS pg_catalog.text),
-      pg_catalog.concat(n.nspname, CASE WHEN p.prorettype OPERATOR(pg_catalog.=) e.oid THEN '|self' ELSE '' END)
-    FROM e JOIN pg_catalog.pg_proc p ON p.pronargs OPERATOR(pg_catalog.=) 1 AND p.proargtypes[0] OPERATOR(pg_catalog.=) e.oid
-      AND p.prokind OPERATOR(pg_catalog.=) 'a'
-    JOIN pg_catalog.pg_depend pd ON pd.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_proc' AS pg_catalog.regclass)
-      AND pd.objid OPERATOR(pg_catalog.=) p.oid AND pd.deptype OPERATOR(pg_catalog.=) 'e' AND pd.refobjid OPERATOR(pg_catalog.=) e.refobjid
-    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
-    WHERE p.pronamespace OPERATOR(pg_catalog.=) (SELECT et.typnamespace FROM pg_catalog.pg_type et WHERE et.oid OPERATOR(pg_catalog.=) e.oid)
-    UNION ALL
-    SELECT 'fun', NULL, CAST(f.proname AS pg_catalog.text), NULL,
-      CASE WHEN pg_catalog.bool_or(EXISTS (SELECT 1 FROM pg_catalog.unnest(f.outs) AS o(t)
-        WHERE o.t OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x))
-          OR EXISTS (SELECT 1 FROM pg_catalog.pg_type ot WHERE ot.oid OPERATOR(pg_catalog.=) o.t
-            AND ((ot.typtype OPERATOR(pg_catalog.=) 'p' AND ot.oid OPERATOR(pg_catalog.<>) CAST('pg_catalog.record' AS pg_catalog.regtype)
-                AND EXISTS (SELECT 1 FROM x))
-              OR (ot.typtype OPERATOR(pg_catalog.=) 'c' AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute ca
-                WHERE ca.attrelid OPERATOR(pg_catalog.=) ot.typrelid AND ca.attnum OPERATOR(pg_catalog.>) 0 AND NOT ca.attisdropped
-                  AND ca.atttypid OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x))))))))
-        THEN 'unknown'
-        WHEN pg_catalog.bool_and(NOT EXISTS (SELECT 1 FROM pg_catalog.unnest(f.outs) AS o(t)
-          WHERE o.t OPERATOR(pg_catalog.<>) ALL (CAST('{pg_catalog.text,pg_catalog.varchar,pg_catalog.bpchar,pg_catalog.name}' AS pg_catalog.regtype[]))))
-        THEN 'string' ELSE 'known' END
-    FROM f GROUP BY f.proname
-    UNION ALL
-    SELECT CASE WHEN o.op IS NULL THEN 'fcol' ELSE 'fop' END, CAST(w.pos AS pg_catalog.text), CAST(f.proname AS pg_catalog.text),
-      o.op, o.schema
-    FROM f JOIN LATERAL (SELECT u.pos, u.t FROM pg_catalog.unnest(f.outs) WITH ORDINALITY AS u(t, pos)) AS w ON TRUE
-    JOIN pg_catalog.pg_type wt ON wt.oid OPERATOR(pg_catalog.=) w.t
-    JOIN LATERAL (
-      SELECT NULL AS op, CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
-          WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
-            AND d.objid OPERATOR(pg_catalog.=) w.t)
-          THEN pg_catalog.concat('ext:', CAST(wt.typcategory AS pg_catalog.text), ':', pg_catalog.quote_ident(CAST((SELECT tn.nspname FROM pg_catalog.pg_namespace tn
-            WHERE tn.oid OPERATOR(pg_catalog.=) wt.typnamespace) AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(wt.typname AS pg_catalog.text)))
-        WHEN w.t OPERATOR(pg_catalog.=) ANY (ARRAY(SELECT x.oid FROM x)) OR wt.typtype OPERATOR(pg_catalog.=) 'p'
-          OR wt.typtype OPERATOR(pg_catalog.=) 'c' THEN 'unknown'
-        WHEN wt.typcategory OPERATOR(pg_catalog.=) 'S'
-          AND wt.typnamespace OPERATOR(pg_catalog.=) CAST('pg_catalog' AS pg_catalog.regnamespace) THEN 'string'
-        ELSE 'known' END AS schema
-      UNION ALL
-      SELECT CAST(op.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
-      FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_operator op ON op.oprleft OPERATOR(pg_catalog.=) w.t AND op.oprright OPERATOR(pg_catalog.=) w.t
-      JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
-        AND od.objid OPERATOR(pg_catalog.=) op.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) d.refobjid
-      JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) op.oprnamespace
-      WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'
-        AND d.objid OPERATOR(pg_catalog.=) w.t) AS o ON TRUE
-    WHERE (SELECT pg_catalog.count(*) FROM f g WHERE g.proname OPERATOR(pg_catalog.=) f.proname) OPERATOR(pg_catalog.=) 1
-    UNION ALL
-    SELECT 'iso', NULL, NULL, pg_catalog.current_setting('transaction_isolation'), NULL};
-# The same without the function-rowset parts (most statements read from no
-# function): far less to plan (review LOW 3).
-my $EXTENSION_OPERATORS_NO_FUNCTIONS_SQL = do {
-    my $sql = $EXTENSION_OPERATORS_SQL;
-    $sql =~ s/\),\n    l\(oid, parent\) AS MATERIALIZED \(.*?\n    SELECT 'col'/)\n    SELECT 'col'/s or die 'extension SQL: no function CTEs';
-    $sql =~ s/\n    UNION ALL\n    SELECT 'fun'.*?\n    UNION ALL\n    SELECT 'iso'/\n    UNION ALL\n    SELECT 'iso'/s or die 'extension SQL: no function rows';
-    $sql;
-};
-# Function rowset candidates (review M1 of b969df8), one entry per
-# function of that name in the pinned schemas (or the schema the call
-# names), with whether it is an installed extension's own function over one
-# of that extension's types (see _pg_function_rowset).
-my $EXTENSION_PROBE_SQL = q{SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
-      WHERE d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass) AND d.deptype OPERATOR(pg_catalog.=) 'e'),
-    pg_catalog.current_setting('transaction_isolation'),
-    ARRAY(SELECT pg_catalog.concat(k.sch, pg_catalog.chr(31), k.name, pg_catalog.chr(31), CAST(n.nspname AS pg_catalog.text), pg_catalog.chr(31),
-        p.pronargs, pg_catalog.chr(31), p.pronargdefaults, pg_catalog.chr(31),
-        pg_catalog.array_to_string(ARRAY(SELECT pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
-            pg_catalog.quote_ident(CAST(t.typname AS pg_catalog.text)))
-          FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) WITH ORDINALITY AS u(o, i)
-          JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) u.o JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
-          ORDER BY u.i), pg_catalog.chr(30)), pg_catalog.chr(31),
-        (SELECT pg_catalog.concat(pg_catalog.quote_ident(CAST(vn.nspname AS pg_catalog.text)), '.',
-            pg_catalog.quote_ident(CAST(vt.typname AS pg_catalog.text)))
-          FROM pg_catalog.pg_type vt JOIN pg_catalog.pg_namespace vn ON vn.oid OPERATOR(pg_catalog.=) vt.typnamespace
-          WHERE vt.oid OPERATOR(pg_catalog.=) p.provariadic), pg_catalog.chr(31),
-        CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend pd
-          WHERE pd.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_proc' AS pg_catalog.regclass) AND pd.objid OPERATOR(pg_catalog.=) p.oid
-            AND pd.deptype OPERATOR(pg_catalog.=) 'e'
-            AND EXISTS (SELECT 1 FROM pg_catalog.unnest(CAST(p.proargtypes AS pg_catalog.oid[])) AS ua(t)
-              JOIN pg_catalog.pg_depend td ON td.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
-                AND td.objid OPERATOR(pg_catalog.=) ua.t AND td.deptype OPERATOR(pg_catalog.=) 'e'
-                AND td.refobjid OPERATOR(pg_catalog.=) pd.refobjid)) THEN 'member' ELSE '' END,
-        pg_catalog.chr(31),
-        (SELECT CAST(pg_catalog.min(xd.refobjid) AS pg_catalog.text) FROM pg_catalog.pg_depend xd
-          WHERE xd.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_proc' AS pg_catalog.regclass) AND xd.objid OPERATOR(pg_catalog.=) p.oid
-            AND xd.deptype OPERATOR(pg_catalog.=) 'e'))
-      FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[]))) AS k(sch, name)
-      JOIN (pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace)
-        ON CAST(p.proname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.name
-        AND CASE WHEN k.sch OPERATOR(pg_catalog.=) '' THEN CAST(n.nspname AS pg_catalog.text) OPERATOR(pg_catalog.=) ANY (CAST($3 AS pg_catalog.text[]))
-          ELSE CAST(n.nspname AS pg_catalog.text) OPERATOR(pg_catalog.=) k.sch END)};
-sub _pg_extension_operators {
-    my ($self, $sql) = @_;
-    require Selecto::PostgreSQL::Qualify;
-    my $tokens = eval { Selecto::PostgreSQL::Qualify::tokenize($sql) } or return {};
-    # Every schema-qualified relation the SQL names (generated SQL always
-    # qualifies them, R23b), and every function it reads rows from; the
-    # qualifier resolves column references to these by query scope.
-    my (%rels, %functions, %host);
-    my $name = sub { my ($t) = @_; my $v = $t->[1]; $v =~ s/\A"((?:[^"]|"")*)"\z/$1/ ? $v =~ s/""/"/gr : lc $v };
-    for my $k (0 .. $#$tokens - 1) {
-        next unless $tokens->[$k][0] =~ /\A(?:id|qid)\z/;
-        my $prev = $k > 0 ? uc($tokens->[$k - 1][1]) : '';
-        if ($prev =~ /\A(?:FROM|JOIN|LATERAL|,|\()\z/) {
-            my $j = $k;
-            $j += 2 while $j + 2 < @$tokens && $tokens->[$j + 1][1] eq '.' && $tokens->[$j + 2][0] =~ /\A(?:id|qid)\z/;
-            if ($j + 1 < @$tokens && $tokens->[$j + 1][1] eq '(') {
-                $functions{$name->($tokens->[$j])} = 1;
-                # A function read from (function_lateral): resolved among
-                # the pinned schemas, or the schema it names (review M1).
-                # (A keyword construct or a pg_catalog function, as the
-                # qualifier treats them, is not one.)
-                my $bare = $j == $k && $tokens->[$k][0] eq 'id';
-                $host{($j == $k + 2 ? $name->($tokens->[$k]) : '') . "\0" . $name->($tokens->[$j])} = 1
-                    if $prev =~ /\A(?:FROM|JOIN|LATERAL|,)\z/ && ($j == $k || $j == $k + 2)
-                    && !($bare && (Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1]) || $self->_pg_catalog_functions->{lc $tokens->[$k][1]}
-                        || uc($tokens->[$k][1]) =~ /\A(?:CAST|EXISTS|ARRAY|ANY|ALL|SOME|EXTRACT|COALESCE|GREATEST|LEAST|ROW|TRIM|SUBSTRING|POSITION|OVERLAY|NULLIF)\z/))
-                    && !($j == $k + 2 && $name->($tokens->[$k]) eq 'pg_catalog');
-            }
-        }
-        # Every call: the functions it can reach, for R58 and R62.
-        if ($tokens->[$k + 1][1] eq '(' && !($k > 0 && $tokens->[$k - 1][1] eq '.' && $k > 1 && uc($tokens->[$k - 2][1]) =~ /\A(?:INTO)\z/) && uc($prev) ne 'INTO'
-            && (!($tokens->[$k][0] eq 'id' && Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1])) || Selecto::PostgreSQL::Qualify::_keyword_call($tokens, $k))) {
-            my $qualified = $k > 1 && $tokens->[$k - 1][1] eq '.' && $tokens->[$k - 2][0] =~ /\A(?:id|qid)\z/;
-            $host{($qualified ? $name->($tokens->[$k - 2]) : '') . "\0" . $name->($tokens->[$k])} = 1
-                unless $qualified && $name->($tokens->[$k - 2]) eq 'pg_catalog';
-        }
-        # Any other call, by the last name of its chain: what it returns types
-        # an operand (see the qualifier's function atoms).
-        if ($tokens->[$k + 1][1] eq '(' && !($tokens->[$k][0] eq 'id' && Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1]))
-            && !($k > 2 && $tokens->[$k - 1][1] eq '.' && uc($tokens->[$k - 3][1]) eq 'INTO') && uc($prev) ne 'INTO'
-            && !$self->_pg_catalog_functions->{lc $tokens->[$k][1]}) {
-            $functions{$name->($tokens->[$k])} = 1;
-        }
-        next unless $k + 2 <= $#$tokens && $tokens->[$k + 1][1] eq '.' && $tokens->[$k + 2][0] =~ /\A(?:id|qid)\z/;
-        next if $k > 0 && $tokens->[$k - 1][1] eq '.';
-        my $after = $k + 3 < @$tokens ? $tokens->[$k + 3] : undef;
-        next if $after && ($after->[1] eq '(' || $after->[1] eq '.') && !($k > 0 && uc($tokens->[$k - 1][1]) eq 'INTO');
-        next unless $prev =~ /\A(?:FROM|JOIN|INTO|UPDATE|ONLY|\(|,)\z/;
-        $rels{"$tokens->[$k][1].$tokens->[$k + 2][1]"} = 1;
-    }
-    # Casts to a schema-qualified type outside pg_catalog (the guarded
-    # insert admission's CAST($n AS "public"."citext")): an extension type,
-    # or a domain over one, gives the cast its extension operators.
-    my %casts;
-    for my $k (0 .. $#$tokens - 4) {
-        next unless uc($tokens->[$k][1]) eq 'AS' && $tokens->[$k + 1][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 2][1] eq '.'
-            && $tokens->[$k + 3][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 4][1] eq ')';
-        my $schema = $name->($tokens->[$k + 1]);
-        next if $schema eq 'pg_catalog';
-        $casts{"$schema." . $name->($tokens->[$k + 3])} = "$tokens->[$k + 1][1].$tokens->[$k + 3][1]";
-    }
-    # x::public.citext, x::citext and CAST(x AS citext) too: a name that is no
-    # extension's type finds nothing. (AS name) may be a column alias, so a bare
-    # name is spelled quoted, which to_regtype cannot refuse as a keyword. It
-    # resolves as the statement will, under the pinned search_path.
-    for my $k (0 .. $#$tokens - 1) {
-        my $first = $tokens->[$k + 1];
-        my $after = $k + 2 <= $#$tokens ? $tokens->[$k + 2][1] : '';
-        my $form = $tokens->[$k][1] eq '::' ? 'cast' : uc($tokens->[$k][1]) eq 'AS' && $after eq ')' ? 'as' : next;
-        next unless $first->[0] =~ /\A(?:id|qid)\z/;
-        my $second = $form eq 'cast' && $after eq '.' && $k + 3 <= $#$tokens ? $tokens->[$k + 3] : undef;
-        if ($second) {
-            next if $name->($first) eq 'pg_catalog' || $second->[0] !~ /\A(?:id|qid)\z/;
-            $casts{$name->($first) . '.' . $name->($second)} = "$first->[1].$second->[1]";
-        } else {
-            my $bare = $name->($first);
-            next if Selecto::PostgreSQL::Qualify::_string_type($bare);
-            $casts{$bare} = '"' . ($bare =~ s/"/""/gr) . '"';
-        }
-    }
-    # type 'literal', the same.
-    for my $k (0 .. $#$tokens - 1) {
-        next unless $tokens->[$k + 1][0] eq 'str' && $tokens->[$k][0] =~ /\A(?:id|qid)\z/;
-        next if $tokens->[$k][0] eq 'id' && Selecto::PostgreSQL::Qualify::_keyword($tokens->[$k][1]);
-        my $qualified = $k > 1 && $tokens->[$k - 1][1] eq '.' && $tokens->[$k - 2][0] =~ /\A(?:id|qid)\z/;
-        my $bare = $name->($tokens->[$k]);
-        if ($qualified) {
-            $casts{$name->($tokens->[$k - 2]) . ".$bare"} = "$tokens->[$k - 2][1].$tokens->[$k][1]" unless $name->($tokens->[$k - 2]) eq 'pg_catalog';
-        } elsif (!Selecto::PostgreSQL::Qualify::_string_type($bare)) {
-            $casts{$bare} = '"' . ($bare =~ s/"/""/gr) . '"';
-        }
-    }
-    # AS alias (column type, ...): a declared extension type is reason enough to
-    # read this statement's columns. AS MATERIALIZED ( opens a CTE's body (the
-    # bounded guard's), whose "SELECT rows.*" is no column and type.
-    for my $k (0 .. $#$tokens - 3) {
-        next unless uc($tokens->[$k][1]) eq 'AS' && $tokens->[$k + 1][0] =~ /\A(?:id|qid)\z/ && $tokens->[$k + 2][1] eq '(';
-        next if $tokens->[$k + 1][0] eq 'id' && uc($tokens->[$k + 1][1]) eq 'MATERIALIZED';
-        for (my $j = $k + 3; $j + 1 < @$tokens && $tokens->[$j][1] ne ')'; $j++) {
-            next unless $tokens->[$j][0] =~ /\A(?:id|qid)\z/ && $tokens->[$j + 1][0] =~ /\A(?:id|qid)\z/;
-            my $bare = $name->($tokens->[$j + 1]);
-            if ($j + 3 < @$tokens && $tokens->[$j + 2][1] eq '.') {
-                # schema.type only: to_regtype refuses a spelling such as "rows.*".
-                next unless $tokens->[$j + 3][0] =~ /\A(?:id|qid)\z/;
-                $casts{"$bare." . $name->($tokens->[$j + 3])} = "$tokens->[$j + 1][1].$tokens->[$j + 3][1]";
-            } elsif (!Selecto::PostgreSQL::Qualify::_string_type($bare)) {
-                $casts{$bare} = '"' . ($bare =~ s/"/""/gr) . '"';
-            }
-        }
-    }
-    return {} unless %rels || %functions || %casts;
-    my @rels = sort keys %rels;
-    my @functions = sort keys %functions;
-    # Within one write (its statements run under the write's relation lock),
-    # the same relations and functions are read once (review LOW 3); so are a
-    # host transaction's reads (_read_catalog_cache), and under catalog_trust a
-    # process's reads (_trusted_catalog_cache).
-    my $shared = $self->{_selecto_write_catalog} // $self->_trusted_catalog_cache // $self->_read_catalog_cache;
-    my $key = join("\0", @rels) . "\x1f" . join("\0", @functions) . "\x1f" . join("\0", sort keys %host)
-        . "\x1f" . join("\0", @{$self->{_selecto_qualify_declared} // []}) . "\x1f" . join("\0", sort keys %casts);
-    return $shared->{$key} if ref($shared) eq 'HASH' && $shared->{$key};
-    my $result = $self->_pg_extension_lookup(\@rels, \@functions, \%host);
-    if (%casts && ref($result) eq 'HASH' && $result->{extension_types}) {
-        $result->{casts} = $self->_pg_cast_types(\%casts);
-        $result->{extension} = 1 if %{$result->{casts}};
-    }
-    $shared->{$key} = $result if ref($shared) eq 'HASH';
-    return $result;
-}
-
-# A cast target's extension type (through any domain chain): its own
-# operators (members of its extension, in its schema) and its qualified name
-# (R50 casts), keyed like Selecto::PostgreSQL::Qualify's cast lookup.
-my $CAST_TYPES_SQL = q{WITH RECURSIVE k(name, spelled) AS (
-      SELECT * FROM ROWS FROM (pg_catalog.unnest(CAST($1 AS pg_catalog.text[])), pg_catalog.unnest(CAST($2 AS pg_catalog.text[])))),
-    c(name, oid, depth) AS (
-      SELECT k.name, CAST(pg_catalog.to_regtype(k.spelled) AS pg_catalog.oid), 0 FROM k
-      UNION ALL
-      SELECT c.name, t.typbasetype, c.depth OPERATOR(pg_catalog.+) 1 FROM c JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.oid
-      WHERE t.typtype OPERATOR(pg_catalog.=) 'd' AND c.depth OPERATOR(pg_catalog.<) 16),
-    e AS (SELECT c.name, ty.oid, ty.typnamespace, d.refobjid FROM c
-      JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) c.oid AND ty.typtype OPERATOR(pg_catalog.<>) 'd'
-        AND ty.typcategory OPERATOR(pg_catalog.<>) 'A'
-      JOIN pg_catalog.pg_depend d ON d.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_type' AS pg_catalog.regclass)
-        AND d.objid OPERATOR(pg_catalog.=) ty.oid AND d.deptype OPERATOR(pg_catalog.=) 'e')
-    SELECT 'typ', e.name, pg_catalog.concat(pg_catalog.quote_ident(CAST(tn.nspname AS pg_catalog.text)), '.',
-        pg_catalog.quote_ident(CAST(ty.typname AS pg_catalog.text))), CAST(ty.typcategory AS pg_catalog.text)
-    FROM e JOIN pg_catalog.pg_type ty ON ty.oid OPERATOR(pg_catalog.=) e.oid
-    JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) ty.typnamespace
-    UNION ALL
-    SELECT 'xop', e.name,
-      pg_catalog.concat(o.oprname, pg_catalog.chr(31),
-        pg_catalog.quote_ident(CAST(ln.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(lt.typname AS pg_catalog.text)), pg_catalog.chr(31),
-        pg_catalog.quote_ident(CAST(rn.nspname AS pg_catalog.text)), '.', pg_catalog.quote_ident(CAST(rt.typname AS pg_catalog.text))),
-      CAST(n.nspname AS pg_catalog.text)
-    FROM e JOIN pg_catalog.pg_operator o ON (o.oprleft OPERATOR(pg_catalog.=) e.oid OR o.oprright OPERATOR(pg_catalog.=) e.oid)
-      AND o.oprleft OPERATOR(pg_catalog.<>) o.oprright
-    JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
-      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
-    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace
-    JOIN pg_catalog.pg_type lt ON lt.oid OPERATOR(pg_catalog.=) o.oprleft
-    JOIN pg_catalog.pg_namespace ln ON ln.oid OPERATOR(pg_catalog.=) lt.typnamespace
-    JOIN pg_catalog.pg_type rt ON rt.oid OPERATOR(pg_catalog.=) o.oprright
-    JOIN pg_catalog.pg_namespace rn ON rn.oid OPERATOR(pg_catalog.=) rt.typnamespace
-    WHERE o.oprnamespace OPERATOR(pg_catalog.=) e.typnamespace
-    UNION ALL
-    SELECT 'op', e.name, CAST(o.oprname AS pg_catalog.text), CAST(n.nspname AS pg_catalog.text)
-    FROM e JOIN pg_catalog.pg_operator o ON o.oprleft OPERATOR(pg_catalog.=) e.oid AND o.oprright OPERATOR(pg_catalog.=) e.oid
-      AND o.oprnamespace OPERATOR(pg_catalog.=) e.typnamespace
-    JOIN pg_catalog.pg_depend od ON od.classid OPERATOR(pg_catalog.=) CAST('pg_catalog.pg_operator' AS pg_catalog.regclass)
-      AND od.objid OPERATOR(pg_catalog.=) o.oid AND od.deptype OPERATOR(pg_catalog.=) 'e' AND od.refobjid OPERATOR(pg_catalog.=) e.refobjid
-    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) o.oprnamespace};
-sub _pg_cast_types {
-    my ($self, $casts) = @_;
-    my @keys = sort keys %$casts;
-    my $rows;
-    my $ok = eval { $rows = $self->{dbh}->selectall_arrayref($CAST_TYPES_SQL, undef, \@keys, [map { $casts->{$_} } @keys]); 1 };
-    die $self->normalize_error($@) unless $ok;
-    my %entries;
-    for my $row (@{$rows // []}) {
-        my ($kind, $key, $a, $b) = @$row;
-        if ($kind eq 'typ') { $entries{$key}{"\0type"} = $a; $entries{$key}{"\0strcat"} = 1 if ($b // '') eq 'S' }
-        elsif ($kind eq 'xop') { $entries{$key}{"\0x"}{(split /\x1f/, $a, 2)[0]}{(split /\x1f/, $a, 2)[1] =~ s/\x1f/\0/r} = '"' . ($b =~ s/"/""/gr) . '"' }
-        else { $entries{$key}{$a} = '"' . ($b =~ s/"/""/gr) . '"' }
-    }
-    return \%entries;
-}
-
-# The extension lookups of the host transaction in progress, keyed as
-# _pg_extension_operators keys them; undef outside one, so a statement in a
-# transaction of its own looks its catalog up afresh. On a large catalog (a
-# partitioned database: hundreds of thousands of types) one lookup costs a
-# scan of pg_type, and a page's statements read the same relations. A
-# transaction is known by its backend and start time; the cache holds only the
-# current one's. Every statement still rechecks its relations (R41).
-my $TRANSACTION_IDENTITY_SQL = q{SELECT pg_catalog.pg_backend_pid(),
-    CAST(pg_catalog.transaction_timestamp() AS pg_catalog.text)};
-# Under catalog_trust => 'domain', a compiled read's extension lookups are the
-# process's for a database and login (relations resolve by the login's
-# search_path) for $TRUSTED_CATALOG_SECONDS: the host vouches for its catalog,
-# and an extension type or a column's type changes only with a migration,
-# which this bounds how long to see.
-my %TRUSTED_CATALOG;
-our $TRUSTED_CATALOG_SECONDS = 300;
-sub _trusted_catalog_cache {
-    my ($self) = @_;
-    return undef unless $self->_domain_trusted;
-    my $dbh = $self->{dbh};
-    my $database = join "\0", $dbh->{Name} // '', $dbh->{Username} // '';
-    my $bucket = $TRUSTED_CATALOG{$database};
-    $TRUSTED_CATALOG{$database} = $bucket = {at => time, entries => {}}
-        unless $bucket && time - $bucket->{at} < $TRUSTED_CATALOG_SECONDS;
-    return $bucket->{entries};
-}
-
-sub _read_catalog_cache {
-    my ($self) = @_;
-    return undef unless $self->_transaction_open;
-    # A failure (a cancel among them) is the statement's, as any catalog read's.
-    my ($pid, $started);
-    my $ok = eval { ($pid, $started) = $self->{dbh}->selectrow_array($TRANSACTION_IDENTITY_SQL); 1 };
-    die $self->normalize_error($@) unless $ok;
-    return undef unless defined($pid) && defined($started);
-    my $id = "$pid\0$started";
-    my $cache = $self->{_selecto_read_catalog};
-    $self->{_selecto_read_catalog} = $cache = {id => $id, entries => {}}
-        unless ref($cache) eq 'HASH' && $cache->{id} eq $id;
-    return $cache->{entries};
-}
-
-sub _pg_extension_lookup {
-    my ($self, $rels, $functions, $host_set) = @_;
-    my @rels = @$rels;
-    my @functions = @$functions;
-    my %host = %$host_set;
-    # Whether the database has any extension-owned type, the isolation level,
-    # and the schema of each function read from (when only one schema has
-    # it; review LOW 7): with no extension type and read committed, nothing
-    # else is needed (review LOW 10).
-    my @host = sort keys %host;
-    my @pinned = @host ? ('pg_catalog', @{$self->{_selecto_qualify_declared} // []}, $self->_pg_reset_schemas) : ();
-    my @probe;
-    my $ok = eval { @probe = $self->{dbh}->selectrow_array($EXTENSION_PROBE_SQL, undef,
-        [map { (split /\0/, $_, 2)[0] } @host], [map { (split /\0/, $_, 2)[1] } @host], \@pinned); 1 };
-    die $self->normalize_error($@) unless $ok;
-    my ($has_extension, $level, $candidates) = @probe;
-    my %host_functions = map { ($_ => {candidates => []}) } @host;
-    for (@{$candidates // []}) {
-        my ($sch, $fname, $schema, $nargs, $defaults, $args, $variadic, $member, $extension) = split /\x1f/, $_, 9;
-        push @{$host_functions{"$sch\0$fname"}{candidates}}, {schema => $schema, nargs => $nargs, defaults => $defaults,
-            args => [length($args // '') ? split(/\x1e/, $args) : ()], variadic => length($variadic // '') ? $variadic : undef,
-            member => ($member // '') eq 'member' ? 1 : 0, extension => length($extension // '') ? $extension : undef};
-    }
-    if (!$has_extension && defined($level) && $level eq 'read committed') {
-        return {functions => {map { ($_ => {state => 'known'}) } @functions}, host_functions => \%host_functions, extension => 0};
-    }
-    return {functions => {}, host_functions => \%host_functions, extension => 0, extension_types => $has_extension ? 1 : 0}
-        unless @rels || @functions;
-    my $rows;
-    $ok = eval { $rows = @functions ? $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_SQL, undef, \@rels, \@functions)
-        : $self->{dbh}->selectall_arrayref($EXTENSION_OPERATORS_NO_FUNCTIONS_SQL, undef, \@rels); 1 };
-    die $self->normalize_error($@) unless $ok;
-    my (%relations, %types, %known, $isolation);
-    # Folded as PostgreSQL folds it: an unquoted part to lower case, a quoted
-    # part exact (R56). Column names come from the catalog, exact.
-    my $key = sub { join '.', map { /\A"((?:[^"]|"")*)"\z/ ? $1 =~ s/""/"/gr : lc } split /\.(?=(?:[^"]*"[^"]*")*[^"]*\z)/, $_[0] };
-    my $quote = sub { '"' . ($_[0] =~ s/"/""/gr) . '"' };
-    my $extension = 0;
-    for my $row (@{$rows // []}) {
-        my ($kind, $rel, $column, $a, $b) = @$row;
-        if ($kind eq 'iso') { $isolation = $a; next }
-        if ($kind eq 'fun') { $known{$column}{state} = $b; $extension = 1 if $b eq 'unknown'; next }
-        # The one function of that name: each output column's type (review
-        # M2), an extension type's operators included.
-        if ($kind eq 'fcol') {
-            my $col = $known{$column}{cols}[$rel - 1] //= {};
-            $col->{"\0unknown"} = 1 if $b eq 'unknown';
-            $col->{"\0string"} = 1 if $b eq 'string';
-            if ($b =~ /\Aext:(.):(.+)\z/s) { $col->{"\0type"} = $2; $col->{"\0strcat"} = 1 if $1 eq 'S' }
-            next;
-        }
-        if ($kind eq 'fop') { $known{$column}{cols}[$rel - 1]{$a} = $quote->($b); next }
-        my $columns = $relations{$key->($rel)} //= {};
-        my $entry = $columns->{$column} //= {};
-        if ($kind eq 'col') { $types{$rel}{$column} = $a; next }
-        if ($kind eq 'str') { $entry->{"\0string"} = 1; $entry->{"\0bpchar"} = 1 if ($a // '') eq 'bpchar'; next }
-        if ($kind eq 'estr') { $entry->{"\0elemstr"} = 1; next }
-        # A domain chain deeper than the walk follows: its base type, and so
-        # its operators, are unknown (review LOW).
-        Selecto::Error->throw('query_rule_not_evaluable', 'a column is a domain chain too deep to resolve its base type',
-            {reason => 'domain_chain_too_deep', relation => $rel, column => $column}) if $kind eq 'deep';
-        $extension = 1;
-        my $target = $kind =~ /\Ae/ ? ($entry->{"\0elem"} //= {}) : $entry;
-        if ($kind eq 'xdom') {
-            # The exact operators of its pg_catalog base type, if it has one.
-            $target->{"\0extdom"}{$a} = 1 if defined $a;
-            $target->{"\0extdom"} //= {};
-            $target->{"\0extdom_type"} //= $b;
-        } elsif ($kind =~ /\Ae?xop\z/) {
-            my ($op, $left, $right) = split /\x1f/, $a, 3;
-            $target->{"\0x"}{$op}{"$left\0$right"} = $quote->($b);
-        } elsif ($kind =~ /typ\z/) {
-            # The member type's own name: operands of its operators are cast
-            # to it (R50).
-            $target->{"\0type"} = $a;
-            $target->{"\0strcat"} = 1 if ($b // '') eq 'S';
-        } elsif ($kind =~ /op\z/) {
-            $target->{$a} = $quote->($b);
-        } else {
-            my ($schema, $self_type) = $b =~ /\A(.*?)(\|self)?\z/s;
-            $target->{"\0fn"}{lc $a} = {schema => $quote->($schema), self => $self_type ? 1 : 0};
-        }
-    }
-    $self->_pg_verify_column_types(\%types) if %types && defined($isolation) && $isolation ne 'read committed';
-
-    return {relations => \%relations, functions => \%known, host_functions => \%host_functions, extension => $extension,
-        extension_types => $has_extension ? 1 : 0};
-}
-
-# R49a: under REPEATABLE READ or SERIALIZABLE the catalog read above sees the
-# transaction's snapshot, while the statement is planned against the
-# current catalog. Each column's type is read again through the parser,
-# pg_typeof((NULL::relation).column), and each relation's column count from
-# its current row type; any difference is refused, typed.
-sub _pg_verify_column_types {
-    my ($self, $types) = @_;
-    my (@select, @expected);
-    for my $rel (sort keys %$types) {
-        my $row = "CAST(NULL AS $rel)";
-        push @select, "(SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(pg_catalog.to_jsonb("
-            . "pg_catalog.jsonb_populate_record($row, CAST('{}' AS pg_catalog.jsonb)))))";
-        push @expected, scalar keys %{$types->{$rel}};
-        for my $column (sort keys %{$types->{$rel}}) {
-            push @select, "CAST(pg_catalog.pg_typeof(($row)." . $self->quote_identifier($column) . ') AS pg_catalog.oid)';
-            push @expected, $types->{$rel}{$column};
-        }
-    }
-    my @row;
-    my $ok = eval { @row = $self->{dbh}->selectrow_array('SELECT ' . join(', ', @select)); 1 };
-    my $same = $ok && @row == @expected && !grep { !defined($row[$_]) || "$row[$_]" ne "$expected[$_]" } 0 .. $#expected;
-    Selecto::Error->throw('query_rule_not_evaluable',
-        "a relation's column types changed after the transaction's snapshot; they cannot be read in this transaction",
-        {reason => 'catalog_changed'}) unless $same;
-    return;
 }
 
 1;
@@ -3195,8 +2481,7 @@ are C<1> or C<0> and JSON columns are text.
 The schemas the host's relations live in, in order. Every relation, root,
 reference guard, joined relation, column catalog and post-image alike, resolves
 in the first of them that has it, whatever the reset C<search_path> or the host's
-current one say, and refuses C<relation_unresolved> otherwise. They come first
-after C<pg_catalog> in the pinned C<search_path>. A tenant prefix on the engine
+current one say, and refuses C<relation_unresolved> otherwise. A tenant prefix on the engine
 still decides a read's own schema. Declare them to reach a schema the reset path
 does not name, and for a relation that refers across schemas: with nothing
 declared, a reference resolves only in the root's schema.
@@ -3231,9 +2516,7 @@ C<''> (the default): every read and write checks the catalog and the session
 around its statement (see L</SESSION STATE>). C<'domain'> (opt-in): the host
 vouches that it meets L</What the host must provide>, and a compiled read that
 locks no rows takes the domain's word for its relations: it skips the relation
-recheck and the session snapshot before and after it, and its extension-type
-lookup is kept for the process, per database and login, for five minutes
-(C<$Selecto::PostgreSQL::TRUSTED_CATALOG_SECONDS>). Its pinned settings,
+recheck and the session snapshot before and after it. Its pinned settings,
 read-only mode and rollback stand, and so do tenant predicates and query
 budgets. Writes, row-locking reads, bounded streams and a host's hand-built
 statements are checked in full. On a database with a large catalog (heavy
@@ -3362,20 +2645,18 @@ refuses the same way, never at whatever comes first on the path; the schemas
 attribute below declares more. A relation the host's current
 C<search_path> resolves to a different relation is refused (reason
 C<relation_ambiguous>), for compiled statements and a host's hand-built
-statements alike. Each Selecto statement runs with C<search_path>
-pinned to C<pg_catalog>, the reset path's schemas and C<pg_temp> (last),
-inside its own transaction or savepoint (on an idle autocommit handle, a
-read sets it for the session), and the host's value is restored
-afterwards; so a C<search_path> switch that persisted before the call
-redirects neither relations nor operators. C<TimeZone>, C<DateStyle>,
-C<IntervalStyle>, C<extra_float_digits>, C<bytea_output> and
-C<standard_conforming_strings> are pinned the same way, to their reset
-values (server, database, role or connection configuration): a host that
-C<SET>s one of them for its session loses that inside Selecto statements.
-Hosts that C<SET search_path> to reach other schemas must pin the schema
-instead. Row triggers fired by
-Selecto writes run under the pinned C<search_path>. Functions, operators and
-types in Selecto's own catalog and guard SQL are C<pg_catalog>-qualified.
+statements alike. Each Selecto statement runs with C<TimeZone>,
+C<DateStyle>, C<IntervalStyle>, C<extra_float_digits>, C<bytea_output> and
+C<standard_conforming_strings> pinned to their reset values (server,
+database, role or connection configuration), inside its own transaction or
+savepoint (on an idle autocommit handle, a read sets them for the session),
+and the host's values are restored afterwards: a host that C<SET>s one of
+them for its session loses that inside Selecto statements. C<search_path>
+stays the host's. Hosts that C<SET search_path> to reach other schemas must
+declare the schema (see L</schemas>) for relations to resolve there. Selecto's own catalog and
+guard SQL qualifies what it calls with C<pg_catalog>; generated statements
+write operators and functions plainly, so they resolve as PostgreSQL resolves
+them for any query (see L</What the host must provide>).
 
 =item *
 
@@ -3428,8 +2709,12 @@ by its virtual transaction id.
 
 These checks protect Selecto's own SQL. They do not contain code already running
 as the application's role. No untrusted role may have C<CREATE> on a schema the
-application reaches, and the host's triggers, views and row-security policies
-must schema-qualify the functions they call. Planted code reached through them
+application reaches: generated statements write operators and functions plainly,
+so an operator or function created in such a schema (an exact-type C<=> over
+C<varchar>, a C<lower(varchar)>) would be chosen over C<pg_catalog>'s, as it
+would for any query the application runs (and extension types such as
+C<citext> keep their own operators the same way). The host's triggers, views
+and row-security policies must schema-qualify the functions they call. Planted code reached through them
 can change the session or swap a stream's cursor between statements: Selecto
 catches some of that, and does not promise to. A host that meets this may say
 so with C<< catalog_trust => 'domain' >> (see L</catalog_trust>), and its

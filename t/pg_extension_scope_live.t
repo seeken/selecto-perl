@@ -13,18 +13,16 @@ use Selecto::PostgreSQL ();
 use lib 't/lib';
 use TestPostgreSQL ();
 
-# Push-gate review of R48 (H1, H2, M1):
-# - a DOMAIN over an extension type (citext) compares with the extension's
-#   operators, as PostgreSQL resolves it (H1);
+# Extension types in generated SQL answer as PostgreSQL answers the same
+# query on the same connection:
+# - a DOMAIN over citext, at any depth, compares with citext's operators;
 # - a read with a declared schema (a tenant prefix) resolves its relations
-#   under the pin pg_catalog, <declared>, <reset>, pg_temp, and is not
-#   refused as ambiguous when the prefix is not first on the reset path (H2);
-# - the extension-operator choice follows the column's source in scope, so
-#   an alias reused for another relation, or a CTE or member output, gets
-#   its own relation's type (M1).
+#   there, and is not refused as ambiguous when the prefix is not first on
+#   the reset path;
+# - an alias reused for another relation, or a CTE or member output, keeps
+#   its own relation's type.
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
-local $ENV{SELECTO_PG_SQL_LINT} = 1;
 my $x = 'Selecto::Expression';
 my $admin = TestPostgreSQL->connect;
 $admin->do('SET client_min_messages TO warning');
@@ -37,12 +35,16 @@ my $outcome = sub {
         ? $error->code . (ref($error->details) eq 'HASH' && $error->details->{reason} ? '/' . $error->details->{reason} : '')
         : "died: $error";
 };
+# The citext section's connections have the extension's schema on their
+# search_path, as the native comparison's does.
+my $extension_path;
 my $connect = sub {
     my (%options) = @_;
     my ($dsn, @auth) = TestPostgreSQL->connection;
     $dsn .= ";options='$options{options}'" if $options{options};
     my $dbh = DBI->connect($dsn, @auth, {RaiseError => 1, PrintError => 0, AutoCommit => 1, pg_enable_utf8 => 1});
     $dbh->do('SET client_min_messages TO warning');
+    $dbh->do(qq{SET search_path = public, "$extension_path"}) if defined($extension_path) && !$options{options};
     return $dbh;
 };
 my $engine = sub {
@@ -97,8 +99,9 @@ SKIP: {
     skip 'citext is not available', 31 unless $has;
     my ($schema) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
     my $citext = qq{"$schema".citext};
-    # Natively, with the extension schema on the path.
+    # Natively, with the extension schema on the path; Selecto's connections too.
     $admin->do(qq{SET search_path = public, "$schema"});
+    $extension_path = $schema;
 
     # H1: a domain over citext, as a required filter on a read and a bulk write.
     $admin->do($_) for "CREATE DOMAIN r49_email AS $citext CHECK (VALUE LIKE '%\@%')",
@@ -181,7 +184,8 @@ SKIP: {
     $admin->do($_) for 'CREATE TABLE r49_deep16 (id INT PRIMARY KEY, org TEXT NOT NULL, note r49_d16)',
         'CREATE TABLE r49_deep17 (id INT PRIMARY KEY, org TEXT NOT NULL, note r49_d17)';
     $admin->do("INSERT INTO $_ VALUES (1, 't1', 'abc'), (2, 't1', 'ABC'), (3, 't1', 'xyz')") for qw(r49_deep16 r49_deep17);
-    for my $case (['r49_deep16', 'applied 3'], ['r49_deep17', 'query_rule_not_evaluable/domain_chain_too_deep']) {
+    # PostgreSQL follows a domain chain of any depth to citext's operators.
+    for my $case (['r49_deep16', 'applied 3'], ['r49_deep17', 'applied 3']) {
         my ($table, $want) = @$case;
         my $deep = Selecto::Domain->parse({schema_version => 1, name => 'R49D', source => {source_table => $table, primary_key => 'id',
             tenant_field => 'org', fields => [qw(id org note)], columns => {id => {type => 'integer'}, org => {type => 'string'},

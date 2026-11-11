@@ -35,7 +35,7 @@ $admin->do($_) for @clean, qq{CREATE TABLE public.ct_t (id INT PRIMARY KEY, ci "
 my %calls;
 {
     no warnings 'redefine';
-    for my $name (qw(_pg_check_relations _pg_admit_session _pg_session_state _pg_extension_lookup)) {
+    for my $name (qw(_pg_check_relations _pg_admit_session _pg_session_state)) {
         my $original = Selecto::PostgreSQL->can($name);
         no strict 'refs';
         *{"Selecto::PostgreSQL::$name"} = sub { $calls{$name}++; return $original->(@_) };
@@ -93,18 +93,6 @@ my $setting = sub { my ($dbh, $name) = @_; return ($dbh->selectrow_array('SELECT
     is_deeply $rows->($adapter), [[1]], 'an untrusted read answers';
     is $calls{_pg_check_relations}, 1, 'after rechecking its relations';
     ok $calls{_pg_admit_session} && $calls{_pg_session_state}, 'and reading the session before and after it';
-    $dbh->disconnect;
-}
-{
-    my $dbh = TestPostgreSQL->connect;
-    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh, catalog_trust => 'domain'));
-    $rows->($adapter);
-    %calls = ();
-    $rows->($adapter) for 1 .. 2;
-    is $calls{_pg_extension_lookup} // 0, 0, "trusted reads in later transactions reuse the process's extension lookup";
-    local $Selecto::PostgreSQL::TRUSTED_CATALOG_SECONDS = 0;
-    $rows->($adapter);
-    is $calls{_pg_extension_lookup}, 1, 'until it expires';
     $dbh->disconnect;
 }
 done_testing;

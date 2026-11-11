@@ -24,7 +24,6 @@ use TestPostgreSQL ();
 # transaction_handler.
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
-local $ENV{SELECTO_PG_SQL_LINT} = 1;
 my $admin = TestPostgreSQL->connect;
 $admin->do('SET client_min_messages TO warning');
 my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
@@ -63,12 +62,10 @@ my $domain = sub {
         schemas => {}, joins => {}, writes => {operations => {insert => {enabled => 1}, upsert => {enabled => 1, conflict_targets => [[qw(org id)]]}},
             fields => {id => {insertable => 1}, org => {insertable => 1}, note => {insertable => 1, updatable => 1}}}});
 };
-my @sql;
 my $run = sub {
     my ($column, $type, $tenant, $mode, $operation, $assignments) = @_;
     my $dbh = TestPostgreSQL->connect;
     $dbh->do('SET client_min_messages TO warning');
-    $dbh->{Callbacks} = {prepare => sub { push @sql, $_[1]; return }};
     my %options = $mode eq 'host' ? (transaction_mode => 'external')
         : $mode eq 'handler' ? (transaction_handler => sub { my ($work) = @_; $dbh->begin_work; my $r = eval { $work->() };
             my $e = $@; $e ? $dbh->rollback : $dbh->commit; die $e if $e; $r }) : ();
@@ -105,11 +102,6 @@ for my $case (@types) {
         is($stored->(), "9/$tenant/new", "$label: the upserted row is the tenant's");
     }
 }
-# The citext admission probe compares with citext's own operator, its
-# operands cast to the member type (R50).
-my ($probe) = grep { /__selecto_candidate/ && /citext/ } @sql;
-like($probe // '', qr/OPERATOR\("\Q$schema\E"\.=\)/, "the citext admission compares with citext's own operator");
-like($probe // '', qr/CAST\(\(.*?\) AS "?\Q$schema\E"?\.citext\)\) OPERATOR/, 'its operands cast to the member type');
 # A domain's CHECK constraint: a typed refusal.
 $admin->do($_) for 'DROP TABLE IF EXISTS r52_t', 'CREATE TABLE r52_t (id INT PRIMARY KEY, org r52_short NOT NULL, note TEXT, UNIQUE (org, id))';
 is($run->('r52_short', 'string', 'toolong', 'own', 'insert', {id => 9, note => 'n'}), 'database_check_violation',

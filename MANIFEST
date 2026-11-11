@@ -86,10 +86,7 @@ t/pg_guarded_write_isolation_live.t
 t/pg_bound_delete_lock_live.t
 t/pg_graph_bound_descendants_live.t
 t/pg_review_round3_live.t
-t/pg_operator_qualification_live.t
 t/pg_case_twin_columns_live.t
-t/pg_extension_member_fallback_live.t
-t/pg_extension_expression_types_live.t
 t/pg_guard_statements_unnamed_live.t
 t/pg_stream_cursor_replaced_live.t
 t/pg_stream_host_takeover_live.t
@@ -99,16 +96,13 @@ t/pg_extension_cast_forms_live.t
 t/pg_function_resolution_live.t
 t/pg_read_alarm_live.t
 t/pg_catalog_trust_live.t
-t/pg_read_catalog_cache_live.t
 t/pg_cancel_storm_live.t
 t/pg_stream_host_work_live.t
 t/pg_keyword_functions_live.t
-t/pg_qualify_keyword_functions.t
 t/pg_extension_scope_live.t
 t/pg_extension_types_live.t
 t/pg_insert_storage_types_live.t
 t/pg_post_image_reread_live.t
-t/pg_qualify_grouping.t
 t/pg_session_state_live.t
 t/host_transaction_refusal_live.t
 t/write_atomicity_modes_live.t
@@ -313,7 +307,6 @@ script/importer-memory-check
 script/rules-package-consumer
 script/verify-rules-package
 t/security_boundaries_live.t
-lib/Selecto/PostgreSQL/Qualify.pm
 lib/Selecto/PostgreSQL/Stream.pm
 t/bounded_stream.t
 docs/typed-insert-admission.md

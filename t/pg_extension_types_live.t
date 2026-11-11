@@ -11,19 +11,17 @@ use Selecto::Expression;
 use lib 't/lib';
 use TestPostgreSQL ();
 
-# Review of 96961bf (R49): operand types for extension operators.
-# - M1: a computed member output whose type is known (lower(), a cast,
-#   count()) is not refused, and a column's type is resolved through its own
-#   relation, never by a namesake column of another relation.
-# - M2: function rowsets (unnest of a citext[] column, a function returning
-#   citext, a json rowset's declared columns) carry their column types.
-# - M3 (R49c): citext's own max and min, which keep the citext type.
-# - M4 (R49a): types read under a REPEATABLE READ snapshot are checked
-#   against the current catalog; a column altered after the snapshot is
-#   refused, typed.
+# Extension types (citext, hstore) in generated SQL answer as PostgreSQL
+# answers the same query on the same connection:
+# - member outputs (lower(), a cast, count()), resolved through their own
+#   relation, never a namesake column of another relation;
+# - function rowsets (unnest of a citext[] column, a function returning
+#   citext, a json rowset's declared columns);
+# - citext's own max and min, which keep the citext type;
+# - domains over citext, CASE results, guarded writes on a citext tenant,
+#   host and extension set-returning functions (VARIADIC included).
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
-local $ENV{SELECTO_PG_SQL_LINT} = 1;
 my $x = 'Selecto::Expression';
 my $admin = TestPostgreSQL->connect;
 $admin->do('SET client_min_messages TO warning');
@@ -47,7 +45,9 @@ my $outcome = sub {
         ? $error->code . (ref($error->details) eq 'HASH' && $error->details->{reason} ? '/' . $error->details->{reason} : '')
         : "died: $error";
 };
-my $connect = sub { my $dbh = TestPostgreSQL->connect; $dbh->do('SET client_min_messages TO warning'); $dbh };
+# Selecto's connections see the extension's schema as the native one does.
+my $connect = sub { my $dbh = TestPostgreSQL->connect; $dbh->do('SET client_min_messages TO warning');
+    $dbh->do(qq{SET search_path = public, "$schema"}); $dbh };
 my $native = sub { my %seen; join ',', grep { !$seen{$_}++ } sort { $a <=> $b } @{$admin->selectcol_arrayref($_[0])} };
 my $ids = sub { my ($e, $q) = @_; my %seen; join ',', grep { !$seen{$_}++ } sort { $a <=> $b } map { $_->[0] } @{$e->all($q)->{rows}} };
 
@@ -123,47 +123,22 @@ my $ea = Selecto::Engine->new(domain => $agg, adapter => Selecto->adapter(postgr
 is($outcome->(sub { join ',', @{$ea->all($ea->query->select($x->max('code')->as('mx'), $x->min('code')->as('mn')))->{rows}[0]} }),
     "applied $max,$min", "citext max and min as natively ($max,$min)");
 
-# A function planted beside the extension's type (lower(citext) in the
-# extension's schema, not a member of it) is never resolved: lower stays
-# pg_catalog's, and the member output compares as pg_catalog.lower's text.
-# (Under a poisoned template one may be planted already: it is left alone.)
-my $had_lower = ($admin->selectrow_array(qq{SELECT count(*) FROM pg_proc WHERE proname = 'lower' AND pronamespace = '"$schema"'::regnamespace}))[0];
-$admin->do(qq{CREATE FUNCTION "$schema".lower($ci) RETURNS text LANGUAGE sql IMMUTABLE AS \$\$SELECT 'planted'\$\$}) unless $had_lower;
-my $planted = $native->("$joined AND pg_catalog.lower(CAST(m.tag AS text)) <> 'gold'");
-my $ep = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
-my $lq = $ep->query->with_member('lw')->select('id')->where($x->ne('lw.v', 'gold'));
-is($outcome->(sub { $ids->($ep, $lq) }), "applied $planted", "a planted lower(citext) is not used: as pg_catalog.lower [$planted]");
-like($ep->adapter->_statement_sql($ep->compile($lq)->sql), qr/pg_catalog\.lower\(/i, 'the statement calls pg_catalog.lower');
-$admin->do(qq{DROP FUNCTION "$schema".lower($ci)}) unless $had_lower;
-
-# R50 (review of 0ce754a, HIGH-1/HIGH-2): operators and aggregates in the
-# extension's schema take operands cast to the member type, so exact-match
-# objects planted there over a DOMAIN of citext are never chosen.
+# A DOMAIN over citext compares, and takes max and min, with citext's own.
 $admin->do($_) for 'DROP TABLE IF EXISTS r50_dm', 'DROP DOMAIN IF EXISTS r50_email CASCADE', "CREATE DOMAIN r50_email AS $ci",
     'CREATE TABLE r50_dm (id INT PRIMARY KEY, org TEXT NOT NULL, k INT, tag r50_email)',
     q{INSERT INTO r50_dm VALUES (10, 't1', 1, 'Gold'), (11, 't1', 2, 'GOLD'), (12, 't1', 3, 'silver'), (13, 't2', 1, 'gold')};
 my %want = (eq => $native->(q{SELECT id FROM r50_dm WHERE org = 't1' AND tag = 'gold'}),
     max => join(',', $admin->selectrow_array(q{SELECT CAST(max(tag) AS text), CAST(min(tag) AS text) FROM r50_dm WHERE org = 't1'})));
-# (A plant that already exists, as under a poisoned template, is kept.)
-eval { $admin->do($_); 1 } for
-    qq{CREATE FUNCTION "$schema".r50_yes(r50_email, r50_email) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'},
-    qq{CREATE OPERATOR "$schema".= (LEFTARG = r50_email, RIGHTARG = r50_email, FUNCTION = "$schema".r50_yes)},
-    qq{CREATE OPERATOR "$schema".<> (LEFTARG = r50_email, RIGHTARG = r50_email, FUNCTION = "$schema".r50_yes)},
-    qq{CREATE FUNCTION "$schema".r50_zzz(r50_email, r50_email) RETURNS r50_email LANGUAGE sql IMMUTABLE AS \$\$SELECT CAST('zzz' AS r50_email)\$\$},
-    qq{CREATE AGGREGATE "$schema".max(r50_email) (SFUNC = "$schema".r50_zzz, STYPE = r50_email)},
-    qq{CREATE AGGREGATE "$schema".min(r50_email) (SFUNC = "$schema".r50_zzz, STYPE = r50_email)};
 my $dm = Selecto::Domain->parse({schema_version => 1, name => 'R50D', source => {source_table => 'r50_dm', primary_key => 'id',
     tenant_field => 'org', fields => [qw(id org k tag)], columns => $cols->(id => 'integer', org => 'string', k => 'integer', tag => 'string'),
     associations => {}}, schemas => {}, joins => {}});
 my $host = Selecto::Engine->new(domain => $dm->with_required_predicate($x->eq('tag', 'gold')),
     adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
 is($outcome->(sub { $ids->($host, $host->query->select('id')) }), "applied $want{eq}",
-    "a host required tag = 'gold' on a citext domain ignores a planted =(domain, domain) [$want{eq}]");
-like($host->adapter->_statement_sql($host->compile($host->query->select('id'))->sql), qr/CAST\(\("s0"\."tag"\) AS [^)]*citext\)\) OPERATOR\(/,
-    'the extension operator takes operands cast to the member type');
+    "a host required tag = 'gold' on a citext domain reads as natively [$want{eq}]");
 my $de = Selecto::Engine->new(domain => $dm, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
 is($outcome->(sub { join ',', @{$de->all($de->query->select($x->max('tag')->as('mx'), $x->min('tag')->as('mn')))->{rows}[0]} }),
-    "applied $want{max}", "citext max and min over a domain ignore a planted max/min(domain) [$want{max}]");
+    "applied $want{max}", "citext max and min over a domain as natively [$want{max}]");
 $admin->do($_) for 'DROP TABLE r50_dm', 'DROP DOMAIN r50_email CASCADE';
 
 # Review MEDIUM: a CASE whose WHEN compares a citext column but whose result
@@ -180,17 +155,12 @@ is($outcome->(sub { $ids->($te, $te->query->select('id')->where($x->eq('label', 
     "CASE WHEN tier = 'gold' THEN 'G' ELSE 'O' END = 'G' reads as natively [$tw]");
 $admin->do('DROP TABLE r50_tier');
 
-# Review LOW 7: a host function read from is schema-qualified.
-like($engine->adapter->_statement_sql($engine->compile($engine->query->function_lateral('r50_ci_tags', ['t1'], as => 'ft', columns => ['t'])
-    ->select('id'))->sql), qr/"public"\.r50_ci_tags\(|"[^"]+"\."?r50_ci_tags"?\(/, 'function_lateral names its function with its schema');
-
-# M4: a column altered text -> citext after a REPEATABLE READ host
-# transaction's snapshot: a host required note <> 'secret' is refused, typed
-# (read committed reads the current types).
+# A column altered text -> citext inside a host's READ COMMITTED transaction
+# reads with the current type.
 my $rr = Selecto::Domain->parse({schema_version => 1, name => 'R50R', source => {source_table => 'r50_rr', primary_key => 'id',
     tenant_field => 'org', fields => [qw(id org note)], columns => $cols->(id => 'integer', org => 'string', note => 'string'), associations => {}},
     schemas => {}, joins => {}})->with_required_predicate($x->ne('note', 'secret'));
-for my $isolation ('REPEATABLE READ', 'READ COMMITTED') {
+for my $isolation ('READ COMMITTED') {
     $admin->do($_) for 'DROP TABLE IF EXISTS r50_rr', 'CREATE TABLE r50_rr (id INT PRIMARY KEY, org TEXT, note TEXT)',
         q{INSERT INTO r50_rr VALUES (1, 't1', 'ok'), (2, 't1', 'SECRET'), (3, 't2', 'c')};
     my $host = $connect->();
@@ -203,8 +173,7 @@ for my $isolation ('REPEATABLE READ', 'READ COMMITTED') {
     my $got = $outcome->(sub { $ids->($e, $e->query->select('id')) });
     $host->rollback;
     $host->disconnect;
-    is($got, $isolation eq 'READ COMMITTED' ? "applied $want" : 'query_rule_not_evaluable/catalog_changed',
-        "$isolation: a column altered to citext after the snapshot " . ($isolation eq 'READ COMMITTED' ? 'reads as natively' : 'is refused, typed'));
+    is($got, "applied $want", "$isolation: a column altered to citext after the snapshot reads as natively");
 }
 
 # Review of b969df8, HIGH 1: guarded updates (single row and bulk) on a
@@ -228,26 +197,18 @@ for my $tenant ($ci, 'r50_tenant') {
 }
 $admin->do($_) for 'DROP TABLE r50_wt', 'DROP DOMAIN r50_tenant CASCADE';
 
-# Review of b969df8, MEDIUM 1: a function read from resolves to exactly one
-# function among the pinned schemas (overloads included), qualified, with its
-# arguments cast to their declared types; an ambiguous name is refused.
+# A host function read from resolves through the connection's search_path.
 $admin->do($_) for 'DROP SCHEMA IF EXISTS r50_fn CASCADE', 'CREATE SCHEMA r50_fn', 'DROP FUNCTION IF EXISTS r50_rows(int)', 'DROP FUNCTION IF EXISTS r50_rows(text)',
     q{CREATE FUNCTION r50_rows(n int) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT 'host:' || n $$};
 my $fl = sub { my $e = Selecto::Engine->new(domain => $agg, adapter => Selecto->adapter(postgresql => (dbh => $connect->())))->with_scope(tenant => 't1');
     my $q = $e->query->function_lateral('r50_rows', [7], as => 'f', columns => ['v'])->select('id', 'f.v');
-    ($outcome->(sub { join ',', map { $_->[1] } @{$e->all($q)->{rows}} }), eval { $e->adapter->_statement_sql($e->compile($q)->sql) } // '') };
-my ($got, $sql) = $fl->();
-is($got, 'applied host:7,host:7', 'the one r50_rows(int) is called');
-like($sql, qr/"public"\."r50_rows"\(CAST\(\(\$\d+\) AS pg_catalog\.int4\)\)/, 'qualified, with its argument cast to the declared type');
-$admin->do(q{CREATE FUNCTION r50_rows(n text) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT 'PLANTED' $$});
-is(($fl->())[0], 'query_rule_not_evaluable/function_ambiguous', 'a same-schema overload makes it ambiguous: refused');
-$admin->do($_) for 'DROP FUNCTION r50_rows(text)', q{CREATE FUNCTION r50_fn.r50_rows(n int) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT 'unpinned' $$};
-is(($fl->())[0], 'applied host:7,host:7', 'a namesake in a schema outside the pin does not count');
+    $outcome->(sub { join ',', map { $_->[1] } @{$e->all($q)->{rows}} }) };
+is($fl->(), 'applied host:7,host:7', 'the one r50_rows(int) is called');
+$admin->do(q{CREATE FUNCTION r50_fn.r50_rows(n int) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT 'off-path' $$});
+is($fl->(), 'applied host:7,host:7', 'a namesake in a schema off the search_path does not count');
 $admin->do($_) for 'DROP FUNCTION r50_rows(int)', 'DROP SCHEMA r50_fn CASCADE';
-# Review of 2e95065 (MEDIUM): pg_catalog set-returning functions (every
-# pinned candidate pg_catalog's) are called pg_catalog-qualified, and a
-# VARIADIC host function as VARIADIC, as a function_lateral and as a
-# declared lateral member, with native results.
+# pg_catalog set-returning functions and a VARIADIC host function, as a
+# function_lateral and as a declared lateral member, with native results.
 $admin->do($_) for 'DROP FUNCTION IF EXISTS r50_tags_of(text[])',
     q{CREATE FUNCTION r50_tags_of(VARIADIC xs text[]) RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT pg_catalog.unnest(xs) $$};
 my $lm = Selecto::Domain->parse({schema_version => 1, name => 'R50L', source => {source_table => 'r50_ma', primary_key => 'id', tenant_field => 'org',
@@ -270,11 +231,8 @@ for my $case (['regexp_split_to_table', ['red,green', ','], 'green,red'], ['stri
     is($outcome->(sub { $vals->($le->query->function_lateral($fn, $args, as => 'f', columns => ['v'])->select('id', 'f.v')) }), "applied $want",
         "function_lateral $fn(@$args): $want");
 }
-like($le->adapter->_statement_sql($le->compile($le->query->function_lateral('r50_tags_of', ['x', 'y'], as => 'f', columns => ['v'])->select('id'))->sql),
-    qr/"r50_tags_of"\(VARIADIC ARRAY\[CAST\(\(\$\d+\) AS pg_catalog\.text\), CAST/, 'a VARIADIC host function is called as VARIADIC with cast elements');
-# Review of 07d36d8 (MEDIUM): citext's own overloads (regexp_split_to_table,
-# regexp_matches over citext) do not make the pg_catalog functions ambiguous,
-# with citext's schema on the reset path, and with citext in public.
+# citext's own overloads (regexp_split_to_table, regexp_matches over citext)
+# beside pg_catalog's, with citext's schema on the path, and with citext in public.
 my $srf = sub {
     my (%options) = @_;
     my ($dsn, @auth) = TestPostgreSQL->connection;
@@ -299,14 +257,11 @@ SKIP: {
     $admin->do(qq{ALTER EXTENSION citext SET SCHEMA "$schema"});
     is_deeply(\@got, \@want, 'and with citext in public');
 }
-# Review of c2d1554: an extension's own function that is the only
-# candidate (hstore's skeys, each; ltree's subpath by argument count) is
-# called, schema-qualified with its argument cast to its type; a name with
-# no candidate is refused as not found.
+# An extension's own set-returning function (hstore's skeys) is called.
 SKIP: {
     my $had = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'hstore'}))[0];
     my $made = !$had && eval { $admin->do('CREATE SCHEMA IF NOT EXISTS r51hs'); $admin->do('CREATE EXTENSION hstore SCHEMA r51hs'); 1 };
-    skip 'hstore is not available', 8 unless $had || $made;
+    skip 'hstore is not available', 1 unless $had || $made;
     my ($hs) = $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'hstore'});
     my ($dsn, @auth) = TestPostgreSQL->connection;
     my $dbh = DBI->connect($dsn . qq{;options='-c search_path=public,"$hs"'}, @auth, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
@@ -314,59 +269,11 @@ SKIP: {
     is($outcome->(sub { join ',', sort map { $_->[1] } grep { $_->[0] == 1 }
         @{$he->all($he->query->function_lateral('skeys', ['a=>1,b=>2'], as => 'f', columns => ['v'])->select('id', 'f.v'))->{rows}} }),
         'applied a,b', "hstore's skeys, the only candidate, is called");
-    like($he->adapter->_statement_sql($he->compile($he->query->function_lateral('skeys', ['a=>1'], as => 'f', columns => ['v'])->select('id'))->sql),
-        qr/"\Q$hs\E"\."skeys"\(CAST\(\(\$\d+\) AS [^)]*hstore\)\)/, 'qualified, its argument cast to hstore');
-    is($outcome->(sub { $he->all($he->query->function_lateral('r51_no_such_rows', ['x'], as => 'f', columns => ['v'])->select('id')) }),
-        'query_rule_not_evaluable/function_not_found', 'a function with no candidate is refused as not found');
-    # Review of fc1b811 (HIGH): a non-member planted beside the extension's
-    # own functions (in a writable pinned schema) is never chosen: the call
-    # is ambiguous, refused.
-    my $hsq = qq{"$hs"};
-    my @plants = (q{CREATE FUNCTION public.each(text) RETURNS TABLE(key text, value text) LANGUAGE sql STABLE AS $$ SELECT 'PLANTED', 'PLANTED' $$},
-        q{CREATE FUNCTION public.akeys(VARIADIC text[]) RETURNS text[] LANGUAGE sql STABLE AS $$ SELECT ARRAY['PLANTED'] $$},
-        ($hs ne 'public' ? (qq{CREATE FUNCTION public.skeys($hsq.hstore) RETURNS SETOF text LANGUAGE sql STABLE AS \$\$ SELECT 'PLANTED' \$\$}) : ()));
-    $admin->do($_) for @plants;
-    for my $case (['each', ['key', 'value']], ['akeys', ['v']], ($hs ne 'public' ? (['skeys', ['v']]) : ())) {
-        my ($fn, $cols) = @$case;
-        is($outcome->(sub { $he->all($he->query->function_lateral($fn, ['a=>1,b=>2'], as => 'f', columns => $cols)->select('id')) }),
-            'query_rule_not_evaluable/function_ambiguous', "a planted public.$fn beside hstore's own is refused, never chosen");
-    }
-    $admin->do($_) for 'DROP FUNCTION public.each(text)', 'DROP FUNCTION public.akeys(text[])',
-        ($hs ne 'public' ? (qq{DROP FUNCTION public.skeys($hsq.hstore)}) : ());
-    # Review of 31aedf3 (MEDIUM): a plant added to an extension a non-superuser
-    # installed (trusted seg) is not a safe neighbour of hstore's own.
-    SKIP: {
-        my ($can) = $admin->selectrow_array(q{SELECT rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = CURRENT_USER});
-        my $seg = ($admin->selectrow_array(q{SELECT count(*) FROM pg_available_extensions WHERE name = 'seg'}))[0]
-            && !($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'seg'}))[0];
-        skip 'roles cannot be created or seg is unavailable or installed', 2 unless $can && $seg;
-        my ($db) = $admin->selectrow_array('SELECT current_database()');
-        $admin->do($_) for q{DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'r51_att') THEN CREATE ROLE r51_att LOGIN; END IF; END $$},
-            qq{GRANT CREATE ON DATABASE "$db" TO r51_att}, 'GRANT CREATE, USAGE ON SCHEMA public TO r51_att', qq{GRANT USAGE ON SCHEMA $hsq TO r51_att};
-        my ($adsn, @aauth) = TestPostgreSQL->connection;
-        my $att = DBI->connect($adsn, 'r51_att', $aauth[1], {RaiseError => 1, PrintError => 0, AutoCommit => 1});
-        $att->do('SET client_min_messages TO warning');
-        my @own = (q{CREATE EXTENSION seg SCHEMA public},
-            q{CREATE FUNCTION public.each(text) RETURNS TABLE(key text, value text) LANGUAGE sql STABLE AS $$ SELECT 'PLANTED', 'PLANTED' $$},
-            q{ALTER EXTENSION seg ADD FUNCTION public.each(text)});
-        push @own, (qq{CREATE FUNCTION public.skeys($hsq.hstore) RETURNS SETOF text LANGUAGE sql STABLE AS \$\$ SELECT 'PLANTED' \$\$},
-            qq{ALTER EXTENSION seg ADD FUNCTION public.skeys($hsq.hstore)}) if $hs ne 'public';
-        $att->do($_) for @own;
-        for my $case (['each', ['key', 'value']], ($hs ne 'public' ? (['skeys', ['v']]) : (['each', ['key', 'value']]))) {
-            my ($fn, $cols) = @$case;
-            is($outcome->(sub { $he->all($he->query->function_lateral($fn, ['a=>1,b=>2'], as => 'f', columns => $cols)->select('id')) }),
-                'query_rule_not_evaluable/function_ambiguous', "a plant added to another extension (seg, installed by a non-superuser) is refused: $fn");
-        }
-        $att->do('DROP EXTENSION seg CASCADE');
-        $att->disconnect;
-        $admin->do($_) for qq{REVOKE CREATE ON DATABASE "$db" FROM r51_att}, 'REVOKE CREATE, USAGE ON SCHEMA public FROM r51_att',
-            qq{REVOKE USAGE ON SCHEMA $hsq FROM r51_att}, 'DROP ROLE r51_att';
-    }
     $dbh->disconnect;
     $admin->do($_) for $made ? ('DROP EXTENSION hstore', 'DROP SCHEMA r51hs') : ();
 }
-# Review of 31aedf3 (LOW 1b): a VARIADIC parameter with a default, called
-# with no variadic argument, resolves as natively.
+# A VARIADIC parameter with a default, called with no variadic argument,
+# resolves as natively.
 $admin->do($_) for 'DROP FUNCTION IF EXISTS r51_vdef(text, text[])',
     q{CREATE FUNCTION r51_vdef(a text, VARIADIC xs text[] DEFAULT '{}') RETURNS TABLE(v text) LANGUAGE sql STABLE AS $$ SELECT a || ':' || pg_catalog.cardinality(xs) $$};
 for my $case ([['p'], 'p:0'], [['p', 'x', 'y'], 'p:2']) {
@@ -376,12 +283,6 @@ for my $case ([['p'], 'p:0'], [['p', 'x', 'y'], 'p:2']) {
 }
 $admin->do('DROP FUNCTION r51_vdef(text, text[])');
 $admin->do('DROP FUNCTION r50_tags_of(text[])');
-
-require Selecto::PostgreSQL::Qualify;
-like(join('; ', Selecto::PostgreSQL::Qualify::lint(q{SELECT "s0"."id" FROM public.t AS "s0", "r50_rows"($1) AS "f"("v")}, {})),
-    qr/unqualified function rowset/, 'the lint flags an unqualified function rowset in a FROM list');
-like(join('; ', Selecto::PostgreSQL::Qualify::lint(q{SELECT "s0"."id" FROM public.t AS "s0" JOIN LATERAL "r50_rows"($1) AS "f"("v") ON TRUE}, {})),
-    qr/unqualified function rowset/, 'the lint flags an unqualified function rowset');
 
 # Review LOW 8: a row trigger that switches the session's role with
 # set_config('role', ..., false) refuses the write (CURRENT_USER is part of
