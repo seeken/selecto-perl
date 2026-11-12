@@ -2516,12 +2516,21 @@ sub _required_key {
         unless exists $value->{$key};
 }
 
+# A number decoded from JSON (numeric, never used as a string), which is not
+# text even though Perl would print it.
+sub _json_number {
+    my ($value) = @_;
+    require B;
+    my $flags = B::svref_2object(\$value)->FLAGS;
+    return ($flags & (B::SVp_IOK() | B::SVp_NOK())) && !($flags & B::SVp_POK()) ? 1 : 0;
+}
+
 # Plain text for people: 1-1000 characters, line breaks allowed, no other
 # control characters.
 sub _description {
     my ($value, $label) = @_;
     Selecto::Error->throw('invalid_domain', "$label must be a non-empty string")
-        if !defined($value) || ref($value) || "$value" !~ /\S/;
+        if !defined($value) || ref($value) || _json_number($value) || "$value" !~ /\S/;
     Selecto::Error->throw('invalid_domain', "$label must be at most 1000 characters")
         if length("$value") > 1000;
     Selecto::Error->throw('invalid_domain', "$label cannot contain control characters")

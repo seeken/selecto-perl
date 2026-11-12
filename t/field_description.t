@@ -56,6 +56,11 @@ for my $bad ([undef, 'undefined'], ['', 'empty'], ['   ', 'blank'], [[1], 'a ref
     like $@, qr/column total description/, 'naming the column';
 }
 ok eval { Selecto::Domain->parse(contract(description => 'x' x 1000), strict => 1); 1 }, '1000 characters are allowed';
+ok !eval { Selecto::Domain->parse(contract(description => 5), strict => 1); 1 }, 'a number is not a description';
+ok !eval { Selecto::Domain->parse(contract(description => "a\rb"), strict => 1); 1 }, 'nor is text with a carriage return';
+ok eval { Selecto::Domain->parse(contract(description => "\x{1F600}" x 1000), strict => 1); 1 },
+    '1000 characters are counted as code points';
+ok !eval { Selecto::Domain->parse(contract(description => "\x{1F600}" x 1001), strict => 1); 1 }, 'and 1001 are too many';
 my $bad_choice = contract();
 $bad_choice->{components}{filter_choices}{total}{description} = {};
 ok !eval { Selecto::Domain->parse($bad_choice, strict => 1); 1 }, 'a filter choice description must be text';
