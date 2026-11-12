@@ -128,6 +128,18 @@ subtest 'a version 2 tenant is the public write authority' => sub {
         'bounded to that tenant');
 };
 
+subtest 'a document that is not schema 2 refuses a top-level tenant' => sub {
+    for my $version (1, '2', undef) {
+        my $doc = {%$v1, tenant => {field => 'org_id'}};
+        if (defined $version) { $doc->{schema_version} = $version } else { delete $doc->{schema_version} }
+        for my $strict (1, 0) {
+            my $error = eval { Selecto::Domain->parse($doc, strict => $strict); 1 } ? undef : $@;
+            is(blessed($error) && $error->code, 'unknown_domain_key',
+                'schema_version ' . ($version // 'absent') . ($strict ? ', strict' : ', not strict') . ': refused');
+        }
+    }
+};
+
 subtest 'the computed fingerprint is a version 2 domain\'s identity' => sub {
     require Selecto::API;
     my $doc = {%{$V2->migrate($v1)->{document}}, domain_version => '1'};

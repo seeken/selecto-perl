@@ -341,6 +341,9 @@ sub parse {
         Selecto::ConfiguredDomain->admit_library($raw->{query_library});
     }
     _reject_unknown($raw, \%TOP_LEVEL, 'domain') if $strict;
+    # A top-level tenant is schema 2's: ignored here, the domain would load
+    # without its tenant, so it refuses even when the parse is not strict.
+    _reject_unknown({tenant => $raw->{tenant}}, {}, 'domain') if exists $raw->{tenant};
     _required_key($raw, 'source', 'domain');
     _object($raw->{source}, 'source');
     _normalize_fts5_index($raw->{source}{fts5_index}) if defined $raw->{source}{fts5_index};
@@ -3099,7 +3102,8 @@ refuses its writes with C<write_policy_missing>.
 
 Parses and validates a domain document. Strict mode, the default, rejects
 unknown keys at every level with C<unknown_domain_key>;
-C<< strict => 0 >> ignores them. Other problems throw C<invalid_domain> with
+C<< strict => 0 >> ignores them, except a top-level C<tenant> on a document that
+is not schema 2, which always refuses. Other problems throw C<invalid_domain> with
 a message and details describing the first one found.
 
 Both domain schema versions parse. Schema 2 (certification specification 3.0)
