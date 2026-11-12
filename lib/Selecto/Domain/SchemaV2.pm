@@ -327,11 +327,11 @@ sub to_version_1 {
     }
     if (my $tenant = delete $doc->{tenant}) {
         $doc->{source}{tenant_field} = $tenant->{field};
-        if (exists($tenant->{write_field}) || exists($tenant->{satisfied_by})) {
-            my $scope = {required => JSON::PP::true, field => $tenant->{write_field} // $tenant->{field}};
-            $scope->{satisfied_by} = $tenant->{satisfied_by} if exists $tenant->{satisfied_by};
-            $doc->{writes}{scope}{tenant} = $scope;
-        }
+        # The tenant declaration is also the public write authority, so the
+        # schema 1 form always carries writes.scope.tenant.
+        my $scope = {required => JSON::PP::true, field => $tenant->{write_field} // $tenant->{field}};
+        $scope->{satisfied_by} = $tenant->{satisfied_by} if exists $tenant->{satisfied_by};
+        $doc->{writes}{scope}{tenant} = $scope;
         # Pins lead, as tenant pins usually do in version 1.
         unshift @{$doc->{required_filters}}, map { [@$_] } @{$tenant->{pins}} if ref($tenant->{pins}) eq q{ARRAY} && @{$tenant->{pins}};
     }

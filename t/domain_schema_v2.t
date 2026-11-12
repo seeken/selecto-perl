@@ -87,4 +87,36 @@ subtest 'a version 2 domain reads and writes like its version 1 form' => sub {
     is_deeply($sql->($V2->migrate($v1)->{document}), $sql->($v1), 'the same SQL and parameters');
 };
 
+subtest 'a version 2 tenant is the public write authority' => sub {
+    my $v2 = {
+        schema_version => 2, name => 'Orders', tenant => {field => 'org_id'},
+        source => {source_table => 'orders', primary_key => 'id', associations => {},
+            columns => {id => {type => 'integer'}, org_id => {type => 'integer'}, total => {type => 'integer'}}},
+        schemas => {}, joins => {},
+        writes => {operations => {update => {enabled => 1, bulk => 1}}, fields => {total => {updatable => 1}}},
+    };
+    is_deeply($V2->to_version_1($v2)->{writes}{scope}{tenant}, {required => JSON::PP::true, field => 'org_id'},
+        'a plain tenant maps to writes.scope.tenant');
+
+    plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
+    require Selecto::API::EngineHandler;
+    my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', '', '', {RaiseError => 1, PrintError => 0});
+    $dbh->do('CREATE TABLE orders (id INTEGER PRIMARY KEY, org_id INTEGER, total INTEGER)');
+    $dbh->do('INSERT INTO orders VALUES (1, 7, 1), (2, 8, 1)');
+    my $adapter = Selecto->adapter(sqlite => dbh => $dbh);
+    my $handler = Selecto::API::EngineHandler->new;
+    my $update = sub {
+        my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse($_[0]), adapter => $adapter, scope => {tenant => 7});
+        my $ok = eval { $handler->write($engine, {operation => 'update', assignments => {total => 9},
+            filters => [{field => 'id', op => 'in', value => [1, 2]}]}); 1 };
+        return $ok ? 'ok' : (blessed($@) && $@->isa('Selecto::Error') ? $@->code : "died: $@");
+    };
+    my $v1_form = $V2->to_version_1($v2);
+    delete $v1_form->{writes}{scope};
+    is($update->($v1_form), 'missing_tenant_scope', 'version 1 without writes.scope.tenant: the engine tenant alone does not authorize');
+    is($update->($v2), 'ok', 'version 2: the engine tenant authorizes a public write');
+    is_deeply($dbh->selectall_arrayref('SELECT id, org_id, total FROM orders ORDER BY id'), [[1, 7, 9], [2, 8, 1]],
+        'bounded to that tenant');
+};
+
 done_testing;
