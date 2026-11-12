@@ -76,10 +76,11 @@ Revision history for Selecto
       writes.scope.tenant did not scope reads by the engine tenant; its schema 2
       form does. Selecto::Domain::SchemaV2 holds the rules and the migration;
       the Perl targets certify domain_schema_v2 (DS201-DS203).
-    - An engine tenant is a public write boundary on a tenant_field domain, with or
-      without writes.scope.tenant: the API write handler no longer refuses such a
-      write with missing_tenant_scope, and the write binder confines it to the
-      tenant. Certification TB007 and TKC002-005 now pass on every Perl target.
+    - Public write authority stays explicit (certification TB007,
+      engine_api_tenant_boundary 1.3.0): on a tenant_field domain without
+      writes.scope.tenant, an engine tenant alone does not authorize an API write;
+      it fails with missing_tenant_scope. A schema 2 tenant declaration is that
+      authority: its schema 1 form always carries writes.scope.tenant.
     - The verification models and the contract compatibility checker move to
       selecto-perl-certification (Selecto::Certification::Verification::*,
       Selecto::Certification::ContractVerification). Domain no longer has

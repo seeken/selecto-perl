@@ -2564,10 +2564,12 @@ sub enforce_query_evidence {
 # True when execution will add the trusted tenant for this field itself.
 sub _scopes_tenant_field {
     my ($self, $field) = @_;
-    # An engine tenant bounds the write: the write binder confines every write to
-    # it on the tenant column (lesson 47), with or without writes.scope.tenant.
+    # Public write authority is explicit (TB007): the engine tenant authorizes a
+    # public write only when the domain declares writes.scope.tenant (a schema 2
+    # tenant always does). The write binder still confines every write to it.
+    my $scope = $self->{domain}->write_tenant_scope;
     my $column = $self->_write_tenant_column;
-    return defined($column) && $column eq $field && defined($self->{scope}{tenant});
+    return $scope && defined($column) && $column eq $field && defined($self->{scope}{tenant});
 }
 
 # A scope counts as tenant-scoped only when a positive conjunct (eq or in over
