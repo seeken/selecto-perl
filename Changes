@@ -50,6 +50,13 @@ Revision history for Selecto
       bare commit or rollback under completion_type 2.
     - Deploy selecto-perl-mcp and every companion at this version together.
 
+    - Columns (root and associated schemas) and components.filter_choices entries take
+      an optional description: plain text for people choosing or reading the field
+      (1-1000 characters, line breaks allowed). Selecto::Domain::field_description
+      returns it. The API's OpenAPI document lists the public fields under
+      x-selecto.fields (path, type, and label, description and unit when declared);
+      internal and redacted fields are never listed.
+
     - PostgreSQL: the adapter no longer defends against roles with CREATE in the
       application's schemas or against code planted in triggers and views, which are
       outside the threat model. Removed: the operator and function qualifier, the

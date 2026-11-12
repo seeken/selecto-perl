@@ -7,6 +7,7 @@ use JSON::PP ();
 use Cpanel::JSON::XS ();
 use Selecto::CanonicalJSON ();
 use Scalar::Util qw(blessed looks_like_number);
+use Storable qw(dclone);
 use Selecto::API::ResultFormatter ();
 use Selecto::API::ResponsePolicy ();
 use Selecto::Limits ();
@@ -49,11 +50,12 @@ sub new ($class, @args) {
 
     my $base_path = _normalize_base_path($self->base_path // $DEFAULT_PATH);
     my $identity = _domain_identity($contract);
+    my $fields = _public_fields($domain);
     canonical_json($contract);
     $self->domain($contract);
     $self->base_path($base_path);
     $self->manifest(_manifest($identity, $base_path, $self->resources));
-    $self->openapi(_openapi($identity, $base_path, $self->resources));
+    $self->openapi(_openapi($identity, $base_path, $self->resources, $fields));
     return $self;
 }
 
@@ -494,7 +496,7 @@ sub _manifest ($identity, $base_path, $resources = 0) {
     };
 }
 
-sub _openapi ($identity, $base_path, $resources = 0) {
+sub _openapi ($identity, $base_path, $resources = 0, $fields = []) {
     my %paths;
     for my $route (@{_routes($base_path, $resources)}) {
         my $operation = {
@@ -558,8 +560,41 @@ sub _openapi ($identity, $base_path, $resources = 0) {
             domainFingerprint => $identity->{fingerprint},
             domainSchemaVersion => $identity->{schema_version},
             domainVersion => $identity->{version},
+            fields => $fields,
         },
     };
+}
+
+# The public fields a query may name (root fields and one association hop),
+# with what a person needs to choose them: [{path, type, label?, description?,
+# unit?}] (unit as Selecto::Analytics::UnitRegistry normalizes it, other than a
+# plain scalar). Internal and redacted fields are never listed.
+sub _public_fields ($domain) {
+    my $fields = $domain->fields;
+    my $associations = $domain->associations;
+    my @paths = (
+        (sort keys %$fields),
+        map {
+            my $name = $_;
+            map { "$name.$_" } sort keys %{$associations->{$name}->fields}
+        } sort keys %$associations,
+    );
+    my @described;
+    for my $path (grep { $domain->field_is_public($_) } @paths) {
+        my $metadata = $domain->field_metadata($path);
+        my $type = $path =~ /\A([^.]+)\.(.+)\z/
+            ? $associations->{$1}->fields->{$2} : $fields->{$path};
+        my $unit = $domain->field_unit($path);
+        my $description = $domain->field_description($path);
+        push @described, {
+            path => $path,
+            type => "$type",
+            (defined($metadata->{label}) && !ref($metadata->{label}) ? (label => "$metadata->{label}") : ()),
+            (defined($description) ? (description => $description) : ()),
+            (ref($unit) eq 'HASH' && ($unit->{kind} // '') ne 'scalar' ? (unit => dclone($unit)) : ()),
+        };
+    }
+    return \@described;
 }
 
 sub _response_description ($operation_id) {
@@ -720,7 +755,11 @@ basename of at most 160 characters ending in the format's extension.
 =head2 openapi_document, manifest
 
 The generated OpenAPI document and the API manifest (domain identity and
-route list).
+route list). The document's C<x-selecto.fields> lists the public fields a query
+may name, root fields and one association hop, by path: each C<path> and
+C<type>, and the column's C<label>, C<description> and C<unit> when it has
+them. Internal and redacted fields are never listed, so a governed domain
+publishes only what its caller may use.
 
 =head2 error_status
 
