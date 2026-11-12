@@ -110,7 +110,11 @@ sub fingerprint {
 sub is_version_2 {
     my ($class, $version) = @_;
     return 0 unless defined($version) && !ref($version);
-    return _is_number($version) ? ($version == 2 ? 1 : 0) : ($version eq q{2} ? 1 : 0);
+    # Only the number 2: the string "2" (a decoded JSON string) is not schema 2,
+    # as in the reference. A number keeps its numeric flag even after it has
+    # been printed, so a numeric flag is enough here.
+    my $flags = B::svref_2object(\$version)->FLAGS;
+    return ($flags & (B::SVp_IOK() | B::SVp_NOK())) && $version == 2 ? 1 : 0;
 }
 
 sub _relations {

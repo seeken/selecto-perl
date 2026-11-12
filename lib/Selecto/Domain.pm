@@ -320,9 +320,14 @@ sub parse {
         my $errors = Selecto::Domain::SchemaV2->validate($raw);
         Selecto::Error->throw(q{invalid_domain}, "domain schema 2: $errors->[0]{code}",
             {reason => $errors->[0]{code}, path => $errors->[0]{path}, errors => $errors}) if @$errors;
-        my $domain = $class->parse(Selecto::Domain::SchemaV2->to_version_1($raw), %options);
+        # The computed fingerprint is the domain's identity, so the version 1 form
+        # carries it as domain_fingerprint (the canonical API reads it there).
+        my $fingerprint = Selecto::Domain::SchemaV2->fingerprint($raw);
+        my $v1 = Selecto::Domain::SchemaV2->to_version_1($raw);
+        $v1->{domain_fingerprint} = $fingerprint;
+        my $domain = $class->parse($v1, %options);
         $domain->{schema_version} = 2;
-        $domain->{fingerprint} = Selecto::Domain::SchemaV2->fingerprint($raw);
+        $domain->{fingerprint} = $fingerprint;
         return $domain;
     }
     require Selecto::Tenant::Context;

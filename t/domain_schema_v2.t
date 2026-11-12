@@ -72,6 +72,15 @@ subtest 'parse' => sub {
     delete $doc->{domain_fingerprint};
     $error = eval { Selecto::Domain->parse({%$doc, source => {%{$doc->{source}}, fields => ['id']}}); 1 } ? undef : $@;
     is(blessed($error) && $error->details->{reason}, 'fields_removed', 'version 2 has no fields');
+
+    ok(!$V2->is_version_2('2'), 'the string "2" is not schema 2');
+    ok(!$V2->is_version_2($json->decode('["2"]')->[0]), 'nor is a decoded JSON string "2"');
+    my $printed = 2;
+    my $text = "$printed";
+    ok($V2->is_version_2($printed), 'the number 2 is, even after it has been printed');
+    ok($V2->is_version_2($json->decode('[2]')->[0]), 'and so is a decoded JSON number');
+    $error = eval { Selecto::Domain->parse({%$doc, schema_version => '2'}); 1 } ? undef : $@;
+    ok(blessed($error), 'a domain whose schema_version is the string "2" does not load as schema 2');
 };
 
 subtest 'a version 2 domain reads and writes like its version 1 form' => sub {
@@ -117,6 +126,16 @@ subtest 'a version 2 tenant is the public write authority' => sub {
     is($update->($v2), 'ok', 'version 2: the engine tenant authorizes a public write');
     is_deeply($dbh->selectall_arrayref('SELECT id, org_id, total FROM orders ORDER BY id'), [[1, 7, 9], [2, 8, 1]],
         'bounded to that tenant');
+};
+
+subtest 'the computed fingerprint is a version 2 domain\'s identity' => sub {
+    require Selecto::API;
+    my $doc = {%{$V2->migrate($v1)->{document}}, domain_version => '1'};
+    my $domain = Selecto::Domain->parse($doc);
+    my $computed = $V2->fingerprint($doc);
+    is($domain->contract->{domain_fingerprint}, $computed, 'the version 1 form carries it as domain_fingerprint');
+    my $api = Selecto::API->new(domain => $domain, base_path => '/api/v1/orders');
+    is($api->manifest->{domain}{fingerprint}, $computed, 'the canonical API hosts it and reports it');
 };
 
 done_testing;
