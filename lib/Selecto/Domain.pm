@@ -907,6 +907,8 @@ sub _canonical_fields {
             ) unless ($column->{type} // '') eq 'string';
             $column->{text_case} = $text_case;
         }
+        $column->{description} = _description($column->{description}, "column $field description")
+            if exists $column->{description};
         $relation->{columns}{$field} = $column;
         $result{$field} = $column->{type};
     }
@@ -1593,6 +1595,14 @@ sub field_unit {
     );
 }
 
+# The field's description (column metadata), for people choosing or reading
+# it; undef when it has none.
+sub field_description {
+    my ($self, $path) = @_;
+    my $description = $self->_field_metadata_view($path)->{description};
+    return defined($description) && !ref($description) ? "$description" : undef;
+}
+
 sub field_behavior {
     my ($self, $path) = @_;
     require Selecto::Analytics::UnitRegistry;
@@ -1641,7 +1651,7 @@ sub _normalize_components {
                 unless $path =~ /\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\z/;
             my $spec = $filters->{$path};
             _object($spec, "filter choices for $path");
-            _reject_unknown($spec, {label => 1, choices => 1, conditional => 1,
+            _reject_unknown($spec, {label => 1, description => 1, choices => 1, conditional => 1,
                 picker_hidden => 1}, "filter choices for $path");
             my $label = _nonblank_string($spec->{label}, "filter choices for $path label");
             my $choices = $spec->{choices};
@@ -1662,6 +1672,8 @@ sub _normalize_components {
                 };
             }
             my %normalized_spec = (label => $label, choices => \@items);
+            $normalized_spec{description} = _description($spec->{description},
+                "filter choices for $path description") if exists $spec->{description};
             if (exists $spec->{conditional}) {
                 my $conditional = $spec->{conditional};
                 _object($conditional, "conditional filter choices for $path");
@@ -2496,6 +2508,19 @@ sub _required_key {
         unless exists $value->{$key};
 }
 
+# Plain text for people: 1-1000 characters, line breaks allowed, no other
+# control characters.
+sub _description {
+    my ($value, $label) = @_;
+    Selecto::Error->throw('invalid_domain', "$label must be a non-empty string")
+        if !defined($value) || ref($value) || "$value" !~ /\S/;
+    Selecto::Error->throw('invalid_domain', "$label must be at most 1000 characters")
+        if length("$value") > 1000;
+    Selecto::Error->throw('invalid_domain', "$label cannot contain control characters")
+        if "$value" =~ /[\x00-\x09\x0b-\x1f\x7f]/;
+    return "$value";
+}
+
 sub _required_string {
     my ($value, $label) = @_;
     Selecto::Error->throw('invalid_domain', "$label must be a non-empty string")
@@ -3277,6 +3302,13 @@ every value of an assignment hash. The engine does this for every write.
 Return the normalized analytics C<unit> and C<behavior> of a column; see
 L<Selecto::Analytics::UnitRegistry> and F<docs/analytics-units.md>.
 
+=head2 field_description
+
+  my $text = $domain->field_description('customer.name');
+
+The column's C<description>, or C<undef>. Like every field metadata, a caller
+showing it to someone should check L</field_is_public> first.
+
 =head2 values_foreign_keys
 
 Returns, per root field, the allowed values of a one-to-one association to an
@@ -3344,9 +3376,14 @@ metadata. C<type> is required. The portable types are C<string> (also
 C<text>), C<integer>, C<decimal>, C<boolean>, C<date>, C<utc_datetime>,
 C<naive_datetime>, C<epoch_datetime> (numeric epoch storage), C<json> or
 C<jsonb>, C<uuid> and C<array>. Other keys include C<internal>,
-C<label>, C<format>, C<text_case>, C<unit>, C<behavior>, C<computed>,
+C<label>, C<description>, C<format>, C<text_case>, C<unit>, C<behavior>, C<computed>,
 C<storage>, and for arrays C<items> (C<string>, C<integer>, C<decimal>,
 C<boolean>, C<date> or C<uuid>).
+
+C<description> is plain text for people choosing or reading the field (1-1000
+characters, line breaks allowed); L</field_description> returns it, and the
+Explorer and the API show it beside the label. Associated schemas' columns
+take it too.
 
 C<storage> is available only on C<utc_datetime> columns that are not
 computed, and its only value is C<naive_utc>: the column is a time-zone-less
@@ -3590,7 +3627,8 @@ Import field mappings and key sets; see L<Selecto::Importer>.
 =item C<components>
 
 Hints for exploration user interfaces: C<filter_choices> (option catalogs for
-a field, optionally C<conditional> on whether a root field is null),
+a field, with a C<label>, an optional C<description>, and optionally
+C<conditional> on whether a root field is null),
 C<filter_picker_hidden_paths>, C<picker_visible_id_paths> and
 C<query_params>.
 
