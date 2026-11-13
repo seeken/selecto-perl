@@ -50,6 +50,14 @@ Revision history for Selecto
       bare commit or rollback under completion_type 2.
     - Deploy selecto-perl-mcp and every companion at this version together.
 
+    - Selecto::API::Spa serves the Selecto SPA explorer protocol (selecto.spa.*/v1:
+      descriptors; Detail with repeated columns, Aggregate with rollup and the grid,
+      Graph; nested AND/OR filters; paging) through the canonical query handler.
+      Selecto::API::EngineHandler gains two trusted options for it, off by default and
+      never enabled by Selecto::API: filter_groups ({any|all => [...]} filter groups)
+      and aggregate_selections ({aggregate, field, alias} select entries). The
+      canonical API's requests and refusals are unchanged.
+
     - Columns (root and associated schemas) and components.filter_choices entries take
       an optional description: plain text for people choosing or reading the field
       (1-1000 characters, line breaks allowed). Selecto::Domain::field_description

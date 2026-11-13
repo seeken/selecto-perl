@@ -428,6 +428,19 @@ engine; complete Domain publication remains opt-in. The sibling
 shows the same reader behind native HTMX and Vue, including its current
 unsupported wire features and real PostgreSQL verification.
 
+`Selecto::API::Spa` serves the Selecto SPA explorer protocol
+(`selecto.spa.*/v1`, spoken by the Vue, React, Svelte and Angular explorers)
+from a host-supplied descriptor and engine. It validates explorer requests
+and runs them through `Selecto::API::EngineHandler` with its `filter_groups`
+and `aggregate_selections` options, so field governance, filter translation
+and execution are the canonical API's:
+
+```perl
+my $spa = Selecto::API::Spa->new(domains => [{descriptor => $descriptor, engine => $engine}]);
+my $response = $spa->request({method => 'POST', path => '/api/selecto/query', body => $json});
+# {status => 200, json => {schema => 'selecto.spa.query-response/v1', ...}}
+```
+
 The core has no routes or templates. `Selecto::API` implements the canonical
 Selecto HTTP contract as a pure function from a request hash to a response
 hash, and `Selecto::API::EngineHandler` turns API query and write bodies into
