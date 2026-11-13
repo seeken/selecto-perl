@@ -11,6 +11,16 @@ use Selecto::API::EngineHandler ();
 use Selecto::Domain ();
 use Selecto::Engine ();
 
+{
+    package TestHandlerExtensions::MSSQL;
+    use Mojo::Base 'Selecto::MSSQL', -signatures;
+    # Records the statement; answers one summary row.
+    sub execute_query ($self, $statement) {
+        push @{$self->{statements}}, $statement->sql;
+        return {columns => $statement->columns, rows => [[map { 3 } @{$statement->columns}]]};
+    }
+}
+
 plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
 
 # The trusted filter_groups and aggregate_selections extensions: off for the
@@ -121,6 +131,22 @@ subtest 'aggregate selections' => sub {
         'a to-many path is refused';
     is code_of($extended, {select => [{aggregate => 'count', alias => 'id'}, 'id'], group_by => ['id']}), 'invalid_api_query',
         'aliases still produce unique columns';
+};
+
+subtest 'a summary is not paged in SQL (SQL Server pages only ordered queries)' => sub {
+    my $adapter = TestHandlerExtensions::MSSQL->new(dbh => bless({}, 'TestHandlerExtensions::DBH'));
+    my $mssql = Selecto::Engine->new(domain => $domain, adapter => $adapter);
+    my $result = $extended->query($mssql, {select => [{aggregate => 'count', alias => 'n'}], limit => 1});
+    is_deeply $result->{rows}, [[3]], 'one summary row';
+    unlike $adapter->{statements}[-1], qr/OFFSET|FETCH/, 'without OFFSET/FETCH';
+    is_deeply $extended->query($mssql, {select => [{aggregate => 'count', alias => 'n'}], offset => 1})->{rows}, [],
+        'an offset past the summary row returns none';
+    is_deeply $extended->query($mssql, {select => [{aggregate => 'count', alias => 'n'}], limit => 0})->{rows}, [],
+        'a zero page compiles without executing';
+    is scalar @{$adapter->{statements}}, 2, 'only the two non-empty pages ran';
+    my $grouped = eval { $extended->query($mssql, {select => ['label', {aggregate => 'count', alias => 'n'}],
+        group_by => ['label'], order_by => [{field => 'label'}]}); 1 };
+    like $adapter->{statements}[-1], qr/FETCH NEXT/, 'a grouped query is still paged';
 };
 
 done_testing;

@@ -632,7 +632,12 @@ sub _query ($self, $engine, $body, %options) {
     $children_per_root += $_->{limit} for @subtables;
     $self->limits->check_count('max_total_collection_rows', $limit * $children_per_root,
         'invalid_api_query', 'requested related collection rows');
-    $query = $query->limit($limit)->offset($offset);
+    # An aggregate summary (aggregate_selections without group_by) is one row:
+    # it is not paged in SQL, which SQL Server permits only for an ordered
+    # query, and limit and offset apply to that row here.
+    my $summary = !exists($body->{group_by}) && grep { _is_aggregate_expression($_) } @{$query->selections};
+    $query = $query->limit($limit)->offset($offset) unless $summary;
+    my $paged = sub ($rows) { $summary ? $query : $query->limit($rows) };
     if (defined $timezone) {
         my $ok = eval { $query = $query->use_timezone($timezone); 1 };
         if (!$ok) {
@@ -647,16 +652,17 @@ sub _query ($self, $engine, $body, %options) {
     # data. SQL Server cannot execute FETCH NEXT 0, so compile with one solely
     # to obtain validated column metadata; never execute that statement.
     my $result = $limit == 0
-        ? {columns => $engine->compile($query->limit(1))->columns, rows => []}
+        ? {columns => $engine->compile($paged->(1))->columns, rows => []}
         : $self->bounded_results
-            ? Selecto::BoundedQuery->all($engine, $query->limit($limit + 1), limits => $self->limits,
+            ? Selecto::BoundedQuery->all($engine, $paged->($limit + 1), limits => $self->limits,
                 max_rows => $limit + 1, canonical_values => 1)
-        : $engine->all($query->limit($limit + 1), $options{export_scalars} ? (export_scalars => 1) : (canonical_values => 1));
+        : $engine->all($paged->($limit + 1), $options{export_scalars} ? (export_scalars => 1) : (canonical_values => 1));
     Selecto::Error->throw(
         'invalid_api_host', 'Selecto adapter returned an invalid result',
     ) unless ref($result) eq 'HASH'
         && ref($result->{columns}) eq 'ARRAY'
         && ref($result->{rows}) eq 'ARRAY';
+    splice @{$result->{rows}}, 0, $offset if $summary;
     my $has_more = @{$result->{rows}} > $limit;
     splice @{$result->{rows}}, $limit if $has_more;
     _shape_result_rows($result, \@subtables, $row_format, $self->limits);
@@ -1732,7 +1738,8 @@ required; only C<count> may omit the field (C<COUNT(*)>); C<sum> and C<avg>
 need a numeric field; the field is governed like any selection and may not
 cross a to-many association. Aggregates are exempt from the C<group_by>
 rule; without C<group_by>, every selection must be an aggregate and the query
-cannot be ordered.
+cannot be ordered. Such a summary is one row and is not paged in SQL (SQL
+Server pages only ordered queries); C<limit> and C<offset> apply to that row.
 
 =back
 
