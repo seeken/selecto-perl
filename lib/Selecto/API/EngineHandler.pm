@@ -35,6 +35,12 @@ has default_limit     => 100;
 has max_write_count   => 1000;
 has limits => sub { Selecto::Limits->new };
 has bounded_results => 0;
+# Trusted host extensions, off for the public canonical API (Selecto::API):
+# nested any/all filter groups and aggregate select entries. Explorer
+# protocols such as Selecto::API::Spa enable them on their own handler.
+has filter_groups        => 0;
+has aggregate_selections => 0;
+has max_filter_depth     => 4;
 
 # Optional trusted host callback ($engine, \@primary_keys) returning
 # {primary_key => version}: publishes the virtual aggregate_version field.
@@ -54,9 +60,13 @@ sub new ($class, @args) {
             && $self->bounded_results =~ /\A[01]\z/;
     Selecto::Error->throw('invalid_api_handler', 'limits must be a Selecto::Limits')
         unless blessed($self->limits) && $self->limits->isa('Selecto::Limits');
+    for my $name (qw(filter_groups aggregate_selections)) {
+        Selecto::Error->throw('invalid_api_handler', "$name must be a trusted boolean")
+            unless defined($self->$name) && !ref($self->$name) && $self->$name =~ /\A[01]\z/;
+    }
     for my $name (qw(
         max_fields max_filters max_filter_values max_orders max_segments
-        max_limit max_offset default_limit max_write_count
+        max_limit max_offset default_limit max_write_count max_filter_depth
     )) {
         my $value = $self->$name;
         Selecto::Error->throw(
@@ -473,13 +483,14 @@ sub _query ($self, $engine, $body, %options) {
 
     if ($has_select) {
         # Validate caller intent before composing host-mandated output fields.
-        _api_selections($domain, $body->{select}, $self->max_fields, $self->limits, $engine->adapter);
+        _api_selections($domain, $body->{select}, $self->max_fields, $self->limits, $engine->adapter,
+            $self->_selection_options);
         my @required = @{($domain->contract // {})->{required_selected} // []};
         my %required = map { $_ => 1 } @required;
         my $field_identity = sub {
             my ($entry) = @_;
             return $entry unless ref($entry);
-            return $entry->{field} if ref($entry) eq 'HASH'
+            return $entry->{field} if ref($entry) eq 'HASH' && !exists($entry->{aggregate})
                 && ($entry->{alias} // $entry->{field}) eq $entry->{field};
             return undef;
         };
@@ -493,6 +504,7 @@ sub _query ($self, $engine, $body, %options) {
         );
         my $selection_plan = _api_selections(
             $domain, \@selections, $self->max_fields, $self->limits, $engine->adapter,
+            $self->_selection_options,
         );
         $query = $query->select($selection_plan->{expressions});
         @subtables = @{$selection_plan->{subtables}};
@@ -596,12 +608,18 @@ sub _query ($self, $engine, $body, %options) {
         my @groups = _string_array($body->{group_by}, 'group_by', $self->max_fields, 1);
         _visible_field_definition($domain, $_, 'group') for @groups;
         my %grouped = map {$_ => 1} @groups;
+        # An aggregate selection (aggregate_selections) summarises its group.
         my @ungrouped = grep {!$grouped{$_}}
             map {Selecto::Expression->field_references($_)}
-            (@{$query->selections}, map {$_->[0]} @{$query->orders});
+            ((grep { !_is_aggregate_expression($_) } @{$query->selections}), map {$_->[0]} @{$query->orders});
         Selecto::Error->throw('invalid_api_query', 'Selected and ordered fields must be grouped')
             if @ungrouped;
         $query = $query->group_by(@groups);
+    } elsif (grep { _is_aggregate_expression($_) } @{$query->selections}) {
+        # Without group_by, an aggregate query returns one summary row.
+        Selecto::Error->throw('invalid_api_query', 'Selected and ordered fields must be grouped')
+            if grep { !_is_aggregate_expression($_) } @{$query->selections}
+                or @{$query->orders};
     }
 
     my $limit = exists($body->{limit})
@@ -672,8 +690,16 @@ sub _admit_body ($self, $body, $code) {
     push @values, values %{$body->{assignments}} if ref($body->{assignments}) eq 'HASH';
     push @values, values %{$body->{parameters}} if ref($body->{parameters}) eq 'HASH';
     if (ref($body->{filters}) eq 'ARRAY') {
-        for my $filter (@{$body->{filters}}) {
+        my @filters = @{$body->{filters}};
+        while (@filters) {
+            my $filter = shift @filters;
             next unless ref($filter) eq 'HASH';
+            # Tree admission bounded the nesting; the group's members are
+            # validated when the filters are translated.
+            if ($self->filter_groups && _is_filter_group($filter)) {
+                push @filters, @{$filter->{any} // $filter->{all}};
+                next;
+            }
             push @values, $filter->{$_} for grep { exists $filter->{$_} } qw(value end);
         }
     }
@@ -1087,61 +1113,86 @@ sub _filters ($self, $domain, $filters) {
         unless ref($filters) eq 'ARRAY';
     Selecto::Error->throw('invalid_api_query', 'Too many filters')
         if @$filters > $self->max_filters;
-    my @expressions;
-    for my $filter (@$filters) {
-        _object($filter, 'filter');
-        _reject_unknown($filter, [qw(field op value end)], 'filter');
-        my $field = _required_string($filter->{field}, 'filter field');
-        my $operator = lc _required_string($filter->{op}, 'filter operator');
-        my $choice = $domain->components->{filter_choices}{$field};
-        my $conditional = ref($choice) eq 'HASH' ? $choice->{conditional} : undef;
-        if (ref($conditional) eq 'HASH') {
-            Selecto::Error->throw('invalid_api_query',
-                "Unsupported filter operator $operator")
-                unless $operator =~ /\A(?:eq|ne|in|not_in|is_null|not_null)\z/;
-            my $definition = $domain->resolve($conditional->{present_field});
-            my $present = $self->_query_filter_expression(
-                $filter, $operator, $definition,
-                Selecto::Expression->field($conditional->{present_field}),
-            );
-            my $absent = $self->_query_filter_expression(
-                $filter, $operator, $definition,
-                Selecto::Expression->field($conditional->{absent_field}),
-            );
-            # A choice filter may read internal fields, but only through the
-            # choices the domain declares: any other value, or a null test,
-            # would probe their values.
-            if (grep { !$domain->field_is_public($conditional->{$_}) }
-                qw(when_field present_field absent_field)) {
-                my %declared = map { ("$_->{value}" => 1) } @{$choice->{choices} // []};
-                my @values = $operator =~ /\A(?:in|not_in)\z/
-                    ? @{$filter->{value}} : ($filter->{value});
-                Selecto::Error->throw(
-                    'field_not_public', 'Filter value is not a declared choice',
-                    {field => "$field"},
-                ) if $operator =~ /\A(?:is_null|not_null)\z/
-                    || grep { !defined($_) || ref($_) || !$declared{"$_"} } @values;
-            }
-            my $when = Selecto::Expression->field($conditional->{when_field});
-            push @expressions, Selecto::Expression->any([
-                Selecto::Expression->all([
-                    Selecto::Expression->not_null($when), $present,
-                ]),
-                Selecto::Expression->all([
-                    Selecto::Expression->is_null($when), $absent,
-                ]),
-            ]);
-            next;
-        }
-        my $definition = _visible_field_definition($domain, $field, 'filter');
-        my $operand = $definition->{type} eq 'epoch_datetime'
-            ? Selecto::Expression->epoch_datetime($field)
-            : Selecto::Expression->field($field);
-        push @expressions, $self->_query_filter_expression(
-            $filter, $operator, $definition, $operand,
-        );
+    my $leaves = 0;
+    return map { $self->_filter_entry($domain, $_, 0, \$leaves) } @$filters;
+}
+
+# One filter, or (filter_groups) an {any => [...]} or {all => [...]} group of
+# filters and groups. Every leaf counts against max_filters.
+sub _filter_entry ($self, $domain, $filter, $depth, $leaves) {
+    if ($self->filter_groups && _is_filter_group($filter)) {
+        _reject_unknown($filter, [qw(any all)], 'filter group');
+        my $conjunction = exists $filter->{any} ? 'any' : 'all';
+        my $members = $filter->{$conjunction};
+        Selecto::Error->throw('invalid_api_query', 'filter group must be a non-empty array')
+            unless ref($members) eq 'ARRAY' && @$members;
+        Selecto::Error->throw('invalid_api_query', 'filter groups are nested too deeply')
+            if $depth >= $self->max_filter_depth;
+        my @expressions = map { $self->_filter_entry($domain, $_, $depth + 1, $leaves) } @$members;
+        return $expressions[0] if @expressions == 1;
+        return Selecto::Expression->$conjunction(\@expressions);
     }
-    return @expressions;
+    Selecto::Error->throw('invalid_api_query', 'Too many filters')
+        if ++$$leaves > $self->max_filters;
+    return $self->_filter_leaf($domain, $filter);
+}
+
+sub _filter_leaf ($self, $domain, $filter) {
+    _object($filter, 'filter');
+    _reject_unknown($filter, [qw(field op value end)], 'filter');
+    my $field = _required_string($filter->{field}, 'filter field');
+    my $operator = lc _required_string($filter->{op}, 'filter operator');
+    my $choice = $domain->components->{filter_choices}{$field};
+    my $conditional = ref($choice) eq 'HASH' ? $choice->{conditional} : undef;
+    if (ref($conditional) eq 'HASH') {
+        Selecto::Error->throw('invalid_api_query',
+            "Unsupported filter operator $operator")
+            unless $operator =~ /\A(?:eq|ne|in|not_in|is_null|not_null)\z/;
+        my $definition = $domain->resolve($conditional->{present_field});
+        my $present = $self->_query_filter_expression(
+            $filter, $operator, $definition,
+            Selecto::Expression->field($conditional->{present_field}),
+        );
+        my $absent = $self->_query_filter_expression(
+            $filter, $operator, $definition,
+            Selecto::Expression->field($conditional->{absent_field}),
+        );
+        # A choice filter may read internal fields, but only through the
+        # choices the domain declares: any other value, or a null test,
+        # would probe their values.
+        if (grep { !$domain->field_is_public($conditional->{$_}) }
+            qw(when_field present_field absent_field)) {
+            my %declared = map { ("$_->{value}" => 1) } @{$choice->{choices} // []};
+            my @values = $operator =~ /\A(?:in|not_in)\z/
+                ? @{$filter->{value}} : ($filter->{value});
+            Selecto::Error->throw(
+                'field_not_public', 'Filter value is not a declared choice',
+                {field => "$field"},
+            ) if $operator =~ /\A(?:is_null|not_null)\z/
+                || grep { !defined($_) || ref($_) || !$declared{"$_"} } @values;
+        }
+        my $when = Selecto::Expression->field($conditional->{when_field});
+        return Selecto::Expression->any([
+            Selecto::Expression->all([
+                Selecto::Expression->not_null($when), $present,
+            ]),
+            Selecto::Expression->all([
+                Selecto::Expression->is_null($when), $absent,
+            ]),
+        ]);
+    }
+    my $definition = _visible_field_definition($domain, $field, 'filter');
+    my $operand = $definition->{type} eq 'epoch_datetime'
+        ? Selecto::Expression->epoch_datetime($field)
+        : Selecto::Expression->field($field);
+    return $self->_query_filter_expression(
+        $filter, $operator, $definition, $operand,
+    );
+}
+
+sub _is_filter_group ($filter) {
+    return ref($filter) eq 'HASH' && (exists($filter->{any}) xor exists($filter->{all}))
+        && !exists($filter->{field}) ? 1 : 0;
 }
 
 sub _query_filter_expression ($self, $filter, $operator, $definition, $operand) {
@@ -1258,7 +1309,17 @@ sub _required_string ($value, $label) {
     return "$value";
 }
 
-sub _api_selections ($domain, $value, $maximum, $limits, $adapter) {
+sub _selection_options ($self) {
+    return {aggregates => $self->aggregate_selections};
+}
+
+my %AGGREGATE_KIND = map { ($_ => 1) } qw(count count_field count_distinct sum avg min max);
+sub _is_aggregate_expression ($expression) {
+    return blessed($expression) && $expression->isa('Selecto::Expression')
+        && $AGGREGATE_KIND{$expression->kind} ? 1 : 0;
+}
+
+sub _api_selections ($domain, $value, $maximum, $limits, $adapter, $options = {}) {
     my $adapter_name = $adapter->name;
     Selecto::Error->throw('invalid_api_query', 'select must be an array')
         unless ref($value) eq 'ARRAY';
@@ -1268,7 +1329,9 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter) {
     my $field_count = 0;
     for my $entry (@$value) {
         if (ref($entry) ne 'ARRAY') {
-            my $selection = _api_selection_entry($domain, $entry, 'select entry', \@hidden);
+            my $selection = $options->{aggregates} && ref($entry) eq 'HASH' && exists($entry->{aggregate})
+                ? _api_aggregate_entry($domain, $entry, 'select entry', \@hidden)
+                : _api_selection_entry($domain, $entry, 'select entry', \@hidden);
             $field_count++;
             next unless $selection;
             Selecto::Error->throw(
@@ -1352,6 +1415,49 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter) {
     return {
         expressions => \@expressions,
         subtables => \@subtables,
+    };
+}
+
+# aggregate_selections: {aggregate => count|count_distinct|sum|avg|min|max,
+# field => ..., alias => ...}. Only count may omit the field (COUNT(*)); the
+# alias is required, so a summary column is always named by the caller.
+my %AGGREGATE_FUNCTION = (
+    count => 'count_field', count_distinct => 'count_distinct',
+    sum => 'sum', avg => 'avg', min => 'min', max => 'max',
+);
+sub _api_aggregate_entry ($domain, $entry, $label, $hidden) {
+    _reject_unknown($entry, [qw(aggregate field alias)], $label);
+    my $function = _required_string($entry->{aggregate}, "$label aggregate");
+    Selecto::Error->throw('invalid_api_query', 'select aggregate is not available',
+        {aggregate => $function}) unless $AGGREGATE_FUNCTION{$function};
+    my $alias = _required_string($entry->{alias}, "$label alias");
+    Selecto::Error->throw('invalid_api_query', 'select alias must be a valid identifier',
+        {alias => $alias}) unless Selecto::Identifier::valid($alias);
+    if (!exists $entry->{field}) {
+        Selecto::Error->throw('invalid_api_query', "$label aggregate requires a field",
+            {aggregate => $function}) unless $function eq 'count';
+        my $expression = Selecto::Expression->count;
+        return {result_name => $alias, expression => $expression, flat_expression => $expression->as($alias)};
+    }
+    my $field = _required_string($entry->{field}, "$label field");
+    my $definition = $domain->resolve($field);
+    unless ($domain->field_is_public($field)) {
+        push @$hidden, $field;
+        return undef;
+    }
+    # A to-many path would multiply the root rows each aggregate summarises.
+    Selecto::Error->throw('invalid_api_query', 'aggregate fields cannot cross a to-many association',
+        {field => $field}) if grep { $_->cardinality eq 'many' } @{$definition->{associations} // []};
+    Selecto::Error->throw('invalid_api_query', "$function requires a numeric field",
+        {field => $field, aggregate => $function})
+        if ($function eq 'sum' || $function eq 'avg')
+            && ($definition->{type} // '') !~ /\A(?:integer|bigint|smallint|decimal|numeric|number|float|double|real)\z/i;
+    my $method = $AGGREGATE_FUNCTION{$function};
+    my $expression = Selecto::Expression->$method(Selecto::Expression->field($field));
+    return {
+        field => $field, definition => $definition,
+        result_name => $alias, expression => $expression,
+        flat_expression => $expression->as($alias),
     };
 }
 
@@ -1603,6 +1709,32 @@ All limits are optional non-negative integers:
   max_write_count   1000     largest expected_count
 
 Throws C<invalid_api_handler> for invalid limits.
+
+Two trusted extensions are off by default, and L<Selecto::API> never enables
+them; explorer hosts such as L<Selecto::API::Spa> construct their own handler
+with them:
+
+=over 4
+
+=item filter_groups
+
+C<filters> entries may also be C<< {any => [...]} >> or C<< {all => [...]} >>
+groups of filters and further groups (non-empty, at most C<max_filter_depth>
+levels, default 4). Every leaf filter counts against C<max_filters> and is
+validated exactly like a top-level filter.
+
+=item aggregate_selections
+
+C<select> entries may also be
+C<< {aggregate => $function, field => $path, alias => $name} >> with
+C<count>, C<count_distinct>, C<sum>, C<avg>, C<min> or C<max>. The alias is
+required; only C<count> may omit the field (C<COUNT(*)>); C<sum> and C<avg>
+need a numeric field; the field is governed like any selection and may not
+cross a to-many association. Aggregates are exempt from the C<group_by>
+rule; without C<group_by>, every selection must be an aggregate and the query
+cannot be ordered.
+
+=back
 
 C<versioner> is an optional trusted callback that publishes the virtual,
 read-only C<aggregate_version> field:
