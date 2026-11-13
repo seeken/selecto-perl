@@ -87,6 +87,7 @@ t/pg_review_round3_live.t
 t/pg_case_twin_columns_live.t
 t/pg_guard_statements_unnamed_live.t
 t/pg_client_encoding_live.t
+t/pg_read_round_trips_live.t
 t/pg_extension_cast_forms_live.t
 t/pg_function_resolution_live.t
 t/pg_cancel_storm_live.t

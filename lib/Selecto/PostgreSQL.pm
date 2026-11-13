@@ -1227,9 +1227,10 @@ sub _refuse_pending_result {
 # Where a read runs: 'own' (no transaction open: a read-only transaction of
 # its own, rolled back) or 'host' (the host's transaction, as written). libpq
 # says which, so a transaction a raw BEGIN opened is the host's, never rolled
-# back (DBD::Pg's ping sends a query only when no transaction is open). A
-# pending result, an aborted transaction or an unknown state is refused before
-# anything is sent; so is a handle a bounded stream holds.
+# back. DBD::Pg 3.21.2 exposes this status through pg_ping, which sends a
+# query even in a transaction; AutoCommit alone cannot detect raw BEGIN.
+# Pending results and handles a bounded stream holds are refused before ping;
+# aborted or unknown states are refused before read or transaction control.
 sub _read_guard_scope {
     my ($self) = @_;
     my $dbh = $self->{dbh};
@@ -1266,24 +1267,31 @@ sub _pg_session_checked {
     return eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' } ? 1 : 0;
 }
 
-# Bound values are sent as UTF-8; read as another encoding they are other
-# values (a tenant name with an accent becomes another tenant's). The server's
-# own value, which it reports as UTF8 or UNICODE: on every read in a
-# transaction of Selecto's (in the statement that makes it read-only, see
-# _pg_begin_read), and otherwise once per connection.
+# Bound values are sent as UTF-8; another encoding can name another tenant.
+# DBD::Pg's documented auto-detection setter reads PQparameterStatus locally.
+# Refresh it every time: the host may have changed encoding since a prior
+# operation, including SET LOCAL followed by ROLLBACK. Keep the host's driver
+# mode (forced byte strings, forced Unicode, or automatic) on both outcomes.
 sub _pg_require_utf8 {
     my ($self) = @_;
     my $dbh = $self->{dbh};
-    return if !$self->_pg_session_checked || $dbh->{private_selecto_utf8};
-    my $encoding;
+    return unless $self->_pg_session_checked;
+    $self->_refuse_pending_result;
+    _refuse_connection_state('unknown') unless $dbh->{Active};
+    my $mode = $dbh->{pg_enable_utf8};
+    my ($utf8, $error);
     my $ok = eval {
-        local $dbh->{RaiseError} = 1;
-        local $dbh->{PrintError} = 0;
-        ($encoding) = $dbh->selectrow_array(q{SELECT pg_catalog.current_setting('client_encoding')});
+        $dbh->{pg_enable_utf8} = -1;
+        $utf8 = $dbh->{pg_utf8_flag};
         1;
     };
-    die $self->normalize_error($@) unless $ok;
-    _pg_utf8_encoding($dbh, $encoding);
+    $error = $@ unless $ok;
+    unless (eval { $dbh->{pg_enable_utf8} = $mode; 1 }) {
+        eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
+        _refuse_connection_state('unknown');
+    }
+    die $self->normalize_error($error) unless $ok;
+    _pg_utf8_encoding($dbh, $utf8 ? 'UTF8' : undef);
     return;
 }
 
@@ -1295,17 +1303,21 @@ sub _pg_utf8_encoding {
     return;
 }
 
-# The first statement of a read's own transaction (begin_work done): READ ONLY
-# unless it locks rows, and the encoding check, in one round trip.
+# Streams retain DBI's begin_work/rollback ownership and its takeover proof.
+# Ordinary reads can open READ ONLY in one command while AutoCommit remains
+# on; their matching explicit ROLLBACK is below. No SQL values are interpolated.
 sub _pg_begin_read {
-    my ($self, $locks) = @_;
+    my ($self, $locks, $explicit) = @_;
     my $dbh = $self->{dbh};
+    $self->_pg_require_utf8 unless $explicit;
     local $dbh->{RaiseError} = 1;
     local $dbh->{PrintError} = 0;
-    my (undef, $encoding) = $dbh->selectrow_array('SELECT '
-        . ($locks ? '1' : q{pg_catalog.set_config('transaction_read_only', 'on', true)})
-        . q{, pg_catalog.current_setting('client_encoding')});
-    _pg_utf8_encoding($dbh, $encoding);
+    # Previously the first SELECT took a read-write snapshot before setting
+    # READ ONLY, so a host's default DEFERRABLE never made our reads wait for
+    # a safe snapshot. Preserve that behavior without changing session defaults.
+    my $sql = $explicit ? ($locks ? 'BEGIN' : 'BEGIN READ ONLY NOT DEFERRABLE')
+        : 'SET TRANSACTION READ ONLY, NOT DEFERRABLE';
+    defined($dbh->do($sql)) or die Selecto::SQL::_dbi_error($dbh, 'read transaction control failed');
     return;
 }
 
@@ -1338,17 +1350,19 @@ sub _guarded_read {
     }
     my $dbh = $self->{dbh};
     my $locks = blessed($source) && $source->{_selecto_row_lock};
-    eval { $dbh->begin_work; 1 } or die $self->_transaction_control_error($@);
+    # Check before opening anything; an invalid encoding must not touch the
+    # host's session, even when a transaction-control statement would fail.
+    $self->_pg_require_utf8;
     my $result;
     my $ok = eval {
-        $self->_pg_begin_read($locks);
+        $self->_pg_begin_read($locks, 1);
         $result = $work->();
         1;
     };
     my $error = $ok ? undef : $@;
     # (Read at once: the rollback clears the handle's error.)
     $error = $self->normalize_error($error) if !$ok && !blessed($error) && "$error" =~ /\ADBD::/;
-    unless (eval { local $dbh->{PrintError} = 0; $dbh->rollback }) {
+    unless (eval { local $dbh->{PrintError} = 0; local $dbh->{RaiseError} = 1; defined($dbh->do('ROLLBACK')) }) {
         # A read that cannot be ended is not left open for the host to commit.
         my $ending = $self->_transaction_control_error($@ || 'the read could not be ended');
         eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
@@ -1418,8 +1432,8 @@ sub _hand_built_may_write {
     return $text =~ /\b(?:INSERT|UPDATE|DELETE|MERGE|TRUNCATE|INTO)\b/i ? 1 : 0;
 }
 
-# Before a write sends anything, the session must send UTF-8 (once per
-# connection). A busy connection is the write's own guard to refuse.
+# Before a write sends anything, refresh the session's local UTF-8 status.
+# A busy connection is the write's own guard to refuse.
 for my $method (qw(execute_write execute_batch execute_graph execute_transaction
     execute_write_unsafe execute_batch_unsafe execute_graph_unsafe)) {
     no strict 'refs';
@@ -1651,8 +1665,9 @@ failures become C<query_error>.
 =head1 READS
 
 With no transaction open, a read is a transaction of its own:
-C<BEGIN>, one statement that makes it C<READ ONLY> and checks that
-C<client_encoding> is UTF8, the query, C<ROLLBACK>. Nothing it reaches can
+C<BEGIN READ ONLY NOT DEFERRABLE>, the query, C<ROLLBACK>. A preceding C<pg_ping> detects
+raw host transactions. C<client_encoding> is checked from libpq's local
+parameter status on every operation, without a query. Nothing it reaches can
 write, and nothing it changes outlasts it: a view using C<nextval> or an
 audit function refuses (C<query_error>, C<details.category>
 C<read_only_transaction>, SQLSTATE C<25006>). A read that locks rows
@@ -1710,8 +1725,9 @@ resolve names as the host's own queries do. The host provides:
 =over 4
 
 =item * C<client_encoding> UTF8. Bound values are UTF-8; read as another
-encoding a tenant name with an accent is another tenant's. It is checked on
-every read with no transaction open, and otherwise once per connection.
+encoding a tenant name with an accent is another tenant's. It is refreshed
+from libpq's local parameter status before reads and writes, and before
+each host-owned cursor fetch; no successful check is cached across calls.
 
 =item * A C<search_path> that names the application's schemas. Generated
 statements name relations by the engine's tenant prefix when it has one, and
