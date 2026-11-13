@@ -7,12 +7,13 @@ use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed);
 use Storable qw(dclone);
 use Selecto::Domain ();
+use Selecto::Domain::SchemaV2 ();
 use Selecto::DataRules ();
 use Selecto::Limits ();
 use Selecto::Error ();
 
 my %MAP_SECTION = map { $_ => 1 } qw(
-    source schemas joins associations filters functions query_members query_library
+    source schemas joins associations filters functions query_members query_library tenant
     published_views detail_actions components columns custom_columns jsonb_schemas
     subfilters window_functions pagination retarget writes actions imports capabilities
     source_relationships choice_sources co_domains editors
@@ -29,16 +30,22 @@ sub compose {
     @overlays = @{$overlays[0]} if @overlays == 1 && ref($overlays[0]) eq 'ARRAY';
 
     my $base_domain = _coerce_domain($base, 'base domain');
-    my $contract = $base_domain->as_contract;
+    # A schema 2 base composes as its schema 2 document and stays schema 2.
+    my $schema_2 = $base_domain->schema_version == 2;
+    my $contract = $schema_2 ? $base_domain->as_document : $base_domain->as_contract;
     _validate_section_shapes($contract, undef);
     my @warnings;
 
     for my $index (0 .. $#overlays) {
         my $overlay = _overlay_fragment($overlays[$index], $index);
+        _throw_schema_2_errors(Selecto::Domain::SchemaV2->overlay_errors($overlay), $index)
+            if $schema_2;
         push @warnings, _collision_warnings($contract, $overlay, $index);
         $contract = _merge_domain_maps($contract, $overlay);
     }
 
+    _throw_schema_2_errors(Selecto::Domain::SchemaV2->settle_composition($contract), undef)
+        if $schema_2;
     _validate_section_shapes($contract, undef);
     my $domain = Selecto::Domain->parse($contract, strict => 1);
     my $diagnostics = {
@@ -52,8 +59,24 @@ sub compose {
 sub merge_contracts {
     my ($class, $base, @overlays) = @_;
     my ($domain, $diagnostics) = $class->compose($base, @overlays);
-    my $contract = $domain->as_contract;
+    my $contract = $domain->as_document;
     return wantarray ? ($contract, $diagnostics) : $contract;
+}
+
+sub _throw_schema_2_errors {
+    my ($errors, $index) = @_;
+    return unless @$errors;
+    my $first = $errors->[0];
+    Selecto::Error->throw(
+        'invalid_domain_overlay',
+        "domain overlay against a schema 2 domain: $first->{code}",
+        {
+            reason => $first->{code},
+            path => $first->{path},
+            errors => $errors,
+            (defined($index) ? (overlay_index => $index) : ()),
+        },
+    );
 }
 
 sub validate_contract_shapes {
@@ -246,6 +269,18 @@ replaced by later overlays. Updates to existing C<actions>, C<capabilities>,
 C<source_relationships> and C<choice_sources> entries are reported as
 collision diagnostics. The complete result crosses the strict
 L<Selecto::Domain> parser before it is returned.
+
+A schema 2 base (a schema 2 document, or a domain parsed from one) composes as
+its schema 2 document, so the result is a schema 2 domain: its top-level
+C<tenant> deep-merges like the other maps, and its fingerprint is computed for
+the composed document. Overlays written in schema 1 shape are read this way: a
+relation's C<fields> list must name exactly that relation's composed columns
+and becomes its C<field_order> (none when sorted); columns added to a relation
+whose C<field_order> came from the base are appended to it, sorted; and
+C<source.tenant_field>, C<writes.scope.tenant>, a C<schema_version> other than 2
+and a C<domain_fingerprint> refuse with C<invalid_domain_overlay>, its
+C<reason> naming the rule (see L<Selecto::Domain::SchemaV2>). C<merge_contracts>
+returns the schema 2 document for a schema 2 base.
 
 This module is an internal part of the L<Selecto> distribution. Its interface
 may change without notice; call C<< Selecto::Domain->compose >> and build

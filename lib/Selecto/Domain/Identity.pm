@@ -8,11 +8,12 @@ use JSON::PP ();
 use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
+use Selecto::Domain::SchemaV2 ();
 
 my @CANONICAL = qw(schema_version domain_version domain_fingerprint name source schemas joins
     default_selected required_selected required_filters required_order_by required_group_by filters
     functions query_members query_library rules co_domains domain_dependencies operations experiences
-    published_views detail_actions editors components imports domain_data extensions);
+    published_views detail_actions editors components imports domain_data extensions tenant);
 my @PROJECTION = qw(columns custom_columns json_schemas subfilters window_functions pagination retarget redact_fields);
 my @PROPOSED = qw(writes actions events capabilities source_relationships choice_sources);
 my %CATEGORY = ((map { $_ => 'canonical' } @CANONICAL), (map { $_ => 'projection' } @PROJECTION),
@@ -20,7 +21,7 @@ my %CATEGORY = ((map { $_ => 'canonical' } @CANONICAL), (map { $_ => 'projection
 my @MAPS = qw(source schemas joins filters functions query_members query_library rules operations
     experiences published_views detail_actions editors components imports columns custom_columns
     json_schemas subfilters window_functions pagination retarget writes actions events capabilities
-    source_relationships choice_sources co_domains);
+    source_relationships choice_sources co_domains tenant);
 my @LISTS = qw(default_selected required_selected required_filters required_order_by required_group_by
     domain_dependencies redact_fields);
 my %MAP = map { $_ => 1 } @MAPS;
@@ -67,7 +68,10 @@ sub normalize {
     # Canonical normalization exposes an empty write registry for a source.
     # Diagnostics classify authored keys; a subsequent composition normalizes
     # this canonical map and consequently sees the proposed writes section.
-    $domain->{writes} = {} if ref($domain->{source}) eq 'HASH' && !exists $domain->{writes};
+    # A schema 2 document is its identity (its fingerprint is computed from
+    # it), so it gains no key here.
+    $domain->{writes} = {} if ref($domain->{source}) eq 'HASH' && !exists $domain->{writes}
+        && !Selecto::Domain::SchemaV2->is_version_2($authored->{schema_version});
     my $normalized = {schema_version => $version, domain_version => $domain_version,
         domain_fingerprint => $fingerprint, authored_domain => $authored, domain => $domain,
         sections => _clone(\%sections), source => _clone($domain->{source}),
@@ -87,14 +91,21 @@ sub validate {
     my $normalized = $result->{normalized};
     my $domain = $normalized->{domain};
     my $errors = $result->{diagnostics}{errors};
+    # Schema 2: its own rules, then the relation checks on its schema 1 form.
+    if (Selecto::Domain::SchemaV2->is_version_2($normalized->{authored_domain}{schema_version})) {
+        my $rules = Selecto::Domain::SchemaV2->validate($normalized->{authored_domain});
+        push @$errors, map { _diagnostic($_->{code}, $_->{path}, 'domain breaks a schema 2 rule') } @$rules;
+        $domain = Selecto::Domain::SchemaV2->to_version_1($normalized->{authored_domain}) unless @$rules;
+    }
     for my $section (qw(source schemas)) {
         push @$errors, _diagnostic('missing_required_section', [$section], 'required domain section is missing')
             unless exists $normalized->{authored_domain}{$section};
     }
     _relation_errors($domain->{source}, ['source'], 'source', $errors);
-    if (ref($normalized->{schemas}) eq 'HASH') {
-        _relation_errors($normalized->{schemas}{$_}, ['schemas', $_], 'schema', $errors)
-            for sort keys %{$normalized->{schemas}};
+    my $schemas = exists($domain->{schemas}) ? $domain->{schemas} : {};
+    if (ref($schemas) eq 'HASH') {
+        _relation_errors($schemas->{$_}, ['schemas', $_], 'schema', $errors)
+            for sort keys %$schemas;
     } else {
         push @$errors, _diagnostic('invalid_section_shape', ['schemas'], 'schemas must be an object');
     }
@@ -104,16 +115,23 @@ sub validate {
 
 sub compose {
     my ($class, $base, $overlays) = @_;
+    # A schema 2 base composes as its schema 2 document and stays schema 2.
+    my $schema_2 = blessed($base) && $base->isa('Selecto::Domain') ? $base->schema_version == 2
+        : ref($base) eq 'HASH' && Selecto::Domain::SchemaV2->is_version_2($base->{schema_version});
+    $base = $base->as_document if $schema_2 && blessed($base);
     my $result = $class->normalize($base);
     return $result unless $result->{ok};
     $overlays = [] unless defined $overlays;
     $overlays = [$overlays] if ref($overlays) eq 'HASH';
     return _overlay_error(undef) unless ref($overlays) eq 'ARRAY';
-    my $domain = $result->{normalized}{domain};
+    my $domain = $schema_2 ? Selecto::Domain::SchemaV2->copy($result->{normalized}{authored_domain})
+        : $result->{normalized}{domain};
     my @warnings;
     for my $index (0 .. $#$overlays) {
         my $overlay = $overlays->[$index];
         return _overlay_error($index) unless ref($overlay) eq 'HASH';
+        return _schema_2_overlay_errors(Selecto::Domain::SchemaV2->overlay_errors($overlay), $index)
+            if $schema_2 && @{Selecto::Domain::SchemaV2->overlay_errors($overlay)};
         for my $section (sort keys %COLLISION) {
             next unless ref($domain->{$section}) eq 'HASH' && ref($overlay->{$section}) eq 'HASH';
             push @warnings, {code => 'overlay_collision', section => $section, key => $_,
@@ -121,6 +139,12 @@ sub compose {
                 for grep { exists $domain->{$section}{$_} } sort keys %{$overlay->{$section}};
         }
         $domain = _merge($domain, $overlay, []);
+    }
+    if ($schema_2) {
+        my $errors = Selecto::Domain::SchemaV2->settle_composition($domain);
+        return _schema_2_overlay_errors($errors, undef) if @$errors;
+        # The composed document's identity is its computed fingerprint.
+        $domain->{domain_fingerprint} = Selecto::Domain::SchemaV2->fingerprint($domain);
     }
     # Metadata inspection never invokes extension or other declared callbacks.
     $result = $class->normalize($domain);
@@ -244,6 +268,8 @@ sub _schema_version {
     my ($domain) = @_;
     return (1, 1, []) unless exists $domain->{schema_version};
     my $value = $domain->{schema_version};
+    # Domain schema 2 (the number 2 only) is supported.
+    return (2, 0, []) if Selecto::Domain::SchemaV2->is_version_2($value);
     my $flags = !ref($value) && defined($value) ? B::svref_2object(\$value)->FLAGS : 0;
     my $text = defined($value) && !ref($value) ? "$value" : '';
     my $digits = $text; $digits =~ s/^\+//; $digits =~ s/^0+(?=[0-9])//;
@@ -277,6 +303,14 @@ sub _overlay_error {
     my $error = _diagnostic('invalid_domain_overlay', [], 'domain overlays must be objects');
     $error->{overlay_index} = $index;
     return _result(undef, [$error], [], undef, 0);
+}
+sub _schema_2_overlay_errors {
+    my ($errors, $index) = @_;
+    my @diagnostics = map {
+        +{%{_diagnostic($_->{code}, $_->{path}, 'domain overlay cannot say this to a schema 2 domain')},
+            (defined($index) ? (overlay_index => $index) : ())}
+    } @$errors;
+    return _result(undef, \@diagnostics, [], undef, 0);
 }
 sub _clone {
     my ($value, $active) = @_;
@@ -317,5 +351,15 @@ future versions warn, and invalid versions warn and use v1. Inspection copies
 input containers and never executes callbacks. Composition deep-merges known
 map sections, unions redaction/extension lists, and replaces other lists.
 It does not invoke extension callbacks or expand executable shorthand.
+
+Domain schema 2 (the number 2) is a supported version. Normalizing one adds no
+C<writes> key, and validating one applies its rules (L<Selecto::Domain::SchemaV2>)
+before the relation checks on its schema 1 form. Composing a schema 2 base (a
+document, or a domain parsed from one) keeps it schema 2: the overlays merge into
+the schema 2 document as in L<Selecto::Domain/compose> (C<tenant> deep-merges; a
+schema 1 C<fields> list becomes the C<field_order>; C<source.tenant_field>,
+C<writes.scope.tenant>, another C<schema_version> or a C<domain_fingerprint> in an
+overlay is an error diagnostic naming the rule), and the result's
+C<domain_fingerprint> is the fingerprint computed for the composed document.
 
 =cut
