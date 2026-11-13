@@ -406,6 +406,9 @@ sub _clone_with_rules {
 sub _parse_canonical {
     my ($class, $raw, $source, $strict) = @_;
     $raw = _clone_with_rules($raw);
+    # Domains nested in write relationships may be schema 2: they load here,
+    # once, into the schema 1 form every write path reads.
+    _load_nested_domains($raw);
     $source = $raw->{source};
     _reject_unknown($source, {%RELATION, fts5_index => 1}, 'source') if $strict;
     Selecto::Error->throw(
@@ -484,6 +487,18 @@ sub _parse_canonical {
         encode_utf8(Selecto::CanonicalJSON->encode($fingerprint_document))
     );
     return $domain;
+}
+
+sub _load_nested_domains {
+    my ($raw) = @_;
+    require Selecto::Domain::SchemaV2;
+    my $errors = Selecto::Domain::SchemaV2->load_nested_domains($raw);
+    return unless @$errors;
+    my $first = $errors->[0];
+    Selecto::Error->throw('unknown_domain_key', 'unknown keys in nested relationship domain',
+        {keys => ['tenant'], path => $first->{path}}) if $first->{code} eq 'unknown_domain_key';
+    Selecto::Error->throw(q{invalid_domain}, "nested domain schema 2: $first->{code}",
+        {reason => $first->{code}, path => $first->{path}, errors => $errors});
 }
 
 sub _apply_required_filters {
@@ -3148,6 +3163,14 @@ reports C<domain_schema_deprecated> with the schema 2 document to store. One
 difference to know before storing it: a schema 1 domain that declared tenancy
 only in C<writes.scope.tenant> did not scope reads by the engine tenant; its
 schema 2 form does. See L<Selecto::Domain::SchemaV2>.
+
+A domain nested in a write relationship (C<writes.relationships.*.domain>, at
+any depth, under a schema 1 or schema 2 parent) may be schema 2 too. It loads
+the same way, into its schema 1 form, so its C<tenant> is that child's
+C<writes.scope.tenant> and C<source.tenant_field>. A nested schema 2 domain that
+breaks a rule throws C<invalid_domain> with C<reason> naming it and C<path>
+pointing into the nested domain; a nested domain that is not schema 2 and has a
+top-level C<tenant> throws C<unknown_domain_key>.
 
 =head2 schema_version, schema_diagnostics
 

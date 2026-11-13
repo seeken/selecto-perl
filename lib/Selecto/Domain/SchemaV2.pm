@@ -352,6 +352,42 @@ sub to_version_1 {
     return $doc;
 }
 
+# ------------------------------------------------------------------ nested domains
+
+# The domains nested in write relationships (writes.relationships.*.domain),
+# at any depth, loaded in place into the schema 1 form the write engine reads:
+# a schema 2 one by its own rules and to_version_1 (its tenant becomes
+# source.tenant_field and writes.scope.tenant), and one that is not schema 2
+# refuses a top-level tenant as a top-level domain does. Returns a list of
+# {code, path}; a domain that breaks a rule is left as it was.
+sub load_nested_domains {
+    my ($class, $document, $path) = @_;
+    $path //= [];
+    my @errors;
+    return \@errors unless ref($document) eq 'HASH' && ref($document->{writes}) eq 'HASH'
+        && ref($document->{writes}{relationships}) eq 'HASH';
+    my $relationships = $document->{writes}{relationships};
+    for my $id (sort keys %$relationships) {
+        my $spec = $relationships->{$id};
+        next unless ref($spec) eq 'HASH' && ref($spec->{domain}) eq 'HASH';
+        my $nested = $spec->{domain};
+        my @at = (@$path, 'writes', 'relationships', $id, 'domain');
+        if ($class->is_version_2($nested->{schema_version})) {
+            my $rules = $class->validate($nested);
+            if (@$rules) {
+                push @errors, map { {code => $_->{code}, path => [@at, @{$_->{path}}]} } @$rules;
+                next;
+            }
+            $nested = $spec->{domain} = $class->to_version_1($nested);
+        } elsif (exists $nested->{tenant}) {
+            push @errors, {code => 'unknown_domain_key', path => [@at, 'tenant']};
+            next;
+        }
+        push @errors, @{$class->load_nested_domains($nested, \@at)};
+    }
+    return \@errors;
+}
+
 # ------------------------------------------------------------------ composition
 
 # A plain copy that keeps each scalar's number or string form, so the copy's
@@ -436,6 +472,13 @@ both versions; a version 1 domain reports C<domain_schema_deprecated>.
 C<< jcs($value) >>, C<< fingerprint($document) >>, C<< validate($document) >>
 (a list of C<{code, path}>), C<< migrate($v1) >> (C<{document, diagnostics}> or
 C<{refused}>) and C<< to_version_1($v2) >> are class methods.
+
+C<< load_nested_domains($doc) >> loads, in place and at any depth, the
+domains nested in write relationships (C<writes.relationships.*.domain>) into
+the schema 1 form the write engine reads: a schema 2 one by its rules and
+C<to_version_1>, so its tenant becomes that child's C<writes.scope.tenant>.
+A nested domain that is not schema 2 and has a top-level C<tenant> is an
+C<unknown_domain_key> error. It returns a list of C<{code, path}>.
 
 Composition (L<Selecto::Domain/compose>) uses three more. C<< copy($value) >>
 copies a document keeping each scalar's number or string form.

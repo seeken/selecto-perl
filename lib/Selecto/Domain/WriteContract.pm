@@ -133,8 +133,24 @@ sub _new_state {
     # This boundary consumes the complete plain declaration. Callers passing
     # normalize() output explicitly select its domain; unrelated authored keys
     # never replace the supplied source or write policy.
-    $state->{domain} = _normalize($state, $raw);
+    $state->{domain} = _schema_2($state, _normalize($state, $raw));
     return $state;
+}
+# A schema 2 declaration, and schema 2 domains nested in write relationships,
+# are read in their schema 1 form (Selecto::Domain::SchemaV2), so a schema 2
+# tenant counts as writes.scope.tenant here as it does in Selecto::Domain.
+sub _schema_2 {
+    my ($state, $domain) = @_;
+    return $domain unless ref($domain) eq 'HASH';
+    require Selecto::Domain::SchemaV2;
+    my $v2 = 'Selecto::Domain::SchemaV2';
+    if ($v2->is_version_2($domain->{schema_version})) {
+        my $rules = $v2->validate($domain);
+        if (@$rules) { _error($state, $_->{code}, $_->{path}) for @$rules; return $domain }
+        $domain = $v2->to_version_1($domain);
+    }
+    _error($state, $_->{code}, $_->{path}) for @{$v2->load_nested_domains($domain)};
+    return $domain;
 }
 sub _operations {
     my ($state, $writes) = @_;
