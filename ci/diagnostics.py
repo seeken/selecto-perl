@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from sources import manifest
+from sources import expected_commit, manifest
 
 def git(path, *args):
     return subprocess.check_output(['git', '-C', str(path), *args], text=True, stderr=subprocess.DEVNULL).strip()
@@ -14,7 +14,8 @@ def main():
     config = manifest(root)
     sources = []
     for repo, path, expected in [(os.environ['GITHUB_REPOSITORY'], root, os.environ['GITHUB_SHA'])] + [
-        (item['repository'], root.parent / item['repository'].split('/')[1], item['commit']) for item in config['sources']]:
+        (item['repository'], root.parent / item['repository'].split('/')[1],
+         expected_commit(item, root.parent / item['repository'].split('/')[1])) for item in config['sources']]:
         actual = git(path, 'rev-parse', 'HEAD')
         clean = not git(path, 'status', '--porcelain')
         if actual != expected or not clean:
