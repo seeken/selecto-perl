@@ -106,6 +106,15 @@ Revision history for Selecto
       domain_fingerprint; normalize_identity and validate_identity treat schema 2
       as supported (no unsupported_schema_version warning, no added writes key,
       its rules checked).
+    - A domain nested in a write relationship (writes.relationships.*.domain, at any
+      depth) may be schema 2. Domain->parse, validate_write_contract and
+      compile_write_contract load it through the schema 2 path into its schema 1
+      form, so its top-level tenant is the child's writes.scope.tenant and
+      source.tenant_field. Before, a schema 2 nested domain refused every nested
+      write with write_policy_missing. A nested schema 2 domain that breaks a rule
+      refuses with invalid_domain (reason and path into the nested domain); a nested
+      domain that is not schema 2 and has a top-level tenant refuses with
+      unknown_domain_key at parse instead of at its first write.
     - Public write authority stays explicit (certification TB007,
       engine_api_tenant_boundary 1.3.0): on a tenant_field domain without
       writes.scope.tenant, an engine tenant alone does not authorize an API write;

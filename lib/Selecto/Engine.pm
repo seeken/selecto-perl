@@ -3086,6 +3086,16 @@ sub _relationship_context {
             } @{$spec->{allowed_ops}};
     }
     my $nested = ref($spec->{domain}) eq 'HASH' ? $spec->{domain} : {};
+    # A parsed domain has already loaded its nested domains into schema 1
+    # form; a schema 2 one handed here directly loads the same way.
+    require Selecto::Domain::SchemaV2;
+    if (Selecto::Domain::SchemaV2->is_version_2($nested->{schema_version})) {
+        my $loaded = {writes => {relationships => {nested => {domain => $nested}}}};
+        my $errors = Selecto::Domain::SchemaV2->load_nested_domains($loaded);
+        Selecto::Error->throw('invalid_domain', "nested domain schema 2: $errors->[0]{code}",
+            {reason => $errors->[0]{code}, errors => $errors}) if @$errors;
+        $nested = $loaded->{writes}{relationships}{nested}{domain};
+    }
     Selecto::Error->throw('write_relation_mismatch','relationship domain must own its actual native relation')
         if ref($nested->{source}) eq 'HASH' && defined($nested->{source}{source_table})
             && $nested->{source}{source_table} ne $table;
