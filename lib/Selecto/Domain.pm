@@ -278,6 +278,9 @@ sub without_action_prerequisites {
         delete @{$contract->{components}{filter_choices}}{@remove};
     }
     $copy->{contract} = $contract;
+    # The stored schema 2 document no longer describes this copy; as_document
+    # migrates the changed contract instead.
+    delete $copy->{schema_v2_document};
     if (ref($self->{components}{filter_choices}) eq 'HASH') {
         $copy->{components} = dclone($self->{components});
         delete @{$copy->{components}{filter_choices}}{@remove};
@@ -328,6 +331,10 @@ sub parse {
         my $domain = $class->parse($v1, %options);
         $domain->{schema_version} = 2;
         $domain->{fingerprint} = $fingerprint;
+        # The schema 2 document itself, for as_document and compose.
+        my $document = Selecto::Domain::SchemaV2->copy($raw);
+        delete $document->{domain_fingerprint};
+        $domain->{schema_v2_document} = $document;
         return $domain;
     }
     require Selecto::Tenant::Context;
@@ -1362,6 +1369,21 @@ sub compose {
     my ($base, @overlays) = ref($invocant) ? ($invocant, @args) : @args;
     require Selecto::Domain::Overlay;
     return Selecto::Domain::Overlay->compose($base, @overlays);
+}
+
+# The domain's own document: the schema 2 document of a schema 2 domain
+# (without a declared fingerprint; it is computed), else as_contract.
+sub as_document {
+    my ($self) = @_;
+    return $self->as_contract unless $self->schema_version == 2;
+    require Selecto::Domain::SchemaV2;
+    return Selecto::Domain::SchemaV2->copy($self->{schema_v2_document})
+        if ref($self->{schema_v2_document}) eq 'HASH';
+    my $migrated = Selecto::Domain::SchemaV2->migrate($self->as_contract);
+    Selecto::Error->throw('invalid_domain', 'domain has no schema 2 document',
+        {reason => $migrated->{refused}{code}, path => $migrated->{refused}{path}})
+        unless $migrated->{document};
+    return $migrated->{document};
 }
 
 sub as_contract {
@@ -3173,6 +3195,22 @@ C<extensions> append uniquely, other lists and scalars are replaced by later
 overlays. C<$diagnostics> reports collisions with existing C<actions>,
 C<capabilities>, C<source_relationships> and C<choice_sources> entries. See
 L<Selecto::Domain::Overlay>.
+
+A schema 2 base yields a schema 2 domain: the overlays merge into its schema 2
+document (C<as_document>), its top-level C<tenant> survives and deep-merges,
+and the fingerprint is computed for the composed document. A schema 1 C<fields>
+list in an overlay must name exactly the relation's composed columns and
+becomes its C<field_order>; C<source.tenant_field> and C<writes.scope.tenant>
+in an overlay refuse with C<invalid_domain_overlay> (declare tenancy in
+C<tenant>). A schema 1 base still yields a schema 1 domain.
+
+=head2 as_document
+
+  my $document = $domain->as_document;
+
+The schema 2 document of a schema 2 domain, without a declared
+C<domain_fingerprint> (its C<fingerprint> is computed from it); for a schema 1
+domain, C<as_contract>.
 
 =head1 METHODS
 

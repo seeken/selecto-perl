@@ -352,6 +352,70 @@ sub to_version_1 {
     return $doc;
 }
 
+# ------------------------------------------------------------------ composition
+
+# A plain copy that keeps each scalar's number or string form, so the copy's
+# RFC 8785 serialization (and so its fingerprint) is the original's.
+sub copy {
+    my ($class, $value) = @_;
+    return _copy($value);
+}
+
+# What a schema 1 shaped overlay cannot say to a schema 2 base: a list of
+# {code, path}. Tenancy is declared once, in the top-level tenant, so the
+# schema 1 tenancy keys refuse rather than being guessed into it; the version
+# is not the overlay's to change; and the fingerprint is computed.
+sub overlay_errors {
+    my ($class, $overlay) = @_;
+    my @errors;
+    return \@errors unless ref($overlay) eq 'HASH';
+    push @errors, {code => 'overlay_schema_version', path => ['schema_version']}
+        if exists($overlay->{schema_version}) && !$class->is_version_2($overlay->{schema_version});
+    push @errors, {code => 'domain_fingerprint_computed', path => ['domain_fingerprint']}
+        if exists $overlay->{domain_fingerprint};
+    push @errors, {code => 'tenant_field_removed', path => ['source', 'tenant_field']}
+        if ref($overlay->{source}) eq 'HASH' && exists $overlay->{source}{tenant_field};
+    push @errors, {code => 'writes_scope_tenant_removed', path => ['writes', 'scope', 'tenant']}
+        if ref($overlay->{writes}) eq 'HASH' && ref($overlay->{writes}{scope}) eq 'HASH'
+            && exists $overlay->{writes}{scope}{tenant};
+    return \@errors;
+}
+
+# Settles a merged schema 2 document in place and returns a list of
+# {code, path}. A relation's schema 1 `fields` list (from an overlay) must name
+# exactly its composed columns; it becomes the field_order (none when it is the
+# sorted order). Columns an overlay adds to a relation whose field_order came
+# from the base follow that order, sorted. A declared fingerprint is dropped:
+# the composed document's fingerprint is computed.
+sub settle_composition {
+    my ($class, $document) = @_;
+    my @errors;
+    delete $document->{domain_fingerprint};
+    for my $relation (_relations($document)) {
+        my ($path, $spec) = @$relation;
+        my $columns = $spec->{columns};
+        next unless ref($columns) eq 'HASH';
+        if (exists $spec->{fields}) {
+            my $fields = delete $spec->{fields};
+            my %seen;
+            unless (ref($fields) eq 'ARRAY' && !grep({ !defined($_) || ref($_) || $seen{$_}++ } @$fields)
+                && @$fields == keys(%$columns) && !grep({ !exists $columns->{$_} } @$fields)) {
+                push @errors, {code => 'overlay_fields_not_columns', path => [@$path, 'fields']};
+                next;
+            }
+            if (join("\0", @$fields) ne join("\0", _sorted_names(keys %$columns))) {
+                $spec->{field_order} = [@$fields];
+            } else {
+                delete $spec->{field_order};
+            }
+        } elsif (ref($spec->{field_order}) eq 'ARRAY') {
+            my %ordered = map { (defined($_) && !ref($_) ? ($_ => 1) : ()) } @{$spec->{field_order}};
+            push @{$spec->{field_order}}, _sorted_names(grep { !$ordered{$_} } keys %$columns);
+        }
+    }
+    return \@errors;
+}
+
 1;
 
 __END__
@@ -372,5 +436,21 @@ both versions; a version 1 domain reports C<domain_schema_deprecated>.
 C<< jcs($value) >>, C<< fingerprint($document) >>, C<< validate($document) >>
 (a list of C<{code, path}>), C<< migrate($v1) >> (C<{document, diagnostics}> or
 C<{refused}>) and C<< to_version_1($v2) >> are class methods.
+
+Composition (L<Selecto::Domain/compose>) uses three more. C<< copy($value) >>
+copies a document keeping each scalar's number or string form.
+C<< overlay_errors($overlay) >> lists what an overlay cannot say to a schema 2
+base: a C<schema_version> other than the number 2
+(C<overlay_schema_version>), a C<domain_fingerprint>
+(C<domain_fingerprint_computed>), and the schema 1 tenancy keys
+C<source.tenant_field> (C<tenant_field_removed>) and C<writes.scope.tenant>
+(C<writes_scope_tenant_removed>); tenancy is declared in the top-level
+C<tenant>, which an overlay deep-merges into. C<< settle_composition($doc) >>
+settles a merged document in place: a schema 1 C<fields> list must name exactly
+the relation's composed columns (else C<overlay_fields_not_columns>) and
+becomes its C<field_order>, or none when it is the sorted order; columns added
+to a relation whose C<field_order> came from the base are appended to it,
+sorted; and a declared C<domain_fingerprint> is dropped, since the composed
+document's fingerprint is computed.
 
 =cut
