@@ -115,7 +115,11 @@ sub close {
 sub _refuse_host_state {
     my ($self) = @_;
     return unless $self->{scope} eq 'host';
-    my $refused = eval { $self->{adapter}->_read_guard_scope; 1 } ? undef : $@;
+    my $refused = eval {
+        $self->{adapter}->_read_guard_scope;
+        $self->{adapter}->_pg_require_utf8;
+        1;
+    } ? undef : $@;
     return unless $refused;
     $self->_finish(0);
     die $refused;
