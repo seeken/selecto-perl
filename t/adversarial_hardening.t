@@ -169,7 +169,7 @@ subtest 'S22/AC-02/AC-04: action grants expire by default and a mismatched use r
     is($dbh->selectrow_array('SELECT state FROM work_orders WHERE id = 1'), 'done', 'no revoked grant wrote');
 };
 
-subtest 'PE :123/FV-03: library orderings and segments cannot read internal fields; choice filters keep to their choices' => sub {
+subtest 'PE :123/FV-03: library orderings cannot read internal fields, nor segment parameters probe them; choice filters keep to their choices' => sub {
     my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', '', '', {RaiseError => 1, PrintError => 0, AutoCommit => 1});
     $dbh->do('CREATE TABLE accounts (id integer primary key, name text, backup_code integer, secret_code integer, vip integer)');
     $dbh->do(q{INSERT INTO accounts VALUES (1, 'a', 10, 300, 1), (2, 'b', 20, 100, NULL), (3, 'c', 30, 200, 1)});
@@ -210,9 +210,6 @@ subtest 'PE :123/FV-03: library orderings and segments cannot read internal fiel
         'a named ordering on an internal field' => {ordering => 'by_secret'},
         'a view ordering on an internal field' => {view => 'secret_listing', select => undef},
         'a parameterized segment on an internal field' => {segments => ['secret_at_least'], parameters => {min => 150}},
-        'a fixed segment on an internal field' => {segments => ['vip_only']},
-        'a view segment on an internal field' => {view => 'vip_listing', select => undef},
-        'a segment comparing to an internal field' => {segments => ['secret_reference']},
         'an undeclared value on a conditional filter switching on an internal field' =>
             {filters => [{field => 'either_code', op => 'eq', value => 20}]},
         'an undeclared value on a conditional filter reading an internal field' =>
@@ -233,6 +230,13 @@ subtest 'PE :123/FV-03: library orderings and segments cannot read internal fiel
     is_deeply($ids->({ordering => 'by_name'}), [1, 2, 3], 'a named ordering on public fields still applies');
     is_deeply($ids->({segments => ['named'], order_by => [{field => 'id'}]}), [1, 2, 3],
         'a segment on public fields still applies');
+    # Segments give safe access to internal fields: the domain fixes their values.
+    is_deeply($ids->({segments => ['vip_only'], order_by => [{field => 'id'}]}), [1, 3],
+        'a fixed segment filters on an internal field');
+    is_deeply([map { $_->{id} } @{$handler->query($engine, {view => 'vip_listing', row_format => 'objects',
+        order_by => [{field => 'id'}]})->{rows}}], [1, 3], 'and so does a view\'s segment');
+    is_deeply($ids->({segments => ['secret_reference']}), [],
+        'a fixed segment may compare a public field with an internal one');
     is_deeply($ids->({filters => [{field => 'code_or_backup', op => 'in', value => [100]}]}), [2],
         'a declared choice still filters through an internal field');
     is_deeply($ids->({filters => [{field => 'either_code', op => 'eq', value => '10'}]}), [1],
