@@ -14,6 +14,7 @@ use_ok('Selecto::Analytics::Pipeline');
 use_ok('Selecto::API');
 use_ok('Selecto::API::EngineHandler');
 use_ok('Selecto::API::ResultFormatter');
+use_ok('Selecto::API::Spa');
 use_ok('Selecto::DateShortcut');
 use_ok('Selecto::Adapter');
 use_ok('Selecto::Adapter::Registry');
