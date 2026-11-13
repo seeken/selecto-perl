@@ -13,7 +13,7 @@ use Selecto::OperationBudget ();
 # intent after applying a named view cannot remove the authored obligations.
 sub apply {
     my ($class, $domain, $query, $limits) = @_;
-    my $contract = $domain->contract // {};
+    my $contract = $domain->_contract_view // {};
     return $query unless grep { exists $contract->{$_} } qw(default_selected required_selected required_order_by required_group_by);
     Selecto::OperationBudget->new(limits => $limits, code => 'invalid_domain')->check_tree(
         {map { exists($contract->{$_}) ? ($_ => $contract->{$_}) : () } qw(default_selected required_selected required_order_by required_group_by)},

@@ -189,7 +189,7 @@ sub _plan {
         unless $operation =~ /\A(?:insert|update|upsert|delete)\z/;
 
     my $writes = $contract->{writes} // {};
-    my $operation_spec = $writes->{operations}{$operation};
+    my $operation_spec = _lookup($writes, 'operations', $operation);
     Selecto::Error->throw('action_operation_not_enabled', 'action operation is not enabled by the write contract')
         unless ref($operation_spec) eq 'HASH' && $operation_spec->{enabled};
 
@@ -209,7 +209,7 @@ sub _plan {
     my %system_values;
     for my $field (keys %$changes) {
         my $value = $changes->{$field};
-        my $type = $contract->{source}{columns}{$field}{type} // '';
+        my $type = _lookup($contract, 'source', 'columns', $field, 'type') // '';
         if (blessed($value) && $value->isa('Selecto::Write::Expression')
             && $value->kind eq 'current_timestamp') {
             Selecto::Error->throw('invalid_action_changes', 'system-now requires a temporal field', {field => $field})
@@ -315,7 +315,7 @@ sub validate_plan_limits {
     Selecto::Error->throw('invalid_action_plan', 'action plan is required')
         unless blessed($plan) && $plan->isa('Selecto::Action::Plan');
     my $contract = _contract($input);
-    my $action = $contract->{actions}{$plan->action};
+    my $action = _lookup($contract, 'actions', $plan->action);
     Selecto::Error->throw('invalid_action_plan', 'action plan belongs to a different domain')
         unless ref($action) eq 'HASH';
     my $limits = _limits($options{limits});
@@ -668,7 +668,9 @@ sub _collection_patches {
 sub _contract {
     my ($input) = @_;
     if (blessed($input) && $input->isa('Selecto::Domain')) {
-        my $contract = $input->contract;
+        # Planning only reads the admitted contract. Selected templates and
+        # values are copied at their existing mutation/return boundaries.
+        my $contract = $input->_contract_view;
         Selecto::Error->throw('missing_domain_contract', 'canonical domain contract is required for actions')
             unless ref($contract) eq 'HASH';
         return $contract;
@@ -758,7 +760,7 @@ sub _transition {
         if grep { $_ eq '' } ($field, $from, $to);
     Selecto::Error->throw('invalid_action_transition', 'transition output does not match action changes')
         unless exists($changes->{$field}) && "$changes->{$field}" eq $to;
-    my $allowed = $writes->{transitions}{$field}{$from};
+    my $allowed = _lookup($writes, 'transitions', $field, $from);
     Selecto::Error->throw('invalid_action_transition', 'transition is not allowed by the write contract')
         unless ref($allowed) eq 'ARRAY' && grep { "$_" eq $to } @$allowed;
     return ($transition, [{
@@ -775,7 +777,7 @@ sub _validate_changes {
     return if $operation eq 'delete';
     Selecto::Error->throw('invalid_action_changes', 'action changes must not be empty') unless keys %$changes || $operation eq 'update' && $collections;
     for my $field (keys %$changes) {
-        my $field_spec = $writes->{fields}{$field};
+        my $field_spec = _lookup($writes, 'fields', $field);
         my $permission = $operation eq 'insert' || $operation eq 'upsert' ? 'insertable' : 'updatable';
         Selecto::Error->throw('action_field_not_writable', 'action changes an undeclared write field', { field => $field })
             unless ref($field_spec) eq 'HASH' && $field_spec->{$permission};
@@ -785,7 +787,7 @@ sub _validate_changes {
 sub _validate_capability {
     my ($contract, $capability, $action, $operation) = @_;
     return unless defined $capability;
-    my $spec = $contract->{capabilities}{$capability};
+    my $spec = _lookup($contract, 'capabilities', $capability);
     Selecto::Error->throw('action_capability_not_declared', 'action capability is not declared') unless ref($spec) eq 'HASH';
     my $declared_operations = ref($spec->{operations}) eq 'ARRAY' ? $spec->{operations} : [];
     my %operations;
@@ -794,6 +796,15 @@ sub _validate_capability {
         unless $operations{action} && $operations{$operation};
     Selecto::Error->throw('action_capability_mismatch', 'capability names a different action')
         if defined($spec->{action}) && "$spec->{action}" ne $action;
+}
+
+sub _lookup {
+    my ($value, @path) = @_;
+    for my $key (@path) {
+        return undef unless ref($value) eq 'HASH';
+        $value = $value->{$key};
+    }
+    return $value;
 }
 
 sub _target_value {
