@@ -65,6 +65,13 @@ Revision history for Selecto
       x-selecto.fields (path, type, and label, description and unit when declared);
       internal and redacted fields are never listed.
 
+    - PostgreSQL: a direct bounded read (Selecto::BoundedQuery, a result within one
+      fetch batch in the host's transaction) takes four round trips, as documented,
+      not five. Its read guard asked the server for the connection's state (pg_ping)
+      again right after the budget's own SAVEPOINT had succeeded in that
+      transaction; the direct path now tells it (_under_new_savepoint). Every other
+      read still asks.
+
     - API queries: segments give safe access to withheld fields. A requested or view
       segment may filter on an internal, hidden or redacted field, or one the caller
       cannot filter on, with the values its definition fixes. A segment filter that
