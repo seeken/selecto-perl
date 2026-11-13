@@ -25,24 +25,38 @@ my %BOOLEAN = map { $_ => 1 } qw(JSON::PP::Boolean JSON::XS::Boolean Types::Seri
 # repeated aliases and allocation; active-path references distinguish cycles
 # from repeated, independently copied values.
 sub _copy_plain {
-    my ($value, $limits, $code, $label) = @_;
-    my $budget = Selecto::OperationBudget->new(limits => $limits, code => $code);
-    $budget->consume_count('max_expression_nodes', 1, label => "$label nodes");
+    my ($value, $limits, $code, $label, $same_tree) = @_;
+    Selecto::Error->throw('invalid_limits', 'operation budget requires Selecto::Limits')
+        unless blessed($limits) && $limits->isa('Selecto::Limits');
+    # This walk owns fresh counters. Read each trusted maximum once and call
+    # the same throwing path only on a breach, rather than dispatching several
+    # budget methods for every scalar/key in every subject and policy copy.
+    my ($nodes, $bytes) = (1, 0);
+    my $nodes_max = $limits->get('max_expression_nodes');
+    my $bytes_max = $limits->get('max_state_bytes');
+    my $depth_max = $limits->get('max_expression_depth');
+    $limits->check_count('max_expression_nodes', $nodes, $code, "$label nodes") if $nodes > $nodes_max;
     my ($copy, %active);
     my @stack = ([\$value, \$copy, 0]);
     while (@stack) {
         my ($source, $target, $depth, $leave) = @{pop @stack};
         if ($leave) { delete $active{$leave}; next }
-        $limits->check_count('max_expression_depth', $depth, $code, "$label depth");
+        $limits->check_count('max_expression_depth', $depth, $code, "$label depth") if $depth > $depth_max;
         my $node = $$source;
         my $type = reftype($node);
         unless (defined $type) {
             my $boolean = defined($node) && JSON::PP::is_bool($node);
             my $flags = defined($node) ? B::svref_2object(\$node)->FLAGS : 0;
-            $budget->consume_count('max_state_bytes', defined($node) ? do { use bytes; length($node) } : 0,
-                label => "$label bytes");
+            $bytes += defined($node) ? do { use bytes; length($node) } : 0;
+            $limits->check_count('max_state_bytes', $bytes, $code, "$label bytes") if $bytes > $bytes_max;
             if (!defined $node) { $$target = undef }
-            elsif ($boolean) { my $bit = $node ? 1 : 0; $$target = bless \$bit, 'JSON::PP::Boolean' }
+            elsif ($boolean) {
+                my $bit = $node ? 1 : 0; $$target = bless \$bit, 'JSON::PP::Boolean';
+                # A core false Boolean can stringify to zero bytes; the
+                # normalized blessed Boolean counts as one. Its caller must
+                # retain normalized-tree admission in that case.
+                $$same_tree = 0 if $same_tree;
+            }
             elsif ($flags & B::SVf_POK()) { $$target = substr($node, 0) }
             elsif ($flags & B::SVf_IOK()) { $$target = 0 + $node }
             else {
@@ -58,7 +72,8 @@ sub _copy_plain {
             _fail($code, "$label contains an invalid Boolean") if !defined($$node) || defined(reftype($$node))
                 || do { use bytes; length($$node) } != 1 || "$$node" !~ /\A[01]\z/;
             my $bit = $$node ? 1 : 0;
-            $budget->consume_count('max_state_bytes', 1, label => "$label bytes");
+            ++$bytes;
+            $limits->check_count('max_state_bytes', $bytes, $code, "$label bytes") if $bytes > $bytes_max;
             $$target = bless \$bit, 'JSON::PP::Boolean';
             next;
         }
@@ -68,12 +83,14 @@ sub _copy_plain {
         _fail($code, "$label contains a cycle") if $active{$address};
         $active{$address} = 1;
         my $count = $type eq 'HASH' ? scalar(keys %$node) : scalar(@$node);
-        $budget->consume_count('max_expression_nodes', $count, label => "$label nodes");
+        $nodes += $count;
+        $limits->check_count('max_expression_nodes', $nodes, $code, "$label nodes") if $nodes > $nodes_max;
         push @stack, [undef, undef, undef, $address];
         if ($type eq 'HASH') {
             my $result = {}; $$target = $result;
             for my $key (keys %$node) {
-                $budget->consume_count('max_state_bytes', do { use bytes; length($key) }, label => "$label bytes");
+                $bytes += do { use bytes; length($key) };
+                $limits->check_count('max_state_bytes', $bytes, $code, "$label bytes") if $bytes > $bytes_max;
                 push @stack, [\$node->{$key}, \$result->{$key}, $depth + 1];
             }
         } else {
@@ -225,9 +242,9 @@ sub _reads_related {
 # evidence. It inspects every applicable binding, including advisory and false
 # conditions, without running a normalizer, condition or rule test.
 sub _preflight_subject {
-    my ($self, $request, $subject, $limits, $work) = @_;
+    my ($self, $request, $subject, $limits, $work, $copied) = @_;
     Selecto::OperationBudget->new(limits => $limits, code => 'evaluation_limit')
-        ->check_tree($subject, label => 'rule subject');
+        ->check_tree($subject, label => 'rule subject') unless $copied;
     for my $binding (values %{$self->{bindings}}) {
         next unless _applies($binding, $request);
         my ($value, $present) = _at($subject, $binding->{subject}{path});
@@ -269,8 +286,12 @@ sub _evaluate_request {
     # Refuse oversized/cyclic values before cloning. Check every consumed value
     # before conditions so an advisory or false branch cannot conceal resources.
     my $admitted = eval {
-        $normalized = _copy_plain($subject_value, $limits, 'evaluation_limit', 'rule subject');
-        $self->_preflight_subject(\%request, $normalized, $limits, $work);
+        my $same_tree = 1;
+        $normalized = _copy_plain($subject_value, $limits, 'evaluation_limit', 'rule subject', \$same_tree);
+        # _copy_plain just checked the same tree nodes, bytes, depth, classes
+        # and cycles, unless it normalized a native Boolean's representation.
+        # Rule-specific resource preflight still runs in full in either case.
+        $self->_preflight_subject(\%request, $normalized, $limits, $work, $same_tree);
         1;
     };
     unless ($admitted) {

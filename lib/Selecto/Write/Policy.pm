@@ -134,7 +134,14 @@ sub _missing {
 # write-once guards and normalized result/cardinality metadata are executable.
 sub apply {
     my ($class, $command, $raw_writes, $fields, %options) = @_;
-    my $writes = _plain($raw_writes // {});
+    return $class->_apply($command, _plain($raw_writes // {}), $fields, %options);
+}
+
+# Engine governance has admitted the domain's write contract already. Read
+# that contract in place; copies retained on commands are still independent.
+# Public apply continues to admit/copy arbitrary caller declarations above.
+sub _apply {
+    my ($class, $command, $writes, $fields, %options) = @_;
     _fail('invalid_domain', 'writes must be an object') unless ref($writes) eq 'HASH';
     my $operation = $command->operation;
     my $spec = ref($writes->{operations}) eq 'HASH' ? $writes->{operations}{$operation} : undef;

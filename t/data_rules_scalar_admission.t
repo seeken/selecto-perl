@@ -297,4 +297,54 @@ subtest 'action native expression copies remain narrow and bounded' => sub {
     my $cycle=[];push @$cycle,$cycle;
     is(error(sub {Selecto::Action::Plan->new(changes=>{name=>$cycle})->to_hash}),'invalid_planned_operation','cyclic action payload is bounded');
 };
+subtest 'subject copying retains exact resource boundaries and independent aliases' => sub {
+    my $rules = Selecto::DataRules->parse(contract({op=>'presence.required'}));
+    my $subject = {value => {a => ['x']}};
+    # 4 nodes, depth 3, 7 key/value bytes; admission precedes rule-specific
+    # preflight even for a subject whose consumed value has no numeric work.
+    for my $case (
+        [max_expression_nodes => 4, 3],
+        [max_expression_depth => 3, 2],
+        [max_state_bytes => 7, 6],
+    ) {
+        my ($name, $at, $over) = @$case;
+        is($rules->evaluate(stage=>'input',subject=>$subject,
+            limits=>Selecto::Limits->new($name=>$at))->{state},'passed',"$name accepts its exact boundary");
+        my $result = $rules->evaluate(stage=>'input',subject=>$subject,
+            limits=>Selecto::Limits->new($name=>$over));
+        is_deeply($result,{state=>'error',code=>'evaluation_limit',normalized=>{}},"$name refuses before evaluation");
+    }
+    my $shared = ['x'];
+    my $result = $rules->evaluate(stage=>'input',subject=>{value=>$shared, other=>$shared});
+    isnt(refaddr($result->{normalized}{value}),refaddr($result->{normalized}{other}),'aliases are copied independently');
+    $result->{normalized}{value}[0] = 'changed';
+    is($result->{normalized}{other}[0],'x','changing one copy does not affect the other');
+    is($shared->[0],'x','changing the result does not affect the subject');
+    my $cycle = {}; $cycle->{value} = $cycle;
+    is($rules->evaluate(stage=>'input',subject=>$cycle)->{code},'evaluation_limit','a cycle still refuses');
+    # A core false Boolean stringifies to zero bytes, but its normalized
+    # JSON::PP::Boolean representation consumes one byte on the tree boundary.
+    my $native_false = !!0;
+    if (JSON::PP::is_bool($native_false)) {
+        is($rules->evaluate(stage=>'input',subject=>{value=>$native_false},
+            limits=>Selecto::Limits->new(max_state_bytes=>5))->{state},'error','normalized native false still consumes one byte');
+        is($rules->evaluate(stage=>'input',subject=>{value=>$native_false},
+            limits=>Selecto::Limits->new(max_state_bytes=>6))->{state},'passed','native false accepts the normalized byte boundary');
+    }
+};
+
+subtest 'planning reads the configured contract without changing or exposing it' => sub {
+    my $domain = Selecto::Domain->parse(policy_document());
+    my $before = wire($domain->contract);
+    my $plan = Selecto::Action->plan($domain,{action=>'set_name',target=>1,inputs=>{name=>'next'}});
+    $plan->changes->{name} = 'host change';
+    is(wire($domain->contract),$before,'successful planning and plan mutation leave the contract unchanged');
+    my $raw = policy_document();
+    $raw->{actions}{set_name}{execution}{set} = {unknown=>'next'};
+    $domain = Selecto::Domain->parse($raw);
+    $before = wire($domain->contract);
+    is(error(sub {Selecto::Action->plan($domain,{action=>'set_name',target=>1,inputs=>{name=>'next'}})}),
+        'action_field_not_writable','undeclared assignment refuses');
+    is(wire($domain->contract),$before,'a failed lookup does not autovivify the contract');
+};
 done_testing;

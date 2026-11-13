@@ -289,7 +289,11 @@ sub required_filters {
     my ($self) = @_;
     $self->assert_domain_identity;
     require Selecto::QueryPolicy;
-    my $filters = Selecto::QueryPolicy->filters($self->{domain}, $self->query, $self->{limits});
+    # Only the host's required predicate contributes here. Constructing and
+    # admitting an empty optional query repeats unrelated query work on every
+    # scope check; lower the same required expression directly instead.
+    my $required = $self->{domain}->required_predicate;
+    my $filters = defined($required) ? Selecto::QueryPolicy::_top_filters($required) : [];
     push @$filters, @{$self->{tenant_required_filters} // []};
     my $read_field = $self->{domain}->tenant_field;
     push @$filters, [$read_field, $self->{scope}{tenant}]
@@ -341,6 +345,7 @@ sub _ensure_write_context {
 }
 sub _ensure_read_scope {
     my ($self) = @_;
+    return if $self->{_read_scope_checked};
     $self->_assert_engine_tenant_agrees;
     my $report = $self->validate_tenant_scope;
     Selecto::Error->throw($report->{error}{code}, 'required read tenant scope is missing or inconsistent', $report->{error}) unless $report->{valid};
@@ -485,6 +490,9 @@ sub compile {
     my ($self, $query) = @_;
     $self->assert_domain_identity;
     $self->_ensure_read_scope;
+    # read_domain below is part of this same synchronous compile. Keep scope
+    # validation per call, without repeating it when obtaining that domain.
+    local $self->{_read_scope_checked} = 1;
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_query')->check_tree(
         $query, label => 'query', allowed_classes => [qw(Selecto::Query Selecto::Expression Selecto::Domain Selecto::Domain::Association)],
         allowed_base_classes => ['Selecto::Query']);
@@ -1098,7 +1106,7 @@ sub governed_write {
                 && _has_conjunct($command->query_enforcement->predicate, $required));
     }
     my %returning_fields = map { ($_ => $self->{domain}->_field_metadata_view($_)) } keys %{$self->{domain}->fields};
-    $command = Selecto::Write::Policy->apply($command, $self->{domain}->writes_shared, \%returning_fields,
+    $command = Selecto::Write::Policy->_apply($command, $self->{domain}->writes_shared, \%returning_fields,
         trusted_field => $trusted);
     $self->_validate_write_command($command, trusted_field => $trusted);
     $self->_check_required_tenant_assignment($command, $required, %details);
@@ -1149,6 +1157,9 @@ sub required_write_guard {
 # with the trusted write context's required filters.
 sub _host_required_predicate {
     my ($self) = @_;
+    # resolve() omits required_filters when none were supplied. The domain
+    # and context are already admitted; no filter means nothing to lower.
+    return $self->{domain}->required_predicate unless exists $self->{write_context}{required_filters};
     my $contract=$self->{domain}->_contract_view // {};
     my $source=$contract->{source} // {fields=>[sort keys %{$self->{domain}->fields}]};
     return Selecto::QueryEnforcement::combine($self->{domain}->required_predicate,
