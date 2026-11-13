@@ -57,6 +57,7 @@ my $domain = Selecto::Domain->parse({
         segments => {
             named => {filters => [['not_null', 'name']]},
             secretive => {filters => [['eq', 'secret', 'x']]},
+            probing => {parameters => {guess => {type => 'string'}}, filters => [['eq', 'secret', ['param', 'guess']]]},
         },
         orderings => {by_name => {order_by => [['name', 'asc']]}, by_secret => {order_by => [['secret', 'asc']]}},
         views => {
@@ -86,8 +87,8 @@ subtest 'every place a query can name a hidden field' => sub {
         ['hidden field outside the subtable association', {select => ['id', ['orders.id', 'secret']]}, 'secret'],
         ['projection', {projection => 'hidden'}, 'secret'],
         ['view projection', {view => 'hidden_listing'}, 'secret'],
-        ['segment', {select => ['id'], segments => ['secretive']}, 'secret'],
-        ['view segment', {view => 'secret_segment'}, 'secret'],
+        ['segment parameter compared with the field', {select => ['id'], segments => ['probing'],
+            parameters => {guess => 'x'}}, 'secret'],
         ['named ordering', {select => ['id'], ordering => 'by_secret'}, 'secret'],
         ['view ordering', {view => 'secret_order'}, 'secret'],
         ['order_by', {select => ['id'], order_by => [{field => 'secret'}]}, 'secret'],
@@ -104,6 +105,10 @@ subtest 'every place a query can name a hidden field' => sub {
     is($query->({select => ['id', 'name', ['orders.id', 'orders.total']],
         segments => ['named'], ordering => 'by_name'})->{code}, 'ok', 'public fields still query');
     is($adapter->{executed}, 1, 'the accepted query executed once');
+    # Segments give safe access to withheld fields: the domain fixes their values.
+    is($query->({select => ['id'], segments => ['secretive']})->{code}, 'ok',
+        'a segment may filter on a hidden field with a fixed value');
+    is($query->({view => 'secret_segment'})->{code}, 'ok', 'and so may a view\'s segment');
 };
 
 subtest 'unknown and hidden fields together' => sub {

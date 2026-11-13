@@ -57,6 +57,14 @@ Revision history for Selecto
       x-selecto.fields (path, type, and label, description and unit when declared);
       internal and redacted fields are never listed.
 
+    - API queries: segments give safe access to withheld fields. A requested or view
+      segment may filter on an internal, hidden or redacted field, or one the caller
+      cannot filter on, with the values its definition fixes. A segment filter that
+      compares such a field with a caller parameter still refuses (hidden_field, or
+      invalid_field for a disabled role), since the parameter could probe the value.
+      Selecto::QueryLibrary::parameterized_fields lists the fields segments compare
+      with parameters.
+
     - PostgreSQL: the adapter no longer defends against roles with CREATE in the
       application's schemas or against code planted in triggers and views, which are
       outside the threat model. Removed: the operator and function qualifier, the

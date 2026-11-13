@@ -30,7 +30,8 @@ my $domain = Selecto::Domain->parse({
     }, schemas => {}, joins => {},
     query_library => {
         projections => {public => {fields => [qw(id name)]}},
-        segments => {name_probe => {filters => [['eq', 'name', 'private']]}},
+        segments => {name_probe => {filters => [['eq', 'name', 'private']]},
+            name_guess => {parameters => {guess => {type => 'string'}}, filters => [['eq', 'name', ['param', 'guess']]]}},
         orderings => {name_probe => {order_by => [['name', 'asc']]}},
         views => {name_probe => {projection => 'public', ordering => 'name_probe'}},
     },
@@ -42,7 +43,6 @@ for my $probe (
     ['filter', {select => ['id'], filters => [{field => 'name', op => 'eq', value => 'private'}]}],
     ['sort', {select => ['id'], order_by => [{field => 'name'}]}],
     ['group', {select => ['name'], group_by => ['name']}],
-    ['named segment', {select => ['id'], segments => ['name_probe']}],
     ['named ordering', {select => ['id'], ordering => 'name_probe'}],
     ['named view', {view => 'name_probe'}],
 ) {
@@ -54,6 +54,16 @@ for my $probe (
         "$label fails with the stable public field refusal";
 }
 is $adapter->{executions} // 0, 0, 'disabled-role refusals happen before database execution';
+# A segment's fixed filters are the domain's own, so they may use a field the
+# caller cannot filter on; a caller parameter compared with it may not.
+ok eval {$handler->query($engine, {select => ['id'], segments => ['name_probe']}); 1},
+    'a fixed named segment filters on a field the caller cannot filter on';
+my $guess = eval {$handler->query($engine, {select => ['id'], segments => ['name_guess'],
+    parameters => {guess => 'private'}}); 1};
+my $guess_error = $@;
+ok !$guess, 'a segment parameter cannot bypass the disabled field role';
+is ref($guess_error) && $guess_error->can('code') ? $guess_error->code : undef, 'invalid_field',
+    'and fails with the stable public field refusal';
 my $result = $handler->query($engine, {select => [qw(id name)]});
 is_deeply $result->{rows}, [[1, 'public']], 'disabled filtering and sorting still allow public selection';
 $result = $handler->query($engine, {select => ['id'], group_by => ['id'], order_by => [{field => 'id'}]});
@@ -91,7 +101,7 @@ for my $intent (
     {select => ['id'], order_by => [{field => 'name'}]},
     {select => ['name'], group_by => ['name']},
     {projection => 'public'},
-    {select => ['id'], segments => ['name_probe']},
+    {select => ['id'], segments => ['name_guess'], parameters => {guess => 'private'}},
     {select => ['id'], ordering => 'name_probe'},
     {view => 'name_probe'},
 ) {
@@ -100,4 +110,6 @@ for my $intent (
     ok !$accepted, 'hidden marker refuses public query role or named route';
     is ref($error) ? $error->code : undef, 'hidden_field', 'hidden marker uses the public secrecy code';
 }
+ok eval {$handler->query($hidden_engine, {select => ['id'], segments => ['name_probe']}); 1},
+    'a fixed named segment filters on a hidden field';
 done_testing;

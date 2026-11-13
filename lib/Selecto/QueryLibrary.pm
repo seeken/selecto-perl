@@ -198,6 +198,48 @@ sub apply_segments {
     return $query->with_applied_query_library($applied);
 }
 
+# The fields that segments compare with caller parameters: every field a
+# filter names when its value or end takes a parameter. A segment's fixed
+# filters are the domain author's own, so only these let a caller probe a value.
+sub parameterized_fields {
+    my ($class, $domain, $segment_ids, $limits) = @_;
+    $limits //= Selecto::Limits->new;
+    _array($segment_ids, 'query-library segments');
+    my $library = $class->library($domain);
+    my $context = _resolution($limits);
+    _names($context, $segment_ids, 'segment selection');
+    my (%seen, @fields);
+    for my $id (@$segment_ids) {
+        for my $filter (@{_resolve_segment($library, $id, [], $context)->{filters}}) {
+            push @fields, grep { !$seen{$_}++ } _parameterized_filter_fields($filter);
+        }
+    }
+    return \@fields;
+}
+
+sub _parameterized_filter_fields {
+    my ($filter) = @_;
+    return () unless ref($filter) eq 'ARRAY' && @$filter;
+    my ($operator, @args) = @$filter;
+    $operator = lc("$operator");
+    if ($operator eq 'and' || $operator eq 'or' || $operator eq 'not') {
+        my $items = $operator eq 'not' ? [$args[0]]
+            : @args == 1 && ref($args[0]) eq 'ARRAY' ? $args[0] : \@args;
+        return map { _parameterized_filter_fields($_) } @$items;
+    }
+    my ($field, @values) = @args;
+    return () unless grep { _takes_parameter($_) } @values;
+    return defined($field) && !ref($field) ? ("$field") : ();
+}
+
+sub _takes_parameter {
+    my ($value) = @_;
+    return 1 if ref($value) eq 'ARRAY' && @$value == 2 && "$value->[0]" eq 'param';
+    return scalar(grep { _takes_parameter($_) } @$value) if ref($value) eq 'ARRAY';
+    return scalar(grep { _takes_parameter($_) } values %$value) if ref($value) eq 'HASH';
+    return 0;
+}
+
 sub apply_projection {
     my ($class, $domain, $query, $projection_ids, $limits) = @_;
     _query($query);
@@ -857,6 +899,14 @@ The validated picker groups as a sorted list.
 
 AND the segments' filters into the query's predicate. The combined parameter
 contract is validated before the query changes.
+
+=item C<parameterized_fields($domain, \@ids)>
+
+The fields the named segments (and the segments they reference) compare with
+a caller parameter: each filter's field when its value or end takes a
+C<['param', ...]>. A host that withholds fields uses
+this to let segments filter on them with fixed values while refusing a
+parameter that could probe them.
 
 =item C<apply_projection($domain, $query, $id_or_ids)>
 

@@ -536,10 +536,17 @@ sub _query ($self, $engine, $body, %options) {
         my %seen;
         @segments = grep { !$seen{$_}++ } @segments;
         $query = Selecto::QueryLibrary->apply_segments($domain, $query, \@segments, $parameters, $self->limits);
-        # Segments are not permission to filter on an internal field either:
-        # with a parameter, a caller could probe its value. They are the only
-        # predicate so far (the required predicate is added when compiling).
-        _visible_field_definition($domain, $_, 'filter') for Selecto::Expression->field_references($query->predicate);
+        # Segments give safe access to withheld fields: the domain fixes their
+        # filters, so a segment may filter on an internal field. A field it
+        # compares with a caller parameter must be public, or the parameter
+        # could probe its value. Segments are the only predicate so far (the
+        # required predicate is added when compiling).
+        my %parameterized = map { $_ => 1 }
+            @{Selecto::QueryLibrary->parameterized_fields($domain, \@segments, $self->limits)};
+        for my $field (Selecto::Expression->field_references($query->predicate)) {
+            $parameterized{$field} ? _visible_field_definition($domain, $field, 'filter')
+                : $domain->resolve($field);
+        }
     } elsif (keys %$parameters) {
         Selecto::Error->throw(
             'invalid_api_query',
@@ -1559,9 +1566,12 @@ Only public fields are accepted. Columns marked C<internal> or C<hidden> and fie
 listed in C<redact_fields> cannot be selected, filtered or ordered by a
 query (C<hidden_field>, details C<field>), nor assigned or returned by a
 write (C<field_not_public>), at any association depth. Query-library names
-are no exception: a projection or view that selects such a field, a
-requested segment (or a view's segment) that reads one, or an ordering that
-sorts by one, fails the same way. A field that does not exist fails first
+are no exception: a projection or view that selects such a field, or an
+ordering that sorts by one, fails the same way. Segments are the exception:
+they give safe access to withheld fields, so a requested segment (or a view's
+segment) may filter on one with the values its definition fixes. A segment
+that compares a withheld field with a caller parameter fails with
+C<hidden_field>, since the parameter could probe the value. A field that does not exist fails first
 (C<unknown_field>); within C<select>, every other selection error is
 reported before a hidden field. Through L<Selecto::API>, C<hidden_field>
 answers 403 (see L<Selecto::API/error_status>). A
