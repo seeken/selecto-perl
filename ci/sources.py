@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Immutable siblings; credentials travel only through Git's credential protocol."""
+"""Declared siblings; credentials travel only through Git's credential protocol."""
 import json
 import os
 from pathlib import Path
@@ -18,12 +18,23 @@ def manifest(root=ROOT):
         repo = source.get('repository', '')
         if not re.fullmatch(r'seeken/[A-Za-z0-9_-]+', repo) or repo in seen:
             raise ValueError('invalid or duplicate source repository')
-        if not re.fullmatch(r'[0-9a-f]{40}', source.get('commit', '')):
+        if 'branch' in source:
+            if repo != 'seeken/selecto-perl-certification' or source['branch'] != 'main' or 'commit' in source:
+                raise ValueError('only the certification runner may follow main')
+        elif not re.fullmatch(r'[0-9a-f]{40}', source.get('commit', '')):
             raise ValueError('source needs a complete immutable Git commit')
         if source.get('access') not in ('private', 'public'):
             raise ValueError('source access must be explicit')
         seen.add(repo)
     return config
+
+def expected_commit(source, path):
+    if 'commit' in source:
+        return source['commit']
+    # Bind diagnostics to the branch tip fetched for this job, even if main moves later.
+    return subprocess.check_output(
+        ['git', '-C', str(path), 'rev-parse', 'FETCH_HEAD^{commit}'], text=True
+    ).strip()
 
 def credential():
     if len(sys.argv) != 3 or sys.argv[2] != 'get':
@@ -55,7 +66,7 @@ def credential():
     sys.stdout.write('username=x-access-token\npassword=' + token + '\n')
 
 def checkout():
-    config = manifest()
+    config = manifest(ROOT)
     workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
     if ROOT.parent != workspace:
         raise ValueError('root checkout must be a direct workspace child')
@@ -65,7 +76,8 @@ def checkout():
         if key.startswith('GIT_TRACE') or key in ('GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT'):
             del env[key]
     for source in config['sources']:
-        repo, commit = source['repository'], source['commit']
+        repo = source['repository']
+        revision = source.get('commit') or 'refs/heads/' + source['branch']
         destination = workspace / repo.split('/')[1]
         if destination.exists():
             raise ValueError('refusing an existing sibling checkout: ' + repo)
@@ -76,12 +88,13 @@ def checkout():
             base += ['-c', 'credential.https://github.com.helper=' + helper]
         subprocess.run(base + ['init', '--quiet', str(destination)], check=True, env=env)
         subprocess.run(base + ['-C', str(destination), 'remote', 'add', 'origin', 'https://github.com/' + repo + '.git'], check=True, env=env)
-        subprocess.run(base + ['-C', str(destination), 'fetch', '--quiet', '--no-tags', '--depth=1', 'origin', commit], check=True, env=env)
+        subprocess.run(base + ['-C', str(destination), 'fetch', '--quiet', '--no-tags', '--depth=1', 'origin', revision], check=True, env=env)
+        commit = expected_commit(source, destination)
         subprocess.run(base + ['-C', str(destination), 'checkout', '--quiet', '--detach', commit], check=True, env=env)
         actual = subprocess.check_output(['git', '-C', str(destination), 'rev-parse', 'HEAD'], text=True).strip()
         if actual != commit:
             raise ValueError('sibling commit mismatch')
-        print(json.dumps({'repository': repo, 'commit': actual, 'access': source['access']}))
+        print(json.dumps({'repository': repo, 'requested_ref': revision, 'commit': actual, 'access': source['access']}))
 
 if __name__ == '__main__':
     if len(sys.argv) >= 2 and sys.argv[1] == 'credential':

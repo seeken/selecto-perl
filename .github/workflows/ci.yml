@@ -50,7 +50,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes libpq-dev libsqlite3-dev libssl-dev postgresql-client
-      - name: Verify immutable sources and complete distribution
+      # Follow the runner's latest main at CI time to break the mutual SHA-pin cycle.
+      - name: Verify library with latest runner main and complete distribution
         env:
           SELECTO_CI_EVIDENCE_DIR: ${{ runner.temp }}/selecto-perl-ci-evidence
           SELECTO_CI_CPAN_DIR: ${{ runner.temp }}/selecto-perl-cpan

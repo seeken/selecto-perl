@@ -11,7 +11,7 @@
   "sources": [
     {
       "repository": "seeken/selecto-perl-certification",
-      "commit": "740a2a25ca95486c49e249d647f289aadae4d927",
+      "branch": "main",
       "access": "private"
     }
   ],

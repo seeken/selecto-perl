@@ -1,8 +1,10 @@
 # Beep CI
 
 This library verifies pull requests and its default branch on disposable Beep
-runners. `ci/beep.json` declares complete immutable sibling commits and source
-paths. Public references clone without authentication; private references use
+runners. `ci/beep.json` declares sibling sources and paths. The certification
+runner follows the latest `main` at CI time to break the mutual SHA-pin cycle;
+its resolved commit is recorded and checked throughout that job. Other sibling
+references remain immutable commits. Public references clone without authentication; private references use
 only the job-scoped, read-only credential file through Git's credential pipe.
 
 The actual runtime is Perl 5.40.2, relocatable SDK 5.40.2.1, with Mise 2026.10.3
