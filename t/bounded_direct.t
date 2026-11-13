@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use Selecto;
 use Selecto::BoundedQuery;
+use File::Temp ();
 use lib 't/lib';
 use TestPostgreSQL ();
 use TestSelecto;
@@ -68,6 +69,26 @@ subtest 'PostgreSQL direct bounded execution' => sub {
     is scalar(grep { /\AROLLBACK TO SAVEPOINT (selecto_budget\w+); RELEASE SAVEPOINT \1\z/ } @sql), 1,
         'and is rolled back and released in one more';
     is $timeout->(), '0', 'the timeout ends with the page';
+
+    # Its round trips, from libpq's trace: each ends with the server's ReadyForQuery.
+    my $traced = sub {
+        my ($work) = @_;
+        my ($fh, $path) = File::Temp::tempfile(UNLINK => 1);
+        $dbh->pg_server_trace($fh);
+        my $ok = eval { $work->(); 1 };
+        my $error = $@;
+        $dbh->pg_server_untrace;
+        close $fh;
+        die $error unless $ok;
+        open my $read, '<', $path or die $!;
+        my @lines = <$read>;
+        return {trips => scalar(grep { /\tB\t\d+\tReadyForQuery/ } @lines),
+            pings => scalar(grep { /\tF\t\d+\tQuery\t "\/\* DBD::Pg ping test/ } @lines)};
+    };
+    is_deeply $traced->(sub { Selecto::BoundedQuery->all($engine, $page, max_rows => 10_000) }), {trips => 4, pings => 1},
+        'four round trips: the state check, the savepoint with its timeout, the query, the rollback';
+    is_deeply $traced->(sub { $engine->adapter->execute_query(statement('SELECT 1 AS n')) }), {trips => 2, pings => 1},
+        'a read outside a new savepoint still asks where it runs';
     ok eval { $dbh->do('SELECT pg_sleep(0.05)'); 1 }, 'the host transaction runs on under its own timeout';
     my $all = Selecto::BoundedQuery->all($engine, $engine->query->select('id')->order_by('id'), max_rows => 10_000);
     is scalar(@{$all->{rows}}), 150, 'a result larger than one batch still streams';

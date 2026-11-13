@@ -1239,12 +1239,26 @@ sub _read_guard_scope {
         . 'handle between fetches', {method => 'selecto'})
         if $Selecto::PostgreSQL::Stream::OWNED{Scalar::Util::refaddr($dbh) // 0};
     $self->_refuse_pending_result;
+    # The first read right under a savepoint budget opened with nothing sent
+    # since (_under_new_savepoint) is in the host's healthy transaction: that
+    # SAVEPOINT succeeded in it. Any later read asks again.
+    return 'host' if delete $self->{_selecto_pg_new_savepoint};
     my $status = eval { $dbh->pg_ping } // 0;
     # (AutoCommit off and nothing sent yet: DBD::Pg begins the host's transaction
     # with the read's first statement.)
     return eval { $dbh->{AutoCommit} } ? 'own' : 'host' if $status == 1;
     return 'host' if $status == 3;
     _refuse_connection_state({2 => 'active', 4 => 'inerror'}->{$status} // 'unknown');
+}
+
+# Runs $work, a read, right after a savepoint budget opened on this handle
+# (Selecto::BoundedQuery's direct path), with nothing sent in between. Only
+# the code between them may call this: it tells the read's guard where it runs
+# instead of the guard asking with pg_ping, one round trip fewer.
+sub _under_new_savepoint {
+    my ($self, $work) = @_;
+    local $self->{_selecto_pg_new_savepoint} = 1;
+    return $work->();
 }
 
 sub _refuse_connection_state {

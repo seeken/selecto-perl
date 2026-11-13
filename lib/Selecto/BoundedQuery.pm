@@ -184,7 +184,11 @@ sub execute {
             $engine->assert_domain_identity;
             _assert_prepared_policy($engine, $prepared);
             $deadline->check(defer_rearm => 1);
-            $admit->($_) for @{$adapter->execute_query($guarded, @canonical)->{rows}};
+            # Nothing has been sent since the savepoint: the query's read guard
+            # need not ask the server again where it runs.
+            my $run = sub { $adapter->execute_query($guarded, @canonical) };
+            my $result = $adapter->can('_under_new_savepoint') ? $adapter->_under_new_savepoint($run) : $run->();
+            $admit->($_) for @{$result->{rows}};
         } else {
             $deadline = $adapter->begin_query_budget(timeout_ms => $timeout);
             $engine->assert_domain_identity;
