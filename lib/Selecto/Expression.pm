@@ -39,6 +39,15 @@ sub literal { my ($class, $value) = @_; return $class->new('literal', $value); }
 sub count   { my ($class) = @_; return $class->new('count'); }
 sub count_field { my ($class, $field) = @_; return $class->new('count_field', $class->_operand($field)); }
 sub count_distinct { my ($class, $field) = @_; return $class->new('count_distinct', $class->_operand($field)); }
+# Typed JSON/array comparison. Field metadata determines storage and casts;
+# only finite comparators and bound plain values are accepted.
+sub structured_compare {
+    my ($class, $field, $operator, $value) = @_;
+    Selecto::Error->throw('invalid_query', 'unsupported structured comparator')
+        unless defined($operator) && $operator =~ /\A(?:eq|neq|in|not_in)\z/;
+    return $class->new('structured_compare', $class->field($field), $operator, $value);
+}
+sub trim { my ($class, $field) = @_; return $class->new('trim', $class->_operand($field)); }
 sub avg     { my ($class, $field) = @_; return $class->new('avg', $class->_operand($field)); }
 sub sum     { my ($class, $field) = @_; return $class->new('sum', $class->_operand($field)); }
 sub sum_zero { my ($class, $field) = @_; return $class->new('sum_zero', $class->_operand($field)); }
@@ -110,6 +119,13 @@ sub dimension_display {
         $class->_operand($display_field),
         $class->_operand($dimension_key),
     );
+}
+# Bounded rows also serve a declared to-one relationship; consumers check
+# cardinality using a second row instead of silently choosing one.
+sub related_rows {
+    my ($class, $association, $fields, %options) = @_;
+    my $expr = $class->related_collection($association, $fields, %options);
+    return $class->new('related_rows', @{$expr->arguments});
 }
 sub related_collection {
     my ($class, $association, $fields, %options) = @_;
@@ -508,6 +524,14 @@ sub field_references {
             require Selecto::ValueExpression;
             return Selecto::ValueExpression->dependencies($arguments->[0]);
         }
+        if ($kind eq 'related_rows') {
+            my ($association, $fields, $options) = @$arguments;
+            $options //= {};
+            return (
+                (map { !ref($_) ? "$association.$_" : $class->field_references($_->{expression}) } @$fields),
+                (map { "$association.$_->[0]" } @{$options->{filters} // []}, @{$options->{order_by} // []}),
+            );
+        }
         if ($kind eq 'related_collection') {
             my ($association, $fields, $options) = @$arguments;
             $options = {} unless ref($options) eq 'HASH';
@@ -772,6 +796,16 @@ association is not joined into it. Options: C<filters> (C<[[field, value]]>
 equalities), C<order_by> (C<[[field, direction]]>), C<limit> (per parent,
 requires C<order_by>) and C<after> (a keyset cursor). Field entries may also
 be C<< {key => 'name', expression => $expression} >>.
+
+=head2 trim, structured_compare, related_rows
+
+C<trim($field)> removes space padding through the native adapter.
+C<structured_compare($field, $operator, $value)> accepts C<eq>, C<neq>, C<in>
+and C<not_in> over declared JSON/array fields using bound values on PostgreSQL
+and JSON-backed values on SQLite. Other adapters refuse explicitly.
+C<related_rows> has the same arguments and bounds as C<related_collection> and
+also permits declared one relationships. A consumer can request two rows to
+check singleton cardinality before presenting its result.
 
 =head1 DATES AND TIMES
 

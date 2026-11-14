@@ -730,6 +730,12 @@ sub _canonical_associations {
                     && $on->[0]{left} eq $association->{owner_key} && $on->[0]{right} eq $association->{related_key};
         }
         my $target_fields = _canonical_fields($target);
+        for my $field (keys %{$association->{where}//{}}) {
+            my $v=$association->{where}{$field}; next unless ref($v) eq 'ARRAY';
+            Selecto::Error->throw('invalid_domain','association inequality requires physical local fields')
+                unless @$v==2 && !ref($v->[0]) && $v->[0] eq 'ne' && ref($v->[1]) eq 'ARRAY' && @{$v->[1]}==2 && $v->[1][0] eq 'field'
+                && !grep {!defined($_) || ref($_) || !exists($target_fields->{$_}) || exists($target->{columns}{$_}{computed})} ($field,$v->[1][1]);
+        }
         my $values = $has_values
             ? _canonical_relation_values($target, "schema $queryable")
             : undef;
@@ -2530,7 +2536,10 @@ sub _constant_predicates {
         my $name = _identifier($field, "$label field");
         my $literal = $value->{$field};
         Selecto::Error->throw('invalid_domain', "$label values must be scalar literals")
-            if ref($literal) && !JSON::PP::is_bool($literal);
+            if ref($literal) && !JSON::PP::is_bool($literal)
+                && !(ref($literal) eq 'ARRAY' && @$literal==2 && !ref($literal->[0]) && $literal->[0] eq 'ne'
+                    && ref($literal->[1]) eq 'ARRAY' && @{$literal->[1]}==2 && $literal->[1][0] eq 'field'
+                    && defined($literal->[1][1]) && !ref($literal->[1][1]) && $literal->[1][1] =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/);
         $predicates{$name} = $literal;
     }
     return \%predicates;
@@ -2823,6 +2832,9 @@ sub new {
             'invalid_domain', 'association where field is not queryable',
             {association => $args{name}, field => $field},
         ) unless exists $fields->{$field};
+        if (ref($where->{$field}) eq 'ARRAY') {
+            Selecto::Error->throw('invalid_domain','association inequality field is not queryable') unless exists $fields->{$where->{$field}[1][1]};
+        }
     }
     my $cardinality = lc(Selecto::Domain::_required_string(
         $value->{cardinality} // 'one', 'association cardinality'

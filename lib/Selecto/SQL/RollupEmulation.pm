@@ -39,7 +39,7 @@ sub validate_projection {
     # Scalar compositions may use dimensions, constants, and closed measures.
     # A free field, window, subquery, or unrelated value AST is not a measure.
     Selecto::Error->throw('invalid_query', 'rollup projections require dimensions or closed aggregates')
-        if $kind =~ /\A(?:field|value|window|related_collection|recursion_depth)\z/;
+        if $kind =~ /\A(?:field|value|window|related_collection|related_rows|recursion_depth)\z/;
     my @children = _expression_children($args);
     Selecto::Error->throw('invalid_query', 'rollup projections require dimensions or closed aggregates')
         unless @children;

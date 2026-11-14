@@ -1224,6 +1224,52 @@ sub _compile_array_predicate {
     Selecto::Error->throw('unsupported_feature', 'array predicates are not supported by this SQL dialect');
 }
 
+# Public structured comparison API; all SQL and driver representation stay
+# inside the adapter boundary. JSON-backed arrays preserve array order.
+sub _compile_structured_compare {
+    my ($self, $domain, $expression, $params) = @_;
+    my ($operand, $operator, $value) = @{$expression->arguments};
+    my $field = $operand->arguments->[0];
+    my $type = $domain->resolve($field)->{type};
+    Selecto::Error->throw('invalid_query', 'structured comparison requires a JSON or array field') unless $type =~ /\A(?:jsonb?|array)\z/;
+    Selecto::Error->throw('query_rule_not_evaluable', 'structured comparison is unavailable on this adapter', {reason=>'structured_comparison_unsupported'})
+        unless $self->name eq 'postgresql' || $self->name eq 'sqlite';
+    Selecto::Error->throw('invalid_query', 'unsupported structured comparator') unless $operator =~ /\A(?:eq|neq|in|not_in)\z/;
+    my @values = $operator =~ /in\z/ ? (ref($value) eq 'ARRAY' && @$value ? @$value : Selecto::Error->throw('invalid_query','structured membership requires values')) : ($value);
+    if (!defined($value) && $operator =~ /\A(?:eq|neq)\z/) { return $self->_compile_expression($domain,$operand,$params).($operator eq 'eq' ? ' IS NULL' : ' IS NOT NULL'); }
+    my @comparisons;
+    for my $item (@values) {
+        my $left = $self->_compile_expression($domain, $operand, $params);
+        my $right;
+        if (!defined($item)) { push @$params, undef; $right = $self->placeholder(scalar @$params); }
+        elsif ($self->name eq 'postgresql' && $type eq 'array') {
+            # PostgreSQL infers the parameter's exact array type from the
+            # governed column. Serialize data using its array text format;
+            # no SQL type or cast comes from a caller or needs guessed items.
+            my $encode; $encode=sub {
+                my ($v)=@_;
+                return '{'.join(',',map {$encode->($_)} @$v).'}' if ref($v) eq 'ARRAY';
+                return 'NULL' unless defined $v;
+                $v=$v?'true':'false' if JSON::PP::is_bool($v);
+                Selecto::Error->throw('invalid_query','structured array members must be literals') if ref($v);
+                my $s="$v";$s =~ s/(["\\])/\\$1/g;return '"'.$s.'"';
+            };
+            Selecto::Error->throw('invalid_query','structured array comparison requires an array') unless ref($item) eq 'ARRAY';
+            push @$params,$encode->($item);$right=$self->placeholder(scalar @$params);
+        } else {
+            push @$params, Cpanel::JSON::XS->new->canonical->allow_nonref->encode($item);
+            $right = $self->placeholder(scalar @$params);
+            if ($self->name eq 'postgresql') { $left='CAST(' . $left . ' AS JSONB)'; $right='CAST(' . $right . ' AS JSONB)'; }
+        }
+        my $negative = $operator eq 'neq' || $operator eq 'not_in';
+        if ($self->name eq 'sqlite') {
+            Selecto::Error->throw('unsupported_feature','SQLite JSON functions are unavailable') unless $self->_json_available;
+            push @comparisons, ($negative ? 'NOT ' : '') . 'selecto_json_equal(' . $left . ',' . $right . ')';
+        } else { push @comparisons, $left . ($negative ? ' <> ' : ' = ') . $right; }
+    }
+    return '(' . join($operator eq 'not_in' ? ' AND ' : ' OR ', @comparisons) . ')';
+}
+
 sub _compile_json_contains {
     Selecto::Error->throw('unsupported_feature', 'JSON containment is not supported by this SQL dialect');
 }
@@ -1806,6 +1852,7 @@ sub _compile_expression {
         );
         return '(' . $self->_compile_value_expression($domain, $arguments->[0], $params) . ')';
     }
+    return $self->_compile_structured_compare($domain, $expression, $params) if $kind eq 'structured_compare';
     if ($kind eq 'literal') {
         push @$params, $arguments->[0];
         return $self->placeholder(scalar @$params);
@@ -1895,7 +1942,7 @@ sub _compile_expression {
         return "CASE WHEN GROUPING($key_sql) = 1 THEN NULL ELSE MIN($display_sql) END";
     }
     return $self->_compile_related_collection($domain, $expression, $params)
-        if $kind eq 'related_collection';
+        if $kind eq 'related_collection' || $kind eq 'related_rows';
     return $self->_compile_window($domain, $expression, $params)
         if $kind eq 'window';
     return 'COUNT(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')'
@@ -1919,6 +1966,7 @@ sub _compile_expression {
     return $self->_compile_dialect_expression($domain, $expression, $params)
         if $kind eq 'count_bucket' || $kind eq 'bucket' || $kind eq 'datetime_format'
             || $kind eq 'epoch_datetime' || $kind eq 'text_search' || $kind eq 'text_rank';
+    return ($self->name eq 'postgresql' ? 'pg_catalog.btrim(' : 'TRIM(') . $self->_compile_expression($domain, $arguments->[0], $params) . ')' if $kind eq 'trim';
     if ($kind eq 'avg' || $kind eq 'sum' || $kind eq 'min' || $kind eq 'max') {
         return uc($kind) . '(' . $self->_compile_expression($domain, $arguments->[0], $params) . ')';
     }
@@ -2085,7 +2133,7 @@ sub _compile_related_collection_at {
         ? $self->_association_parent_types($domain, $association_name) : undef;
     my $association = $resolved_association->{association};
     Selecto::Error->throw('invalid_query', 'related collections require a to-many association')
-        unless $association->cardinality eq 'many';
+        unless $association->cardinality eq 'many' || $expression->kind eq 'related_rows';
     my $alias_suffix = $association_name;
     $alias_suffix =~ s/\./_/g;
     my $alias = 'c_' . $alias_suffix;
@@ -2109,7 +2157,7 @@ sub _compile_related_collection_at {
                 && defined($field->{key}) && !ref($field->{key}) && length("$field->{key}")
                 && blessed($field->{expression})
                 && $field->{expression}->isa('Selecto::Expression');
-        if ($field->{expression}->kind eq 'related_collection') {
+        if ($field->{expression}->kind eq 'related_collection' || $field->{expression}->kind eq 'related_rows') {
             push @collection_fields, {
                 key => "$field->{key}",
                 type => 'json',
@@ -2204,6 +2252,14 @@ sub _compile_related_collection_at {
             unless ref($filter) eq 'ARRAY' && @$filter == 2
             && defined($filter->[0]) && !ref($filter->[0])
             && exists($association_fields->{$filter->[0]});
+        my $path="$association_name.$filter->[0]";
+        my $type=$domain->resolve($path)->{type};
+        if ($type =~ /\A(?:jsonb?|array)\z/ && defined($filter->[1])) {
+            local $self->{_join_aliases}={%{$self->{_join_aliases}//{}},$association_name=>$alias};
+            push @predicates,$self->_compile_structured_compare($domain,Selecto::Expression->structured_compare($path,'eq',$filter->[1]),$params);
+            next;
+        }
+        Selecto::Error->throw('invalid_query','related collection scalar filter must be a literal') if ref($filter->[1]) && !JSON::PP::is_bool($filter->[1]);
         push @predicates, $self->_identity_values_sql($self->_qualified($alias, $filter->[0]), [$filter->[1]], $params,
             defined($filter->[1]) && !ref($filter->[1])
                 && $self->_identity_field_exact($domain, "$association_name.$filter->[0]"));
@@ -2279,6 +2335,23 @@ sub _compile_related_collection_at {
                 $params, $alias, $parent_identity, \@stable_orders, $options->{after}
             );
         }
+        # The bounded source must not read private physical columns merely
+        # because they share a relation with the requested projection. Keep
+        # only selectors, sort keys and parent keys needed by nested children.
+        my %needed=map {$_->[0]=>1} @stable_orders;
+        for my $field (@$fields) {
+            if (!ref($field)) {$needed{$field}=1;next;}
+            my $expr=$field->{expression};
+            if ($expr->kind eq 'related_rows' || $expr->kind eq 'related_collection') {
+                my $nested=$domain->resolve_association($expr->arguments->[0])->{association};
+                $needed{$_}=1 for grep {defined($_)} ($nested->owner_key,$nested->source_scope_key,$nested->source_tenant_field);
+            } else {
+                for my $path ($self->_expression_field_paths($expr)) {
+                    my $r=$domain->resolve($path);
+                    $needed{$r->{field}}=1 if ($r->{association_path}//'') eq $association_name;
+                }
+            }
+        }
         ($from, $where, $limit) = $self->_bounded_related_collection_source(
             $from, $where, $order, int($limit), $quoted_alias);
     }
@@ -2296,8 +2369,10 @@ sub _compile_related_collection_at {
 # source, predicate and a limit the aggregate itself must still apply (undef
 # when the source already applies it).
 sub _bounded_related_collection_source {
-    my ($self, $from, $where, $order, $limit, $quoted_alias) = @_;
-    return ('(SELECT ' . $quoted_alias . '.* FROM ' . $from .
+    my ($self, $from, $where, $order, $limit, $quoted_alias, $fields) = @_;
+    my $projection=ref($fields) eq 'ARRAY' && @$fields
+        ? join(', ',map {$quoted_alias.'.'.$self->quote_identifier($_)} @$fields) : $quoted_alias.'.*';
+    return ('(SELECT ' . $projection . ' FROM ' . $from .
         ' WHERE ' . $where . ' ORDER BY ' . $order .
         ' LIMIT ' . int($limit) . ') AS ' . $quoted_alias, 'TRUE', undef);
 }
@@ -2709,7 +2784,7 @@ sub _expression_associations {
     my ($self, $expression, $domain) = @_;
     return () unless blessed($expression) && $expression->isa('Selecto::Expression');
     my $arguments = $expression->arguments;
-    return () if $expression->kind eq 'related_collection';
+    return () if $expression->kind eq 'related_collection' || $expression->kind eq 'related_rows';
     if ($expression->kind eq 'value') {
         require Selecto::ValueExpression;
         return map { $self->_expression_associations(Selecto::Expression->field($_)) }
@@ -3088,6 +3163,12 @@ sub _constant_join_predicates {
     my @predicates;
     for my $field (sort keys %$where) {
         my $column = $self->_qualified($alias, $field);
+        if (ref($where->{$field}) eq 'ARRAY') {
+            my $v=$where->{$field};
+            Selecto::Error->throw('invalid_query','association inequality is invalid') unless @$v==2 && $v->[0] eq 'ne' && ref($v->[1]) eq 'ARRAY' && @{$v->[1]}==2 && $v->[1][0] eq 'field';
+            push @predicates,$column.' <> '.$self->_qualified($alias,$v->[1][1]);
+            next;
+        }
         if (!defined($where->{$field})) {
             push @predicates, "$column IS NULL";
             next;

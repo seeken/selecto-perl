@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 0.2.3  Unreleased
+    - Added governed trim, structured JSON/array comparisons and related_rows
+      expressions for bounded read consumers. SQLite streams retain their
+      query_only guard until the last active stream closes or fails. New row
+      expressions participate in field-reference inspection and remain outside
+      the older bounded-result and rollup projection profiles.
+    - Added typed nested child filters, NULL structured comparison,
+      association inequality predicates and prepare_read_values (stable date
+      and interval text inside a read transaction).
     Before deploying:
     - PostgreSQL: Selecto's statements run in the host's session and resolve names as
       the host's own queries do. Check that every connection's search_path names the

@@ -42,6 +42,8 @@ sub prepare {
     while (@scan) {
         my $node = pop @scan;
         next unless ref($node);
+        Selecto::Error->throw('unsupported_feature', 'related rows require a separately bounded profile')
+            if blessed($node) && $node->isa('Selecto::Expression') && $node->kind eq 'related_rows';
         Selecto::Error->throw('unsupported_feature', 'nested collection expressions require a bounded profile')
             if blessed($node) && $node->isa('Selecto::Expression')
                 && $node->kind eq 'related_collection' && !$top{refaddr($node)};

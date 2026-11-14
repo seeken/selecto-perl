@@ -111,6 +111,17 @@ sub _with_relations {
     return $derived;
 }
 
+# Text-driver consumers that build a typed JSON representation need stable
+# server date/interval text. Keep these changes local to an existing host read
+# transaction, so rollback restores even deliberately non-default sessions.
+sub prepare_read_values {
+    my ($self)=@_;
+    Selecto::Error->throw('invalid_transaction','read value formats require an open transaction') unless $self->_transaction_open;
+    $self->dbh->do(q{SET LOCAL DateStyle TO 'ISO, YMD'});
+    $self->dbh->do(q{SET LOCAL IntervalStyle TO 'postgres'});
+    return $self;
+}
+
 sub stream_query {
     my ($self, $statement, %options) = @_;
     unless ($options{bounded}) {
