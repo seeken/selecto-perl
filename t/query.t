@@ -384,7 +384,7 @@ my $line_limited_statement = $line_engine->compile(
     )
 );
 like $line_limited_statement->sql,
-    qr{FROM \(SELECT "c_lines"\.\* FROM "invoice_lines" AS "c_lines" WHERE "c_lines"\."invoice_id" = "s0"\."id" ORDER BY "c_lines"\."id" ASC LIMIT 2\) AS "c_lines"},
+    qr{FROM \(SELECT "c_lines"\."id", "c_lines"\."sku" FROM "invoice_lines" AS "c_lines" WHERE "c_lines"\."invoice_id" = "s0"\."id" ORDER BY "c_lines"\."id" ASC LIMIT 2\) AS "c_lines"},
     'per-parent limit selects ordered child rows before JSON aggregation';
 my $line_tie_statement = $line_engine->compile(
     $line_engine->query->select(

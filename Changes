@@ -6,6 +6,13 @@ Revision history for Selecto
       query_only guard until the last active stream closes or fails. New row
       expressions participate in field-reference inspection and remain outside
       the older bounded-result and rollup projection profiles.
+    - Changed SQL: a related-collection subquery (related_collection and
+      related_rows) now selects only the columns the request needs (the
+      requested fields, sort keys and the keys of nested children) instead of
+      alias.*. With column-level grants, a role that may not read every column
+      of the related table was refused the whole query; it now reads only the
+      permitted columns it asked for. Results are unchanged; emitted SQL text
+      for these subqueries differs from earlier releases.
     - Added typed nested child filters, NULL structured comparison,
       association inequality predicates and prepare_read_values (stable date
       and interval text inside a read transaction).
