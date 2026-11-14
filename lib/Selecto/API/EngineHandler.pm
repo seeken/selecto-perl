@@ -622,6 +622,14 @@ sub _query ($self, $engine, $body, %options) {
                 'invalid_api_query', 'order_by direction must be asc or desc',
             ) unless $direction eq 'asc' || $direction eq 'desc';
             _visible_field_definition($domain, $field, 'sort');
+            # explorer_extensions: nulls sort first ascending and last
+            # descending on every database (a 0/1 null rank in the entry's
+            # direction); the primary key is never null.
+            my $key = $domain->primary_key;
+            $query = $query->order_by(Selecto::Expression->value(['case',
+                [['is_null', $field], ['literal', 0, 'integer']], ['else', ['literal', 1, 'integer']]],
+                limits => $self->limits), $direction)
+                if $self->explorer_extensions && !(defined($key) && !ref($key) && $key eq $field);
             $query = $query->order_by($field, $direction);
         }
     }
@@ -1957,7 +1965,8 @@ C<group_by> entries may be objects with an C<alias> and one of C<format> (a
 L<Selecto::DateFormat>), C<< ranges => [{where, label}, ...] >> (first match,
 else C<Other>) or C<step> with C<kind> C<numeric> or C<year>; C<select> takes
 C<< {group => $alias} >> for them. Filter leaves may be
-C<< {field, format, op => 'eq'|'is_null', value} >>. With the trusted C<today>
+C<< {field, format, op => 'eq'|'is_null', value} >>. Every C<order_by> entry sorts
+nulls first ascending and last descending, whatever the database. With the trusted C<today>
 (an ISO date) C<date_shortcut> binds literal bounds; with
 C<explorer_timezone>, instants are formatted, grouped and shortcut in that
 zone.

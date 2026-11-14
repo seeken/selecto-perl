@@ -51,7 +51,7 @@ my %AGGREGATES = map { ($_ => 1) } qw(count count_distinct sum avg min max true_
     true_percentage bucket_count);
 my %ERROR_STATUS = (malformed_request => 400, unsupported_protocol_version => 400,
     unsupported_media_type => 415, stale_domain_fingerprint => 409, stale_explorer_features => 409,
-    operation_forbidden => 403, operation_unsupported => 501, hidden_field => 403,
+    operation_forbidden => 403, missing_tenant_scope => 403, operation_unsupported => 501, hidden_field => 403,
     invalid_field => 422, invalid_query => 422, result_limit_exceeded => 422,
     count_unavailable => 422, export_limit_exceeded => 422, response_format_not_acceptable => 406,
     query_timeout => 504);
@@ -60,7 +60,7 @@ my %ERROR_CODE = (field_not_public => 'hidden_field', unknown_field => 'invalid_
     invalid_query_library => 'invalid_query', unknown_query_library_definition => 'invalid_query',
     query_library_cycle => 'invalid_query', invalid_value_expression => 'invalid_query',
     query_rule_not_evaluable => 'invalid_query', unsupported_feature => 'operation_unsupported',
-    missing_tenant_scope => 'operation_forbidden', tenant_scope_required => 'operation_forbidden',
+    tenant_scope_required => 'missing_tenant_scope',
     tenant_mismatch => 'operation_forbidden', related_collection_limit_exceeded => 'result_limit_exceeded',
     api_result_limit_exceeded => 'result_limit_exceeded');
 my $ALIAS = qr/\A[A-Za-z_][A-Za-z0-9_]{0,62}\z/;
@@ -297,7 +297,12 @@ sub _public_field ($entry) {
 
 sub _query_response ($self, $engine, $request) {
     my $body = $request->{body};
-    # 1. Envelope.
+    # 1. Media type, before the body is read: application/json, with at most
+    # a utf-8 charset parameter.
+    my $type = $request->{content_type};
+    _reject('unsupported_media_type') unless _string($type)
+        && $type =~ m{\A\s*application/json\s*(?:;\s*charset\s*=\s*"?utf-8"?\s*)?\z}i;
+    # 2. Envelope.
     _reject('malformed_request') unless ref($body) eq 'HASH';
     my %envelope = map { ($_ => 1) } qw(format format_version domain features request_id query);
     _reject('malformed_request') if grep { !$envelope{$_} } keys %$body;
@@ -311,9 +316,6 @@ sub _query_response ($self, $engine, $request) {
     _reject('malformed_request') if exists($body->{request_id}) && !_request_id($body->{request_id});
     _reject('malformed_request') unless exists $body->{query};
     _reject('unsupported_protocol_version') unless _integer($body->{format_version}) && $body->{format_version} == 1;
-    # 2. Media type.
-    my $type = $request->{content_type} // '';
-    _reject('unsupported_media_type') unless !ref($type) && $type =~ m{\Aapplication/json(?:\s*;[^\r\n]*)?\z}i;
     # 3-4. Bindings.
     _reject('stale_domain_fingerprint') unless $body->{domain}{fingerprint} eq _fingerprint($engine);
     my $features = $self->features($engine);
@@ -328,9 +330,11 @@ sub _query_response ($self, $engine, $request) {
     _reject('invalid_query') unless ref($query) eq 'HASH';
     my $context = {engine => $engine, supports => $self->_supports($engine), features => $features,
         catalogue => $self->_catalogue($engine->domain, $self->_supports($engine)), limits => $self->limits};
-    # 6. supports, 7. the field pre-pass, then shape and limits.
+    # 6. Member supports, 7. the field pre-pass, 8. instant conversions on a
+    # UTC-only host (they need the field types), then shape and limits.
     $self->_check_supports($context, $query);
     $self->_field_prepass($context, $query);
+    $self->_check_conversions($context, $query);
     my $plan = $self->_plan($context, $query);
     my $format;
     if ($plan->{export}) {
@@ -446,6 +450,40 @@ sub _field_prepass ($self, $context, $query) {
     for my $order (ref($query->{order_by}) eq 'ARRAY' ? @{$query->{order_by}} : ()) {
         next unless ref($order) eq 'HASH' && _string($order->{field});
         $visit->($order->{field}) unless $aliases{$order->{field}};
+    }
+    return;
+}
+
+# ---- instant conversions on a UTC-only host (501) ----
+
+sub _check_conversions ($self, $context, $query) {
+    return unless $context->{supports}{timezones} eq 'utc';
+    my $zone = exists($query->{timezone}) ? $query->{timezone} : 'UTC';
+    return unless _string($zone) && $zone ne 'UTC' && DateTime::TimeZone->is_valid_name($zone);
+    my $catalogue = $context->{catalogue}{by_path};
+    my $instant = sub ($path) { _string($path) && $catalogue->{$path} && $catalogue->{$path}{type} eq 'utc_datetime' };
+    my $refuse = sub ($path) { _reject('operation_unsupported') if $instant->($path) };
+    for my $entry (ref($query->{select}) eq 'ARRAY' ? @{$query->{select}} : ()) {
+        next unless ref($entry) eq 'HASH';
+        $refuse->($entry->{field}) if exists($entry->{format}) && !exists($entry->{aggregate});
+        $refuse->($entry->{field}) if _string($entry->{aggregate}) && $entry->{aggregate} eq 'bucket_count'
+            && ref($entry->{buckets}) eq 'HASH' && ($entry->{buckets}{kind} // '') ne 'numeric';
+    }
+    for my $entry (ref($query->{group_by}) eq 'ARRAY' ? @{$query->{group_by}} : ()) {
+        next unless ref($entry) eq 'HASH';
+        $refuse->($entry->{field}) if exists($entry->{format})
+            || (ref($entry->{buckets}) eq 'HASH' && ($entry->{buckets}{kind} // '') ne 'numeric');
+    }
+    my @nodes = ref($query->{filters}) eq 'ARRAY' ? @{$query->{filters}} : ();
+    while (@nodes) {
+        my $node = shift @nodes;
+        next unless ref($node) eq 'HASH';
+        if (_is_group($node)) {
+            push @nodes, @{$node->{any} // $node->{all}} if ref($node->{any} // $node->{all}) eq 'ARRAY';
+            next;
+        }
+        $refuse->($node->{field}) if exists($node->{format})
+            || (_string($node->{op}) && $node->{op} eq 'date_shortcut');
     }
     return;
 }
@@ -921,7 +959,7 @@ sub _filter_value ($field, $value) {
 sub _handler ($self, $plan) {
     my $limits = $self->limits;
     my $rows = max($limits->{max_limit}, $limits->{max_groups} + 1, $limits->{max_count_rows} + 1,
-        $limits->{max_export_rows} + 1);
+        $limits->{max_export_rows} + 1, 10_000);
     my $engine_limits = $self->engine_limits->tightened(max_collection_rows => 0 + $self->collection_limit);
     return Selecto::API::EngineHandler->new(
         filter_groups => 1, aggregate_selections => 1, explorer_extensions => 1,
@@ -1048,30 +1086,27 @@ sub _execute_summary ($self, $handler, $engine, $plan) {
         total_count => $plan->{count} eq 'exact' ? 1 : undef};
 }
 
-# Year steps over instants become ranges, one per step between the zone
-# years of the matching rows' earliest and latest instants.
+# Year steps over instants become ranges, one per non-empty step: the
+# distinct years (in the request zone) of the matching rows, at most 9999,
+# give the step starts, so a wide sparse span costs nothing.
 sub _resolve_instant_steps ($self, $handler, $engine, $plan) {
     for my $group (grep { $_->{kind} eq 'bucket' && $_->{bucket}{step} && $_->{bucket}{kind} eq 'year'
             && $_->{field}{type} eq 'utc_datetime' } @{$plan->{groups}}) {
         my $path = $group->{field}{path};
-        my $result = $handler->query($engine, {select => [
-            {aggregate => 'min', field => $path, alias => 'low'}, {aggregate => 'max', field => $path, alias => 'high'},
-        ], $self->_base_body($plan), limit => 1});
-        my ($low, $high) = map { _wire($_, 'utc_datetime') } @{$result->{rows}[0] // []};
+        my $result = $handler->query($engine, {select => [{group => 'y'}],
+            group_by => [{field => $path, alias => 'y', format => 'year'}],
+            $self->_base_body($plan), limit => 10_000});
         my $step = $group->{bucket}{step};
-        my @ranges;
-        if (defined($low) && defined($high)) {
-            my ($first, $last) = map {
-                DateTime->from_epoch(epoch => _instant_epoch($_), time_zone => $plan->{zone})->year
-            } $low, $high;
-            my $start = _floor_div($first, $step) * $step;
-            while ($start <= $last) {
-                _reject('result_limit_exceeded') if @ranges > $self->limits->{max_groups};
-                push @ranges, {label => $start . '-' . ($start + $step - 1), start => $start,
-                    where => $self->_range_bounds($plan, $group->{field}, 'year', $start, $start + $step - 1)};
-                $start += $step;
-            }
+        my %starts;
+        for my $row (@{$result->{rows}}) {
+            next unless defined($row->[0]) && $row->[0] =~ /\A[0-9]{1,4}\z/;
+            $starts{_floor_div(0 + $row->[0], $step) * $step} = 1;
         }
+        _reject('result_limit_exceeded') if keys(%starts) > $self->limits->{max_groups};
+        my @ranges = map {
+            {label => $_ . '-' . ($_ + $step - 1), start => $_,
+                where => $self->_range_bounds($plan, $group->{field}, 'year', $_, $_ + $step - 1)}
+        } sort { $a <=> $b } keys %starts;
         @ranges = ({label => 'Other', start => 0, where => [['lt', '0001-01-01T00:00:00Z']]}) unless @ranges;
         $group->{bucket} = {kind => 'year', step => $step, ranges => \@ranges, instant_steps => 1};
     }
@@ -1438,10 +1473,14 @@ canonical JSON without the revision.
 =item C<POST base_path/explorer-query>
 
 A C<selecto.explorer-query> v1 request. Refusals follow the profile's order,
-all before SQL: envelope (400), media type (415), domain fingerprint and
-features revision (409), trusted tenant scope (403 C<operation_forbidden>),
-C<supports> (501), the field pre-pass (403 C<hidden_field> before 422
-C<invalid_field>), then shape and limits (422). Results carry typed columns,
+all before SQL: media type (415, also for no Content-Type), envelope (400
+C<malformed_request>, then C<unsupported_protocol_version>), domain
+fingerprint and features revision (409), trusted tenant scope (403
+C<missing_tenant_scope>), member C<supports> (501), the field pre-pass (403
+C<hidden_field> or 422 C<invalid_field>, first reference first), a UTC-only
+host's instant conversions (501), then shape and limits (422). Detail rows
+sort nulls first ascending and last descending; rollup rows are paged
+together; step buckets are bounded only by C<max_groups>. Results carry typed columns,
 C<row_meta> drilldowns for grouped rows, bounded exact counts and C<complete>
 grids; C<export> returns CSV, TSV, JSON or XLSX of the whole result.
 

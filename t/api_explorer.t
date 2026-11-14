@@ -195,12 +195,22 @@ subtest 'export' => sub {
 subtest 'refusal order' => sub {
     is refusal({select => ['id']}, body => []), '400 malformed_request';
     is refusal({select => ['id']}, content_type => 'text/plain'), '415 unsupported_media_type';
+    is refusal(undef, content_type => 'text/plain', body => []), '415 unsupported_media_type', 'media type before envelope';
+    is refusal({select => ['id']}, content_type => 'application/json; charset=utf-8') =~ s/ //r, '200', 'charset is allowed';
+    is_deeply rows({select => ['id', 'hours'], order_by => [{field => 'hours', direction => 'asc'}]}),
+        [[3, undef], [1, '1.5'], [2, '2.25']], 'detail nulls first ascending';
+    is_deeply rows({select => ['id', 'done'], order_by => [{field => 'done', direction => 'desc'}], limit => 4}),
+        [[1, $t], [3, $t], [2, $f], [4, undef]], 'detail nulls last descending';
+    my (undef, $paged) = post({group_by => ['state', 'done'], select => ['state', 'done', {aggregate => 'count', alias => 'n'}],
+        rollup => $t, limit => 2, offset => 2});
+    is_deeply [map { $_->{kind} } @{$paged->{data}{row_meta}}], [qw(subtotal detail)], 'rollup rows are paged together';
+    is $paged->{data}{page}{has_more}, $t;
     is refusal(undef, body => {format => 'selecto.explorer-query', format_version => 1, domain => {fingerprint => 'sha256:old'},
         query => {select => ['id']}}), '409 stale_domain_fingerprint';
     is refusal(undef, body => {format => 'selecto.explorer-query', format_version => 1,
         domain => {fingerprint => $features->{domain}{fingerprint}}, features => {revision => 'sha256:old'},
         query => {select => ['id']}}), '409 stale_explorer_features';
-    is refusal({select => ['note']}, engine => $unscoped), '403 operation_forbidden', 'tenant scope before fields';
+    is refusal({select => ['note']}, engine => $unscoped), '403 missing_tenant_scope', 'tenant scope before fields';
     is refusal({select => ['id', 'note', 'id'], limit => 99}), '403 hidden_field', 'withheld before shape';
     is refusal({select => ['id'], filters => [{any => [{field => 'state', op => 'eq', value => 'x'},
         {field => 'note', op => 'eq', value => 'n1'}]}]}), '403 hidden_field', 'withheld inside any';
