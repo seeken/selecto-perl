@@ -54,7 +54,7 @@ my %ERROR_STATUS = (malformed_request => 400, unsupported_protocol_version => 40
     operation_forbidden => 403, missing_tenant_scope => 403, operation_unsupported => 501, hidden_field => 403,
     invalid_field => 422, invalid_query => 422, result_limit_exceeded => 422,
     count_unavailable => 422, export_limit_exceeded => 422, response_format_not_acceptable => 406,
-    query_timeout => 504);
+    export_busy => 429, query_timeout => 504);
 my %ERROR_CODE = (field_not_public => 'hidden_field', unknown_field => 'invalid_field',
     unknown_association => 'invalid_field', invalid_api_query => 'invalid_query',
     invalid_query_library => 'invalid_query', unknown_query_library_definition => 'invalid_query',
@@ -76,6 +76,14 @@ has supports => sub { +{} };
 has services => sub { +{} };
 has links => sub { +{} };
 has publish_domain => 0;
+# Optional host callback around an accepted export (after every refusal the
+# profile orders before execution, including the export format's 406/501):
+# $guard->($format, $run). $run->() executes the export and encodes it, and
+# returns the response it produced, the file or the export's own refusal
+# (422 export_limit_exceeded, 504, ...), so the guard sees the real outcome.
+# The guard returns that response; returning anything else without running
+# refuses with 429 export_busy. Without a guard, exports run as before.
+has export_guard => undef;
 # Trusted engine limits (Selecto::Limits) for the handler and the
 # remote_query.v1 routes.
 has engine_limits => sub { Selecto::Limits->new };
@@ -121,6 +129,8 @@ sub new ($class, @args) {
     }
     _host_error('services must be an object') unless ref($self->services) eq 'HASH';
     _host_error('links must be an object') unless ref($self->links) eq 'HASH';
+    _host_error('export_guard must be a code reference')
+        if defined($self->export_guard) && ref($self->export_guard) ne 'CODE';
     _host_error('engine_limits must be a Selecto::Limits')
         unless blessed($self->engine_limits) && $self->engine_limits->isa('Selecto::Limits');
     $self->{remote} = Selecto::API::RemoteQuery->new(base_path => $base,
@@ -342,6 +352,7 @@ sub _query_response ($self, $engine, $request) {
         _reject('response_format_not_acceptable') unless defined $format;
         _reject('operation_unsupported') unless grep { $_ eq $format } @{$context->{supports}{export}};
     }
+    return $self->_guarded_export($context, $plan, $format, $request) if $plan->{export} && $self->export_guard;
     my $result = $self->_execute($context, $plan);
     my $meta = exists($body->{request_id}) ? {request_id => $body->{request_id}} : undef;
     return $self->_export_response($plan, $result, $format) if $plan->{export};
@@ -1249,6 +1260,17 @@ sub _compare_value ($x, $y, $type) {
 
 # ---- export ----
 
+# The accepted export run inside the host's export_guard.
+sub _guarded_export ($self, $context, $plan, $format, $request) {
+    my $run = sub {
+        my $response = eval { $self->_export_response($plan, $self->_execute($context, $plan), $format) };
+        return $response // $self->_error_response($@, $request);
+    };
+    my $response = $self->export_guard->($format, $run);
+    _reject('export_busy') unless ref($response) eq 'HASH' && defined $response->{status};
+    return $response;
+}
+
 sub _export_response ($self, $plan, $result, $format) {
     my ($columns, $rows) = ([map { $_->{id} } @{$plan->{columns}}], $result->{rows});
     $rows = [map { ref($_) eq 'HASH' ? [my @r = @$_{@$columns}] : $_ } @$rows];
@@ -1507,6 +1529,20 @@ C<limits> (the profile's fourteen limits), C<supports> (flag overrides and
 C<export>), C<services>, C<links>, C<publish_domain> and C<engine_limits> (a
 L<Selecto::Limits>) are optional. Invalid configuration throws
 C<invalid_api_host>.
+
+C<supports.export> lists the export formats; C<[]> refuses every export with
+501 C<operation_unsupported> among the member C<supports> checks, and a format
+the list omits is refused with 501 after the shape checks, before the query
+runs. A host that grants export per actor passes that actor's formats here.
+
+C<export_guard> is an optional code reference that wraps an accepted export,
+for example to hold a concurrency slot and audit the result. It is called as
+C<< $guard->($format, $run) >> after every refusal above, before the query
+runs. C<< $run->() >> executes and encodes the export and returns the
+response it produced: the file, or the export's own refusal such as 422
+C<export_limit_exceeded>. The guard returns that response. Returning anything
+else without calling C<$run> refuses with 429 C<export_busy>. Without a guard
+an export runs exactly as before.
 
 =head1 SEE ALSO
 

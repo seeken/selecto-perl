@@ -192,6 +192,51 @@ subtest 'export' => sub {
     is refusal({select => ['id'], export => {all_rows => $t}}, accept => 'application/pdf'), '406 response_format_not_acceptable';
 };
 
+subtest 'export guard' => sub {
+    my $query = {select => ['id'], order_by => [{field => 'id'}], export => {all_rows => $t, shape => 'rows'}};
+    my $send = sub {
+        my ($host, $q, %options) = @_;
+        my $response = $host->request($options{engine} // $engine, {method => 'POST', path => '/x/tasks/explorer-query',
+            content_type => exists($options{content_type}) ? $options{content_type} : 'application/json',
+            accept => exists($options{accept}) ? $options{accept} : 'text/csv',
+            body => $options{body} // {format => 'selecto.explorer-query', format_version => 1,
+                domain => {fingerprint => $features->{domain}{fingerprint}}, request_id => 'r1', query => $q}});
+        my $code = ($response->{content_type} // '') =~ m{json} ? ($json->decode($response->{body})->{error}{code} // '') : '';
+        return "$response->{status} $code" =~ s/ \z//r;
+    };
+    my @calls;
+    my $guarded = Selecto::API::Explorer->new(%host, export_guard => sub {
+        my ($format, $run) = @_;
+        my $response = $run->();
+        push @calls, [$format, $response->{status}];
+        return $response;
+    });
+    is $send->($guarded, $query), '200', 'a guard that runs returns the file';
+    is_deeply \@calls, [['csv', 200]], 'the guard sees the format and the outcome';
+    @calls = ();
+    is $send->($guarded, {select => ['id'], export => {all_rows => $t}}, engine => $unscoped), '403 missing_tenant_scope';
+    is $send->($guarded, $query, content_type => undef), '415 unsupported_media_type';
+    is $send->($guarded, $query, body => {format => 'selecto.explorer-query', format_version => 1,
+        domain => {fingerprint => 'sha256:old'}, query => $query}), '409 stale_domain_fingerprint';
+    is $send->($guarded, {select => ['note'], export => {all_rows => $t}}), '403 hidden_field';
+    is $send->($guarded, {select => ['id'], export => {all_rows => $t}}, accept => 'application/pdf'), '406 response_format_not_acceptable';
+    is_deeply \@calls, [], 'refusals come before the guard';
+    my $limited = Selecto::API::Explorer->new(%host, limits => {%{$host{limits}}, max_export_rows => 2},
+        export_guard => sub { my ($format, $run) = @_; my $r = $run->(); push @calls, [$format, $r->{status}]; $r });
+    is $send->($limited, $query), '422 export_limit_exceeded', 'the export refusal is the response';
+    is_deeply \@calls, [['csv', 422]], 'the guard sees the refusal';
+    my $busy = Selecto::API::Explorer->new(%host, export_guard => sub { undef });
+    is $send->($busy, $query), '429 export_busy', 'a guard that does not run refuses busy';
+    is $send->($busy, {select => ['note'], export => {all_rows => $t}}), '403 hidden_field', 'validation before busy';
+    is $send->($busy, {select => ['id'], limit => 1}, accept => undef), '200', 'non-export queries skip the guard';
+    my $none = Selecto::API::Explorer->new(%host, supports => {export => []}, export_guard => sub { die 'not reached' });
+    is $send->($none, $query), '501 operation_unsupported', 'no formats: 501 before the guard';
+    is $send->($none, {select => ['note'], export => {all_rows => $t}}), '501 operation_unsupported', '501 before the field pre-pass';
+    my $json_only = Selecto::API::Explorer->new(%host, supports => {export => ['json']}, export_guard => sub { die 'not reached' });
+    is $send->($json_only, $query), '501 operation_unsupported', 'an unlisted format: 501 before the guard';
+    ok !eval { Selecto::API::Explorer->new(%host, export_guard => 'x'); 1 }, 'export_guard must be code';
+};
+
 subtest 'refusal order' => sub {
     is refusal({select => ['id']}, body => []), '400 malformed_request';
     is refusal({select => ['id']}, content_type => 'text/plain'), '415 unsupported_media_type';
