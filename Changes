@@ -64,6 +64,12 @@ Revision history for Selecto
       formats, ranges and steps, {group} selections, derived-group filter
       leaves) and the trusted today and explorer_timezone attributes. Off by
       default; Selecto::API never enables them.
+    - Selecto::API::Explorer takes an optional export_guard code reference that
+      wraps an accepted export after every refusal and before the query runs:
+      $guard->($format, $run), where $run->() returns the file or the export's own
+      refusal. A guard that does not run refuses with 429 export_busy. Hosts use it
+      to hold export slots and audit the real outcome; without one, exports are
+      unchanged.
     - Selecto::DateShortcut->expression takes a timezone for instant operands
       (day_start_instant), and SQLite datetime formats accept a UTC timezone.
     - Selecto::API::Spa serves the Selecto SPA explorer protocol (selecto.spa.*/v1:
