@@ -62,7 +62,7 @@ sub _aggregates {
     if (blessed($node) && $node->isa('Selecto::Expression')) {
         my $kind = $node->kind;
         return 1 if $AGGREGATE{$kind};
-        return 0 if $kind eq 'window' || $kind eq 'related_collection';
+        return 0 if $kind eq 'window' || $kind eq 'related_collection' || $kind eq 'related_rows';
         return _aggregates($node->arguments);
     }
     return scalar grep { _aggregates($_) } @$node if ref($node) eq 'ARRAY';

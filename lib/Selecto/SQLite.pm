@@ -8,8 +8,11 @@ use POSIX qw(isfinite);
 use DBI qw(SQL_INTEGER SQL_DOUBLE SQL_VARCHAR);
 use Selecto::SQLite::Ownership ();
 use Cpanel::JSON::XS ();
+use Selecto::CanonicalJSON ();
 use JSON::PP ();
 use Selecto::SQL::RollupEmulation ();
+use Hash::Util::FieldHash ();
+Hash::Util::FieldHash::fieldhash(my %STREAM_QUERY_ONLY);
 
 
 sub ownership_storage {
@@ -414,9 +417,31 @@ sub _execute_statement {
 sub stream_query {
     my ($self, $statement, @options) = @_;
     $self->_query_transport_sql($statement);
-    my $stream = $self->_read_only(sub { $self->SUPER::stream_query($statement, @options) });
+    my $dbh = $self->dbh;
+    my $guard = $STREAM_QUERY_ONLY{$dbh};
+    unless ($guard) {
+        my ($prior) = $dbh->selectrow_array('PRAGMA query_only');
+        Selecto::Error->throw('query_error', 'SQLite read-only state is unavailable') unless defined $prior;
+        $dbh->do('PRAGMA query_only = ON') unless $prior;
+        $guard = $STREAM_QUERY_ONLY{$dbh} = {prior => $prior, count => 0};
+    }
+    ++$guard->{count};
+    my $stream = eval { $self->SUPER::stream_query($statement, @options) };
+    my $error = $@;
+    unless ($stream) { _release_stream_guard($dbh); die $error; }
     $stream->{sqlite_adapter} = $self;
+    $stream->{sqlite_query_guard} = 1;
     return bless $stream, 'Selecto::SQLite::Stream';
+}
+
+sub _release_stream_guard {
+    my ($dbh) = @_;
+    my $guard = $STREAM_QUERY_ONLY{$dbh} // return;
+    return if --$guard->{count} > 0;
+    delete $STREAM_QUERY_ONLY{$dbh};
+    return if $guard->{prior};
+    my $ok = eval { defined($dbh->do('PRAGMA query_only = OFF')) or die 'guard restoration failed'; 1 };
+    Selecto::Error->throw('query_error', 'SQLite read-only state could not be restored') unless $ok;
 }
 
 sub _compile_pagination {
@@ -477,6 +502,13 @@ sub _json_available {
             my $json = Cpanel::JSON::XS->new->allow_nonref(1)->allow_bignum(1)->allow_dupkeys(1);
             return 0 unless eval { $left = $json->decode($source); $right = $json->decode($needle); 1 };
             return _json_contains_value($left, $right) ? 1 : 0;
+        });
+        die 'SQLite JSON function registration failed' unless $registered;
+        $registered = $dbh->sqlite_create_function('selecto_json_equal', 2, sub {
+            my ($left,$right)=@_; return undef unless defined($left) && defined($right);
+            my $json=Cpanel::JSON::XS->new->canonical->allow_nonref;
+            my ($a,$b); return 0 unless eval {$a=$json->decode($left);$b=$json->decode($right);1};
+            return Selecto::CanonicalJSON->encode($a) eq Selecto::CanonicalJSON->encode($b) ? 1 : 0;
         });
         die 'SQLite JSON function registration failed' unless $registered;
         1;
@@ -1005,9 +1037,17 @@ use Mojo::Base 'Selecto::Stream';
 sub next {
     my ($self) = @_;
     return undef if $self->closed;
-    return $self->{sqlite_adapter}->_read_only(sub { $self->SUPER::next });
+    return $self->SUPER::next;
 }
 
+sub close {
+    my ($self) = @_;
+    return $self if $self->closed;
+    $self->SUPER::close;
+    Selecto::SQLite::_release_stream_guard($self->{sqlite_adapter}->dbh)
+        if delete $self->{sqlite_query_guard};
+    return $self;
+}
 
 1;
 

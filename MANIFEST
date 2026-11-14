@@ -433,3 +433,5 @@ t/fluent_edit_handles.integration.t
 t/fluent_write_builder.t
 docs/fluent-writes.md
 t/fluent_transaction.t
+t/read_lane_api.t
+t/read_lane_typed_children.t
