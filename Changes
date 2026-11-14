@@ -102,6 +102,14 @@ Revision history for Selecto
       x-selecto.fields (path, type, and label, description and unit when declared);
       internal and redacted fields are never listed.
 
+    - Selecto::API builds its manifest and OpenAPI document when first asked for
+      them, not in new: a query, write or resource request serves neither, and
+      building them (the public field list above all) was most of new's cost
+      (12 ms to 3 ms on mojo's Load API). A host's additions to them stay.
+      Selecto::Domain->published_fingerprint gives the contract's
+      domain_fingerprint without copying the contract, and the engine handler
+      reads required_selected without a copy.
+
     - PostgreSQL: a direct bounded read (Selecto::BoundedQuery, a result within one
       fetch batch in the host's transaction) takes four round trips, as documented,
       not five. Its read guard asked the server for the connection's state (pg_ping)

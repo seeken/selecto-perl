@@ -19,7 +19,12 @@ our $DEFAULT_PATH = '/api/v1/selecto';
 our $JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
 our $OPENAPI_CONTENT_TYPE = 'application/vnd.oai.openapi+json;version=3.1';
 
-has [qw(domain base_path manifest openapi)];
+has [qw(domain base_path)];
+# Built when first asked for: a query, write or resource request needs neither.
+has manifest => sub ($self) { _manifest($self->{_identity}, $self->base_path, $self->resources) };
+has openapi => sub ($self) {
+    _openapi($self->{_identity}, $self->base_path, $self->resources, _public_fields($self->{_source_domain}));
+};
 has limits => sub { Selecto::Limits->new };
 has debug_sql => 0;
 has publish_domain => 0;
@@ -49,13 +54,12 @@ sub new ($class, @args) {
     ) unless defined $contract;
 
     my $base_path = _normalize_base_path($self->base_path // $DEFAULT_PATH);
-    my $identity = _domain_identity($contract);
-    my $fields = _public_fields($domain);
+    $self->{_identity} = _domain_identity($contract);
+    $self->{_source_domain} = $domain;
     canonical_json($contract);
     $self->domain($contract);
     $self->base_path($base_path);
-    $self->manifest(_manifest($identity, $base_path, $self->resources));
-    $self->openapi(_openapi($identity, $base_path, $self->resources, $fields));
+    delete @{$self}{qw(manifest openapi)};   # (always generated, from the domain)
     return $self;
 }
 
@@ -755,7 +759,9 @@ basename of at most 160 characters ending in the format's extension.
 =head2 openapi_document, manifest
 
 The generated OpenAPI document and the API manifest (domain identity and
-route list). The document's C<x-selecto.fields> lists the public fields a query
+route list), built from the domain the first time each is asked for, so a
+request that serves neither (a query, write or resource) does not pay for
+them. A host that adds to them changes the copy this object then keeps. The document's C<x-selecto.fields> lists the public fields a query
 may name, root fields and one association hop, by path: each C<path> and
 C<type>, and the column's C<label>, C<description> and C<unit> when it has
 them. Internal and redacted fields are never listed, so a governed domain
