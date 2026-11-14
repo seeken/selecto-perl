@@ -2653,6 +2653,11 @@ sub tenant_required { return $_[0]->{tenant_required} // 0; }
 sub contract     { return defined($_[0]->{contract}) ? _clone_with_rules($_[0]->{contract}) : undef; }
 # The contract itself, for library code that only reads it; never modify it.
 sub _contract_view { return $_[0]->{contract}; }
+# The domain_fingerprint its contract publishes (Selecto::API's identity), or undef.
+sub published_fingerprint {
+    my $contract = $_[0]->{contract};
+    return ref($contract) eq 'HASH' ? $contract->{domain_fingerprint} : undef;
+}
 sub retarget_config {
     my ($self) = @_;
     my $contract = $self->{contract};
@@ -3411,6 +3416,9 @@ C<name>, C<table>, C<primary_key>, C<tenant_field>, C<fingerprint>,
 C<required_predicate>, C<fields> (hash of field name to type),
 C<associations> (hash of name to L</Selecto::Domain::Association>),
 C<contract> (a copy, or C<undef>), C<rules>, C<write_tenant_scope>.
+C<published_fingerprint> is the C<domain_fingerprint> the contract carries
+(the identity L<Selecto::API> publishes), or C<undef>, without copying the
+contract.
 
 Copies of contract sections: C<writes>, C<actions>, C<capabilities>,
 C<imports>, C<editors>, C<detail_actions>, C<components>, C<query_library>,

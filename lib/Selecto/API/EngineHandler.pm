@@ -507,7 +507,7 @@ sub _query ($self, $engine, $body, %options) {
         # Validate caller intent before composing host-mandated output fields.
         _api_selections($domain, $body->{select}, $self->max_fields, $self->limits, $engine->adapter,
             $self->_selection_options);
-        my @required = @{($domain->contract // {})->{required_selected} // []};
+        my @required = @{($domain->_contract_view // {})->{required_selected} // []};
         my %required = map { $_ => 1 } @required;
         my $field_identity = sub {
             my ($entry) = @_;
