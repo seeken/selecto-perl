@@ -1761,6 +1761,17 @@ sub _selection_name {
 }
 
 # Escapes LIKE wildcards with '!', the ESCAPE character every dialect declares.
+# A literal starts_with/text_contains/ends_with test (and their _ci forms) of
+# compiled field SQL; LIKE wildcards in the text are escaped. Dialects whose
+# LIKE ignores case override the plain forms.
+sub _compile_text_match {
+    my ($self, $kind, $field_sql, $text, $params) = @_;
+    $text = $self->_escape_like($text);
+    push @$params, $kind =~ /\Atext_contains/ ? "%$text%"
+        : $kind =~ /\Aends_with/ ? "%$text" : "$text%";
+    return $self->_like_sql($field_sql, $self->placeholder(scalar @$params), $kind =~ /_ci\z/ ? 1 : 0);
+}
+
 sub _escape_like {
     my ($self, $text) = @_;
     $text =~ s/([!%_])/!$1/g;
@@ -1815,11 +1826,8 @@ sub _compile_expression {
         my $text = $literal->arguments->[0];
         Selecto::Error->throw('invalid_query', "$kind requires a literal string value")
             if !defined($text) || ref($text);
-        $text = $self->_escape_like($text);
         my $field_sql = $self->_compile_expression($domain, $arguments->[0], $params);
-        push @$params, $kind =~ /\Atext_contains/ ? "%$text%"
-            : $kind =~ /\Aends_with/ ? "%$text" : "$text%";
-        return $self->_like_sql($field_sql, $self->placeholder(scalar @$params), $kind =~ /_ci\z/ ? 1 : 0);
+        return $self->_compile_text_match($kind, $field_sql, $text, $params);
     }
     if ($kind eq 'between') {
         my $value = $self->_compile_expression($domain, $arguments->[0], $params);

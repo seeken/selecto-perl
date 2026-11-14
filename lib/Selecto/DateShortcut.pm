@@ -129,22 +129,48 @@ sub plan {
 # Without today, the database compares against its own current date, so the
 # session's time zone decides when a day begins. A given today (an ISO date)
 # is bound as literal dates instead.
+#
+# With timezone (an IANA name) the operand is an instant: range bounds are
+# the instants at which their days begin in that zone (RFC 3339, UTC), and
+# recurring shortcuts read the operand's month and day in that zone.
 sub expression {
-    my ($class, $operand, $shortcut, $today) = @_;
+    my ($class, $operand, $shortcut, $today, %options) = @_;
     return Selecto::Expression->date_shortcut($operand, $shortcut)
         unless defined $today;
     my $plan = $class->plan($shortcut, $today);
+    my $timezone = $options{timezone};
     if ($plan->{kind} eq 'range') {
+        my @bounds = map { defined($timezone) ? $class->day_start_instant($_, $timezone) : $_ }
+            $plan->{start}, $plan->{end};
         return Selecto::Expression->all([
-            Selecto::Expression->gte($operand, $plan->{start}),
-            Selecto::Expression->lt($operand, $plan->{end}),
+            Selecto::Expression->gte($operand, $bounds[0]),
+            Selecto::Expression->lt($operand, $bounds[1]),
         ]);
     }
-    my $month_day = Selecto::Expression->datetime_format($operand, 'month_day');
+    my $month_day = Selecto::Expression->datetime_format($operand, 'month_day',
+        (defined($timezone) ? (timezone => $timezone) : ()));
     return Selecto::Expression->all([
         Selecto::Expression->gte($month_day, $plan->{start}),
         Selecto::Expression->lte($month_day, $plan->{end}),
     ]);
+}
+
+# The instant (RFC 3339 in UTC) at which an ISO date begins in an IANA zone.
+sub day_start_instant {
+    my ($class, $date, $timezone) = @_;
+    die "date must be an ISO date\n" unless $class->valid_date($date);
+    require DateTime;
+    my ($year, $month, $day) = "$date" =~ /\A(\d{4})-(\d{2})-(\d{2})\z/;
+    # A zone whose clocks skip midnight begins that day at the first hour
+    # that exists.
+    my $start;
+    for my $hour (0 .. 3) {
+        last if eval { $start = DateTime->new(year => $year, month => $month, day => $day,
+            hour => $hour, time_zone => "$timezone"); 1 };
+    }
+    die "date has no start in the zone\n" unless $start;
+    $start->set_time_zone('UTC');
+    return $start->strftime('%Y-%m-%dT%H:%M:%SZ');
 }
 
 sub _date {

@@ -70,7 +70,8 @@ for my $kind (qw(starts_with starts_with_ci text_contains text_contains_ci ends_
     like($like->params->[0], qr/\A%?!\[a-z\]!%!_!!%?\z/, "SQL Server $kind binds [ as a literal");
 }
 my $sqlite = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter(sqlite => (dbh => TestSelecto::DBH->new)));
-is($sqlite->compile($sqlite->query->select('id')->where(Selecto::Expression->starts_with('name', '[a]')))->params->[0],
+# SQLite's plain text operators compare exactly; its _ci forms use LIKE.
+is($sqlite->compile($sqlite->query->select('id')->where(Selecto::Expression->starts_with_ci('name', '[a]')))->params->[0],
     '[a]%', 'dialects without bracket classes leave [ unescaped');
 
 is($adapter->_decode('1234567890123456789012345678.90', DBI::SQL_NUMERIC()), '1234567890123456789012345678.9', 'SQL Server preserves an exact high-precision decimal string');

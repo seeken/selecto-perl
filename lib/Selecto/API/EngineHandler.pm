@@ -41,6 +41,15 @@ has bounded_results => 0;
 has filter_groups        => 0;
 has aggregate_selections => 0;
 has max_filter_depth     => 4;
+# Trusted explorer extension (Selecto::API::Explorer): boolean aggregates,
+# sum ignore_nulls, bucket counts, group_by objects (formats, ranges, steps),
+# {group => alias} selections and derived-group filter leaves. today (an ISO
+# date) is the trusted calendar date date_shortcut measures from, and
+# explorer_timezone the zone in which instants are formatted, grouped and
+# shortcut.
+has explorer_extensions  => 0;
+has 'today';
+has 'explorer_timezone';
 
 # Optional trusted host callback ($engine, \@primary_keys) returning
 # {primary_key => version}: publishes the virtual aggregate_version field.
@@ -60,7 +69,7 @@ sub new ($class, @args) {
             && $self->bounded_results =~ /\A[01]\z/;
     Selecto::Error->throw('invalid_api_handler', 'limits must be a Selecto::Limits')
         unless blessed($self->limits) && $self->limits->isa('Selecto::Limits');
-    for my $name (qw(filter_groups aggregate_selections)) {
+    for my $name (qw(filter_groups aggregate_selections explorer_extensions)) {
         Selecto::Error->throw('invalid_api_handler', "$name must be a trusted boolean")
             unless defined($self->$name) && !ref($self->$name) && $self->$name =~ /\A[01]\z/;
     }
@@ -82,6 +91,14 @@ sub new ($class, @args) {
     ) if $self->max_write_count < 1;
     Selecto::Error->throw('invalid_api_handler', 'versioner must be a callback')
         if defined($self->versioner) && ref($self->versioner) ne 'CODE';
+    Selecto::Error->throw('invalid_api_handler', 'today must be a trusted ISO date')
+        if defined($self->today) && !Selecto::DateShortcut->valid_date($self->today);
+    if (defined $self->explorer_timezone) {
+        require DateTime::TimeZone;
+        Selecto::Error->throw('invalid_api_handler', 'explorer_timezone must be an IANA timezone name')
+            if ref($self->explorer_timezone)
+                || !DateTime::TimeZone->is_valid_name($self->explorer_timezone);
+    }
     $self->max_filter_values($self->limits->get('max_filter_values'))
         if $self->max_filter_values > $self->limits->get('max_filter_values');
     $self->max_fields($self->limits->get('max_fields'))
@@ -480,6 +497,11 @@ sub _query ($self, $engine, $body, %options) {
         {row_format => $row_format},
     ) unless $row_format eq 'arrays' || $row_format eq 'objects';
     my @subtables;
+    # Explorer group entries become expressions before the selections, which
+    # may name an object entry with {group => alias}.
+    my $group_plan = $self->explorer_extensions && exists($body->{group_by})
+        ? $self->_explorer_groups($domain, $body->{group_by}) : undef;
+    local $self->{_group_aliases} = $group_plan ? $group_plan->{aliases} : undef;
 
     if ($has_select) {
         # Validate caller intent before composing host-mandated output fields.
@@ -491,7 +513,7 @@ sub _query ($self, $engine, $body, %options) {
             my ($entry) = @_;
             return $entry unless ref($entry);
             return $entry->{field} if ref($entry) eq 'HASH' && !exists($entry->{aggregate})
-                && ($entry->{alias} // $entry->{field}) eq $entry->{field};
+                && defined($entry->{field}) && ($entry->{alias} // $entry->{field}) eq $entry->{field};
             return undef;
         };
         my %authored = map {
@@ -604,7 +626,17 @@ sub _query ($self, $engine, $body, %options) {
         }
     }
 
-    if (exists $body->{group_by}) {
+    if ($group_plan) {
+        # Plain selections and orders must name a plain group path; group
+        # selections and aggregates summarise their groups.
+        my @ungrouped = grep { !$group_plan->{plain}{$_} }
+            map {Selecto::Expression->field_references($_)}
+            ((grep { !_is_aggregate_expression($_) && !$group_plan->{selected}{_expression_identity($_)} }
+                @{$query->selections}), map {$_->[0]} @{$query->orders});
+        Selecto::Error->throw('invalid_api_query', 'Selected and ordered fields must be grouped')
+            if @ungrouped;
+        $query = $query->group_by(@{$group_plan->{expressions}});
+    } elsif (exists $body->{group_by}) {
         my @groups = _string_array($body->{group_by}, 'group_by', $self->max_fields, 1);
         _visible_field_definition($domain, $_, 'group') for @groups;
         my %grouped = map {$_ => 1} @groups;
@@ -1145,6 +1177,8 @@ sub _filter_entry ($self, $domain, $filter, $depth, $leaves) {
 
 sub _filter_leaf ($self, $domain, $filter) {
     _object($filter, 'filter');
+    return $self->_derived_group_leaf($domain, $filter)
+        if $self->explorer_extensions && exists $filter->{format};
     _reject_unknown($filter, [qw(field op value end)], 'filter');
     my $field = _required_string($filter->{field}, 'filter field');
     my $operator = lc _required_string($filter->{op}, 'filter operator');
@@ -1196,6 +1230,136 @@ sub _filter_leaf ($self, $domain, $filter) {
     );
 }
 
+# explorer_extensions: {field, format, op => eq|is_null, value}, the field's
+# value in a group format (Selecto::DateFormat) equals value, or is null.
+sub _derived_group_leaf ($self, $domain, $filter) {
+    _reject_unknown($filter, [qw(field format op value)], 'filter');
+    my $field = _required_string($filter->{field}, 'filter field');
+    my $operator = lc _required_string($filter->{op}, 'filter operator');
+    my $definition = _visible_field_definition($domain, $field, 'filter');
+    my $expression = $self->_formatted_field($definition, $field,
+        _required_string($filter->{format}, 'filter format'));
+    if ($operator eq 'is_null') {
+        Selecto::Error->throw('invalid_api_query', 'is_null takes no value') if exists $filter->{value};
+        return Selecto::Expression->is_null($expression);
+    }
+    Selecto::Error->throw('invalid_api_query', 'derived group filters use eq or is_null')
+        unless $operator eq 'eq';
+    my $value = $filter->{value};
+    Selecto::Error->throw('invalid_api_query', 'derived group filter value must be a string')
+        if !defined($value) || ref($value);
+    return Selecto::Expression->eq($expression, "$value");
+}
+
+# datetime_format of a temporal field; instants convert to the explorer zone.
+sub _formatted_field ($self, $definition, $field, $format) {
+    Selecto::Error->throw('invalid_api_query', 'format is not available', {format => $format})
+        unless Selecto::DateFormat::valid($format);
+    my $type = $definition->{type} // '';
+    Selecto::Error->throw('invalid_api_query', 'format requires a date or time field',
+        {field => $field, format => $format}) unless $type =~ /(?:date|time)/i;
+    my $expression = Selecto::Expression->field($field);
+    $expression = Selecto::Expression->epoch_datetime($expression) if $type eq 'epoch_datetime';
+    return Selecto::Expression->datetime_format($expression, $format,
+        ($type =~ /\A(?:utc_datetime|epoch_datetime)\z/ && defined($self->explorer_timezone)
+            ? (timezone => $self->explorer_timezone) : ()));
+}
+
+# explorer_extensions group_by entries: a field path, or an object with an
+# alias and one of format (a Selecto::DateFormat), ranges ([{where =>
+# [[op, value], ...], label}], first match wins, else 'Other') or step with
+# kind numeric or year (the bucket increments).
+my %RANGE_OPERATOR = map { ($_ => 1) } qw(eq gt gte lt lte);
+sub _explorer_groups ($self, $domain, $entries) {
+    Selecto::Error->throw('invalid_api_query', 'group_by must be a non-empty array')
+        unless ref($entries) eq 'ARRAY' && @$entries;
+    Selecto::Error->throw('invalid_api_query', 'Too many group_by entries')
+        if @$entries > $self->max_fields;
+    my (@expressions, %aliases, %plain, %selected, %seen);
+    for my $entry (@$entries) {
+        if (!ref($entry)) {
+            my $field = _required_string($entry, 'group_by entry');
+            _visible_field_definition($domain, $field, 'group');
+            Selecto::Error->throw('invalid_api_query', 'group_by entries must be distinct')
+                if $seen{"field:$field"}++;
+            $plain{$field} = 1;
+            push @expressions, Selecto::Expression->field($field);
+            next;
+        }
+        _object($entry, 'group_by entry');
+        _reject_unknown($entry, [qw(field alias format ranges step kind)], 'group_by entry');
+        my $field = _required_string($entry->{field}, 'group_by field');
+        my $alias = _required_string($entry->{alias}, 'group_by alias');
+        Selecto::Error->throw('invalid_api_query', 'group_by alias must be a valid identifier')
+            unless Selecto::Identifier::valid($alias);
+        Selecto::Error->throw('invalid_api_query', 'group_by aliases must be distinct')
+            if exists $aliases{$alias};
+        my $definition = _visible_field_definition($domain, $field, 'group');
+        my $kinds = grep { exists $entry->{$_} } qw(format ranges step);
+        Selecto::Error->throw('invalid_api_query', 'group_by entry needs one of format, ranges or step')
+            unless $kinds == 1;
+        my $expression;
+        if (exists $entry->{format}) {
+            $expression = $self->_formatted_field($definition, $field,
+                _required_string($entry->{format}, 'group_by format'));
+        } elsif (exists $entry->{ranges}) {
+            my $ranges = $entry->{ranges};
+            Selecto::Error->throw('invalid_api_query', 'group_by ranges must be a non-empty array')
+                unless ref($ranges) eq 'ARRAY' && @$ranges;
+            my @branches = map {
+                my $range = $_;
+                _object($range, 'group_by range');
+                _reject_unknown($range, [qw(where label)], 'group_by range');
+                my $label = _required_string($range->{label}, 'group_by range label');
+                [_range_condition($field, $range->{where}), ['literal', $label, 'string']];
+            } @$ranges;
+            $expression = Selecto::Expression->value(['case', @branches,
+                ['else', ['literal', 'Other', 'string']]], limits => $self->limits);
+        } else {
+            my $kind = _required_string($entry->{kind} // '', 'group_by step kind');
+            Selecto::Error->throw('invalid_api_query', 'group_by step kind must be numeric or year')
+                unless $kind eq 'numeric' || $kind eq 'year';
+            my $step = $entry->{step};
+            Selecto::Error->throw('invalid_api_query', 'group_by step must be a positive integer')
+                unless defined($step) && !ref($step) && "$step" =~ /\A[1-9][0-9]{0,8}\z/;
+            $expression = Selecto::Expression->bucket(Selecto::Expression->field($field),
+                {kind => "${kind}_increment", increment => 0 + $step});
+        }
+        $aliases{$alias} = $expression;
+        $selected{_expression_identity($expression->as($alias))} = 1;
+        push @expressions, $expression;
+    }
+    return {expressions => \@expressions, aliases => \%aliases, plain => \%plain, selected => \%selected};
+}
+
+# A filter AST conjunction of [operator, value] bounds on one field.
+sub _range_condition ($field, $where) {
+    Selecto::Error->throw('invalid_api_query', 'range bounds must be a non-empty array')
+        unless ref($where) eq 'ARRAY' && @$where;
+    my @conditions = map {
+        my $bound = $_;
+        Selecto::Error->throw('invalid_api_query', 'range bound must be [operator, value]')
+            unless ref($bound) eq 'ARRAY' && @$bound == 2 && defined($bound->[0]) && !ref($bound->[0])
+                && $RANGE_OPERATOR{$bound->[0]} && defined($bound->[1]) && !ref($bound->[1]);
+        [$bound->[0], $field, $bound->[1]];
+    } @$where;
+    # A one-member ['and', X] would read X as its member list.
+    return @conditions == 1 ? $conditions[0] : ['and', @conditions];
+}
+
+sub _expression_identity ($expression) {
+    return Cpanel::JSON::XS->new->canonical(1)->allow_nonref(1)->encode(_plain_expression($expression));
+}
+
+sub _plain_expression ($value) {
+    return {kind => $value->kind, alias => $value->alias_name,
+        arguments => [map { _plain_expression($_) } @{$value->arguments}]}
+        if blessed($value) && $value->isa('Selecto::Expression');
+    return [map { _plain_expression($_) } @$value] if ref($value) eq 'ARRAY';
+    return {map { ($_ => _plain_expression($value->{$_})) } keys %$value} if ref($value) eq 'HASH';
+    return $value;
+}
+
 sub _is_filter_group ($filter) {
     return ref($filter) eq 'HASH' && (exists($filter->{any}) xor exists($filter->{all}))
         && !exists($filter->{field}) ? 1 : 0;
@@ -1245,7 +1409,12 @@ sub _query_filter_expression ($self, $filter, $operator, $definition, $operand) 
         my $shortcut = _required_string($filter->{value}, 'date shortcut value');
         Selecto::Error->throw('invalid_api_query', 'Date shortcut is not available',
             {value => $shortcut}) unless Selecto::DateShortcut->valid($shortcut);
-        return Selecto::DateShortcut->expression($operand, $shortcut);
+        # A trusted today binds the shortcut's bounds; instants are measured
+        # in the explorer zone.
+        return Selecto::DateShortcut->expression($operand, $shortcut, $self->today,
+            (defined($self->today) && defined($self->explorer_timezone)
+                && ($definition->{type} // '') eq 'utc_datetime'
+                ? (timezone => $self->explorer_timezone) : ()));
     }
     Selecto::Error->throw('invalid_api_query',
         "Unsupported filter operator $operator")
@@ -1316,10 +1485,12 @@ sub _required_string ($value, $label) {
 }
 
 sub _selection_options ($self) {
-    return {aggregates => $self->aggregate_selections};
+    return {aggregates => $self->aggregate_selections, explorer => $self->explorer_extensions,
+        handler => $self, groups => $self->{_group_aliases}};
 }
 
-my %AGGREGATE_KIND = map { ($_ => 1) } qw(count count_field count_distinct sum avg min max);
+my %AGGREGATE_KIND = map { ($_ => 1) } qw(count count_field count_distinct sum avg min max
+    sum_zero true_count false_count true_percentage);
 sub _is_aggregate_expression ($expression) {
     return blessed($expression) && $expression->isa('Selecto::Expression')
         && $AGGREGATE_KIND{$expression->kind} ? 1 : 0;
@@ -1335,9 +1506,11 @@ sub _api_selections ($domain, $value, $maximum, $limits, $adapter, $options = {}
     my $field_count = 0;
     for my $entry (@$value) {
         if (ref($entry) ne 'ARRAY') {
-            my $selection = $options->{aggregates} && ref($entry) eq 'HASH' && exists($entry->{aggregate})
-                ? _api_aggregate_entry($domain, $entry, 'select entry', \@hidden)
-                : _api_selection_entry($domain, $entry, 'select entry', \@hidden);
+            my $selection = $options->{explorer} && ref($entry) eq 'HASH' && exists($entry->{group})
+                ? _api_group_selection($entry, $options)
+                : $options->{aggregates} && ref($entry) eq 'HASH' && exists($entry->{aggregate})
+                ? _api_aggregate_entry($domain, $entry, 'select entry', \@hidden, $options)
+                : _api_selection_entry($domain, $entry, 'select entry', \@hidden, $options);
             $field_count++;
             next unless $selection;
             Selecto::Error->throw(
@@ -1431,11 +1604,29 @@ my %AGGREGATE_FUNCTION = (
     count => 'count_field', count_distinct => 'count_distinct',
     sum => 'sum', avg => 'avg', min => 'min', max => 'max',
 );
-sub _api_aggregate_entry ($domain, $entry, $label, $hidden) {
-    _reject_unknown($entry, [qw(aggregate field alias)], $label);
+# explorer_extensions: {group => alias} selects an object group entry.
+sub _api_group_selection ($entry, $options) {
+    _reject_unknown($entry, ['group'], 'select entry');
+    my $alias = _required_string($entry->{group}, 'select group');
+    my $expression = ref($options->{groups}) eq 'HASH' ? $options->{groups}{$alias} : undef;
+    Selecto::Error->throw('invalid_api_query', 'select group names no group_by entry',
+        {group => $alias}) unless $expression;
+    return {result_name => $alias, expression => $expression, flat_expression => $expression->as($alias)};
+}
+
+my %EXPLORER_AGGREGATE = map { ($_ => 1) } qw(true_count false_count true_percentage count_where);
+sub _api_aggregate_entry ($domain, $entry, $label, $hidden, $options = {}) {
+    _reject_unknown($entry, [qw(aggregate field alias), ($options->{explorer} ? qw(ignore_nulls where) : ())], $label);
     my $function = _required_string($entry->{aggregate}, "$label aggregate");
     Selecto::Error->throw('invalid_api_query', 'select aggregate is not available',
-        {aggregate => $function}) unless $AGGREGATE_FUNCTION{$function};
+        {aggregate => $function})
+        unless $AGGREGATE_FUNCTION{$function} || ($options->{explorer} && $EXPLORER_AGGREGATE{$function});
+    Selecto::Error->throw('invalid_api_query', 'ignore_nulls is only available as auto on sum')
+        if exists($entry->{ignore_nulls})
+            && ($function ne 'sum' || !defined($entry->{ignore_nulls}) || ref($entry->{ignore_nulls})
+                || $entry->{ignore_nulls} ne 'auto');
+    Selecto::Error->throw('invalid_api_query', 'where is only available on count_where')
+        if exists($entry->{where}) xor $function eq 'count_where';
     my $alias = _required_string($entry->{alias}, "$label alias");
     Selecto::Error->throw('invalid_api_query', 'select alias must be a valid identifier',
         {alias => $alias}) unless Selecto::Identifier::valid($alias);
@@ -1458,8 +1649,20 @@ sub _api_aggregate_entry ($domain, $entry, $label, $hidden) {
         {field => $field, aggregate => $function})
         if ($function eq 'sum' || $function eq 'avg')
             && ($definition->{type} // '') !~ /\A(?:integer|bigint|smallint|decimal|numeric|number|float|double|real)\z/i;
-    my $method = $AGGREGATE_FUNCTION{$function};
-    my $expression = Selecto::Expression->$method(Selecto::Expression->field($field));
+    Selecto::Error->throw('invalid_api_query', "$function requires a boolean field",
+        {field => $field, aggregate => $function})
+        if $function =~ /\A(?:true_count|false_count|true_percentage)\z/
+            && ($definition->{type} // '') ne 'boolean';
+    my $expression;
+    if ($function eq 'count_where') {
+        # COUNT of a CASE that is 1 when every bound holds: nulls count in none.
+        $expression = Selecto::Expression->count_field(Selecto::Expression->value(
+            ['case', [_range_condition($field, $entry->{where}), ['literal', 1, 'integer']]],
+            ($options->{handler} ? (limits => $options->{handler}->limits) : ())));
+    } else {
+        my $method = exists($entry->{ignore_nulls}) ? 'sum_zero' : $AGGREGATE_FUNCTION{$function} // $function;
+        $expression = Selecto::Expression->$method(Selecto::Expression->field($field));
+    }
     return {
         field => $field, definition => $definition,
         result_name => $alias, expression => $expression,
@@ -1467,7 +1670,7 @@ sub _api_aggregate_entry ($domain, $entry, $label, $hidden) {
     };
 }
 
-sub _api_selection_entry ($domain, $entry, $label, $hidden) {
+sub _api_selection_entry ($domain, $entry, $label, $hidden, $options = {}) {
     my ($field, $alias, $format);
     if (ref($entry) eq 'HASH') {
         _reject_unknown($entry, [qw(field alias format)], $label);
@@ -1503,7 +1706,10 @@ sub _api_selection_entry ($domain, $entry, $label, $hidden) {
     my $result_name = defined($alias)
         ? $alias : Selecto::Identifier::result_name($field);
     my $expression = Selecto::Expression->field($field);
-    if (defined $format) {
+    if (defined($format) && $options->{explorer} && $options->{handler}) {
+        # Explorer formats convert instants to the explorer zone.
+        $expression = $options->{handler}->_formatted_field($definition, $field, $format);
+    } elsif (defined $format) {
         $expression = Selecto::Expression->epoch_datetime($expression)
             if $definition->{type} eq 'epoch_datetime';
         $expression = Selecto::Expression->datetime_format($expression, $format);
@@ -1716,9 +1922,9 @@ All limits are optional non-negative integers:
 
 Throws C<invalid_api_handler> for invalid limits.
 
-Two trusted extensions are off by default, and L<Selecto::API> never enables
-them; explorer hosts such as L<Selecto::API::Spa> construct their own handler
-with them:
+Three trusted extensions are off by default, and L<Selecto::API> never enables
+them; explorer hosts such as L<Selecto::API::Spa> and L<Selecto::API::Explorer>
+construct their own handler with them:
 
 =over 4
 
@@ -1740,6 +1946,21 @@ cross a to-many association. Aggregates are exempt from the C<group_by>
 rule; without C<group_by>, every selection must be an aggregate and the query
 cannot be ordered. Such a summary is one row and is not paged in SQL (SQL
 Server pages only ordered queries); C<limit> and C<offset> apply to that row.
+
+=item explorer_extensions
+
+Used by L<Selecto::API::Explorer>. Aggregate entries also accept
+C<true_count>, C<false_count> and C<true_percentage> (boolean fields),
+C<< ignore_nulls => 'auto' >> on C<sum> (nulls count as 0) and C<count_where>
+(C<< where => [[op, value], ...] >>: the rows whose field meets every bound).
+C<group_by> entries may be objects with an C<alias> and one of C<format> (a
+L<Selecto::DateFormat>), C<< ranges => [{where, label}, ...] >> (first match,
+else C<Other>) or C<step> with C<kind> C<numeric> or C<year>; C<select> takes
+C<< {group => $alias} >> for them. Filter leaves may be
+C<< {field, format, op => 'eq'|'is_null', value} >>. With the trusted C<today>
+(an ISO date) C<date_shortcut> binds literal bounds; with
+C<explorer_timezone>, instants are formatted, grouped and shortcut in that
+zone.
 
 =back
 
