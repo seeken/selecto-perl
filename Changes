@@ -49,7 +49,23 @@ Revision history for Selecto
     - selecto-perl-kit has not had its transaction fixes yet; do not rely on its
       bare commit or rollback under completion_type 2.
     - Deploy selecto-perl-mcp and every companion at this version together.
+    - SQLite: plain starts_with, text_contains and ends_with now compare
+      case-sensitively (they used LIKE, which folds ASCII case); search host
+      filters that relied on the folding and use the _ci forms there.
 
+    - Selecto::API::Explorer serves remote_query.explorer.v1 and the
+      selecto.explorer-features v1 sidecar (specification 3.3.0): the
+      remote_query.v1 manifest plus getExplorerFeatures and queryExplorer, with
+      its refusal order, trusted clock and host limits, grouped ordering,
+      rollup by prefix queries, drilldowns, bounded exact counts, collections and
+      CSV/TSV/JSON/XLSX export. Every query runs through
+      Selecto::API::EngineHandler, which gains the trusted explorer_extensions
+      option (boolean aggregates, sum ignore_nulls, bucket counts, group_by
+      formats, ranges and steps, {group} selections, derived-group filter
+      leaves) and the trusted today and explorer_timezone attributes. Off by
+      default; Selecto::API never enables them.
+    - Selecto::DateShortcut->expression takes a timezone for instant operands
+      (day_start_instant), and SQLite datetime formats accept a UTC timezone.
     - Selecto::API::Spa serves the Selecto SPA explorer protocol (selecto.spa.*/v1:
       descriptors; Detail with repeated columns, Aggregate with rollup and the grid,
       Graph; nested AND/OR filters; paging) through the canonical query handler.

@@ -659,6 +659,25 @@ sub _compile_value_expression {
     return $self->SUPER::_compile_value_expression($domain, $node, $params);
 }
 
+# Plain starts_with, text_contains and ends_with compare exactly: SQLite's
+# LIKE folds ASCII case, so only the _ci forms use it.
+sub _compile_text_match {
+    my ($self, $kind, $field_sql, $text, $params) = @_;
+    return $self->SUPER::_compile_text_match($kind, $field_sql, $text, $params) if $kind =~ /_ci\z/;
+    return "$field_sql IS NOT NULL" if $text eq '';
+    if ($kind eq 'text_contains') {
+        push @$params, $text;
+        return "INSTR($field_sql, " . $self->placeholder(scalar @$params) . ') > 0';
+    }
+    push @$params, $text;
+    my $length = 'LENGTH(' . $self->placeholder(scalar @$params) . ')';
+    push @$params, $text;
+    my $marker = $self->placeholder(scalar @$params);
+    return $kind eq 'starts_with'
+        ? "SUBSTR($field_sql, 1, $length) = $marker"
+        : "SUBSTR($field_sql, -$length) = $marker";
+}
+
 sub _compile_timezone_sql {
     my ($self, $sql, $type, $timezone) = @_;
     Selecto::Error->throw('unsupported_feature', 'SQLite requires UTC for explicit query timezones')
@@ -765,7 +784,13 @@ sub _compile_text_search {
 }
 
 sub _compile_datetime_format {
-    my ($self, $domain, $field, $format, $params) = @_;
+    # The arguments are the expression's (field, format, optional timezone)
+    # followed by the parameter list.
+    my ($self, $domain, $field, $format, @rest) = @_;
+    my $params = pop @rest;
+    my ($timezone) = @rest;
+    Selecto::Error->throw('unsupported_feature', 'SQLite requires UTC for explicit query timezones')
+        if defined($timezone) && $timezone ne 'UTC';
     my $source = $field->kind eq 'epoch_datetime' ? $field->arguments->[0] : $field;
     my $resolved = $self->_governed_dialect_field($domain, $source);
     Selecto::Error->throw('invalid_query', 'datetime format requires a date or time field')

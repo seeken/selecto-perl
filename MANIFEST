@@ -17,6 +17,7 @@ lib/Selecto/Analytics/TransformRegistry.pm
 lib/Selecto/Analytics/UnitRegistry.pm
 lib/Selecto/API.pm
 lib/Selecto/API/EngineHandler.pm
+lib/Selecto/API/Explorer.pm
 t/api_error_status_unsupported_scope.t
 t/api_field_roles_adversarial.t
 lib/Selecto/API/ResultFormatter.pm
@@ -115,6 +116,7 @@ t/mysql_non_transactional_engine_live.t
 t/member_group_identity_live.t
 t/upsert_scope_live.t
 t/sqlite_rules_transaction_handler.t
+t/sqlite_text_match_case.t
 t/rule_compare_path.t
 t/sqlite_plan_authority.integration.t
 lib/Selecto/Statement.pm
@@ -143,6 +145,7 @@ t/analytics_unit_registry.t
 t/api.t
 t/api_engine_handler.t
 t/api_engine_handler_extensions.t
+t/api_explorer.t
 t/api_hidden_field.t
 t/api_missing_tenant_scope.t
 t/api_query_library_parity_live.t
