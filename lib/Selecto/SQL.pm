@@ -2353,7 +2353,7 @@ sub _compile_related_collection_at {
             }
         }
         ($from, $where, $limit) = $self->_bounded_related_collection_source(
-            $from, $where, $order, int($limit), $quoted_alias);
+            $from, $where, $order, int($limit), $quoted_alias, [sort keys %needed]);
     }
     return $self->_compile_related_collection_sql({
         fields => \@collection_fields,
