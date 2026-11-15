@@ -5,6 +5,7 @@ use JSON::PP ();
 use Cpanel::JSON::XS ();
 use B ();
 use Digest::SHA qw(sha1_hex);
+use Hash::Util::FieldHash qw(fieldhash);
 use Scalar::Util qw(blessed refaddr);
 use Selecto::Error ();
 use Selecto::Expression ();
@@ -1721,8 +1722,25 @@ sub _compile_selection {
         : $sql;
 }
 
+# Syntax only: no domain resolution, policy, parameters or rendered SQL is
+# remembered. Entries die with the expression (including query copies), and
+# compare the complete leaf input on every use, including direct hash edits.
+# Subclasses and non-string/malformed leaves retain the general implementation.
+fieldhash my %FIELD_KEYS;
 sub _expression_key {
     my ($expression) = @_;
+    if (ref($expression) eq 'Selecto::Expression' && $expression->kind eq 'field') {
+        my $args = $expression->arguments;
+        if (@$args == 1 && defined($args->[0]) && !ref($args->[0])
+            && (B::svref_2object(\$args->[0])->FLAGS & B::SVp_POK())) {
+            my $path = $args->[0];
+            my $memo = $FIELD_KEYS{$expression};
+            return $memo->[1] if $memo && $memo->[0] eq $path;
+            my $key = 'e:field:a:[s:' . length($path) . ':' . $path . ']';
+            $FIELD_KEYS{$expression} = [$path, $key];
+            return $key;
+        }
+    }
     return _value_key($expression);
 }
 
