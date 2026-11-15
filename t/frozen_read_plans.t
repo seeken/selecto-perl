@@ -24,6 +24,15 @@ sub refused {
     ok(!eval {$call->();1}, $label);
     like("$@", qr/frozen|read.only/, "$label explains immutability");
 }
+{
+ package FrozenCopyHook;
+ our $CALLS=0;
+ sub STORABLE_freeze { ++$CALLS; return ('payload'); }
+ sub STORABLE_thaw { $_[0]{restored}=$_[2]; }
+}
+my $hook_copy=Selecto::Frozen->copy({hook=>bless({}, 'FrozenCopyHook')});
+is($FrozenCopyHook::CALLS,1,'mutable metadata preserves its original Storable hook');
+is($hook_copy->{hook}{restored},'payload','mutable metadata preserves Storable thaw semantics');
 my ($weak_domain, $weak_copy);
 {
  my $owned=domain();

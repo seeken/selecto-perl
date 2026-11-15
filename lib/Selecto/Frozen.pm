@@ -77,7 +77,33 @@ sub _freeze_nodes {
 # Unlike dclone on a tied record, this deliberately drops the freeze machinery.
 sub copy {
     my ($class, $root) = @_;
+    # Preserve Storable hooks and cloning semantics for the unchanged mutable
+    # path. Only our immutable containers need the explicit thawing copy.
+    return Storable::dclone($root) unless _contains_frozen($root);
     return _copy_value($root, {});
+}
+sub _contains_frozen {
+    my ($root) = @_;
+    my (@stack, %seen);
+    push @stack, $root;
+    while (@stack) {
+        my $value = pop @stack;
+        next unless ref $value;
+        next if $seen{refaddr($value)}++;
+        my $type = reftype($value) // '';
+        if ($type eq 'HASH') {
+            my $tie = tied %$value;
+            return 1 if $tie && ref($tie) eq 'Selecto::Frozen::Hash';
+            next if $tie; # let Storable own foreign tie/serialization hooks
+            return 1 if Hash::Util::hash_locked(%$value);
+            push @stack, values %$value;
+        } elsif ($type eq 'ARRAY') {
+            next if tied @$value;
+            return 1 if Internals::SvREADONLY(@$value);
+            push @stack, @$value;
+        }
+    }
+    return 0;
 }
 sub _copy_value {
     my ($value, $seen) = @_;
