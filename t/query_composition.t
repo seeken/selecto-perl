@@ -71,9 +71,14 @@ for my $backend ('sqlite', ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} ? 'postgresql' 
                 $q = $q->clear_selections->select('id') if $select_mode eq 'clear';
                 $q = $q->replace_selections([])->select('id') if $select_mode eq 'empty_replace';
                 my $rows = $scoped->all($q->order_by('id'))->{rows};
-                is_deeply([map { $_->[0] } @$rows], [1,4], "$filter_mode/$select_mode retains tenant and domain predicates");
+                my $expected = $select_mode eq 'compose' ? [[1,1],[4,4]] : [[1],[4]];
+                is_deeply($rows, $expected, "$filter_mode/$select_mode retains guards and exact ordered output positions");
             }
         }
+        my $aliased = $scoped->all($scoped->query
+            ->select($x->field('id')->as('left_id'))->select($x->field('id')->as('right_id'))->order_by('id'));
+        is_deeply($aliased->{columns}, ['left_id', 'right_id'], 'distinct aliases survive chained select execution');
+        is_deeply($aliased->{rows}, [[1,1],[4,4]], 'both repeated expression positions execute under authority');
         $dbh->do('DROP TABLE compose_spec_people');
         $dbh->disconnect;
     };
