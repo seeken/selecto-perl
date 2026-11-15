@@ -3,7 +3,20 @@ use strict;
 use warnings;
 use ExtUtils::MakeMaker;
 
+# Optional native acceleration. Probe both compilation and linking first;
+# a source installation without a working toolchain remains pure Perl.
+my ($cc) = map { /\ACC=(.*)\z/ ? $1 : () } @ARGV;
+my $xs = !$ENV{SELECTO_PERL_NO_XS} && eval {
+    require ExtUtils::CBuilder;
+    ExtUtils::CBuilder->new(quiet => 1, (defined($cc) ? (config => {cc => $cc}) : ()))->have_compiler;
+};
+print $xs ? "Optional canonical XS enabled\n" : "Canonical conversion: pure Perl (optional XS unavailable or disabled)\n";
+
 WriteMakefile(
+    XS               => $xs ? {'xs/CanonicalXS.xs' => 'CanonicalXS.c'} : {},
+    C                => $xs ? ['CanonicalXS.c'] : [],
+    OBJECT           => $xs ? 'CanonicalXS$(OBJ_EXT)' : '',
+    clean            => { FILES => 'CanonicalXS.c CanonicalXS.o' },
     NAME             => 'Selecto',
     VERSION_FROM     => 'lib/Selecto.pm',
     ABSTRACT_FROM    => 'lib/Selecto.pm',
@@ -83,3 +96,14 @@ WriteMakefile(
         },
     },
 );
+
+# Keep the XS source out of MakeMaker's automatic top-level *.xs discovery,
+# so disabled/no-compiler builds cannot accidentally request a shared library.
+sub MY::postamble {
+    return '' unless $xs;
+    return <<'MAKE';
+CanonicalXS.c: xs/CanonicalXS.xs $(XSUBPPDEPS)
+	$(XSUBPPRUN) $(XSPROTOARG) $(XSUBPPARGS) $(XSUBPP_EXTRA_ARGS) xs/CanonicalXS.xs > CanonicalXS.xsc
+	$(MV) CanonicalXS.xsc CanonicalXS.c
+MAKE
+}

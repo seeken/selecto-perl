@@ -44,4 +44,17 @@ $query=$engine->query->select('name');$engine->all($query);
 $query->{selections}[0]{arguments}[0]='missing';
 eval {$engine->all($query)};
 like("$@",qr/unknown.field/i,'field resolution still runs after warm execution');
+my $td=Selecto::Domain->parse({schema_version=>1,name=>'Tenanted people',
+    source=>{source_table=>'people',primary_key=>'id',tenant_field=>'id',fields=>[qw(id name score)],
+        columns=>{id=>{type=>'integer'},name=>{type=>'string'},score=>{type=>'integer'}},associations=>{}},
+    schemas=>{},joins=>{}});
+my $te=Selecto::Engine->new(domain=>$td,adapter=>$engine->adapter);
+my $tq=$te->query->select('name');
+is_deeply($te->with_scope(tenant=>1)->all($tq)->{rows},[['Ada']],'first tenant execution');
+is_deeply($te->with_scope(tenant=>2)->all($tq)->{rows},[['Grace']],'same query under a different trusted tenant');
+$tq->{selections}[0]{alias_name}='label';
+is_deeply($te->with_scope(tenant=>2)->all($tq)->{columns},['label'],'alias mutation remains live');
+$tq->{selections}[0]{arguments}[0]='missing';
+eval {$te->with_scope(tenant=>2)->all($tq)};
+like("$@",qr/unknown.field/i,'warm scoped query still resolves fields');
 done_testing;

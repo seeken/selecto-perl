@@ -1187,6 +1187,15 @@ sub _require_iso_dates {
 # Keep one converter plan per adapter. A changed type vector, export mode or
 # driver-number mode replaces it; no rows, values, query or request context
 # are retained. Closures process a whole column, avoiding a Perl call per cell.
+our $PURE_PERL = 0;
+my $XS_AVAILABLE;
+sub _xs_available {
+    return $XS_AVAILABLE if defined $XS_AVAILABLE;
+    local $@;
+    $XS_AVAILABLE = eval { require Selecto::PostgreSQL::CanonicalXS; 1 } ? 1 : 0;
+    return $XS_AVAILABLE;
+}
+
 sub _decode_rows {
     my ($self, $rows, $types) = @_;
     return if $self->{_selecto_raw_values};
@@ -1195,10 +1204,11 @@ sub _decode_rows {
     my $export = $self->{_selecto_export_scalars} ? 1 : 0;
     my $numbers = CREATED_AS_NUMBER && (grep { defined($_) && /\Aint[248]\z/ } @$types)
         && defined($self->_canonical_server_version) ? 1 : 0;
-    my $key = join(':', $export, $numbers, map { defined($_) ? length($_) . ':' . $_ : '-' } @$types);
+    my $xs = !$PURE_PERL && !$ENV{SELECTO_PERL_PURE} && _xs_available() ? 1 : 0;
+    my $key = join(':', $export, $numbers, $xs, map { defined($_) ? length($_) . ':' . $_ : '-' } @$types);
     my $plan = $self->{_selecto_decode_plan};
     unless ($plan && $plan->[0] eq $key) {
-        $plan = [$key, _column_converters($types, $export, $numbers)];
+        $plan = [$key, _column_converters($types, $export, $numbers, $xs)];
         $self->{_selecto_decode_plan} = $plan;
     }
     $_->[1]->($rows, $_->[0]) for @{$plan->[1]};
@@ -1206,7 +1216,7 @@ sub _decode_rows {
 }
 
 sub _column_converters {
-    my ($types, $export, $numbers) = @_;
+    my ($types, $export, $numbers, $xs) = @_;
     my @plan;
     for my $i (0 .. $#$types) {
         my $type = $types->[$i] // '';
@@ -1275,6 +1285,25 @@ sub _column_converters {
                     $row->[$i] = $normalized;
                 }
             };
+        }
+        if ($xs && $convert && !($export && $type =~ /\A(?:numeric|bool|json|jsonb)\z/)) {
+            my $kind = $type =~ /\A(?:numeric|float4|float8)\z/ ? 0
+                : $type eq 'timestamp' || $type eq 'timestamptz' ? 1
+                : $numbers && $type =~ /\Aint[248]\z/ ? 2
+                : $type eq 'bool' ? 3 : undef;
+            if (defined $kind) {
+                my $perl = $convert;
+                $convert = sub {
+                    my ($rows, $i) = @_;
+                    if ($kind == 1) {
+                        for my $row (@$rows) {
+                            next unless defined $row->[$i];
+                            last if _require_iso_dates($row->[$i]);
+                        }
+                    }
+                    $perl->($rows, $i) unless Selecto::PostgreSQL::CanonicalXS::convert_column($rows, $i, $kind);
+                };
+            }
         }
         push @plan, [$i, $convert] if $convert;
     }

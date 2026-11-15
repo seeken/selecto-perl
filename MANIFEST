@@ -441,3 +441,9 @@ t/api_nested_detail.t
 t/fixtures/canonical_nested_detail_v1.json
 t/pg_pipeline_available.t
 t/pg_pipeline_live.t
+xs/CanonicalXS.xs
+lib/Selecto/PostgreSQL/CanonicalXS.pm
+t/query_syntax_cache.t
+t/canonical_converter_parity.t
+docs/canonical_acceleration.md
+t/optional_xs_build.t
