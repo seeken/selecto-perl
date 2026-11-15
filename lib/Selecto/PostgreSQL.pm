@@ -411,6 +411,8 @@ sub supports {
 # value; every other value is canonical. Export scalars are decoded in Perl.
 sub execute_query {
     my ($self, $statement, %options) = @_;
+    # Only ordinary materialized reads can supply the entire frame upfront.
+    local $self->{_selecto_pg_pipeline_eligible} = 1;
     # See READS in the POD.
     return $self->_guarded_read($statement, sub { return $self->_execute_raw($statement, %options) });
 }
@@ -419,13 +421,73 @@ sub _execute_raw {
     my ($self, $statement, %options) = @_;
     if ($options{export_scalars}) {
         local $self->{_selecto_export_scalars} = 1;
-        return $self->SUPER::execute_query($statement);
+        return $self->_execute_read_rows($statement);
     }
     unless ($self->_canonical_requested(%options)) {
         local $self->{_selecto_raw_values} = 1;
-        return $self->SUPER::execute_query($statement);
+        return $self->_execute_read_rows($statement);
     }
-    return $self->SUPER::execute_query($self->_canonical_statement($statement));
+    return $self->_execute_read_rows($self->_canonical_statement($statement));
+}
+
+# Keep the usual canonical/export transformations and decoder around the
+# driver's materialized result. Streams and host-owned transactions use DBI.
+sub _execute_read_rows {
+    my ($self, $statement) = @_;
+    return $self->SUPER::execute_query($statement) unless $self->{_selecto_pg_pipeline_frame};
+    my $dbh = $self->{dbh};
+    my ($frame, $error);
+    {
+        local $dbh->{RaiseError} = 0;
+        local $dbh->{PrintError} = 0;
+        my $ok = eval {
+            $frame = $dbh->pg_pipeline([
+                {sql => 'BEGIN READ ONLY NOT DEFERRABLE'},
+                {sql => $self->_query_transport_sql($statement), params => $statement->params, sync => 1},
+                {sql => 'ROLLBACK'},
+            ]);
+            1;
+        };
+        $error = $self->normalize_error($ok ? ($dbh->errstr || 'query execution failed') : $@)
+            if !$ok || !$frame || $frame->[0]{error} || $frame->[1]{error};
+    }
+    # A rollback result and idle status are both required. A read may change
+    # session state; never return its answer while its frame remains open.
+    unless ($frame && @$frame == 3 && !$frame->[2]{error}
+        && $frame->[2]{status} eq 'PGRES_COMMAND_OK'
+        && eval { $dbh->pg_transaction_status == 0 }) {
+        my $ending = $self->_transaction_control_error('the pipelined read could not be ended');
+        eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
+        die($error || $ending);
+    }
+    die $error if $error;
+    my $rows = $frame->[1]{rows};
+    my $decoded = eval { $self->_decode_rows($rows, $frame->[1]{types}); 1 };
+    die $self->normalize_error($@) unless $decoded;
+    return {columns => $statement->columns, rows => $rows};
+}
+
+sub _pg_pipeline_available {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    # Host callbacks and handle/adapter subclasses can change execute's
+    # behavior. The frame API has no per-command DBI execute dispatch, so
+    # preserve those hooks through the existing path.
+    return 0 if ref($self) ne __PACKAGE__ || ref($dbh) ne 'DBI::db'
+        || keys %{$dbh->{Callbacks} // {}} || $dbh->{HandleError} || $dbh->{HandleSetErr}
+        || $SIG{__WARN__};
+    return 0 if $self->can('_execute_statement') != Selecto::SQL->can('_execute_statement');
+    return $dbh->can('pg_pipeline') && $dbh->can('pg_transaction_status');
+}
+
+# Use libpq's local transaction state when supported, otherwise retain the
+# documented pg_ping mapping. Both paths distinguish raw host BEGIN.
+sub _pg_transaction_status {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return eval { $dbh->pg_transaction_status } // 4 if $dbh->can('pg_transaction_status');
+    my $ping = eval { $dbh->pg_ping } // 0;
+    return {1 => 0, 2 => 1, 3 => 2, 4 => 3}->{$ping} // 4;
 }
 
 # ---- Canonical values in SQL ------------------------------------------------
@@ -1215,10 +1277,10 @@ sub _export_scalar {
 # savepoint around a result it does not own.
 sub _server_transaction_open {
     my ($self) = @_;
-    my $status = eval { $self->{dbh}->pg_ping };
-    return undef unless defined($status) && $status > 0;
-    _refuse_connection_state('active') if $status == 2;
-    return $status >= 3 ? 1 : 0;
+    my $status = $self->_pg_transaction_status;
+    return undef if $status == 4;
+    _refuse_connection_state('active') if $status == 1;
+    return $status >= 2 ? 1 : 0;
 }
 
 # DBD::Pg holds the host's asynchronous query (pg_async) until the host takes
@@ -1239,8 +1301,8 @@ sub _refuse_pending_result {
 # Where a read runs: 'own' (no transaction open: a read-only transaction of
 # its own, rolled back) or 'host' (the host's transaction, as written). libpq
 # says which, so a transaction a raw BEGIN opened is the host's, never rolled
-# back. DBD::Pg 3.21.2 exposes this status through pg_ping, which sends a
-# query even in a transaction; AutoCommit alone cannot detect raw BEGIN.
+# back. Newer DBD::Pg exposes local pg_transaction_status; older drivers
+# retain pg_ping. AutoCommit alone cannot detect raw BEGIN.
 # Pending results and handles a bounded stream holds are refused before ping;
 # aborted or unknown states are refused before read or transaction control.
 sub _read_guard_scope {
@@ -1255,12 +1317,12 @@ sub _read_guard_scope {
     # since (_under_new_savepoint) is in the host's healthy transaction: that
     # SAVEPOINT succeeded in it. Any later read asks again.
     return 'host' if delete $self->{_selecto_pg_new_savepoint};
-    my $status = eval { $dbh->pg_ping } // 0;
+    my $status = $self->_pg_transaction_status;
     # (AutoCommit off and nothing sent yet: DBD::Pg begins the host's transaction
     # with the read's first statement.)
-    return eval { $dbh->{AutoCommit} } ? 'own' : 'host' if $status == 1;
-    return 'host' if $status == 3;
-    _refuse_connection_state({2 => 'active', 4 => 'inerror'}->{$status} // 'unknown');
+    return eval { $dbh->{AutoCommit} } ? 'own' : 'host' if $status == 0;
+    return 'host' if $status == 2;
+    _refuse_connection_state({1 => 'active', 3 => 'inerror'}->{$status} // 'unknown');
 }
 
 # Runs $work, a read, right after a savepoint budget opened on this handle
@@ -1379,6 +1441,10 @@ sub _guarded_read {
     # Check before opening anything; an invalid encoding must not touch the
     # host's session, even when a transaction-control statement would fail.
     $self->_pg_require_utf8;
+    if (!$locks && $self->{_selecto_pg_pipeline_eligible} && $self->_pg_pipeline_available) {
+        local $self->{_selecto_pg_pipeline_frame} = 1;
+        return $work->();
+    }
     my $result;
     my $ok = eval {
         $self->_pg_begin_read($locks, 1);
@@ -1691,8 +1757,15 @@ failures become C<query_error>.
 =head1 READS
 
 With no transaction open, a read is a transaction of its own:
-C<BEGIN READ ONLY NOT DEFERRABLE>, the query, C<ROLLBACK>. A preceding C<pg_ping> detects
-raw host transactions. C<client_encoding> is checked from libpq's local
+C<BEGIN READ ONLY NOT DEFERRABLE>, the query, C<ROLLBACK>. When DBD::Pg exposes
+C<pg_transaction_status>, the ownership check uses local libpq state; older
+drivers retain C<pg_ping> to detect raw host transactions. When it also exposes
+C<pg_pipeline>, ordinary materialized reads send that entire frame without an
+intermediate wait. An error boundary before ROLLBACK makes cleanup run after a
+failed read; successful cleanup and idle state are required before returning.
+A failed cleanup disconnects the handle. Streams, locking reads, handle or
+adapter subclasses, and handles with DBI callbacks/error handlers or a custom
+warning handler retain sequential execution to preserve their hooks. C<client_encoding> is checked from libpq's local
 parameter status on every operation, without a query. Nothing it reaches can
 write, and nothing it changes outlasts it: a view using C<nextval> or an
 audit function refuses (C<query_error>, C<details.category>

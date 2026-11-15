@@ -136,9 +136,15 @@ subtest 'failed rollback closes the ordinary read connection' => sub {
     my $owned=TestPostgreSQL->connect;
     my $adapter=Selecto::PostgreSQL->new(dbh=>$owned);
     my $do=DBD::Pg::db->can('do');
+    my $pipeline=DBD::Pg::db->can('pg_pipeline');
     {
         no warnings 'redefine';
         local *DBD::Pg::db::do=sub {die "refused rollback\n" if $_[1] eq 'ROLLBACK';goto &$do};
+        # Exercise a real server failure at the pipeline cleanup boundary.
+        local *DBD::Pg::db::pg_pipeline=sub {
+            my ($handle,$commands)=@_;
+            return $pipeline->($handle,[map {+{%$_, sql => $_->{sql} eq 'ROLLBACK' ? 'SELECT 1/0' : $_->{sql}}} @$commands]);
+        } if $pipeline;
         ok(failure(sub {$adapter->execute_query($read)}),'cleanup failure is typed');
     }
     ok(!$owned->{Active},'an unended read connection is closed');

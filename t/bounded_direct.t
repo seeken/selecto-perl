@@ -85,10 +85,11 @@ subtest 'PostgreSQL direct bounded execution' => sub {
         return {trips => scalar(grep { /\tB\t\d+\tReadyForQuery/ } @lines),
             pings => scalar(grep { /\tF\t\d+\tQuery\t "\/\* DBD::Pg ping test/ } @lines)};
     };
-    is_deeply $traced->(sub { Selecto::BoundedQuery->all($engine, $page, max_rows => 10_000) }), {trips => 4, pings => 1},
-        'four round trips: the state check, the savepoint with its timeout, the query, the rollback';
-    is_deeply $traced->(sub { $engine->adapter->execute_query(statement('SELECT 1 AS n')) }), {trips => 2, pings => 1},
-        'a read outside a new savepoint still asks where it runs';
+    my $local_status = $dbh->can('pg_transaction_status') ? 1 : 0;
+    is_deeply $traced->(sub { Selecto::BoundedQuery->all($engine, $page, max_rows => 10_000) }), {trips => $local_status ? 3 : 4, pings => $local_status ? 0 : 1},
+        'savepoint, query and rollback; older drivers also ping';
+    is_deeply $traced->(sub { $engine->adapter->execute_query(statement('SELECT 1 AS n')) }), {trips => $local_status ? 1 : 2, pings => $local_status ? 0 : 1},
+        'a read outside a new savepoint checks the current transaction state';
     ok eval { $dbh->do('SELECT pg_sleep(0.05)'); 1 }, 'the host transaction runs on under its own timeout';
     my $all = Selecto::BoundedQuery->all($engine, $engine->query->select('id')->order_by('id'), max_rows => 10_000);
     is scalar(@{$all->{rows}}), 150, 'a result larger than one batch still streams';
