@@ -439,3 +439,4 @@ t/read_lane_typed_children.t
 lib/Selecto/API/NestedDetail.pm
 t/api_nested_detail.t
 t/fixtures/canonical_nested_detail_v1.json
+t/pg_pipeline_live.t
