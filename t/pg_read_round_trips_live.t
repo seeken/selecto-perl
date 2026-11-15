@@ -11,6 +11,8 @@ use TestPostgreSQL;
 
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not configured' unless TestPostgreSQL->configured;
 plan skip_all => 'DBD::Pg required' unless eval { require DBD::Pg; 1 };
+# PQtrace uses primitive reads/writes before libpq 14, message rows thereafter.
+my $frontend_message=qr/(?:\tF\t|^To backend> Msg [A-Z]$)/m;
 sub statement {
     return Selecto::Statement->new(sql=>$_[0],params=>$_[1]//[],columns=>$_[2]//['n'],adapter_name=>'postgresql');
 }
@@ -38,7 +40,7 @@ subtest 'local encoding refresh is current and preserves every driver mode' => s
         my $dbh=TestPostgreSQL->connect(pg_enable_utf8=>$mode);
         my $a=Selecto::PostgreSQL->new(dbh=>$dbh);
         my $protocol=trace($dbh,sub {$a->_pg_require_utf8});
-        unlike($protocol,qr/\tF\t/,"mode $mode: UTF8 check sends nothing");
+        unlike($protocol,$frontend_message,"mode $mode: UTF8 check sends nothing");
         is($dbh->{pg_enable_utf8},$mode,"mode $mode: mode preserved after acceptance");
         is($dbh->{pg_utf8_flag},$mode==0?0:1,"mode $mode: result-decoding flag preserved");
         $dbh->do(q{SET client_encoding='LATIN1'});
@@ -46,7 +48,7 @@ subtest 'local encoding refresh is current and preserves every driver mode' => s
             my $error=failure(sub {$a->_pg_require_utf8});
             is($error->details->{reason},'client_encoding',"mode $mode: change after acceptance is caught");
         });
-        unlike($protocol,qr/\tF\t/,"mode $mode: refusal sends nothing");
+        unlike($protocol,$frontend_message,"mode $mode: refusal sends nothing");
         is($dbh->{pg_enable_utf8},$mode,"mode $mode: mode preserved after refusal");
         is($dbh->{pg_utf8_flag},$mode==1?1:0,"mode $mode: forced decoding is preserved, automatic decoding is refreshed");
         $dbh->do(q{SET client_encoding='UTF8'});

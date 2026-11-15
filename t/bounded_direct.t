@@ -81,9 +81,11 @@ subtest 'PostgreSQL direct bounded execution' => sub {
         close $fh;
         die $error unless $ok;
         open my $read, '<', $path or die $!;
-        my @lines = <$read>;
-        return {trips => scalar(grep { /\tB\t\d+\tReadyForQuery/ } @lines),
-            pings => scalar(grep { /\tF\t\d+\tQuery\t "\/\* DBD::Pg ping test/ } @lines)};
+        my $wire = do { local $/; <$read> };
+        # Before libpq 14, PQtrace logs primitive reads. Match the completed
+        # ReadyForQuery including its state, not a peek at its header.
+        return {trips => scalar(() = $wire =~ /(?:\tB\t\d+\tReadyForQuery|^From backend> Z\nFrom backend \(#4\)> 5\nFrom backend> [ITE]$)/gm),
+            pings => scalar(() = $wire =~ /(?:\tF\t\d+\tQuery\t |^To backend> )"\/\* DBD::Pg ping test/gm)};
     };
     my $local_status = $dbh->can('pg_transaction_status') ? 1 : 0;
     is_deeply $traced->(sub { Selecto::BoundedQuery->all($engine, $page, max_rows => 10_000) }), {trips => $local_status ? 3 : 4, pings => $local_status ? 0 : 1},
