@@ -25,6 +25,7 @@ WriteMakefile(
         'Math::BigInt' => 0,
         'Math::BigRat' => 0,
         'Math::BigFloat' => 0,
+        'MIME::Base64' => 0,
         'Mojolicious' => '9.49',
         'Scalar::Util'=> 0,
         'Storable'    => 0,

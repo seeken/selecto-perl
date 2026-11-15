@@ -981,13 +981,24 @@ sub _compile_mutation_default {
 
 sub _compile_related_collection_sql {
     my ($self, $spec) = @_;
+    # SQLite uses positional '?' parameters. Retain the bounded policy source
+    # once, then measure and aggregate that same source; duplicating its SQL
+    # would duplicate placeholders without duplicating the governed bindings.
+    my $source;
+    if (defined $self->{_selecto_collection_json_budget}) {
+        $source = '(WITH __selecto_nested_projection AS MATERIALIZED (SELECT * FROM '
+            . $spec->{from} . ' WHERE ' . $spec->{where} . ') SELECT ';
+        $spec = {%$spec, from => '__selecto_nested_projection AS ' . $spec->{quoted_alias}, where => 'TRUE'};
+    }
     my @pairs = $self->_related_collection_json_pairs($spec->{fields}, $spec->{quoted_alias});
     Selecto::Error->throw('unsupported_feature', 'SQLite JSON functions are unavailable')
         if eval { $self->dbh->isa('DBI::db') } && !$self->_json_available;
-    return '(SELECT JSON_GROUP_ARRAY(JSON(__selecto_children.record)) FROM '
+    my $sql = '(SELECT JSON_GROUP_ARRAY(JSON(__selecto_children.record)) FROM '
         . '(SELECT JSON_OBJECT(' . join(', ', @pairs) . ') AS record FROM ' . $spec->{from}
         . ' WHERE ' . $spec->{where} . (defined($spec->{order}) ? ' ORDER BY ' . $spec->{order} : '')
         . ') AS __selecto_children)';
+    $sql = $self->_guard_collection_json($sql, $spec);
+    return defined($source) ? $source . $sql . ')' : $sql;
 }
 
 sub _related_collection_order_term {

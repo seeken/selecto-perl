@@ -428,6 +428,19 @@ engine; complete Domain publication remains opt-in. The sibling
 shows the same reader behind native HTMX and Vue, including its current
 unsupported wire features and real PostgreSQL verification.
 
+`Selecto::API::NestedDetail` publishes `canonical_nested_detail.v1` for one
+configured direct to-many association on the same governed engine. Alternatively,
+compose it with an explorer host using `nested_detail => {collection => 'lines'}`.
+Its manifest adds `getNestedDetailFeatures`; the existing `/query` route selects
+nested validation when `Selecto-Nested-Detail-Context` is present. The HTTP mount
+must pass original UTF-8 `raw_body` bytes and that header, and bound incoming
+bodies to one MiB. Success returns at most 25 parents with 20 complete children
+each, typed array/object rows and an echoed publication context. Oversized
+children, hidden fields and unrepresentable values refuse the whole query.
+Generic v1 requests keep their existing behavior. The normative contract and
+ND001–ND015 fixtures live in the sibling certification harness's
+[`docs/canonical_nested_detail.md`](../selecto_backend_certification/docs/canonical_nested_detail.md).
+
 `Selecto::API::Spa` serves the Selecto SPA explorer protocol
 (`selecto.spa.*/v1`, spoken by the Vue, React, Svelte and Angular explorers)
 from a host-supplied descriptor and engine. It validates explorer requests

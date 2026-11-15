@@ -707,9 +707,10 @@ sub _compile_related_collection_sql {
     my @pairs = $self->_related_collection_json_pairs($spec->{fields}, $spec->{quoted_alias}, 1);
     my $aggregate = 'JSON_AGG(JSON_BUILD_OBJECT(' . join(', ', @pairs) . ')' .
         (defined($spec->{order}) ? " ORDER BY $spec->{order}" : '') . ')';
-    return $self->_related_collection_aggregate_sql(
+    my $sql = $self->_related_collection_aggregate_sql(
         $aggregate, $spec->{from}, $spec->{where}, q{'[]'::json},
     );
+    return $self->_guard_collection_json($sql, $spec);
 }
 
 sub _compile_dialect_expression {

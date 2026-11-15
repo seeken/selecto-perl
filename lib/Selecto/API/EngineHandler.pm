@@ -35,6 +35,10 @@ has default_limit     => 100;
 has max_write_count   => 1000;
 has limits => sub { Selecto::Limits->new };
 has bounded_results => 0;
+# Selected complete nested profiles must page parents before fetching children:
+# the unreturned lookahead parent's collection cannot consume the page budget.
+has collection_parent_lookahead => 0;
+has collection_json_budget => undef;
 # Trusted host extensions, off for the public canonical API (Selecto::API):
 # nested any/all filter groups and aggregate select entries. Explorer
 # protocols such as Selecto::API::Spa enable them on their own handler.
@@ -69,7 +73,10 @@ sub new ($class, @args) {
             && $self->bounded_results =~ /\A[01]\z/;
     Selecto::Error->throw('invalid_api_handler', 'limits must be a Selecto::Limits')
         unless blessed($self->limits) && $self->limits->isa('Selecto::Limits');
-    for my $name (qw(filter_groups aggregate_selections explorer_extensions)) {
+    Selecto::Error->throw('invalid_api_handler', 'collection_json_budget must be positive')
+        if defined($self->collection_json_budget) && (ref($self->collection_json_budget)
+            || $self->collection_json_budget !~ /\A[1-9][0-9]{0,8}\z/);
+    for my $name (qw(filter_groups aggregate_selections explorer_extensions collection_parent_lookahead)) {
         Selecto::Error->throw('invalid_api_handler', "$name must be a trusted boolean")
             unless defined($self->$name) && !ref($self->$name) && $self->$name =~ /\A[01]\z/;
     }
@@ -691,11 +698,24 @@ sub _query ($self, $engine, $body, %options) {
     # A zero-sized page still validates the compiled query, but does not fetch
     # data. SQL Server cannot execute FETCH NEXT 0, so compile with one solely
     # to obtain validated column metadata; never execute that statement.
+    my %collection_budget = defined($self->collection_json_budget) && @subtables && $limit > 0
+        ? (collection_json_budget => int($self->collection_json_budget / $limit) || 1) : ();
+    my $parent_has_more;
+    if ($self->collection_parent_lookahead && $self->bounded_results && @subtables && $limit > 0) {
+        # Admit the complete child plan before any SQL, including its policy.
+        Selecto::BoundedQuery->prepare($engine, $query, limits => $self->limits, %collection_budget);
+        my $key = $domain->primary_key;
+        Selecto::Error->throw('invalid_api_query', 'parent paging requires a primary key') unless defined $key;
+        my $peek = $query->_copy(selections => [Selecto::Expression->field($key)])->limit($limit + 1);
+        my $parents = Selecto::BoundedQuery->all($engine, $peek, limits => $self->limits,
+            max_rows => $limit + 1, canonical_values => 1);
+        $parent_has_more = @{$parents->{rows}} > $limit ? 1 : 0;
+    }
     my $result = $limit == 0
         ? {columns => $engine->compile($paged->(1))->columns, rows => []}
         : $self->bounded_results
-            ? Selecto::BoundedQuery->all($engine, $paged->($limit + 1), limits => $self->limits,
-                max_rows => $limit + 1, canonical_values => 1)
+            ? Selecto::BoundedQuery->all($engine, $paged->(defined($parent_has_more) ? $limit : $limit + 1), limits => $self->limits, %collection_budget,
+                max_rows => defined($parent_has_more) ? $limit : $limit + 1, canonical_values => 1)
         : $engine->all($paged->($limit + 1), $options{export_scalars} ? (export_scalars => 1) : (canonical_values => 1));
     Selecto::Error->throw(
         'invalid_api_host', 'Selecto adapter returned an invalid result',
@@ -703,8 +723,8 @@ sub _query ($self, $engine, $body, %options) {
         && ref($result->{columns}) eq 'ARRAY'
         && ref($result->{rows}) eq 'ARRAY';
     splice @{$result->{rows}}, 0, $offset if $summary;
-    my $has_more = @{$result->{rows}} > $limit;
-    splice @{$result->{rows}}, $limit if $has_more;
+    my $has_more = defined($parent_has_more) ? $parent_has_more : @{$result->{rows}} > $limit;
+    splice @{$result->{rows}}, $limit if $has_more && !defined($parent_has_more);
     _shape_result_rows($result, \@subtables, $row_format, $self->limits);
     my %subtable_metadata = map {
         $_->{column} => {columns => [@{$_->{columns}}], limit => $_->{limit}, complete => JSON::PP::true}

@@ -14,6 +14,7 @@ use Scalar::Util qw(blessed);
 use Selecto::API ();
 use Selecto::API::EngineHandler ();
 use Selecto::API::RemoteQuery ();
+use Selecto::API::NestedDetail ();
 use Selecto::API::ResultFormatter ();
 use Selecto::DateShortcut ();
 use Selecto::Error ();
@@ -76,6 +77,8 @@ has supports => sub { +{} };
 has services => sub { +{} };
 has links => sub { +{} };
 has publish_domain => 0;
+# Explicit direct collection publication; ordinary explorer mounts are unchanged.
+has nested_detail => undef;
 # Optional host callback around an accepted export (after every refusal the
 # profile orders before execution, including the export format's 406/501):
 # $guard->($format, $run). $run->() executes the export and encodes it, and
@@ -133,7 +136,9 @@ sub new ($class, @args) {
         if defined($self->export_guard) && ref($self->export_guard) ne 'CODE';
     _host_error('engine_limits must be a Selecto::Limits')
         unless blessed($self->engine_limits) && $self->engine_limits->isa('Selecto::Limits');
-    $self->{remote} = Selecto::API::RemoteQuery->new(base_path => $base,
+    _host_error('nested_detail must be an object') if defined($self->nested_detail) && ref($self->nested_detail) ne 'HASH';
+    my $remote_class = $self->nested_detail ? 'Selecto::API::NestedDetail' : 'Selecto::API::RemoteQuery';
+    $self->{remote} = $remote_class->new(($self->nested_detail ? (%{$self->nested_detail}, id => $self->id, publication => $self->publication) : ()), base_path => $base,
         publish_domain => $self->publish_domain, limits => $self->engine_limits,
         max_limit => $limits{max_limit}, default_limit => $self->default_limit);
     return $self;
