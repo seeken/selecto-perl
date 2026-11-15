@@ -477,7 +477,8 @@ sub _pg_pipeline_available {
         || keys %{$dbh->{Callbacks} // {}} || $dbh->{HandleError} || $dbh->{HandleSetErr}
         || $SIG{__WARN__};
     return 0 if $self->can('_execute_statement') != Selecto::SQL->can('_execute_statement');
-    return $dbh->can('pg_pipeline') && $dbh->can('pg_transaction_status');
+    return $dbh->can('pg_pipeline') && $dbh->can('pg_transaction_status')
+        && (!$dbh->can('pg_can_pipeline') || $dbh->pg_can_pipeline);
 }
 
 # Use libpq's local transaction state when supported, otherwise retain the
@@ -1760,8 +1761,13 @@ With no transaction open, a read is a transaction of its own:
 C<BEGIN READ ONLY NOT DEFERRABLE>, the query, C<ROLLBACK>. When DBD::Pg exposes
 C<pg_transaction_status>, the ownership check uses local libpq state; older
 drivers retain C<pg_ping> to detect raw host transactions. When it also exposes
-C<pg_pipeline>, ordinary materialized reads send that entire frame without an
-intermediate wait. An error boundary before ROLLBACK makes cleanup run after a
+C<pg_pipeline>, ordinary materialized reads can send that entire frame without an
+intermediate wait. If the driver exposes C<pg_can_pipeline>, it must return true:
+this selects supported builds and loaded libpq libraries and honors the handle's
+C<pg_pipeline =E<gt> 0> opt-out. Unsupported or disabled handles use sequential
+execution without a pipeline error. Earlier pipeline drivers without
+C<pg_can_pipeline> are selected by method presence alone.
+An error boundary before ROLLBACK makes cleanup run after a
 failed read; successful cleanup and idle state are required before returning.
 A failed cleanup disconnects the handle. Streams, locking reads, handle or
 adapter subclasses, and handles with DBI callbacks/error handlers or a custom

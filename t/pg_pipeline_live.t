@@ -12,6 +12,12 @@ use TestPostgreSQL;
 plan skip_all => 'PostgreSQL not configured' unless TestPostgreSQL->configured;
 plan skip_all => 'DBD::Pg unavailable' unless eval {require DBD::Pg;1};
 
+# PQtrace's text format changed in libpq 14. Accept the protocol message in
+# either format so the sequential fallback is also checked with older libpq.
+my $query_message=qr/(?:\tQuery\t|^To backend> Msg Q$)/m;
+my $parse_message=qr/(?:\tParse\t|^To backend> Msg P$)/m;
+my $frontend_message=qr/(?:\tF\t|^To backend> Msg [A-Z]$)/m;
+
 # Model a handle whose driver predates both methods, with the same patched
 # driver underneath so both paths exercise identical binding/conversion code.
 {
@@ -72,13 +78,13 @@ for my $legacy (0,1) {
         });
         is_deeply($r->{rows}[0],[42,'on','héllo'],'bound read and read-only guard');
         is($a->_read_guard_scope,'own','read leaves idle');
-        if (!$legacy && $dbh->can('pg_pipeline')) {
-            like($wire,qr/\tParse\t/, 'pipeline uses extended protocol');
-            unlike($wire,qr/\tQuery\t/, 'status and framing have no simple-protocol query');
+        if ($a->_pg_pipeline_available) {
+            like($wire,$parse_message, 'pipeline uses extended protocol');
+            unlike($wire,$query_message, 'status and framing have no simple-protocol query');
             my ($local)=trace($dbh,sub {$a->_pg_transaction_status});
-            unlike($local,qr/\tF\t/,'status has no wire traffic');
+            unlike($local,$frontend_message,'status has no wire traffic');
         } else {
-            like($wire,qr/\tQuery\t/, 'fallback keeps sequential commands');
+            like($wire,$query_message, 'fallback keeps sequential commands');
         }
         is(error(sub {$a->execute_query(statement('SELECT 1/0'))})->details->{sqlstate},'22012','original error SQLSTATE retained');
         is($a->_read_guard_scope,'own','read error cleanup leaves idle');
@@ -109,4 +115,16 @@ for my $legacy (0,1) {
         ok(!$dbh->{Active},'rollback failure disconnects');
     };
 }
+subtest 'driver opt-out keeps materialized reads sequential' => sub {
+    my $dbh=TestPostgreSQL->connect;
+    plan skip_all => 'driver has no pipeline capability selection' unless $dbh->can('pg_can_pipeline');
+    $dbh->{pg_pipeline}=0;
+    my $a=Selecto::PostgreSQL->new(dbh=>$dbh);
+    ok(!$a->_pg_pipeline_available,'disabled handle selects fallback');
+    my ($wire,$r)=trace($dbh,sub {$a->execute_query(statement('SELECT ?::integer',[42]))});
+    is_deeply($r->{rows},[[42]],'disabled pipeline read succeeds without error');
+    like($wire,$query_message, 'disabled pipeline uses sequential commands');
+    is($a->_read_guard_scope,'own','sequential cleanup leaves idle');
+    $dbh->disconnect;
+};
 done_testing;
