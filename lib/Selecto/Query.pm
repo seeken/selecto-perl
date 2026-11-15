@@ -4,7 +4,16 @@ use 5.034;
 use strict;
 use warnings;
 use Scalar::Util qw(blessed reftype);
-use Storable qw(dclone);
+use Selecto::Frozen ();
+sub dclone { Selecto::Frozen->copy($_[0]) }
+use Hash::Util::FieldHash qw(fieldhash);
+fieldhash my %VERSION;
+my $NEXT_ID = 0;
+sub _version_state {
+    return $VERSION{$_[0]} //= {id => join(":", $$, ++$NEXT_ID), version => 0};
+}
+sub version { return $_[0]->_version_state->{version}; }
+sub identity { return $_[0]->_version_state->{id}; }
 use DateTime::TimeZone ();
 use Selecto::Error ();
 use Selecto::Expression ();
@@ -24,6 +33,7 @@ sub new {
 sub _build {
     my ($class, $given, $share_library) = @_;
     my %args = %$given;
+    my $freeze = delete $args{freeze};
     my %allowed = map { $_ => 1 } qw(
         selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
         set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
@@ -109,7 +119,7 @@ sub _build {
             if $key ne 'subqueries';
         $extra{$key} = [map { _clone_source_plan($_) } @$plans];
     }
-    return bless {
+    my $self = bless {
         %extra,
         selections  => [@{$args{selections} // []}],
         predicate   => $args{predicate},
@@ -136,7 +146,12 @@ sub _build {
             ordering => undef, views => [],
         }),
     }, $class;
+    $self->_version_state->{freeze} = defined($freeze) ? $freeze : ($ENV{SELECTO_PERL_FREEZE_DOMAINS} // 0);
+    return $self;
 }
+
+sub freeze { require Selecto::Frozen; return Selecto::Frozen->freeze($_[0]); }
+sub frozen_identity { require Selecto::Frozen; return Selecto::Frozen->identity($_[0]); }
 
 sub select {
     my ($self, @values) = @_;
@@ -749,6 +764,7 @@ sub _nonnegative {
 sub _copy {
     my ($self, %changes) = @_;
     my %state = (
+        freeze => $self->_version_state->{freeze},
         selections   => $self->{selections},
         predicate    => $self->{predicate},
         groups       => $self->{groups},
@@ -773,6 +789,7 @@ sub _copy {
     # A subclass with its own constructor still receives every copy through it.
     my $copy = $class->can('new') != \&new ? $class->new(%state)
         : $class->_build(\%state, !exists($changes{applied_query_library}) && defined($self->{applied_query_library}));
+    $copy->_version_state->{version} = $self->version + 1;
     return Selecto::QueryBinding->inherit($self, $copy);
 }
 

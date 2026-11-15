@@ -13,6 +13,9 @@ use lib 't/lib';
 use TestSelecto;
 
 local $ENV{SELECTO_PERL_PLAN_CACHE} = 1;
+# Retain the original mutable snapshot-key adversarial corpus. The frozen
+# identity path and its mutation refusals have their own companion corpus.
+local $ENV{SELECTO_PERL_FREEZE_DOMAINS} = 0;
 my $json = JSON::PP->new->canonical->allow_nonref;
 plan skip_all => 'DBD::SQLite is not installed' unless eval { require DBD::SQLite; 1 };
 my $dbh = DBI->connect('dbi:SQLite:dbname=:memory:', '', '', {RaiseError=>1, PrintError=>0});

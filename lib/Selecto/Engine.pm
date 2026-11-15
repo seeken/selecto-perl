@@ -51,6 +51,10 @@ sub _read_authority {
 # host's business, as with any object it holds.
 my $seal_domain = sub {
     my ($self) = @_;
+    if ($self->{domain}->is_frozen) {
+        Selecto::Frozen->freeze($self->{$_}) for grep { defined $self->{$_} }
+            qw(scope write_context tenant_context tenant_required_filters limits);
+    }
     $CONFIGURED_DOMAIN{$self} = {};
     return $self;
 };
@@ -386,6 +390,7 @@ sub with_limits {
     my ($self, $limits) = @_;
     $self->assert_domain_identity;
     my $copy = bless {%$self, limits => $self->{limits}->intersect($limits)}, ref($self);
+    Selecto::Frozen->freeze($copy->{limits}) if $copy->{domain}->is_frozen;
     $CONFIGURED_DOMAIN{$copy} = {%{$CONFIGURED_DOMAIN{$self}}};
     return Selecto::QueryBinding->inherit_engine($self, $copy, flat_input => 1);
 }
@@ -454,7 +459,7 @@ sub domain  { $_[0]->assert_domain_identity; return $_[0]->{domain}; }
 sub adapter { return $_[0]->{adapter}; }
 sub domain_ref { return $_[0]->{domain_ref}; }
 sub query_mode { $_[0]->assert_domain_identity; return $_[0]->{query_mode}; }
-sub query   { $_[0]->assert_domain_identity; return Selecto::QueryBinding->bind($_[0], Selecto::Query->new); }
+sub query   { my ($self, %options) = @_; $self->assert_domain_identity; return Selecto::QueryBinding->bind($self, Selecto::Query->new(%options)); }
 sub write {
     my ($self, @args) = @_;
     $self->assert_domain_identity;
@@ -572,6 +577,7 @@ sub read_domain {
         }
         $domain;
     };
+    $read->_finish_freeze(1) if $self->{domain}->is_frozen;
     $self->{_read_domain} = $read;
     return $read;
 }

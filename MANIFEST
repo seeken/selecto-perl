@@ -445,3 +445,5 @@ lib/Selecto/SQL/ReadPlan.pm
 t/read_plan_cache.t
 docs/read_plan_cache.md
 t/read_plan_session_live.t
+lib/Selecto/Frozen.pm
+t/frozen_read_plans.t

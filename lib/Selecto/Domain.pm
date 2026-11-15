@@ -10,7 +10,8 @@ use Cpanel::JSON::XS ();
 use Selecto::CanonicalJSON ();
 use Hash::Util::FieldHash qw(fieldhash);
 use Scalar::Util qw(blessed refaddr);
-use Storable qw(dclone);
+use Selecto::Frozen ();
+sub dclone { Selecto::Frozen->copy($_[0]) }
 use Selecto::Error ();
 use Selecto::ConfiguredDomain ();
 use Selecto::DataRules ();
@@ -60,7 +61,16 @@ sub new {
     my ($class, %args) = @_;
     my $self = $class->_construct(%args);
     $self->validate_query_library;
-    return $self;
+    return $self->_finish_freeze($args{freeze});
+}
+
+sub freeze { return Selecto::Frozen->freeze($_[0]); }
+sub frozen_identity { return Selecto::Frozen->identity($_[0]); }
+sub is_frozen { return defined $_[0]->frozen_identity; }
+sub _finish_freeze {
+    my ($self, $option) = @_;
+    my $enabled = defined($option) ? $option : ($ENV{SELECTO_PERL_FREEZE_DOMAINS} // 0);
+    return $enabled ? $self->freeze : $self;
 }
 
 # Canonical parsing attaches its full schema graph before library validation.
@@ -238,7 +248,7 @@ sub with_required_predicate {
     _check_predicate_depth($predicate);
     my $copy = bless {%$self}, ref($self);
     $copy->{required_predicate} = $predicate;
-    return $copy->_refresh_fingerprint;
+    return $copy->_refresh_fingerprint->_finish_freeze($self->is_frozen);
 }
 
 # Some hosts have role-dependent ownership boundaries over the same relation.
@@ -251,7 +261,7 @@ sub with_tenant_field {
         unless exists $self->{fields}{$field};
     my $copy = bless {%$self}, ref($self);
     $copy->{tenant_field} = $field;
-    return $copy->_refresh_fingerprint;
+    return $copy->_refresh_fingerprint->_finish_freeze($self->is_frozen);
 }
 
 # Action prerequisite columns (can_<action>) a host must not show this request,
@@ -285,7 +295,7 @@ sub without_action_prerequisites {
         $copy->{components} = dclone($self->{components});
         delete @{$copy->{components}{filter_choices}}{@remove};
     }
-    return $copy->_refresh_fingerprint;
+    return $copy->_refresh_fingerprint->_finish_freeze($self->is_frozen);
 }
 
 # {action id => field} for the action prerequisite columns this domain has.
@@ -305,6 +315,12 @@ sub action_prerequisite_fields {
 }
 
 sub parse {
+    my ($class, $document, %options) = @_;
+    my $domain = $class->_parse_unfrozen($document, %options);
+    return $domain->_finish_freeze($options{freeze});
+}
+
+sub _parse_unfrozen {
     my ($class, $document, %options) = @_;
     my $strict = exists($options{strict}) ? $options{strict} : 1;
     my $raw;
@@ -328,7 +344,7 @@ sub parse {
         my $fingerprint = Selecto::Domain::SchemaV2->fingerprint($raw);
         my $v1 = Selecto::Domain::SchemaV2->to_version_1($raw);
         $v1->{domain_fingerprint} = $fingerprint;
-        my $domain = $class->parse($v1, %options);
+        my $domain = $class->_parse_unfrozen($v1, %options);
         $domain->{schema_version} = 2;
         $domain->{fingerprint} = $fingerprint;
         # The schema 2 document itself, for as_document and compose.
@@ -364,6 +380,7 @@ sub parse {
     _required_key($raw->{source}, 'table', 'source');
     _required_key($raw->{source}, 'fields', 'source');
     my $domain = $class->new(
+        freeze => 0,
         name => $raw->{name},
         table => $raw->{source}{table},
         fields => $raw->{source}{fields},
@@ -657,6 +674,11 @@ sub _tenant_family {
 
 sub _canonical_associations {
     my ($relation, $schemas, $joins, $strict, $prefix, $family, $anchors) = @_;
+    # Lazy maps normalize column metadata while building. Work on an owned
+    # copy when the schema graph has already been finalized.
+    if (tied(%$relation) || tied(%$schemas)) {
+        ($relation, $schemas, $joins) = @{dclone([$relation, $schemas, $joins])};
+    }
     # Lessons 41a and 41b: in a tenant family every hop pairs a target's
     # tenant column only with a column of its own name that anchors the
     # parent (the root's two columns; a nested or rebuilt hop's own tenant
@@ -1378,6 +1400,7 @@ sub resolve_association {
             $associations = $association->associations;
         }
     }
+    Selecto::Frozen->freeze($_) for $self->is_frozen ? @resolved : ();
     return {
         association => $resolved[-1],
         associations => \@resolved,

@@ -55,7 +55,7 @@ my $calls=0;
 {package LibraryHook;use overload '""'=>sub{$calls++;'hook'},'bool'=>sub{$calls++;1},fallback=>1;sub isa{$calls++;1}sub STORABLE_freeze{$calls++;die 'hook'} }
 my $hook=bless {},'LibraryHook';
 for my $bad ($hook,sub{$calls++}) {
- my $mutated=Selecto::Domain->new(name=>'Records',table=>'records',fields=>{id=>'integer'});
+ my $mutated=Selecto::Domain->new(freeze=>0,name=>'Records',table=>'records',fields=>{id=>'integer'});
  $mutated->{query_library}={segments=>{unsafe=>{parameters=>{p=>$bad}}}};$events=0;
  $error=caught(sub{Selecto::QueryLibrary->parameter_specs($mutated,segments=>['unsafe'])});is($error->code,'invalid_query_library','direct public parameter inspection admits metadata before clone/encode hooks');is($events,0,'malformed direct metadata performs no native work');
 }

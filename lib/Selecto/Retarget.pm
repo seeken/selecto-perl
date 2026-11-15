@@ -107,8 +107,9 @@ sub target_domain {
             sets => [map { [@{$_->[1]}] } grep { !$family || $_->[0] eq $family->{tenant} } @$sets],
         }}, ref($relation_domain);
     }
-    return Selecto::QueryMember->bound_source_domain($domain, $relation_domain,
+    my $bound = Selecto::QueryMember->bound_source_domain($domain, $relation_domain,
         label => "retarget to $target->{path}", tenant => $options{tenant}, chained_site => 1);
+    return $bound->_finish_freeze($domain->is_frozen);
 }
 
 # The target relation as an unscoped domain: its fields, associations, and
@@ -134,12 +135,13 @@ sub relation_domain {
         $document{redact_fields} = \@redacted if @redacted;
         # The target's hops pair by name in the root's tenant family.
         local $Selecto::Domain::DERIVED_TENANT_FAMILY = $domain->tenant_family;
-        return Selecto::Domain->parse(\%document);
+        return Selecto::Domain->parse(\%document, freeze => $domain->is_frozen);
     }
     # Directly constructed domains carry their relationships as nested
     # associations and declare no tenant field on related relations, so the
     # context (which always carries the root scope) bounds the target.
     return Selecto::Domain->new(
+        freeze => $domain->is_frozen,
         name => $domain->name,
         table => $association->table,
         fields => $association->fields,

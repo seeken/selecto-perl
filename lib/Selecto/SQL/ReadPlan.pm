@@ -7,6 +7,9 @@ no overloading;
 use Scalar::Util qw(blessed refaddr reftype);
 use Cpanel::JSON::XS ();
 use JSON::PP ();
+use Hash::Util::FieldHash qw(fieldhash);
+use Selecto::Frozen ();
+
 use Digest::SHA qw(sha256_hex);
 use Selecto::Statement ();
 use Selecto::QueryEnforcement ();
@@ -80,7 +83,7 @@ sub compile {
 }
 
 # A separate native snapshot, not the domain's cached public fingerprint.
-# No serialization hooks, overloads, ties or subclass methods may run here.
+# No serialization hooks, overloads, foreign ties or subclass methods run here.
 # Failure is a cache bypass, so the reference compiler owns refusal order.
 sub _plain {
     my ($value, $state, $depth) = @_;
@@ -98,7 +101,7 @@ sub _plain {
     die "bypass\n" if $state->{active}{$id};
     local $state->{active}{$id} = 1;
     if ($type eq 'HASH') {
-        die "bypass\n" if tied %$value;
+        die "bypass\n" if tied(%$value) && !($state->{frozen} && ref(tied(%$value)) eq "Selecto::Frozen::Hash");
         my @keys = keys %$value;
         die "bypass\n" if ($state->{nodes} += @keys) > 4096;
         return [$class, {map { $_ => ref($value->{$_})
@@ -151,6 +154,15 @@ sub _predicate {
 
 sub _key {
     my ($adapter, $domain, $query) = @_;
+    if (ref($domain) eq "Selecto::Domain" && $domain->is_frozen) {
+        my $key = eval { _fast_key($adapter, $domain, $query) };
+        return $key if defined $key;
+    }
+    return _snapshot_key(@_);
+}
+
+sub _snapshot_key {
+    my ($adapter, $domain, $query) = @_;
     return unless (ref($adapter) eq 'Selecto::PostgreSQL' || ref($adapter) eq 'Selecto::SQLite')
         && ref($domain) eq 'Selecto::Domain' && ref($query) eq 'Selecto::Query';
     return if $adapter->{canonical_sql} || defined($query->{timezone}) || defined($query->{row_lock})
@@ -161,7 +173,7 @@ sub _key {
     # Bound preflight; cycles/unknown native state are a bypass, never an error.
     my $key = eval {
         my $engine = $adapter->{_selecto_compile_engine};
-        my $state = {nodes => 0, bytes => 0, active => {}};
+        my $state = {nodes => 0, bytes => 0, active => {}, frozen => $domain->is_frozen};
         my $snapshot = _plain([$domain, $engine ? $engine->_read_authority : undef,
             $adapter->{_selecto_compile_limits}], $state, 0);
         die "bypass\n" if grep { !_field($_, $domain) } @{$query->{selections}};
@@ -182,6 +194,76 @@ sub _key {
     };
     return $key;
 }
+
+# Only immutable native domains, query/authority/limits
+# receive an integer key. Static eligibility is memoized with the query; all
+# renderer obligations and engine/governance admission still run every call.
+fieldhash my %DOMAIN_ADMISSION;
+fieldhash my %QUERY_ADMISSION;
+sub _fast_key {
+    my ($adapter, $domain, $query) = @_;
+    return unless (ref($adapter) eq 'Selecto::PostgreSQL' || ref($adapter) eq 'Selecto::SQLite')
+        && ref($query) eq 'Selecto::Query';
+    return if $adapter->{canonical_sql};
+    my $qid = $query->_version_state;
+    return unless $query->frozen_identity || $qid->{freeze};
+    my $did = $domain->frozen_identity;
+    unless ($DOMAIN_ADMISSION{$domain}) {
+        _plain($domain, {nodes => 0, bytes => 0, active => {}, frozen => 1}, 0);
+        $DOMAIN_ADMISSION{$domain} = 1;
+    }
+    unless ($QUERY_ADMISSION{$query}) {
+        # Explicitly sealed queries need the same native-record admission as
+        # queries sealed here. Immutability alone does not admit custom code.
+        _plain($query, {nodes => 0, bytes => 0, active => {}, frozen => 1}, 0);
+    }
+    # Eligibility depends on this immutable domain and this immutable query.
+    # Keep only a bounded one-domain memo per query, never the domain object.
+    if (($qid->{domain} // '') ne $did) {
+        $qid->{domain} = $did;
+        $qid->{eligible} = 0;
+        return if defined($query->{timezone}) || defined($query->{row_lock})
+            || defined($query->{retarget}) || $query->{grouping_mode} ne 'plain';
+        return if grep { @{$query->{$_}} } qw(groups set_operations ctes values_sources subqueries function_laterals
+            lateral_joins json_rowsets array_rowsets members);
+        return unless @{$query->{selections}};
+        return if grep { !_field($_, $domain) } @{$query->{selections}};
+        return unless _predicate($query->{predicate}, $domain) && _predicate($domain->{required_predicate}, $domain);
+        return if grep { !_field($_->[0], $domain) } @{$query->{orders}};
+        $query->freeze unless $query->frozen_identity;
+        $QUERY_ADMISSION{$query} = 1;
+        $qid->{eligible} = 1;
+    }
+    return unless $qid->{eligible};
+    my $engine = $adapter->{_selecto_compile_engine};
+    my $authority = '';
+    if ($engine) {
+        return unless ref($engine) eq 'Selecto::Engine';
+        return if ref($engine->{query_mode});
+        my @parts;
+        for my $key (qw(scope write_context tenant_context tenant_required_filters)) {
+            my $value = $engine->{$key};
+            return if defined($value) && ref($value) ne "HASH" && ref($value) ne "ARRAY";
+            push @parts, defined($value) ? (Selecto::Frozen->identity($value) // die "bypass\n") : '';
+        }
+        push @parts, $engine->{query_mode};
+        $authority = join '', map { my $v = defined($_) ? "$_" : ''; length($v) . ':' . $v } @parts;
+    }
+    my $limits = $adapter->{_selecto_compile_limits};
+    return if $limits && ref($limits) ne "Selecto::Limits";
+    my $limit_id = $limits ? (Selecto::Frozen->identity($limits) // die "bypass\n") : '';
+    my $version = eval { $adapter->dbh->{pg_server_version} } // '';
+    # Copy optional slots before examining them: grep/map alias their lists
+    # and can create missing Mojo attributes with undef, suppressing defaults.
+    my ($canonical, $mode) = ($adapter->{canonical_values} // 0, $adapter->{transaction_mode} // "managed");
+    return if ref($version) || ref($canonical) || ref($mode);
+    # Length-prefix the handful of scalar components; no hashes or object
+    # addresses are mistaken for immutable identities or authority evidence.
+    return join '', map { my $v = defined($_) ? "$_" : ''; length($v) . ':' . $v }
+        'frozen-v1', $did, $qid->{id}, $qid->{version}, $authority, $limit_id,
+        ref($adapter), $version, $canonical, $mode;
+}
+
 sub _shape {
     my ($value) = @_;
     return $value unless ref $value;
