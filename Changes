@@ -1,5 +1,12 @@
 Revision history for Selecto
 
+0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Repeated where/filter AND predicates; select appends in order, preserving
+      unaliased duplicates. Empty append is a no-op. Use replace_where/clear_where
+      and replace_selections/clear_selections for caller resets. Required domain
+      predicates and trusted tenant scope survive all operations. Explicit alias
+      collisions still refuse; canonical wire validation is unchanged.
+
 0.2.3  Unreleased
     - Added governed trim, structured JSON/array comparisons and related_rows
       expressions for bounded read consumers. SQLite streams retain their

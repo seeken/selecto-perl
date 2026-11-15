@@ -237,9 +237,16 @@ sub _compile_single {
         $with_sql, \@params, $domain, $sources, $physical, \%cte_names, @association_paths,
     );
     my @columns = map { $self->_selection_name($_) } @$selections;
-    my %column_counts;
-    $column_counts{$_}++ for @columns;
-    my @duplicate_columns = sort grep { $column_counts{$_} > 1 } keys %column_counts;
+    my (%column_counts, %explicit_aliases);
+    for my $index (0 .. $#$selections) {
+        $column_counts{$columns[$index]}++;
+        $explicit_aliases{$columns[$index]} = 1 if defined $selections->[$index]->alias_name;
+    }
+    # Repeated unaliased selections are ordered native output, not a mutation
+    # to deduplicate. Explicit aliases must still identify one result column.
+    my @duplicate_columns = sort grep {
+        $column_counts{$_} > 1 && $explicit_aliases{$_}
+    } keys %column_counts;
     Selecto::Error->throw(
         'invalid_query',
         'query selections produce duplicate result column names; provide explicit aliases',

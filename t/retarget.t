@@ -89,6 +89,12 @@ subtest 'query state' => sub {
     is($spec->{path}, 'attendees.orders', 'the path is kept');
     is($spec->{strategy}, 'in', 'in is the default strategy');
     is($spec->{context}->kind, 'eq', 'the earlier predicate is the context');
+    my $target_filtered = $query->where($E->gt('total', 10))->where($E->lt('total', 50));
+    is($target_filtered->predicate->kind, 'and', 'target filters compose conjunctively');
+    is_deeply($target_filtered->clear_where->retarget_spec->{context}, $spec->{context},
+        'clearing target caller filters preserves the origin context');
+    is_deeply($target_filtered->replace_where($E->gt('total', 0))->retarget_spec->{context}, $spec->{context},
+        'replacing target caller filters preserves the origin context');
     is($pg->query->retarget_spec, undef, 'an ordinary query has no retarget');
     is(code_of(sub { $query->retarget('attendees') }), 'invalid_query', 'a query retargets once');
     is(code_of(sub { $pg->query->retarget('attendees', strategy => 'join') }), 'invalid_query',

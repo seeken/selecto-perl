@@ -195,17 +195,21 @@ my $valid_values_write = $values_engine->preview_write(
 is_deeply $valid_values_write->{params}, [10, 'at'],
     'inline-values foreign keys normalize case before validation and SQL generation';
 
+my $duplicate_result = $join_engine->compile($join_engine->query->select(
+    'person.name', 'person.name',
+));
+is_deeply($duplicate_result->columns, ['person.name', 'person.name'],
+    'duplicate unaliased selections preserve result positions');
 my $duplicate_result_error = eval {
     $join_engine->compile($join_engine->query->select(
-        'person.name',
-        'person.name',
+        Selecto::Expression->field('person.name')->as('person.name'), 'person.name',
     ));
     undef;
 } // $@;
 is($duplicate_result_error->code, 'invalid_query',
-    'duplicate default result names fail closed');
+    'explicit alias collisions still fail closed');
 is_deeply($duplicate_result_error->details, {columns => ['person.name']},
-    'duplicate result errors identify the colliding column');
+    'duplicate alias errors identify the colliding column');
 
 my $deep_domain = Selecto::Domain->parse({
     schema_version => 1,

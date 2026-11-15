@@ -191,7 +191,7 @@ sub apply_segments {
             $predicate = Selecto::Expression->all([$existing, $predicate]);
             $predicate->{_query_filter_list} = 1;
         }
-        $query = $query->where($predicate);
+        $query = $query->replace_where($predicate);
     }
     my $applied = $query->applied_query_library;
     _append_unique($applied->{segments}, $_, $context) for @{$resolved->{ids}};

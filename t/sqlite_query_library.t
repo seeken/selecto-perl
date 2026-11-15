@@ -40,9 +40,9 @@ for my $selection (@{$fixtures->{QL002}{segments}}) {
 }
 my $view = $engine->apply_view($engine->query, $fixtures->{QL004}{view}, $fixtures->{QL004}{parameters});
 is_deeply($engine->all($view)->{rows}, [[1,'A','active',3]], 'view casts minimum string to numeric and executes the actual filters');
-my $changed = $view->where($x->eq('visible', 0))->select('name')->replace_orders([['priority','desc']]);
+my $changed = $view->replace_where($x->eq('visible', 0))->replace_selections('name')->replace_orders([['priority','desc']]);
 is_deeply($engine->all($changed)->{rows}, [], 'replacing optional predicate cannot remove domain visibility');
-my $replaced = $view->where($x->gte('priority', 0))->select('name')->replace_orders([['priority','desc']]);
+my $replaced = $view->replace_where($x->gte('priority', 0))->replace_selections('name')->replace_orders([['priority','desc']]);
 is_deeply($engine->all($replaced)->{rows}, [[1,'A'],[2,'B'],[3,'C'],[4,'D']], 'required selected ID and ordering survive later selection and ordering replacement');
 is_deeply($adapter->execute_query($adapter->compile($domain, $replaced))->{rows}, $engine->all($replaced)->{rows}, 'direct adapter compilation preserves the same obligations');
 is_deeply([map { $_->arguments->[0] } @{$replaced->selections}], ['name'], 'compilation preserves immutable optional intent');

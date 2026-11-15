@@ -1,5 +1,12 @@
 # Selecto
 
+Repeated `where` (or `filter`) calls AND predicates in call order. Repeated
+`select` calls append, preserving order and duplicates; empty append is a no-op.
+Use `replace_where` / `clear_where` and `replace_selections` / `clear_selections`
+when resetting caller clauses. Domain required predicates and trusted tenant
+scope always survive. This breaks the former replacement behavior; see
+[Query POD](lib/Selecto/Query.pm) for the native contract and empty query default.
+
 Selecto is a governed data-access layer for Perl applications. You describe a
 table and its relationships once, as a *domain*; Selecto then builds immutable
 queries against that domain, compiles them to parameterized SQL for your
@@ -9,7 +16,7 @@ domain instead of being re-checked in every controller. The core is
 HTTP-neutral: it takes a DBI handle and returns plain Perl data, so it fits
 behind any web framework, job runner or command-line tool.
 
-Selecto is alpha software (version 0.2.3). Its contracts follow the
+Selecto is alpha software (version 0.3.0). Its contracts follow the
 cross-language Selecto protocol, and the PostgreSQL adapter is certified
 against the shared specification suite.
 

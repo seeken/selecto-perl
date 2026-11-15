@@ -108,7 +108,7 @@ sub lookup {
             'invalid_co_domain_lookup', 'lookup scope predicate must be a Selecto expression',
         ) unless blessed($predicate) && $predicate->isa('Selecto::Expression');
     }
-    $query = $query->where(@predicates == 1
+    $query = $query->replace_where(@predicates == 1
         ? $predicates[0] : Selecto::Expression->all(\@predicates));
     if ($search->{rank}) {
         my $orders = $query->orders;

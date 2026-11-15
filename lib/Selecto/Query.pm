@@ -148,7 +148,7 @@ sub select {
     my @expressions = map {
         blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
     } @values;
-    return $self->_copy(selections => \@expressions);
+    return $self->_copy(selections => [@{$self->{selections}}, @expressions]);
 }
 
 # The domain owns the relation graph. Declared associations and query members
@@ -171,11 +171,33 @@ sub join {
 }
 
 sub where {
-    my ($self, $expression) = @_;
+    my ($self, @expressions) = @_;
     $self->_ensure_pre_set_mutation('where');
-    Selecto::Error->throw('invalid_query', 'where expects an expression')
-        unless blessed($expression) && $expression->isa('Selecto::Expression');
-    return $self->_copy(predicate => $expression);
+    return $self unless @expressions;
+    return $self if @expressions == 1 && ref($expressions[0]) eq 'ARRAY' && !@{$expressions[0]};
+    Selecto::Error->throw('invalid_query', 'where expects one expression')
+        unless @expressions == 1 && blessed($expressions[0])
+            && $expressions[0]->isa('Selecto::Expression');
+    my $expression = $expressions[0];
+    return $self->_copy(predicate => defined($self->{predicate})
+        ? Selecto::Expression->all($self->{predicate}, $expression) : $expression);
+}
+
+sub replace_where {
+    my ($self, @expressions) = @_;
+    $self->_ensure_pre_set_mutation('replace_where');
+    return $self->clear_where->where(@expressions);
+}
+
+sub clear_where {
+    my ($self) = @_;
+    $self->_ensure_pre_set_mutation('clear_where');
+    return $self->_copy(predicate => undef);
+}
+
+sub clear_selections {
+    my ($self) = @_;
+    return $self->replace_selections;
 }
 
 sub group_by {
@@ -211,11 +233,7 @@ sub order_by {
 sub replace_selections {
     my ($self, @values) = @_;
     $self->_ensure_pre_set_mutation('replace_selections');
-    @values = @{$values[0]} if @values == 1 && ref($values[0]) eq 'ARRAY';
-    my @expressions = map {
-        blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
-    } @values;
-    return $self->_copy(selections => \@expressions);
+    return $self->_copy(selections => [])->select(@values);
 }
 
 sub replace_orders {
@@ -727,12 +745,10 @@ sub for_share {
     return $self->_copy(row_lock => 'share');
 }
 sub filter {
-    my ($self, $expression) = @_;
-    Selecto::Error->throw('invalid_query', 'filter expects an expression')
-        unless blessed($expression) && $expression->isa('Selecto::Expression');
-    return $self->where(defined($self->predicate)
-        ? Selecto::Expression->all($self->predicate, $expression) : $expression);
+    my ($self, @expressions) = @_;
+    return $self->where(@expressions);
 }
+
 sub select_for_update {
     my ($self, @fields) = @_;
     require Selecto::Write::LockedQuery;
@@ -923,22 +939,44 @@ form exists for tools that rebuild queries and is rarely needed.
   $query->select('id', 'name', Selecto::Expression->count->as('n'));
   $query->select([qw(id name)]);
 
-Sets the selections, replacing any previous ones. Result columns are named by
+Appends selections in order, preserving duplicates. Empty input is a no-op.
+Result columns are named by
 the alias (C<as>) or, for plain fields, by the field path.
 
 =head2 replace_selections
 
-Same as L</select>; provided for code that wants to make replacement
-explicit.
+Replaces caller selections. Empty input restores the empty/default query state.
+C<clear_selections> is the explicit no-argument clearing operation. As before,
+a native Perl query with no selections must select fields before execution.
+
+=head2 clear_selections
+
+  $query->clear_selections->select('id');
+
+Restores the initial empty selection list without changing filters or authority.
 
 =head2 where
 
   $query->where(Selecto::Expression->eq('status', 'open'));
 
-Sets the predicate. B<Calling C<where> again replaces the previous
-predicate>; combine conditions with C<< Selecto::Expression->all(...) >> or
-C<any(...)>. The domain's required predicate and the engine's tenant are
-added at compile time and cannot be removed by a query.
+ANDs the predicate with existing caller filters in call order. C<filter> is an
+alias. Empty input (no argument or C<[]>) is a no-op; OR remains explicit with
+C<any(...)>. C<replace_where($expression)> replaces only the caller predicate;
+C<replace_where()> or C<clear_where> clears it. The domain's required predicate
+and the engine's tenant are added at compile time and cannot be removed by a
+query. Replacement and clearing preserve those guards and retarget context.
+
+=head2 replace_where
+
+  $query->replace_where(Selecto::Expression->eq('id', 7));
+
+Replaces only the caller predicate. No arguments or C<[]> clears it.
+
+=head2 clear_where
+
+  $query->clear_where;
+
+Restores the unfiltered caller state, retaining domain and tenant predicates.
 
 =head2 group_by
 
