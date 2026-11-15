@@ -600,10 +600,7 @@ sub _query ($self, $engine, $body, %options) {
         my $filter = @filters == 1
             ? $filters[0]
             : Selecto::Expression->all(\@filters);
-        my $existing = $query->predicate;
-        $query = $query->where($existing
-            ? Selecto::Expression->all([$existing, $filter])
-            : $filter);
+        $query = $query->where($filter);
     }
 
     if (defined $named_ordering) {
