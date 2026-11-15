@@ -14,6 +14,7 @@ requires 'Unicode::Normalize';
 requires 'Math::BigInt';
 requires 'Math::BigRat';
 requires 'Math::BigFloat';
+requires 'MIME::Base64';
 requires 'Mojolicious', '9.49';
 requires 'Scalar::Util';
 requires 'Storable';

@@ -1,0 +1,1447 @@
+{
+  "domain": {
+    "schema_version": 1,
+    "domain_version": "1",
+    "domain_fingerprint": "sha256:nested-detail-fixture-v1",
+    "name": "Nested parents",
+    "source": {
+      "source_table": "selecto_cert_nd_parents",
+      "primary_key": "id",
+      "tenant_field": "tenant_id",
+      "fields": [
+        "id",
+        "tenant_id",
+        "name",
+        "visible",
+        "secret"
+      ],
+      "columns": {
+        "id": {
+          "type": "integer",
+          "nullable": false
+        },
+        "tenant_id": {
+          "type": "integer",
+          "nullable": false,
+          "internal": true
+        },
+        "name": {
+          "type": "string",
+          "nullable": false
+        },
+        "visible": {
+          "type": "integer",
+          "nullable": false,
+          "internal": true
+        },
+        "secret": {
+          "type": "string",
+          "nullable": false,
+          "internal": true
+        }
+      },
+      "associations": {
+        "children": {
+          "queryable": "children",
+          "owner_key": "id",
+          "related_key": "parent_id",
+          "cardinality": "many",
+          "where": {
+            "visible": 1
+          }
+        }
+      }
+    },
+    "schemas": {
+      "children": {
+        "source_table": "selecto_cert_nd_children",
+        "primary_key": "id",
+        "tenant_field": "tenant_id",
+        "fields": [
+          "id",
+          "tenant_id",
+          "parent_id",
+          "name",
+          "price",
+          "visible",
+          "secret"
+        ],
+        "columns": {
+          "id": {
+            "type": "integer",
+            "nullable": false
+          },
+          "tenant_id": {
+            "type": "integer",
+            "nullable": false,
+            "internal": true
+          },
+          "parent_id": {
+            "type": "integer",
+            "nullable": false,
+            "internal": true
+          },
+          "name": {
+            "type": "string",
+            "nullable": false
+          },
+          "price": {
+            "type": "decimal",
+            "nullable": false
+          },
+          "visible": {
+            "type": "integer",
+            "nullable": false,
+            "internal": true
+          },
+          "secret": {
+            "type": "string",
+            "nullable": false,
+            "internal": true
+          }
+        },
+        "associations": {}
+      }
+    },
+    "joins": {
+      "children": {
+        "type": "left"
+      }
+    },
+    "required_filters": [
+      [
+        "eq",
+        "visible",
+        1
+      ]
+    ]
+  },
+  "dataset": {
+    "parents": [
+      [
+        1,
+        7,
+        "Parent one",
+        1,
+        "root-secret"
+      ],
+      [
+        2,
+        7,
+        "Empty parent",
+        1,
+        "root-secret"
+      ],
+      [
+        3,
+        8,
+        "Foreign parent",
+        1,
+        "foreign-secret"
+      ],
+      [
+        4,
+        7,
+        "Withheld parent",
+        0,
+        "root-secret"
+      ],
+      [
+        5,
+        7,
+        "Twenty children",
+        1,
+        "root-secret"
+      ],
+      [
+        6,
+        7,
+        "Overflow parent",
+        1,
+        "root-secret"
+      ]
+    ],
+    "children": [
+      [
+        12,
+        7,
+        1,
+        "Child twelve",
+        "2.5",
+        1,
+        "child-secret"
+      ],
+      [
+        11,
+        7,
+        1,
+        "Child eleven",
+        "0.1",
+        1,
+        "child-secret"
+      ],
+      [
+        13,
+        8,
+        1,
+        "FOREIGN",
+        "99",
+        1,
+        "foreign-secret"
+      ],
+      [
+        14,
+        7,
+        1,
+        "INVISIBLE",
+        "88",
+        0,
+        "hidden-secret"
+      ],
+      [
+        15,
+        8,
+        3,
+        "Foreign child",
+        "77",
+        1,
+        "foreign-secret"
+      ],
+      [
+        100,
+        7,
+        5,
+        "Bound 0",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        101,
+        7,
+        5,
+        "Bound 1",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        102,
+        7,
+        5,
+        "Bound 2",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        103,
+        7,
+        5,
+        "Bound 3",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        104,
+        7,
+        5,
+        "Bound 4",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        105,
+        7,
+        5,
+        "Bound 5",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        106,
+        7,
+        5,
+        "Bound 6",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        107,
+        7,
+        5,
+        "Bound 7",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        108,
+        7,
+        5,
+        "Bound 8",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        109,
+        7,
+        5,
+        "Bound 9",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        110,
+        7,
+        5,
+        "Bound 10",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        111,
+        7,
+        5,
+        "Bound 11",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        112,
+        7,
+        5,
+        "Bound 12",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        113,
+        7,
+        5,
+        "Bound 13",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        114,
+        7,
+        5,
+        "Bound 14",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        115,
+        7,
+        5,
+        "Bound 15",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        116,
+        7,
+        5,
+        "Bound 16",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        117,
+        7,
+        5,
+        "Bound 17",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        118,
+        7,
+        5,
+        "Bound 18",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        119,
+        7,
+        5,
+        "Bound 19",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        200,
+        7,
+        6,
+        "Overflow 0",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        201,
+        7,
+        6,
+        "Overflow 1",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        202,
+        7,
+        6,
+        "Overflow 2",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        203,
+        7,
+        6,
+        "Overflow 3",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        204,
+        7,
+        6,
+        "Overflow 4",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        205,
+        7,
+        6,
+        "Overflow 5",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        206,
+        7,
+        6,
+        "Overflow 6",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        207,
+        7,
+        6,
+        "Overflow 7",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        208,
+        7,
+        6,
+        "Overflow 8",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        209,
+        7,
+        6,
+        "Overflow 9",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        210,
+        7,
+        6,
+        "Overflow 10",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        211,
+        7,
+        6,
+        "Overflow 11",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        212,
+        7,
+        6,
+        "Overflow 12",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        213,
+        7,
+        6,
+        "Overflow 13",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        214,
+        7,
+        6,
+        "Overflow 14",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        215,
+        7,
+        6,
+        "Overflow 15",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        216,
+        7,
+        6,
+        "Overflow 16",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        217,
+        7,
+        6,
+        "Overflow 17",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        218,
+        7,
+        6,
+        "Overflow 18",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        219,
+        7,
+        6,
+        "Overflow 19",
+        "1",
+        1,
+        "child-secret"
+      ],
+      [
+        220,
+        7,
+        6,
+        "Overflow 20",
+        "1",
+        1,
+        "child-secret"
+      ]
+    ]
+  },
+  "host": {
+    "base_path": "/api/nd",
+    "id": "nested",
+    "publication": "nested-fixture:1",
+    "collection": "children"
+  },
+  "trusted_scope": {
+    "tenant": 7
+  },
+  "cases": {
+    "ND001": {
+      "title": "Bound discovery and stable complete collection catalogue",
+      "probes": []
+    },
+    "ND002": {
+      "title": "Array rows preserve parent and child order, decimals and empty children",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "ND003": {
+      "title": "Object rows use full paths at both levels",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "row_format": "objects"
+          }
+        }
+      ]
+    },
+    "ND004": {
+      "title": "Parent paging uses lookahead and no child flattening",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "limit": 1
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "limit": 1,
+            "offset": 1
+          }
+        }
+      ]
+    },
+    "ND005": {
+      "title": "Twenty children are complete; twenty-one refuses",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "eq",
+                "value": "5"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "eq",
+                "value": "6"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "ND006": {
+      "title": "Withheld child fields precede shape and limits",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              [
+                "children.secret"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "limit": 0
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              [
+                "children.tenant_id"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "children.secret",
+                "direction": "asc"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "ND007": {
+      "title": "Child tenant collisions and fixed child filters remain confined",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "eq",
+                "value": "1"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "ND008": {
+      "title": "Root required filters and caller filters intersect",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "eq",
+                "value": "4"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "ND009": {
+      "title": "Missing trusted tenant scope precedes hidden fields",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              [
+                "children.secret"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "limit": 0
+          },
+          "unscoped": true
+        }
+      ]
+    },
+    "ND010": {
+      "title": "Fingerprint before context before fields",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          },
+          "fingerprint": "stale",
+          "context_revision": "old"
+        },
+        {
+          "query": {
+            "select": [
+              "secret",
+              [
+                "children.id"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          },
+          "context_revision": "old"
+        }
+      ]
+    },
+    "ND011": {
+      "title": "Unsupported members refuse before fields",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "secret",
+              [
+                "children.id"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "where": {
+              "and": []
+            }
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "child_order_by": []
+          }
+        }
+      ]
+    },
+    "ND012": {
+      "title": "Closed shape, parent and selection limits",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "limit": 26
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "offset": 100001
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id"
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        },
+        {
+          "query": {
+            "select": [
+              [
+                "children.id"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              [
+                "children.id"
+              ],
+              [
+                "children.name"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              [
+                "children.id",
+                "children.id"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "children.id",
+                "op": "eq",
+                "value": "11"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          }
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "unknown": true
+          }
+        }
+      ]
+    },
+    "ND013": {
+      "title": "Media type, malformed envelope and lexical tokens refuse",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          },
+          "content_type": "text/plain",
+          "fingerprint": "stale"
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          },
+          "raw": "{\"format\":1,\"format\":2}"
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          },
+          "limit_token": "1e0"
+        },
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ]
+          },
+          "version_token": "1.0"
+        }
+      ]
+    },
+    "ND014": {
+      "title": "Empty pages retain typed complete child headers",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "asc"
+              }
+            ],
+            "offset": 99
+          }
+        }
+      ]
+    },
+    "ND015": {
+      "title": "Root filters and explicit descending parent order",
+      "probes": [
+        {
+          "query": {
+            "select": [
+              "id",
+              "name",
+              [
+                "children.id",
+                "children.name",
+                "children.price"
+              ]
+            ],
+            "filters": [
+              {
+                "field": "name",
+                "op": "ne",
+                "value": "No match"
+              },
+              {
+                "field": "id",
+                "op": "lte",
+                "value": "2"
+              }
+            ],
+            "order_by": [
+              {
+                "field": "id",
+                "direction": "desc"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

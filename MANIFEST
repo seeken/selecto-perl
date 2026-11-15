@@ -436,3 +436,6 @@ docs/fluent-writes.md
 t/fluent_transaction.t
 t/read_lane_api.t
 t/read_lane_typed_children.t
+lib/Selecto/API/NestedDetail.pm
+t/api_nested_detail.t
+t/fixtures/canonical_nested_detail_v1.json

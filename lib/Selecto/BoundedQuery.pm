@@ -32,6 +32,10 @@ sub prepare {
     $engine->assert_domain_identity;
     my $limits = _limits($engine, $args{limits});
     my $adapter = $engine->adapter;
+    my $json_budget = $args{collection_json_budget};
+    Selecto::Error->throw('invalid_query', 'invalid projected collection budget')
+        if defined($json_budget) && (ref($json_budget) || "$json_budget" !~ /\A[1-9][0-9]{0,8}\z/);
+    local $adapter->{_selecto_collection_json_budget} = $json_budget;
     _capabilities($adapter);
     require Selecto::QueryPolicy;
     $query = Selecto::QueryPolicy->apply($engine->read_domain, $query, $limits);
@@ -78,7 +82,7 @@ sub prepare {
                     %$options, order_by => \@orders, limit => $cap + 1);
                 $bounded = $bounded->as($expression->alias_name) if defined($expression->alias_name);
                 $expression = $bounded;
-                push @collections, [scalar(@select), $cap];
+                push @collections, [scalar(@select), $cap, (defined($json_budget) ? (1) : ())];
             }
         }
         push @select, $expression;
@@ -90,13 +94,15 @@ sub prepare {
     return $prepared;
 }
 
-# A formatted child date is still one value per child row. Any other child
+# A scalar field descriptor emitted by EngineHandler and a formatted child
+# date are still one value per child row. Any other child
 # expression could conceal a nested collection outside the per-parent cap.
 sub _formatted_child {
     my ($field) = @_;
     my $expression = ref($field) eq 'HASH' ? $field->{expression} : undef;
     return 0 unless blessed($expression) && $expression->isa('Selecto::Expression')
-        && $expression->kind eq 'datetime_format';
+        && ($expression->kind eq 'field' || $expression->kind eq 'datetime_format');
+    return 1 if $expression->kind eq 'field';
     my $operand = $expression->arguments->[0];
     return blessed($operand) && $operand->kind eq 'field' ? 1 : 0;
 }
@@ -233,7 +239,7 @@ sub admit_row {
     $limits->check_count('max_total_cells', $budget->{cells} += @$row, 'result_limit_exceeded', 'Result cells');
     # Raw JSON must fit before decoding, even for custom host cache entries.
     for my $column (@{$collections // []}) {
-        my ($index, $cap) = @$column;
+        my ($index, $cap, $json_guard) = @$column;
         my $value = $row->[$index];
         if (defined($value) && !ref($value)) {
             $limits->check_bytes('max_result_cell_bytes', $value, 'result_limit_exceeded', 'Result cell');
@@ -243,6 +249,8 @@ sub admit_row {
         }
         Selecto::Error->throw('invalid_result', 'Invalid child collection')
             unless ref($value) eq 'ARRAY' && !grep { ref($_) ne 'HASH' } @$value;
+        Selecto::Error->throw('result_limit_exceeded', 'Child projection exceeds its preaggregation budget')
+            if $json_guard && @$value == 1 && exists($value->[0]{__selecto_nested_byte_overflow});
         Selecto::Error->throw('result_limit_exceeded', 'Child collection exceeds its resource limit') if @$value > $cap;
         $limits->check_count('max_total_collection_rows', $budget->{children} += @$value,
             'result_limit_exceeded', 'Child collections');

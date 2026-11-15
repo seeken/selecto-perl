@@ -2474,6 +2474,34 @@ sub _expression_field_paths {
     return grep { !$seen{$_}++ } @paths;
 }
 
+# Selected nested Detail only. Estimate an upper bound on projected JSON bytes
+# using scalar byte lengths before constructing any child JSON. JSON escaping
+# uses at most six bytes per source byte; keys and punctuation are fixed. CASE
+# gates the scalar aggregate subquery, rather than gating an aggregate in the
+# same SELECT (which PostgreSQL would evaluate before CASE).
+sub _guard_collection_json {
+    my ($self, $sql, $spec) = @_;
+    my $budget = $self->{_selecto_collection_json_budget};
+    return $sql unless defined $budget;
+    Selecto::Error->throw('unsupported_feature', 'projected collection bytes require a certified dialect')
+        unless $self->name eq 'postgresql' || $self->name eq 'sqlite';
+    my (@terms, @large);
+    for my $field (@{$spec->{fields}}) {
+        my $value = $self->_related_collection_value_sql($field);
+        my $size = $self->name eq 'postgresql' ? "OCTET_LENGTH(CAST($value AS TEXT))"
+            : "LENGTH(CAST($value AS BLOB))";
+        push @large, "COALESCE($size, 0) > 16384";
+        push @terms, (length($field->{key}) + 8) . " + 6 * COALESCE($size, 4)";
+    }
+    my $estimate = '3 + ' . join(' + ', @terms);
+    my $overflow = '(SELECT CASE WHEN COALESCE(SUM(' . $estimate . '), 0) + 2 > ' . int($budget)
+        . ' OR COALESCE(MAX(CASE WHEN ' . join(' OR ', @large) . ' THEN 1 ELSE 0 END), 0) > 0'
+        . ' THEN 1 ELSE 0 END FROM ' . $spec->{from} . ' WHERE ' . $spec->{where} . ')';
+    my $marker = q{'[{"__selecto_nested_byte_overflow":true}]'};
+    $marker .= '::json' if $self->name eq 'postgresql';
+    return "(CASE WHEN $overflow = 1 THEN $marker ELSE $sql END)";
+}
+
 sub _related_collection_aggregate_sql {
     my ($self, $aggregate, $from, $where, $empty) = @_;
     return "COALESCE((SELECT $aggregate FROM $from WHERE $where), $empty)";
