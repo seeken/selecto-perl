@@ -1281,7 +1281,7 @@ sub _column_converters {
                     my $normalized = "$value";
                     $normalized =~ tr/ /T/;
                     $normalized =~ s/(?:\.0+)?(?:\+00(?::00)?|Z)\z//
-                        if index($normalized, '+') >= 0 || index($normalized, 'Z') >= 0;
+                        if $normalized =~ tr/+Z//;
                     $row->[$i] = $normalized;
                 }
             };
