@@ -9,7 +9,7 @@ domain instead of being re-checked in every controller. The core is
 HTTP-neutral: it takes a DBI handle and returns plain Perl data, so it fits
 behind any web framework, job runner or command-line tool.
 
-Selecto is alpha software (version 0.2.0). Its contracts follow the
+Selecto is alpha software (version 0.2.3). Its contracts follow the
 cross-language Selecto protocol, and the PostgreSQL adapter is certified
 against the shared specification suite.
 
@@ -26,7 +26,7 @@ database you use:
 
 | Database             | Adapter name | Driver                                      |
 | -------------------- | ------------ | ------------------------------------------- |
-| PostgreSQL           | `postgresql` | `DBD::Pg` 3.016+                            |
+| PostgreSQL           | `postgresql` | `DBD::Pg` >= 3.21.2                            |
 | SQLite               | `sqlite`     | `DBD::SQLite` 1.64+                         |
 | MySQL                | `mysql`      | `DBD::MariaDB` 1.24+                        |
 | MariaDB              | `mariadb`    | `DBD::MariaDB` 1.24+                        |
