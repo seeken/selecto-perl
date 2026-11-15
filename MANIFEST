@@ -441,3 +441,7 @@ t/api_nested_detail.t
 t/fixtures/canonical_nested_detail_v1.json
 t/pg_pipeline_available.t
 t/pg_pipeline_live.t
+lib/Selecto/SQL/ReadPlan.pm
+t/read_plan_cache.t
+docs/read_plan_cache.md
+t/read_plan_session_live.t

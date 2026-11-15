@@ -199,6 +199,20 @@ sub _compile_single {
     $query = $self->_expand_query($domain, $query);
     return $self->_compile_rollup($domain, $query, %options)
         if $query->grouping_mode eq 'rollup' && $self->_emulates_rollup;
+    if (!%options && (!defined($ENV{SELECTO_PERL_PLAN_CACHE}) || $ENV{SELECTO_PERL_PLAN_CACHE} ne '0')
+        && (($ENV{SELECTO_PERL_PLAN_CACHE} // '') eq '1' || $self->{plan_cache})
+        && (!exists($self->{plan_cache}) || $self->{plan_cache})) {
+        require Selecto::SQL::ReadPlan;
+        return Selecto::SQL::ReadPlan->compile($self, $domain, $query,
+            sub { $self->_render_single($domain, $query) });
+    }
+    return $self->_render_single($domain, $query, %options);
+}
+
+# The reference renderer is also the cache-off path. ReadPlan admits only a
+# deliberately small subset; all other query shapes call this unchanged body.
+sub _render_single {
+    my ($self, $domain, $query, %options) = @_;
     local $self->{_root_alias} = $options{root_alias} // 's0';
     local $self->{_tenant_root} = $domain;
     local $self->{_timezone} = $query->timezone;
