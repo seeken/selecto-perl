@@ -1184,10 +1184,105 @@ sub _require_iso_dates {
     return 1;
 }
 
-# Column-wise _decode: the type branch is chosen once per column rather than
-# once per cell, and each cell gets exactly the transformation _decode gives
-# it. A subclass that redefines _decode keeps the per-cell path.
+# Keep one converter plan per adapter. A changed type vector, export mode or
+# driver-number mode replaces it; no rows, values, query or request context
+# are retained. Closures process a whole column, avoiding a Perl call per cell.
 sub _decode_rows {
+    my ($self, $rows, $types) = @_;
+    return if $self->{_selecto_raw_values};
+    return $self->SUPER::_decode_rows($rows, $types)
+        unless $self->can('_decode') == \&_decode;
+    my $export = $self->{_selecto_export_scalars} ? 1 : 0;
+    my $numbers = CREATED_AS_NUMBER && (grep { defined($_) && /\Aint[248]\z/ } @$types)
+        && defined($self->_canonical_server_version) ? 1 : 0;
+    my $key = join(':', $export, $numbers, map { defined($_) ? length($_) . ':' . $_ : '-' } @$types);
+    my $plan = $self->{_selecto_decode_plan};
+    unless ($plan && $plan->[0] eq $key) {
+        $plan = [$key, _column_converters($types, $export, $numbers)];
+        $self->{_selecto_decode_plan} = $plan;
+    }
+    $_->[1]->($rows, $_->[0]) for @{$plan->[1]};
+    return;
+}
+
+sub _column_converters {
+    my ($types, $export, $numbers) = @_;
+    my @plan;
+    for my $i (0 .. $#$types) {
+        my $type = $types->[$i] // '';
+        my $convert;
+        if ($export && $type =~ /\A(?:numeric|bool|json|jsonb)\z/) {
+            $convert = sub {
+                my ($rows, $i) = @_;
+                for my $row (@$rows) {
+                    $row->[$i] = _export_scalar($row->[$i], $type) if defined $row->[$i];
+                }
+            };
+        } elsif ($type eq 'bool') {
+            $convert = sub {
+                my ($rows, $i) = @_;
+                for my $row (@$rows) {
+                    my $value = $row->[$i];
+                    $row->[$i] = ($value eq 't' || "$value" eq '1') ? 1 : 0 if defined $value;
+                }
+            };
+        } elsif ($type eq 'int2' || $type eq 'int4' || $type eq 'int8') {
+            $convert = $numbers ? sub {
+                my ($rows, $i) = @_;
+                for my $row (@$rows) {
+                    next unless defined(my $value = $row->[$i]);
+                    BEGIN { warnings->unimport('experimental::builtin') if CREATED_AS_NUMBER }
+                    next if _created_as_number($value);
+                    $row->[$i] = int($value) if "$value" =~ /\A-?\d+\z/;
+                }
+            } : sub {
+                my ($rows, $i) = @_;
+                for my $row (@$rows) {
+                    next unless defined(my $value = $row->[$i]);
+                    $row->[$i] = int($value) if "$value" =~ /\A-?\d+\z/;
+                }
+            };
+        } elsif ($type eq 'numeric' || $type eq 'float4' || $type eq 'float8') {
+            $convert = sub {
+                my ($rows, $i) = @_;
+                for my $row (@$rows) {
+                    next unless defined(my $value = $row->[$i]);
+                    my $normalized = "$value";
+                    $normalized =~ s/(\.\d*?)0+\z/$1/;
+                    $normalized =~ s/\.\z//;
+                    $row->[$i] = $normalized eq '-0' ? '0' : $normalized;
+                }
+            };
+        } elsif ($type eq 'date') {
+            $convert = sub {
+                my ($rows, $i) = @_;
+                for my $row (@$rows) {
+                    next unless defined $row->[$i];
+                    last if _require_iso_dates($row->[$i]);
+                }
+            };
+        } elsif ($type eq 'timestamp' || $type eq 'timestamptz') {
+            $convert = sub {
+                my ($rows, $i) = @_;
+                my $checked;
+                for my $row (@$rows) {
+                    next unless defined(my $value = $row->[$i]);
+                    $checked = _require_iso_dates($value) unless $checked;
+                    my $normalized = "$value";
+                    $normalized =~ tr/ /T/;
+                    $normalized =~ s/(?:\.0+)?(?:\+00(?::00)?|Z)\z//
+                        if index($normalized, '+') >= 0 || index($normalized, 'Z') >= 0;
+                    $row->[$i] = $normalized;
+                }
+            };
+        }
+        push @plan, [$i, $convert] if $convert;
+    }
+    return \@plan;
+}
+
+# Previous column loop retained as the pure-Perl reference for parity tests.
+sub _decode_rows_reference {
     my ($self, $rows, $types) = @_;
     return if $self->{_selecto_raw_values};
     return $self->SUPER::_decode_rows($rows, $types)
