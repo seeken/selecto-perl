@@ -111,7 +111,7 @@ for my $backend (@backends) {
                     # for a re-read by key: the update is refused before it
                     # runs. PostgreSQL re-reads by row id and needs no key.
                     is($run->($mode, $path, {org_key => 'T1'}, %options),
-                        $plain_key && $name ne 'postgresql' ? 'query_rule_not_evaluable' : 'query_rule_violation',
+                        $plain_key && $name ne 'postgresql' && $name ne 'sqlite' ? 'query_rule_not_evaluable' : 'query_rule_violation',
                         "$label, $table: assigning the scoped column out of scope is refused");
                     is($state->(), '1:t1:n 2:t2:n', "$label, $table: and nothing changed");
                 } else {
@@ -133,9 +133,8 @@ for my $backend (@backends) {
         }
     }
 
-    # A bound-scope update needs an enforced unique key and may not assign
-    # it: with only an index on id, a decoy sharing the old key would stand
-    # in for the row the update moved out of scope.
+    # Only the non-RETURNING readback fallback needs an immutable unique key.
+    # PostgreSQL and SQLite evaluate scope directly on each mutation tuple.
     {
         my $host = 'host scope predicate';
         my $key_domain = Selecto::Domain->parse({%$document, writes => {%{$document->{writes}},
@@ -155,10 +154,9 @@ for my $backend (@backends) {
             $dbh->do($plain_key ? q{INSERT INTO selecto_post_rows (id, org_key, name, note) VALUES (1, 'T1', 'x', 'n'), (1, 'T1', 'y', 'n')}
                 : q{INSERT INTO selecto_post_rows (id, org_key, name, note) VALUES (1, 'T1', 'x', 'n'), (3, 'T1', 'y', 'n')});
             my $table = $plain_key ? 'a non-unique key with a decoy' : 'a primary key';
-            if ($name eq 'postgresql') {
-                # PostgreSQL re-reads the written rows by (tableoid, ctid)
-                # (R9): a key reassigned, or not unique, cannot let a decoy
-                # stand in, so only leaving the scope is refused.
+            if ($name eq 'postgresql' || $name eq 'sqlite') {
+                # RETURNING checks the mutation tuple even when the key changes
+                # or is non-unique, so only leaving the scope is refused.
                 is($key_run->({id => 2, org_key => 'T2'}), 'query_rule_violation', "$name $table: reassigning the key out of scope is refused");
                 is($key_run->({id => 2}), 'applied', "$name $table: reassigning the key in scope applies");
                 is($key_run->({note => 'changed'}), 'applied', "$name $table: an ordinary update applies");
@@ -180,7 +178,7 @@ for my $backend (@backends) {
     }
 
     # A trigger that rewrites the scoped column after a governed update of
-    # another column moves the row out of scope: the re-read refuses it.
+    # another column moves the row out of scope: the stored-tuple check refuses it.
     my $trigger = $name eq 'postgresql' ? sub {
         $dbh->do(q{CREATE OR REPLACE FUNCTION selecto_post_upper() RETURNS trigger LANGUAGE plpgsql AS
             $$ BEGIN NEW.org_key := upper(NEW.org_key); RETURN NEW; END $$});
@@ -253,27 +251,25 @@ for my $backend (@backends) {
         }
         $dbh->do('DROP TABLE IF EXISTS selecto_post_audit');
         if ($name eq 'postgresql') {
-            # An AFTER trigger (row or statement level) that rewrites the
-            # scoped column runs before the re-read and is caught.
+            # AFTER trigger effects belong to the host; RETURNING checks the
+            # mutation tuple before those effects.
             for my $level ('ROW', 'STATEMENT') {
                 $reset->();
                 $dbh->do(q{CREATE OR REPLACE FUNCTION selecto_post_after() RETURNS trigger LANGUAGE plpgsql AS
                     $$ BEGIN UPDATE selecto_post_rows SET org_key = upper(org_key) WHERE org_key <> upper(org_key); RETURN NULL; END $$});
                 $dbh->do("CREATE TRIGGER selecto_post_after AFTER UPDATE OF note ON selecto_post_rows FOR EACH $level EXECUTE FUNCTION selecto_post_after()");
-                # A statement-level trigger is refused before the update: it
-                # can write rows the re-read does not name.
-                is($run->($host, 'single', {note => 'changed'}), $level eq 'ROW' ? 'query_rule_violation' : 'write_capability_missing',
-                    "$name: an AFTER $level trigger moving the row out of scope is refused");
-                is($state->(), '1:t1:n 2:t2:n', "$name: AFTER $level, and nothing changed");
+                # No catalog guard is taken for the host statement trigger.
+                is($run->($host, 'single', {note => 'changed'}), 'applied',
+                    "$name: host AFTER $level trigger effects are outside the write boundary");
+                is($state->(), '1:T1:changed 2:T2:n', "$name: host AFTER $level trigger ran");
             }
-            # A deferrable constraint trigger fires at commit, after any
-            # re-read: the update is refused before it runs.
+            # A deferrable host trigger is outside the boundary.
             $reset->();
             $dbh->do(q{CREATE OR REPLACE FUNCTION selecto_post_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$});
             $dbh->do('CREATE CONSTRAINT TRIGGER selecto_post_deferred AFTER UPDATE ON selecto_post_rows DEFERRABLE INITIALLY DEFERRED'
                 . ' FOR EACH ROW EXECUTE FUNCTION selecto_post_noop()');
-            is($run->($host, 'single', {note => 'changed'}), 'query_rule_not_evaluable', "$name: a deferrable constraint trigger is refused");
-            is($state->(), '1:t1:n 2:t2:n', "$name: deferrable, and nothing changed");
+            is($run->($host, 'single', {note => 'changed'}), 'applied', "$name: a host deferrable trigger is not inspected");
+            is($state->(), '1:t1:changed 2:t2:n', "$name: update under a host deferrable trigger applies");
         }
         # A guarded update through a view cannot be verified.
         $reset->();
@@ -283,8 +279,8 @@ for my $backend (@backends) {
         my $view_error = eval { Selecto::Engine->new(adapter => $adapter, domain => $view_domain)->execute_write(
             Selecto::Write::Command->new(operation => 'update', relation => 'selecto_post_view', assignments => {note => 'changed'},
                 predicate => $x->eq('name', 'x'), scope_predicate => $x->eq('org_key', 't1'))); 1 } ? undef : $@;
-        is(blessed($view_error) ? $view_error->code : 'applied', ($name =~ /\A(?:mysql|mariadb)\z/ ? 'write_capability_missing' : 'query_rule_not_evaluable'), "$name: a guarded update through a view is refused");
-        is($state->(), '1:t1:n 2:t2:n', "$name: view, and nothing changed");
+        is(blessed($view_error) ? $view_error->code : 'applied', ($name eq 'postgresql' ? 'query_error' : $name eq 'sqlite' ? 'query_rule_not_evaluable' : 'write_capability_missing'), "$name: a guarded update through a view is refused");
+        is($state->(), '1:t1:n 2:t2:n', "$name: view outcome matches backend support");
         $dbh->do('DROP VIEW IF EXISTS selecto_post_view');
     }
     $dbh->do('DROP TABLE IF EXISTS selecto_post_rows');

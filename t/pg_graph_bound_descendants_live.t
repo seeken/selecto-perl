@@ -11,14 +11,8 @@ use Selecto::Expression;
 use Selecto::QueryEnforcement ();
 use Selecto::Write ();
 
-# Items 33/33a: when a graph's root is bound (engine tenant, trusted tenant
-# pin, host scope, query enforcement), every descendant delete and update
-# runs the bound-scope target contract (table lock, READ COMMITTED, no
-# deferrable trigger, statement-level trigger or rule for the event, checked
-# before and after the statement), even on tables without a tenant column:
-# child delta deletes, join-table unlinks, depth-2 grandchild deletes and
-# child updates and child inserts. A statement trigger or DO ALSO rule on such a table used to
-# rewrite the other tenant's parent row ('pwned').
+# Graph descendants retain governed ownership and transaction checks.
+# Host statement triggers and rules are outside the write boundary.
 my $url = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless defined($url) && $url ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; require Selecto::Certification; 1 };
@@ -111,8 +105,8 @@ for my $kind ('a statement trigger', 'a DO ALSO rule') {
                 $dbh->do("CREATE RULE selecto_gb_pwn AS ON $event TO $table DO ALSO UPDATE selecto_gb_p SET title = 'pwned' WHERE org_key = 't2'");
             }
             my ($engine, $extra) = $roots{$bound}->();
-            is($run->($engine, $extra, $nodes->()), 'write_capability_missing', "$bound root, $kind on $table: $shape is refused");
-            is_deeply($parents->(), [[1, 'a'], [2, 'theirs']], "$bound root, $kind: $shape, and the graph rolled back untouched");
+            is($run->($engine, $extra, $nodes->()), 'applied', "$bound root, $kind on $table: $shape applies without catalog checks");
+            is_deeply($parents->(), [[1, 'b'], [2, 'pwned']], "$bound root, $kind: $shape, host object effects remain the host responsibility");
         }
     }
 }
@@ -129,9 +123,8 @@ for my $shape (sort keys %shapes) {
     my $engine = Selecto::Engine->new(adapter => $adapter, domain => Selecto::Domain->parse($root->()));
     is($run->($engine, {}, $shapes{'a child delta delete'}[2]->()), 'applied', 'an unbound root: its child delete is not bound');
 }
-# A graph-bound upsert can insert or update: INSERT and UPDATE statement
-# triggers and rules are both refused (the adapter-level contract, as the
-# engine marks a graph node).
+# A graph-bound upsert leaves host INSERT/UPDATE statement triggers and
+# rules to PostgreSQL, including its native ON CONFLICT rule restriction.
 for my $case (['an INSERT statement trigger', 'CREATE TRIGGER selecto_gb_pwn AFTER INSERT ON selecto_gb_c FOR EACH STATEMENT EXECUTE FUNCTION selecto_gb_pwn()'],
               ['an UPDATE statement trigger', 'CREATE TRIGGER selecto_gb_pwn AFTER UPDATE ON selecto_gb_c FOR EACH STATEMENT EXECUTE FUNCTION selecto_gb_pwn()'],
               ['an UPDATE rule', q{CREATE RULE selecto_gb_pwn AS ON UPDATE TO selecto_gb_c DO ALSO UPDATE selecto_gb_p SET title = 'pwned' WHERE org_key = 't2'}]) {
@@ -141,8 +134,10 @@ for my $case (['an INSERT statement trigger', 'CREATE TRIGGER selecto_gb_pwn AFT
         assignments => {id => 10, parent_id => 1, note => 'up'},
         metadata => {conflict_target => ['id'], upsert_update_fields => ['note'], __selecto_primary_key => 'id', __selecto_graph_bound => 1})); 'applied' }
         // (blessed($@) ? $@->code : "died: $@");
-    is($code, 'write_capability_missing', "a graph-bound upsert refuses $case->[0]");
-    is_deeply($parents->(), [[1, 'a'], [2, 'theirs']], "graph-bound upsert, $case->[0]: nothing changed");
+    is($code, $case->[0] eq 'an UPDATE rule' ? 'query_error' : 'applied',
+        "a graph-bound upsert leaves $case->[0] to PostgreSQL");
+    is_deeply($parents->(), [[1, 'a'], [2, $case->[0] eq 'an UPDATE rule' ? 'theirs' : 'pwned']],
+        "graph-bound upsert, $case->[0]: native database outcome");
 }
 $dbh->do('DROP TABLE IF EXISTS selecto_gb_p, selecto_gb_c, selecto_gb_gc, selecto_gb_link CASCADE');
 $dbh->do('DROP FUNCTION IF EXISTS selecto_gb_pwn()');

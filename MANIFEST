@@ -80,8 +80,6 @@ t/scalar_admission_v2_live.t
 t/update_post_image_live.t
 t/update_post_image_tenant_pin_live.t
 t/update_post_image_pg_topology_live.t
-t/update_post_image_pg_race_live.t
-t/pg_guarded_write_isolation_live.t
 t/pg_bound_delete_lock_live.t
 t/pg_graph_bound_descendants_live.t
 t/pg_review_round3_live.t
@@ -102,7 +100,6 @@ t/host_transaction_refusal_live.t
 t/write_atomicity_modes_live.t
 t/guarded_insert_trigger_refusal_live.t
 t/external_graph_implicit_transaction_live.t
-t/mysql_post_image_metadata_lock_live.t
 t/mysql_returning_insert_trigger_live.t
 t/mysql_host_savepoint_collision_live.t
 t/mysql_association_timestamp_pin_live.t
@@ -443,3 +440,4 @@ t/fixtures/canonical_nested_detail_v1.json
 t/pg_pipeline_available.t
 t/pg_pipeline_live.t
 t/query_composition.t
+t/mysql_write_key_metadata_live.t

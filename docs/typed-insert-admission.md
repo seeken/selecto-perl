@@ -38,8 +38,10 @@ main-schema table, no same-name temporary object, no transforming triggers, and
 non-generated policy fields. Storage must have the supported integer, numeric,
 or text affinity. String comparison uses the actual BINARY, NOCASE, or RTRIM
 collation. Unsupported custom collations/types are refused. PostgreSQL requires
-a real DBD::Pg handle and ordinary nonpartitioned/noninherited table without
-user triggers or rewrite rules. Supported storage types are built-in integer,
+a real DBD::Pg handle and verified column storage. Host relation topology,
+rules and concurrent DDL are outside this boundary. A transforming BEFORE
+INSERT trigger that violates the RETURNING guard remains conservatively
+refused for TA005; ordinary row triggers remain allowed. Supported storage types are built-in integer,
 numeric (including declared precision/scale), text/varchar, boolean and uuid,
 the citext extension's own type (a member of the citext extension in the
 extension's schema), and domains over these (followed through the domain
@@ -57,16 +59,17 @@ before any SQL: an explicit value must equal the trusted scope value exactly,
 else `tenant_mismatch` (a case variant such as `T1` for a citext tenant `t1`, or
 an upper-case uuid, is refused, as in Python; native citext equality does not
 admit it); an omitted value is filled from the scope. The storage check then
-compares the candidate with the column's own semantics, and the post-image
-re-read verifies the stored row.
+compares the candidate with the column's own semantics, and the same-statement
+RETURNING guard verifies the PostgreSQL stored tuple (MySQL-family adapters
+retain their same-transaction stored-row check).
 
 Threat model for this profile: out of scope are roles with CREATE in the
 application's schemas (planted functions, operators and overloads), code
 planted in triggers and views, extension installers and owners, superusers,
 and concurrent DDL by table owners.
 
-PostgreSQL holds a table lock across metadata inspection and DML; SQLite's
-transaction keeps the inspected schema stable. A five-second database query
+PostgreSQL reads the actual storage metadata without a catalog-stability
+table lock. SQLite retains the admission required by its certified storage profile. A five-second database query
 budget bounds the admission probe, including PostgreSQL lock waits. A savepoint
 allows PostgreSQL timeout settings to be restored after a failed probe.
 
