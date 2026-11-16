@@ -39,6 +39,23 @@ sub supports {
         || "$feature" eq 'stream' ? 1 : 0;
 }
 
+sub query_budget_supported {
+    my ($self) = @_;
+    return defined(eval { $self->dbh->{odbc_query_timeout} }) ? 1 : 0;
+}
+
+sub configure_query_budget {
+    my ($self, $ms, $budget) = @_;
+    my $dbh = $self->dbh;
+    my $prior = $dbh->{odbc_query_timeout};
+    my $seconds = int(($ms + 999) / 1000);
+    $seconds = $prior if $prior && $prior < $seconds;
+    $budget->install_restore(sub { $dbh->{odbc_query_timeout} = $prior; });
+    $dbh->{odbc_query_timeout} = $seconds;
+    die 'query timeout configuration failed' unless $dbh->{odbc_query_timeout} == $seconds;
+    return 1;
+}
+
 sub _values_cast_types {
     return {
         integer => 'BIGINT', int => 'BIGINT', bigint => 'BIGINT',
@@ -165,7 +182,7 @@ sub _compile_write {
     my @quoted = map { $self->quote_identifier(Selecto::Identifier::checked($_)) } @fields;
     my @params;
     my @values = map {
-        $self->_compile_assignment_value($assignments->{$_}, \@params, 'upsert', 1)
+        $self->compile_assignment_value($assignments->{$_}, \@params, 'upsert', 1)
     } @fields;
     my @source = map { 'source.' . $_ } @quoted;
     my @matches = map {
@@ -178,8 +195,8 @@ sub _compile_write {
     } @$updates;
 
     # Each branch carries the foreign-key guard (TW-05), bound once per branch.
-    my $matched_guard = $self->_compile_foreign_key_guards($command, \@params);
-    my $insert_guard = $self->_compile_foreign_key_guards($command, \@params);
+    my $matched_guard = $self->compile_foreign_key_guards($command, \@params);
+    my $insert_guard = $self->compile_foreign_key_guards($command, \@params);
     my $sql = 'MERGE INTO ' . $self->quote_identifier($relation) . ' WITH (HOLDLOCK) AS target ' .
         'USING (VALUES (' . join(', ', @values) . ')) AS source (' . join(', ', @quoted) . ') ' .
         'ON ' . join(' AND ', @matches) . ' ' .
@@ -190,7 +207,7 @@ sub _compile_write {
     # Keep the shared returning validation on the specialized MERGE path.
     # SQL Server does not yet implement the portable returning contract; never
     # execute a mutation while silently dropping requested result fields.
-    return $self->_append_returning($sql, \@params, $command);
+    return $self->append_returning($sql, \@params, $command);
 }
 
 sub _compile_mutation_default {
@@ -240,7 +257,7 @@ sub _compile_related_collection_sql {
     my ($self, $spec) = @_;
     my $quoted_alias = $spec->{quoted_alias};
     my $projection = join(', ', map {
-        $self->_related_collection_value_sql($_) . ' AS ' . $self->quote_identifier($_->{key})
+        $self->related_collection_value_sql($_) . ' AS ' . $self->quote_identifier($_->{key})
     } @{$spec->{fields}});
     return "COALESCE((SELECT $projection FROM $spec->{from} " .
         "WHERE $spec->{where}" .
@@ -301,8 +318,8 @@ sub _savepoint_transaction {
     my $ok = eval { $value = $operation->(); 1 };
     if (!$ok) {
         my $error = $@;
-        die $error if eval { $self->_rollback_transaction; 1 };
-        die $self->_undo_failed($error);
+        die $error if eval { $self->rollback_transaction; 1 };
+        die $self->undo_failed($error);
     }
     return $value;
 }

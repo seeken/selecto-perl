@@ -38,10 +38,11 @@ sub supported {
     my $name = $adapter->name;
     my $dbh = $adapter->dbh;
     return 0 unless eval { $dbh->isa('DBI::db') };
+    my $native = $adapter->query_budget_supported;
+    return $native ? 1 : 0 if defined($native);
     return $dbh->can('sqlite_progress_handler') && $dbh->can('sqlite_busy_timeout') ? 1 : 0
         if $name eq 'sqlite';
     return 1 if $name =~ /\A(?:postgresql|mysql|mariadb)\z/;
-    return defined(eval { $dbh->{odbc_query_timeout} }) ? 1 : 0 if $name eq 'mssql';
     return 0;
 }
 
@@ -76,7 +77,9 @@ sub begin {
     weaken($ACTIVE{$identity});
     my $name = $adapter->name;
     my $ok = eval {
-        if ($name eq 'sqlite') {
+        if ($adapter->configure_query_budget($ms, $self)) {
+            # Selected adapter installed its native strategy explicitly.
+        } elsif ($name eq 'sqlite') {
             my $busy = $dbh->sqlite_busy_timeout;
             my $prior = $adapter->query_budget_progress_handler;
             Selecto::Error->throw('invalid_query_budget', 'configured SQLite progress handler is invalid')
@@ -176,13 +179,7 @@ sub begin {
             };
             defined($dbh->do('SET SESSION ' . $setting . ' = ' . $literal->($value)))
                 or die 'query timeout configuration failed';
-        } elsif ($name eq 'mssql') {
-            my $prior = $dbh->{odbc_query_timeout};
-            my $seconds = int(($ms + 999) / 1000);
-            $seconds = $prior if $prior && $prior < $seconds;
-            $self->{restore} = sub { $dbh->{odbc_query_timeout} = $prior; };
-            $dbh->{odbc_query_timeout} = $seconds;
-            die 'query timeout configuration failed' unless $dbh->{odbc_query_timeout} == $seconds;
+
         }
         1;
     };
@@ -196,6 +193,22 @@ sub begin {
             || (blessed($typed) && $typed->can('details') && ($typed->details->{category} // '') eq 'query_canceled'));
         Selecto::Error->throw('query_budget_unavailable', 'database query deadline could not be configured');
     }
+    return $self;
+}
+
+sub install_restore {
+    my ($self, $callback) = @_;
+    Selecto::Error->throw('invalid_query_budget', 'restore must be a callback')
+        unless ref($callback) eq 'CODE';
+    $self->{restore} = $callback;
+    return $self;
+}
+
+sub install_rearm {
+    my ($self, $callback) = @_;
+    Selecto::Error->throw('invalid_query_budget', 'rearm must be a callback')
+        unless ref($callback) eq 'CODE';
+    $self->{rearm} = $callback;
     return $self;
 }
 

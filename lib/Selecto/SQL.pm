@@ -752,6 +752,21 @@ sub _values_cast_types { return {}; }
 # Public adapter SDK utility; callback signature is (adapter, values).
 sub values_decimal_type { return shift->_values_decimal_sql(@_); }
 
+# Public, compiler-owned extension helpers. Inputs are validated intent or
+# fragments produced by this compiler; none is a caller SQL execution API.
+sub compile_assignment_value { return shift->_compile_assignment_value(@_); }
+sub compile_foreign_key_guards { return shift->_compile_foreign_key_guards(@_); }
+sub append_returning { return shift->_append_returning(@_); }
+sub related_collection_value_sql { return shift->_related_collection_value_sql(@_); }
+sub rollback_transaction { return shift->_rollback_transaction(@_); }
+sub undo_failed { return shift->_undo_failed(@_); }
+
+# Optional native deadline strategy. undef delegates support detection to the
+# bundled generic strategies; false explicitly refuses this native boundary.
+sub query_budget_supported { return undef; }
+sub configure_query_budget { return 0; }
+
+
 sub _values_decimal_sql {
     my ($self, $values) = @_;
     my ($digits, $scale) = (0, 0);
@@ -4479,6 +4494,26 @@ retains governance, authorization and DBI handle ownership.
 C<values_decimal_type($values)> returns an exact C<DECIMAL(38, scale)> cast type
 for a column of exact decimal text, refusing precision overflow. It can be used
 as a C<_values_cast_types> callback without reaching into core-private functions.
+
+The supported template overrides include C<_values_cast_types>,
+C<_compile_pagination>, C<_compile_expression>, C<_escape_like>,
+C<_compile_write>, C<_compile_mutation_default>, C<_logical_affected_rows>,
+C<_column_types>, C<_decode>, C<_compile_related_collection_sql>,
+C<_related_collection_text_sql>, C<_hand_built_refusal>,
+C<_server_transaction_open>, C<_savepoint_sql>, and C<_savepoint_transaction>.
+An override may delegate to the same superclass template implementation.
+Other compiler/transaction services are public helpers:
+C<compile_assignment_value>, C<compile_foreign_key_guards>,
+C<append_returning>, C<related_collection_value_sql>, C<rollback_transaction>
+and C<undo_failed>. They preserve the corresponding shared compiler behavior;
+adapters must not call its private helper functions.
+
+C<query_budget_supported> may return a defined boolean for native deadline
+support. C<configure_query_budget($milliseconds, $budget)> returns true when
+it installs the strategy. The budget exposes C<install_restore($callback)>
+and C<install_rearm($callback)>; install restoration before changing native
+state. The host retains the connection and the budget owns only its deadline
+state. The default returns false and leaves bundled backends unchanged.
 
 =head1 ATTRIBUTES
 
