@@ -16,7 +16,6 @@ sub default ($class) {
     my $version = $Selecto::Adapter::CONTRACT_VERSION;
     $DEFAULT->register(duckdb => 'Selecto::DuckDB', contract_version => $version);
     $DEFAULT->register(mariadb => 'Selecto::MariaDB', contract_version => $version);
-    $DEFAULT->register(mssql => 'Selecto::MSSQL', contract_version => $version);
     $DEFAULT->register(mysql => 'Selecto::MySQL', contract_version => $version);
     $DEFAULT->register(postgresql => 'Selecto::PostgreSQL', contract_version => $version);
     $DEFAULT->register(sqlite => 'Selecto::SQLite', contract_version => $version);
@@ -51,6 +50,8 @@ sub names ($self) { return [sort keys %{$self->adapters}]; }
 
 sub build ($self, $name, %args) {
     my $class = $self->adapters->{$name // ''};
+    Selecto::Error->throw('missing_adapter', 'SQL Server requires the optional Selecto-SqlServer package; explicitly inject Selecto::SqlServer')
+        if !$class && defined($name) && $name eq 'mssql';
     Selecto::Error->throw('unknown_adapter', "database adapter is not registered: " . ($name // '')) unless $class;
     my $file = $class =~ s{::}{/}gr . '.pm';
     my $loaded = eval { require $file; 1 };
@@ -89,7 +90,7 @@ Selecto::Adapter::Registry - name-to-class registry for database adapters
 
 Applications choose an adapter by a stable lowercase name instead of
 constructing a dialect class. The default registry, used by
-L<Selecto/adapter>, contains C<duckdb>, C<mariadb>, C<mssql>, C<mysql>,
+L<Selecto/adapter>, contains C<duckdb>, C<mariadb>, C<mysql>,
 C<postgresql> and C<sqlite>. Adapter classes are loaded lazily by L</build>,
 so the core never loads a driver you do not use.
 

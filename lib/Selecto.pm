@@ -175,7 +175,7 @@ C<invalid_adapter> when the module cannot be loaded or no handle is given.
   my $names = Selecto->available_adapters;   # ['duckdb', 'mariadb', ...]
 
 Returns the sorted adapter names currently registered. This release registers
-C<duckdb>, C<mariadb>, C<mssql>, C<mysql>, C<postgresql> and C<sqlite>.
+C<duckdb>, C<mariadb>, C<mysql>, C<postgresql> and C<sqlite>.
 
 =head2 domain_registry
 
@@ -255,7 +255,7 @@ The adapter contract, the name registry, and the shared SQL implementation
 that concrete adapters inherit.
 
 =item L<Selecto::PostgreSQL>, L<Selecto::SQLite>, L<Selecto::MySQL>,
-L<Selecto::MariaDB>, L<Selecto::MSSQL>, L<Selecto::DuckDB>
+L<Selecto::MariaDB>, L<Selecto::DuckDB>
 
 The bundled adapters.
 

@@ -22,7 +22,6 @@ requires 'Text::CSV', '2.04';
 
 recommends 'DBD::Pg', '>= 3.21.2';  # 3.20.x breaks two-column and tenant-boundary writes
 recommends 'DBD::MariaDB', '1.24';
-recommends 'DBD::ODBC', '1.61';
 recommends 'DBD::SQLite', '1.64';
 recommends 'DBD::DuckDB', '0.16';
 

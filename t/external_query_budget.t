@@ -8,7 +8,7 @@ use Selecto::QueryBudget;
     package ExternalBudgetAdapter;
     use Mojo::Base 'Selecto::SQLite';
     our @EVENTS;
-    sub query_budget_supported { 1 }
+    sub native_query_budget_supported { 1 }
     sub configure_query_budget {
         my ($self, $milliseconds, $budget) = @_;
         push @EVENTS, ['configured', $milliseconds];

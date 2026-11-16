@@ -19,7 +19,7 @@ sub join_domain {
         }});
 }
 
-for my $name (qw(sqlite mysql mariadb mssql postgresql duckdb)) {
+for my $name (qw(sqlite mysql mariadb postgresql duckdb)) {
     subtest "$name emitted clause binding order" => sub {
         for my $through (0, 1) {
             my $engine = Selecto::Engine->new(domain => join_domain($through),
@@ -79,7 +79,7 @@ subtest 'originating cardinality errors never serialize match counts' => sub {
     }
 };
 subtest 'parameterized IN operands retain SQL occurrence order' => sub {
-    for my $name (qw(sqlite mysql mariadb mssql postgresql duckdb)) {
+    for my $name (qw(sqlite mysql mariadb postgresql duckdb)) {
         my $engine = Selecto::Engine->new(domain => TestSelecto::people_domain(),
             adapter => Selecto->adapter($name => (dbh => TestSelecto::DBH->new)));
         my $statement = $engine->compile($engine->query->select('id')->where(

@@ -1,5 +1,7 @@
 # Selecto
 
+SQL Server support is provided by the separately selected private [Selecto-SqlServer](https://github.com/seeken/selecto-sqlserver-perl). The default core excludes its implementation and driver dependencies. SQL Server behavior described below applies to that optional package; its native tests and observation entrypoint live there.
+
 Repeated `where` (or `filter`) calls AND predicates in call order. Repeated
 `select` calls append, preserving order and duplicates; empty append is a no-op.
 Use `replace_where` / `clear_where` and `replace_selections` / `clear_selections`
@@ -37,7 +39,7 @@ database you use:
 | SQLite               | `sqlite`     | `DBD::SQLite` 1.64+                         |
 | MySQL                | `mysql`      | `DBD::MariaDB` 1.24+                        |
 | MariaDB              | `mariadb`    | `DBD::MariaDB` 1.24+                        |
-| Microsoft SQL Server | `mssql`      | `DBD::ODBC` 1.61+ (Unicode build) and an ODBC driver |
+| Optional SQL Server package | `mssql` | `Selecto-SqlServer`; its own driver dependencies |
 | DuckDB               | `duckdb`     | `DBD::DuckDB` 0.16+                         |
 
 See [Database notes](#database-notes) for what each database supports and what
@@ -702,7 +704,7 @@ perl Makefile.PL && make test
 
 Tests that need a live server are skipped unless you provide a disposable
 database: `SELECTO_PERL_TEST_POSTGRES_URL`, `SELECTO_PERL_TEST_MYSQL_URL`,
-`SELECTO_PERL_TEST_MARIADB_URL` or `SELECTO_PERL_TEST_MSSQL_URL`. SQLite and
+`SELECTO_PERL_TEST_MARIADB_URL`. The optional package owns the SQL Server tests and `SELECTO_PERL_TEST_MSSQL_URL`. SQLite and
 DuckDB tests run in memory when their drivers are installed. Test data must be
 synthetic, and credentials must never appear in fixtures or output.
 
@@ -723,3 +725,12 @@ there are no PostgreSQL post-write catalog checks or stored-row rereads.
 Typed insert admission and SQLite physical-ownership certification retain
 their narrow storage checks. MySQL/MariaDB updates retain same-transaction
 readback because those backends lack UPDATE RETURNING.
+
+## SQL Server migration
+
+SQL Server is supplied by the explicitly selected private `Selecto-SqlServer`
+distribution. Its `Selecto::SqlServer` constructor accepts a host-owned DBI
+handle; its `Selecto::SqlServer::Certification` module composes the public
+observer. The optional distribution owns `Selecto::MSSQL` compatibility and
+DBD::ODBC requirements. Importing it does not register a default adapter or
+open a connection. Core-only SQL Server selection names the missing package.

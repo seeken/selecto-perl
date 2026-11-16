@@ -335,36 +335,6 @@ subtest 'MySQL and MariaDB' => sub {
     }
 };
 
-subtest 'SQL Server' => sub {
-    my $raw = RecordingDBH->new(answers => { 'SELECT @@TRANCOUNT' => 1 });
-    ok(!$write->(Selecto->adapter(mssql => (dbh => $raw))), 'SQL Server write succeeds');
-    is_deeply($raw->events, [
-        'SELECT @@TRANCOUNT', 'SELECT @@TRANCOUNT', 'SAVE TRANSACTION selecto_write_1', 'write',
-    ], 'SQL Server uses SAVE TRANSACTION inside an open transaction and has no release');
-
-    my $failing = RecordingDBH->new(AutoCommit => 0, affected => [0], answers => { 'SELECT @@TRANCOUNT' => 2 });
-    is($write->(Selecto->adapter(mssql => (dbh => $failing)))->code, 'cardinality_mismatch',
-        'a failed SQL Server write keeps its error');
-    is_deeply($failing->events, [
-        'SELECT @@TRANCOUNT', 'SAVE TRANSACTION selecto_write_1', 'write',
-        'ROLLBACK TRANSACTION selecto_write_1',
-    ], 'a failed SQL Server write rolls back to its savepoint');
-
-    my $implicit = RecordingDBH->new(AutoCommit => 0, answers => { 'SELECT @@TRANCOUNT' => 0 });
-    ok(!$write->(Selecto->adapter(mssql => (dbh => $implicit))), 'implicit-transaction write succeeds');
-    is_deeply($implicit->events, ['SELECT @@TRANCOUNT', 'write'],
-        'with AutoCommit off and nothing pending the write is left for the host to commit');
-    my $implicit_failure = RecordingDBH->new(AutoCommit => 0, affected => [0], answers => { 'SELECT @@TRANCOUNT' => 0 });
-    $write->(Selecto->adapter(mssql => (dbh => $implicit_failure)));
-    is_deeply($implicit_failure->events, ['SELECT @@TRANCOUNT', 'write', 'rollback'],
-        'and a failure there rolls back only the write');
-
-    my $idle = RecordingDBH->new(answers => { 'SELECT @@TRANCOUNT' => 0 });
-    $write->(Selecto->adapter(mssql => (dbh => $idle)));
-    is_deeply($idle->events, ['SELECT @@TRANCOUNT', 'begin_work', 'write', 'commit'],
-        'SQL Server begins and commits on an idle connection');
-};
-
 subtest 'PostgreSQL detects a raw BEGIN' => sub {
     no warnings 'once';
     local *RecordingDBH::pg_ping = sub { push @{$_[0]{events}}, 'pg_ping'; return $_[0]{ping}; };

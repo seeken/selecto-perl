@@ -151,7 +151,7 @@ for my $name (qw(postgresql duckdb)) {
     };
 }
 
-for my $name (qw(sqlite mysql mariadb mssql)) {
+for my $name (qw(sqlite mysql mariadb)) {
     subtest "$name accepts the hint and compiles as before" => sub {
         my $hinted = Selecto::Engine->new(domain => storage_domain(),
             adapter => Selecto->adapter($name => (temporary_relations => 1,dbh => TestSelecto::DBH->new)));

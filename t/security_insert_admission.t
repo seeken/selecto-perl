@@ -99,7 +99,7 @@ subtest 'PostgreSQL actual type and precision govern prospective rows' => sub {
 };
 
 subtest 'unsupported adapter storage proof fails closed' => sub {
-    for my $backend (qw(mysql mariadb mssql duckdb)) {
+    for my $backend (qw(mysql mariadb duckdb)) {
         my $dbh = TestSelecto::DBH->new;
         my $engine = engine($dbh, $backend, 'records', 'tenant_id', 'integer', Selecto::Expression->eq('tenant_id', 7));
         my $error = error { $engine->execute_write(command('records', 1, 'tenant_id', 7)) };

@@ -3,7 +3,6 @@ use strict;
 use warnings;
 use Test::More;
 use JSON::PP ();
-use Selecto::MSSQL ();
 use Selecto::PostgreSQL ();
 use Selecto::SQL ();
 
@@ -137,13 +136,7 @@ subtest 'the base adapter decodes nothing; adapters with their own _decode decod
     $base->_decode_rows(\@rows, ['numeric', 'bool']);
     is_deeply(\@rows, [['12.50', 't']], 'identity');
 
-    my $mssql = bless {}, 'Selecto::MSSQL';
-    my @types = (4, 2);    # SQL_INTEGER, SQL_NUMERIC
-    my @raw = (['42', '12.500']);
-    my @per_cell = map { my $row = $_; [map { $mssql->_decode($row->[$_], $types[$_]) } 0 .. 1] } @raw;
-    my @decoded = map { [@$_] } @raw;
-    $mssql->_decode_rows(\@decoded, \@types);
-    is_deeply(\@decoded, \@per_cell, 'same as per-cell _decode');
+
 };
 
 done_testing;

@@ -5,7 +5,6 @@ use Test::More;
 use lib 't/lib';
 use TestSelecto;
 use Selecto::DuckDB ();
-use Selecto::MSSQL ();
 use Selecto::PostgreSQL ();
 use Selecto::SQLite ();
 
@@ -56,7 +55,12 @@ is($failed->details->{graph_node}, 'line_item',
 is_deeply($failed_dbh->events, ['BEGIN', 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED', 'ROLLBACK'],
     'a node-attributed graph failure still rolls back the managed transaction');
 
-my $unsupported = Selecto::MSSQL->new(dbh => TestSelecto::DBH->new);
+{
+    package TestSelecto::NoGraph;
+    our @ISA = ('Selecto::PostgreSQL');
+    sub write_capabilities { return { %{$_[0]->SUPER::write_capabilities}, write_graph => 0 }; }
+}
+my $unsupported = TestSelecto::NoGraph->new(dbh => TestSelecto::DBH->new);
 eval { $unsupported->execute_graph_unsafe($graph) };
 is($@->code, 'write_capability_missing', 'non-graph adapters fail closed before a transaction begins');
 

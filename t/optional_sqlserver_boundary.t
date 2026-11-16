@@ -1,0 +1,13 @@
+use strict;
+use warnings;
+use Test::More;
+use Selecto;
+ok(!grep($_ eq 'mssql', @{Selecto->available_adapters}), 'core has no SQL Server registration');
+my $ok = eval { Selecto->adapter(mssql => (dbh => bless({}, 'UnusedDBH'))); 1 };
+my $error = $@;
+ok(!$ok, 'core-only selection refuses');
+is($error->code, 'missing_adapter', 'specific missing-adapter error');
+like("$error", qr/Selecto-SqlServer/, 'error names the optional package');
+ok(!exists($INC{'Selecto/MSSQL.pm'}), 'core did not load SQL Server');
+ok(!exists($INC{'DBD/ODBC.pm'}), 'core did not load the driver');
+done_testing;

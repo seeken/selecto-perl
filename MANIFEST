@@ -58,7 +58,6 @@ lib/Selecto/Files.pm
 lib/Selecto/Identifier.pm
 lib/Selecto/Importer.pm
 lib/Selecto/MariaDB.pm
-lib/Selecto/MSSQL.pm
 lib/Selecto/MySQL.pm
 lib/Selecto/MySQLFamily.pm
 lib/Selecto/MySQLFamily/DateFormat.pm
@@ -204,10 +203,6 @@ t/in_list_golden.t
 t/lib/TestSelecto.pm
 t/lib/TestWorkItems.pm
 t/manifest.t
-t/mssql.integration.t
-t/mssql.t
-t/mssql_decimal_scale.t
-t/mssql_bound_scope_refusals.t
 t/duckdb_bound_scope_refusals.t
 t/duckdb_external_post_statement_checks.t
 t/duckdb_scope_provenance.t
@@ -443,3 +438,4 @@ t/query_composition.t
 t/mysql_write_key_metadata_live.t
 t/adapter_decimal_type.t
 t/external_query_budget.t
+t/optional_sqlserver_boundary.t

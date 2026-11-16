@@ -763,7 +763,7 @@ sub undo_failed { return shift->_undo_failed(@_); }
 
 # Optional native deadline strategy. undef delegates support detection to the
 # bundled generic strategies; false explicitly refuses this native boundary.
-sub query_budget_supported { return undef; }
+sub native_query_budget_supported { return undef; }
 sub configure_query_budget { return 0; }
 
 
@@ -4478,7 +4478,7 @@ compilation (joins, computed fields, CTEs, set operations, windows, related
 collections), eager and streaming execution, portable writes, write graphs
 and transactions. The bundled adapters (L<Selecto::PostgreSQL>,
 L<Selecto::SQLite>, L<Selecto::MySQL>, L<Selecto::MariaDB>,
-L<Selecto::MSSQL>, L<Selecto::DuckDB>) subclass it and override only what
+L<Selecto::DuckDB>) subclass it and override only what
 differs in their dialect.
 
 Identifiers are validated and quoted separately from values; every value is
@@ -4508,7 +4508,7 @@ C<append_returning>, C<related_collection_value_sql>, C<rollback_transaction>
 and C<undo_failed>. They preserve the corresponding shared compiler behavior;
 adapters must not call its private helper functions.
 
-C<query_budget_supported> may return a defined boolean for native deadline
+C<native_query_budget_supported> may return a defined boolean for native deadline
 support. C<configure_query_budget($milliseconds, $budget)> returns true when
 it installs the strategy. The budget exposes C<install_restore($callback)>
 and C<install_rearm($callback)>; install restoration before changing native

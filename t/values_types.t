@@ -6,7 +6,6 @@ use lib 't/lib';
 use TestSelecto;
 use DBI ();
 use Selecto::DuckDB ();
-use Selecto::MSSQL ();
 use Selecto::PostgreSQL ();
 use Selecto::SQLite ();
 
@@ -83,10 +82,6 @@ like $duckdb,
     qr/\ASELECT CAST\(\$1 AS VARCHAR\) AS "status", CAST\(\$2 AS VARCHAR\) AS "label", CAST\(\$3 AS BIGINT\) AS "sort_order", CAST\(\$4 AS DECIMAL\(38,2\)\) AS "weight", CAST\(\$5 AS BOOLEAN\) AS "terminal", CAST\(\$6 AS DATE\) AS "opened_on", \$7 AS "payload" UNION ALL /,
     'DuckDB casts values cells, sizing decimals to the widest declared scale';
 
-my ($mssql) = values_cte(Selecto::MSSQL->new(dbh => $dbh));
-like $mssql,
-    qr/\ASELECT \? AS \[status\], \? AS \[label\], CAST\(\? AS BIGINT\) AS \[sort_order\], CAST\(\? AS DECIMAL\(38,2\)\) AS \[weight\], CAST\(\? AS BIT\) AS \[terminal\], CAST\(\? AS DATE\) AS \[opened_on\], \? AS \[payload\] UNION ALL /,
-    'SQL Server casts only its allowlisted values types';
 
 SKIP: {
     skip 'DBD::SQLite is not installed', 2 unless eval { require DBD::SQLite; 1 };

@@ -38,7 +38,7 @@ sub supported {
     my $name = $adapter->name;
     my $dbh = $adapter->dbh;
     return 0 unless eval { $dbh->isa('DBI::db') };
-    my $native = $adapter->query_budget_supported;
+    my $native = $adapter->native_query_budget_supported;
     return $native ? 1 : 0 if defined($native);
     return $dbh->can('sqlite_progress_handler') && $dbh->can('sqlite_busy_timeout') ? 1 : 0
         if $name eq 'sqlite';

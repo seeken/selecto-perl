@@ -105,7 +105,7 @@ subtest 'PostgreSQL preflight refuses before nontransactional trigger effects' =
 };
 
 subtest 'unproven broad-write dialects refuse, bounded key writes remain supported' => sub {
-    for my $name(qw(mysql mariadb mssql duckdb)) {
+    for my $name(qw(mysql mariadb duckdb)) {
         my $adapter=Selecto->adapter($name=>(temporary_relations => 1,dbh=>TestSelecto::DBH->new));
         my $cmd=command(1)->with_metadata({__selecto_primary_key=>'id',__selecto_write_limit=>1000});
         eval{$adapter->_bounded_write_command($cmd)};

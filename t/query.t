@@ -6,7 +6,6 @@ use lib 't/lib';
 use TestSelecto;
 use Selecto::Identifier ();
 use Selecto::DuckDB ();
-use Selecto::MSSQL ();
 use Selecto::MySQL ();
 use Selecto::PostgreSQL ();
 use Selecto::SQLite ();
@@ -1190,14 +1189,7 @@ like(
     qr/JSON_ARRAYAGG\(JSON_OBJECT\('sku', `c_lines`\.`sku`\)\)/,
     'MySQL related collections use JSON_ARRAYAGG',
 );
-like(
-    Selecto::Engine->new(
-        domain => $line_domain,
-        adapter => Selecto::MSSQL->new(dbh => TestSelecto::DBH->new),
-    )->compile($collection_query)->sql,
-    qr/FOR JSON PATH/,
-    'SQL Server related collections use FOR JSON PATH',
-);
+
 
 my $string_collection_query = $line_engine->query->select(
     'id', Selecto::Expression->related_collection('lines', [{
@@ -1209,7 +1201,6 @@ for my $case (
     [Selecto::PostgreSQL->new(dbh => TestSelecto::DBH->new), qr/CAST\("c_lines"\."sku" AS TEXT\)/, 'PostgreSQL'],
     [Selecto::SQLite->new(dbh => TestSelecto::DBH->new), qr/CAST\("c_lines"\."sku" AS TEXT\)/, 'SQLite'],
     [Selecto::MySQL->new(dbh => TestSelecto::DBH->new), qr/CAST\(`c_lines`\.`sku` AS CHAR\)/, 'MySQL'],
-    [Selecto::MSSQL->new(dbh => TestSelecto::DBH->new), qr/CAST\(\[c_lines\]\.\[sku\] AS NVARCHAR\(MAX\)\)/, 'SQL Server'],
     [Selecto::DuckDB->new(dbh => TestSelecto::DBH->new), qr/CAST\("c_lines"\."sku" AS VARCHAR\)/, 'DuckDB'],
 ) {
     my ($compiler, $cast, $dialect) = @$case;

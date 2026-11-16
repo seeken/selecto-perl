@@ -160,7 +160,7 @@ subtest 'actual PostgreSQL joined, correlated and lateral reads' => sub {
 };
 
 subtest 'six native dialect compilers retain inferred joins and bound parameters' => sub {
-    for my $backend (qw(postgresql sqlite duckdb mysql mariadb mssql)) {
+    for my $backend (qw(postgresql sqlite duckdb mysql mariadb)) {
         my $engine = Selecto::Engine->new(domain => Selecto::Domain->parse(contract(), strict => 1),
             adapter => Selecto->adapter($backend => (temporary_relations => 1,dbh => TestSelecto::DBH->new)), scope => {tenant => 7});
         my $statement = $engine->compile($engine->query->select(Selecto::Expression->literal(99)->as('literal'),
