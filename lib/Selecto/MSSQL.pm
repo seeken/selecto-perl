@@ -42,8 +42,8 @@ sub supports {
 sub _values_cast_types {
     return {
         integer => 'BIGINT', int => 'BIGINT', bigint => 'BIGINT',
-        decimal => \&Selecto::SQL::_values_decimal_sql,
-        numeric => \&Selecto::SQL::_values_decimal_sql,
+        decimal => \&Selecto::SQL::values_decimal_type,
+        numeric => \&Selecto::SQL::values_decimal_type,
         boolean => 'BIT', date => 'DATE',
     };
 }

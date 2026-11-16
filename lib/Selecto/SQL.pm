@@ -749,6 +749,9 @@ sub _values_cast_types { return {}; }
 
 # Exact DECIMAL(38, s) target wide enough for every value in the column, for
 # dialects whose bare DECIMAL has a small default scale.
+# Public adapter SDK utility; callback signature is (adapter, values).
+sub values_decimal_type { return shift->_values_decimal_sql(@_); }
+
 sub _values_decimal_sql {
     my ($self, $values) = @_;
     my ($digits, $scale) = (0, 0);
@@ -4465,6 +4468,17 @@ differs in their dialect.
 
 Identifiers are validated and quoted separately from values; every value is
 a bound parameter.
+
+=head1 ADAPTER EXTENSION CONTRACT
+
+Adapter contract version 1 supports external C<Selecto::SQL> subclasses using
+its compiler and transaction override methods. Override methods receive validated
+intent or compiler-generated fragments; they are not a caller SQL API. The core
+retains governance, authorization and DBI handle ownership.
+
+C<values_decimal_type($values)> returns an exact C<DECIMAL(38, scale)> cast type
+for a column of exact decimal text, refusing precision overflow. It can be used
+as a C<_values_cast_types> callback without reaching into core-private functions.
 
 =head1 ATTRIBUTES
 

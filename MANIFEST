@@ -441,3 +441,4 @@ t/pg_pipeline_available.t
 t/pg_pipeline_live.t
 t/query_composition.t
 t/mysql_write_key_metadata_live.t
+t/adapter_decimal_type.t
