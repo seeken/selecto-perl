@@ -86,8 +86,8 @@ for my $backend (@backends) {
     $dbh->do('DROP TABLE IF EXISTS selecto_up_rows');
 }
 
-# A PostgreSQL statement-level UPDATE trigger can write rows the post-image
-# re-read does not name: a bound-scope update on such a table is refused.
+# Host statement-level UPDATE/DELETE trigger effects belong to the host;
+# governed mutations keep their own scope predicates without catalog checks.
 SKIP: {
     my ($pg) = grep { $_->[0] eq 'postgresql' } @backends;
     skip 'SELECTO_PERL_TEST_POSTGRES_URL is not configured', 10 unless $pg;
@@ -109,8 +109,8 @@ SKIP: {
     my $result = eval { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_up_rows',
         assignments => {note => 'changed'}, predicate => $x->eq('code', 'a'), scope_predicate => $x->eq('org_key', 't1'))); 'applied' }
         // (blessed($@) ? $@->code : "died: $@");
-    is($result, 'write_capability_missing', 'a statement-level trigger writing other rows is refused');
-    is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_up_rows ORDER BY id'), [[1, 'n'], [2, 'n']], 'and nothing changed');
+    is($result, 'applied', 'a host statement-level trigger is not catalog-checked');
+    is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_up_rows ORDER BY id'), [[1, 'changed'], [2, 'other']], 'the host trigger ran outside the governed tuple check');
     my $required = Selecto::Engine->new(adapter => Selecto->adapter(postgresql => (dbh => $dbh)),
         domain => $domain->with_required_predicate($x->eq('org_key', 't1')));
     is(eval { $required->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_up_rows',
@@ -145,12 +145,12 @@ SKIP: {
     my $pg_adapter = Selecto->adapter(postgresql => (dbh => $dbh));
     $reset->();
     is($delete->(Selecto::Engine->new(adapter => $pg_adapter, domain => $delete_domain->(1), scope => {tenant => 't1'})),
-        'write_capability_missing', 'an engine-tenant delete on a table with a statement-level DELETE trigger is refused');
-    is_deeply($state->(), [[5, 'n'], [6, 'n']], 'and nothing changed');
+        'applied', 'an engine-tenant delete leaves the host statement trigger to PostgreSQL');
+    is_deeply($state->(), [[6, 'other']], 'the scoped delete and host trigger both ran');
     $reset->();
     is($delete->(Selecto::Engine->new(adapter => $pg_adapter, domain => $delete_domain->(0)), scope_predicate => $x->eq('org_key', 't1')),
-        'write_capability_missing', 'a host-scoped delete on such a table is refused');
-    is_deeply($state->(), [[5, 'n'], [6, 'n']], 'and nothing changed');
+        'applied', 'a host-scoped delete leaves the host statement trigger to PostgreSQL');
+    is_deeply($state->(), [[6, 'other']], 'the scoped delete and host trigger both ran');
     $reset->();
     is($delete->(Selecto::Engine->new(adapter => $pg_adapter, domain => $delete_domain->(0)->with_required_predicate($x->eq('org_key', 't1')))),
         'applied', 'a required-only delete is not bound and applies');

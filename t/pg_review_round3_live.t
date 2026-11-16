@@ -13,7 +13,7 @@ use lib 't/lib';
 use TestPostgreSQL ();
 
 # PostgreSQL findings of the round-3 review (R9, R13, R17, R33, item 58):
-# - post-image re-reads name the written rows by (tableoid, ctid), so a key
+# - same-statement RETURNING checks the written tuple, so a key
 #   renumbering trigger with a decoy cannot pass and keys of any type work;
 # - guarded inserts keep ordinary row triggers (updated_at, audit) and are
 #   re-read under their full guard;
@@ -61,7 +61,7 @@ my ($r3k_ext, $ci);
 # Remove what this file installed even if it dies part-way, so a later
 # run never mistakes a leftover for a preinstalled extension.
 END { eval { $admin->do($_) for 'DROP EXTENSION IF EXISTS citext CASCADE', 'DROP SCHEMA IF EXISTS r3kext CASCADE' } if $r3k_ext }
-subtest 'R9: re-reads by (tableoid, ctid): a renumbering trigger cannot hide a moved row; keys of any type work' => sub {
+subtest 'R9: RETURNING catches a moved row; keys of any type work' => sub {
     $r3k_ext = !($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
     $admin->do($_) for $r3k_ext ? ('CREATE SCHEMA IF NOT EXISTS r3kext', 'CREATE EXTENSION citext SCHEMA r3kext') : ();
     $ci = qq{"$_".citext} for $admin->selectrow_array(q{SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'citext'});
@@ -131,7 +131,7 @@ subtest 'R13: guarded inserts keep ordinary row triggers' => sub {
     $admin->do('DROP TABLE r3t, r3t_audit CASCADE');
 };
 
-subtest 'item 58: catalog checks resolve operators in pg_catalog only' => sub {
+subtest 'host statement triggers are not catalog-checked' => sub {
     $admin->do($_) for 'DROP SCHEMA IF EXISTS r3o_evil CASCADE', 'DROP TABLE IF EXISTS r3o CASCADE',
         'DROP FUNCTION IF EXISTS r3o_stmt() CASCADE', 'CREATE SCHEMA r3o_evil',
         q{CREATE FUNCTION r3o_evil.never(a "char", b "char") RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false'},
@@ -146,8 +146,8 @@ subtest 'item 58: catalog checks resolve operators in pg_catalog only' => sub {
         adapter => Selecto->adapter(postgresql => (temporary_relations => 1,dbh => $dbh)));
     is($outcome->(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'r3o',
         assignments => {note => 'u'}, predicate => $x->eq('name', 'x'), scope_predicate => $x->eq('org_key', 't1')))->affected_rows }),
-        'write_capability_missing', 'the statement-level trigger is still seen and refused');
-    is($rows->($admin, 'SELECT note FROM r3o'), 'n', 'nothing changed');
+        'applied 1', 'a host statement trigger does not cause a catalog refusal');
+    is($rows->($admin, 'SELECT note FROM r3o'), 'u', 'the governed mutation applied');
     $admin->do($_) for 'DROP TABLE r3o CASCADE', 'DROP FUNCTION r3o_stmt() CASCADE', 'DROP SCHEMA r3o_evil CASCADE';
 };
 

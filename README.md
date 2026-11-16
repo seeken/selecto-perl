@@ -715,3 +715,11 @@ Copyright (c) 2026 by Chris Rohlfs.
 
 This is free software, licensed under the Artistic License 2.0 (GPL
 compatible). See [LICENSE](LICENSE).
+
+Governed PostgreSQL and SQLite updates check trusted scope in the mutation's
+`RETURNING`, then check cardinality before commit. Host-installed triggers,
+rules and concurrent owner DDL are outside the governed-write threat model;
+there are no PostgreSQL post-write catalog checks or stored-row rereads.
+Typed insert admission and SQLite physical-ownership certification retain
+their narrow storage checks. MySQL/MariaDB updates retain same-transaction
+readback because those backends lack UPDATE RETURNING.

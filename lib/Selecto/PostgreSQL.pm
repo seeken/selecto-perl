@@ -234,28 +234,12 @@ sub insert_admission_storage {
         'PostgreSQL cannot establish the guarded insert storage contract'); };
     $fail->() unless eval { $dbh->isa('DBI::db') && $dbh->{Driver}{Name} eq 'Pg' };
     my $table = $self->quote_identifier(Selecto::Identifier::checked($command->relation));
-    # Keep the inspected table and trigger/type definitions stable until DML.
-    $dbh->do("LOCK TABLE ONLY $table IN ROW EXCLUSIVE MODE");
-    # The trigger and rule checks below need READ COMMITTED (see
-    # Selecto::SQL::_require_read_committed).
-    $self->_require_read_committed(Selecto::Identifier::checked($command->relation));
+    # Storage typing needs only the target oid. TA005's transforming
+    # BEFORE INSERT trigger is classified only if RETURNING fails its guard.
     my $relation = $dbh->selectrow_hashref(q{
-        SELECT c.oid, CAST(c.relkind AS pg_catalog.text) AS relkind, CAST(c.relispartition AS pg_catalog.int4) AS relispartition,
-          CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgrelid OPERATOR(pg_catalog.=) c.oid AND NOT t.tgisinternal
-            AND t.tgenabled OPERATOR(pg_catalog.<>) 'D') AS pg_catalog.int4) AS triggers,
-          CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r WHERE r.ev_class OPERATOR(pg_catalog.=) c.oid) AS pg_catalog.int4) AS rules,
-          CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid OPERATOR(pg_catalog.=) c.oid
-            OR i.inhparent OPERATOR(pg_catalog.=) c.oid) AS pg_catalog.int4) AS inheritance
-        FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(CAST(? AS pg_catalog.text))
+        SELECT CAST(pg_catalog.to_regclass(CAST(? AS pg_catalog.text)) AS pg_catalog.oid) AS oid
     }, undef, $table);
-    # A guarded insert is re-read by row id under its full guard after the
-    # statement, so ordinary row triggers (updated_at, audit) stay
-    # allowed; statement-level and deferrable triggers are refused by its
-    # target contract. An upsert has no such re-read.
-    my $triggers_checked = $command->operation eq 'insert' && $self->_rereads_by_row_id;
-    $fail->() unless $relation && $relation->{relkind} eq 'r'
-        && !$relation->{relispartition} && ($triggers_checked || !$relation->{triggers}) && !$relation->{rules}
-        && !$relation->{inheritance};
+    $fail->() unless $relation && defined($relation->{oid});
     # Each column's type, and its base type through any domain chain (a
     # cast to the domain enforces its CHECK constraints, as PostgreSQL does
     # natively), with whether that base is the citext extension's own type
@@ -1410,15 +1394,19 @@ sub _pg_begin_read {
     return;
 }
 
-# Post-statement re-reads name the written rows by (tableoid, ctid).
-sub _rereads_by_row_id { return $_[0]->_pg_session_checked; }
+# Broad-write selection still uses physical identities while holding row locks.
+sub _write_uses_physical_ids { return $_[0]->_pg_session_checked; }
 
-sub _with_row_ids {
-    my ($self, $compiled) = @_;
-    return $compiled unless ref($compiled) eq 'HASH';
-    my $columns = 'CAST(tableoid AS pg_catalog.text), CAST(ctid AS pg_catalog.text)';
-    return {%$compiled, row_ids => 1,
-        sql => $compiled->{sql} . (@{$compiled->{returning} // []} ? ', ' : ' RETURNING ') . $columns};
+sub _insert_scope_failure {
+    my ($self, $command) = @_;
+    my ($trigger) = $self->dbh->selectrow_array(q{SELECT CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t
+        WHERE t.tgrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(CAST(? AS pg_catalog.text))
+          AND NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
+          AND (t.tgtype OPERATOR(pg_catalog.&) CAST(7 AS pg_catalog.int2)) OPERATOR(pg_catalog.=) CAST(7 AS pg_catalog.int2)) AS pg_catalog.int4)},
+        undef, $self->quote_identifier(Selecto::Identifier::checked($command->relation)));
+    Selecto::Error->throw('query_rule_not_evaluable',
+        'a BEFORE INSERT trigger rewrote the guarded row; the insert admission cannot be evaluated',
+        {reason => 'transforming_trigger', relation => $command->relation}) if $trigger;
 }
 
 # Reads. With no transaction open, a read is a READ ONLY
@@ -1463,39 +1451,6 @@ sub _guarded_read {
     }
     die $error unless $ok;
     return $result;
-}
-
-# The relation a write's post-statement SQL addresses, resolved
-# before the statement (under its lock): its oid, its schema-qualified name
-# and the oids its rows may live in (itself and its partitions). Rechecks
-# use the oid and re-reads the qualified name with tableoid = ANY(oids),
-# never a search_path lookup a trigger could redirect.
-sub _pg_resolve_write_target {
-    my ($self, $table) = @_;
-    my $context = $self->{_selecto_write_target};
-    return $context->{$table} if ref($context) eq 'HASH' && $context->{$table};
-    my @row = $self->dbh->selectrow_array(q{
-        SELECT c.oid, pg_catalog.quote_ident(n.nspname) OPERATOR(pg_catalog.||) '.' OPERATOR(pg_catalog.||) pg_catalog.quote_ident(c.relname),
-          ARRAY(SELECT CAST(t.relid AS pg_catalog.oid) FROM pg_catalog.pg_partition_tree(c.oid) t
-                UNION SELECT c.oid)
-        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
-        WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)}, undef, $self->quote_identifier($table));
-    Selecto::Error->throw('query_rule_not_evaluable', 'the written relation could not be resolved',
-        {reason => 'relation_unresolved', relation => $table}) unless @row && defined $row[0];
-    my $target = {oid => $row[0], qualified => $row[1], oids => $row[2]};
-    $context->{$table} = $target if ref($context) eq 'HASH';
-    return $target;
-}
-
-# The target resolved before the statement; a post-statement check without
-# one fails closed.
-sub _pg_write_target {
-    my ($self, $table) = @_;
-    my $context = $self->{_selecto_write_target};
-    my $target = ref($context) eq 'HASH' ? $context->{$table} : undef;
-    Selecto::Error->throw('query_rule_not_evaluable', 'the written relation was not resolved before the statement',
-        {reason => 'relation_unresolved', relation => $table}) unless $target;
-    return $target;
 }
 
 sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
@@ -1808,19 +1763,19 @@ A bounded stream follows the same rules; see L<Selecto::PostgreSQL::Stream>.
 
 =head1 WRITES
 
-A governed write's post-statement SQL (the post-image re-read and the
-trigger, rule and deferrable rechecks) addresses its relation by the oid
-and schema-qualified name resolved under its lock before the DML, with
-C<tableoid = ANY(...)>. A bound-scope update locks its rows and names them
-by (tableoid, ctid), and both a bound-scope update and a guarded insert
-return the (tableoid, ctid) of every row they wrote and re-read exactly
-those rows after every trigger has run, under the update's trusted scope or
-the insert's full guard. No key is needed, so keys of any type (composite,
-temporal, float, citext, partitioned) work, and a trigger that renumbers a
-row behind a decoy cannot pass; a row a later trigger updates again has a new
-row id and is refused. A guarded insert therefore keeps ordinary row triggers
-(C<updated_at>, audit); statement-level triggers, rules and deferrable
-triggers for the event stay refused.
+Governed updates evaluate their trusted scope in the same statement's
+C<RETURNING>; guarded inserts evaluate their full insert guard there. This
+covers storage coercion, defaults and BEFORE-row transformations without a
+separate stored-row read. Broad writes retain bounded selection with row
+locks; identity-bounded writes need no selection snapshot. Expected counts
+are checked before commit, and failures roll back within the owned write scope.
+
+Governed writes do not catalog-check host-installed rules, statement or
+deferred triggers, relation topology or concurrent owner DDL. These objects
+belong to the host's trusted schema. TA005 retains a narrow transforming
+insert-trigger error classification, and typed insert admission still checks
+actual storage types. Host transaction ownership, encoding, hand-built SQL
+refusals and non-relaxing query deadlines remain enforced.
 
 =head1 WHAT THE HOST MUST PROVIDE
 

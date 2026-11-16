@@ -2535,17 +2535,17 @@ sub _verify_inserted_row {
 # one row.
 sub _unique_key_columns {
     my ($self, $table, $keys) = @_;
-    my ($indexes, $nullable);
+    my $indexes;
     my $ok = eval {
-        $indexes = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT INDEX_NAME, COLUMN_NAME, SUB_PART
-            FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND NON_UNIQUE = 0
-            ORDER BY INDEX_NAME, SEQ_IN_INDEX}), undef, $table);
-        $nullable = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT COLUMN_NAME, IS_NULLABLE
-            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
+        $indexes = $self->dbh->selectall_arrayref($self->_statement_sql(q{SELECT s.INDEX_NAME, s.COLUMN_NAME, s.SUB_PART, c.IS_NULLABLE
+            FROM information_schema.STATISTICS s LEFT JOIN information_schema.COLUMNS c
+              ON c.TABLE_SCHEMA = s.TABLE_SCHEMA AND c.TABLE_NAME = s.TABLE_NAME AND c.COLUMN_NAME = s.COLUMN_NAME
+            WHERE s.TABLE_SCHEMA = DATABASE() AND s.TABLE_NAME = ? AND s.NON_UNIQUE = 0
+            ORDER BY s.INDEX_NAME, s.SEQ_IN_INDEX}), undef, $table);
         1;
     };
     die $self->normalize_error($@) unless $ok;
-    my %null = map { (lc($_->[0]) => uc($_->[1] // 'YES')) } @$nullable;
+    my %null = map { (lc($_->[1]) => uc($_->[3] // 'YES')) } grep { defined($_->[1]) } @$indexes;
     my %want = map { (lc($_) => 1) } @$keys;
     my %index;
     for my $row (@$indexes) {

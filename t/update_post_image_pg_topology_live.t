@@ -10,19 +10,8 @@ use Selecto::Domain;
 use Selecto::Expression;
 use Selecto::Write ();
 
-# PostgreSQL TW-09 post-image topologies beyond the written relation. A
-# deferrable constraint trigger fires at commit, after the re-read, so one
-# anywhere in the database is refused: on a leaf partition or an
-# inheritance child (it fires for rows the update reaches through the
-# parent), or on another table a row trigger writes to (an audit table whose
-# deferred trigger rewrites the updated row). Statement-level update
-# triggers and rules are refused on the relation and every partition or
-# child below it. Ordinary partitioned updates, row triggers caught by the
-# re-read, and deferrable foreign keys (internal triggers) keep working.
-#
-# Each case builds its tables inside a host transaction and rolls it back,
-# so no other session sees its deferrable triggers; the audit case also runs
-# once in a write-owned transaction to show the committed effect.
+# RETURNING verifies scope on partitioned and inherited tuples. Host rules,
+# statement triggers and deferred effects are not catalog-checked.
 my $url = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless defined($url) && $url ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; require Selecto::Certification; 1 };
@@ -123,36 +112,29 @@ for my $case (sort keys %setup) {
             my $code = code_of(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update',
                 relation => 'selecto_topo', assignments => {note => 'changed'}, predicate => $x->eq('name', 'x'), %$extra,
                 ($returning ? (metadata => {returning => ['id']}) : ()))) });
-            is($code, $expected{$case} // 'query_rule_not_evaluable', "$label: refused before the update");
-            is($state->(), '1:t1:n 2:t2:n', "$label: and nothing changed");
-            if ($code eq 'applied') {
-                # Show what the host commit would leave behind.
-                $dbh->commit;
-                is($state->(), '1:t1:changed 2:t2:n', "$label: after commit the row is still in scope");
-                $dbh->do('DROP TABLE IF EXISTS selecto_topo, selecto_topo_audit, selecto_topo_log CASCADE');
-            } else {
-                $dbh->rollback;
-            }
+            is($code, 'applied', "$label: no host-object catalog refusal");
+            is($state->(), '1:t1:changed 2:t2:n', "$label: mutation applies before host commit");
+            $dbh->rollback;
         }
     }
 }
 
 # The audit topology in a write-owned transaction: the deferred trigger
-# would fire at the write's own commit.
+# fires at the write's own commit, outside the governed boundary.
 {
     $dbh->do('DROP TABLE IF EXISTS selecto_topo, selecto_topo_audit CASCADE');
     $setup{'deferred trigger on an audit table'}->();
     $dbh->do(q{INSERT INTO selecto_topo VALUES (1, 't1', 'x', 'n'), (2, 't2', 'x', 'n')});
     my ($engine) = $modes{'engine tenant'}->();
     is(code_of(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_topo',
-        assignments => {note => 'changed'}, predicate => $x->eq('name', 'x'))) }), 'query_rule_not_evaluable',
-        'write-owned transaction: a deferred trigger on an audit table is refused');
-    is($state->(), '1:t1:n 2:t2:n', 'write-owned transaction: and nothing changed');
+        assignments => {note => 'changed'}, predicate => $x->eq('name', 'x'))) }), 'applied',
+        'write-owned transaction: host deferred trigger effects are outside the boundary');
+    is($state->(), '1:t2:changed 2:t2:n', 'write-owned transaction: the host deferred trigger ran');
     $dbh->do('DROP TABLE IF EXISTS selecto_topo, selecto_topo_audit CASCADE');
 }
 
 # What keeps working: an ordinary update of a partitioned table, a leaf
-# partition's row trigger moving the row (caught by the re-read), and a
+# partition's BEFORE-row scope change (caught by RETURNING), and a
 # deferrable foreign key, whose triggers are internal.
 for my $mode (sort keys %modes) {
     $dbh->begin_work;
@@ -187,7 +169,7 @@ for my $mode (sort keys %modes) {
 # An inheritance parent's key is not unique across its children: a BEFORE
 # UPDATE trigger that rewrites the key (and the tenant) let the re-read by
 # the old key find a decoy row in a child. A bound-scope update of a
-# relation with (non-partition) inheritance children is refused; a child
+# relation with inheritance children is checked by RETURNING; a child
 # without children of its own is updated as before.
 for my $mode ('engine tenant', 'host scope') {
     for my $returning (0, 1) {
@@ -205,8 +187,8 @@ for my $mode ('engine tenant', 'host scope') {
             @{$dbh->selectall_arrayref('SELECT tableoid::regclass, id, org_key, name, note FROM selecto_topo ORDER BY 1, 2')} };
         is(code_of(sub { $engine->execute_write(Selecto::Write::Command->new(operation => 'update', relation => 'selecto_topo',
             assignments => {note => 'changed'}, predicate => $x->eq('name', 'evil'), %$extra,
-            ($returning ? (metadata => {returning => ['id']}) : ()))) }), 'query_rule_not_evaluable',
-            "$label: an update of a relation with inheritance children is refused");
+            ($returning ? (metadata => {returning => ['id']}) : ()))) }), 'query_rule_violation',
+            "$label: RETURNING catches the changed scope without a topology check");
         is($rows->(), 'selecto_topo:5:t1:evil:n selecto_topo:6:t2:other:n selecto_topo_c:5:t1:decoy:n', "$label: and nothing changed");
         $dbh->rollback;
     }

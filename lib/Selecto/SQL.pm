@@ -1479,11 +1479,9 @@ sub preview_write {
 
 sub _admit_plan_storage { return; }
 
-# Dialect hook: true when post-statement re-reads name the written rows by
-# their physical row id (PostgreSQL: RETURNING tableoid, ctid) instead of
-# their key value. _with_row_ids appends the row ids to a compiled write.
-sub _rereads_by_row_id { return 0; }
-sub _with_row_ids { return $_[1]; }
+# Broad-write selection can retain physical identities rather than rebinding
+# logical keys whose driver rendering may be inexact.
+sub _write_uses_physical_ids { return 0; }
 
 # Execution requires the engine's authorization for the exact object; see
 # Selecto::Write::Authorization. The *_unsafe variants skip domain governance
@@ -3612,7 +3610,7 @@ sub _check_typed_insert_admission {
 sub _typed_insert_admission_probe {
     my ($self, $command, $predicate, $candidate, $budget) = @_;
     # This runs inside the write transaction. Concrete adapters verify actual
-    # column storage, hold schema stable, and refuse transforming triggers.
+    # column storage. Narrow trigger admission remains where certification requires it.
     my $storage = $self->insert_admission_storage($command, $candidate->{types});
     $budget->check;
     my @params;
@@ -3718,52 +3716,38 @@ sub _check_write_cardinality {
 
 sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
-    # The write's relation as resolved before the DML (item 51) lives for
-    # this write only.
-    local $self->{_selecto_write_target} = {};
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
     $self->_check_typed_insert_admission($command);
-    # A governed update's trusted scope (required predicate, host scope,
-    # query enforcement) must hold for the rows it leaves behind too: an
-    # assignment, or a BEFORE UPDATE trigger, could move a row out of scope.
-    # Its rows are locked and named by key first, and re-read afterwards.
     my $post_image = _post_image_predicate($command);
-    $self->_admit_post_image_target($command) if $post_image;
-    # A guarded insert's stored rows are re-read under its full guard after
-    # the statement, where the dialect re-reads by row id (PostgreSQL, items
-    # 24, 65, R13): ordinary row triggers (updated_at, audit) then stay
-    # allowed, and one that rewrites the row out of the guard is caught.
-    my $insert_guard = $self->_rereads_by_row_id ? _insert_post_image_predicate($command) : undef;
-    # The bound-scope target contract for deletes and for graph descendants
-    # (see _bound_target_event), and for re-read guarded inserts: table
-    # lock, READ COMMITTED, and no deferrable trigger, statement-level
-    # trigger or rule for the event, checked before the statement and again
-    # after it.
-    my $bound_event = _bound_target_event($command) // ($insert_guard ? 'insert' : undef);
-    $self->_bound_target_check($command, $bound_event, 'before') if $bound_event;
-    my ($bounded, $identities) = $self->_bounded_write_command($command, $post_image ? (force => 1) : ());
+    my $insert_guard = $self->name eq 'postgresql' ? _insert_post_image_predicate($command) : undef;
+    my $same_statement = ($post_image || $insert_guard)
+        && $self->name =~ /\A(?:postgresql|sqlite)\z/ && $self->write_capabilities->{returning};
+    # Backends without UPDATE RETURNING still need locked identities and a
+    # same-transaction read to evaluate the stored scope. Identity-bounded
+    # RETURNING writes need neither that snapshot nor its budget/savepoint.
+    $self->_admit_post_image_target($command) if $post_image && !$same_statement;
+    my ($bounded, $identities) = $self->_bounded_write_command($command,
+        $post_image && !$same_statement ? (force => 1) : ());
     $compiled = $self->_compile_write($bounded) if $bounded != $command;
     $command = $bounded;
-    my $row_ids = ($post_image || $insert_guard) && $self->_rereads_by_row_id;
-    $compiled = $self->_with_row_ids($compiled) if $row_ids;
-    my @row_ids;
+    $compiled = $self->_with_scope_returning($compiled, $post_image // $insert_guard) if $same_statement;
     my ($sth, $affected, %values);
     my $ok = eval {
         $sth = $self->{dbh}->prepare($self->_statement_sql($compiled->{sql}));
         die _dbi_error($self->{dbh}, 'database prepare failed') unless $sth;
         my $executed = $self->_execute_statement($sth, $compiled->{params});
         die _dbi_error($sth, 'database write failed') unless defined $executed;
-        if ($compiled->{row_ids}) {
-            # Every row's (tableoid, ctid) follows the requested RETURNING
-            # columns; the first row's leading columns are the values.
+        if ($compiled->{scope_returning}) {
             my @wanted = @{$compiled->{returning} // []};
             my ($first, $returned);
             while (my @row = $sth->fetchrow_array) {
-                Selecto::Error->throw('query_error', 'write row identity is unavailable')
-                    unless @row == @wanted + 2 && defined($row[-1]) && defined($row[-2]);
-                push @row_ids, [@row[-2, -1]];
-                $first //= [@row[0 .. $#wanted]];
+                unless (@row == @wanted + 1 && defined($row[-1]) && "$row[-1]" eq '1') {
+                    $self->_insert_scope_failure($command) if $insert_guard;
+                    Selecto::Error->throw('query_rule_violation', 'written row no longer satisfies its trusted scope',
+                        {truth_value => 'false_or_unknown'});
+                }
+                $first //= [@row[0 .. $#wanted]] if @wanted;
                 ++$returned;
             }
             die _dbi_error($sth, 'database returning fetch failed') if eval { $sth->err };
@@ -3799,13 +3783,8 @@ sub _execute_compiled_write_in_transaction {
     };
     die $self->normalize_error($@) unless $ok;
     $self->_check_write_cardinality($command, $affected, $bounds);
-    $self->_bound_target_check($command, $bound_event, 'after') if $bound_event;
-    if ($post_image) {
-        $self->_recheck_post_image_target($command);
-        $row_ids ? $self->_verify_row_post_image($command, $post_image, \@row_ids, $affected)
-            : $self->_verify_post_image($command, $post_image, $identities, $affected);
-    }
-    $self->_verify_row_post_image($command, $insert_guard, \@row_ids, $affected, 'insert') if $insert_guard;
+    $self->_verify_post_image($command, $post_image, $identities, $affected)
+        if $post_image && !$same_statement;
     # Without an expected count, a guarded write that changed nothing is still
     # refused rather than reported as an empty success.
     _guarded_cardinality($command, $affected) if !$affected && @{$command->foreign_key_guards};
@@ -3818,7 +3797,7 @@ sub _execute_compiled_write_in_transaction {
 # The required predicate, query enforcement and the caller's filter bound
 # the pre-image only: an update may change the column it was found by.
 # The engine tenant's columns are immutable, but a BEFORE UPDATE trigger
-# could still rewrite them: they are re-read like any bound scope.
+# could still rewrite them: RETURNING checks the stored tuple's scope.
 # A guarded insert's full guard (its predicate, scope and query
 # enforcement: an insert has no pre-image, items 24, 65), when it has one and
 # the typed storage admission runs for it.
@@ -3832,70 +3811,16 @@ sub _insert_post_image_predicate {
     );
 }
 
-# The post-image re-read by row id (PostgreSQL, R9): the rows the statement
-# reported (RETURNING tableoid, ctid) are read again after every trigger has
-# run, FROM the schema-qualified relation resolved before the statement and
-# only among its own oids; each must still exist at that row id (a row a
-# later trigger moved again has a new one) and satisfy $predicate under the
-# write's host-exact comparison. A key-renumbering trigger or a decoy row
-# sharing the old key value cannot stand in for a moved row.
-sub _verify_row_post_image {
-    my ($self, $command, $predicate, $row_ids, $affected, $kind) = @_;
-    return 1 unless $affected;
-    my %wanted = map { (join(':', @$_) => 1) } @$row_ids;
-    Selecto::Error->throw('query_rule_violation', 'the written rows could not be identified',
-        {truth_value => 'false_or_unknown'}) unless keys(%wanted) == @$row_ids && @$row_ids == $affected;
-    my $relation = Selecto::Identifier::checked($command->relation);
-    my $target = $self->_pg_write_target($relation);
-    my @params;
+# Append a private truth marker after the public RETURNING values. The
+# backend evaluates it on the same stored tuple as the mutation, including
+# coercion, rounding, defaults and BEFORE-row transformations.
+sub _with_scope_returning {
+    my ($self, $compiled, $predicate) = @_;
+    my @params = @{$compiled->{params}};
     my $condition = $self->_compile_write_predicate($predicate, \@params);
-    push @params, $target->{oids};
-    my $oids = $self->placeholder(scalar @params);
-    push @params, [map { $_->[1] } @$row_ids];
-    my $tids = $self->placeholder(scalar @params);
-    my $sql = 'SELECT CAST(tableoid AS pg_catalog.text), CAST(ctid AS pg_catalog.text), '
-        . "CASE WHEN ($condition) THEN 1 ELSE 0 END FROM $target->{qualified}"
-        . " WHERE tableoid OPERATOR(pg_catalog.=) ANY (CAST($oids AS pg_catalog.oid[]))"
-        . " AND ctid OPERATOR(pg_catalog.=) ANY (CAST($tids AS pg_catalog.tid[]))";
-    my $rows;
-    my $ok = eval { $rows = $self->dbh->selectall_arrayref($self->_statement_sql($sql), undef, @params); 1 };
-    die $self->normalize_error($@) unless $ok;
-    my %seen;
-    for my $row (@$rows) {
-        my $id = "$row->[0]:$row->[1]";
-        next unless $wanted{$id};
-        $seen{$id} = defined($row->[2]) && "$row->[2]" eq '1' ? 1 : 0;
-    }
-    return 1 if keys(%seen) == keys(%wanted) && !grep { !$_ } values %seen;
-    # A guarded insert the typed admission accepted, rewritten by a BEFORE
-    # INSERT row trigger so it no longer satisfies its guard: the trigger
-    # made the admission unevaluable (typed_insert_admission TA005), and the
-    # insert is refused and rolled back as before the re-read existed.
-    Selecto::Error->throw('query_rule_not_evaluable',
-        'a BEFORE INSERT trigger rewrote the guarded row; the insert admission cannot be evaluated',
-        {reason => 'transforming_trigger', relation => $relation})
-        if ($kind // '') eq 'insert' && $self->_pg_before_insert_triggers($target->{oid});
-    Selecto::Error->throw('query_rule_violation',
-        ($kind // '') eq 'insert' ? 'inserted row does not satisfy its guard after the statement'
-            : 'updated row no longer satisfies its trusted scope',
-        {truth_value => 'false_or_unknown'});
-}
-
-# Whether the relation (by oid) has an enabled user-defined BEFORE INSERT
-# row trigger (tgtype bits: ROW 1, BEFORE 2, INSERT 4).
-sub _pg_before_insert_triggers {
-    my ($self, $oid) = @_;
-    my ($count);
-    my $ok = eval {
-        ($count) = $self->dbh->selectrow_array(q{SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t
-            WHERE t.tgrelid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid) AND NOT t.tgisinternal
-              AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
-              AND (t.tgtype OPERATOR(pg_catalog.&) CAST(7 AS pg_catalog.int2)) OPERATOR(pg_catalog.=) CAST(7 AS pg_catalog.int2)},
-            undef, $oid);
-        1;
-    };
-    die $self->normalize_error($@) unless $ok;
-    return $count ? 1 : 0;
+    return {%$compiled, params => \@params, scope_returning => 1,
+        sql => $compiled->{sql} . (@{$compiled->{returning} // []} ? ', ' : ' RETURNING ')
+            . "CASE WHEN ($condition) THEN 1 ELSE 0 END"};
 }
 
 sub _post_image_predicate {
@@ -3905,164 +3830,22 @@ sub _post_image_predicate {
     return blessed($predicate) && $predicate->isa('Selecto::Expression') ? $predicate : undef;
 }
 
-# The re-read runs after the statement, when every BEFORE and AFTER trigger
-# (row or statement level) has run, so ordinary triggers (updated_at, audit)
-# keep working and one that moves a row out of scope is caught. It cannot see
-# what runs later, or through another relation: a deferrable constraint
-# trigger (PostgreSQL) fires at commit, and a view's rules or INSTEAD OF
-# triggers write elsewhere. Those are refused before the update.
-#
-# PostgreSQL: a deferrable constraint trigger anywhere in the database is
-# refused, not only one on the written relation: a leaf partition's or an
-# inheritance child's fires for rows the update reaches through the parent,
-# and one on another table fires when a row trigger writes there (an audit
-# table) and can then rewrite the updated row at commit. Statement-level
-# update triggers and rules are refused on the relation and on every
-# partition or child below it. A relation with (non-partition) inheritance
-# children is refused: its key is not unique across the children, so the
-# re-read by key could find a decoy row in a child. Every other adapter
-# (SQL Server, DuckDB) refuses bound-scope updates outright: it never
-# re-reads the rows, so a generated column, a trigger or a view/synonym
-# could leave the scope unseen.
+# Only the non-RETURNING fallback must name stored rows by an immutable,
+# enforced unique key. Host-installed triggers, rules and concurrent DDL
+# are outside the governed-write boundary.
 sub _admit_post_image_target {
     my ($self, $command) = @_;
     my $table = Selecto::Identifier::checked($command->relation);
-    my $refuse = sub { Selecto::Error->throw('query_rule_not_evaluable', $_[0], {relation => $table}) };
-    my $name = $self->name;
     Selecto::Error->throw('write_capability_missing',
-        ({mssql => 'SQL Server', duckdb => 'DuckDB'}->{$name} // 'adapter')
-            . ' cannot verify that an update keeps its rows in their trusted scope', {relation => $table})
-        unless $name =~ /\A(?:postgresql|sqlite|mysql|mariadb)\z/;
-    my $dbh = $self->dbh;
-    my @row;
-    my $ok = eval {
-        if ($name eq 'postgresql') {
-            # ROW EXCLUSIVE (what the UPDATE takes anyway, on every partition
-            # and child too) conflicts with CREATE TRIGGER, ALTER TABLE ...
-            # ENABLE TRIGGER and CREATE RULE on them: the catalog read below
-            # stays true for these relations until commit.
-            $dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
-            $self->_require_read_committed($table);
-            # Resolved under the lock, before the statement (item 51).
-            @row = $self->_pg_post_image_catalog($self->_pg_resolve_write_target($table)->{oid});
-        } elsif ($name eq 'sqlite') {
-            @row = $dbh->selectrow_array(q{SELECT type, 0 FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')},
-                undef, $table);
-        } else {
-            # Read the table first, in the write's transaction: its shared
-            # metadata lock holds until commit, so a concurrent CREATE
-            # TRIGGER, ALTER or DROP INDEX cannot change what the
-            # information_schema checks below (kind, unique key) describe.
-            $dbh->do($self->_statement_sql('SELECT 1 FROM ' . $self->quote_identifier($table) . ' LIMIT 0'));
-            @row = $dbh->selectrow_array($self->_statement_sql(q{SELECT TABLE_TYPE, 0 FROM information_schema.TABLES
-                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?}), undef, $table);
-        }
-        1;
-    };
-    die $self->normalize_error($@) unless $ok;
-    my ($kind, $deferrable, $statement_trigger, $inheritance, $rules) = @row;
-    $refuse->('a governed update through a view cannot verify the rows it leaves behind')
-        unless defined($kind) && ($kind eq 'r' || $kind eq 'p' || $kind eq 'table' || $kind eq 'BASE TABLE');
-    $refuse->('a deferrable constraint trigger could change the rows after their verification') if $deferrable;
-    $refuse->('a governed update under a bound scope cannot verify a relation with inheritance children') if $inheritance;
-    $refuse->('a rule on the relation could rewrite the update outside the verified scope') if $rules;
-    # A statement-level UPDATE trigger can write rows the re-read does not
-    # name. Row-level triggers that modify OTHER rows stay allowed (user
-    # decision, TW item 19): their effects are the schema owner's
-    # responsibility, and the re-read covers the updated rows only.
-    Selecto::Error->throw('write_capability_missing',
-        'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
-        if $statement_trigger;
-    # The re-read names the updated rows by their key: the key must be
-    # unique (contain an enforced PRIMARY/UNIQUE index of whole, NOT NULL
-    # columns) and must not change, or another row sharing the old key value
-    # could stand in for a row the update moved out of scope.
-    # A re-read by row id (PostgreSQL) needs no key: any key, assigned or
-    # not, unique or not, only bounds which rows are locked.
-    return if $self->_rereads_by_row_id;
+        'adapter cannot verify that an update keeps its rows in their trusted scope', {relation => $table})
+        unless $self->name =~ /\A(?:sqlite|mysql|mariadb)\z/;
     my $primary = $command->metadata->{__selecto_primary_key};
     my @keys = map { Selecto::Identifier::checked($_) } ref($primary) eq 'ARRAY' ? @$primary : ($primary);
     my %key = map { (lc($_) => 1) } @keys;
-    $refuse->('a governed update under a bound scope cannot assign its key')
-        if grep { $key{lc $_} } keys %{$command->assignments};
-    $refuse->('a governed update under a bound scope requires an enforced unique key')
-        unless $self->_enforced_unique_key($table, \@keys);
-    return;
-}
-
-# PostgreSQL: a guarded write's catalog checks (triggers, rules,
-# inheritance) are only meaningful under READ COMMITTED. Under REPEATABLE
-# READ or SERIALIZABLE, catalog queries read the transaction snapshot while
-# trigger firing uses the latest catalog, so a trigger committed after the
-# snapshot passes every check and still fires. Read in the write's
-# transaction (a host's transaction, or a managed one, which begins READ
-# COMMITTED explicitly); anything else is refused.
-sub _require_read_committed {
-    my ($self, $table) = @_;
-    return unless $self->name eq 'postgresql';
-    my $level;
-    my $ok = eval { ($level) = $self->dbh->selectrow_array(q{SELECT pg_catalog.current_setting('transaction_isolation')}); 1 };
-    die $self->normalize_error($@) unless $ok;
-    Selecto::Error->throw('query_rule_not_evaluable',
-        'a guarded PostgreSQL write requires READ COMMITTED isolation',
-        {reason => 'isolation_level', relation => $table, isolation => $level})
-        unless defined($level) && $level eq 'read committed';
-    return;
-}
-
-# PostgreSQL catalog facts the post-image check depends on: the relation's
-# kind; whether any enabled non-internal deferrable trigger exists in the
-# database; statement-level UPDATE triggers, (non-partition) inheritance
-# children and rules on the relation or any partition or child below it.
-# Read by the oid resolved before the statement (item 51a).
-sub _pg_post_image_catalog {
-    my ($self, $oid) = @_;
-    return $self->dbh->selectrow_array(q{
-                WITH RECURSIVE tree(oid, partition) AS (
-                  SELECT c.oid, TRUE FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid)
-                  UNION ALL
-                  SELECT i.inhrelid, child.relispartition FROM pg_catalog.pg_inherits i
-                  JOIN tree ON i.inhparent OPERATOR(pg_catalog.=) tree.oid
-                  JOIN pg_catalog.pg_class child ON child.oid OPERATOR(pg_catalog.=) i.inhrelid)
-                SELECT CAST(c.relkind AS pg_catalog.text),
-                  CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
-                    AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable) AS pg_catalog.int4),
-                  CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid OPERATOR(pg_catalog.=) tree.oid
-                    WHERE NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
-                    AND (t.tgtype OPERATOR(pg_catalog.&) CAST(1 AS pg_catalog.int2)) OPERATOR(pg_catalog.=) CAST(0 AS pg_catalog.int2)
-                    AND (t.tgtype OPERATOR(pg_catalog.&) CAST(16 AS pg_catalog.int2)) OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.int2)) AS pg_catalog.int4),
-                  CAST(EXISTS(SELECT 1 FROM tree WHERE NOT tree.partition) AS pg_catalog.int4),
-                  CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class OPERATOR(pg_catalog.=) tree.oid
-                    WHERE r.rulename OPERATOR(pg_catalog.<>) CAST('_RETURN' AS pg_catalog.name)) AS pg_catalog.int4)
-                FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) CAST(? AS pg_catalog.oid)}, undef, $oid, $oid);
-}
-
-# After the UPDATE and before the re-read (PostgreSQL): the table lock keeps
-# the written relations' triggers and rules fixed, but a deferrable trigger
-# on another table (an audit table a row trigger writes to) could have been
-# created or enabled while the update waited for its rows. A deferred event
-# is queued only for a trigger that existed when the row trigger fired, so a
-# clean check now closes that window; otherwise the write is refused and
-# rolled back.
-sub _recheck_post_image_target {
-    my ($self, $command) = @_;
-    return unless $self->name eq 'postgresql';
-    my $table = Selecto::Identifier::checked($command->relation);
-    my @row;
-    my $oid = $self->_pg_write_target($table)->{oid};
-    my $ok = eval { @row = $self->_pg_post_image_catalog($oid); 1 };
-    die $self->normalize_error($@) unless $ok;
-    my ($kind, $deferrable, $statement_trigger, $inheritance, $rules) = @row;
-    Selecto::Error->throw('query_rule_not_evaluable',
-        'a deferrable constraint trigger could change the rows after their verification', {relation => $table})
-        if $deferrable;
-    Selecto::Error->throw('query_rule_not_evaluable',
-        'the relation gained inheritance children or rules while the update ran', {relation => $table})
-        if $inheritance || $rules;
-    Selecto::Error->throw('write_capability_missing',
-        'a statement-level update trigger can write rows outside the verified scope', {relation => $table})
-        if $statement_trigger;
-    return;
+    Selecto::Error->throw('query_rule_not_evaluable', 'a governed update under a bound scope cannot assign its key',
+        {relation => $table}) if grep { $key{lc $_} } keys %{$command->assignments};
+    Selecto::Error->throw('query_rule_not_evaluable', 'a governed update under a bound scope requires an enforced unique key',
+        {relation => $table}) unless $self->_enforced_unique_key($table, \@keys);
 }
 
 # True when @$keys contain every column of an enforced unique index (or
@@ -4103,90 +3886,6 @@ sub _enforced_unique_key {
     return 0;
 }
 
-# Which bound-scope target contract a write runs (PostgreSQL), if any:
-# - a governed delete under a bound scope (engine tenant, writes.scope, host
-#   scope, a required tenant pin) or under query enforcement alone (a plain
-#   required filter alone is not bound, TW-09);
-# - a delete or update of any node of a graph whose root (or any node) is
-#   bound (__selecto_graph_bound, set by the engine), even when its own table
-#   has no tenant column. A graph update that carries its own post-image
-#   scope already runs the post-image contract.
-sub _bound_target_event {
-    my ($command) = @_;
-    my $metadata = $command->metadata;
-    return undef unless exists $metadata->{__selecto_primary_key};
-    my $operation = $command->operation;
-    return 'delete' if $operation eq 'delete'
-        && (blessed($metadata->{__selecto_post_image_scope}) || defined($command->query_enforcement)
-            || $metadata->{__selecto_graph_bound});
-    return 'update' if $operation eq 'update' && $metadata->{__selecto_graph_bound} && !_post_image_predicate($command);
-    # A graph-bound insert or upsert (a child, join-table or deeper row under a
-    # bound root) may carry no predicate of its own, so no insert admission
-    # runs; it still gets the target contract for its events.
-    return $operation if ($operation eq 'insert' || $operation eq 'upsert') && $metadata->{__selecto_graph_bound};
-    return undef;
-}
-
-# PostgreSQL bound-scope target contract. Before the statement: LOCK TABLE
-# ... IN ROW EXCLUSIVE MODE (the write's own lock, recursing to partitions
-# and children), so triggers and rules on these relations cannot change
-# until commit, and READ COMMITTED. Before and after it: no enabled
-# deferrable constraint trigger anywhere in the database (it fires at
-# commit), and no statement-level trigger or rule for the event on the
-# relation or below it (they can write rows outside the write's scope).
-# Row-level triggers that modify other rows are the schema owner's
-# responsibility (item 19).
-sub _bound_target_check {
-    my ($self, $command, $event, $phase) = @_;
-    return unless $self->name eq 'postgresql';
-    my $table = Selecto::Identifier::checked($command->relation);
-    # pg_trigger.tgtype bits (4 INSERT, 8 DELETE, 16 UPDATE) and
-    # pg_rewrite.ev_type ('3' INSERT, '4' DELETE, '2' UPDATE) for the events
-    # the write can fire; an upsert can insert or update.
-    my ($mask, @rule_events) = @{{delete => [8, '4'], update => [16, '2'], insert => [4, '3'], upsert => [4 | 16, '3', '2']}->{$event}};
-    my ($first_rule, $second_rule) = (@rule_events, @rule_events)[0, 1];
-    my ($deferrable, $statement, $rules);
-    my $ok = eval {
-        my $oid;
-        if ($phase eq 'before') {
-            $self->dbh->do('LOCK TABLE ' . $self->quote_identifier($table) . ' IN ROW EXCLUSIVE MODE');
-            $self->_require_read_committed($table);
-            $oid = $self->_pg_resolve_write_target($table)->{oid};
-        } else {
-            # By the oid resolved before the statement (item 51a).
-            $oid = $self->_pg_write_target($table)->{oid};
-        }
-        ($deferrable, $statement, $rules) = $self->dbh->selectrow_array(q{
-            WITH RECURSIVE tree(oid) AS (
-              SELECT CAST(? AS pg_catalog.oid)
-              UNION ALL
-              SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree ON i.inhparent OPERATOR(pg_catalog.=) tree.oid)
-            SELECT
-              CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t WHERE NOT t.tgisinternal
-                AND t.tgenabled OPERATOR(pg_catalog.<>) 'D' AND t.tgdeferrable) AS pg_catalog.int4),
-              CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_trigger t JOIN tree ON t.tgrelid OPERATOR(pg_catalog.=) tree.oid
-                WHERE NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'D'
-                AND (t.tgtype OPERATOR(pg_catalog.&) CAST(1 AS pg_catalog.int2)) OPERATOR(pg_catalog.=) CAST(0 AS pg_catalog.int2)
-                AND (t.tgtype OPERATOR(pg_catalog.&) CAST(? AS pg_catalog.int2)) OPERATOR(pg_catalog.<>) CAST(0 AS pg_catalog.int2)) AS pg_catalog.int4),
-              CAST(EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite r JOIN tree ON r.ev_class OPERATOR(pg_catalog.=) tree.oid
-                WHERE (r.ev_type OPERATOR(pg_catalog.=) CAST(? AS pg_catalog."char") OR r.ev_type OPERATOR(pg_catalog.=) CAST(? AS pg_catalog."char"))
-                  AND r.rulename OPERATOR(pg_catalog.<>) CAST('_RETURN' AS pg_catalog.name)) AS pg_catalog.int4)},
-            undef, $oid, $mask, $first_rule, $second_rule);
-        1;
-    };
-    die $self->normalize_error($@) unless $ok;
-    Selecto::Error->throw('query_rule_not_evaluable',
-        'a deferrable constraint trigger could change the rows after their verification', {relation => $table})
-        if $deferrable;
-    Selecto::Error->throw('write_capability_missing',
-        "a statement-level $event trigger can write rows outside the write's scope", {relation => $table})
-        if $statement;
-    Selecto::Error->throw('write_capability_missing',
-        "a rule on the relation can rewrite the $event outside the write's scope", {relation => $table})
-        if $rules;
-    return;
-}
-
 # Every locked row the update could have changed must still satisfy the
 # trusted predicate, re-read in the write's transaction under the same
 # (host-exact) comparison; otherwise the write fails and rolls back. Rows the
@@ -4204,20 +3903,8 @@ sub _verify_post_image {
     my @params;
     my $relation = Selecto::Identifier::checked($command->relation);
     my $table = $self->quote_identifier($relation);
-    my $pg = $self->name eq 'postgresql';
-    # PostgreSQL (item 51/51a): through the schema-qualified relation resolved
-    # before the statement, and only its own rows (and its partitions'), with
-    # pg_catalog functions; the session check before this ensured the rest
-    # of the statement resolves as it did before the DML.
-    my $target = $pg ? $self->_pg_write_target($relation) : undef;
-    $table = $target->{qualified} if $target;
-    my ($count, $sum) = $pg ? ('pg_catalog.count', 'pg_catalog.sum') : ('COUNT', 'SUM');
-    my $sql = "SELECT $count(*), COALESCE($sum(CASE WHEN (" . $self->_compile_write_predicate($predicate, \@params)
+    my $sql = "SELECT COUNT(*), COALESCE(SUM(CASE WHEN (" . $self->_compile_write_predicate($predicate, \@params)
         . ") THEN 1 ELSE 0 END), 0) FROM $table WHERE " . $self->_compile_write_predicate($locked, \@params);
-    if ($target) {
-        push @params, $target->{oids};
-        $sql .= ' AND tableoid OPERATOR(pg_catalog.=) ANY (CAST(' . $self->placeholder(scalar @params) . ' AS pg_catalog.oid[]))';
-    }
     my @row;
     my $ok = eval { @row = $self->dbh->selectrow_array($self->_statement_sql($sql), undef, @params); 1 };
     die $self->normalize_error($@) unless $ok;
@@ -4283,7 +3970,7 @@ sub _bounded_write_command {
     # whatever the key's type or the session's settings (a float or
     # timestamp key rebound as text could miss its row), and stable while
     # the row lock is held.
-    my $by_row = $self->_rereads_by_row_id;
+    my $by_row = $self->_write_uses_physical_ids;
     my $selected = $by_row ? 'CAST(tableoid AS pg_catalog.text), CAST(ctid AS pg_catalog.text)' : $columns;
     my $sql = "SELECT $selected FROM $table WHERE $where ORDER BY $columns LIMIT $probe_limit";
     # InnoDB locking reads hold the selected keys until the write commits.
@@ -4400,7 +4087,7 @@ sub _transaction {
 }
 
 # External mode: the host owns the transaction, but a write refused after its
-# DML ran (a post-image violation, a post-DML catalog recheck, a cardinality
+# DML ran (a post-image violation, a cardinality
 # mismatch) must not leave that DML for the host to commit. The write runs in
 # its own savepoint and rolls back to it on failure; the host's earlier work
 # and its transaction are kept, and nothing is ever committed. (DuckDB has no

@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Governed PostgreSQL/SQLite updates verify stored scope in RETURNING.
+      Removed PostgreSQL catalog-stability locks, topology/trigger/rule checks
+      and post-write physical-row rereads. Broad-write bounds, transaction
+      ownership, cardinality and certified insert/storage admission remain.
+      QueryBudget reads normalized statement_timeout through current_setting
+      instead of pg_settings, preserving stricter deadlines and restoration.
+      MySQL-family stored-row verification shares one unique-key metadata query.
     - Repeated where/filter AND predicates; select appends in order, preserving
       unaliased duplicates. Empty append is a no-op. Use replace_where/clear_where
       and replace_selections/clear_selections for caller resets. Required domain

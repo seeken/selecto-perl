@@ -135,6 +135,33 @@ subtest 'PostgreSQL budgets inside a transaction restore its timeout' => sub {
     $dbh->disconnect;
 };
 
+subtest 'PostgreSQL duration units keep the stricter ceiling and restore exactly' => sub {
+    plan skip_all => 'disposable PostgreSQL unavailable' unless $ENV{SELECTO_PERL_TEST_POSTGRES_URL}
+        && eval { require DBI; require DBD::Pg; 1 };
+    my $dbh = DBI->connect(TestPostgreSQL->connection, {RaiseError => 1, PrintError => 0});
+    my $adapter = Selecto->adapter(postgresql => (dbh => $dbh));
+    for my $prior ('0', '0ms', '4ms', '2s', '1min', '1h', '1d', '0.5s', '2 ms', '2147483647ms') {
+        for my $transaction (0, 1) {
+            $dbh->do(q{SELECT set_config('statement_timeout', ?, false)}, undef, $prior);
+            my ($display) = $dbh->selectrow_array('SHOW statement_timeout');
+            $dbh->begin_work if $transaction;
+            my $guard = $adapter->begin_query_budget(timeout_ms => 300);
+            my ($ms) = $dbh->selectrow_array(q{SELECT CAST(EXTRACT(EPOCH FROM current_setting('statement_timeout')::interval)*1000 AS bigint)});
+            is($ms, $prior eq '4ms' || $prior eq '2 ms' ? ($prior eq '4ms' ? 4 : 2) : 300,
+                "$prior, transaction $transaction: effective ceiling never relaxed");
+            $guard->close;
+            is(($dbh->selectrow_array('SHOW statement_timeout'))[0], $display,
+                "$prior, transaction $transaction: prior setting restored");
+            $dbh->rollback if $transaction;
+        }
+    }
+    $dbh->do('SET statement_timeout = 0');
+    eval { $adapter->begin_query_budget(timeout_ms => '1s') };
+    is($@->code, 'invalid_query_budget', 'invalid budget fails without changing the setting');
+    is(($dbh->selectrow_array('SHOW statement_timeout'))[0], '0', 'invalid budget leaves the host setting alone');
+    $dbh->disconnect;
+};
+
 subtest 'savepoint budgets need PostgreSQL' => sub {
     plan skip_all => 'SQLite driver unavailable' unless eval { require DBI; require DBD::SQLite; 1 };
     my $adapter = Selecto->adapter(sqlite => (dbh=>DBI->connect('dbi:SQLite:dbname=:memory:', '', '', {RaiseError=>1, PrintError=>0})));

@@ -24,7 +24,7 @@ use TestPostgreSQL ();
 # transaction_handler.
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
-my $admin = TestPostgreSQL->connect;
+my $admin = TestPostgreSQL->connect(pg_bool_tf => 1);
 $admin->do('SET client_min_messages TO warning');
 my $preinstalled = ($admin->selectrow_array(q{SELECT count(*) FROM pg_extension WHERE extname = 'citext'}))[0];
 my $has = $preinstalled
@@ -64,7 +64,7 @@ my $domain = sub {
 };
 my $run = sub {
     my ($column, $type, $tenant, $mode, $operation, $assignments) = @_;
-    my $dbh = TestPostgreSQL->connect;
+    my $dbh = TestPostgreSQL->connect(pg_bool_tf => 1);
     $dbh->do('SET client_min_messages TO warning');
     my %options = $mode eq 'host' ? (transaction_mode => 'external')
         : $mode eq 'handler' ? (transaction_handler => sub { my ($work) = @_; $dbh->begin_work; my $r = eval { $work->() };

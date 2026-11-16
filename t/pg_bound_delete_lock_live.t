@@ -3,9 +3,7 @@ use strict;
 use warnings;
 use Test::More;
 use DBI ();
-use File::Temp ();
 use Scalar::Util qw(blessed);
-use Time::HiRes ();
 use Selecto;
 use Selecto::Engine;
 use Selecto::Domain;
@@ -13,13 +11,8 @@ use Selecto::Expression;
 use Selecto::Write ();
 use Selecto::QueryEnforcement ();
 
-# PostgreSQL bound-scope deletes: the statement-trigger check runs after
-# LOCK TABLE ... IN ROW EXCLUSIVE MODE, so a statement-level DELETE trigger
-# another session creates while the delete waits for a row lock cannot fire
-# (here the creating session deadlocks against its own row lock and is
-# aborted); before, it was created after the check and rewrote the other
-# tenant's row ('pwned'). A DELETE rule on the relation is refused too, and
-# the check requires READ COMMITTED (t/pg_guarded_write_isolation_live.t).
+# Bound-scope deletes still apply their tenant WHERE. Host rules and
+# statement triggers are not catalog-checked and their effects belong to the host.
 my $url = $ENV{SELECTO_PERL_TEST_POSTGRES_URL};
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless defined($url) && $url ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; require Selecto::Certification; 1 };
@@ -53,33 +46,13 @@ my $delete = sub {
 my $other_row = sub { $dbh->selectall_arrayref('SELECT id, org_key, note FROM selecto_del WHERE id = 2') };
 
 {
-    my $flags = File::Temp->newdir;
-    $reset->();
-    my $pid = fork // die "fork: $!";
-    if (!$pid) {
-        my $locker = $connect->();
-        $locker->begin_work;
-        $locker->do('SELECT 1 FROM selecto_del WHERE id = 1 FOR UPDATE');
-        open my $fh, '>', "$flags/locked" or die; close $fh;
-        Time::HiRes::sleep(1.5);
-        eval { $locker->do('CREATE TRIGGER selecto_del_pwn AFTER DELETE ON selecto_del FOR EACH STATEMENT'
-            . ' EXECUTE FUNCTION selecto_del_pwn()'); $locker->commit; 1 } or eval { $locker->rollback };
-        $locker->disconnect;
-        require POSIX; POSIX::_exit(0);
-    }
-    Time::HiRes::sleep(0.05) until -e "$flags/locked";
-    my $code = $delete->();
-    waitpid $pid, 0;
-    is_deeply($other_row->(), [[2, 't2', 'n']], "a statement trigger raced in during the delete's row-lock wait does not fire ($code)");
-}
-{
     $reset->();
     $dbh->do(q{CREATE RULE selecto_del_rule AS ON DELETE TO selecto_del DO ALSO UPDATE selecto_del SET note = 'pwned' WHERE org_key = 't2'});
-    is($delete->(), 'write_capability_missing', 'a DELETE rule on the relation is refused');
-    is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_del ORDER BY id'), [[1, 'n'], [2, 'n']], 'and nothing changed');
+    is($delete->(), 'applied', 'a host DELETE rule is not inspected');
+    is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_del ORDER BY id'), [[2, 'pwned']], 'host rule effects are outside the write boundary');
 }
-# A delete bounded only by query enforcement is a bound-scope delete too: a
-# statement-level DELETE trigger is refused. (A plain required filter alone
+# A delete bounded only by query enforcement still applies its scope,
+# while host statement-trigger effects remain outside the boundary. (A plain required filter alone
 # is not a bound scope; t/upsert_scope_live.t keeps that.)
 {
     my $plain = Selecto::Domain->parse({schema_version => 1, name => 'DelLockPlain',
@@ -101,8 +74,8 @@ my $other_row = sub { $dbh->selectall_arrayref('SELECT id, org_key, note FROM se
         my ($e, %extra) = $bounds{$bound}->();
         my $code = eval { $e->execute_write(Selecto::Write::Command->new(operation => 'delete', relation => 'selecto_del',
             predicate => $x->eq('name', 'x'), %extra)); 'applied' } // (blessed($@) ? $@->code : "died: $@");
-        is($code, 'write_capability_missing', "a delete bounded by $bound refuses a statement-level DELETE trigger");
-        is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_del ORDER BY id'), [[1, 'n'], [2, 'n']], "$bound: and nothing changed");
+        is($code, 'applied', "a delete bounded by $bound does not catalog-check a host DELETE trigger");
+        is_deeply($dbh->selectall_arrayref('SELECT id, note FROM selecto_del ORDER BY id'), [[2, 'pwned']], "$bound: host rule or trigger effects apply");
     }
 }
 {
