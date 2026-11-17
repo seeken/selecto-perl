@@ -1,0 +1,20 @@
+name: Selected backend consumer
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  consumer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [core, postgresql, mysql, mariadb, sqlite, duckdb]
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash ci/single-backend/run "${{ matrix.backend }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selected-${{ matrix.backend }}
+          path: single-backend-evidence
