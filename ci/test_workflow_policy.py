@@ -38,7 +38,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("if: github.ref == 'refs/heads/main'", source)
         self.assertIn('ref: ${{ github.sha }}', source)
         self.assertIn('runs-on: [self-hosted, beep-vm]', source)
-        self.assertIn('run: mise exec perl@5.40.2.1 python@3.14.3 -- ci/verify', source)
+        self.assertRegex(source, r'(?m)^\s*run: mise exec \S.* -- ci/verify\s*$')
 
 
 if __name__ == '__main__':

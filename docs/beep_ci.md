@@ -4,9 +4,9 @@ Pull requests run the selected-backend consumer matrix on GitHub-hosted runners.
 That path receives no Beep credential files, does not check out private siblings,
 and does not invoke `ci/verify`. The complete verifier runs on disposable Beep
 runners only for a `main` push or a manual dispatch of `main`, and checks out the
-event's immutable commit SHA. The Beep runner group must admit only the protected
-`ci.yml` workflow from `refs/heads/main`, and branch protection must require
-review before `main` changes.
+event's immutable commit SHA. `ci/test_workflow_policy.py` (run in both paths)
+fails if a pull-request workflow uses a self-hosted runner or names the private
+verifier or credential paths, and if `ci.yml` stops being limited to `main`.
 
 `ci/beep.json` declares sibling sources and paths. The certification runner
 follows the latest `main` at CI time to break the mutual SHA-pin cycle; its
