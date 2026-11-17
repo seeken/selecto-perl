@@ -1,7 +1,6 @@
 name: CI
 
 on:
-  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
@@ -24,6 +23,7 @@ env:
 jobs:
   verify:
     name: Verify Perl library
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, beep-vm]
     timeout-minutes: 90
     defaults:
@@ -31,10 +31,11 @@ jobs:
         shell: bash
         working-directory: selecto-perl
     steps:
-      - name: Checkout reviewed library
+      - name: Checkout protected library commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: selecto-perl
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Set up pinned toolchains
         uses: jdx/mise-action@94c60b39bc2d90ab2f9bab27f38d3cc4812c1834 # v5.1.0

@@ -8,6 +8,7 @@ export PATH="$(dirname -- "$sdk_perl"):$(dirname -- "$sdk_python"):$PATH"
 export PERL5LIB="${SELECTO_CI_CPAN_DIR:?}/lib/perl5${PERL5LIB:+:$PERL5LIB}"
 export HARNESS_VERBOSE=1 PYTHONDONTWRITEBYTECODE=1
 stage() { label=$1; shift; python3 -B ci/run.py "$label" -- "$@"; }
+python3 -B ci/test_workflow_policy.py
 stage checkout python3 -B ci/sources.py checkout
 stage dependencies ci/deps
 python3 -B ci/test_run.py

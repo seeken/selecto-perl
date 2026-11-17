@@ -1,11 +1,19 @@
 # Beep CI
 
-This library verifies pull requests and its default branch on disposable Beep
-runners. `ci/beep.json` declares sibling sources and paths. The certification
-runner follows the latest `main` at CI time to break the mutual SHA-pin cycle;
-its resolved commit is recorded and checked throughout that job. Other sibling
-references remain immutable commits. Public references clone without authentication; private references use
-only the job-scoped, read-only credential file through Git's credential pipe.
+Pull requests run the selected-backend consumer matrix on GitHub-hosted runners.
+That path receives no Beep credential files, does not check out private siblings,
+and does not invoke `ci/verify`. The complete verifier runs on disposable Beep
+runners only for a `main` push or a manual dispatch of `main`, and checks out the
+event's immutable commit SHA. The Beep runner group must admit only the protected
+`ci.yml` workflow from `refs/heads/main`, and branch protection must require
+review before `main` changes.
+
+`ci/beep.json` declares sibling sources and paths. The certification runner
+follows the latest `main` at CI time to break the mutual SHA-pin cycle; its
+resolved commit is recorded and checked throughout that job. Other sibling
+references remain immutable commits. Public references clone without
+authentication; private references use only the job-scoped, read-only
+credential file through Git's credential pipe.
 
 The actual runtime is Perl 5.40.2, relocatable SDK 5.40.2.1, with Mise 2026.10.3
 and Python 3.14.3. Browser/MCP jobs additionally use Node 22.23.3; MCP uses uv
@@ -14,8 +22,9 @@ install into the disposable job directory, with declared constraints checked
 before testing. Top-level selected versions and loaded paths are recorded;
 unlocked transitive CPAN requirements are not a full dependency lock.
 
-The workflow runs the complete package verifier, mandatory native controls,
-and distribution tests. Raw command output stays in bounded temporary files;
-artifacts contain stage statuses, TAP counts/skips and source/runtime identities.
-SQL Patterns' six-dialect output is compilation evidence; optional database
-backends are not certified by this workflow. No production database is used.
+The protected workflow runs the complete package verifier, mandatory native
+controls, and distribution tests. Raw command output stays in bounded temporary
+files; artifacts contain stage statuses, TAP counts/skips and source/runtime
+identities. SQL Patterns' six-dialect output is compilation evidence; optional
+database backends are not certified by this workflow. No production database is
+used.
