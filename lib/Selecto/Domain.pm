@@ -16,6 +16,8 @@ use Selecto::ConfiguredDomain ();
 use Selecto::DataRules ();
 use Selecto::Write::Scope ();
 
+our $DERIVED_TENANT_FAMILY;
+
 my %TOP_LEVEL = map { $_ => 1 } qw(
     schema_version domain_version domain_fingerprint name source schemas joins associations
     default_selected required_selected required_order_by required_group_by required_filters
@@ -199,14 +201,21 @@ sub _refresh_fingerprint {
         if keys %{$self->{experiences}};
     $fingerprint_value->{detail_actions} = $self->{detail_actions}
         if keys %{$self->{detail_actions}};
-    # Derived domains keep the governed write surface of their contract.
+    # Derived domains keep the governed surface of their contract.
     my $contract = $self->{contract};
     $fingerprint_value->{tenant_required} = 1 if $self->{tenant_required};
+    # A derived domain must retain every SQL-affecting contract declaration,
+    # including required query policy and schema/field expression metadata.
+    # A published fingerprint is a label, not input to its own generation.
     if (ref($contract) eq 'HASH') {
-        for my $key (qw(writes actions capabilities choice_sources query_members)) {
-            $fingerprint_value->{$key} = $contract->{$key} if defined $contract->{$key};
-        }
+        $fingerprint_value->{contract} = {map { ($_ => $contract->{$_}) }
+            grep { $_ ne 'domain_fingerprint' } keys %$contract};
     }
+    for my $key (qw(write_tenant_scope _tenant_family _tenant_carry _read_prefix)) {
+        $fingerprint_value->{$key} = $self->{$key} if defined $self->{$key};
+    }
+    $fingerprint_value->{authored_predicates} = [map { _expression_value($_) }
+        @{$self->{_selecto_authored_predicates}}] if $self->{_selecto_authored_predicates};
     my $json = Selecto::CanonicalJSON->encode($fingerprint_value);
     $self->{fingerprint} = 'sha256:' . sha256_hex(encode_utf8($json));
     return $self;
@@ -335,6 +344,7 @@ sub parse {
         my $document = Selecto::Domain::SchemaV2->copy($raw);
         delete $document->{domain_fingerprint};
         $domain->{schema_v2_document} = $document;
+        $domain->_refresh_fingerprint if $DERIVED_TENANT_FAMILY;
         return $domain;
     }
     require Selecto::Tenant::Context;
@@ -486,6 +496,7 @@ sub _parse_canonical {
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
         encode_utf8(Selecto::CanonicalJSON->encode($fingerprint_document))
     );
+    $domain->_refresh_fingerprint if $DERIVED_TENANT_FAMILY;
     return $domain;
 }
 
@@ -644,7 +655,6 @@ sub _apply_values_foreign_key_metadata {
 # columns as the root's pairing anchors. A domain a retarget rebuilds from it
 # is parsed under $DERIVED_TENANT_FAMILY and anchors only its own tenant
 # column. Elsewhere there is no family and tenant columns pair by position.
-our $DERIVED_TENANT_FAMILY;
 sub _tenant_family {
     my ($source, $scope_tenant) = @_;
     my $tenant = $source->{tenant_field};
@@ -1297,6 +1307,8 @@ sub _expression_value {
     return $expression unless blessed($expression) && $expression->isa('Selecto::Expression');
     return {
         kind => $expression->kind,
+        (defined($expression->alias_name) ? (alias_name => $expression->alias_name) : ()),
+        ($expression->{_query_filter_list} ? (_query_filter_list => 1) : ()),
         arguments => [map {
             ref($_) eq 'ARRAY'
                 ? [map { _expression_value($_) } @$_]
@@ -3126,6 +3138,13 @@ the domain. Anything the domain does not declare is an error.
 Domains are immutable. Methods that "change" a domain, such as
 L</with_required_predicate>, return a new object. Every domain has a
 deterministic SHA-256 C<fingerprint> of its governed content.
+
+Domain and Query state is immutable through the public API. Accessors return
+copies; derive changes with C<with_required_predicate>, C<with_tenant_field>,
+other derivation methods, or Query builders/C<_copy>, which return new objects.
+Editing their internal hash fields (including nested metadata and expressions)
+is not a supported API and does not invalidate render plans. Each derived
+Domain refreshes its fingerprint before it is used for rendering.
 
 There are three ways to build one:
 

@@ -133,6 +133,12 @@ sub new {
     Selecto::Error->throw('invalid_domain_ref', 'engine domain_ref must be a Selecto domain reference')
         if defined($args{domain_ref})
             && !(blessed($args{domain_ref}) && $args{domain_ref}->isa('Selecto::Domain::Ref'));
+    Selecto::Error->throw('invalid_query', 'compile_cache must be 0 or 1')
+        if exists($args{compile_cache}) && (!defined($args{compile_cache}) || ref($args{compile_cache})
+            || $args{compile_cache} !~ /\A[01]\z/);
+    Selecto::Error->throw('invalid_query', 'compile_cache_size must be a positive integer')
+        if exists($args{compile_cache_size}) && (!defined($args{compile_cache_size}) || ref($args{compile_cache_size})
+            || $args{compile_cache_size} !~ /\A[1-9][0-9]*\z/);
     my $scope=_trusted_scope($args{scope});
     my $write_context=Selecto::Write::Context->resolve({}, {context=>$args{write_context}//{},
         (defined($scope->{tenant}) ? (tenant_id=>$scope->{tenant}) : ())});
@@ -154,6 +160,7 @@ sub new {
         unless !defined(reftype($mode)) && ($mode eq 'strict' || $mode eq 'permissive');
     my $self = bless {
         query_mode => $mode,
+        (map { exists($args{$_}) ? ($_ => $args{$_}) : () } qw(compile_cache compile_cache_size)),
         domain => $args{domain},
         adapter => $args{adapter},
         domain_ref => $args{domain_ref},
@@ -505,6 +512,8 @@ sub compile {
         Selecto::Error->throw('unsupported_feature', 'prefix read contexts do not support retargeted queries')
             if $query->retarget_spec;
     }
+    local $self->{adapter}{_selecto_compile_cache} = $self->{compile_cache};
+    local $self->{adapter}{_selecto_compile_cache_size} = $self->{compile_cache_size};
     local $self->{adapter}{_selecto_compile_engine} = $self;
     local $self->{adapter}{_selecto_compile_limits} = $self->{limits};
     # This query was just admitted under these limits, and its parameters are
@@ -569,6 +578,7 @@ sub read_domain {
         my $prefix = ($self->{tenant_context} // {})->{prefix};
         if (defined $prefix) {
             $domain = bless {%$domain, _read_prefix => $prefix}, ref($domain);
+            $domain->_refresh_fingerprint;
         }
         $domain;
     };

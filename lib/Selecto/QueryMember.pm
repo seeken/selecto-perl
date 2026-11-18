@@ -236,6 +236,7 @@ sub _source {
 sub _authored {
     my ($member_domain, @queries) = @_;
     push @{$member_domain->{_selecto_authored_predicates}}, grep { defined } map { $_->predicate } @queries;
+    $member_domain->_refresh_fingerprint;
     return;
 }
 
@@ -256,7 +257,10 @@ sub _source_domain {
         schemas => {},
         joins => {},
     });
-    $member = bless {%$member, _read_prefix => $domain->{_read_prefix}}, ref($member) if defined $domain->{_read_prefix};
+    if (defined $domain->{_read_prefix}) {
+        $member = bless {%$member, _read_prefix => $domain->{_read_prefix}}, ref($member);
+        $member->_refresh_fingerprint;
+    }
     return __PACKAGE__->bound_source_domain($domain, $member, label => $label, tenant => $tenant);
 }
 

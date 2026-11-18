@@ -106,6 +106,7 @@ sub target_domain {
             field => defined($field) ? "$field" : undef,
             sets => [map { [@{$_->[1]}] } grep { !$family || $_->[0] eq $family->{tenant} } @$sets],
         }}, ref($relation_domain);
+        $relation_domain->_refresh_fingerprint;
     }
     return Selecto::QueryMember->bound_source_domain($domain, $relation_domain,
         label => "retarget to $target->{path}", tenant => $options{tenant}, chained_site => 1);

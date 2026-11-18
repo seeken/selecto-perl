@@ -29,6 +29,9 @@ our %WRITE_CAPABILITIES = map { $_ => 1 } qw(
     insert update upsert delete transactions atomic_batch mutation_expressions
 );
 
+has compile_cache => 1;
+has compile_cache_size => 256;
+
 has transaction_mode => 'managed';
 has 'transaction_handler';
 has 'query_budget_progress_handler';
@@ -77,6 +80,7 @@ sub compile {
     # Every relation the statement names, as its SQL spells it, collected
     # while compiling (see _note_relation and Selecto::Statement relations).
     my $top = ref($self->{_selecto_relation_sink}) ne 'HASH';
+    local $self->{_selecto_cache_top} = $top;
     local $self->{_selecto_relation_sink} = $top ? {} : $self->{_selecto_relation_sink};
     local $self->{_selecto_recursion_sink} = $top ? {} : $self->{_selecto_recursion_sink};
     my $statement = $self->_compile_query($domain, $query);
@@ -118,7 +122,11 @@ sub _compile_query {
     my $operations = $query->set_operations;
     Selecto::Error->throw('invalid_query', 'row locks cannot be combined with set operations')
         if @$operations && defined($query->row_lock);
-    return $self->_compile_single($domain, $query) unless @$operations;
+    unless (@$operations) {
+        require Selecto::CompileCache;
+        return Selecto::CompileCache->render($self, $domain, $query)
+            // $self->_compile_single($domain, $query);
+    }
     Selecto::Error->throw('unsupported_feature', 'adapter does not support set operations')
         unless $self->supports('set_operations');
 

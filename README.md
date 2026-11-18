@@ -734,3 +734,6 @@ handle; its `Selecto::SqlServer::Certification` module composes the public
 observer. The optional distribution owns `Selecto::MSSQL` compatibility and
 DBD::ODBC requirements. Importing it does not register a default adapter or
 open a connection. Core-only SQL Server selection names the missing package.
+
+Flat PostgreSQL/SQLite reads use a bounded pure-Perl render-plan cache. See
+[compile cache](docs/compile_cache.md) for its grammar, live checks and opt-out.
