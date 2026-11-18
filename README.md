@@ -377,6 +377,19 @@ connection strings and SQL fragments do not leak into responses.
 
 ## Database notes
 
+PostgreSQL reads work with stock `DBD::Pg`, where a generated read takes four
+round trips: a ping, `BEGIN READ ONLY`, the query and `ROLLBACK`. Selecto also
+checks whether the driver offers `pg_transaction_status`, `pg_pipeline` and
+`pg_can_pipeline`. When it does, it reads the transaction state without a
+round trip and sends the whole read as one libpq pipeline, so the read takes
+one round trip. Every check is the same either way. A DBD::Pg 3.22.0 with
+these methods (proposed upstream) can be installed from a pinned fork; it
+needs libpq 14 or later:
+
+```sh
+cpanm https://github.com/seeken/dbdpg/archive/6d80b3fd084394306f4c735fa000b22c037437ab.tar.gz
+```
+
 SQLite checks the connected library for CTEs (3.8.3), modern window frames
 (3.28.0), RETURNING/write graphs and bounded materialization (3.35.0), JSON1
 and FTS5. It supports typed computed values, JSON extraction and structural
