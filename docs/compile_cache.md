@@ -16,12 +16,17 @@ Runtime monkeypatching of compiler methods also requires disabling the cache.
 Adapter subclasses always retain the ordinary compiler.
 
 The domain key combines its logical identity (name, relation and declared
-version) with its construction-time `fingerprint`. Domain eligibility is
-memoized by object in a private fieldhash; no domain serialization or hashing
-runs during lookup. Equivalent fresh declarations can share an adapter's
-plans. Required-predicate values participate in the domain fingerprint, so
-different scoped fingerprints conservatively use different entries. Required
-and optional parameters are nevertheless collected anew for every call.
+version) with a private render fingerprint. Domains without required predicates
+reuse their existing fingerprint. Otherwise, once per immutable domain object,
+a shallow private copy is fingerprinted using the complete derived-domain
+fingerprint logic, with only `required_predicate` removed. The live public
+`fingerprint` is unchanged and still covers required values. The required
+predicate's masked structure is keyed separately on every call; required and
+optional parameters are collected anew. Thus equivalent tenant-scoped domains
+share plans without retaining tenant values or reusing admission decisions.
+Eligibility and the render digest are memoized in a private fieldhash; warmed
+lookups do not serialize or hash domains. Equivalent fresh declarations share
+an adapter's plans too.
 
 `_refresh_fingerprint` covers fields and their metadata, recursive associations,
 root/related/bridge relations, tenant fields, required expressions, and derived
@@ -38,7 +43,7 @@ and collects primitive bind values together. It includes aliases, selection,
 group/order structure, pagination, operator kinds and IN arity. Literal values
 are excluded from the query shape. Concrete adapter/dialect, contract/library
 version and supported SQL options complete the key. No Storable, JSON encoder,
-B flag inspection or domain hash calculation is used on the lookup path.
+B flag inspection or domain hash calculation is used on a warmed lookup.
 
 ## Cached work and live checks
 

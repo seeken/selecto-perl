@@ -46,7 +46,7 @@ sub render {
     return if grep { ref($adapter->{$_}) } qw(canonical_values canonical_sql rollup_sort_fix temporary_relations catalog_trust);
     return if ref($domain->{contract}) eq 'HASH' && exists($domain->{contract}{required_filters});
     # Domain metadata is immutable through its API. Inspect eligibility once
-    # per object; the public construction-time fingerprint is the generation.
+    # per object, including a private value-independent render fingerprint.
     my $metadata = $DOMAINS{$domain} //= _domain($domain);
     return unless $metadata->{eligible};
     return unless _flat_query($query);
@@ -63,7 +63,7 @@ sub render {
     }
     return unless @{$query->{selections}};
     push @shape, map { _scalar($_) } @{$query}{qw(limit_value offset_value)};
-    my $key = join('|', $metadata->{identity}, $domain->fingerprint,
+    my $key = join('|', $metadata->{identity}, $metadata->{render_fingerprint},
         ref($adapter), $adapter->dialect, $Selecto::VERSION // 'unloaded', $adapter->contract_version,
         (map { my $value = $adapter->{$_}; _scalar($value) } qw(canonical_values canonical_sql rollup_sort_fix temporary_relations catalog_trust)),
         @shape);
@@ -173,7 +173,20 @@ sub _domain {
     # a map argument list would insert that key into the immutable contract.
     my @identity = ($domain->{name}, $domain->{table},
         ref($contract) eq 'HASH' ? $contract->{domain_version} : undef);
+    # Reuse the complete derived-domain fingerprint coverage, but remove only
+    # the required predicate from a private shallow copy. Its masked shape is
+    # included separately by _shape on every call, along with fresh bind values.
+    # Never refresh or replace the live domain's public fingerprint. This runs
+    # once per immutable domain object and retains only the digest, not a copy
+    # of the domain or its request values, in the fieldhash metadata.
+    my $render_fingerprint = $domain->fingerprint;
+    if (defined($domain->{required_predicate})) {
+        my $render_domain = bless {%$domain, required_predicate => undef}, 'Selecto::Domain';
+        $render_domain->_refresh_fingerprint;
+        $render_fingerprint = $render_domain->fingerprint;
+    }
     return {eligible => 1, association_work => $count,
+        render_fingerprint => $render_fingerprint,
         identity => join('|', map { _scalar($_) } @identity)};
 }
 
