@@ -11,6 +11,12 @@ use Selecto::Expression ();
 use Selecto::Identifier ();
 use Selecto::QueryBinding ();
 
+my %BUILD_KEYS = map { $_ => 1 } qw(
+    selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
+    set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
+    retarget values_sources subqueries function_laterals
+);
+
 our $RECURSION_DEPTH_COLUMN = 'selecto_depth';
 
 sub new {
@@ -24,12 +30,7 @@ sub new {
 sub _build {
     my ($class, $given, $share_library) = @_;
     my %args = %$given;
-    my %allowed = map { $_ => 1 } qw(
-        selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
-        set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
-        retarget values_sources subqueries function_laterals
-    );
-    my @unknown = sort grep { !$allowed{$_} } keys %args;
+    my @unknown = sort grep { !$BUILD_KEYS{$_} } keys %args;
     Selecto::Error->throw(
         'invalid_query',
         'query state contains unsupported keys',
@@ -106,7 +107,10 @@ sub _build {
             unless ref($plans) eq 'ARRAY' && !grep { ref($_) ne 'HASH' } @$plans;
         require Selecto::Domain::QueryContract;
         $plans = Selecto::Domain::QueryContract->copy_declaration({plans => $plans})->{plans}
-            if $key ne 'subqueries';
+            # A plain empty array is already fully admitted by the shape check
+            # above; it has no metadata to walk or copy. Keep the general path
+            # for tied arrays and every nonempty declaration.
+            if $key ne 'subqueries' && (@$plans || tied(@$plans));
         $extra{$key} = [map { _clone_source_plan($_) } @$plans];
     }
     return bless {
