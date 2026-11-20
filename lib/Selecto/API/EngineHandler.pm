@@ -8,6 +8,7 @@ use Mojo::Base -base, -signatures;
 use JSON::PP ();
 use Cpanel::JSON::XS ();
 use Scalar::Util qw(blessed);
+use Hash::Util::FieldHash ();
 use Selecto::API::ResultFormatter ();
 use Selecto::API::ResponsePolicy ();
 use Selecto::BoundedQuery ();
@@ -1002,6 +1003,9 @@ my %GOVERNED_WRITE_PROPERTIES = map { $_ => 1 } qw(
     upsert_update_fields relationships
 );
 my %WRITE_OPERATIONS = map { $_ => 1 } qw(insert update upsert delete);
+# Names each SelectoWrite schema received from describe_write_property, so a
+# host may describe its own property again but never replace one the API set.
+Hash::Util::FieldHash::fieldhash(my %HOST_WRITE_PROPERTIES);
 
 # A host write handler's own request property beside the governed contract
 # (an order's vehicles, say), published on the SelectoWrite schema so API
@@ -1015,6 +1019,8 @@ sub describe_write_property ($self, $api, $name, $schema, %options) {
         unless defined($name) && !ref($name) && $name =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
     Selecto::Error->throw('invalid_api_host', "write property $name is part of the governed request")
         if $GOVERNED_WRITE_PROPERTIES{$name};
+    Selecto::Error->throw('invalid_api_host', "write property $name is already part of the write schema")
+        if exists $write->{properties}{$name} && !$HOST_WRITE_PROPERTIES{$write}{$name};
     Selecto::Error->throw('invalid_api_host', 'write property schema must be an object')
         unless ref($schema) eq 'HASH';
     my %property = %$schema;
@@ -1042,10 +1048,18 @@ sub describe_write_property ($self, $api, $name, $schema, %options) {
         Selecto::Error->throw('invalid_api_host', 'write property replaces root domain fields')
             unless ref($replaces) eq 'ARRAY' && @$replaces && ref($columns) eq 'HASH'
                 && !grep { !defined($_) || ref($_) || !exists($columns->{$_}) } @$replaces;
+        # The published document lists only public fields; naming a withheld
+        # one here would publish it.
+        my $domain = $api->{_source_domain};
+        if (my ($withheld) = grep { !$domain->field_is_public($_) } @$replaces) {
+            Selecto::Error->throw('invalid_api_host', 'write property replaces only public fields',
+                {field => "$withheld"});
+        }
         $property{'x-selecto-replaces'} = [@$replaces];
     }
     $property{description} = "$options{description}" if defined $options{description};
     $write->{properties}{$name} = \%property;
+    $HOST_WRITE_PROPERTIES{$write}{$name} = 1;
     return $api;
 }
 
@@ -2293,8 +2307,8 @@ for C<orig_id>), becomes C<x-selecto-replaces>; the API console offers the
 property with them, and does not require a replaced field while the property
 is given. A governed
 property name (C<operation>, C<assignments>, C<filters>, C<expected_count>,
-C<returning>, C<conflict_target>, C<upsert_update_fields>, C<relationships>)
-is refused with C<invalid_api_host>.
+C<returning>, C<conflict_target>, C<upsert_update_fields>, C<relationships>), any other property the API already put on the schema, and a C<replaces> field the domain
+withholds (it would be published) are refused with C<invalid_api_host>.
 
 =head1 ERRORS
 

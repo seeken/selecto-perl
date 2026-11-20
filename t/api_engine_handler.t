@@ -695,11 +695,19 @@ is_deeply $api->openapi_document->{paths}{'/api/v1/records/write'}{post}{request
         [origin => {type => 'string'}, choices => [{label => 'No value'}]],
         [origin => {type => 'string'}, replaces => ['no_such_field']],
         [origin => {type => 'string'}, replaces => []],
+        [origin => {type => 'string'}, replaces => ['tenant_id']],
     ) {
         my ($name, $schema, @options) = @$bad;
         my $error = eval { $describer->describe_write_property($copy, $name, $schema, @options); 1 } ? undef : $@;
         is eval { $error->code }, 'invalid_api_host', "write property $name refused: @options";
     }
+    is_deeply $copy->openapi_document->{components}{schemas}{SelectoWrite}{properties}{origin}{'x-selecto-replaces'},
+        [$field], 'a refused withheld field is never published';
+    my $properties = $copy->openapi_document->{components}{schemas}{SelectoWrite}{properties};
+    $properties->{api_owned} = {type => 'string'};   # as a later governed property would be
+    my $error = eval { $describer->describe_write_property($copy, api_owned => {type => 'object'}); 1 } ? undef : $@;
+    is eval { $error->code }, 'invalid_api_host', 'a property the API put on the write schema is never replaced';
+    is_deeply $properties->{api_owned}, {type => 'string'}, 'and keeps the API description';
 }
 is_deeply
     $api->openapi_document->{paths}{'/api/v1/records/query'}{post}{parameters}[0]{schema}{enum},
