@@ -115,12 +115,19 @@ is($admin->selectrow_array(q{SELECT count(*) FROM r65_t WHERE note = 'W'}), 0, '
     $admin->do('DROP SCHEMA "r65_é"');
 }
 
-# A change a view makes during the statement ends with the read's own transaction.
+# A generated read is one autocommit statement (user ruling of 2026-11-20), so
+# a session change the host's view makes during it lasts, as it does for the
+# host's own SELECT; the next read refuses the session. A hand-built read keeps
+# its own transaction, and the change ends with it.
 {
     my $dbh = TestPostgreSQL->connect;
-    my $e = Selecto::Engine->new(domain => $domain->('r65_v'), adapter => Selecto::PostgreSQL->new(dbh => $dbh))->with_scope(tenant => 'café');
+    my $adapter = Selecto::PostgreSQL->new(dbh => $dbh);
+    my $e = Selecto::Engine->new(domain => $domain->('r65_v'), adapter => $adapter)->with_scope(tenant => 'café');
+    eval { $adapter->execute_query(Selecto::Statement->new(sql => 'SELECT id FROM public.r65_v', params => [], columns => ['id'], adapter_name => 'postgresql')); 1 };
+    is(($dbh->selectrow_array('SHOW client_encoding'))[0], 'UTF8', "a view's client_encoding change does not outlast a hand-built read");
     eval { $e->all($e->query->select('id')); 1 };
-    is(($dbh->selectrow_array('SHOW client_encoding'))[0], 'UTF8', "a view's client_encoding change does not outlast the read");
+    is(($dbh->selectrow_array('SHOW client_encoding'))[0], 'LATIN1', "it outlasts a generated read, as it would the host's own statement");
+    ok($refused->(sub { $e->all($e->query->select('id')) }), 'and the next read refuses the session, typed');
 }
 # A session switched after an earlier read is refused by the next read.
 {

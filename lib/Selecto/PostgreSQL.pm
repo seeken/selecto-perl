@@ -1409,10 +1409,14 @@ sub _insert_scope_failure {
         {reason => 'transforming_trigger', relation => $command->relation}) if $trigger;
 }
 
-# Reads. With no transaction open, a read is a READ ONLY
-# transaction of its own, rolled back: nothing it reaches can write, and
-# nothing it changes outlasts it. One that locks rows is not read-only (its
-# locks end with it). In the host's transaction it runs as written: the host
+# Reads. With no transaction open, a generated read is one autocommit
+# statement: no READ ONLY and no transaction of its own (user ruling of
+# 2026-11-20, which narrows the earlier one), so a view or function of the
+# host's that writes is committed, as it is for the host's own SELECT. A
+# hand-built read keeps a READ ONLY transaction of its own, rolled back: that
+# is what refuses a hand-built write (25006), and nothing it changes outlasts
+# it. One that locks rows keeps a transaction too, not read-only (its locks
+# end with it). In the host's transaction a read runs as written: the host
 # owns that transaction. Nested reads run under the outer one.
 sub _guarded_read {
     my ($self, $source, $work) = @_;
@@ -1430,6 +1434,9 @@ sub _guarded_read {
     # Check before opening anything; an invalid encoding must not touch the
     # host's session, even when a transaction-control statement would fail.
     $self->_pg_require_utf8;
+    # Only a statement compile vouches for runs bare; anything else is
+    # hand-built and keeps the frame.
+    return $work->() if !$locks && _generated($source);
     if (!$locks && $self->{_selecto_pg_pipeline_eligible} && $self->_pg_pipeline_available) {
         local $self->{_selecto_pg_pipeline_frame} = 1;
         return $work->();
@@ -1451,6 +1458,12 @@ sub _guarded_read {
     }
     die $error unless $ok;
     return $result;
+}
+
+# A statement the adapter compiled, or derived from one it compiled.
+sub _generated {
+    my ($statement) = @_;
+    return blessed($statement) && $statement->can('relations') && defined($statement->relations) ? 1 : 0;
 }
 
 sub _identity_correlation_sql { return "$_[1] IS NOT DISTINCT FROM $_[2]"; }
@@ -1712,11 +1725,23 @@ failures become C<query_error>.
 
 =head1 READS
 
-With no transaction open, a read is a transaction of its own:
+With no transaction open, a generated read (a statement C<compile> returned,
+or one an adapter derived from it) is one autocommit statement: no
+C<READ ONLY> and no transaction of its own. It runs as the host's own
+C<SELECT> would, so a view or function of the host's that writes (a view
+using C<nextval>, an audit function) is committed when a generated read
+reaches it, and a session setting such code changes lasts. An unbounded
+stream is one statement too and runs the same way. No C<statement_timeout> is
+sent unless a deadline is asked for (L<Selecto::QueryBudget>), and the
+session's value is unchanged after one.
+
+A hand-built read, with no transaction open, is a transaction of its own:
 C<BEGIN READ ONLY NOT DEFERRABLE>, the query, C<ROLLBACK>. When DBD::Pg exposes
 C<pg_transaction_status>, the ownership check uses local libpq state; older
-drivers retain C<pg_ping> to detect raw host transactions. When it also exposes
-C<pg_pipeline>, ordinary materialized reads can send that entire frame without an
+drivers retain C<pg_ping>, one round trip before every read, which is what
+tells them a raw host C<BEGIN>, a failed transaction, a busy connection and a
+lost one. When the driver also exposes
+C<pg_pipeline>, hand-built materialized reads can send that entire frame without an
 intermediate wait. If the driver exposes C<pg_can_pipeline>, it must return true:
 this selects supported builds and loaded libpq libraries and honors the handle's
 C<pg_pipeline =E<gt> 0> opt-out. Unsupported or disabled handles use sequential
@@ -1727,11 +1752,12 @@ failed read; successful cleanup and idle state are required before returning.
 A failed cleanup disconnects the handle. Streams, locking reads, handle or
 adapter subclasses, and handles with DBI callbacks/error handlers or a custom
 warning handler retain sequential execution to preserve their hooks. C<client_encoding> is checked from libpq's local
-parameter status on every operation, without a query. Nothing it reaches can
-write, and nothing it changes outlasts it: a view using C<nextval> or an
-audit function refuses (C<query_error>, C<details.category>
-C<read_only_transaction>, SQLSTATE C<25006>). A read that locks rows
-(C<for_update>, C<for_share>) is not read-only; its locks end with it.
+parameter status on every operation, without a query. Nothing a hand-built
+read reaches can write, and nothing it changes outlasts it: a data-modifying
+C<WITH>, a view using C<nextval> or an audit function refuses (C<query_error>,
+C<details.category> C<read_only_transaction>, SQLSTATE C<25006>). A generated
+read that locks rows (C<for_update>, C<for_share>) has a transaction of its
+own, not read-only; its locks end with it.
 
 Inside the host's transaction a read runs as the host's own statement would:
 its locks, snapshot and any write a view makes belong to that transaction,
@@ -1759,7 +1785,9 @@ too. Otherwise it runs as written. This stops honest mistakes, not evasion.
 Selecto needs handles with
 C<< RaiseError => 1 >>.
 
-A bounded stream follows the same rules; see L<Selecto::PostgreSQL::Stream>.
+A bounded stream needs a transaction for its cursor: on an idle handle it
+opens a C<READ ONLY> one of its own, generated or hand-built; see
+L<Selecto::PostgreSQL::Stream>.
 
 =head1 WRITES
 

@@ -83,6 +83,7 @@ t/pg_bound_delete_lock_live.t
 t/pg_graph_bound_descendants_live.t
 t/pg_review_round3_live.t
 t/pg_case_twin_columns_live.t
+t/pg_generated_read_live.t
 t/pg_guard_statements_unnamed_live.t
 t/pg_client_encoding_live.t
 t/pg_read_round_trips_live.t

@@ -1,6 +1,24 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - PostgreSQL: a generated read is one autocommit statement (user ruling of
+      2026-11-20, which narrows R55 below). With no transaction open it no
+      longer runs in a READ ONLY transaction of its own, so with stock DBD::Pg
+      it takes two round trips (the connection state check and the query)
+      instead of four; an unbounded stream is one statement and runs the same
+      way. Consequence: a generated read that reaches a view or function of
+      the host's that writes (a view using nextval, an audit function) now
+      commits that write, where it was refused with 25006, and a session
+      setting such code changes lasts. Unchanged: a hand-built read keeps its
+      READ ONLY transaction and a hand-built write still refuses with 25006; a
+      bounded stream keeps its cursor's READ ONLY transaction; a locking read
+      keeps its own transaction; a read in the host's transaction runs as
+      written; a statement_timeout is sent only for a QueryBudget deadline and
+      the session's value is unchanged afterwards; a session whose
+      client_encoding is not UTF8 is refused from libpq's local value. MySQL,
+      MariaDB and DuckDB read transactions are unchanged. R63 is withdrawn by
+      the same rulings (named statements are allowed); statements still run
+      on a fresh handle per call, so nothing changes here.
     - A governed write is preflighted against the adapter's write capabilities
       once, in the engine, instead of up to seven walks of the command; the
       authorized adapter entry does not walk it again (execute_write_unsafe

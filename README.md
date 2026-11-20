@@ -187,8 +187,8 @@ print join(', ', @{$statement->params}), "\n";   # the bound values
 ```
 
 The text is what the adapter sends. Run a compiled statement with
-`$engine->adapter->execute_query($statement)`, which adds the read-only
-transaction and decodes the results.
+`$engine->adapter->execute_query($statement)`, which checks the connection
+and decodes the results.
 
 Filters can also be written as a portable array AST, which is how they
 usually arrive from a client:
@@ -377,12 +377,20 @@ connection strings and SQL fragments do not leak into responses.
 
 ## Database notes
 
-PostgreSQL reads work with stock `DBD::Pg`, where a generated read takes four
-round trips: a ping, `BEGIN READ ONLY`, the query and `ROLLBACK`. Selecto also
-checks whether the driver offers `pg_transaction_status`, `pg_pipeline` and
-`pg_can_pipeline`. When it does, it reads the transaction state without a
-round trip and sends the whole read as one libpq pipeline, so the read takes
-one round trip. Every check is the same either way. A DBD::Pg 3.22.0 with
+On PostgreSQL a generated read is one autocommit statement: no `READ ONLY`
+and no transaction of its own, so a view or function of yours that writes is
+committed when a generated read reaches it, as it is for your own `SELECT`. A
+hand-built read keeps a `READ ONLY` transaction of its own (`BEGIN READ ONLY`,
+the query, `ROLLBACK`), which is what refuses a hand-built write (SQLSTATE
+25006). With stock `DBD::Pg` a generated read takes two round trips, a ping
+and the query, and a hand-built read four. The ping is how Selecto learns the
+connection's state before it sends anything: a transaction your code opened
+with a raw `BEGIN`, a failed transaction, a statement still in progress or a
+lost connection. Selecto also checks whether the driver offers
+`pg_transaction_status`, `pg_pipeline` and `pg_can_pipeline`. When it does, it
+reads the transaction state without a round trip and sends a hand-built read's
+transaction as one libpq pipeline, so either read takes one round trip. Every
+check is the same either way. A DBD::Pg 3.22.0 with
 these methods (proposed upstream) can be installed from a pinned fork; it
 needs libpq 14 or later:
 

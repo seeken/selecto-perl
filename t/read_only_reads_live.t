@@ -13,9 +13,14 @@ use lib 't/lib';
 use TestPostgreSQL ();
 
 # R55: a read in a transaction of Selecto's is READ ONLY and ends in ROLLBACK,
-# on every path, so nothing it reaches outlives it: a view that writes (one using
-# nextval, or an audit function) refuses. In the host's transaction it runs as
-# written.
+# so nothing it reaches outlives it: a view that writes (one using nextval, or
+# an audit function) refuses. In the host's transaction it runs as written.
+# PostgreSQL, since the user ruling of 2026-11-20 that narrows R55: a generated
+# read (and an unbounded stream, which is one statement too) is one autocommit
+# statement in no transaction of Selecto's, so what such a view writes is
+# committed; a bounded stream keeps its cursor's READ ONLY transaction and a
+# hand-built read keeps its own (t/pg_generated_read_live.t). MySQL, MariaDB
+# and DuckDB are unchanged.
 my $domain = sub {
     my ($table, %options) = @_;
     Selecto::Domain->parse({schema_version => 1, name => "D$table", source => {source_table => $table, primary_key => 'id', ($options{untenanted} ? () : (tenant_field => 'org')),
@@ -49,12 +54,15 @@ subtest postgresql => sub {
     for my $table (qw(r55_seq_v r55_audit_v)) {
         my $e = $engine->($table);
         my $query = $e->query->select('id', 'note')->order_by('id');
-        ok(!eval { $e->all($query); 1 } && $read_only->($@), "$table: a read through a view that writes refuses");
-        ok(!eval { my $s = $e->stream($query); while ($s->next) { } 1 } && $read_only->($@), "$table: so does a stream");
-        ok(!eval { my $s = $e->stream($query, bounded => 1, fetch_size => 2); while ($s->next) { } 1 } && $read_only->($@), "$table: so does a bounded stream");
+        ok(eval { $e->all($query); 1 }, "$table: a generated read through a view that writes runs as written") or diag $@;
+        ok(eval { my $s = $e->stream($query); while ($s->next) { } 1 }, "$table: so does a stream") or diag $@;
+        ok(!eval { my $s = $e->stream($query, bounded => 1, fetch_size => 2); while ($s->next) { } 1 } && $read_only->($@), "$table: a bounded stream's cursor transaction still refuses");
+        my $hand = Selecto::Statement->new(sql => "SELECT note FROM public.$table", params => [], columns => ['note'], adapter_name => 'postgresql');
+        ok(!eval { $adapter->execute_query($hand); 1 } && $read_only->($@), "$table: so does a hand-built read");
     }
-    is($count->(), 0, 'nothing a read did is left');
-    is($next->(), $seq, 'and the sequence did not move');
+    is($count->(), 12, "what the host's view wrote in the two generated reads is committed, and nothing else");
+    is($next->(), $seq + 11, 'and the sequence moved for those two reads only');
+    $admin->do('DELETE FROM r55_log');
     # In the host's transaction a read runs as written: what a view does there
     # is the host's transaction's, to commit or roll back.
     for my $table (qw(r55_seq_v r55_audit_v)) {

@@ -19,6 +19,9 @@ use TestPostgreSQL ();
 # (pg_switch_prepared), so they run unnamed. This pins that: if a guard ever
 # moves to a reused handle, it fails here. (A pin: this held before it was written, so
 # it passes with or without any later fix.)
+# R63 was withdrawn by the user on 2026-11-20: named statements are allowed
+# again. Nothing here changed with that: a fresh handle per call is still how
+# these statements run, so this now pins what the adapter does, not a rule.
 plan skip_all => 'SELECTO_PERL_TEST_POSTGRES_URL is not set' unless ($ENV{SELECTO_PERL_TEST_POSTGRES_URL} // '') ne '';
 plan skip_all => 'DBD::Pg is not installed' unless eval { require DBD::Pg; 1 };
 my $x = 'Selecto::Expression';
