@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - A governed write is preflighted against the adapter's write capabilities
+      once, in the engine, instead of up to seven walks of the command; the
+      authorized adapter entry does not walk it again (execute_write_unsafe
+      still does). Same limits and refusal codes.
     - Add copied canonical contract key tables and contract_json, an idempotent
       boolean export preserving field visibility, effective tenant aliases and
       literal/inline cell types without exporting request predicates or scope values. Preserve the existing
