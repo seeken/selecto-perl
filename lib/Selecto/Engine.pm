@@ -709,7 +709,8 @@ sub _execute_write {
     $command = $self->governed_write($command);
     $command = Selecto::WriteRules->prepare_submitted($self,$command,input=>$input,accepted_input=>$accepted_input);
     $self->preflight_write($command);
-    return $self->_execute_governed(execute_write => $command) unless Selecto::WriteRules->has_stored_rules($self->{domain}, $command->operation);
+    # This exact object was preflighted on the line above.
+    return $self->_execute_governed(execute_write => $command, 1) unless Selecto::WriteRules->has_stored_rules($self->{domain}, $command->operation);
     return $self->_rules_transaction(sub {
         return $self->_execute_governed(execute_write => Selecto::WriteRules->govern(
             $self, $command, input_prepared => 1, accepted_upsert => $accepted_upsert));
@@ -719,10 +720,10 @@ sub _execute_write {
 # Hands a governed write object to the adapter with the engine's single-use
 # authorization for it.
 sub _execute_governed {
-    my ($self, $method, $subject) = @_;
+    my ($self, $method, $subject, $preflighted) = @_;
     $self->assert_domain_identity;
     $self->_ensure_write_context;
-    $self->preflight_write($subject) unless $method eq 'execute_transaction';
+    $self->preflight_write($subject) unless $preflighted || $method eq 'execute_transaction';
     return $self->{adapter}->$method($subject, Selecto::Write::Authorization->_issue($subject));
 }
 
