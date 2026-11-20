@@ -997,6 +997,58 @@ sub describe_openapi ($self, $api) {
     return $api;
 }
 
+my %GOVERNED_WRITE_PROPERTIES = map { $_ => 1 } qw(
+    operation assignments filters expected_count returning conflict_target
+    upsert_update_fields relationships
+);
+my %WRITE_OPERATIONS = map { $_ => 1 } qw(insert update upsert delete);
+
+# A host write handler's own request property beside the governed contract
+# (an order's vehicles, say), published on the SelectoWrite schema so API
+# consoles can offer it. The host's handler still owns its validation.
+sub describe_write_property ($self, $api, $name, $schema, %options) {
+    my $openapi = $api->openapi_document;
+    my $write = $openapi->{components}{schemas}{SelectoWrite};
+    Selecto::Error->throw('invalid_api_host', 'describe_openapi must run before describe_write_property')
+        unless ref($write) eq 'HASH' && ref($write->{properties}) eq 'HASH';
+    Selecto::Error->throw('invalid_api_host', 'write property name must be an identifier', {name => $name})
+        unless defined($name) && !ref($name) && $name =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/;
+    Selecto::Error->throw('invalid_api_host', "write property $name is part of the governed request")
+        if $GOVERNED_WRITE_PROPERTIES{$name};
+    Selecto::Error->throw('invalid_api_host', 'write property schema must be an object')
+        unless ref($schema) eq 'HASH';
+    my %property = %$schema;
+    if (defined(my $operations = $options{operations})) {
+        Selecto::Error->throw('invalid_api_host', 'write property operations must be write operations')
+            unless ref($operations) eq 'ARRAY' && @$operations
+                && !grep { !defined($_) || ref($_) || !$WRITE_OPERATIONS{$_} } @$operations;
+        $property{'x-selecto-operations'} = [@$operations];
+    }
+    if (defined(my $examples = $options{examples})) {
+        Selecto::Error->throw('invalid_api_host', 'write property examples are keyed by operation')
+            unless ref($examples) eq 'HASH' && !grep { !$WRITE_OPERATIONS{$_} } keys %$examples;
+        $property{'x-selecto-examples'} = {%$examples};
+    }
+    if (defined(my $choices = $options{choices})) {
+        Selecto::Error->throw('invalid_api_host', 'write property choices are {label, value} examples')
+            unless ref($choices) eq 'ARRAY' && !grep {
+                ref($_) ne 'HASH' || !defined($_->{label}) || ref($_->{label}) || !length($_->{label})
+                    || !exists($_->{value}) || keys(%$_) != 2
+            } @$choices;
+        $property{'x-selecto-example-choices'} = [map { +{%$_} } @$choices];
+    }
+    if (defined(my $replaces = $options{replaces})) {
+        my $columns = ref($api->domain->{source}) eq 'HASH' ? $api->domain->{source}{columns} : undef;
+        Selecto::Error->throw('invalid_api_host', 'write property replaces root domain fields')
+            unless ref($replaces) eq 'ARRAY' && @$replaces && ref($columns) eq 'HASH'
+                && !grep { !defined($_) || ref($_) || !exists($columns->{$_}) } @$replaces;
+        $property{'x-selecto-replaces'} = [@$replaces];
+    }
+    $property{description} = "$options{description}" if defined $options{description};
+    $write->{properties}{$name} = \%property;
+    return $api;
+}
+
 # The virtual aggregate_version column: selectable on queries and returned by
 # resource reads, never filterable, sortable or writable.
 sub _describe_aggregate_version ($self, $api) {
@@ -2220,6 +2272,29 @@ Queries may select C<aggregate_version> (optionally C<< {field =>
 Adds this handler's request schemas and limits to a L<Selecto::API>
 object's OpenAPI document. With a versioner it also lists the read-only
 C<aggregate_version> column in the published domain.
+
+=head2 describe_write_property
+
+  $handler->describe_write_property($api, vehicles => {
+      type => 'array', items => {'$ref' => '#/components/schemas/Vehicle'},
+  }, operations => ['insert'], examples => {insert => [{vin => '1HGCM82633A004352'}]},
+     description => 'The order\'s vehicles.');
+
+Publishes a host write handler's own request property on the C<SelectoWrite>
+schema, after L</describe_openapi>, for a handler that accepts more than the
+governed request (such as a consignment's vehicles). It never changes what
+this handler accepts: the host's write handler validates the property.
+C<operations> becomes C<x-selecto-operations> (the operations that take it)
+C<examples> becomes C<x-selecto-examples> (an example value per
+operation), and C<choices>, a list of C<< {label, value} >> examples of the
+property's alternative forms, becomes C<x-selecto-example-choices>, and
+C<replaces>, the root fields the property gives instead (such as an origin
+for C<orig_id>), becomes C<x-selecto-replaces>; the API console offers the
+property with them, and does not require a replaced field while the property
+is given. A governed
+property name (C<operation>, C<assignments>, C<filters>, C<expected_count>,
+C<returning>, C<conflict_target>, C<upsert_update_fields>, C<relationships>)
+is refused with C<invalid_api_host>.
 
 =head1 ERRORS
 

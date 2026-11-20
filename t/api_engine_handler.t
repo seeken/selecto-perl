@@ -662,6 +662,45 @@ is_deeply $api->openapi_document->{paths}{'/api/v1/records/write'}{post}{request
     {content}{'application/json'}{schema},
     {'$ref' => '#/components/schemas/SelectoWrite'},
     'OpenAPI binds the write endpoint to the governed write request schema';
+{
+    my $copy = Selecto::API->new(
+        domain => $domain, base_path => "/api/v1/host-properties",
+    );
+    my $describer = Selecto::API::EngineHandler->new;
+    ok !eval { $describer->describe_write_property($copy, rush => {type => 'boolean'}); 1 },
+        'a host write property needs the described write schema';
+    $describer->describe_openapi($copy);
+    $describer->describe_write_property($copy, rush => {type => 'boolean'},
+        operations => [qw(insert update)], examples => {insert => JSON::PP::true},
+        description => 'Rush the order.');
+    is_deeply $copy->openapi_document->{components}{schemas}{SelectoWrite}{properties}{rush},
+        {type => 'boolean', description => 'Rush the order.',
+            'x-selecto-operations' => [qw(insert update)], 'x-selecto-examples' => {insert => JSON::PP::true}},
+        'a host write property publishes its operations and examples for consoles';
+    $describer->describe_write_property($copy, origin => {type => 'string'},
+        choices => [{label => 'Your own company', value => 'consignor'}, {label => 'By key', value => {key => 'LOT7'}}]);
+    is_deeply $copy->openapi_document->{components}{schemas}{SelectoWrite}{properties}{origin}{'x-selecto-example-choices'},
+        [{label => 'Your own company', value => 'consignor'}, {label => 'By key', value => {key => 'LOT7'}}],
+        'and labelled examples of its alternative forms';
+    my ($field) = sort keys %{$copy->domain->{source}{columns}};
+    $describer->describe_write_property($copy, origin => {type => 'string'}, replaces => [$field]);
+    is_deeply $copy->openapi_document->{components}{schemas}{SelectoWrite}{properties}{origin}{'x-selecto-replaces'},
+        [$field], 'and the root fields it is given instead of';
+    for my $bad (
+        [assignments => {type => 'object'}],
+        ['two words' => {type => 'string'}],
+        [vehicles => {type => 'array'}, operations => ['select']],
+        [vehicles => {type => 'array'}, examples => {query => []}],
+        [origin => {type => 'string'}, choices => [{label => '', value => 'x'}]],
+        [origin => {type => 'string'}, choices => [{label => 'No value'}]],
+        [origin => {type => 'string'}, replaces => ['no_such_field']],
+        [origin => {type => 'string'}, replaces => []],
+    ) {
+        my ($name, $schema, @options) = @$bad;
+        my $error = eval { $describer->describe_write_property($copy, $name, $schema, @options); 1 } ? undef : $@;
+        is eval { $error->code }, 'invalid_api_host', "write property $name refused: @options";
+    }
+}
 is_deeply
     $api->openapi_document->{paths}{'/api/v1/records/query'}{post}{parameters}[0]{schema}{enum},
     [qw(json csv tsv xlsx)],
