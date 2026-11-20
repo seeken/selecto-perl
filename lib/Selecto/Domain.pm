@@ -38,6 +38,7 @@ my %JOIN = map { $_ => 1 } qw(
     source fields on
     type name display_field dimension_key display_fallback joins
 );
+my @JOIN_TYPES = qw(left inner star_dimension);
 my %THROUGH = map { $_ => 1 } qw(
     table owner_key related_key source_scope_key through_scope_key target_scope_key
     where target_key_cast
@@ -57,6 +58,109 @@ my %EDITOR_COLLECTION = map { $_ => 1 } qw(
     id label fields order_by limit empty_label
 );
 my %EDITOR_COLLECTION_FIELD = map { $_ => 1 } qw(field label);
+
+# Copies: callers cannot change the parser's admission tables.
+sub contract_keys {
+    return {
+        top_level => [sort keys %TOP_LEVEL],
+        relation => [sort keys %RELATION],
+        association => [sort keys %ASSOCIATION],
+        join => [sort keys %JOIN],
+        through => [sort keys %THROUGH],
+        join_types => [@JOIN_TYPES],
+    };
+}
+
+sub _json_booleans {
+    my ($object, @keys) = @_;
+    return unless ref($object) eq 'HASH';
+    for my $key (@keys) {
+        next unless exists $object->{$key};
+        my $value = $object->{$key};
+        next if JSON::PP::is_bool($value);
+        $object->{$key} = $value ? JSON::PP::true : JSON::PP::false;
+    }
+}
+
+sub _contract_objects {
+    return ref($_[0]) eq 'HASH' ? values %{$_[0]} : ();
+}
+
+# Context matters: a literal, option, or inline cell named 'hidden' is data.
+sub _contract_json_booleans {
+    my ($contract) = @_;
+    # The engine coalesces undefined aliases before applying its boolean test.
+    # Emitting false for one undefined alias beside a true defined alias would
+    # manufacture a conflict when the exported contract is parsed again.
+    my $tenant_required = $contract->{tenant_required} // $contract->{require_tenant} // 0;
+    for my $key (qw(tenant_required require_tenant)) {
+        $contract->{$key} = $tenant_required if exists($contract->{$key}) && !defined($contract->{$key});
+    }
+    _json_booleans($contract, qw(tenant_required require_tenant));
+    my @relations = ($contract->{source}, _contract_objects($contract->{schemas}));
+    for my $relation (@relations) {
+        next unless ref($relation) eq 'HASH';
+        for my $column (_contract_objects($relation->{columns})) {
+            _json_booleans($column, qw(hidden internal redacted nullable selectable filterable
+                sortable groupable detail_selectable query_filterable aggregatable));
+        }
+    }
+    for my $column (_contract_objects($contract->{columns})) {
+        _json_booleans($column, qw(hidden internal redacted nullable selectable filterable
+            sortable groupable detail_selectable query_filterable aggregatable));
+    }
+    my $components = ref($contract->{components}) eq 'HASH' ? $contract->{components} : {};
+    _json_booleans($components, 'query_params');
+    for my $choice (_contract_objects($components->{filter_choices})) {
+        _json_booleans($choice, 'picker_hidden');
+    }
+    for my $co (_contract_objects($contract->{co_domains})) {
+        _json_booleans($co->{search}, 'rank') if ref($co) eq 'HASH';
+    }
+    for my $action (_contract_objects($contract->{actions})) {
+        next unless ref($action) eq 'HASH';
+        _json_booleans($action, 'prerequisite_column');
+        my $inputs = $action->{inputs} // {};
+        for my $input (ref($inputs) eq 'HASH' ? values %$inputs : ref($inputs) eq 'ARRAY' ? @$inputs : ()) {
+            _json_booleans($input, 'required');
+        }
+    }
+    for my $action (_contract_objects($contract->{detail_actions})) {
+        _json_booleans($action->{payload}, 'navigation_enabled') if ref($action) eq 'HASH';
+    }
+    for my $editor (_contract_objects($contract->{editors})) {
+        next unless ref($editor) eq 'HASH';
+        for my $entry (ref($editor->{fields}) eq 'ARRAY' ? @{$editor->{fields}} : ()) {
+            _json_booleans($entry, qw(required nullable readonly));
+        }
+    }
+    my $writes = ref($contract->{writes}) eq 'HASH' ? $contract->{writes} : {};
+    for my $operation (_contract_objects($writes->{operations})) {
+        _json_booleans($operation, qw(enabled bulk require_filter));
+    }
+    for my $field (_contract_objects($writes->{fields})) {
+        _json_booleans($field, qw(insertable updatable required write_once));
+    }
+    my $scope = ref($writes->{scope}) eq 'HASH' ? $writes->{scope} : {};
+    _json_booleans($scope->{tenant}, 'required');
+    for my $relationship (_contract_objects($writes->{relationships})) {
+        next unless ref($relationship) eq 'HASH';
+        _json_booleans($relationship, qw(writable delete_missing required cascade_delete cascade_update));
+        _contract_json_booleans($relationship->{domain}) if ref($relationship->{domain}) eq 'HASH';
+    }
+    return $contract;
+}
+
+sub contract_json {
+    my ($self) = @_;
+    my $contract = $self->contract;
+    unless (defined $contract) {
+        my $copy = bless {%$self}, ref($self);
+        delete $copy->{required_predicate};
+        $contract = $copy->as_contract;
+    }
+    return _contract_json_booleans($contract);
+}
 
 sub new {
     my ($class, %args) = @_;
@@ -751,8 +855,7 @@ sub _canonical_associations {
             : undef;
         my $join_mode = lc(_required_string($join->{type} // 'left', 'join type'));
         Selecto::Error->throw('invalid_domain', "unsupported join type $join_mode")
-            unless $join_mode eq 'left' || $join_mode eq 'inner'
-                || $join_mode eq 'star_dimension';
+            unless grep { $_ eq $join_mode } @JOIN_TYPES;
         my $target_primary_key = $target->{primary_key} // 'id';
         my $display_fallback;
         if (exists $join->{display_fallback}) {
@@ -3376,6 +3479,53 @@ visible only where its action is. The copy's contract sets
 C<prerequisite_column> false on those actions, so parsing it again keeps them
 hidden. Ids without a column are ignored; when none has one, the domain itself
 is returned. It never changes the shared domain.
+
+=head2 contract_keys
+
+  my $keys = Selecto::Domain->contract_keys;
+
+Returns fresh arrays of accepted C<top_level>, C<relation>, C<association>,
+C<join>, C<through> keys and C<join_types>. These are the canonical parser's
+actual tables, not a separate schema. Column metadata is extensible. The root
+also accepts C<fts5_index>. Structural admission does not imply that an adapter
+supports every declaration.
+
+=head2 contract_json
+
+  my $data = $domain->contract_json;
+  my $bytes = JSON::PP->new->canonical->encode($data);
+
+Returns a fresh canonical contract with JSON::PP booleans. It never includes
+request scope values or the required predicate installed by
+C<with_required_predicate> or C<with_scope>. Authored C<required_filters> stay
+in the contract. Constructor-form domains are converted to canonical form.
+
+Boolean positions are domain C<tenant_required> and C<require_tenant>; column
+C<hidden>, C<internal>, C<redacted>, C<nullable>, C<selectable>, C<filterable>,
+C<sortable>, C<groupable>, C<detail_selectable>, C<query_filterable> and
+C<aggregatable> (also top-level column overrides); components C<query_params>
+and filter-choice C<picker_hidden>; co-domain search C<rank>; action
+C<prerequisite_column> and input C<required>; detail-action payload
+C<navigation_enabled>; editor-field C<required>, C<nullable>, C<readonly>;
+write-operation C<enabled>, C<bulk>, C<require_filter>; write-field
+C<insertable>, C<updatable>, C<required>, C<write_once>; write tenant-scope
+C<required>; and write-relationship C<writable>, C<delete_missing>,
+C<required>, C<cascade_delete>, C<cascade_update>. Nested write domains use
+the same positions.
+The export uses Perl truthiness at these positions and preserves existing
+JSON::PP booleans. It never rejects a flag value. The parser's existing checks
+still apply: tenant requirements and the UI/action/editor switches accept only
+0/1 or JSON booleans; their accepted values have the same truth test. Undefined
+tenant requirement aliases use the engine's defined alternate alias, or false
+when neither alias is defined. No parser validation or
+fingerprint algorithm is changed by this accessor.
+
+Literal values, inline rows and arbitrary metadata retain their original
+number or string types. Export, encode, parse and export is idempotent and
+preserves C<field_is_public> for every field path. The normalized export can
+have a different fingerprint from its raw authored document; the domain's
+fingerprint continues to use the original parser algorithm. Constructor-form
+and schema 2 domains export their canonical schema 1 contract.
 
 =head2 as_contract
 

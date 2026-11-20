@@ -444,3 +444,4 @@ lib/Selecto/CompileCache.pm
 t/compile_cache.t
 t/compile_cache_fingerprint.t
 t/compile_cache_tenants.t
+t/domain_contract_json.t
