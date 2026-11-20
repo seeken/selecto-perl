@@ -204,7 +204,10 @@ sub requirements {
 sub require {
     my ($class, $capabilities, $write) = @_;
     $class->validate($capabilities);
-    my $required = $class->requirements($write);
+    return _require($capabilities, $class->requirements($write));
+}
+sub _require {
+    my ($capabilities, $required) = @_;
     my @missing = grep { !_supported($capabilities, $_) } @$required;
     _fail('write_capability_missing', 'configured adapter cannot preserve requested write semantics',
         {required => $required, missing => \@missing}) if @missing;
@@ -212,7 +215,9 @@ sub require {
 }
 sub preflight {
     my ($class, $adapter, $write) = @_;
-    $class->requirements($write);
+    # One admission walk per preflight: the requirements computed here are
+    # the ones checked against the adapter's report below.
+    my $required = $class->requirements($write);
     # A dialect may refuse a structured operation whose physical semantics it
     # cannot supply. This preserves specific fail-closed intent diagnostics;
     # the hook never grants a missing protocol/capability or dispatches SQL.
@@ -227,7 +232,8 @@ sub preflight {
     my ($capabilities, $failed);
     { local $@; my $ok = eval { $capabilities = $adapter->write_capabilities; 1 }; $failed = !$ok }
     _fail('invalid_write_capabilities', 'write adapter capability discovery failed') if $failed;
-    return $class->require($capabilities, $write);
+    $class->validate($capabilities);
+    return _require($capabilities, $required);
 }
 1;
 
