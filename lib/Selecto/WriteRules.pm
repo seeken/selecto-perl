@@ -292,7 +292,8 @@ sub _typed_subject {
 sub prepare_submitted {
     my ($class,$engine,$command,%options)=@_;
     return Selecto::Write::FieldValidators->with_budget(sub {
-        my $writes=$engine->domain->writes;
+        # Read only here; FieldValidators->admit copies the specs it keeps.
+        my $writes=$engine->domain->writes_shared;
         my $fields=ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : {};
         my $assignments=$command->assignments;
         my $rules=$engine->domain->rules;
