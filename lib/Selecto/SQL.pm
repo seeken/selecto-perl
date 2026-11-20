@@ -1515,6 +1515,10 @@ sub _write_uses_physical_ids { return 0; }
 sub execute_write {
     my ($self, $command, $authorization) = @_;
     Selecto::Write::Authorization->require_for($command, $authorization);
+    # The engine issues an authorization only for an object it has just
+    # preflighted against this adapter, so the authorized path does not
+    # walk it again. execute_write_unsafe keeps its own preflight.
+    local $self->{_selecto_preflighted_write} = refaddr($command);
     return $self->execute_write_unsafe($command);
 }
 
@@ -1548,7 +1552,9 @@ sub execute_transaction {
 
 sub execute_write_unsafe {
     my ($self, $command) = @_;
-    Selecto::Write::Capabilities->preflight($self, $command);
+    my $preflighted = $self->{_selecto_preflighted_write};
+    Selecto::Write::Capabilities->preflight($self, $command)
+        unless defined($preflighted) && ref($command) && $preflighted == refaddr($command);
     $self->_validate_write_cardinality($command);
     my $compiled = $self->_compile_write($command);
     return $self->_transaction(sub { return $self->_execute_compiled_write_in_transaction($command, $compiled); });
