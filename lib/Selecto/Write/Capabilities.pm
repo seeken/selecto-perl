@@ -6,6 +6,7 @@ use warnings;
 no overloading;
 use B ();
 use bytes ();
+use Hash::Util::FieldHash qw(fieldhash);
 use Scalar::Util qw(blessed refaddr reftype);
 use Selecto::Error ();
 use Selecto::Limits ();
@@ -32,7 +33,18 @@ sub _name { defined($_[0]) && !defined(reftype($_[0])) && $_[0] =~ /\A[A-Za-z_][
 # write walks its command before governance and again after it. A refusal
 # unwinds through local, which also keeps a nested admission (a tied container
 # that admits something itself) apart from the one that is under way.
+#
+# A write is walked before governance and again after it, and the governed
+# command carries records that were admitted already: the submitted predicate,
+# and the engine's limits record on every write. Expressions and limit
+# records are immutable once built, so a native record of exactly one of
+# those classes that a walk admitted keeps what that walk charged for it
+# (nodes below it, bytes, levels below it), keyed by the record itself, and a
+# later walk charges that instead of walking it again. A record whose charge
+# would break a limit is walked as before, so a refusal is the walk's own.
 my $DEPTH_MAX = $LIMITS->get('max_expression_depth');
+my %IMMUTABLE = map { $_ => 1 } qw(Selecto::Expression Selecto::Limits);
+fieldhash my %MEASURED;
 our ($NODES, $BYTES, $NODES_LIMIT, $BYTES_LIMIT, $NATIVE, $CODE, %ACTIVE);
 sub _admit {
     my ($value, $native, $code) = @_;
@@ -42,22 +54,23 @@ sub _admit {
     local %ACTIVE;
     _walk($value, 0);
 }
+# Returns the levels below $value that the walk visited.
 sub _walk {
     my ($value, $depth) = @_;
     _fail($CODE, 'write preflight input exceeds its resource limit')
         if ++$NODES > $NODES_LIMIT || $depth > $DEPTH_MAX;
     my $type = reftype($value);
     unless (defined $type) {
-        return unless defined $value;
+        return 0 unless defined $value;
         use bytes;
         _fail($CODE, 'write preflight input exceeds its byte limit') if ($BYTES += length($value)) > $BYTES_LIMIT;
-        return;
+        return 0;
     }
     my $class = blessed($value) // '';
     if ($BOOLEAN{$class} && $type eq 'SCALAR') {
         _fail($CODE, 'write preflight contains an invalid Boolean')
             if !defined($$value) || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
-        return;
+        return 0;
     }
     _fail($CODE, 'write preflight contains unsupported executable or object input')
         if length($class) && (!$NATIVE || !$RECORD{$class});
@@ -65,6 +78,17 @@ sub _walk {
         unless $type eq 'HASH' || $type eq 'ARRAY';
     my $address = refaddr($value);
     _fail($CODE, 'write preflight contains a cycle') if $ACTIVE{$address};
+    # Only native admission reaches this with a class, so only it records.
+    my $immutable = $IMMUTABLE{$class};
+    if ($immutable && (my $measured = $MEASURED{$value})) {
+        if ($NODES + $measured->[0] <= $NODES_LIMIT && $BYTES + $measured->[1] <= $BYTES_LIMIT
+            && $depth + $measured->[2] <= $DEPTH_MAX) {
+            $NODES += $measured->[0];
+            $BYTES += $measured->[1];
+            return $measured->[2];
+        }
+    }
+    my ($nodes_before, $bytes_before) = ($NODES, $BYTES);
     # The marks are discarded when a refusal unwinds, so they need no scope
     # guard. Scalar leaves are counted here, with the same checks in the same
     # order as a call each would make.
@@ -74,6 +98,7 @@ sub _walk {
         if $NODES + $count > $NODES_LIMIT;
     my $deeper = $depth + 1;
     my $too_deep = $deeper > $DEPTH_MAX;
+    my $height = 0;
     use bytes;
     if ($type eq 'HASH') {
         for my $key (keys %$value) {
@@ -82,9 +107,14 @@ sub _walk {
             # A copy, as an argument list made before: measuring a number's
             # length must not give the caller's scalar a string value.
             my $item = $value->{$key};
-            if (defined reftype($item)) { _walk($item, $deeper); next }
+            if (defined reftype($item)) {
+                my $below = _walk($item, $deeper) + 1;
+                $height = $below if $below > $height;
+                next;
+            }
             _fail($CODE, 'write preflight input exceeds its resource limit')
                 if ++$NODES > $NODES_LIMIT || $too_deep;
+            $height ||= 1;
             next unless defined $item;
             _fail($CODE, 'write preflight input exceeds its byte limit')
                 if ($BYTES += length($item)) > $BYTES_LIMIT;
@@ -92,15 +122,22 @@ sub _walk {
     } else {
         for my $i (0 .. $#$value) {
             my $item = $value->[$i];
-            if (defined reftype($item)) { _walk($item, $deeper); next }
+            if (defined reftype($item)) {
+                my $below = _walk($item, $deeper) + 1;
+                $height = $below if $below > $height;
+                next;
+            }
             _fail($CODE, 'write preflight input exceeds its resource limit')
                 if ++$NODES > $NODES_LIMIT || $too_deep;
+            $height ||= 1;
             next unless defined $item;
             _fail($CODE, 'write preflight input exceeds its byte limit')
                 if ($BYTES += length($item)) > $BYTES_LIMIT;
         }
     }
     delete $ACTIVE{$address};
+    $MEASURED{$value} = [$NODES - $nodes_before, $BYTES - $bytes_before, $height] if $immutable;
+    return $height;
 }
 sub _boolean {
     my ($value) = @_;

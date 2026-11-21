@@ -4,6 +4,14 @@ Revision history for Selecto
     - Month buckets: the bucket kind month_ranges groups a date or time by
       calendar months ago (0 is the current month), in PostgreSQL and
       SQLite, with the same range rules as the other kinds.
+    - Write capability admission no longer walks an expression or limits
+      record it has already admitted. A write is admitted before governance
+      and again after it, and the governed command carries the submitted
+      predicate and the engine's limits record again; the second walk (and
+      every later write's) charges what the first walk measured for those
+      immutable records instead of walking them. Limits and refusals are
+      unchanged: a record whose charge would break a limit is walked as
+      before. Subclasses and portable admission are unaffected.
     - PostgreSQL: a single managed write on an idle handle opens its own
       transaction with one statement, BEGIN ISOLATION LEVEL READ COMMITTED,
       instead of begin_work followed by SET TRANSACTION ISOLATION LEVEL READ
