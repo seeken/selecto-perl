@@ -40,6 +40,9 @@ use Selecto::QueryBinding ();
 
 fieldhash my %ACTION_COMMAND_WORK;
 fieldhash my %CONFIGURED_DOMAIN;
+# The field expression of each tenant column a write compares with the
+# engine's trusted tenant, per domain object (see _tenant_comparison).
+fieldhash my %TENANT_FIELDS;
 
 sub _read_authority {
     my ($self) = @_;
@@ -1081,6 +1084,8 @@ sub governed_write {
     Selecto::Error->throw('invalid_write', 'write command required')
         unless blessed($command) && $command->isa('Selecto::Write::Command');
     my $accepted_work = $self->_accepted_command_work($command);
+    # This write's tenant comparisons, each built once (see _tenant_comparison).
+    local $self->{_tenant_comparisons} = [refaddr($self), {}];
     Selecto::OperationBudget->new(limits => $self->{limits}, code => 'invalid_write')->check_tree(
         {assignments => $command->{assignments}, predicate => $command->{predicate},
             scope_predicate => $command->{scope_predicate}, query_enforcement => $command->{query_enforcement}},
@@ -1237,6 +1242,27 @@ sub _write_tenant_fields {
         @{$self->_write_tenant_rules->{pinned}}, @extra, @host];
 }
 
+# column = the engine's trusted tenant, the comparison a governed write puts
+# in its scope and its post-image scope. The tenant is read from this engine
+# every time and bound as a parameter (a literal); it is never cached. What is
+# kept is the column's field expression, per domain object: never shared
+# across domains, freed with the domain, and a changed domain is a new object
+# (configured domains are sealed, assert_domain_identity). Within one governed
+# write the comparison is built once and shared (expressions are immutable
+# records); outside one, and in an engine copied from this one meanwhile
+# (with_scope copies are shallow), it is built on every call.
+sub _tenant_comparison {
+    my ($self, $column) = @_;
+    my $memo = $self->{_tenant_comparisons};
+    my $write = $memo && $memo->[0] == refaddr($self) ? $memo->[1] : undef;
+    return $write->{$column} if $write && $write->{$column};
+    my $fields = $TENANT_FIELDS{$self->{domain}} //= {};
+    my $comparison = Selecto::Expression->eq($fields->{$column} //= Selecto::Expression->field($column),
+        $self->{scope}{tenant});
+    $write->{$column} = $comparison if $write;
+    return $comparison;
+}
+
 # The tenant conditions a stored row of this engine's domain must meet to be
 # one this engine's writes may reach: the bound column equal to the engine
 # tenant, and each pinned column inside its pin. Empty without an engine
@@ -1246,7 +1272,7 @@ sub _write_tenant_conditions {
     my $tenant = $self->{scope}{tenant};
     return () unless defined $tenant;
     my $rules = $self->_write_tenant_rules;
-    my @conditions = defined($rules->{bind}) ? (Selecto::Expression->eq($rules->{bind}, $tenant)) : ();
+    my @conditions = defined($rules->{bind}) ? ($self->_tenant_comparison($rules->{bind})) : ();
     for my $column (@{$rules->{pinned}}) {
         my $pins = $self->_tenant_pins($column) or next;
         push @conditions, @$pins == 1 ? Selecto::Expression->eq($column, $pins->[0])
@@ -1277,6 +1303,7 @@ sub _apply_write_tenant {
     if ($rules->{legacy}) {
         $command = Selecto::Write::Scope->apply(
             $command, $scope, $tenant, label => $command->relation, details => \%details,
+            tenant_comparison => sub { $self->_tenant_comparison($_[0]) },
         );
         push @trusted, $scope->{field};
     } elsif ($scope) {
@@ -1294,7 +1321,8 @@ sub _apply_write_tenant {
         }
         unless ($rules->{legacy}) {
             push @trusted, $column;
-            $command = _bind_write_tenant($command, $column, $tenant, %where);
+            $command = _bind_write_tenant($command, $column, $tenant,
+                sub { $self->_tenant_comparison($column) }, %where);
         }
     }
     for my $pinned (@{$rules->{pinned}}) {
@@ -1359,9 +1387,9 @@ sub _comparison_values {
 }
 
 sub _bind_write_tenant {
-    my ($command, $column, $tenant, %where) = @_;
+    my ($command, $column, $tenant, $comparison, %where) = @_;
     my $operation = $command->operation;
-    return _scope_tenant($command, $column, $tenant) if $operation eq 'delete';
+    return _scope_tenant($command, $column, $tenant, $comparison) if $operation eq 'delete';
     my $assignments = $command->assignments;
     if (exists $assignments->{$column}) {
         my $value = _literal_value($assignments->{$column});
@@ -1378,17 +1406,18 @@ sub _bind_write_tenant {
             \%where,
         ) unless ref($target) eq 'ARRAY' && grep { defined($_) && !ref($_) && "$_" eq $column } @$target;
     }
-    return _scope_tenant($command->with_assignments($assignments), $column, $tenant);
+    return _scope_tenant($command->with_assignments($assignments), $column, $tenant, $comparison);
 }
 
-# ANDs column = tenant into the command's scope once.
+# ANDs column = tenant into the command's scope once; $comparison, when
+# given, builds that comparison.
 sub _scope_tenant {
-    my ($command, $column, $tenant) = @_;
+    my ($command, $column, $tenant, $comparison) = @_;
     my $existing = $command->scope_predicate;
     return $command if grep {
         $_->kind eq 'eq' && _is_tenant_comparison($_, $column) && "${\$_->arguments->[1]->arguments->[0]}" eq "$tenant"
     } _conjuncts($existing);
-    my $guard = Selecto::Expression->eq($column, $tenant);
+    my $guard = $comparison ? $comparison->() : Selecto::Expression->eq($column, $tenant);
     return $command->with_scope_predicate(defined($existing) ? Selecto::Expression->all($existing, $guard) : $guard);
 }
 

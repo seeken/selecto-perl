@@ -121,7 +121,8 @@ sub apply {
         ) unless ref($target) eq 'ARRAY' && grep { defined($_) && !ref($_) && "$_" eq $field } @$target;
     }
 
-    my $guard = Selecto::Expression->eq($field, $trusted);
+    # (The engine passes a builder that shares this comparison with the rest of the write.)
+    my $guard = $args{tenant_comparison} ? $args{tenant_comparison}->($field) : Selecto::Expression->eq($field, $trusted);
     my $existing = $command->scope_predicate;
     return $command
         ->with_assignments($assignments)

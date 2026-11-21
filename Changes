@@ -70,6 +70,14 @@ Revision history for Selecto
       immutable records instead of walking them. Limits and refusals are
       unchanged: a record whose charge would break a limit is walked as
       before. Subclasses and portable admission are unaffected.
+    - A tenant-scoped governed write builds its tenant comparison (the
+      tenant column = the engine's trusted tenant) once and shares it
+      between the write scope and the post-image scope, where it was built
+      two or three times; the column's field expression is kept per domain
+      object (never shared across domains, freed with the domain). The
+      tenant is read from the engine on every write and bound as a
+      parameter; it is never cached. Same statements, parameters, limits and
+      refusals; four expression constructions fewer per write.
     - PostgreSQL, stock DBD::Pg (no pg_transaction_status): a single managed
       write no longer sends pg_ping before its transaction. It asks whether
       the host has a raw BEGIN open in its own first round trip: BEGIN and
