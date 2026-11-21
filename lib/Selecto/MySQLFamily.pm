@@ -224,7 +224,7 @@ sub compile {
     # Column data types read for zone-independent TIMESTAMP scope compares,
     # once per relation per compile.
     local $self->{_selecto_column_catalog} = $top ? {} : $self->{_selecto_column_catalog};
-    my $scope = $top && blessed($query) && !@{$query->set_operations} && $query->grouping_mode ne 'rollup'
+    my $scope = $top && blessed($query) && !@{$query->set_operations} && $query->grouping_mode eq 'plain'
         ? {pending => 1, formatters => {}} : undef;
     local $self->{_selecto_format_scope} = $scope;
     local $self->{_selecto_formats_active};

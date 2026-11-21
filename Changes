@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - CUBE and GROUPING SETS: Selecto::Query gains group_by_cube and
+      group_by_grouping_sets, the grouping modes cube and grouping_sets, and
+      grouping_set_positions. PostgreSQL and DuckDB compile the native
+      clauses; SQLite builds one UNION ALL branch per grouping set, as it
+      does for rollups. cube and grouping_sets are separate adapter
+      capabilities; MySQL, MariaDB and SQL Server do not declare them and
+      refuse such queries. A cube takes at most 8 dimensions and a query at
+      most 64 grouping sets.
     - PostgreSQL: a generated read is one autocommit statement (user ruling of
       2026-11-20, which narrows R55 below). With no transaction open it no
       longer runs in a READ ONLY transaction of its own, so with stock DBD::Pg

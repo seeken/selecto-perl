@@ -39,6 +39,7 @@ sub supports {
     my ($self, $feature) = @_;
     return "$feature" eq 'transactions' || "$feature" eq 'returning'
         || "$feature" eq 'rollup' || "$feature" eq 'set_operations'
+        || "$feature" eq 'cube' || "$feature" eq 'grouping_sets'
         || "$feature" eq 'window_functions'
         || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
         || "$feature" eq 'stream' || "$feature" eq 'value_expressions'

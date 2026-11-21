@@ -75,17 +75,19 @@ sub compile {
     my @columns = map { $self->_selection_name($_) } @$selections;
     my @aliased = map { $selections->[$_]->as($columns[$_]) } 0 .. $#$selections;
     my (@branches, @params);
-    for (my $level = @$groups; $level >= 0; $level--) {
+    my $sets = $query->grouping_set_positions;
+    for my $number (0 .. $#$sets) {
+        my $set = $sets->[$number];
         my $branch = $query->_copy(
             selections => \@aliased,
-            grouping_mode => 'plain', groups => $level ? [@$groups[0 .. $level - 1]] : [],
+            grouping_mode => 'plain', grouping_sets => undef, groups => [@$groups[@$set]],
             orders => [], limit_value => undef, offset_value => undef,
         );
         my $statement = $self->_compile_single($domain, $branch, %options,
-            rollup_projection => {dimensions => \%dimensions, level => $level});
+            rollup_projection => {dimensions => \%dimensions, grouped => {map { ($_ => 1) } @$set}});
         # A derived table also keeps branch-local WITH clauses legal in a union.
         push @branches, 'SELECT * FROM (' . $statement->sql . ') AS '
-            . $self->quote_identifier('__selecto_rollup_branch' . $level);
+            . $self->quote_identifier('__selecto_rollup_branch' . $number);
         push @params, @{$statement->params};
     }
     my $sql = 'SELECT * FROM (' . join(' UNION ALL ', @branches) . ') AS '
@@ -127,7 +129,7 @@ sub selection_expression {
     local $self->{_rollup_projection} = defined $self->{_rollup_branch};
     my $sql = $compile->();
     # COUNT forces the empty grouping set to yield one row even with no measure.
-    return $self->{_rollup_branch} && $self->{_rollup_branch}{level} == 0
+    return $self->{_rollup_branch} && !%{$self->{_rollup_branch}{grouped}}
         ? 'CASE WHEN COUNT(*) >= 0 THEN ' . $sql . ' END' : $sql;
 }
 
@@ -141,7 +143,7 @@ sub branch_expression {
     if ($self->{_rollup_projection} && exists $branch->{dimensions}{$key}) {
         local $self->{_rollup_projection} = 0;
         return _null_dimension($self, sub { $super->($domain, $expression, $params, $compiled_selections) })
-            if $branch->{dimensions}{$key} >= $branch->{level};
+            if !$branch->{grouped}{$branch->{dimensions}{$key}};
         return $super->($domain, $expression, $params, $compiled_selections);
     }
     if ($expression->kind eq 'grouping') {
@@ -150,7 +152,7 @@ sub branch_expression {
         for my $dimension (@{$expression->arguments->[0]}) {
             my $index = $branch->{dimensions}{Selecto::SQL::_expression_key($dimension)};
             Selecto::Error->throw('invalid_query', 'GROUPING must reference rollup dimensions') unless defined $index;
-            $marker = ($marker << 1) | ($index >= $branch->{level} ? 1 : 0);
+            $marker = ($marker << 1) | ($branch->{grouped}{$index} ? 0 : 1);
         }
         return "$marker";
     }
@@ -160,7 +162,7 @@ sub branch_expression {
         Selecto::Error->throw('invalid_query', 'dimension display requires a rollup dimension') unless defined $index;
         local $self->{_rollup_projection} = 0;
         return _null_dimension($self, sub { $self->_compile_expression($domain, $display, $params) })
-            if $index >= $branch->{level};
+            if !$branch->{grouped}{$index};
         return 'MIN(' . $self->_compile_expression($domain, $display, $params) . ')';
     }
     if ($AGGREGATES{$expression->kind}) {

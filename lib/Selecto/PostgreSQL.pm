@@ -377,6 +377,7 @@ sub supports {
         if "$feature" eq 'canonical_values';
     return "$feature" eq 'transactions' || "$feature" eq 'returning'
         || "$feature" eq 'rollup' || "$feature" eq 'set_operations'
+        || "$feature" eq 'cube' || "$feature" eq 'grouping_sets'
         || "$feature" eq 'window_functions' || "$feature" eq 'text_search'
         || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
         || "$feature" eq 'lateral_join' || "$feature" eq 'json_rowset'

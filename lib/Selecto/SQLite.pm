@@ -199,7 +199,8 @@ sub supports {
     return $self->_sqlite_version_at_least(3, 26, 0) if "$feature" eq 'schema_introspection';
     return "$feature" eq 'transactions' || "$feature" eq 'set_operations'
         || "$feature" eq 'stream' || "$feature" eq 'value_expressions'
-        || "$feature" eq 'rollup' ? 1 : 0;
+        || "$feature" eq 'rollup'
+        || "$feature" eq 'cube' || "$feature" eq 'grouping_sets' ? 1 : 0;
 }
 
 sub _emulates_rollup { return 1; }

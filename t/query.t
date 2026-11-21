@@ -818,7 +818,7 @@ my $disabled_fix_engine = Selecto::Engine->new(
 unlike($disabled_fix_engine->compile($rollup)->sql, qr/rollupfix/,
     'rollup_sort_fix can explicitly disable the compatibility wrapper');
 
-eval { Selecto::Query->new(grouping_mode => 'cube') };
+eval { Selecto::Query->new(grouping_mode => 'pivot') };
 is($@->code, 'invalid_query', 'unsupported grouping modes fail closed');
 
 my $dated_domain = Selecto::Domain->new(

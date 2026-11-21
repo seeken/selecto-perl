@@ -240,7 +240,7 @@ The DBI handle.
 
 True when the adapter can compile a feature. Feature names include
 C<transactions>, C<stream>, C<cte>, C<recursive_cte>, C<window_functions>,
-C<set_operations>, C<rollup>, C<lateral_join>, C<json_rowset>,
+C<set_operations>, C<rollup>, C<cube>, C<grouping_sets>, C<lateral_join>, C<json_rowset>,
 C<array_rowset>, C<array_predicates>, C<json_contains>, C<text_search>,
 C<value_expressions>, C<json_text>, C<row_locks>, C<returning> and
 C<projection_sum>. The base class supports nothing.

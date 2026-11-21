@@ -11,7 +11,7 @@ use Selecto::Error ();
 # statement, bind value or authority object is retained in an entry.
 fieldhash my %CACHE;
 fieldhash my %DOMAINS;
-my %QUERY_KEYS = map { $_ => 1 } qw(selections predicate groups grouping_mode orders
+my %QUERY_KEYS = map { $_ => 1 } qw(selections predicate groups grouping_mode grouping_sets orders
     limit_value offset_value ctes lateral_joins values_sources function_laterals
     json_rowsets array_rowsets subqueries members set_operations timezone row_lock
     retarget applied_query_library);

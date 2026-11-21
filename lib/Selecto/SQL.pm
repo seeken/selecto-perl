@@ -22,7 +22,7 @@ use Selecto::Write::Capabilities ();
 use Selecto::Write::Policy ();
 
 our @FEATURE_INVENTORY = qw(
-    cte recursive_cte window_functions set_operations transactions returning rollup stream
+    cte recursive_cte window_functions set_operations transactions returning rollup cube grouping_sets stream
     schema_introspection text_search json_rowset lateral_join
 );
 our %WRITE_CAPABILITIES = map { $_ => 1 } qw(
@@ -205,8 +205,10 @@ sub _compile_single {
     return $self->_compile_retargeted($domain, $query, %options)
         if defined $query->retarget_spec;
     $query = $self->_expand_query($domain, $query);
-    return $self->_compile_rollup($domain, $query, %options)
-        if $query->grouping_mode eq 'rollup' && $self->_emulates_rollup;
+    if ($query->grouping_mode ne 'plain' && $self->_emulates_rollup) {
+        $self->_require_grouping_mode($query);
+        return $self->_compile_rollup($domain, $query, %options);
+    }
     local $self->{_root_alias} = $options{root_alias} // 's0';
     local $self->{_tenant_root} = $domain;
     local $self->{_timezone} = $query->timezone;
@@ -431,8 +433,7 @@ sub _compile_single {
             ? $predicates[0]
             : join(' AND ', map { "($_)" } @predicates));
     }
-    Selecto::Error->throw('unsupported_feature', 'adapter does not support rollups')
-        if $query->grouping_mode eq 'rollup' && !$self->supports('rollup');
+    $self->_require_grouping_mode($query);
     # A member's group key joined to its root as identity groups exactly
     # (dialect hook; plain elsewhere).
     my $byte_groups = $self->{_selecto_group_bytes};
@@ -444,12 +445,26 @@ sub _compile_single {
             : $self->_compile_group_expression($domain, $_, \@params, $byte_groups)
     } @$groups);
     if (@$groups) {
-        $sql .= $query->grouping_mode eq 'rollup'
-            ? ' GROUP BY ROLLUP (' . $group_sql . ')'
-            : ' GROUP BY ' . $group_sql;
+        my $mode = $query->grouping_mode;
+        if ($mode eq 'grouping_sets') {
+            # Each dimension is compiled once above; a set repeats its SQL.
+            my @dimension_sql = map {
+                my $key = _expression_key($_);
+                $self->_reuses_parameter_identity && exists($compiled_selections{$key})
+                    ? $self->_reused_group_sql($compiled_selections{$key}, $_, $byte_groups)
+                    : $self->_grouping_set_member_sql($domain, $_, $byte_groups)
+            } @$groups;
+            $sql .= ' GROUP BY GROUPING SETS (' . join(', ', map {
+                '(' . join(', ', @dimension_sql[@$_]) . ')'
+            } @{$query->grouping_set_positions}) . ')';
+        } else {
+            $sql .= $mode eq 'rollup' ? ' GROUP BY ROLLUP (' . $group_sql . ')'
+                : $mode eq 'cube' ? ' GROUP BY CUBE (' . $group_sql . ')'
+                : ' GROUP BY ' . $group_sql;
+        }
     }
     my $orders = $query->orders;
-    if ($query->grouping_mode eq 'rollup' && @$orders) {
+    if ($query->grouping_mode ne 'plain' && @$orders) {
         my $single_grouping_position = _single_rollup_grouping_position(
             $selections, $groups, \%selection_positions,
         );
@@ -523,7 +538,7 @@ sub _compile_single {
     # would then sort the formatted values.
     $self->_note_projection($statement, start => length($with_sql) + length('SELECT '),
         items => \@projection)
-        unless $query->grouping_mode eq 'rollup' && @$orders;
+        unless $query->grouping_mode ne 'plain' && @$orders;
     return $statement;
 }
 
@@ -1305,6 +1320,30 @@ sub _compile_structured_compare {
 
 sub _compile_json_contains {
     Selecto::Error->throw('unsupported_feature', 'JSON containment is not supported by this SQL dialect');
+}
+
+# ROLLUP, CUBE and GROUPING SETS are separate capabilities: an adapter that
+# lacks one refuses the query rather than grouping it differently.
+sub _require_grouping_mode {
+    my ($self, $query) = @_;
+    my $mode = $query->grouping_mode;
+    return if $mode eq 'plain' || $self->supports($mode);
+    Selecto::Error->throw('unsupported_feature', {
+        rollup => 'adapter does not support rollups',
+        cube => 'adapter does not support cubes',
+        grouping_sets => 'adapter does not support grouping sets',
+    }->{$mode}, {feature => $mode});
+}
+
+# A dimension inside GROUPING SETS. It must not bind parameters of its own
+# there, because one dimension appears in several sets.
+sub _grouping_set_member_sql {
+    my ($self, $domain, $expression, $byte_groups) = @_;
+    my @bound;
+    my $sql = $self->_compile_group_expression($domain, $expression, \@bound, $byte_groups);
+    Selecto::Error->throw('unsupported_feature',
+        'a grouping-set dimension with bound values must also be selected') if @bound;
+    return $sql;
 }
 
 sub _single_rollup_grouping_position {

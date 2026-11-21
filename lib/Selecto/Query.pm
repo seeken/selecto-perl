@@ -12,7 +12,7 @@ use Selecto::Identifier ();
 use Selecto::QueryBinding ();
 
 my %BUILD_KEYS = map { $_ => 1 } qw(
-    selections predicate groups grouping_mode orders limit_value offset_value applied_query_library
+    selections predicate groups grouping_mode grouping_sets orders limit_value offset_value applied_query_library
     set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
     retarget values_sources subqueries function_laterals
 );
@@ -44,8 +44,9 @@ sub _build {
             unless $direction eq 'asc' || $direction eq 'desc';
     }
     my $grouping_mode = $args{grouping_mode} // 'plain';
-    Selecto::Error->throw('invalid_query', 'grouping mode must be plain or rollup')
-        unless $grouping_mode eq 'plain' || $grouping_mode eq 'rollup';
+    Selecto::Error->throw('invalid_query', 'grouping mode must be plain, rollup, cube or grouping_sets')
+        unless $grouping_mode =~ /\A(?:plain|rollup|cube|grouping_sets)\z/;
+    my $grouping_sets = _grouping_sets($grouping_mode, $args{groups} // [], $args{grouping_sets});
     my $set_operations = $args{set_operations} // [];
     Selecto::Error->throw('invalid_query', 'set operations must be an array')
         unless ref($set_operations) eq 'ARRAY';
@@ -119,6 +120,7 @@ sub _build {
         predicate   => $args{predicate},
         groups      => [@{$args{groups} // []}],
         grouping_mode => $grouping_mode,
+        grouping_sets => $grouping_sets,
         orders      => [map { [@$_] } @{$args{orders} // []}],
         limit_value  => defined($args{limit_value}) ? _nonnegative($args{limit_value}, 'limit') : undef,
         offset_value => defined($args{offset_value}) ? _nonnegative($args{offset_value}, 'offset') : undef,
@@ -210,7 +212,7 @@ sub group_by {
     @fields = @{$fields[0]} if @fields == 1 && ref($fields[0]) eq 'ARRAY';
     return $self->_copy(groups => [map {
         blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
-    } @fields], grouping_mode => 'plain');
+    } @fields], grouping_mode => 'plain', grouping_sets => undef);
 }
 
 sub group_by_rollup {
@@ -221,7 +223,101 @@ sub group_by_rollup {
         unless @fields;
     return $self->_copy(groups => [map {
         blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
-    } @fields], grouping_mode => 'rollup');
+    } @fields], grouping_mode => 'rollup', grouping_sets => undef);
+}
+
+sub group_by_cube {
+    my ($self, @fields) = @_;
+    $self->_ensure_pre_set_mutation('group_by_cube');
+    @fields = @{$fields[0]} if @fields == 1 && ref($fields[0]) eq 'ARRAY';
+    Selecto::Error->throw('invalid_query', 'cube requires at least one grouping expression')
+        unless @fields;
+    return $self->_copy(groups => [map {
+        blessed($_) && $_->isa('Selecto::Expression') ? $_ : Selecto::Expression->field($_)
+    } @fields], grouping_mode => 'cube', grouping_sets => undef);
+}
+
+# Each argument is one grouping set: an array of fields or expressions, where
+# an empty array is the grand total. The dimensions are the distinct
+# expressions of all sets, in the order they first appear.
+sub group_by_grouping_sets {
+    my ($self, @sets) = @_;
+    $self->_ensure_pre_set_mutation('group_by_grouping_sets');
+    Selecto::Error->throw('invalid_query', 'grouping sets must be arrays of grouping expressions')
+        if !@sets || grep { ref($_) ne 'ARRAY' } @sets;
+    require Selecto::SQL;
+    my (@groups, %position, @indexes);
+    for my $set (@sets) {
+        my (@members, %in_set);
+        for my $field (@$set) {
+            my $expression = blessed($field) && $field->isa('Selecto::Expression')
+                ? $field : Selecto::Expression->field($field);
+            my $key = Selecto::SQL::_expression_key($expression);
+            if (!exists $position{$key}) {
+                $position{$key} = @groups;
+                push @groups, $expression;
+            }
+            Selecto::Error->throw('invalid_query', 'a grouping set names a dimension twice')
+                if $in_set{$key}++;
+            push @members, $position{$key};
+        }
+        push @indexes, \@members;
+    }
+    return $self->_copy(groups => \@groups, grouping_mode => 'grouping_sets', grouping_sets => \@indexes);
+}
+
+our $MAX_CUBE_DIMENSIONS = 8;
+our $MAX_GROUPING_SETS = 64;
+
+# The stored grouping sets of a grouping_sets query, checked: each set is a
+# list of distinct positions in groups, every dimension is used, and no set
+# repeats. Other modes carry none.
+sub _grouping_sets {
+    my ($mode, $groups, $sets) = @_;
+    if ($mode ne 'grouping_sets') {
+        Selecto::Error->throw('invalid_query', 'grouping sets require the grouping_sets mode')
+            if defined $sets;
+        Selecto::Error->throw('invalid_query', "cube takes at most $MAX_CUBE_DIMENSIONS dimensions")
+            if $mode eq 'cube' && @$groups > $MAX_CUBE_DIMENSIONS;
+        return undef;
+    }
+    Selecto::Error->throw('invalid_query', "grouping sets must be 1 to $MAX_GROUPING_SETS arrays of dimension positions")
+        unless ref($sets) eq 'ARRAY' && @$sets && @$sets <= $MAX_GROUPING_SETS && @$groups;
+    my (%used, %seen, @checked);
+    for my $set (@$sets) {
+        my %members;
+        Selecto::Error->throw('invalid_query', 'a grouping set must list distinct dimension positions')
+            unless ref($set) eq 'ARRAY' && !grep {
+                !defined($_) || ref($_) || !/\A\d+\z/ || $_ > $#$groups || $members{$_}++
+            } @$set;
+        Selecto::Error->throw('invalid_query', 'grouping sets must be distinct')
+            if $seen{CORE::join(',', sort { $a <=> $b } @$set)}++;
+        $used{$_} = 1 for @$set;
+        push @checked, [map { 0 + $_ } @$set];
+    }
+    Selecto::Error->throw('invalid_query', 'every grouping dimension must appear in a grouping set')
+        unless keys(%used) == @$groups;
+    return \@checked;
+}
+
+# The grouping sets this query produces, each as a list of positions in
+# groups: the prefixes of a rollup from longest to the grand total, every
+# subset of a cube, or the declared sets. A plain query has its one set.
+sub grouping_set_positions {
+    my ($self) = @_;
+    my $last = $#{$self->{groups}};
+    my $mode = $self->{grouping_mode};
+    return [map { [@$_] } @{$self->{grouping_sets}}] if $mode eq 'grouping_sets';
+    return [map { [0 .. $_ - 1] } reverse 0 .. $last + 1] if $mode eq 'rollup';
+    if ($mode eq 'cube') {
+        my $count = $last + 1;
+        # Most detailed first; within a size, earlier dimensions are kept longer.
+        my @masks = sort {
+            (sprintf('%b', $b) =~ tr/1//) <=> (sprintf('%b', $a) =~ tr/1//) || $b <=> $a
+        } 0 .. (1 << $count) - 1;
+        return [map { my $mask = $_; [grep { $mask & (1 << ($count - 1 - $_)) } 0 .. $last] } @masks];
+    }
+    return [[0 .. $last]];
 }
 
 sub order_by {
@@ -284,6 +380,7 @@ sub retarget {
         selections => [],
         groups => [],
         grouping_mode => 'plain',
+        grouping_sets => undef,
         orders => [],
         limit_value => undef,
         offset_value => undef,
@@ -773,6 +870,7 @@ sub _copy {
         predicate    => $self->{predicate},
         groups       => $self->{groups},
         grouping_mode => $self->{grouping_mode},
+        grouping_sets => $self->{grouping_sets},
         orders       => $self->{orders},
         limit_value  => $self->{limit_value},
         offset_value => $self->{offset_value},
@@ -838,6 +936,7 @@ sub selections   { return [@{$_[0]->{selections}}]; }
 sub predicate    { return $_[0]->{predicate}; }
 sub groups       { return [@{$_[0]->{groups}}]; }
 sub grouping_mode { return $_[0]->{grouping_mode}; }
+sub grouping_sets { return defined($_[0]->{grouping_sets}) ? [map { [@$_] } @{$_[0]->{grouping_sets}}] : undef; }
 sub orders       { return [map { [@$_] } @{$_[0]->{orders}}]; }
 sub limit_value  { return $_[0]->{limit_value}; }
 sub offset_value { return $_[0]->{offset_value}; }
@@ -1002,6 +1101,42 @@ L<Selecto::Expression/AGGREGATES> to tell detail rows from subtotal rows.
 Requires the C<rollup> capability (PostgreSQL, DuckDB, SQLite). SQLite uses
 bounded C<UNION ALL> branches with explicit grouping masks. See
 L<Selecto::PostgreSQL> for rollup ordering behavior.
+
+=head2 group_by_cube
+
+  my $query = Selecto::Query->new
+      ->select('state', 'region', Selecto::Expression->count->as('orders'),
+          Selecto::Expression->grouping('state', 'region')->as('grouping_mask'))
+      ->group_by_cube('state', 'region');
+
+Groups with C<CUBE>: one result set for every combination of the dimensions,
+from the full detail down to the grand total. At most 8 dimensions (256
+grouping sets). Requires the C<cube> capability.
+
+=head2 group_by_grouping_sets
+
+  $query->group_by_grouping_sets(['state', 'region'], ['state'], []);
+
+Groups with C<GROUPING SETS>. Each argument is one grouping set, an array of
+fields or expressions; an empty array is the grand total. At most 64 distinct
+sets. C<groups> returns the distinct dimensions in the order they first
+appear, and C<grouping_sets> returns each set as positions in that list.
+Requires the C<grouping_sets> capability.
+
+For both, a dimension that a row's grouping set leaves out is C<NULL> in that
+row. Select L<Selecto::Expression/grouping> over the dimensions to tell such
+a row from one whose value really is C<NULL>: its bits, most significant
+first, are 1 for each dimension grouped away. Ordering expressions must also
+be selected, as for rollups. PostgreSQL and DuckDB compile to the native
+clauses; SQLite builds one C<UNION ALL> branch per grouping set. An adapter
+without the capability refuses the query (C<unsupported_feature>) and never
+falls back to plain grouping.
+
+=head2 grouping_set_positions
+
+The grouping sets the query produces, each as a list of positions in
+C<groups>, for any grouping mode: the prefixes of a rollup, every subset of a
+cube, the declared sets, or the single set of a plain query.
 
 =head2 order_by
 
@@ -1192,6 +1327,7 @@ feature fails before any SQL is sent. At the time of writing:
   window functions  yes         yes     3.25+     yes    no
   set operations    yes         yes     yes       yes    no
   rollup            yes         yes     yes       no     no
+  cube, grouping sets  yes      yes     yes       no     no
   lateral, json     yes         no      no        no     no
   array rowsets     yes         no      no        no     no
   for_share         yes         no      no        no     no
@@ -1200,7 +1336,7 @@ Ask the adapter with C<< $adapter->supports($feature) >>.
 
 =head1 ACCESSORS
 
-C<selections>, C<predicate>, C<groups>, C<grouping_mode>, C<orders>,
+C<selections>, C<predicate>, C<groups>, C<grouping_mode>, C<grouping_sets>, C<orders>,
 C<limit_value>, C<offset_value>, C<timezone>, C<row_lock>,
 C<set_operations>, C<ctes>, C<lateral_joins>, C<json_rowsets>,
 C<array_rowsets>, C<members> and C<applied_query_library> return copies of
