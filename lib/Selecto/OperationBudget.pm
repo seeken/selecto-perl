@@ -4,6 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use bytes ();
+use Hash::Util::FieldHash qw(fieldhash);
 use JSON::PP ();
 use Scalar::Util qw(blessed refaddr reftype);
 use Selecto::Error ();
@@ -12,6 +13,12 @@ use Selecto::Limits ();
 # The default policy, built once. Limits objects are immutable and budgets
 # only read them; each budget still has its own counters.
 my $DEFAULT_LIMITS;
+
+# What check_tree charges for an immutable record built from a tree that has
+# already been checked: [node occurrences, bytes, levels below the record].
+# Keyed by the record itself, so an entry ends with its record and a copy made
+# any other way has none.
+fieldhash my %MEASURED;
 
 # JSON::PP::is_bool for a value that is not a blessed reference: true only for
 # Perl core booleans, and only when this JSON::PP recognises them (CORE_BOOL,
@@ -190,6 +197,93 @@ sub check_tree {
     }
     $counts->{"tree_bytes:$byte_limit"} += $bytes;
     return $bytes;
+}
+
+# check_tree for the constructor of an immutable record composed from parts.
+# A part that remember_tree has recorded is charged from its record instead of
+# being walked again; everything else is walked as check_tree walks it. The
+# counters, limits and refusals are check_tree's: a tree within every limit
+# leaves the same counts behind, and anything else (a breach, a cycle, an
+# unsupported reference) is handed to check_tree itself, which walks the
+# whole tree and refuses it exactly as before. Returns the bytes, the node
+# occurrences and the deepest level charged, for the caller to record.
+sub check_composed_tree {
+    my ($self, $value, %options) = @_;
+    my @measured = defined($options{scalar_limit}) ? () : $self->_measure_composed($value, \%options);
+    return @measured if @measured;
+    return scalar $self->check_tree($value, %options);
+}
+
+# Records what check_tree charges for $record when it meets it inside a tree:
+# the node occurrences and bytes below it and the levels it adds. Only for a
+# record no caller can change afterwards, measured by check_composed_tree.
+sub remember_tree {
+    my ($class, $record, $nodes, $bytes, $height) = @_;
+    $MEASURED{$record} = [$nodes, $bytes, $height];
+    return $record;
+}
+
+# The measure check_tree would take, or nothing when it would refuse the tree
+# or the tree is not a plain one. Changes no counter unless it succeeds.
+sub _measure_composed {
+    my ($self, $value, $options) = @_;
+    my $byte_limit = $options->{bytes_limit} // 'max_state_bytes';
+    my $response = $byte_limit eq 'max_response_bytes' || $byte_limit eq 'max_import_preview_bytes';
+    my $nodes_limit = $options->{nodes_limit} // ($response ? 'max_response_nodes' : 'max_expression_nodes');
+    my $depth_limit = $options->{depth_limit} // ($response ? 'max_response_depth' : 'max_expression_depth');
+    my %allowed = map { $_ => 1 } @{$options->{allowed_classes} // []};
+    return if @{$options->{allowed_base_classes} // []};
+    my $limits = $self->{limits};
+    my $counts = $self->{counts};
+    my $nodes_max = $limits->get($nodes_limit);
+    my $depth_max = $limits->get($depth_limit);
+    my $bytes_max = $limits->get($byte_limit) - ($counts->{"tree_bytes:$byte_limit"} // 0);
+    my $nodes_base = $counts->{$nodes_limit} // 0;
+    my ($nodes, $bytes, $deepest) = (1, 0, 0);
+    my (%active, @stack);
+    push @stack, $value, 0, 0;
+    while (@stack) {
+        my $leave = pop @stack;
+        my $depth = pop @stack;
+        my $node = pop @stack;
+        if ($leave) { delete $active{$leave}; next }
+        $deepest = $depth if $depth > $deepest;
+        if (!ref($node)) {
+            # A boolean is charged as the 1 or 0 it stands for.
+            $bytes += _CORE_BOOL && builtin::is_bool($node) ? 1 : defined($node) ? do { use bytes; length($node) } : 0;
+            next;
+        }
+        my $class = blessed($node);
+        if ($class && $allowed{$class} && (my $measured = $MEASURED{$node})) {
+            $nodes += $measured->[0];
+            $bytes += $measured->[1];
+            $deepest = $depth + $measured->[2] if $depth + $measured->[2] > $deepest;
+            return if $nodes_base + $nodes > $nodes_max || $bytes > $bytes_max;
+            next;
+        }
+        # JSON::PP::is_bool is false for every unblessed reference.
+        if ($class && JSON::PP::is_bool($node)) { $bytes += 1; next }
+        my $type = reftype($node) // '';
+        return if ($type ne 'ARRAY' && $type ne 'HASH') || ($class && !$allowed{$class});
+        my $id = refaddr($node);
+        return if $active{$id};
+        $active{$id} = 1;
+        push @stack, undef, 0, $id;
+        $nodes += $type eq 'ARRAY' ? scalar(@$node) : scalar(keys %$node);
+        return if $nodes_base + $nodes > $nodes_max || $bytes > $bytes_max;
+        if ($type eq 'ARRAY') {
+            push @stack, $node->[$_], $depth + 1, 0 for reverse 0 .. $#$node;
+        } else {
+            for my $key (keys %$node) {
+                $bytes += do { use bytes; length($key) };
+                push @stack, $node->{$key}, $depth + 1, 0;
+            }
+        }
+    }
+    return if $nodes_base + $nodes > $nodes_max || $bytes > $bytes_max || $deepest > $depth_max;
+    $counts->{$nodes_limit} = $nodes_base + $nodes;
+    $counts->{"tree_bytes:$byte_limit"} += $bytes;
+    return ($bytes, $nodes, $deepest);
 }
 
 1;

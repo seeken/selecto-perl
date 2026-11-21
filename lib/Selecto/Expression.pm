@@ -15,7 +15,10 @@ sub new {
         if defined($kind) && !ref($kind) && $kind eq 'raw_sql';
     my $budget = Selecto::OperationBudget->new(
         (defined($_CONSTRUCTION_LIMITS) ? (limits => $_CONSTRUCTION_LIMITS) : ()), code => 'invalid_query');
-    $budget->check_tree(\@arguments, label => 'expression arguments', allowed_classes => ['Selecto::Expression']);
+    # Argument expressions were measured when they were built and cannot change
+    # since, so they are charged from that measure instead of being walked again.
+    my ($bytes, $nodes, $depth) = $budget->check_composed_tree(
+        \@arguments, label => 'expression arguments', allowed_classes => ['Selecto::Expression']);
     if ($kind eq 'literal') {
         # Preserve the semantic validators' existing handling of bounded JSON
         # containers (for example an invalid tenant-scope operand). Resource
@@ -31,7 +34,21 @@ sub new {
     } elsif (($kind eq 'and' || $kind eq 'or') && ref($arguments[0]) eq 'ARRAY') {
         $budget->limits->check_count('max_expression_arity', scalar(@{$arguments[0]}), 'invalid_query', 'expression fan-out');
     }
-    return bless { kind => "$kind", arguments => [map { ref($_) ? _clone($_) : $_ } @arguments], alias_name => undef }, $class;
+    my $self = bless { kind => "$kind", arguments => [map { ref($_) ? _clone($_) : $_ } @arguments], alias_name => undef }, $class;
+    return defined($depth) ? _measured($self, $nodes, $bytes, $depth + 1) : $self;
+}
+
+# Records what a tree check charges for this expression inside a larger tree,
+# from the measure of its argument list (or of the expression it copies): the
+# record's three keys and their names, its kind and its alias on top of the
+# arguments. Only for the exact class; a subclass is never admitted as one.
+use constant _KEY_BYTES => length('kind') + length('arguments') + length('alias_name');
+sub _measured {
+    my ($self, $nodes, $bytes, $height) = @_;
+    return $self unless ref($self) eq __PACKAGE__;
+    use bytes;
+    return Selecto::OperationBudget->remember_tree($self, $nodes + 2,
+        $bytes + _KEY_BYTES + length($self->{kind}) + length($self->{alias_name} // ''), $height);
 }
 
 sub field   { my ($class, $name) = @_; return $class->new('field', "$name"); }
@@ -592,14 +609,19 @@ sub _known_options {
 
 sub as {
     my ($self, $name) = @_;
-    Selecto::OperationBudget->new(code => 'invalid_query')->check_tree(
+    my ($bytes, $nodes, $depth) = Selecto::OperationBudget->new(code => 'invalid_query')->check_composed_tree(
         $self, label => 'expression alias', allowed_classes => ['Selecto::Expression']);
     my $copy = bless {
         kind       => $self->{kind},
         arguments  => [map { _clone($_) } @{$self->{arguments}}],
         alias_name => "$name",
     }, ref($self);
-    return $copy;
+    return $copy unless defined $depth;
+    # The same record under another alias: the argument list's share of the
+    # measure just taken, which counted this expression as the tree's root.
+    use bytes;
+    return _measured($copy, $nodes - 3,
+        $bytes - _KEY_BYTES - length($self->{kind}) - length($self->{alias_name} // ''), $depth);
 }
 
 sub kind       { return $_[0]->{kind}; }

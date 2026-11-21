@@ -4,6 +4,17 @@ Revision history for Selecto
     - Month buckets: the bucket kind month_ranges groups a date or time by
       calendar months ago (0 is the current month), in PostgreSQL and
       SQLite, with the same range rules as the other kinds.
+    - Expression constructors no longer walk their argument expressions again.
+      An expression's size (node occurrences, bytes, depth) is recorded when it
+      is built, and a constructor or alias that takes it as an argument charges
+      that record instead of walking the whole tree once more per level of
+      nesting. Limits, counters and refusals are unchanged: a tree that would
+      break a limit, or holds a cycle or an unsupported reference, is handed
+      to the full walk and refused by it as before. Query and write admission
+      still walk every node. An expression whose internals are changed in
+      place after it was built is charged as built by a later constructor;
+      admission still measures what it holds. Selecto::OperationBudget gains
+      check_composed_tree and remember_tree for this.
     - Subtotal rows in the APIs. Selecto::API::Explorer accepts cube and
       grouping_sets beside rollup, advertises supports.cube and
       supports.grouping_sets, lets a complete grid carry cube totals, and

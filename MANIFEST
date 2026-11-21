@@ -439,6 +439,7 @@ t/pg_pipeline_live.t
 t/query_composition.t
 t/mysql_write_key_metadata_live.t
 t/adapter_decimal_type.t
+t/expression_composed_budget.t
 t/external_query_budget.t
 t/optional_sqlserver_boundary.t
 docs/compile_cache.md
