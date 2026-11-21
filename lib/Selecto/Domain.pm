@@ -1697,6 +1697,9 @@ sub _field_metadata_view {
         push @redacted, _redacted($contract, join('.', @segments, $field));
     }
     my $metadata = ref($column) eq 'HASH' ? $column : {};
+    # A column marked redacted is withheld exactly as one named in a
+    # redact_fields list.
+    push @redacted, 1 if $metadata->{redacted};
     # Redacted fields are withheld from every untrusted surface exactly like
     # internal columns: field_is_public is false, so API, component, and
     # template catalogs refuse to select, filter, or order on them.
@@ -3563,8 +3566,8 @@ converted and throws C<invalid_domain_overlay>.
   my $meta = $domain->field_metadata('customer.name');
 
 Returns a copy of the canonical column metadata for a path (empty for
-constructor-form domains). Fields listed in C<redact_fields> report
-C<< internal => 1, redacted => 1 >>.
+constructor-form domains). Fields listed in C<redact_fields>, and columns
+marked C<< redacted => 1 >>, report C<< internal => 1, redacted => 1 >>.
 
 =head2 field_storage
 
@@ -3706,7 +3709,8 @@ tenant data.
 =item C<redact_fields>
 
 Fields of this relation withheld from untrusted surfaces exactly like
-C<internal> columns.
+C<internal> columns. A column marked C<< redacted => 1 >> is withheld the
+same way.
 
 =back
 

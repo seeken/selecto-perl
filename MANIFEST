@@ -37,6 +37,8 @@ lib/Selecto/Document/Plan.pm
 lib/Selecto/Document/ShapeRelease.pm
 lib/Selecto/Domain.pm
 lib/Selecto/Domain/Projection.pm
+t/api_query_boolean_columns.t
+t/column_redacted.t
 t/domain_projection.t
 t/domain_schema_v2.t
 t/domain_compose_schema_v2.t

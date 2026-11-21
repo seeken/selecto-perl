@@ -726,6 +726,7 @@ sub _query ($self, $engine, $body, %options) {
     splice @{$result->{rows}}, 0, $offset if $summary;
     my $has_more = defined($parent_has_more) ? $parent_has_more : @{$result->{rows}} > $limit;
     splice @{$result->{rows}}, $limit if $has_more && !defined($parent_has_more);
+    _json_boolean_columns($domain, $query, $result) unless $options{export_scalars};
     _shape_result_rows($result, \@subtables, $row_format, $self->limits);
     my %subtable_metadata = map {
         $_->{column} => {columns => [@{$_->{columns}}], limit => $_->{limit}, complete => JSON::PP::true}
@@ -745,6 +746,30 @@ sub _query ($self, $engine, $body, %options) {
     # also counts escaping, keys and metadata in the eventual public response.
     Selecto::API::ResponsePolicy->check_json({data => $response, ok => JSON::PP::true}, $self->limits);
     return Selecto::API::ResponsePolicy->bind_limits($response, $self->limits);
+}
+
+# A selected boolean field is JSON true or false, whatever the driver returns
+# for it (DBD::Pg and DBD::SQLite give 1 and 0), as in the explorer. Exports
+# keep their scalars.
+sub _json_boolean_columns ($domain, $query, $result) {
+    my %boolean;
+    for my $selection (@{$query->selections}) {
+        next unless blessed($selection) && $selection->kind eq 'field';
+        my $path = $selection->arguments->[0];
+        my $definition = eval { $domain->resolve($path) };
+        $boolean{$selection->alias_name // $path} = 1
+            if ref($definition) eq 'HASH' && ($definition->{type} // '') eq 'boolean';
+    }
+    return unless %boolean;
+    my @indexes = grep { $boolean{$result->{columns}[$_]} } 0 .. $#{$result->{columns}};
+    for my $row (@{$result->{rows}}) {
+        next unless ref($row) eq 'ARRAY';
+        for my $index (@indexes) {
+            my $value = $row->[$index];
+            next if !defined($value) || JSON::PP::is_bool($value);
+            $row->[$index] = $value =~ /\A(?:1|t|true)\z/i ? JSON::PP::true : JSON::PP::false;
+        }
+    }
 }
 
 # rollup, cube and grouping_sets turn the grouped query into one with subtotal
@@ -2154,7 +2179,8 @@ public primary key.
 With C<< export_scalars => 1 >> the rows hold the engine's canonical export
 scalars (see L<Selecto::Engine/all>): use it when the result will be
 exported as CSV, TSV or XLSX so decimals keep their column scale. Without
-it the result is unchanged.
+it, a selected C<boolean> field is JSON true or false (or null), whatever
+the driver returns for it.
 
 Body keys:
 

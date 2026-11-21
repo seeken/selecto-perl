@@ -1975,7 +1975,7 @@ sub _assert_lookups_public {
         return 0 unless ref($spec) eq 'HASH';
         return 1 if Selecto::Domain::_redacted($spec, $field);
         my $column = ref($spec->{columns}) eq 'HASH' ? $spec->{columns}{$field} : undef;
-        return ref($column) eq 'HASH' && ($column->{internal} || $column->{hidden}) ? 1 : 0;
+        return ref($column) eq 'HASH' && ($column->{internal} || $column->{hidden} || $column->{redacted}) ? 1 : 0;
     };
     # The relations this contract describes as another domain: this domain
     # itself, or schemas keyed or backed by that name.

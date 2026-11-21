@@ -1,6 +1,15 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - A column marked redacted (redacted => 1, on the root or a related
+      relation) is now withheld exactly like a field named in redact_fields:
+      field_is_public is false, the canonical API no longer lists it in
+      x-selecto.fields, the query handler refuses it with hidden_field,
+      describe_write_property refuses it as a replaces target, and lookups
+      may not expose it. It was public before. The export keeps the flag.
+    - The engine-API query handler returns a selected boolean field as JSON
+      true or false (null stays null), as the explorer does; DBD::Pg and
+      DBD::SQLite give 1 and 0. Exports (export_scalars) are unchanged.
     - Month buckets: the bucket kind month_ranges groups a date or time by
       calendar months ago (0 is the current month), in PostgreSQL and
       SQLite, with the same range rules as the other kinds.
