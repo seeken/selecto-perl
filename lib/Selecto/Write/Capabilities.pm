@@ -26,73 +26,81 @@ sub _name { defined($_[0]) && !defined(reftype($_[0])) && $_[0] =~ /\A[A-Za-z_][
 # Admit complete input before reading fields or calling any native accessor.
 # Native prepared graphs contain bounded compiled domain/limit records; their
 # larger native-state ceiling does not enlarge portable capability reports.
+#
+# The walk's counters live in dynamically scoped variables for the length of
+# one admission rather than in a state record read by name at every node: a
+# write walks its command before governance and again after it. A refusal
+# unwinds through local, which also keeps a nested admission (a tied container
+# that admits something itself) apart from the one that is under way.
+my $DEPTH_MAX = $LIMITS->get('max_expression_depth');
+our ($NODES, $BYTES, $NODES_LIMIT, $BYTES_LIMIT, $NATIVE, $CODE, %ACTIVE);
 sub _admit {
     my ($value, $native, $code) = @_;
-    my $state = {nodes => 0, bytes => 0, active => {}, native => $native, code => $code,
-        nodes_limit => $LIMITS->get($native ? 'max_response_nodes' : 'max_expression_nodes'),
-        bytes_limit => $LIMITS->get($native ? 'max_response_bytes' : 'max_state_bytes')};
-    _walk($state, $value, 0);
+    local ($NODES, $BYTES, $NATIVE, $CODE) = (0, 0, $native, $code);
+    local $NODES_LIMIT = $LIMITS->get($native ? 'max_response_nodes' : 'max_expression_nodes');
+    local $BYTES_LIMIT = $LIMITS->get($native ? 'max_response_bytes' : 'max_state_bytes');
+    local %ACTIVE;
+    _walk($value, 0);
 }
 sub _walk {
-    my ($state, $value, $depth) = @_;
-    _fail($state->{code}, 'write preflight input exceeds its resource limit')
-        if ++$state->{nodes} > $state->{nodes_limit} || $depth > $LIMITS->{max_expression_depth};
+    my ($value, $depth) = @_;
+    _fail($CODE, 'write preflight input exceeds its resource limit')
+        if ++$NODES > $NODES_LIMIT || $depth > $DEPTH_MAX;
     my $type = reftype($value);
-    unless (defined $type) { _bytes($state, defined($value) ? $value : ''); return }
+    unless (defined $type) {
+        return unless defined $value;
+        use bytes;
+        _fail($CODE, 'write preflight input exceeds its byte limit') if ($BYTES += length($value)) > $BYTES_LIMIT;
+        return;
+    }
     my $class = blessed($value) // '';
     if ($BOOLEAN{$class} && $type eq 'SCALAR') {
-        _fail($state->{code}, 'write preflight contains an invalid Boolean')
+        _fail($CODE, 'write preflight contains an invalid Boolean')
             if !defined($$value) || defined(reftype($$value)) || "$$value" !~ /\A[01]\z/;
         return;
     }
-    _fail($state->{code}, 'write preflight contains unsupported executable or object input')
-        if length($class) && (!$state->{native} || !$RECORD{$class});
-    _fail($state->{code}, 'write preflight requires plain containers or native records')
+    _fail($CODE, 'write preflight contains unsupported executable or object input')
+        if length($class) && (!$NATIVE || !$RECORD{$class});
+    _fail($CODE, 'write preflight requires plain containers or native records')
         unless $type eq 'HASH' || $type eq 'ARRAY';
     my $address = refaddr($value);
-    my $active = $state->{active};
-    _fail($state->{code}, 'write preflight contains a cycle') if $active->{$address};
-    # The state is discarded when a refusal unwinds, so the mark needs no
-    # scope guard. Scalar leaves are counted here, with the same checks in
-    # the same order as a call each would make.
-    $active->{$address} = 1;
+    _fail($CODE, 'write preflight contains a cycle') if $ACTIVE{$address};
+    # The marks are discarded when a refusal unwinds, so they need no scope
+    # guard. Scalar leaves are counted here, with the same checks in the same
+    # order as a call each would make.
+    $ACTIVE{$address} = 1;
     my $count = $type eq 'HASH' ? scalar(keys %$value) : scalar(@$value);
-    _fail($state->{code}, 'write preflight input exceeds its node limit')
-        if $state->{nodes} + $count > $state->{nodes_limit};
+    _fail($CODE, 'write preflight input exceeds its node limit')
+        if $NODES + $count > $NODES_LIMIT;
     my $deeper = $depth + 1;
-    my $too_deep = $deeper > $LIMITS->{max_expression_depth};
+    my $too_deep = $deeper > $DEPTH_MAX;
     use bytes;
     if ($type eq 'HASH') {
         for my $key (keys %$value) {
-            _fail($state->{code}, 'write preflight input exceeds its byte limit')
-                if ($state->{bytes} += length($key)) > $state->{bytes_limit};
+            _fail($CODE, 'write preflight input exceeds its byte limit')
+                if ($BYTES += length($key)) > $BYTES_LIMIT;
             # A copy, as an argument list made before: measuring a number's
             # length must not give the caller's scalar a string value.
             my $item = $value->{$key};
-            if (defined reftype($item)) { _walk($state, $item, $deeper); next }
-            _fail($state->{code}, 'write preflight input exceeds its resource limit')
-                if ++$state->{nodes} > $state->{nodes_limit} || $too_deep;
+            if (defined reftype($item)) { _walk($item, $deeper); next }
+            _fail($CODE, 'write preflight input exceeds its resource limit')
+                if ++$NODES > $NODES_LIMIT || $too_deep;
             next unless defined $item;
-            _fail($state->{code}, 'write preflight input exceeds its byte limit')
-                if ($state->{bytes} += length($item)) > $state->{bytes_limit};
+            _fail($CODE, 'write preflight input exceeds its byte limit')
+                if ($BYTES += length($item)) > $BYTES_LIMIT;
         }
     } else {
         for my $i (0 .. $#$value) {
             my $item = $value->[$i];
-            if (defined reftype($item)) { _walk($state, $item, $deeper); next }
-            _fail($state->{code}, 'write preflight input exceeds its resource limit')
-                if ++$state->{nodes} > $state->{nodes_limit} || $too_deep;
+            if (defined reftype($item)) { _walk($item, $deeper); next }
+            _fail($CODE, 'write preflight input exceeds its resource limit')
+                if ++$NODES > $NODES_LIMIT || $too_deep;
             next unless defined $item;
-            _fail($state->{code}, 'write preflight input exceeds its byte limit')
-                if ($state->{bytes} += length($item)) > $state->{bytes_limit};
+            _fail($CODE, 'write preflight input exceeds its byte limit')
+                if ($BYTES += length($item)) > $BYTES_LIMIT;
         }
     }
-    delete $active->{$address};
-}
-sub _bytes {
-    my ($state, $value) = @_;
-    $state->{bytes} += do { use bytes; length($value) };
-    _fail($state->{code}, 'write preflight input exceeds its byte limit') if $state->{bytes} > $state->{bytes_limit};
+    delete $ACTIVE{$address};
 }
 sub _boolean {
     my ($value) = @_;
