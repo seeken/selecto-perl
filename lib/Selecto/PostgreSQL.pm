@@ -212,10 +212,41 @@ sub normalize_type {
 }
 
 # A managed transaction begins READ COMMITTED explicitly, so a session or
-# database default (default_transaction_isolation) cannot weaken the
-# guarded-write catalog checks; DBD::Pg sends BEGIN with the first
-# statement, so this is the transaction's first statement.
+# database default (default_transaction_isolation) cannot change the isolation
+# a write and its post-image scope check run under.
+#
+# For a single write on a live DBD::Pg handle BEGIN carries the level: one
+# statement, one round trip. DBI's begin_work cannot do that (DBD::Pg sends a
+# bare "begin" of its own before the next statement, and SET TRANSACTION would
+# be a second round trip), so that transaction is opened as text and AutoCommit
+# stays on while it is open, as it does for a read's own transaction
+# (_pg_begin_read). The adapter remembers that the transaction is its own, and
+# ends it as text too. Only a transaction
+# that runs nothing but the library's statements is opened this way
+# (_selecto_library_transaction): host code inside Selecto::Engine::transaction
+# keeps a begin_work transaction, with AutoCommit off and DBI's rollback, and
+# so does any other handle.
 sub _begin_transaction {
+    my ($self) = @_;
+    my $dbh = $self->{dbh};
+    return $self->_begin_transaction_through_dbi
+        unless $self->{_selecto_library_transaction} && $self->_pg_session_checked && eval { $dbh->{AutoCommit} };
+    $self->_transaction_text('BEGIN ISOLATION LEVEL READ COMMITTED', 'database transaction could not begin');
+    $self->{_selecto_pg_own_transaction} = 1;
+    return;
+}
+
+# One transaction-control statement of the library's own transaction. It fails
+# as begin_work and commit do: with the driver's error, whether or not the
+# handle raises errors by itself.
+sub _transaction_text {
+    my ($self, $sql, $failure) = @_;
+    my $dbh = $self->{dbh};
+    return if defined(eval { $dbh->do($sql) });
+    die($@ || Selecto::SQL::_dbi_error($dbh, $failure));
+}
+
+sub _begin_transaction_through_dbi {
     my ($self) = @_;
     $self->SUPER::_begin_transaction;
     my $ok = eval { $self->dbh->do('SET TRANSACTION ISOLATION LEVEL READ COMMITTED'); 1 };
@@ -225,6 +256,30 @@ sub _begin_transaction {
         die $self->_undo_failed($error);
     }
     return;
+}
+
+sub _commit_transaction {
+    my ($self) = @_;
+    return $self->SUPER::_commit_transaction unless $self->{_selecto_pg_own_transaction};
+    $self->_transaction_text('COMMIT', 'database transaction could not commit');
+    delete $self->{_selecto_pg_own_transaction};
+    return;
+}
+
+sub _rollback_transaction {
+    my ($self, @context) = @_;
+    return $self->SUPER::_rollback_transaction(@context) unless delete $self->{_selecto_pg_own_transaction};
+    my $dbh = $self->{dbh};
+    # (After a COMMIT that failed the server has already ended the transaction;
+    # its "no transaction in progress" warning is not the host's to see.)
+    return if eval {
+        local $dbh->{PrintError} = 0; local $dbh->{PrintWarn} = 0; local $dbh->{RaiseError} = 1;
+        defined($dbh->do('ROLLBACK'));
+    };
+    # A transaction that cannot be ended is not left open for the host to commit.
+    eval { local $dbh->{PrintError} = 0; $dbh->disconnect };
+    Selecto::Error->throw('transaction_state_unsafe', 'the write could not be rolled back: the connection was closed',
+        {state => 'unknown', reason => 'session_not_restored'});
 }
 
 sub insert_admission_storage {
@@ -1278,6 +1333,9 @@ sub _server_transaction_open {
 sub _transaction_open {
     my ($self) = @_;
     $self->_refuse_pending_result;
+    # The adapter's own write transaction, opened as text (_begin_transaction):
+    # AutoCommit is on, and the server need not be asked.
+    return 1 if $self->{_selecto_pg_own_transaction};
     return $self->SUPER::_transaction_open;
 }
 
@@ -1883,6 +1941,14 @@ style.
 =item * Transactions through DBI (C<begin_work>, C<commit>, C<rollback>).
 A raw text C<BEGIN> is seen and respected, but a pooled connection can
 reconnect between statements.
+
+=item * A managed write's own transaction is C<READ COMMITTED> whatever the
+session default. A single write on an idle handle opens it with one statement,
+C<BEGIN ISOLATION LEVEL READ COMMITTED>, and ends it with C<COMMIT> or
+C<ROLLBACK> sent as text, so C<AutoCommit> stays on while that write runs; no
+host code runs inside it. Batches, graphs and L<Selecto::Engine/transaction>
+use C<begin_work> and C<SET TRANSACTION>, with C<AutoCommit> off for the code
+they run.
 
 =back
 

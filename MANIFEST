@@ -451,3 +451,4 @@ t/compile_cache_tenants.t
 t/domain_contract_json.t
 t/month_buckets.t
 t/synthetic_fields.t
+t/pg_write_transaction_live.t

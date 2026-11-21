@@ -1596,6 +1596,10 @@ sub execute_write_unsafe {
         unless defined($preflighted) && ref($command) && $preflighted == refaddr($command);
     $self->_validate_write_cardinality($command);
     my $compiled = $self->_compile_write($command);
+    # Only the library's own statements run inside this transaction: no host
+    # callback sees the handle before it ends. A dialect may therefore open
+    # and end it without DBI's bookkeeping (see _begin_transaction).
+    local $self->{_selecto_library_transaction} = 1;
     return $self->_transaction(sub { return $self->_execute_compiled_write_in_transaction($command, $compiled); });
 }
 
@@ -4592,7 +4596,8 @@ back work it did not start. C<transaction_mode> chooses how:
 
 C<managed> (default). On an idle handle (C<AutoCommit> on) the write runs in
 its own transaction: C<begin_work>, then C<commit>, or C<rollback> on
-failure. On a handle that is already inside a transaction (C<AutoCommit>
+failure (PostgreSQL sends a single write's C<BEGIN>, C<COMMIT> and C<ROLLBACK>
+as text instead; see L<Selecto::PostgreSQL>). On a handle that is already inside a transaction (C<AutoCommit>
 off after C<begin_work>, an C<< AutoCommit => 0 >> handle, or a transaction
 the server reports although C<AutoCommit> is on) the write runs inside a
 savepoint instead: C<SAVEPOINT selecto_write_E<lt>serialE<gt>_E<lt>nonceE<gt>> ...

@@ -4,6 +4,17 @@ Revision history for Selecto
     - Month buckets: the bucket kind month_ranges groups a date or time by
       calendar months ago (0 is the current month), in PostgreSQL and
       SQLite, with the same range rules as the other kinds.
+    - PostgreSQL: a single managed write on an idle handle opens its own
+      transaction with one statement, BEGIN ISOLATION LEVEL READ COMMITTED,
+      instead of begin_work followed by SET TRANSACTION ISOLATION LEVEL READ
+      COMMITTED: one round trip fewer per write. Behaviour change: that
+      transaction is opened and ended as text (BEGIN, COMMIT, ROLLBACK), so
+      the handle's AutoCommit stays on and BegunWork off while the write
+      runs; only the library's own statements run inside it. Batches, graphs,
+      Selecto::Engine::transaction and writes inside a host transaction are
+      unchanged (begin_work or a savepoint, AutoCommit off for host code).
+      A COMMIT the server refuses is now raised on a handle without
+      RaiseError too; it was reported as applied.
     - Selecto::Limits::intersect reads the two limit records directly instead
       of making a get and a tightened step per limit; nested write budgets
       intersect on every write. Same result and refusals.
