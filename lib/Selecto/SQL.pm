@@ -385,6 +385,7 @@ sub _compile_single {
             my @target_on = (
                 $owner_sql . ' = ' .
                     $self->_qualified($lookup_alias, $association->related_key),
+                $self->_join_condition_sql($association, $parent_alias, $lookup_alias),
             );
             my @target_only;
             push @target_only, $self->_constant_join_predicates(
@@ -2334,7 +2335,8 @@ sub _compile_related_collection_at {
     my $owner_key = $self->quote_identifier($parent_alias) . '.' .
         $self->quote_identifier($association->owner_key);
     my $from = "$table AS $quoted_alias";
-    my @predicates = ("$related_key = $owner_key");
+    my @predicates = ("$related_key = $owner_key",
+        $self->_join_condition_sql($association, $parent_alias, $alias));
     if (defined $association->source_scope_key) {
         push @predicates, $self->_identity_equal_sql(
             $quoted_alias . '.' . $self->quote_identifier($association->target_scope_key),
@@ -2797,6 +2799,7 @@ sub _compile_computed_field {
     my @predicates = (
         $self->_qualified($alias, $association->related_key) . ' = ' .
             $self->_qualified($self->_root_alias, $association->owner_key),
+        $self->_join_condition_sql($association, $self->_root_alias, $alias),
     );
     if (defined $association->source_scope_key) {
         push @predicates, $self->_identity_equal_sql(
@@ -3139,6 +3142,33 @@ sub _top_conjuncts {
 sub _identity_equal_sql {
     my ($self, $left, $right, $exact) = @_;
     return "$left = $right";
+}
+
+my %CONDITION_OPERATOR = (lt => '<', lte => '<=', gt => '>', gte => '>=');
+
+# An association's conditions, after its key equality: each compares an owner
+# column with a target column. eq and ne compare text as the dialect's key
+# identity does (byte-exact on MySQL, MariaDB and DuckDB); an open bound also
+# matches a NULL target column. Conditions only narrow the join.
+sub _join_condition_sql {
+    my ($self, $association, $owner_alias, $target_alias) = @_;
+    my $conditions = $association->conditions or return;
+    my $fields = $association->fields;
+    my @sql;
+    for my $condition (@$conditions) {
+        my $left = $self->_qualified($owner_alias, $condition->{left});
+        my $right = $self->_qualified($target_alias, $condition->{right});
+        my $op = $condition->{op};
+        if ($op eq 'eq' || $op eq 'ne') {
+            my $exact = $self->_exact_identity_compare && _identity_text_type($fields->{$condition->{right}}) == 1;
+            my $equal = $self->_identity_equal_sql($left, $right, $exact ? 1 : 0);
+            push @sql, $op eq 'eq' ? $equal : "NOT ($equal)";
+            next;
+        }
+        my $compare = "$left $CONDITION_OPERATOR{$op} $right";
+        push @sql, $condition->{open} ? "($right IS NULL OR $compare)" : $compare;
+    }
+    return @sql;
 }
 
 # A pair with a derived source's column (CTE, VALUES, subquery): such a

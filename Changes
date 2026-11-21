@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Association key conditions, ported from Elixir's conditional joins:
+      up to 8 {left, op, right, open?} comparisons of an owner field with a
+      target field (eq, ne, lt, lte, gt, gte; ordering on numbers and
+      temporal values only; one type family per pair; open lets a NULL
+      right match), ANDed into ON after the key equality on every dialect,
+      in related collections and association_exists, inside the lateral
+      WHERE for lateral_lookup, and in ON for right and full joins. Computed
+      or redacted fields, through and values associations refuse with
+      invalid_domain. They only narrow: tenant pairing is unchanged.
+      Fingerprints change only for domains that declare them; contract_keys
+      lists conditions in the association table. Write-side foreign-key
+      guards treat a conditioned association as a filtered lookup.
     - contract_keys gains a source table: the root source's keys, the
       relation keys plus fts5_index. fts5_index is a root source key: a
       schemas relation naming it now refuses with invalid_domain (reason

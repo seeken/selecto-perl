@@ -37,8 +37,20 @@ my %RELATION = map { $_ => 1 } qw(
 my %ROOT_SOURCE = (%RELATION, fts5_index => 1);
 my %ASSOCIATION = map { $_ => 1 } qw(
     queryable field owner_key related_key cardinality through source_scope_key target_scope_key where
-    join_strategy
+    join_strategy conditions
 );
+# Join conditions: each compares an owner field with a target field after the
+# key equality. Ordering operators compare numbers and temporal values only;
+# the two sides belong to one type family.
+my %CONDITION = map { $_ => 1 } qw(left op right open);
+my %CONDITION_OPS = map { $_ => 1 } qw(eq ne lt lte gt gte);
+my %CONDITION_FAMILY = (
+    integer => 'numeric', decimal => 'numeric', string => 'string', text => 'string',
+    date => 'date', time => 'time', utc_datetime => 'datetime', naive_datetime => 'datetime',
+    epoch_datetime => 'epoch_datetime', boolean => 'boolean', uuid => 'uuid',
+);
+my %CONDITION_ORDERED = map { $_ => 1 } qw(numeric date time datetime epoch_datetime);
+my $CONDITION_LIMIT = 8;
 my %JOIN = map { $_ => 1 } qw(
     source fields on
     type name display_field dimension_key display_fallback joins alias
@@ -194,6 +206,7 @@ sub _construct {
             ? $input->{$name}
             : Selecto::Domain::Association->new(
                 name => $association_name,
+                owner_fields => $fields,
                 value => $input->{$name},
             );
     }
@@ -565,7 +578,7 @@ sub _parse_canonical {
     # ($DERIVED_TENANT_FAMILY), pairs tenant columns by name.
     my ($family, $anchors) = _tenant_family($source, $scope_tenant);
     my $associations = _canonical_associations(
-        $source, $schemas, $joins, $strict, '', $family, $anchors,
+        $source, $schemas, $joins, $strict, '', $family, $anchors, $raw,
     );
     _apply_values_foreign_key_metadata(
         $source, $associations, $raw->{writes},
@@ -793,7 +806,7 @@ sub _tenant_family {
 }
 
 sub _canonical_associations {
-    my ($relation, $schemas, $joins, $strict, $prefix, $family, $anchors) = @_;
+    my ($relation, $schemas, $joins, $strict, $prefix, $family, $anchors, $contract) = @_;
     # Lessons 41a and 41b: in a tenant family every hop pairs a target's
     # tenant column only with a column of its own name that anchors the
     # parent (the root's two columns; a nested or rebuilt hop's own tenant
@@ -955,8 +968,27 @@ sub _canonical_associations {
             %tenant_keys = (target_tenant_field => $target_key,
                 (defined($source_key) ? (source_tenant_field => $source_key) : ()));
         }
+        my $conditions;
+        if (exists $association->{conditions}) {
+            my $owner_fields = _canonical_fields($relation);
+            # A condition reads physical columns only, and never a redacted
+            # one: its comparison would disclose what redaction withholds.
+            my $physical = sub {
+                my ($side, $field) = @_;
+                my ($spec, $redacted_path) = $side eq 'owner'
+                    ? ($relation, $prefix eq '' ? $field : "$prefix.$field") : ($target, "$path.$field");
+                my $column = $spec->{columns}{$field};
+                return 'computed' if ref($column) eq 'HASH' && exists $column->{computed};
+                return 'redacted' if (ref($column) eq 'HASH' && $column->{redacted})
+                    || _redacted($spec, $field) || _redacted($contract, $redacted_path);
+                return;
+            };
+            $conditions = _join_conditions($association->{conditions}, $path, $owner_fields, $target_fields,
+                through => exists($association->{through}), values => $has_values, physical => $physical);
+        }
         $associations{$name} = Selecto::Domain::Association->new(
             name => $name,
+            (defined($conditions) ? (owner_fields => _canonical_fields($relation)) : ()),
             value => {
                 table => $target->{source_table} // "__selecto_values_$queryable",
                 fields => $target_fields,
@@ -979,6 +1011,7 @@ sub _canonical_associations {
                 (exists($association->{join_strategy}) ? (
                     join_strategy => $association->{join_strategy},
                 ) : ()),
+                (defined($conditions) ? (conditions => $conditions) : ()),
                 ($join_mode eq 'star_dimension' ? (
                     display_field => $join->{display_field} // 'name',
                     dimension_key => $join->{dimension_key} // $association->{owner_key},
@@ -990,6 +1023,68 @@ sub _canonical_associations {
         );
     }
     return \%associations;
+}
+
+# An association's conditions, normalized to [{left, op, right, open?}]:
+# $owner_types and $target_types map each side's fields to declared types;
+# $physical, when given, refuses a computed or redacted field
+# ($physical->('owner' | 'target', $field) returns the reason).
+sub _join_conditions {
+    my ($conditions, $path, $owner_types, $target_types, %options) = @_;
+    my $refuse = sub {
+        my ($message, $details) = @_;
+        Selecto::Error->throw('invalid_domain', "association $path conditions $message",
+            {association => $path, code => 'invalid_join_conditions', %{$details // {}}});
+    };
+    $refuse->('must be a non-empty array of at most ' . $CONDITION_LIMIT . ' entries')
+        unless ref($conditions) eq 'ARRAY' && @$conditions && @$conditions <= $CONDITION_LIMIT;
+    $refuse->('are not available on a through association') if $options{through};
+    $refuse->('are not available on a values association') if $options{values};
+    my @normalized;
+    for my $index (0 .. $#$conditions) {
+        my $condition = $conditions->[$index];
+        $refuse->('entries must be objects', {index => $index}) unless ref($condition) eq 'HASH';
+        my @unknown = sort grep { !$CONDITION{$_} } keys %$condition;
+        $refuse->('entries take only left, op, right and open', {index => $index, keys => \@unknown}) if @unknown;
+        for my $key (qw(left op right)) {
+            $refuse->("entries require a string $key", {index => $index})
+                unless defined($condition->{$key}) && !ref($condition->{$key}) && length($condition->{$key});
+        }
+        my $op = lc $condition->{op};
+        $refuse->("operator $condition->{op} is not one of eq, ne, lt, lte, gt or gte", {index => $index})
+            unless $CONDITION_OPS{$op};
+        my ($left, $right) = @{$condition}{qw(left right)};
+        my %sides = (owner => [$left, $owner_types], target => [$right, $target_types]);
+        my %family;
+        for my $side (qw(owner target)) {
+            my ($field, $types) = @{$sides{$side}};
+            $refuse->("$side field $field is not a field", {index => $index, field => $field})
+                unless ref($types) eq 'HASH' && exists $types->{$field};
+            if ($options{physical}) {
+                my $reason = $options{physical}->($side, $field);
+                $refuse->("$side field $field is $reason", {index => $index, field => $field}) if $reason;
+            }
+            my $type = $types->{$field};
+            $family{$side} = defined($type) && !ref($type) ? $CONDITION_FAMILY{lc $type} : undef;
+            $refuse->("$side field $field has a type conditions cannot compare", {index => $index, field => $field})
+                unless defined $family{$side};
+        }
+        $refuse->("compare $left and $right of different types", {index => $index})
+            unless $family{owner} eq $family{target};
+        my $ordering = $op ne 'eq' && $op ne 'ne';
+        $refuse->("$op compares numbers, dates and times only", {index => $index})
+            if $ordering && !$CONDITION_ORDERED{$family{owner}};
+        my $open = 0;
+        if (exists $condition->{open}) {
+            my $value = $condition->{open};
+            $refuse->('open must be a boolean', {index => $index})
+                unless JSON::PP::is_bool($value) || (defined($value) && !ref($value) && "$value" =~ /\A(?:0|1)\z/);
+            $refuse->('open is available only with lt, lte, gt and gte', {index => $index}) unless $ordering;
+            $open = $value ? 1 : 0;
+        }
+        push @normalized, {left => "$left", op => $op, right => "$right", ($open ? (open => 1) : ())};
+    }
+    return \@normalized;
 }
 
 # Join aliases name SQL correlations: identifiers, outside the reserved
@@ -1563,6 +1658,7 @@ sub resolve_association {
                 $prefix,
                 $self->{_tenant_family},
                 [defined($relation->{tenant_field}) ? ("$relation->{tenant_field}") : ()],
+                $self->{contract},
             );
         } else {
             $associations = $association->associations;
@@ -1685,6 +1781,9 @@ sub _portable_associations {
             ) : ()),
             (defined($association->through) ? (through => $association->through) : ()),
             (keys(%{$association->where}) ? (where => $association->where) : ()),
+            (defined($association->conditions) ? (conditions => [map {
+                {%$_, (exists($_->{open}) ? (open => JSON::PP::true) : ())}
+            } @{$association->conditions}]) : ()),
         };
         $joins->{$path} = {
             type => $association->join_mode,
@@ -3031,6 +3130,7 @@ sub new {
         my $association_name = Selecto::Domain::_identifier($name, 'association');
         $associations{$association_name} = __PACKAGE__->new(
             name => $association_name,
+            owner_fields => $fields,
             value => $nested->{$name},
         );
     }
@@ -3047,6 +3147,10 @@ sub new {
             Selecto::Error->throw('invalid_domain','association inequality field is not queryable') unless exists $fields->{$where->{$field}[1][1]};
         }
     }
+    my $conditions = exists($value->{conditions})
+        ? Selecto::Domain::_join_conditions($value->{conditions}, $args{name}, $args{owner_fields}, $fields,
+            through => exists($value->{through}), values => defined($value->{values}))
+        : undef;
     my $cardinality = lc(Selecto::Domain::_required_string(
         $value->{cardinality} // 'one', 'association cardinality'
     ));
@@ -3176,6 +3280,7 @@ sub new {
         join_mode => $join_mode,
         (defined($alias) ? (alias => $alias) : ()),
         (defined($join_strategy) ? (join_strategy => $join_strategy) : ()),
+        (defined($conditions) ? (conditions => $conditions) : ()),
         (map { defined($value->{$_}) ? ($_ => Selecto::Domain::_identifier($value->{$_}, $_ =~ tr/_/ /r)) : () }
             qw(source_tenant_field target_tenant_field)),
         (defined($source_scope_key) ? (
@@ -3222,6 +3327,7 @@ sub fingerprint_value {
             ? (target_primary_key => $self->{target_primary_key}) : ()),
         (defined($self->{through}) ? (through => {%{$self->{through}}}) : ()),
         (defined($self->{where}) ? (where => {%{$self->{where}}}) : ()),
+        (defined($self->{conditions}) ? (conditions => $self->conditions) : ()),
         (map { defined($self->{$_}) ? ($_ => $self->{$_}) : () } qw(source_tenant_field target_tenant_field)),
         (defined($self->{source_scope_key}) ? (
             source_scope_key => $self->{source_scope_key},
@@ -3259,6 +3365,7 @@ sub display_name { return $_[0]->{display_name}; }
 sub display_fallback { return $_[0]->{display_fallback}; }
 sub through { return defined($_[0]->{through}) ? {%{$_[0]->{through}}} : undef; }
 sub where { return defined($_[0]->{where}) ? {%{$_[0]->{where}}} : {}; }
+sub conditions { return defined($_[0]->{conditions}) ? [map { {%$_} } @{$_[0]->{conditions}}] : undef; }
 sub source_scope_key { return $_[0]->{source_scope_key}; }
 sub target_scope_key { return $_[0]->{target_scope_key}; }
 sub source_tenant_field { return $_[0]->{source_tenant_field}; }
@@ -3875,6 +3982,47 @@ so PostgreSQL can use an index on the related key. It is a plan hint for
 misplanned joins; it does not change results. Not available for C<through>
 or C<values> associations.
 
+=item C<conditions>
+
+Extra comparisons between the owner and the target, applied after the key
+equality, as in an effective-dated lookup:
+
+    associations => {price => {
+        queryable => 'prices', owner_key => 'product_id', related_key => 'product_id',
+        conditions => [
+            {left => 'ordered_on', op => 'gte', right => 'valid_from'},
+            {left => 'ordered_on', op => 'lt',  right => 'valid_to', open => JSON::PP::true},
+        ],
+    }}
+
+A non-empty array of at most 8 entries C<{left, op, right, open?}>. C<left>
+is a field of the owner relation, C<right> a field of the target; each is a
+physical column (not C<computed>) and not redacted. C<op> is C<eq>, C<ne>,
+C<lt>, C<lte>, C<gt> or C<gte> (any case; stored lowercased). Both sides
+belong to one type family: numbers (C<integer>, C<decimal>), text
+(C<string>, C<text>), C<date>, C<time>, date-times (C<utc_datetime>,
+C<naive_datetime>), C<epoch_datetime>, C<boolean> or C<uuid>. Ordering
+operators compare numbers, dates, times and date-times only; text takes
+C<eq> and C<ne>. C<open> (a boolean, ordering operators only) also matches a
+NULL C<right>: C<< (t.valid_to IS NULL OR s.ordered_on < t.valid_to) >>.
+C<owner_key> and C<related_key> stay required and are ANDed with the
+conditions; C<through> and C<values> associations refuse them. Anything else
+is C<invalid_domain>.
+
+The conditions join the ON clause after the key equality on every dialect,
+in nested joins, related collections and C<association_exists>; C<eq> and
+C<ne> compare text as the key identity does (byte-exact on MySQL, MariaDB
+and DuckDB). A C<right> or C<full> join keeps them in ON (the target's
+C<where> and tenant bound still filter it first), and C<lateral_lookup>
+puts them in the lateral C<WHERE>. They only narrow a join: tenant pairing
+and bounds are unchanged. A conditioned association is a filtered lookup,
+so write-side foreign-key guards skip it as they skip a C<where>
+association. Domains without C<conditions> keep their fingerprints.
+
+Elixir's other join families are not shared. Tree joins (a level or path
+through a self-reference) are expressed portably with recursive query
+members (L<Selecto::QueryMember>).
+
 =back
 
 =head2 Join types and aliases
@@ -4071,7 +4219,7 @@ Association objects are returned by L</associations> and L</resolve>. Their
 read-only accessors are C<name>, C<table>, C<fields>, C<associations>,
 C<queryable>, C<owner_key>, C<related_key>, C<cardinality>, C<join_type>,
 C<join_mode>, C<join_strategy>, C<target_primary_key>, C<through>, C<where>,
-C<values>, C<value_fields>, C<display_field>, C<dimension_key>,
+C<conditions> (a copy, or undef), C<values>, C<value_fields>, C<display_field>, C<dimension_key>,
 C<display_name>, C<display_fallback>, C<source_scope_key> and
 C<target_scope_key>.
 

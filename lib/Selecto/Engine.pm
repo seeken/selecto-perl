@@ -1625,7 +1625,7 @@ sub _domain_references {
                 table => $association->table,
                 static => defined($association->values) || (ref($target) eq 'HASH' && defined($target->{values})) ? 1 : 0,
                 through => defined($association->through) ? 1 : 0,
-                filtered => keys(%{$association->where // {}}) ? 1 : 0,
+                filtered => keys(%{$association->where // {}}) || $association->conditions ? 1 : 0,
                 source_scope_key => $association->source_scope_key,
                 target_scope_key => $association->target_scope_key,
                 target_tenant_field => ref($target) eq 'HASH' ? $target->{tenant_field} : undef,
@@ -1662,7 +1662,8 @@ sub _contract_references {
                 table => ref($target) eq 'HASH' ? $target->{source_table} : $spec->{table},
                 static => ref($target) eq 'HASH' && defined($target->{values}) ? 1 : 0,
                 through => defined($spec->{through}) ? 1 : 0,
-                filtered => ref($spec->{where}) eq 'HASH' && keys(%{$spec->{where}}) ? 1 : 0,
+                filtered => (ref($spec->{where}) eq 'HASH' && keys(%{$spec->{where}}))
+                    || (ref($spec->{conditions}) eq 'ARRAY' && @{$spec->{conditions}}) ? 1 : 0,
                 source_scope_key => $spec->{source_scope_key},
                 target_scope_key => $spec->{target_scope_key},
                 target_tenant_field => ref($target) eq 'HASH' ? $target->{tenant_field} : undef,
@@ -1856,8 +1857,9 @@ sub _foreign_key_guards {
 
 # Direct to-one associations whose owner key references another row: not the
 # row's own key, a to-many or bridged association, or a static value list,
-# nor a filtered lookup (where), which picks one of the rows matching the owner
-# key (a customer's option in one group) rather than the row it identifies.
+# nor a filtered lookup (where or conditions), which picks one of the rows
+# matching the owner key (a customer's option in one group) rather than the
+# row it identifies.
 sub _guarded_associations {
     my ($references) = @_;
     return grep {
