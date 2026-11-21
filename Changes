@@ -4,6 +4,9 @@ Revision history for Selecto
     - Month buckets: the bucket kind month_ranges groups a date or time by
       calendar months ago (0 is the current month), in PostgreSQL and
       SQLite, with the same range rules as the other kinds.
+    - Selecto::Limits::intersect reads the two limit records directly instead
+      of making a get and a tightened step per limit; nested write budgets
+      intersect on every write. Same result and refusals.
     - Write capability admission (Selecto::Write::Capabilities) keeps its
       node and byte counters in variables scoped to one admission instead of a
       state record read by name at every node. Same walk, limits and refusals.

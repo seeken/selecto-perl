@@ -63,7 +63,23 @@ sub intersect {
     my ($self, $other) = @_;
     Selecto::Error->throw('invalid_limits', 'limits must be a Selecto::Limits')
         unless blessed($other) && $other->isa(__PACKAGE__);
-    return $self->tightened(map { $_ => $other->get($_) } keys %DEFAULTS);
+    return $self->tightened(map { $_ => $other->get($_) } keys %DEFAULTS)
+        unless ref($self) eq __PACKAGE__ && ref($other) eq __PACKAGE__;
+    # The same result and the same refusals as the line above, read straight
+    # from the two records: nested write budgets intersect on every write,
+    # and a get() and a tightened() step per limit was most of that cost.
+    for my $name (keys %DEFAULTS) {
+        Selecto::Error->throw('invalid_limits', 'unknown resource limit') unless exists $other->{$name};
+    }
+    my %next = %$self;
+    for my $name (keys %DEFAULTS) {
+        my $maximum = exists $self->{$name} ? $self->{$name} : $self->get($name);
+        my $value = $other->{$name};
+        Selecto::Error->throw('invalid_limits', 'a tightened ceiling must be a non-negative integer')
+            unless defined($value) && !ref($value) && "$value" =~ /\A[0-9]{1,9}\z/;
+        $next{$name} = 0 + $value if $value < $maximum;
+    }
+    return bless \%next, __PACKAGE__;
 }
 
 sub check_count {
