@@ -29,9 +29,8 @@ is_deeply($projected->{source}{fts5_index}, {table => 'items_search', key => 'id
     'query projection preserves the complete declared external-index metadata');
 ok(!exists($projected->{columns}) && !exists($projected->{redact_fields}),
     'query projection keeps the original presentation section boundary');
-# The portable projection also carries domain_data/extensions metadata that the
-# native strict parser does not enroll. Its existing permissive import mode
-# accepts the complete projected declaration without altering source or scope.
+# The portable projection carries the complete projected declaration; the
+# permissive import mode loads it without altering source or scope.
 my $domain = Selecto::Domain->parse($projected, strict => 0);
 my $engine = Selecto::Engine->new(domain => $domain, adapter => $adapter);
 my $search = Selecto::Expression->text_search(['title'], 'oak:*', mode => 'prefix');

@@ -1,6 +1,24 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Fixed: a tenant_required domain whose tenant_field is not tenant_id
+      (site_id, say) refused every read under with_tenant with
+      tenant_scope_missing, because the scope check looked for a tenant_id
+      filter. validate_tenant_scope now reads the domain's tenant_field when
+      no read context is attached, and a read context that names no
+      tenant_field defaults to the domain's (tenant_id only when the domain
+      declares none); before, with_read_context({tenant_id => ...}) on such a
+      domain refused with unknown_field.
+    - The parser admits top-level domain_data, events and json_schemas and
+      relation source_kind and readonly, with the domain schema conformance
+      fixture's semantics: domain_data and json_schemas are opaque, events
+      and the relation keys are checked as validate_schema checks them. A
+      bad source_kind (not table, view or materialized_view), a readonly
+      that is not a JSON boolean (1, "yes", undef), or a malformed event now
+      throws invalid_domain with reason naming the rule, in strict and
+      non-strict parses alike. Strict parses refused all five keys before;
+      non-strict parses ignored them, so a non-strict domain carrying bad
+      values that loaded before now refuses. contract_keys lists them.
     - A column marked redacted (redacted => 1, on the root or a related
       relation) is now withheld exactly like a field named in redact_fields:
       field_is_public is false, the canonical API no longer lists it in

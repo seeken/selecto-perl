@@ -70,6 +70,10 @@ sub _relation {
             }
         }
     }
+    _relation_metadata($state, $value, $path);
+}
+sub _relation_metadata {
+    my ($state, $value, $path) = @_;
     if (exists $value->{source_kind}) {
         my $kind = $value->{source_kind};
         _error($state, 'invalid_source_kind', [@$path, 'source_kind'])
@@ -128,6 +132,22 @@ sub _registry {
         _error($state, 'invalid_consumer_registry_entry', [$section, $id]) unless ref($registry->{$id}) eq 'HASH';
     }
 }
+# The checks Selecto::Domain->parse shares with validate: relation
+# source_kind and readonly, and event payload schemas. domain_data and
+# json_schemas stay opaque. Returns the first error or undef.
+sub metadata_error {
+    my ($class, $raw) = @_;
+    my $state = {errors => [], budget => Selecto::OperationBudget->new(limits => Selecto::Limits->new, code => 'invalid_domain_schema')};
+    _relation_metadata($state, $raw->{source}, ['source']) if ref($raw->{source}) eq 'HASH';
+    if (ref($raw->{schemas}) eq 'HASH') {
+        for my $id (sort keys %{$raw->{schemas}}) {
+            my $relation = $raw->{schemas}{$id};
+            _relation_metadata($state, $relation, ['schemas', $id]) if ref($relation) eq 'HASH';
+        }
+    }
+    _events($state, $raw->{events}) if exists $raw->{events};
+    return $state->{errors}[0];
+}
 sub validate {
     my ($class, $given) = @_;
     my $raw = Selecto::Domain::QueryContract->copy_declaration($given);
@@ -158,6 +178,11 @@ sub validate {
 Selecto::Domain::Schema - bounded portable domain declaration validation
 
 =head1 DESCRIPTION
+
+C<metadata_error($plain_contract)> runs the relation C<source_kind> and
+C<readonly> checks and the event checks alone, and returns the first error
+(C<code>, C<path>) or undef. C<Selecto::Domain-E<gt>parse> uses it, so a
+domain it loads carries the same metadata C<validate> admits.
 
 C<validate($plain_contract)> returns C<valid>, structured C<errors> and explicit
 C<validated_sections>. It validates relation/table/VALUES shapes and metadata,

@@ -37,7 +37,9 @@ is_deeply($engine->all($q)->{rows},[],'optional contradictory tenant filter cann
 my$udf=Selecto::Expression->new('udf','normalize_title',[Selecto::Expression->field('title')]);
 refusal('native UDF execution remains a concrete unsupported boundary','invalid_query',sub{$engine->all($engine->query->select($udf))});
 my$full=do{open my$fh,'<:raw','t/fixtures/query_policy.json'or die$!;local$/;JSON::PP->new->utf8->decode(<$fh>)};
-refusal('complete rich declaration does not bypass native strict parser','unknown_domain_key',sub{Selecto::Domain->parse($full->{D019}{governed_domain})});
+# domain_data and json_schemas are admitted metadata now; the rich query
+# member is what the native strict parser refuses.
+refusal('complete rich declaration does not bypass native strict parser','invalid_query_member',sub{Selecto::Domain->parse($full->{D019}{governed_domain})});
 is($db->selectrow_array('PRAGMA temp_store'),2,'TEMP storage is memory');
 is($db->selectall_arrayref('PRAGMA database_list')->[0][2],'','main database is memory');
 $db->disconnect;done_testing;

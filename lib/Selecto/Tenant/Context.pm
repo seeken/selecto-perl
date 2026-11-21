@@ -19,14 +19,16 @@ sub boolean {
         unless defined($value) && !ref($value) && "$value" =~ /\A[01]\z/;
     return $value ? 1 : 0;
 }
+# $default_field is the domain's tenant_field: a context that names no
+# tenant_field scopes that column, and tenant_id only when the domain has none.
 sub normalize {
-    my ($class, $given) = @_;
+    my ($class, $given, $default_field) = @_;
     return {} unless defined $given;
     $given = {tenant_id => $given} unless ref($given);
     my $value = Selecto::Domain::QueryContract->copy_declaration($given);
     my %known = map { $_ => 1 } qw(tenant_id id tenant_field prefix required require_tenant required_filters);
     _fail('invalid_tenant_context', 'tenant context contains unsupported fields') if grep { !$known{$_} } keys %$value;
-    my %context = (tenant_field => Selecto::Identifier::checked($value->{tenant_field} // 'tenant_id'));
+    my %context = (tenant_field => Selecto::Identifier::checked($value->{tenant_field} // $default_field // 'tenant_id'));
     for my $key (qw(tenant_id id)) {
         next unless defined $value->{$key};
         _fail('invalid_tenant_context', 'tenant id must be a nonblank scalar')
@@ -64,9 +66,11 @@ sub unique_filters {
     my %seen;
     return [grep { !$seen{Cpanel::JSON::XS->new->allow_nonref(1)->canonical->encode($_)}++ } @$copy];
 }
+# The scope evidence is the filter on the attached context's tenant_field or,
+# with no context attached (a trusted with_tenant engine), on the domain's.
 sub report {
-    my ($class, $required, $context, $filters) = @_;
-    my $field = $context->{tenant_field} // 'tenant_id';
+    my ($class, $required, $context, $filters, $default_field) = @_;
+    my $field = $context->{tenant_field} // $default_field // 'tenant_id';
     my %values;
     for my $filter (@$filters) {
         next unless ref($filter) eq 'ARRAY' && @$filter == 2 && defined($filter->[0]) && !ref($filter->[0]) && $filter->[0] eq $field

@@ -247,7 +247,7 @@ sub with_tenant {
 sub with_read_context {
     my ($self, $given) = @_;
     $self->assert_domain_identity;
-    my $context = Selecto::Tenant::Context->normalize($given);
+    my $context = Selecto::Tenant::Context->normalize($given, $self->{domain}->tenant_field);
     my $old_context = $self->{tenant_context} // {};
     for my $key (qw(tenant_id tenant_field prefix)) {
         my $old = $old_context->{$key};
@@ -290,7 +290,7 @@ sub validate_tenant_scope {
     require Selecto::QueryPolicy;
     my $filters = $self->required_filters;
     return Selecto::Tenant::Context->report($self->{domain}->tenant_required,
-        $self->{tenant_context} // {}, $filters);
+        $self->{tenant_context} // {}, $filters, $self->{domain}->tenant_field);
 }
 sub required_filters {
     my ($self) = @_;
@@ -3412,7 +3412,7 @@ calling scalar C<with_tenant>.
 Attaches bounded plain read context without silently applying row scope.
 Explicit application adds required field/value obligations; ordinary query
 filters cannot satisfy them. Context supports C<tenant_id> (alias C<id>),
-C<tenant_field> (default C<tenant_id>), C<prefix>, boolean C<required>
+C<tenant_field> (default: the domain's C<tenant_field>, else C<tenant_id>), C<prefix>, boolean C<required>
 (alias C<require_tenant>) and scalar-pair C<required_filters>. Callback/tied/
 cyclic inputs are refused before copying. An attached identity cannot be
 replaced. Domain C<tenant_required> (alias C<require_tenant>) fails closed;

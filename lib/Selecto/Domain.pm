@@ -25,10 +25,12 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     source_relationships choice_sources writes actions imports editors extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
     query_library co_domains domain_dependencies operations experiences rules tenant_required require_tenant
+    domain_data events json_schemas
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields fts5_index);
 my %RELATION = map { $_ => 1 } qw(
     source_table values primary_key fields columns associations tenant_field redact_fields
+    source_kind readonly
 );
 my %ASSOCIATION = map { $_ => 1 } qw(
     queryable field owner_key related_key cardinality through source_scope_key target_scope_key where
@@ -462,6 +464,13 @@ sub parse {
         Selecto::ConfiguredDomain->admit_library($raw->{query_library});
     }
     _reject_unknown($raw, \%TOP_LEVEL, 'domain') if $strict;
+    # Relation source_kind/readonly and event payload schemas are checked in
+    # every mode, exactly as validate_schema checks them.
+    require Selecto::Domain::Schema;
+    if (my $error = Selecto::Domain::Schema->metadata_error($raw)) {
+        Selecto::Error->throw('invalid_domain', "domain metadata: $error->{code} at " . join('.', @{$error->{path}}),
+            {reason => $error->{code}, path => $error->{path}});
+    }
     # A top-level tenant is schema 2's: ignored here, the domain would load
     # without its tenant, so it refuses even when the parse is not strict.
     _reject_unknown({tenant => $raw->{tenant}}, {}, 'domain') if exists $raw->{tenant};
@@ -3640,7 +3649,8 @@ copy you own.
       actions  => {...},  capabilities => {...},
       query_library => {...}, query_members => {...}, co_domains => {...},
       imports => {...}, components => {...}, detail_actions => {...}, editors => {...},
-      redact_fields => [...], required_selected => [...], ...
+      redact_fields => [...], required_selected => [...],
+      domain_data => ..., json_schemas => {...}, events => {...}, ...
   }
 
 =head2 Relations
@@ -3712,7 +3722,28 @@ Fields of this relation withheld from untrusted surfaces exactly like
 C<internal> columns. A column marked C<< redacted => 1 >> is withheld the
 same way.
 
+=item C<source_kind>, C<readonly>
+
+Metadata for hosts and tools; neither changes SQL. C<source_kind> is one of
+C<table>, C<view> or C<materialized_view>; C<readonly> is a JSON boolean
+(C<JSON::PP::true> or C<JSON::PP::false>, not C<1> or C<0>). Any other value,
+C<undef> included, throws C<invalid_domain> with C<reason>
+C<invalid_source_kind> or C<invalid_readonly>, strict or not.
+
 =back
+
+=head2 Metadata sections
+
+C<domain_data> and C<json_schemas> are opaque host metadata: any JSON value,
+kept in L</as_contract> and the export and never read by the engine.
+C<events> maps an event id to C<schema_version> (a positive JSON integer),
+optional C<additional_fields> (a JSON boolean) and C<data>, a hash of payload
+fields. A field is a type name or a hash with C<type> (C<any>, C<boolean>,
+C<enum>, C<integer>, C<list>, C<map>, C<number>, C<string> or C<uuid>;
+C<enum> needs C<values>, and only C<list> takes C<item>) and JSON-boolean
+C<required> and C<nullable>. A malformed event throws C<invalid_domain>
+with C<reason> naming the rule, strict or not. These are the rules
+C<validate_schema> applies (L<Selecto::Domain::Schema>).
 
 =head2 Associations
 

@@ -39,6 +39,7 @@ lib/Selecto/Domain.pm
 lib/Selecto/Domain/Projection.pm
 t/api_query_boolean_columns.t
 t/column_redacted.t
+t/domain_metadata_keys.t
 t/domain_projection.t
 t/domain_schema_v2.t
 t/domain_compose_schema_v2.t
@@ -420,6 +421,7 @@ t/co_domain_lookup_tenant_boundary.t
 t/two_column_join_pairing.t
 t/rebuild_tenant_bound.t
 t/engine_read_tenant_boundary.t
+t/tenant_scope_domain_field.t
 t/engine_write_tenant_boundary.t
 t/retarget_hop_pairing.t
 t/shared_hop_site_pairing.t
