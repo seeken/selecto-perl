@@ -45,7 +45,7 @@ my %DEFAULT_LIMITS = (max_limit => 100, max_offset => 10_000, max_select => 20, 
     max_filter_depth => 3, max_filter_values => 100, max_orders => 5, max_group_by => 3,
     max_aggregates => 10, max_groups => 1000, max_result_cells => 10_000, max_buckets => 20,
     max_export_rows => 10_000, max_count_rows => 100_000);
-my @SUPPORT_FLAGS = qw(detail aggregate graph rollup grid nested recursive_filters group_formats
+my @SUPPORT_FLAGS = qw(detail aggregate graph rollup cube grouping_sets grid nested recursive_filters group_formats
     buckets boolean_aggregates count_exact text_ops date_shortcuts);
 my @EXPORT_FORMATS = qw(csv tsv json xlsx);
 my %AGGREGATES = map { ($_ => 1) } qw(count count_distinct sum avg min max true_count false_count
@@ -208,7 +208,7 @@ sub features ($self, $engine) {
         fields => [map { _public_field($_) } @{$catalogue->{list}}],
         collections => $catalogue->{collections},
         default => {select => \@default, order_by => [], group_by => [], aggregates => [],
-            rollup => JSON::PP::false},
+            rollup => JSON::PP::false, cube => JSON::PP::false},
         query_library => {segments => \@segments},
         limits => \%limits,
         supports => {%$supports, map { ($_ => _bool($supports->{$_})) } @SUPPORT_FLAGS},
@@ -383,6 +383,8 @@ sub _check_supports ($self, $context, $query) {
     my $unsupported = sub ($flag) { _reject('operation_unsupported') unless $supports->{$flag} };
     $unsupported->('count_exact') if _string($query->{count}) && $query->{count} eq 'exact';
     $unsupported->('rollup') if JSON::PP::is_bool($query->{rollup}) && $query->{rollup};
+    $unsupported->('cube') if JSON::PP::is_bool($query->{cube}) && $query->{cube};
+    $unsupported->('grouping_sets') if exists $query->{grouping_sets};
     $unsupported->('grid') if JSON::PP::is_bool($query->{complete}) && $query->{complete};
     my $select = ref($query->{select}) eq 'ARRAY' ? $query->{select} : [];
     my $groups = ref($query->{group_by}) eq 'ARRAY' ? $query->{group_by} : [];
@@ -510,7 +512,7 @@ sub _plan ($self, $context, $query) {
     my $limits = $context->{limits};
     my $catalogue = $context->{catalogue}{by_path};
     my %members = map { ($_ => 1) } qw(select filters group_by order_by segments parameters limit offset
-        timezone row_format rollup complete count export);
+        timezone row_format rollup cube grouping_sets complete count export);
     _invalid() if grep { !$members{$_} } keys %$query;
     my $zone = exists($query->{timezone}) ? $query->{timezone} : 'UTC';
     _invalid() unless _string($zone) && DateTime::TimeZone->is_valid_name($zone);
@@ -523,6 +525,7 @@ sub _plan ($self, $context, $query) {
         return $query->{$name} ? 1 : 0;
     };
     $plan->{rollup} = $boolean->('rollup', 0);
+    $plan->{cube} = $boolean->('cube', 0);
     $plan->{complete} = $boolean->('complete', 0);
     $plan->{row_format} = $query->{row_format} // 'arrays';
     _invalid() unless _string($plan->{row_format}) && $plan->{row_format} =~ /\A(?:arrays|objects)\z/;
@@ -701,8 +704,44 @@ sub _plan ($self, $context, $query) {
     $plan->{orders} //= [];
 
     # Result-shape rules.
-    _invalid() if $plan->{rollup} && ($plan->{mode} ne 'grouped' || @$orders);
-    _invalid() if $plan->{complete} && ($plan->{mode} ne 'grouped' || $plan->{rollup} || $plan->{offset});
+    # The grouping sets of the result, each a list of positions in group_by.
+    # A rollup is every prefix, a cube every subset, and grouping_sets names
+    # them. They exclude each other and a caller's ordering.
+    if (exists $query->{grouping_sets}) {
+        my $sets = $query->{grouping_sets};
+        my $count = $plan->{mode} eq 'grouped' ? scalar @{$plan->{groups}} : 0;
+        _invalid() unless $count && ref($sets) eq 'ARRAY' && @$sets && @$sets <= 2**$limits->{max_group_by};
+        my (%seen, %used, @checked);
+        for my $set (@$sets) {
+            my %members;
+            _invalid() unless ref($set) eq 'ARRAY' && !grep {
+                !defined($_) || ref($_) || !/\A(?:0|[1-9][0-9]*)\z/ || $_ >= $count || $members{$_}++
+            } @$set;
+            my @sorted = sort { $a <=> $b } map { 0 + $_ } @$set;
+            _invalid() if $seen{join ',', @sorted}++;
+            $used{$_} = 1 for @sorted;
+            push @checked, \@sorted;
+        }
+        _invalid() unless keys(%used) == $count;
+        $plan->{grouping} = 'grouping_sets';
+        $plan->{sets} = \@checked;
+    }
+    _invalid() if 1 < grep { $_ } $plan->{rollup}, $plan->{cube}, exists($query->{grouping_sets}) ? 1 : 0;
+    if ($plan->{rollup} || $plan->{cube}) {
+        _invalid() unless $plan->{mode} eq 'grouped';
+        my $last = $#{$plan->{groups}};
+        $plan->{grouping} = $plan->{rollup} ? 'rollup' : 'cube';
+        $plan->{sets} = $plan->{rollup}
+            ? [map { [0 .. $_ - 1] } reverse 0 .. $last + 1]
+            : [map { my $mask = $_; [grep { $mask & (1 << ($last - $_)) } 0 .. $last] }
+                sort { (sprintf('%b', $b) =~ tr/1//) <=> (sprintf('%b', $a) =~ tr/1//) || $b <=> $a }
+                    0 .. 2**($last + 1) - 1];
+    }
+    _invalid() if $plan->{grouping} && @$orders;
+    # A complete grid may carry cube totals; subtotal paths of a rollup or of
+    # named sets do not form a grid.
+    _invalid() if $plan->{complete} && ($plan->{mode} ne 'grouped' || $plan->{offset}
+        || ($plan->{grouping} && $plan->{grouping} ne 'cube'));
     if (exists($query->{export}) && defined($query->{export})) {
         my $export = $query->{export};
         _invalid() unless ref($export) eq 'HASH' && !grep { !/\A(?:all_rows|shape)\z/ } keys %$export;
@@ -712,7 +751,7 @@ sub _plan ($self, $context, $query) {
         if ($shape eq 'grid') {
             my @measures = grep { $_->{role} eq 'aggregate' } @{$plan->{columns}};
             _invalid() unless $plan->{mode} eq 'grouped' && @{$plan->{groups}} == 2 && @measures == 1
-                && !$plan->{rollup} && @{$plan->{columns}} == 3;
+                && !$plan->{grouping} && @{$plan->{columns}} == 3;
         }
         $plan->{export} = {shape => $shape};
     }
@@ -722,7 +761,7 @@ sub _plan ($self, $context, $query) {
 sub _group_column ($group, $plan) {
     return {id => $group->{id}, label => $group->{kind} eq 'plain' ? $group->{field}{label} : $group->{id},
         role => 'group', field => $group->{path}, type => $group->{type},
-        nullable => $plan->{rollup} || ($group->{kind} ne 'bucket' && $group->{field}{nullable}) ? 1 : 0,
+        nullable => $plan->{rollup} || $plan->{cube} || $plan->{sets} || ($group->{kind} ne 'bucket' && $group->{field}{nullable}) ? 1 : 0,
         ($group->{kind} eq 'format' ? (format => $group->{format}) : ()), group => $group};
 }
 
@@ -1143,10 +1182,14 @@ sub _execute_grouped ($self, $handler, $engine, $plan) {
     my @groups = @{$plan->{groups}};
     my $entries = $self->_aggregate_entries($plan);
     my $max_groups = $self->limits->{max_groups};
-    my @levels = $plan->{rollup} ? reverse(0 .. @groups) : (scalar @groups);
+    # One plain grouped query per grouping set, merged here, so every adapter
+    # answers rollups, cubes and named sets alike.
+    my @sets = $plan->{sets} ? @{$plan->{sets}} : ([0 .. $#groups]);
     my @merged;
-    for my $level (@levels) {
-        my @present = @groups[0 .. $level - 1];
+    for my $set (@sets) {
+        my $level = scalar @$set;
+        my @present = @groups[@$set];
+        my %position = map { ($set->[$_] => $_) } 0 .. $#$set;
         my @select = ((map { $_->{kind} eq 'plain' ? {field => $_->{path}, alias => 'g' . $_->{index}}
                 : {group => 'g' . $_->{index}} } @present), map { $_->[1] } @$entries);
         my $rows;
@@ -1160,11 +1203,14 @@ sub _execute_grouped ($self, $handler, $engine, $plan) {
         }
         _reject('result_limit_exceeded') if @merged + @$rows > $max_groups;
         for my $raw (@$rows) {
-            my @keys = map { $_ < $level ? _wire($raw->[$_], $groups[$_]{type}) : undef } 0 .. $#groups;
+            my @keys = map {
+                exists($position{$_}) ? _wire($raw->[$position{$_}], $groups[$_]{type}) : undef
+            } 0 .. $#groups;
             my %aggregates = map {
                 ($entries->[$_][0]{id} => _wire($raw->[$level + $_], $entries->[$_][0]{type}))
             } 0 .. $#$entries;
-            push @merged, {level => $level, keys => \@keys, aggregates => \%aggregates};
+            push @merged, {level => $level, set => $set, present => \%position,
+                keys => \@keys, aggregates => \%aggregates};
         }
     }
     my $total = grep { $_->{level} == @groups } @merged;
@@ -1173,7 +1219,7 @@ sub _execute_grouped ($self, $handler, $engine, $plan) {
     }
     my $compare = sub ($a, $b) {
         my $c = 0;
-        unless ($plan->{rollup}) {
+        unless ($plan->{grouping}) {
             for my $order (@{$plan->{orders}}) {
                 $c = $order->{group}
                     ? _compare_key($order->{group}, $a->{keys}[$order->{group}{index}], $b->{keys}[$order->{group}{index}])
@@ -1184,7 +1230,7 @@ sub _execute_grouped ($self, $handler, $engine, $plan) {
         }
         for my $group (@groups) {
             my $i = $group->{index};
-            my ($ra, $rb) = ($i < $a->{level} ? 0 : 1, $i < $b->{level} ? 0 : 1);
+            my ($ra, $rb) = (exists($a->{present}{$i}) ? 0 : 1, exists($b->{present}{$i}) ? 0 : 1);
             $c = $ra <=> $rb || ($ra ? 0 : _compare_key($group, $a->{keys}[$i], $b->{keys}[$i]));
             return $c if $c;
         }
@@ -1218,9 +1264,13 @@ sub _execute_grouped ($self, $handler, $engine, $plan) {
 sub _row_meta ($plan, $item) {
     my @groups = @{$plan->{groups}};
     my $level = $item->{level};
-    return {level => 0, kind => 'total', drilldown => undef} if $level == 0;
+    return {level => 0, kind => 'total',
+        ($plan->{grouping} && $plan->{grouping} ne 'rollup' ? (groups => []) : ()), drilldown => undef} if $level == 0;
     my $kind = $level == @groups ? 'detail' : 'subtotal';
-    my @present = @groups[0 .. $level - 1];
+    my @present = @groups[@{$item->{set}}];
+    # A cube or a named set may keep a later group and drop an earlier one, so
+    # its rows say which groups they hold.
+    my @held = $plan->{grouping} && $plan->{grouping} ne 'rollup' ? (groups => [map { $_->{id} } @present]) : ();
     my $drilldown;
     unless (grep { $_->{kind} eq 'bucket' } @present) {
         $drilldown = {column => $present[-1]{id}, filters => [map {
@@ -1229,7 +1279,7 @@ sub _row_meta ($plan, $item) {
                 (defined($value) ? (op => 'eq', value => _copy_scalar($value, $_->{type})) : (op => 'is_null'))};
         } @present]};
     }
-    return {level => $level, kind => $kind, drilldown => $drilldown};
+    return {level => $level, kind => $kind, @held, drilldown => $drilldown};
 }
 
 # Grouped keys order by type: nulls first, numbers numerically, text by code
@@ -1506,8 +1556,8 @@ fingerprint and features revision (409), trusted tenant scope (403
 C<missing_tenant_scope>), member C<supports> (501), the field pre-pass (403
 C<hidden_field> or 422 C<invalid_field>, first reference first), a UTC-only
 host's instant conversions (501), then shape and limits (422). Detail rows
-sort nulls first ascending and last descending; rollup rows are paged
-together; step buckets are bounded only by C<max_groups>. Results carry typed columns,
+sort nulls first ascending and last descending; rollup, cube and grouping-set
+rows are paged together; step buckets are bounded only by C<max_groups>. Results carry typed columns,
 C<row_meta> drilldowns for grouped rows, bounded exact counts and C<complete>
 grids; C<export> returns CSV, TSV, JSON or XLSX of the whole result.
 
@@ -1520,8 +1570,18 @@ C<filter_groups>, C<aggregate_selections> and C<explorer_extensions>, the
 trusted C<today> (the calendar date of C<clock> in the request's time zone)
 and C<explorer_timezone>, so tenant boundaries, field visibility, roles and
 execution are the canonical handler's. Grouped rows (at most C<max_groups>)
-are ordered and paged here; rollup runs one grouped query per prefix of the
-group keys. Range buckets are compiled with literal bounds from the trusted
+are ordered and paged here. A grouped query takes one of three members for
+subtotal rows: C<rollup> (true) for each leading run of the groups, C<cube>
+(true) for every combination, or C<grouping_sets>, a list of sets, each a list
+of positions in C<group_by> with C<[]> for the grand total. Each grouping set
+runs as one plain grouped query, so every adapter answers them. They cannot be
+combined with each other or with C<order_by>; all their rows count toward
+C<max_groups>; and C<complete> accepts C<cube>, giving a grid its row, column
+and grand totals, but not C<rollup> or C<grouping_sets>. In C<row_meta>, a
+cube or grouping-set row has C<groups>, the ids of the group columns it
+holds, because it may hold a later group without an earlier one; its
+C<drilldown> filters on exactly those. The features document advertises
+C<supports.cube> and C<supports.grouping_sets>. Range buckets are compiled with literal bounds from the trusted
 clock, never the database's current time. PostgreSQL hosts advertise
 C<supports.timezones> C<iana>; other adapters C<utc>, and refuse (501) a
 request that would convert an instant to another zone.

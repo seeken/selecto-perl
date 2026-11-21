@@ -1,6 +1,14 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Subtotal rows in the APIs. Selecto::API::Explorer accepts cube and
+      grouping_sets beside rollup, advertises supports.cube and
+      supports.grouping_sets, lets a complete grid carry cube totals, and
+      names the groups a row holds in row_meta. Selecto::API::EngineHandler
+      (with aggregate_selections) accepts rollup, cube and grouping_sets on
+      a grouped query, runs them through the adapter, and adds a last
+      column, grouping, to tell the rows apart. The remote_query.v1 wire
+      profile is unchanged and still refuses group_by.
     - CUBE and GROUPING SETS: Selecto::Query gains group_by_cube and
       group_by_grouping_sets, the grouping modes cube and grouping_sets, and
       grouping_set_positions. PostgreSQL and DuckDB compile the native

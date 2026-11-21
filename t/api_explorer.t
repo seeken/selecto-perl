@@ -170,6 +170,57 @@ subtest 'aggregates and groups' => sub {
     is_deeply $body->{data}{row_meta}[0]{drilldown}, {column => 'done',
         filters => [{field => 'state', op => 'eq', value => 'done'}, {field => 'done', op => 'is_null'}]};
     is_deeply rows({select => ['id'], filters => $body->{data}{row_meta}[0]{drilldown}{filters}}), [[4]], 'drilldown';
+
+    # The host allows 8 grouped rows; the open tasks alone make a 6-row cube.
+    my %all = (group_by => ['state', 'done'], select => ['state', 'done', {aggregate => 'count', alias => 'n'}], limit => 10);
+    my %grouped = (%all, filters => [{field => 'state', op => 'eq', value => 'open'}]);
+    my ($cube_status, $cube) = post({%grouped, cube => $t});
+    diag explain $cube unless $cube_status == 200;
+    is_deeply $cube->{data}{rows}, [['open', $f, 1], ['open', $t, 1], ['open', undef, 2],
+        [undef, $f, 1], [undef, $t, 1], [undef, undef, 2]],
+        'cube: every combination, rows holding an earlier group first';
+    is_deeply [map { join ',', $_->{kind}, @{$_->{groups}} } @{$cube->{data}{row_meta}}],
+        ['detail,state,done', 'detail,state,done', 'subtotal,state', 'subtotal,done', 'subtotal,done', 'total'],
+        'cube rows name the groups they hold';
+    is_deeply $cube->{data}{row_meta}[3]{drilldown}, {column => 'done', filters => [{field => 'done', op => 'eq', value => $f}]},
+        'a row without the first group drills down on what it holds';
+    ok !exists($body->{data}{row_meta}[0]{groups}), 'rollup row_meta is unchanged';
+    is refusal({%all, cube => $t}), '422 result_limit_exceeded', 'cube rows count toward max_groups';
+
+    my (undef, $sets) = post({%grouped, grouping_sets => [[1], [0], []]});
+    is_deeply $sets->{data}{rows}, [['open', undef, 2], [undef, $f, 1], [undef, $t, 1], [undef, undef, 2]], 'named grouping sets';
+    is_deeply [map { $_->{kind} } @{$sets->{data}{row_meta}}], [qw(subtotal subtotal subtotal total)];
+    is_deeply rows({%all, grouping_sets => [[0, 1], [0], []]}), rows({%all, rollup => $t}), 'prefix sets equal the rollup';
+    is_deeply rows({%all, grouping_sets => [[1, 0]]}), rows({%all}), 'one full set equals plain grouping';
+    is_deeply rows({group_by => ['state'], select => ['state', {aggregate => 'count', alias => 'n'}], cube => $t}),
+        rows({group_by => ['state'], select => ['state', {aggregate => 'count', alias => 'n'}], rollup => $t}),
+        'a one-group cube equals its rollup';
+    # The host allows 12 cells: one detail row makes a 4-row, 3-column cube.
+    my (undef, $cube_grid) = post({%all, cube => $t, complete => $t, filters => [
+        {field => 'state', op => 'eq', value => 'open'}, {field => 'done', op => 'eq', value => $t}]});
+    is_deeply $cube_grid->{data}{rows}, [['open', $t, 1], ['open', undef, 1], [undef, $t, 1], [undef, undef, 1]],
+        'a complete grid may carry its cube totals';
+    is refusal({%grouped, cube => $t, complete => $t}), '422 result_limit_exceeded', 'and its totals count toward max_result_cells';
+    my (undef, $paged_cube) = post({%grouped, cube => $t, limit => 2, offset => 3});
+    is_deeply $paged_cube->{data}{rows}, [[undef, $f, 1], [undef, $t, 1]], 'cube rows are paged together';
+
+    for my $bad (
+        [{%grouped, cube => $t, rollup => $t}, 'cube with rollup'],
+        [{%grouped, cube => $t, grouping_sets => [[0], [1]]}, 'cube with grouping_sets'],
+        [{%grouped, cube => $t, order_by => [{field => 'state'}]}, 'cube with an ordering'],
+        [{%grouped, grouping_sets => []}, 'no sets'],
+        [{%grouped, grouping_sets => [[0]]}, 'a group in no set'],
+        [{%grouped, grouping_sets => [[0, 1], [1, 0]]}, 'the same set twice'],
+        [{%grouped, grouping_sets => [[0, 0], [1]]}, 'a group twice in a set'],
+        [{%grouped, grouping_sets => [[0, 2], [1]]}, 'a position that does not exist'],
+        [{%grouped, grouping_sets => [['state'], [1]]}, 'a name instead of a position'],
+        [{%grouped, grouping_sets => [[0], [1]], complete => $t}, 'a complete grid of named sets'],
+        [{%grouped, rollup => $t, complete => $t}, 'a complete grid of a rollup'],
+        [{select => ['id'], cube => $t}, 'cube without groups'],
+        [{select => ['id'], grouping_sets => [[0]]}, 'grouping_sets without groups'],
+    ) {
+        is refusal($bad->[0]), '422 invalid_query', "refused: $bad->[1]";
+    }
     my ($grid_status, $grid) = post({group_by => ['state', 'done'], select => ['state', 'done', {aggregate => 'count', alias => 'n'}],
         complete => $t, limit => 4});
     is $grid->{data}{complete}, $t;

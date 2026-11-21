@@ -476,6 +476,7 @@ sub _query ($self, $engine, $body, %options) {
     $self->_admit_body($body, 'invalid_api_query');
     _reject_unknown($body, [qw(
         select projection view segments parameters filters ordering order_by group_by limit offset timezone row_format
+        rollup cube grouping_sets
     )], 'query body');
 
     my $has_select = exists $body->{select};
@@ -667,6 +668,8 @@ sub _query ($self, $engine, $body, %options) {
                 or @{$query->orders};
     }
 
+    $query = $self->_with_grouping_sets($engine, $query, $body);
+
     my $limit = exists($body->{limit})
         ? _bounded_integer($body->{limit}, 'limit', 0, $self->max_limit)
         : $self->default_limit;
@@ -742,6 +745,54 @@ sub _query ($self, $engine, $body, %options) {
     # also counts escaping, keys and metadata in the eventual public response.
     Selecto::API::ResponsePolicy->check_json({data => $response, ok => JSON::PP::true}, $self->limits);
     return Selecto::API::ResponsePolicy->bind_limits($response, $self->limits);
+}
+
+# rollup, cube and grouping_sets turn the grouped query into one with subtotal
+# rows. They need a group_by and aggregate select entries, exclude each other,
+# and are run by the adapter: one that lacks the capability refuses. A last
+# column, grouping, tells the rows apart: its bits, first group highest, are 1
+# for each group the row leaves out, so 0 is a detail row.
+sub _with_grouping_sets ($self, $engine, $query, $body) {
+    my @asked = grep { exists $body->{$_} } qw(rollup cube grouping_sets);
+    return $query unless @asked;
+    my $invalid = sub ($message) { Selecto::Error->throw('invalid_api_query', $message) };
+    for my $flag (grep { $_ ne 'grouping_sets' } @asked) {
+        $invalid->("$flag must be a boolean") unless JSON::PP::is_bool($body->{$flag});
+    }
+    my @modes = grep { $_ eq 'grouping_sets' || $body->{$_} } @asked;
+    return $query unless @modes;
+    $invalid->('Use only one of rollup, cube and grouping_sets') if @modes > 1;
+    my $mode = $modes[0];
+    $invalid->("$mode requires aggregate select entries") unless $self->aggregate_selections;
+    my $groups = $query->groups;
+    $invalid->("$mode requires group_by") unless @$groups;
+    $invalid->('A grouped result with subtotals cannot use a field named grouping')
+        if grep { ($_->alias_name // '') eq 'grouping'
+            || ($_->kind eq 'field' && $_->arguments->[0] eq 'grouping') } @{$query->selections};
+    Selecto::Error->throw('unsupported_feature', "The database adapter does not support $mode", {feature => $mode})
+        unless $engine->adapter->supports($mode);
+    my $marker = Selecto::Expression->grouping(@$groups)->as('grouping');
+    my $selected = $query->select($marker);
+    return $selected->group_by_rollup(@$groups) if $mode eq 'rollup';
+    if ($mode eq 'cube') {
+        $invalid->('cube takes at most ' . $Selecto::Query::MAX_CUBE_DIMENSIONS . ' groups')
+            if @$groups > $Selecto::Query::MAX_CUBE_DIMENSIONS;
+        return $selected->group_by_cube(@$groups);
+    }
+    my $sets = $body->{grouping_sets};
+    $invalid->('grouping_sets must be a non-empty array of arrays of group_by positions')
+        unless ref($sets) eq 'ARRAY' && @$sets && @$sets <= $Selecto::Query::MAX_GROUPING_SETS
+            && !grep { ref($_) ne 'ARRAY' } @$sets;
+    my (%seen, %used);
+    for my $set (@$sets) {
+        my %members;
+        $invalid->('A grouping set lists distinct group_by positions')
+            if grep { !defined($_) || ref($_) || !/\A(?:0|[1-9][0-9]*)\z/ || $_ > $#$groups || $members{$_}++ } @$set;
+        $invalid->('grouping_sets must be distinct') if $seen{join ',', sort { $a <=> $b } @$set}++;
+        $used{$_} = 1 for @$set;
+    }
+    $invalid->('Every group_by entry must appear in a grouping set') unless keys(%used) == @$groups;
+    return $selected->group_by_grouping_sets(map { [@{$groups}[@$_]] } @$sets);
 }
 
 # One input budget includes all scalar filters, both range endpoints, membership
@@ -889,6 +940,22 @@ sub describe_openapi ($self, $api) {
                 type => 'array', minItems => 1, maxItems => $self->max_fields,
                 items => {type => 'string'},
                 description => 'Public groupable fields. Selected and ordered fields must be grouped.',
+            },
+            rollup => {
+                type => 'boolean',
+                description => 'Add a subtotal row for each leading run of group_by and a grand total.',
+            },
+            cube => {
+                type => 'boolean',
+                description => 'Add a subtotal row for every combination of group_by and a grand total.',
+            },
+            grouping_sets => {
+                type => 'array', minItems => 1,
+                items => {type => 'array', items => {type => 'integer', minimum => 0}},
+                description => 'The grouping sets to return, each a list of positions in group_by; '
+                    . 'an empty list is the grand total. With rollup, cube or grouping_sets the result '
+                    . 'gains a last column, grouping: a bit mask, first group highest, with 1 for each '
+                    . 'group a row leaves out.',
             },
             limit => {
                 type => 'integer', minimum => 0, maximum => $self->max_limit,
@@ -2037,6 +2104,14 @@ cross a to-many association. Aggregates are exempt from the C<group_by>
 rule; without C<group_by>, every selection must be an aggregate and the query
 cannot be ordered. Such a summary is one row and is not paged in SQL (SQL
 Server pages only ordered queries); C<limit> and C<offset> apply to that row.
+
+A grouped query may also ask for subtotal rows with one of C<rollup> (true),
+C<cube> (true) or C<grouping_sets> (a list of sets, each a list of positions
+in C<group_by>, with C<[]> for the grand total). The adapter runs them, so one
+without the C<rollup>, C<cube> or C<grouping_sets> capability refuses with
+C<unsupported_feature>. The result gains a last column, C<grouping>: a bit
+mask, first group highest, with 1 for each group the row leaves out, so a
+detail row is 0. A selection may not itself be named C<grouping>.
 
 =item explorer_extensions
 

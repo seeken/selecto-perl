@@ -125,4 +125,56 @@ subtest 'aggregate selections' => sub {
 
 
 
+subtest 'rollup, cube and grouping sets' => sub {
+    my $t = JSON::PP::true;
+    my %grouped = (select => ['maker_id', 'notes', {aggregate => 'count', alias => 'n'}], group_by => ['maker_id', 'notes'], limit => 50);
+    my $lines = sub ($body) {
+        my $result = $extended->query($engine, $body);
+        return [sort map { join '|', map { $_ // 'NULL' } @$_ } @{$result->{rows}}];
+    };
+    my @detail = ('1|NULL|1|0', '1|fast|1|0', '2|NULL|1|0', '2|classic|1|0', 'NULL|NULL|1|0');
+    my @by_maker = ('1|NULL|2|1', '2|NULL|2|1', 'NULL|NULL|1|1');
+    my @by_notes = ('NULL|NULL|3|2', 'NULL|classic|1|2', 'NULL|fast|1|2');
+    my @total = ('NULL|NULL|5|3');
+
+    my $cube = $extended->query($engine, {%grouped, cube => $t});
+    is_deeply $cube->{columns}, [qw(maker_id notes n grouping)], 'a grouping column is added last';
+    is_deeply $lines->({%grouped, cube => $t}), [sort @detail, @by_maker, @by_notes, @total], 'cube';
+    is_deeply $lines->({%grouped, rollup => $t}), [sort @detail, @by_maker, @total], 'rollup';
+    is_deeply $lines->({%grouped, grouping_sets => [[1], [0], []]}), [sort @by_maker, @by_notes, @total], 'grouping sets';
+    is_deeply $lines->({%grouped, grouping_sets => [[0, 1], [0], []]}), $lines->({%grouped, rollup => $t}), 'prefix sets equal the rollup';
+    is_deeply $lines->({%grouped, cube => JSON::PP::false}), [map { s/\|0\z//r } sort @detail], 'false asks for nothing';
+    is_deeply $lines->({%grouped, cube => $t, filters => [{field => 'maker_id', op => 'eq', value => 1}]}),
+        [sort '1|NULL|1|0', '1|fast|1|0', '1|NULL|2|1', 'NULL|NULL|1|2', 'NULL|fast|1|2', 'NULL|NULL|2|3'], 'filters apply to every set';
+    is scalar(@{$extended->query($engine, {%grouped, cube => $t, limit => 4})->{rows}}), 4, 'paged like any result';
+    ok $extended->query($engine, {%grouped, cube => $t, limit => 4})->{has_more}, 'with has_more';
+    my $objects = $extended->query($engine, {%grouped, rollup => $t, row_format => 'objects', limit => 1});
+    ok exists($objects->{rows}[0]{grouping}), 'objects carry the grouping key';
+
+    for my $case (
+        [{%grouped, cube => $t, rollup => $t}, 'two modes'],
+        [{%grouped, cube => 'yes'}, 'a non-boolean flag'],
+        [{select => [{aggregate => 'count', alias => 'n'}], cube => $t}, 'no group_by'],
+        [{%grouped, grouping_sets => []}, 'no sets'],
+        [{%grouped, grouping_sets => [[0]]}, 'a group in no set'],
+        [{%grouped, grouping_sets => [[0, 1], [1, 0]]}, 'the same set twice'],
+        [{%grouped, grouping_sets => [[0, 5], [1]]}, 'a position that does not exist'],
+        [{%grouped, grouping_sets => [['maker_id'], [1]]}, 'a name instead of a position'],
+        [{%grouped, grouping_sets => 'all'}, 'not an array'],
+        [{select => ['maker_id', {aggregate => 'count', alias => 'grouping'}], group_by => ['maker_id'], rollup => $t}, 'an alias named grouping'],
+    ) {
+        is code_of($extended, $case->[0]), 'invalid_api_query', "refused: $case->[1]";
+    }
+    is code_of($canonical, {select => ['maker_id'], group_by => ['maker_id'], rollup => $t}), 'invalid_api_query',
+        'a handler without aggregate entries refuses';
+
+    # An adapter without the capability refuses instead of grouping plainly.
+    my $adapter = Selecto->adapter(sqlite => (dbh => $dbh));
+    no warnings qw(redefine once);
+    my $supports = $adapter->can('supports');
+    local *Selecto::SQLite::supports = sub { $_[1] eq 'cube' ? 0 : $supports->(@_) };
+    is code_of($extended, {%grouped, cube => $t}), 'unsupported_feature', 'no cube capability';
+    is code_of($extended, {%grouped, rollup => $t}), 'ok', 'rollup is a separate capability';
+};
+
 done_testing;
