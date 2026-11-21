@@ -40,6 +40,7 @@ lib/Selecto/Domain/Projection.pm
 t/api_query_boolean_columns.t
 t/column_redacted.t
 t/domain_metadata_keys.t
+t/join_right_full.t
 t/domain_projection.t
 t/domain_schema_v2.t
 t/domain_compose_schema_v2.t

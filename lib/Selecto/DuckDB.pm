@@ -48,7 +48,8 @@ sub supports {
         || "$feature" eq 'window_functions'
         || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
         || "$feature" eq 'stream' || "$feature" eq 'value_expressions'
-        || "$feature" eq 'json_text' ? 1 : 0;
+        || "$feature" eq 'json_text'
+        || "$feature" eq 'right_join' || "$feature" eq 'full_join' ? 1 : 0;
 }
 
 # Value expressions cast to fixed targets; bare DECIMAL would round to three

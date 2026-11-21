@@ -240,6 +240,7 @@ sub _compile_single {
         ? {map { (refaddr($_) => 1) } _expression_nodes(@host_trees)} : undef;
     my @association_paths = $self->_referenced_associations($query, $predicate, $domain);
     my ($join_aliases, $through_aliases) = _association_alias_maps(@association_paths);
+    $self->_authored_join_aliases($domain, $join_aliases, $through_aliases, @association_paths);
     local $self->{_join_aliases} = $join_aliases;
     local $self->{_through_aliases} = $through_aliases;
     $self->_validate_query_aliases($sources, @association_paths);
@@ -304,7 +305,15 @@ sub _compile_single {
         local $self->{_selecto_pair_parent_types} = $self->_exact_identity_compare
             ? $self->_association_parent_types($domain, $path) : undef;
         my $association = $resolved->{association};
-        my $keyword = $association->join_type eq 'inner' ? 'INNER JOIN' : 'LEFT JOIN';
+        my $join_type = $association->join_type;
+        # RIGHT and FULL keep the target's unmatched rows; an adapter that
+        # cannot (MySQL and MariaDB have no FULL JOIN, SQLite before 3.39
+        # neither) refuses before any SQL.
+        Selecto::Error->throw('unsupported_feature', uc($join_type) . ' JOIN is not supported by this adapter',
+            {association => $path, join_type => $join_type})
+            if ($join_type eq 'right' || $join_type eq 'full') && !$self->supports("${join_type}_join");
+        my $keyword = $join_type eq 'inner' ? 'INNER JOIN' : $join_type eq 'right' ? 'RIGHT JOIN'
+            : $join_type eq 'full' ? 'FULL JOIN' : 'LEFT JOIN';
         my @segments = split /\./, $path;
         pop @segments;
         my $parent_alias = @segments ? $self->_join_alias(join('.', @segments)) : $self->_root_alias;
@@ -368,13 +377,20 @@ sub _compile_single {
             ) if $lateral_lookup && $self->name ne 'postgresql';
             my $lookup_alias = $lateral_lookup
                 ? '__selecto_lookup_' . $target_alias : $target_alias;
+            # A RIGHT or FULL join keeps target rows its ON clause rejects, so
+            # the target's own restrictions (association where, tenant bound)
+            # filter the target first, in a derived table; ON keeps only the
+            # conditions that pair the two sides.
+            my $preserves_target = $join_type eq 'right' || $join_type eq 'full';
             my @target_on = (
                 $owner_sql . ' = ' .
                     $self->_qualified($lookup_alias, $association->related_key),
             );
-            push @target_on, $self->_constant_join_predicates(
+            my @target_only;
+            push @target_only, $self->_constant_join_predicates(
                 $lookup_alias, $association->where, \@params, $association->fields, $association->table
             );
+            push @target_on, @target_only unless $preserves_target;
             if (defined $association->source_scope_key) {
                 push @target_on, $self->_identity_equal_sql(
                     $self->_qualified($parent_alias, $association->source_scope_key),
@@ -382,9 +398,30 @@ sub _compile_single {
                     $self->_association_identity_exact($association, $association->target_scope_key,
                 $association->source_scope_key));
             }
-            push @target_on, $self->_tenant_pair_sql($association, $parent_alias, $lookup_alias),
-                $self->_tenant_bound_sql($association, $lookup_alias, \@params);
-            if ($lateral_lookup) {
+            push @target_on, $self->_tenant_pair_sql($association, $parent_alias, $lookup_alias);
+            if ($preserves_target) {
+                push @target_only, $self->_tenant_bound_sql($association, $lookup_alias, \@params);
+                # A tenant-paired target is bound by the pair in ON, which a
+                # preserved row escapes: bind it to the engine tenant too.
+                my $engine = $self->{_selecto_compile_engine};
+                my $tenant = $engine ? $engine->scope->{tenant} : undef;
+                push @target_only, $self->_identity_values_sql(
+                    $self->_qualified($lookup_alias, $association->target_tenant_field), [$tenant], \@params,
+                    $self->_association_identity_exact($association, $association->target_tenant_field),
+                ) if defined($tenant) && defined($association->source_tenant_field)
+                    && defined($association->target_tenant_field);
+            } else {
+                push @target_on, $self->_tenant_bound_sql($association, $lookup_alias, \@params);
+            }
+            @target_only = grep { defined && length } @target_only;
+            if ($preserves_target && @target_only) {
+                push @joins,
+                    $keyword . ' (SELECT * FROM ' . $self->_association_source_sql($association) .
+                    ' AS ' . $self->quote_identifier($target_alias) .
+                    ' WHERE ' . join(' AND ', @target_only) . ') AS ' .
+                    $self->quote_identifier($target_alias) .
+                    ' ON ' . join(' AND ', @target_on);
+            } elsif ($lateral_lookup) {
                 # OFFSET 0 keeps PostgreSQL from flattening this correlated
                 # lookup into a join plan that repeatedly scans the relation.
                 # It does not limit rows or change the association's cardinality.
@@ -927,6 +964,27 @@ sub _query_sources {
         $register->($spec->{name}, {value => 1, (defined($spec->{ordinality}) ? ($spec->{ordinality} => 1) : ())});
     }
     return \%sources;
+}
+
+# A join's authored alias (joins.*.alias) replaces its generated one. Every
+# alias of the query stays distinct, ignoring case: an authored alias equal
+# to the root alias, a bridge alias or another join's is refused.
+sub _authored_join_aliases {
+    my ($self, $domain, $join_aliases, $through_aliases, @paths) = @_;
+    my $authored = 0;
+    for my $path (@paths) {
+        my $alias = $domain->resolve_association($path)->{association}->alias;
+        next unless defined $alias;
+        $join_aliases->{$path} = $alias;
+        $authored++;
+    }
+    return unless $authored;
+    my %seen = (lc($self->_root_alias) => 1);
+    for my $alias ((map { $join_aliases->{$_} } @paths), (map { $through_aliases->{$_} } @paths)) {
+        Selecto::Error->throw('invalid_domain', "join alias $alias collides with another relation alias",
+            {alias => $alias}) if $seen{lc $alias}++;
+    }
+    return;
 }
 
 sub _validate_query_aliases {

@@ -130,6 +130,8 @@ my %FEATURE_VERSIONS = (
     # tables; MariaDB: JSON_ARRAYAGG with ORDER BY and LIMIT.
     ordered_related_collections => [[8, 0, 14], [10, 5, 0]],
     bounded_related_collections => [[8, 0, 14], [10, 5, 0]],
+    # RIGHT JOIN everywhere; neither server has FULL JOIN (no entry).
+    right_join => [[5, 0, 0], [5, 0, 0]],
     # InnoDB FULLTEXT indexes in boolean mode.
     text_search => [[5, 7, 0], [10, 2, 0]],
 );

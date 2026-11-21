@@ -38,9 +38,9 @@ my %ASSOCIATION = map { $_ => 1 } qw(
 );
 my %JOIN = map { $_ => 1 } qw(
     source fields on
-    type name display_field dimension_key display_fallback joins
+    type name display_field dimension_key display_fallback joins alias
 );
-my @JOIN_TYPES = qw(left inner star_dimension);
+my @JOIN_TYPES = qw(left inner star_dimension right full);
 my %THROUGH = map { $_ => 1 } qw(
     table owner_key related_key source_scope_key through_scope_key target_scope_key
     where target_key_cast
@@ -542,6 +542,7 @@ sub _parse_canonical {
     my $joins = $raw->{joins} // {};
     _object($schemas, 'schemas');
     _object($joins, 'joins');
+    _join_aliases($joins);
     my $scope_tenant = ref($raw->{writes}) eq 'HASH' && ref($raw->{writes}{scope}) eq 'HASH'
         && ref($raw->{writes}{scope}{tenant}) eq 'HASH'
         ? ($raw->{writes}{scope}{tenant}{field} // $raw->{writes}{scope}{tenant}{tenant_field}) : undef;
@@ -956,6 +957,7 @@ sub _canonical_associations {
                 cardinality => $cardinality,
                 join_type => $join_mode eq 'star_dimension' ? 'left' : $join_mode,
                 join_mode => $join_mode,
+                (exists($join->{alias}) ? (alias => $join->{alias}) : ()),
                 queryable => "$queryable",
                 %scope_keys,
                 %tenant_keys,
@@ -975,6 +977,34 @@ sub _canonical_associations {
         );
     }
     return \%associations;
+}
+
+# Join aliases name SQL correlations: identifiers, outside the reserved
+# __selecto namespace, unique (ignoring case, as SQL does) across every join
+# entry the domain declares, nested ones included.
+sub _join_aliases {
+    my ($joins) = @_;
+    my %seen;
+    my @pending = ([$joins, '']);
+    while (my $next = shift @pending) {
+        my ($level, $prefix) = @$next;
+        next unless ref($level) eq 'HASH';
+        for my $key (sort keys %$level) {
+            my $join = $level->{$key};
+            next unless ref($join) eq 'HASH';
+            my $path = length($prefix) ? "$prefix.$key" : $key;
+            if (exists $join->{alias}) {
+                my $alias = _identifier($join->{alias}, 'join alias');
+                Selecto::Error->throw('invalid_domain', 'join alias uses the reserved __selecto prefix',
+                    {join => $path}) if $alias =~ /\A__selecto/i;
+                Selecto::Error->throw('invalid_domain', 'join aliases must be unique',
+                    {alias => $alias, joins => [$seen{lc $alias}, $path]}) if exists $seen{lc $alias};
+                $seen{lc $alias} = $path;
+            }
+            push @pending, [$join->{joins}, $path] if ref($join->{joins}) eq 'HASH';
+        }
+    }
+    return;
 }
 
 sub _canonical_join {
@@ -1645,6 +1675,7 @@ sub _portable_associations {
         };
         $joins->{$path} = {
             type => $association->join_mode,
+            (defined($association->alias) ? (alias => $association->alias) : ()),
             ($association->join_mode eq 'star_dimension' ? (
                 name => $association->display_name,
                 display_field => $association->display_field,
@@ -2961,12 +2992,24 @@ sub new {
         $value->{join_mode} // $value->{join_type} // 'left', 'join type'
     ));
     Selecto::Error->throw('invalid_domain', "unsupported join type $join_mode")
-        unless $join_mode eq 'left' || $join_mode eq 'inner'
-            || $join_mode eq 'star_dimension';
+        unless $join_mode =~ /\A(?:left|inner|right|full|star_dimension)\z/;
     my $join_type = $join_mode eq 'star_dimension' ? 'left'
         : lc(Selecto::Domain::_required_string($value->{join_type} // $join_mode, 'join type'));
     Selecto::Error->throw('invalid_domain', "unsupported join type $join_type")
-        unless $join_type eq 'left' || $join_type eq 'inner';
+        unless $join_type =~ /\A(?:left|inner|right|full)\z/;
+    # RIGHT and FULL joins keep the target's unmatched rows. They join a
+    # direct table or values association only: a bridge's nested join and a
+    # lateral lookup cannot preserve the target side.
+    Selecto::Error->throw('invalid_domain', "$join_type joins require a direct association",
+        {association => $args{name}, join_type => $join_type})
+        if ($join_type eq 'right' || $join_type eq 'full')
+            && (exists($value->{through}) || exists($value->{join_strategy}));
+    my $alias;
+    if (exists $value->{alias}) {
+        $alias = Selecto::Domain::_identifier($value->{alias}, 'join alias');
+        Selecto::Error->throw('invalid_domain', 'join alias uses the reserved __selecto prefix',
+            {association => $args{name}}) if $alias =~ /\A__selecto/i;
+    }
     my $fields = Selecto::Domain::_normalize_fields($value->{fields}, 'association fields');
     my %associations;
     my $nested = $value->{associations} // {};
@@ -3118,6 +3161,7 @@ sub new {
         target_primary_key => $target_primary_key,
         join_type => $join_type,
         join_mode => $join_mode,
+        (defined($alias) ? (alias => $alias) : ()),
         (defined($join_strategy) ? (join_strategy => $join_strategy) : ()),
         (map { defined($value->{$_}) ? ($_ => Selecto::Domain::_identifier($value->{$_}, $_ =~ tr/_/ /r)) : () }
             qw(source_tenant_field target_tenant_field)),
@@ -3156,6 +3200,7 @@ sub fingerprint_value {
         owner_key => $self->{owner_key},
         related_key => $self->{related_key},
         join_type => $self->{join_type},
+        (defined($self->{alias}) ? (alias => $self->{alias}) : ()),
         (defined($self->{join_strategy}) ? (
             join_strategy => $self->{join_strategy},
         ) : ()),
@@ -3190,6 +3235,7 @@ sub queryable   { return $_[0]->{queryable}; }
 sub owner_key   { return $_[0]->{owner_key}; }
 sub related_key { return $_[0]->{related_key}; }
 sub join_type   { return $_[0]->{join_type}; }
+sub alias       { return $_[0]->{alias}; }
 sub join_strategy { return $_[0]->{join_strategy}; }
 sub cardinality { return $_[0]->{cardinality}; }
 sub target_primary_key { return $_[0]->{target_primary_key}; }
@@ -3755,7 +3801,7 @@ C<validate_schema> applies (L<Selecto::Domain::Schema>).
           cardinality => 'one',         # inferred when omitted
       },
   },
-  joins => {customer => {type => 'left'}},  # left (default), inner, star_dimension
+  joins => {customer => {type => 'left'}},  # left (default), inner, right, full, star_dimension
 
 Cardinality is inferred as C<one> when C<related_key> is the target's primary
 key and C<many> otherwise. Paths may be arbitrarily deep
@@ -3814,6 +3860,30 @@ misplanned joins; it does not change results. Not available for C<through>
 or C<values> associations.
 
 =back
+
+=head2 Join types and aliases
+
+C<type> is C<left> (the default), C<inner>, C<right>, C<full> or
+C<star_dimension>. C<right> and C<full> keep the target's rows that no root
+row matches, with NULL root columns (C<full> also keeps unmatched root rows,
+as C<left> does). The target's own restrictions, its association C<where>
+and its tenant bound, filter the target before the join, so an excluded
+target row never appears. The root's required predicate, tenant scope and
+query filters stay in C<WHERE>, after the join: a predicate that rejects a
+NULL root (a tenant scope always does) removes the unmatched target rows, so
+under a tenant a C<right> join returns what an C<inner> join returns, and a
+C<full> join what a C<left> join returns. They take a direct association
+only (not C<through>, not C<join_strategy>), and the adapter must have the
+join: PostgreSQL and DuckDB have both, SQLite both from 3.39, MySQL and
+MariaDB C<right> only. Otherwise the query is refused with
+C<unsupported_feature> before any SQL (adapter features C<right_join>,
+C<full_join>).
+
+C<alias> names the join's SQL correlation (an identifier, not starting
+with C<__selecto>) instead of the generated one. Aliases are unique across
+the domain's join entries, ignoring case; an alias equal to another relation
+alias of a query (the root's, a bridge's) is refused with C<invalid_domain>.
+It changes no result.
 
 =head2 Star dimensions
 

@@ -1,6 +1,18 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Join types right and full and the join key alias, as Go and PHP (join
+      types) and Go and .NET (alias) have them. RIGHT and FULL joins keep
+      the target's unmatched rows; the target's association where and
+      tenant bound filter it first, in a derived table, and the root's
+      required predicate and tenant scope stay in WHERE (so under a tenant
+      no unmatched target row survives). They take a direct association
+      only. Adapters advertise right_join and full_join: PostgreSQL and
+      DuckDB both, SQLite both from 3.39, MySQL/MariaDB right_join only;
+      otherwise unsupported_feature before SQL. alias names the join's SQL
+      correlation; aliases are identifiers outside __selecto, unique across
+      the domain ignoring case, and never equal another relation alias of
+      the query. contract_keys lists them.
     - Fixed: a tenant_required domain whose tenant_field is not tenant_id
       (site_id, say) refused every read under with_tenant with
       tenant_scope_missing, because the scope check looked for a tenant_id

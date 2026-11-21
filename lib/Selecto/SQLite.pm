@@ -197,6 +197,7 @@ sub supports {
         if "$feature" eq 'ordered_related_collections' || "$feature" eq 'bounded_related_collections';
     return $self->_fts5_available if "$feature" eq 'text_search';
     return $self->_sqlite_version_at_least(3, 26, 0) if "$feature" eq 'schema_introspection';
+    return $self->_sqlite_version_at_least(3, 39, 0) if "$feature" eq 'right_join' || "$feature" eq 'full_join';
     return "$feature" eq 'transactions' || "$feature" eq 'set_operations'
         || "$feature" eq 'stream' || "$feature" eq 'value_expressions'
         || "$feature" eq 'rollup'

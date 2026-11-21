@@ -436,6 +436,7 @@ sub supports {
         || "$feature" eq 'window_functions' || "$feature" eq 'text_search'
         || "$feature" eq 'cte' || "$feature" eq 'recursive_cte'
         || "$feature" eq 'lateral_join' || "$feature" eq 'json_rowset'
+        || "$feature" eq 'right_join' || "$feature" eq 'full_join'
         || "$feature" eq 'stream' || "$feature" eq 'projection_sum'
         || "$feature" eq 'row_locks' || "$feature" eq 'value_expressions'
         || "$feature" eq 'json_text' || "$feature" eq 'array_rowset'

@@ -45,9 +45,9 @@ sub roundtrip {
 subtest 'contract_keys copies the canonical parser tables' => sub {
     my $keys = Selecto::Domain->contract_keys;
     is_deeply([sort keys %$keys], [qw(association join join_types relation through top_level)], 'all six tables');
-    is_deeply($keys->{join_types}, [qw(left inner star_dimension)], 'all accepted join types');
+    is_deeply($keys->{join_types}, [qw(left inner star_dimension right full)], 'all accepted join types');
     push @{$keys->{join_types}}, 'synthetic_unknown';
-    is_deeply(Selecto::Domain->contract_keys->{join_types}, [qw(left inner star_dimension)], 'join types are copied');
+    is_deeply(Selecto::Domain->contract_keys->{join_types}, [qw(left inner star_dimension right full)], 'join types are copied');
     for my $kind (qw(top_level relation association join through)) {
         ok(@{$keys->{$kind}}, "$kind has keys");
         push @{$keys->{$kind}}, 'synthetic_unknown';
@@ -135,11 +135,15 @@ for my $type (@{Selecto::Domain->contract_keys->{join_types}}) {
         $raw->{schemas}{sites}{associations}{area} = {queryable=>'areas', owner_key=>'site_id', related_key=>'id'};
         $raw->{joins}{'site.area'} = {type=>'inner'};
         roundtrip($raw, "$type dotted nested join");
+        # right and full joins take a direct association only.
+        my $direct_only = $type eq 'right' || $type eq 'full';
         $raw->{source}{associations}{site}{through} = {table=>'contract_bridges', owner_key=>'item_id', related_key=>'site_id'};
-        roundtrip($raw, "$type through association");
+        if ($direct_only) { ok(!eval { Selecto::Domain->parse($raw, strict=>1); 1 }, "$type through association refuses") }
+        else { roundtrip($raw, "$type through association") }
         delete $raw->{source}{associations}{site}{through};
         $raw->{source}{associations}{site}{join_strategy} = 'lateral_lookup';
-        roundtrip($raw, "$type lookup association");
+        if ($direct_only) { ok(!eval { Selecto::Domain->parse($raw, strict=>1); 1 }, "$type lookup association refuses") }
+        else { roundtrip($raw, "$type lookup association") }
     };
 }
 subtest 'inline values and extensible metadata round trip' => sub {
