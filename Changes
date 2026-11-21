@@ -70,6 +70,23 @@ Revision history for Selecto
       immutable records instead of walking them. Limits and refusals are
       unchanged: a record whose charge would break a limit is walked as
       before. Subclasses and portable admission are unaffected.
+    - PostgreSQL, stock DBD::Pg (no pg_transaction_status): a single managed
+      write no longer sends pg_ping before its transaction. It asks whether
+      the host has a raw BEGIN open in its own first round trip: BEGIN and
+      SELECT statement_timestamp() = transaction_timestamp(),
+      current_setting('transaction_isolation') as one simple query. One round
+      trip fewer per write (4 to 3). A new transaction goes on as the write's
+      own; inside the host's transaction the bare BEGIN is a no-op (the
+      server's warning is not printed, but the server may log it) and the
+      write takes a savepoint, as before; a failed host transaction refuses
+      with 25P02, a lost connection with its 08 error and a handle in COPY
+      with transaction_state_unsafe (active), as before. Differences: under
+      a session default isolation other than READ COMMITTED the first write
+      rolls its new transaction back and begins it again with the level (one
+      round trip more, once), and that adapter asks pg_ping before later
+      writes; if the check itself is interrupted (a cancel or timeout landing
+      on it) and leaves a transaction open, the handle is disconnected and
+      the write raises transaction_state_unsafe (unknown).
     - PostgreSQL: a single managed write on an idle handle opens its own
       transaction with one statement, BEGIN ISOLATION LEVEL READ COMMITTED,
       instead of begin_work followed by SET TRANSACTION ISOLATION LEVEL READ

@@ -236,6 +236,63 @@ sub _begin_transaction {
     return;
 }
 
+# Stock DBD::Pg cannot tell locally whether the host has a transaction open (a
+# raw BEGIN leaves AutoCommit on): pg_ping asks the server, a round trip before
+# the write's BEGIN. A single write on an idle-looking handle (the transaction
+# _begin_transaction opens as text) asks in its BEGIN's own round trip
+# instead: BEGIN and a SELECT go as one simple query, and the SELECT says
+# whether that BEGIN started the transaction. PostgreSQL documents that
+# statement_timestamp() and transaction_timestamp() are equal in the first
+# command of a transaction; every statement of one simple query shares the
+# statement timestamp, and a transaction the host opened began with an earlier
+# message. Inside the host's transaction a bare BEGIN changes nothing (the
+# server only warns; the warning is not passed on), and the write takes a
+# savepoint there as before. A host transaction that has failed refuses the
+# BEGIN (25P02) with nothing run, as it refused the savepoint. The SELECT also
+# reads the isolation level: when a session default other than READ COMMITTED
+# gave the new transaction another one, it is rolled back and begun again with
+# the level, and this adapter asks pg_ping first from then on.
+my $BEGIN_OR_JOIN = q{BEGIN; SELECT pg_catalog.statement_timestamp() OPERATOR(pg_catalog.=) }
+    . q{pg_catalog.transaction_timestamp(), pg_catalog.current_setting('transaction_isolation')};
+
+sub _managed_transaction {
+    my ($self, $operation) = @_;
+    my $dbh = $self->{dbh};
+    return $self->SUPER::_managed_transaction($operation)
+        unless $self->{_selecto_library_transaction} && !$self->{_selecto_pg_own_transaction}
+            && !$self->{_selecto_pg_isolation_default} && $self->_pg_session_checked
+            && !$dbh->can('pg_transaction_status') && eval { $dbh->{AutoCommit} };
+    $self->_refuse_pending_result;
+    my @row = eval { local $dbh->{PrintWarn} = 0; $dbh->selectrow_array($BEGIN_OR_JOIN) };
+    return $self->_unjoined_transaction($operation, $@ || Selecto::SQL::_dbi_error($dbh,
+        'database transaction could not begin')) unless @row == 2;
+    my ($first, $isolation) = @row;
+    return $self->_savepoint_transaction($operation) unless $first;
+    $self->{_selecto_pg_own_transaction} = 1;
+    if (($isolation // '') ne 'read committed') {
+        $self->{_selecto_pg_isolation_default} = 1;
+        eval { $self->_rollback_transaction; 1 } or die $self->_transaction_control_error($@);
+        return $self->_own_transaction($operation);
+    }
+    return $self->_own_transaction($operation, 1);
+}
+
+# The BEGIN and its SELECT failed. With a failed host transaction (25P02) the
+# server ran nothing, and the write fails as its savepoint did. Otherwise the
+# connection is asked, as it was before the write: busy is refused, lost
+# fails at the write's own BEGIN, idle means nothing ran, and an open
+# transaction whose owner cannot be told is not used again.
+sub _unjoined_transaction {
+    my ($self, $operation, $error) = @_;
+    die $self->_transaction_control_error($error) if (eval { $self->{dbh}->state } // '') eq '25P02';
+    my $status = $self->_pg_transaction_status;
+    return $self->_own_transaction($operation) if $status == 4;
+    _refuse_connection_state('active') if $status == 1;
+    die $self->_transaction_control_error($error) if $status == 0;
+    eval { local $self->{dbh}{PrintError} = 0; $self->{dbh}->disconnect };
+    _refuse_connection_state('unknown');
+}
+
 # One transaction-control statement of the library's own transaction. It fails
 # as begin_work and commit do: with the driver's error, whether or not the
 # handle raises errors by itself.
@@ -1950,6 +2007,16 @@ C<ROLLBACK> sent as text, so C<AutoCommit> stays on while that write runs; no
 host code runs inside it. Batches, graphs and L<Selecto::Engine/transaction>
 use C<begin_work> and C<SET TRANSACTION>, with C<AutoCommit> off for the code
 they run.
+
+On a driver without C<pg_transaction_status> such a write learns whether the
+host has a raw C<BEGIN> open in its own first round trip, with no C<pg_ping>
+before it: C<BEGIN; SELECT statement_timestamp() = transaction_timestamp(),
+current_setting('transaction_isolation')> as one simple query. A new
+transaction goes on as the write's own; inside the host's transaction the
+bare C<BEGIN> is a no-op (its warning is not printed) and the write takes a
+savepoint, as before. If the session default isolation is not C<READ
+COMMITTED> the new transaction is rolled back and begun again with the
+level, and that adapter asks C<pg_ping> before later writes instead.
 
 =back
 

@@ -4256,6 +4256,15 @@ sub _transaction {
         return $self->_external_transaction($operation);
     }
     return $self->_handler_transaction($handler, $operation) if defined $handler;
+    return $self->_managed_transaction($operation);
+}
+
+# Managed mode without a handler: a savepoint inside a transaction that is
+# already open, otherwise the write's own transaction. A dialect that can
+# begin its own and learn whether one was open in the same exchange
+# overrides this (Selecto::PostgreSQL).
+sub _managed_transaction {
+    my ($self, $operation) = @_;
     return $self->_savepoint_transaction($operation) if $self->_transaction_open;
     return $self->_own_transaction($operation);
 }
@@ -4271,12 +4280,13 @@ sub _external_transaction {
     return $self->_savepoint_transaction($operation);
 }
 
-# Managed mode on an idle handle: the write's own transaction.
+# Managed mode on an idle handle: the write's own transaction. $begun says
+# the dialect has already begun it.
 sub _own_transaction {
-    my ($self, $operation) = @_;
+    my ($self, $operation, $begun) = @_;
     # A transaction that never began is not rolled back: the handle may be
     # inside work this adapter cannot see.
-    eval { $self->_begin_transaction; 1 }
+    $begun or eval { $self->_begin_transaction; 1 }
         or die $self->_transaction_control_error($@);
     my ($value, $error);
     my $ok;
@@ -4707,7 +4717,9 @@ Per adapter:
 =over 4
 
 =item * PostgreSQL, SQLite, MySQL and MariaDB use C<SAVEPOINT>. PostgreSQL
-also detects a raw C<BEGIN> through C<pg_ping> and MySQL/MariaDB through
+also detects a raw C<BEGIN> through libpq's transaction status (C<pg_ping> on
+stock DBD::Pg; a single write reads it from its own C<BEGIN> instead, see
+L<Selecto::PostgreSQL/WHAT THE HOST MUST PROVIDE>) and MySQL/MariaDB through
 C<@@in_transaction>; DBD::SQLite turns C<AutoCommit> off itself.
 
 =item * SQL Server uses C<SAVE TRANSACTION> and C<ROLLBACK TRANSACTION>

@@ -112,9 +112,11 @@ for my $stock (0, 1) {
         SKIP: {
             my $sent = statements($wire);
             skip 'this libpq trace does not name messages', 1 unless defined $sent;
-            # BEGIN, the write and COMMIT; a driver without local transaction
-            # status first asks the server whether a transaction is open.
-            is($sent, $local ? 3 : 4, 'three statements' . ($local ? '' : ' after the state check'));
+            # BEGIN, the write and COMMIT. A driver without local transaction
+            # status asks whether a transaction is open in its BEGIN; under
+            # this session default its new transaction is then rolled back and
+            # begun again with the level (t/pg_write_begin_probe_live.t).
+            is($sent, $local ? 3 : 5, $local ? 'three statements' : 'five statements under a SERIALIZABLE default');
         }
         is_deeply($rows->()->[0], [1, 'one', 'read committed'], 'the row is written under READ COMMITTED, whatever the session default');
         ok($dbh->{AutoCommit}, 'AutoCommit is on afterwards');

@@ -459,3 +459,4 @@ t/domain_contract_json.t
 t/month_buckets.t
 t/synthetic_fields.t
 t/pg_write_transaction_live.t
+t/pg_write_begin_probe_live.t
