@@ -115,9 +115,9 @@ for my $stock (0, 1) {
         SKIP: {
             my $sent = statements($wire);
             skip 'this libpq trace does not name messages', 1 unless defined $sent;
-            # (Without local status the one other statement is pg_ping: it tells
-            # a raw host BEGIN, a failed transaction and a lost connection apart.)
-            is($sent, $local ? 1 : 2, $local ? 'one statement, one round trip' : 'one statement after the connection state check');
+            # (Without local status nothing asks the server first either: a
+            # generated read runs as written wherever it is.)
+            is($sent, 1, 'one statement, one round trip');
         }
         is(scalar(@{$result->{rows}}), 6, 'and answers');
         like($result->{rows}[0][1], qr/\Aoff:\d+\z/, 'the read is not READ ONLY');
@@ -129,6 +129,17 @@ for my $stock (0, 1) {
         ok($dbh->{AutoCommit}, 'AutoCommit is unchanged');
         is($dbh->pg_ping, 1, 'and the connection is idle');
         is(($dbh->selectrow_array('SELECT pg_catalog.txid_current_if_assigned()'))[0], undef, 'no transaction is left open');
+
+        # Unasked, a failed host transaction is still refused as one: the
+        # server ran nothing (25P02) and the transaction stays the host's.
+        $dbh->do('BEGIN');
+        eval { local $dbh->{PrintError} = 0; $dbh->do('SELECT 1/0') };
+        my $unasked = eval { $state->all($query); 1 } ? undef : $@;
+        is(eval { $unasked->code }, 'transaction_state_unsafe', 'a generated read in a failed host transaction is refused');
+        is(eval { $unasked->details->{state} }, 'inerror', 'as a failed transaction');
+        is($dbh->pg_ping, 4, 'which is left for the host to roll back');
+        $dbh->do('ROLLBACK');
+        is(scalar(@{$state->all($query)->{rows}}), 6, 'and reads answer again after it does');
 
         # The documented consequence: what the host's view writes is committed.
         my $audit = $engine->('gr_audit_v');
@@ -189,6 +200,32 @@ for my $stock (0, 1) {
         $encoding = failure(sub { $other->all($other->query->select('id', 'note')->order_by('id')) });
         is($encoding && $encoding->details->{reason}, 'client_encoding', 'a connection that begins in LATIN1 is refused too');
         $latin->disconnect;
+
+        # A lost connection is refused as an unknown state, with or without
+        # the question: the backend is ended from outside, in no transaction
+        # and inside a raw host BEGIN, and the handle is disconnected.
+        for my $lost ('backend terminated', 'backend terminated in a host transaction', 'handle disconnected') {
+            my $gone = TestPostgreSQL->connect;
+            bless $gone, 'Local::StockDB' if $stock;
+            my $reader = Selecto::Engine->new(domain => $domain->('gr_state_v'), adapter => Selecto::PostgreSQL->new(dbh => $gone))->with_scope(tenant => 't1');
+            my $read = $reader->query->select('id', 'note')->order_by('id');
+            is(scalar(@{$reader->all($read)->{rows}}), 6, "$lost: the connection reads first");
+            $gone->do('BEGIN') if $lost =~ /host transaction/;
+            if ($lost eq 'handle disconnected') {
+                $gone->disconnect;
+            } else {
+                my $pid = $gone->{pg_pid};
+                $admin->do('SELECT pg_catalog.pg_terminate_backend(?)', undef, $pid);
+                for (1 .. 50) {
+                    last unless ($admin->selectrow_array('SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE pid = ?', undef, $pid))[0];
+                    select undef, undef, undef, 0.02;
+                }
+            }
+            my $error = failure(sub { $reader->all($read) });
+            is($error && $error->code, 'transaction_state_unsafe', "$lost: a generated read is refused");
+            is($error && $error->details->{state}, 'unknown', "$lost: as an unknown connection state");
+            eval { local $gone->{PrintError} = 0; $gone->disconnect };
+        }
     };
 }
 

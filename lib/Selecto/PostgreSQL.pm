@@ -1423,6 +1423,7 @@ sub _guarded_read {
     my ($self, $source, $work) = @_;
     return $work->() if !$self->_pg_session_checked || $self->{_selecto_pg_read_guard};
     local $self->{_selecto_pg_read_guard} = 1;
+    return $self->_generated_read_unasked($source, $work) if $self->_reads_unasked($source);
     my $scope = $self->_read_guard_scope;
     $self->_admit_hand_built($source);
     if ($scope eq 'host') {
@@ -1459,6 +1460,43 @@ sub _guarded_read {
     }
     die $error unless $ok;
     return $result;
+}
+
+# Stock DBD::Pg learns the transaction state only from the server: pg_ping, one
+# round trip before the read. A generated read that locks no rows runs as
+# written wherever it is (the host's transaction, or one autocommit
+# statement), so nothing it does depends on the answer. It is sent without
+# asking, and a failure is read for what the check would have refused: 25P02
+# (the host's transaction had already failed; the server ran nothing) or a
+# lost connection. A driver with a local pg_transaction_status keeps the check.
+sub _reads_unasked {
+    my ($self, $source) = @_;
+    return 0 if $self->{dbh}->can('pg_transaction_status');
+    return _generated($source) && !$source->{_selecto_row_lock} ? 1 : 0;
+}
+
+sub _generated_read_unasked {
+    my ($self, $source, $work) = @_;
+    my $dbh = $self->{dbh};
+    # The local refusals of _read_guard_scope, in its order.
+    Selecto::Error->throw('handle_owned_by_stream',
+        'the handle belongs to an open bounded stream until it closes: call begin_work before the stream to use the '
+        . 'handle between fetches', {method => 'selecto'})
+        if $Selecto::PostgreSQL::Stream::OWNED{Scalar::Util::refaddr($dbh) // 0};
+    $self->_refuse_pending_result;
+    delete $self->{_selecto_pg_new_savepoint};
+    $self->_admit_hand_built($source);
+    $self->_pg_require_utf8;
+    my $wantarray = wantarray;
+    my @result;
+    return $wantarray ? @result : $result[0]
+        if eval { if ($wantarray) { @result = $work->() } else { $result[0] = $work->() } 1 };
+    my $error = $@;
+    my $state = (blessed($error) && $error->can('details') ? ($error->details // {})->{sqlstate} : undef)
+        // eval { $dbh->state } // '';
+    _refuse_connection_state('inerror') if $state eq '25P02';
+    _refuse_connection_state('unknown') if $state =~ /\A08/ || !eval { $dbh->{Active} };
+    die $error;
 }
 
 # A statement the adapter compiled, or derived from one it compiled.
@@ -1739,9 +1777,12 @@ session's value is unchanged after one.
 A hand-built read, with no transaction open, is a transaction of its own:
 C<BEGIN READ ONLY NOT DEFERRABLE>, the query, C<ROLLBACK>. When DBD::Pg exposes
 C<pg_transaction_status>, the ownership check uses local libpq state; older
-drivers retain C<pg_ping>, one round trip before every read, which is what
-tells them a raw host C<BEGIN>, a failed transaction, a busy connection and a
-lost one. When the driver also exposes
+drivers retain C<pg_ping>, one round trip before a hand-built read and wherever a
+read needs a transaction or savepoint of its own, which is what tells them a raw host C<BEGIN>, a failed
+transaction, a busy connection and a lost one. A generated read that locks no
+rows is not preceded by it: it runs as written wherever it is, and a failed
+host transaction (C<25P02>) or a lost connection is still refused as
+C<transaction_state_unsafe>, from the failure. When the driver also exposes
 C<pg_pipeline>, hand-built materialized reads can send that entire frame without an
 intermediate wait. If the driver exposes C<pg_can_pipeline>, it must return true:
 this selects supported builds and loaded libpq libraries and honors the handle's

@@ -9,6 +9,17 @@ Revision history for Selecto
       capabilities; MySQL, MariaDB and SQL Server do not declare them and
       refuse such queries. A cube takes at most 8 dimensions and a query at
       most 64 grouping sets.
+    - PostgreSQL, stock DBD::Pg: a generated read that locks no rows is no
+      longer preceded by the connection state check (pg_ping), so it is one
+      round trip instead of two. It runs as written wherever it is, so nothing
+      it does depended on the answer. Behaviour change: in a failed host
+      transaction the read is now sent and the server refuses it (25P02,
+      nothing runs), where nothing was sent before; the caller still gets
+      transaction_state_unsafe (state inerror). A lost connection (the
+      failure carries SQLSTATE class 08, or the handle is inactive) is still
+      refused as transaction_state_unsafe (state unknown), now read from the
+      failure. Hand-built reads, row-locking reads, streams and writes keep
+      the check; a driver with a local pg_transaction_status is unchanged.
     - PostgreSQL: a generated read is one autocommit statement (user ruling of
       2026-11-20, which narrows R55 below). With no transaction open it no
       longer runs in a READ ONLY transaction of its own, so with stock DBD::Pg
