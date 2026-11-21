@@ -9,6 +9,11 @@ Revision history for Selecto
       a grouped query, runs them through the adapter, and adds a last
       column, grouping, to tell the rows apart. The remote_query.v1 wire
       profile is unchanged and still refuses group_by.
+    - Computed-column shorthand (Selecto::Domain::Synthetic): the kinds
+      temporal_delta (whole days between two date fields) and bucket
+      (labelled inclusive numeric ranges) are parsed into ordinary expression
+      computed columns. Value expressions gain the node days_between,
+      compiled for PostgreSQL, SQLite, DuckDB and MySQL/MariaDB.
     - CUBE and GROUPING SETS: Selecto::Query gains group_by_cube and
       group_by_grouping_sets, the grouping modes cube and grouping_sets, and
       grouping_set_positions. PostgreSQL and DuckDB compile the native

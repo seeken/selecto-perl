@@ -2828,6 +2828,10 @@ sub _compile_value_expression {
             'CAST(' . $self->_compile_value_expression($domain, $_, $params) . " AS $text)"
         } @arguments) . ')';
     }
+    if ($operator eq 'days_between') {
+        my ($start, $end) = map { $self->_compile_value_expression($domain, $_, $params) } @arguments;
+        return $self->_days_between_sql($start, $end);
+    }
     if ($operator eq 'cast') {
         # Casting to an instant reads naive-UTC columns as instants.
         local $self->{_instant_fields} = $self->{_instant_fields} || $arguments[1] eq q{utc_datetime};
@@ -2851,6 +2855,13 @@ sub _compile_value_expression {
         return 'CASE ' . join(' ', @parts) . ' END';
     }
     Selecto::Error->throw('invalid_query', "unsupported value expression operator $operator");
+}
+
+# Whole calendar days from $start to $end: the difference of their dates,
+# whatever the time of day. Negative when $end is the earlier date.
+sub _days_between_sql {
+    my ($self, $start, $end) = @_;
+    return "(CAST($end AS DATE) - CAST($start AS DATE))";
 }
 
 # Adapter-owned allowlist mapping a value type to a SQL cast target.

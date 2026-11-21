@@ -25,6 +25,7 @@ use Selecto::OperationBudget ();
 #   ['json_text', FIELD_PATH, [SEGMENT, ...]]
 #   ['lower' | 'upper', VALUE]
 #   ['concat', VALUE, VALUE, ...]
+#   ['days_between', START, END]   (whole calendar days from START to END)
 #   ['previous', COLUMN]   (recursive member steps only: the previous level's row)
 #
 # FILTER is the portable filter AST accepted by
@@ -126,6 +127,10 @@ sub _parse {
     if ($CASE_FUNCTION{$operator}) {
         _fail("$label $operator requires exactly one value") unless @arguments == 1;
         return [$operator, _parse($arguments[0], "$label $operator argument")];
+    }
+    if ($operator eq 'days_between') {
+        _fail("$label days_between requires a start and an end value") unless @arguments == 2;
+        return ['days_between', map { _parse($_, "$label days_between operand") } @arguments];
     }
     if ($operator eq 'cast') {
         _fail("$label cast requires a value and a target type") unless @arguments == 2;
@@ -265,6 +270,13 @@ sub _infer {
         _infer($_, $resolve) for @arguments;
         return 'string';
     }
+    if ($operator eq 'days_between') {
+        for my $category (map { _infer($_, $resolve) } @arguments) {
+            _type_error("days_between requires date or datetime operands, found $category")
+                unless $category eq 'date' || $category eq 'datetime';
+        }
+        return 'integer';
+    }
     if ($operator eq 'cast') {
         _infer($arguments[0], $resolve);
         return _category_of_cast($arguments[1]);
@@ -350,6 +362,7 @@ parsed.
   ['json_text', FIELD, [SEGMENT, ...]] segments of letters, digits and underscores
   ['lower' | 'upper', NODE]
   ['concat', NODE, NODE, ...]
+  ['days_between', START, END]
   ['previous', COLUMN]                 only in recursive query-member steps
 
 =head1 RULES
@@ -371,6 +384,10 @@ satisfies a declared C<decimal>).
 
 C<divide> always produces a decimal, so integer operands never truncate.
 C<concat> casts each operand to text and treats null as empty.
+C<days_between> takes two date or datetime values and gives the whole
+calendar days from the first to the second as an integer: the difference of
+their dates whatever the times of day, negative when the second is earlier,
+and null when either is null.
 
 =item *
 

@@ -443,7 +443,9 @@ t/external_query_budget.t
 t/optional_sqlserver_boundary.t
 docs/compile_cache.md
 lib/Selecto/CompileCache.pm
+lib/Selecto/Domain/Synthetic.pm
 t/compile_cache.t
 t/compile_cache_fingerprint.t
 t/compile_cache_tenants.t
 t/domain_contract_json.t
+t/synthetic_fields.t

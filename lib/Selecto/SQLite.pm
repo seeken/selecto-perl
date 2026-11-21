@@ -692,6 +692,11 @@ sub _compile_value_expression {
     return $self->SUPER::_compile_value_expression($domain, $node, $params);
 }
 
+sub _days_between_sql {
+    my ($self, $start, $end) = @_;
+    return "CAST(julianday(date($end)) - julianday(date($start)) AS INTEGER)";
+}
+
 # Plain starts_with, text_contains and ends_with compare exactly: SQLite's
 # LIKE folds ASCII case, so only the _ci forms use it.
 sub _compile_text_match {

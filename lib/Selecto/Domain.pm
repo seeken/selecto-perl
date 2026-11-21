@@ -1073,6 +1073,29 @@ sub _validate_computed_columns {
         my $computed = $column->{computed};
         _object($computed, "computed column $field");
         my $kind = _required_string($computed->{kind}, "computed column $field kind");
+        if ($kind eq 'temporal_delta' || $kind eq 'bucket') {
+            # Shorthand: the column is stored and behaves as the expression
+            # it stands for.
+            require Selecto::Domain::Synthetic;
+            $computed = $column->{computed} = {
+                kind => 'expression',
+                expression => Selecto::Domain::Synthetic->expand($field, $computed, sub {
+                    # The declared type of a root field or of a field one
+                    # association away; deeper paths are left to the query.
+                    my ($relation, @rest) = ($source, split /\./, $_[0]);
+                    if (@rest == 2) {
+                        my $association = ref($source->{associations}) eq 'HASH'
+                            ? $source->{associations}{shift @rest} : undef;
+                        $relation = ref($association) eq 'HASH' && defined($association->{queryable})
+                            && ref($schemas) eq 'HASH' ? $schemas->{$association->{queryable}} : undef;
+                    }
+                    return undef unless @rest == 1 && ref($relation) eq 'HASH'
+                        && ref($relation->{columns}) eq 'HASH' && ref($relation->{columns}{$rest[0]}) eq 'HASH';
+                    return $relation->{columns}{$rest[0]}{type};
+                }),
+            };
+            $kind = 'expression';
+        }
         my %allowed = map { $_ => 1 } $kind eq 'predicate' || $kind eq 'expression'
             ? qw(kind expression) : $kind eq 'coalesce_fields'
                 ? qw(kind fields) : qw(kind association);
@@ -3803,6 +3826,14 @@ decisions such as action eligibility:
 
 The joined value, falling back to a root column of the same type. The
 association must be a direct, left-joined one-to-one association.
+
+=item C<< {kind => 'temporal_delta', from => $field, to => $field} >>
+
+=item C<< {kind => 'bucket', field => $field, buckets => [...]} >>
+
+Shorthand for two common expressions: whole days between two dates, and
+labelled numeric ranges. Both are stored as C<expression> columns. See
+L<Selecto::Domain::Synthetic>.
 
 =item C<< {kind => 'association_exists', association => 'name'} >>
 

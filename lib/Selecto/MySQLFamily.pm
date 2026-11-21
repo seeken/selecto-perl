@@ -177,6 +177,11 @@ sub _server_version_at_least {
 
 # Neither server orders rollup NULLs with NULLS FIRST/LAST, and MariaDB has
 # no GROUPING(): rollups compile as UNION ALL grouping branches.
+sub _days_between_sql {
+    my ($self, $start, $end) = @_;
+    return "DATEDIFF(CAST($end AS DATE), CAST($start AS DATE))";
+}
+
 sub _emulates_rollup { return 1; }
 
 # Both servers sort NULL first ascending; results order NULLs as PostgreSQL.

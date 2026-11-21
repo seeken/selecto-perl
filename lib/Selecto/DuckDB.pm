@@ -35,6 +35,11 @@ sub normalize_type {
     }->{lc "$name"} // 'unknown';
 }
 
+sub _days_between_sql {
+    my ($self, $start, $end) = @_;
+    return "date_diff('day', CAST($start AS DATE), CAST($end AS DATE))";
+}
+
 sub supports {
     my ($self, $feature) = @_;
     return "$feature" eq 'transactions' || "$feature" eq 'returning'
