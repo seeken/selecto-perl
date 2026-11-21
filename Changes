@@ -11,8 +11,10 @@ Revision history for Selecto
       or redacted fields, through and values associations refuse with
       invalid_domain. They only narrow: tenant pairing is unchanged.
       Fingerprints change only for domains that declare them; contract_keys
-      lists conditions in the association table. Write-side foreign-key
-      guards treat a conditioned association as a filtered lookup.
+      lists conditions in the association table, and contract_json
+      exports each condition's open as a JSON boolean. Write-side
+      foreign-key guards treat a conditioned association as a filtered
+      lookup.
     - contract_keys gains a source table: the root source's keys, the
       relation keys plus fts5_index. fts5_index is a root source key: a
       schemas relation naming it now refuses with invalid_domain (reason

@@ -197,6 +197,8 @@ subtest 'fingerprint, contract and export' => sub {
     ok((grep { $_ eq 'conditions' } @{Selecto::Domain->contract_keys->{association}}), 'association table lists conditions');
     is_deeply($with->as_contract->{source}{associations}{price}{conditions}, domain()->{source}{associations}{price}{conditions},
         'as_contract keeps the authored conditions');
+    my $exported = Selecto::Domain->parse($upper)->contract_json->{source}{associations}{price}{conditions};
+    ok(JSON::PP::is_bool($exported->[1]{open}) && $exported->[1]{open}, 'contract_json exports open 1 as JSON true');
 };
 
 done_testing;

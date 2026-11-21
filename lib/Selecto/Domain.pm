@@ -122,6 +122,10 @@ sub _contract_json_booleans {
             _json_booleans($column, qw(hidden internal redacted nullable selectable filterable
                 sortable groupable detail_selectable query_filterable aggregatable));
         }
+        for my $association (_contract_objects($relation->{associations})) {
+            next unless ref($association) eq 'HASH' && ref($association->{conditions}) eq 'ARRAY';
+            _json_booleans($_, 'open') for @{$association->{conditions}};
+        }
     }
     for my $column (_contract_objects($contract->{columns})) {
         _json_booleans($column, qw(hidden internal redacted nullable selectable filterable
@@ -3707,7 +3711,8 @@ in the contract. Constructor-form domains are converted to canonical form.
 Boolean positions are domain C<tenant_required> and C<require_tenant>; column
 C<hidden>, C<internal>, C<redacted>, C<nullable>, C<selectable>, C<filterable>,
 C<sortable>, C<groupable>, C<detail_selectable>, C<query_filterable> and
-C<aggregatable> (also top-level column overrides); components C<query_params>
+C<aggregatable> (also top-level column overrides); association-condition
+C<open> on the source and C<schemas> relations; components C<query_params>
 and filter-choice C<picker_hidden>; co-domain search C<rank>; action
 C<prerequisite_column> and input C<required>; detail-action payload
 C<navigation_enabled>; editor-field C<required>, C<nullable>, C<readonly>;
