@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - contract_keys gains a source table: the root source's keys, the
+      relation keys plus fts5_index. fts5_index is a root source key: a
+      schemas relation naming it now refuses with invalid_domain (reason
+      fts5_index_not_root) in every mode; before, a strict parse refused it
+      only on a relation an association named, and otherwise it was ignored.
     - Join types right and full and the join key alias, as Go and PHP (join
       types) and Go and .NET (alias) have them. RIGHT and FULL joins keep
       the target's unmatched rows; the target's association where and

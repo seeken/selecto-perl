@@ -44,11 +44,12 @@ sub roundtrip {
 
 subtest 'contract_keys copies the canonical parser tables' => sub {
     my $keys = Selecto::Domain->contract_keys;
-    is_deeply([sort keys %$keys], [qw(association join join_types relation through top_level)], 'all six tables');
+    is_deeply([sort keys %$keys], [qw(association join join_types relation source through top_level)], 'all seven tables');
+    is_deeply($keys->{source}, [sort(@{$keys->{relation}}, 'fts5_index')], 'the root source is a relation plus fts5_index');
     is_deeply($keys->{join_types}, [qw(left inner star_dimension right full)], 'all accepted join types');
     push @{$keys->{join_types}}, 'synthetic_unknown';
     is_deeply(Selecto::Domain->contract_keys->{join_types}, [qw(left inner star_dimension right full)], 'join types are copied');
-    for my $kind (qw(top_level relation association join through)) {
+    for my $kind (qw(top_level source relation association join through)) {
         ok(@{$keys->{$kind}}, "$kind has keys");
         push @{$keys->{$kind}}, 'synthetic_unknown';
         ok(!grep($_ eq 'synthetic_unknown', @{Selecto::Domain->contract_keys->{$kind}}), "$kind is copied");

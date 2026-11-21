@@ -32,6 +32,9 @@ my %RELATION = map { $_ => 1 } qw(
     source_table values primary_key fields columns associations tenant_field redact_fields
     source_kind readonly
 );
+# The root source is a relation that may also name its FTS5 index; a schemas
+# relation may not.
+my %ROOT_SOURCE = (%RELATION, fts5_index => 1);
 my %ASSOCIATION = map { $_ => 1 } qw(
     queryable field owner_key related_key cardinality through source_scope_key target_scope_key where
     join_strategy
@@ -65,6 +68,7 @@ my %EDITOR_COLLECTION_FIELD = map { $_ => 1 } qw(field label);
 sub contract_keys {
     return {
         top_level => [sort keys %TOP_LEVEL],
+        source => [sort keys %ROOT_SOURCE],
         relation => [sort keys %RELATION],
         association => [sort keys %ASSOCIATION],
         join => [sort keys %JOIN],
@@ -471,6 +475,15 @@ sub parse {
         Selecto::Error->throw('invalid_domain', "domain metadata: $error->{code} at " . join('.', @{$error->{path}}),
             {reason => $error->{code}, path => $error->{path}});
     }
+    # fts5_index is a root source key: a schemas relation naming one is
+    # refused in every mode, referenced by an association or not.
+    if (ref($raw->{schemas}) eq 'HASH') {
+        for my $id (sort keys %{$raw->{schemas}}) {
+            Selecto::Error->throw('invalid_domain', "schema $id: fts5_index is a root source key",
+                {reason => 'fts5_index_not_root', path => ['schemas', $id, 'fts5_index']})
+                if ref($raw->{schemas}{$id}) eq 'HASH' && exists $raw->{schemas}{$id}{fts5_index};
+        }
+    }
     # A top-level tenant is schema 2's: ignored here, the domain would load
     # without its tenant, so it refuses even when the parse is not strict.
     _reject_unknown({tenant => $raw->{tenant}}, {}, 'domain') if exists $raw->{tenant};
@@ -533,7 +546,7 @@ sub _parse_canonical {
     # once, into the schema 1 form every write path reads.
     _load_nested_domains($raw);
     $source = $raw->{source};
-    _reject_unknown($source, {%RELATION, fts5_index => 1}, 'source') if $strict;
+    _reject_unknown($source, \%ROOT_SOURCE, 'source') if $strict;
     Selecto::Error->throw(
         'invalid_domain', 'root source must use source_table rather than values',
     ) if exists $source->{values};
@@ -3565,11 +3578,14 @@ is returned. It never changes the shared domain.
 
   my $keys = Selecto::Domain->contract_keys;
 
-Returns fresh arrays of accepted C<top_level>, C<relation>, C<association>,
-C<join>, C<through> keys and C<join_types>. These are the canonical parser's
-actual tables, not a separate schema. Column metadata is extensible. The root
-also accepts C<fts5_index>. Structural admission does not imply that an adapter
-supports every declaration.
+Returns fresh arrays of accepted C<top_level>, C<source> (the root source),
+C<relation> (each C<schemas> entry), C<association>, C<join>, C<through> keys
+and C<join_types>. These are the canonical parser's actual tables, not a
+separate schema. Column metadata is extensible. C<source> is C<relation> plus
+C<fts5_index>, which only the root source takes: a C<schemas> relation naming
+it is refused with C<invalid_domain> (C<reason> C<fts5_index_not_root>) in
+every mode. Structural admission does
+not imply that an adapter supports every declaration.
 
 =head2 contract_json
 

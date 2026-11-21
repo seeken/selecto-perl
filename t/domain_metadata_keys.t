@@ -100,6 +100,14 @@ subtest 'contract keeps the metadata and the admission tables list it' => sub {
     ok(!grep({ my $k = $_; !grep { $_ eq $k } @{$keys->{relation}} } qw(source_kind readonly)), 'relation table');
     my $simple = {name => 'Simple', source => {table => 'items', fields => {id => 'integer'}, source_kind => 'view'}};
     is(refusal($simple, 1)->code, 'unknown_domain_key', 'a simple source does not take relation metadata');
+    my $index = base();
+    $index->{source}{fts5_index} = {table => 'items_search', key => 'id'};
+    ok(!refusal($index, 1), 'the root source takes fts5_index');
+    $index->{schemas}{other} = {%{other()}, fts5_index => {table => 'items_search', key => 'id'}};
+    for my $strict (1, 0) {
+        my $error = refusal($index, $strict);
+        is($error && $error->details->{reason}, 'fts5_index_not_root', "a schemas relation does not (strict $strict)");
+    }
 };
 
 done_testing;
