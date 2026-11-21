@@ -936,12 +936,15 @@ sub _compile_bucket {
         }
         $result = "CASE WHEN ($text) = '' THEN 'Other' ELSE UPPER(SUBSTR(($text),1," . int($length) . ')) END';
     } else {
-        my %ranges = map { $_ => 1 } qw(numeric_ranges elapsed_days_ranges date_relative_ranges year_ranges);
+        my %ranges = map { $_ => 1 } qw(numeric_ranges elapsed_days_ranges date_relative_ranges year_ranges month_ranges);
         Selecto::Error->throw('invalid_query', 'bucket kind is not available') unless $ranges{$kind};
         my $ranges = $spec->{ranges};
         Selecto::Error->throw('invalid_query', 'bucket ranges must be a non-empty array') unless ref($ranges) eq 'ARRAY' && @$ranges;
         my $number = $kind eq 'elapsed_days_ranges' ? "(JULIANDAY('now', 'start of day') - JULIANDAY(DATE($value)))"
             : $kind eq 'year_ranges' ? "CAST(STRFTIME('%Y', $value) AS INTEGER)"
+            # Calendar months ago: 0 is this month, 1 last month.
+            : $kind eq 'month_ranges' ? "((CAST(STRFTIME('%Y', 'now') AS INTEGER) * 12 + CAST(STRFTIME('%m', 'now') AS INTEGER))" .
+                " - (CAST(STRFTIME('%Y', $value) AS INTEGER) * 12 + CAST(STRFTIME('%m', $value) AS INTEGER)))"
             : $kind eq 'date_relative_ranges' ? "DATE($value)" : $value;
         my @clauses;
         for my $range (@$ranges) {

@@ -1068,7 +1068,7 @@ sub _compile_bucket {
     }
 
     my %range_kinds = map { $_ => 1 } qw(
-        numeric_ranges elapsed_days_ranges date_relative_ranges year_ranges
+        numeric_ranges elapsed_days_ranges date_relative_ranges year_ranges month_ranges
     );
     Selecto::Error->throw('invalid_query', 'bucket kind is not available') unless $range_kinds{$kind};
     Selecto::Error->throw('invalid_query', 'numeric buckets require a numeric field')
@@ -1080,6 +1080,9 @@ sub _compile_bucket {
         unless ref($ranges) eq 'ARRAY' && @$ranges;
     my $value_sql = $kind eq 'elapsed_days_ranges' ? "CURRENT_DATE - DATE($field_sql)"
         : $kind eq 'year_ranges' ? "EXTRACT(YEAR FROM $field_sql)"
+        # Calendar months ago: 0 is this month, 1 last month.
+        : $kind eq 'month_ranges' ? "((EXTRACT(YEAR FROM CURRENT_DATE) * 12 + EXTRACT(MONTH FROM CURRENT_DATE))" .
+            " - (EXTRACT(YEAR FROM $field_sql) * 12 + EXTRACT(MONTH FROM $field_sql)))"
         : $kind eq 'date_relative_ranges' ? "DATE($field_sql)"
         : $field_sql;
     my @clauses;

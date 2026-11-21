@@ -851,7 +851,10 @@ Treats a numeric epoch column as an instant.
 
 Adapter-compiled bucketing for aggregate views. Bucket kinds include
 C<numeric_increment>, C<year_increment>, C<text_prefix>, C<numeric_ranges>,
-C<elapsed_days_ranges>, C<date_relative_ranges> and C<year_ranges>.
+C<elapsed_days_ranges>, C<date_relative_ranges>, C<year_ranges> and
+C<month_ranges>. A C<month_ranges> boundary is a number of calendar months
+ago: 0 is the current month, 1 the month before, so C<{minimum =E<gt> 3,
+maximum =E<gt> 5}> covers the three months from five to three months ago.
 C<count_bucket($field, $minimum, $maximum)> counts values within bounds.
 
 =head1 POSTGRESQL-ONLY EXPRESSIONS

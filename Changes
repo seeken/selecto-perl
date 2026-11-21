@@ -1,6 +1,9 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Month buckets: the bucket kind month_ranges groups a date or time by
+      calendar months ago (0 is the current month), in PostgreSQL and
+      SQLite, with the same range rules as the other kinds.
     - Subtotal rows in the APIs. Selecto::API::Explorer accepts cube and
       grouping_sets beside rollup, advertises supports.cube and
       supports.grouping_sets, lets a complete grid carry cube totals, and
