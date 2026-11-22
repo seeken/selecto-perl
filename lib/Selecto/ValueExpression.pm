@@ -25,7 +25,9 @@ use Selecto::OperationBudget ();
 #   ['json_text', FIELD_PATH, [SEGMENT, ...]]
 #   ['lower' | 'upper', VALUE]
 #   ['concat', VALUE, VALUE, ...]
-#   ['days_between', START, END]   (whole calendar days from START to END)
+#   ['days_between' | 'hours_between' | 'fractional_days_between', START, END]
+#   ['current_timestamp'] / ['temporal_coalesce', START, END]
+#   ['clamp_zero', NUMERIC_VALUE]
 #   ['previous', COLUMN]   (recursive member steps only: the previous level's row)
 #
 # FILTER is the portable filter AST accepted by
@@ -47,6 +49,7 @@ sub category {
     return 'decimal' if $name =~ /\A(?:decimal|numeric|float|double|real|money)\z/;
     return 'boolean' if $name eq 'boolean';
     return 'date' if $name eq 'date';
+    return 'epoch_datetime' if $name eq 'epoch_datetime';
     return 'datetime' if $name =~ /\A(?:utc_datetime|datetime|naive_datetime|timestamp|timestamptz)\z/;
     return 'json' if $name =~ /\A(?:jsonb|json)\z/;
     return 'other';
@@ -128,9 +131,17 @@ sub _parse {
         _fail("$label $operator requires exactly one value") unless @arguments == 1;
         return [$operator, _parse($arguments[0], "$label $operator argument")];
     }
-    if ($operator eq 'days_between') {
-        _fail("$label days_between requires a start and an end value") unless @arguments == 2;
-        return ['days_between', map { _parse($_, "$label days_between operand") } @arguments];
+    if ($operator eq 'current_timestamp') {
+        _fail("$label current_timestamp takes no arguments") if @arguments;
+        return ['current_timestamp'];
+    }
+    if ($operator eq 'clamp_zero') {
+        _fail("$label clamp_zero requires one value") unless @arguments == 1;
+        return ['clamp_zero', _parse($arguments[0], "$label clamp_zero value")];
+    }
+    if ($operator =~ /\A(?:days_between|hours_between|fractional_days_between|temporal_coalesce)\z/) {
+        _fail("$label $operator requires a start and an end value") unless @arguments == 2;
+        return [$operator, map { _parse($_, "$label $operator operand") } @arguments];
     }
     if ($operator eq 'cast') {
         _fail("$label cast requires a value and a target type") unless @arguments == 2;
@@ -270,12 +281,20 @@ sub _infer {
         _infer($_, $resolve) for @arguments;
         return 'string';
     }
-    if ($operator eq 'days_between') {
+    return 'datetime' if $operator eq 'current_timestamp';
+    if ($operator eq 'clamp_zero') {
+        my $category = _infer($arguments[0], $resolve);
+        _type_error("clamp_zero requires a numeric operand")
+            unless $category eq 'integer' || $category eq 'decimal';
+        return $category;
+    }
+    if ($operator =~ /\A(?:days_between|hours_between|fractional_days_between|temporal_coalesce)\z/) {
         for my $category (map { _infer($_, $resolve) } @arguments) {
-            _type_error("days_between requires date or datetime operands, found $category")
-                unless $category eq 'date' || $category eq 'datetime';
+            _type_error("$operator requires date, datetime or epoch_datetime operands, found $category")
+                unless $category eq 'date' || $category eq 'datetime' || $category eq 'epoch_datetime';
         }
-        return 'integer';
+        return 'datetime' if $operator eq 'temporal_coalesce';
+        return $operator eq 'days_between' ? 'integer' : 'decimal';
     }
     if ($operator eq 'cast') {
         _infer($arguments[0], $resolve);
@@ -362,7 +381,10 @@ parsed.
   ['json_text', FIELD, [SEGMENT, ...]] segments of letters, digits and underscores
   ['lower' | 'upper', NODE]
   ['concat', NODE, NODE, ...]
-  ['days_between', START, END]
+  ['days_between' | 'hours_between' | 'fractional_days_between', START, END]
+  ['current_timestamp']
+  ['temporal_coalesce', START, END]
+  ['clamp_zero', NUMERIC_VALUE]
   ['previous', COLUMN]                 only in recursive query-member steps
 
 =head1 RULES
@@ -384,10 +406,15 @@ satisfies a declared C<decimal>).
 
 C<divide> always produces a decimal, so integer operands never truncate.
 C<concat> casts each operand to text and treats null as empty.
-C<days_between> takes two date or datetime values and gives the whole
+C<days_between> takes two date, datetime or epoch_datetime values and gives the whole
 calendar days from the first to the second as an integer: the difference of
 their dates whatever the times of day, negative when the second is earlier,
-and null when either is null.
+and null when either is null. C<hours_between> and C<fractional_days_between>
+take the same operand types and return decimal elapsed units. C<current_timestamp>
+is the database clock; C<temporal_coalesce> replaces a NULL temporal value with
+its second operand, normalizing epochs and date midnights as duration operands.
+C<clamp_zero> preserves NULL and replaces negative numeric results with zero.
+See L<Selecto::Domain::Synthetic> for clock and time zone semantics.
 
 =item *
 
@@ -396,7 +423,8 @@ Computed fields are read-only; write contracts cannot grant them.
 =item *
 
 The adapter needs the C<value_expressions> capability (and C<json_text> for
-that node): PostgreSQL and DuckDB. Others fail with C<unsupported_feature>.
+that node): PostgreSQL, SQLite, DuckDB and supported MySQL/MariaDB versions.
+Others fail with C<unsupported_feature>.
 
 =back
 

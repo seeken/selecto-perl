@@ -693,6 +693,13 @@ sub _compile_value_expression {
     return $self->SUPER::_compile_value_expression($domain, $node, $params);
 }
 
+sub _epoch_instant_sql { return "DATETIME($_[1], 'unixepoch')"; }
+sub _duration_instant_sql { return $_[1]; }
+sub _elapsed_between_sql {
+    my ($self, $start, $end, $divisor) = @_;
+    return "((julianday($end) - julianday($start)) * (86400.0 / $divisor))";
+}
+
 sub _days_between_sql {
     my ($self, $start, $end) = @_;
     return "CAST(julianday(date($end)) - julianday(date($start)) AS INTEGER)";

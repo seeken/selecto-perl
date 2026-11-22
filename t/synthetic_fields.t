@@ -82,7 +82,7 @@ subtest 'shorthand expands to an ordinary expression column' => sub {
         $columns->{lead_bucket}, 'the expanded form parses back unchanged');
 
     my %bad = (
-        'unit other than day' => {kind => 'temporal_delta', from => 'purchased_at', to => 'refunded_on', unit => 'hour'},
+        'unsupported unit' => {kind => 'temporal_delta', from => 'purchased_at', to => 'refunded_on', unit => 'minute'},
         'missing to' => {kind => 'temporal_delta', from => 'purchased_at'},
         'unknown key' => {kind => 'temporal_delta', from => 'purchased_at', to => 'refunded_on', absolute => 1},
         'non-date operand' => {kind => 'temporal_delta', from => 'id', to => 'refunded_on'},

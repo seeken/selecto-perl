@@ -38,12 +38,25 @@ sub expand {
 
 sub _temporal_delta {
     my ($field, $spec) = @_;
-    _only($field, $spec, qw(from to unit));
+    _only($field, $spec, qw(from to unit otherwise minimum));
     my $unit = $spec->{unit} // 'day';
-    _fail($field, 'temporal_delta unit must be day') unless !ref($unit) && $unit eq 'day';
-    return ['days_between',
-        ['field', _path($field, $spec->{from}, 'temporal_delta from')],
-        ['field', _path($field, $spec->{to}, 'temporal_delta to')]];
+    _fail($field, 'temporal_delta unit must be day, hour or fractional_day')
+        unless !ref($unit) && $unit =~ /\A(?:day|hour|fractional_day)\z/;
+    _fail($field, 'temporal_delta otherwise must be now')
+        if exists($spec->{otherwise}) && (!defined($spec->{otherwise})
+            || ref($spec->{otherwise}) || $spec->{otherwise} ne 'now');
+    _fail($field, 'temporal_delta minimum must be 0')
+        if exists($spec->{minimum}) && (!defined($spec->{minimum})
+            || ref($spec->{minimum}) || "$spec->{minimum}" !~ /\A0(?:\.0+)?\z/);
+    my @ends = map {
+        defined($_) && !ref($_) && $_ eq 'now' ? ['current_timestamp']
+            : ['field', _path($field, $_, 'temporal_delta endpoint')]
+    } @{$spec}{qw(from to)};
+    $ends[1] = ['temporal_coalesce', $ends[1], ['current_timestamp']]
+        if exists $spec->{otherwise};
+    my $expression = [ {day => 'days_between', hour => 'hours_between',
+        fractional_day => 'fractional_days_between'}->{$unit}, @ends ];
+    return exists($spec->{minimum}) ? ['clamp_zero', $expression] : $expression;
 }
 
 sub _bound {
@@ -137,11 +150,44 @@ it in the expanded form.
 
 =head2 temporal_delta
 
-C<from> and C<to> are date or datetime field paths. The value is the number of
-whole calendar days from C<from> to C<to> (C<days_between>): the difference
-of the two dates, whatever the times of day, negative when C<to> is the
-earlier date, and C<NULL> when either is C<NULL>. C<unit> may be given and
-must be C<day>. Declare the column as C<integer>.
+C<from> and C<to> are C<date>, C<utc_datetime>, datetime or
+C<epoch_datetime> field paths, including a one-to-one association path. The
+reserved endpoint C<now> uses the adapter clock. C<otherwise =E<gt> 'now'>
+replaces a NULL C<to> only; a NULL C<from> still gives NULL.
+
+C<unit> defaults to C<day>: whole calendar days (the difference of dates,
+whatever the times of day), with a declared C<integer> result. C<hour> and
+C<fractional_day> give elapsed seconds divided by 3600 and 86400 respectively;
+declare these columns C<decimal>. A date means midnight in the session zone,
+or in C<use_timezone> when given. Elapsed units subtract instants, so a DST
+spring-forward day may contain 23 hours. C<minimum =E<gt> 0> optionally clamps
+negative results to zero, preserving NULL. No other minimum is supported.
+
+  pickup_delay => {type => 'decimal', display => {decimals => 1}, computed => {
+      kind => 'temporal_delta', from => 'scheduled_pickup', to => 'actual_pickup',
+      otherwise => 'now', unit => 'hour', minimum => 0,
+  }},
+
+C<field_unit> and C<field_metadata> derive C<< {kind => 'duration', code =>
+'day' | 'hour'} >> unless the host declares a unit. Fractional days have code
+C<day>. The derived metadata does not rewrite legacy contracts or fingerprints.
+The expanded expression remains numeric for sums, averages and numeric buckets.
+
+PostgreSQL and DuckDB render C<CURRENT_TIMESTAMP>, sharing the transaction
+clock. Their session zone, or the query's C<use_timezone>, decides calendar
+dates. SQLite, MySQL and MariaDB bind one application-server local timestamp
+per compilation, shared with C<date_shortcut> and every duration in the query.
+These adapters do not support arbitrary query time zones (SQLite accepts UTC
+only). Configure the application server, stored wall times and database session
+zones consistently; UTC is recommended. SQLite converts epochs to UTC;
+MySQL/MariaDB convert epochs using the database session zone. Numeric epochs
+are Unix seconds. Naive timestamps on adapters without zone support retain
+their stored wall-clock meaning. Recompile queries to refresh bound clocks.
+
+The compile cache excludes computed columns. C<CannedPage> runs its queries
+on every request and has no result cache. No clock value or result is frozen
+in either cache; hosts adding their own result caches must expire or bypass
+time-dependent expressions (C<current_timestamp> in the expanded AST).
 
 =head2 bucket
 

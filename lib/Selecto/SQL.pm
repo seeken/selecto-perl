@@ -81,6 +81,10 @@ sub compile {
     # while compiling (see _note_relation and Selecto::Statement relations).
     my $top = ref($self->{_selecto_relation_sink}) ne 'HASH';
     local $self->{_selecto_cache_top} = $top;
+    # Dialects without zoned clocks bind one application-server wall time for
+    # the complete compile, including nested queries and date shortcuts.
+    local $self->{_selecto_now} = $self->{_selecto_now} // $self->_server_timestamp
+        unless $self->_current_date_shortcuts;
     local $self->{_selecto_relation_sink} = $top ? {} : $self->{_selecto_relation_sink};
     local $self->{_selecto_recursion_sink} = $top ? {} : $self->{_selecto_recursion_sink};
     my $statement = $self->_compile_query($domain, $query);
@@ -2912,9 +2916,23 @@ sub _compile_value_expression {
             'CAST(' . $self->_compile_value_expression($domain, $_, $params) . " AS $text)"
         } @arguments) . ')';
     }
-    if ($operator eq 'days_between') {
-        my ($start, $end) = map { $self->_compile_value_expression($domain, $_, $params) } @arguments;
-        return $self->_days_between_sql($start, $end);
+    if ($operator eq 'clamp_zero') {
+        # Render twice: anonymous placeholders need their own bind at each use.
+        my $test = $self->_compile_value_expression($domain, $arguments[0], $params);
+        my $value = $self->_compile_value_expression($domain, $arguments[0], $params);
+        return "CASE WHEN $test < 0 THEN 0 ELSE $value END";
+    }
+    if ($operator eq 'current_timestamp' || $operator eq 'temporal_coalesce') {
+        return $self->_compile_temporal_operand($domain, $node, $params, 0);
+    }
+    if ($operator =~ /\A(?:days_between|hours_between|fractional_days_between)\z/) {
+        my $elapsed = $operator ne 'days_between';
+        my ($start, $end) = map {
+            $self->_compile_temporal_operand($domain, $_, $params, $elapsed)
+        } @arguments;
+        return $elapsed ? $self->_elapsed_between_sql($start, $end,
+            $operator eq 'hours_between' ? 3600 : 86400)
+            : $self->_days_between_sql($start, $end);
     }
     if ($operator eq 'cast') {
         # Casting to an instant reads naive-UTC columns as instants.
@@ -2939,6 +2957,59 @@ sub _compile_value_expression {
         return 'CASE ' . join(' ', @parts) . ' END';
     }
     Selecto::Error->throw('invalid_query', "unsupported value expression operator $operator");
+}
+
+# Duration operands use instants for elapsed units and local dates for days.
+# In particular, localizing instants before subtracting would lose DST hours.
+sub _compile_temporal_operand {
+    my ($self, $domain, $node, $params, $elapsed) = @_;
+    if ($node->[0] eq 'current_timestamp') {
+        unless ($self->_current_date_shortcuts) {
+            push @$params, $self->{_selecto_now} // $self->_server_timestamp;
+            return 'CAST(' . $self->placeholder(scalar @$params) . ' AS '
+                . $self->_value_type_sql('utc_datetime') . ')';
+        }
+        return defined($self->{_timezone}) && !$elapsed
+            ? $self->_compile_timezone_sql('CURRENT_TIMESTAMP', 'utc_datetime', $self->{_timezone}, $params)
+            : 'CURRENT_TIMESTAMP';
+    }
+    if ($node->[0] eq 'temporal_coalesce') {
+        return 'COALESCE(' . join(', ', map {
+            $self->_compile_temporal_operand($domain, $_, $params, $elapsed)
+        } @$node[1, 2]) . ')';
+    }
+    my $path = $node->[0] eq 'field' ? ($self->{_selecto_field_prefix} // '') . $node->[1] : undef;
+    my $type = defined($path) ? $domain->resolve($path)->{type} : undef;
+    local $self->{_suppress_field_timezone} = $elapsed || $self->{_suppress_field_timezone};
+    local $self->{_instant_fields} = $elapsed || $self->{_instant_fields};
+    my $sql = $self->_compile_value_expression($domain, $node, $params);
+    if (($type // '') eq 'epoch_datetime') {
+        # _field_sql already converts an epoch when it localizes it.
+        $sql = $self->_epoch_instant_sql($sql) unless !$elapsed && defined($self->{_timezone});
+    }
+    return $elapsed ? $self->_duration_instant_sql($sql, $type, $params) : $sql;
+}
+
+sub _server_timestamp {
+    require POSIX;
+    return POSIX::strftime('%Y-%m-%d %H:%M:%S', localtime);
+}
+
+sub _epoch_instant_sql { return "TO_TIMESTAMP($_[1])"; }
+
+sub _duration_instant_sql {
+    my ($self, $sql, $type, $params) = @_;
+    if (($type // '') eq 'date' && defined($self->{_timezone})) {
+        push @$params, $self->{_timezone};
+        return '(CAST(' . $sql . ' AS TIMESTAMP) AT TIME ZONE '
+            . $self->placeholder(scalar @$params) . ')';
+    }
+    return "CAST($sql AS TIMESTAMPTZ)";
+}
+
+sub _elapsed_between_sql {
+    my ($self, $start, $end, $divisor) = @_;
+    return "(EXTRACT(EPOCH FROM ($end - $start)) / $divisor.0)";
 }
 
 # Whole calendar days from $start to $end: the difference of their dates,
@@ -4544,7 +4615,7 @@ sub _compile_date_shortcut {
     unless ($self->_current_date_shortcuts) {
         require POSIX;
         return $self->_compile_expression($domain, Selecto::DateShortcut->expression(
-            $operand, $shortcut, POSIX::strftime('%Y-%m-%d', localtime)), $params);
+            $operand, $shortcut, substr($self->{_selecto_now} // $self->_server_timestamp, 0, 10)), $params);
     }
     if (blessed($operand) && $operand->kind eq 'field') {
         my $type = $domain->resolve($operand->arguments->[0])->{type} // '';

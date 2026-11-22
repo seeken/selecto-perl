@@ -1853,6 +1853,17 @@ sub _field_metadata_view {
         push @redacted, _redacted($contract, join('.', @segments, $field));
     }
     my $metadata = ref($column) eq 'HASH' ? $column : {};
+    # Derive duration metadata without changing legacy normalized contracts or
+    # fingerprints. Explicit host units always win.
+    if (!exists($metadata->{unit}) && ref($metadata->{computed}) eq 'HASH'
+        && ($metadata->{computed}{kind} // '') eq 'expression') {
+        my $node = $metadata->{computed}{expression};
+        $node = $node->[1] if ref($node) eq 'ARRAY' && $node->[0] eq 'clamp_zero';
+        if (ref($node) eq 'ARRAY' && $node->[0] =~ /\A(?:days_between|hours_between|fractional_days_between)\z/) {
+            $metadata = {%$metadata, unit => {kind => 'duration',
+                code => $node->[0] eq 'hours_between' ? 'hour' : 'day'}};
+        }
+    }
     # A column marked redacted is withheld exactly as one named in a
     # redact_fields list.
     push @redacted, 1 if $metadata->{redacted};
@@ -4105,8 +4116,8 @@ association must be a direct, left-joined one-to-one association.
 
 =item C<< {kind => 'bucket', field => $field, buckets => [...]} >>
 
-Shorthand for two common expressions: whole days between two dates, and
-labelled numeric ranges. Both are stored as C<expression> columns. See
+Shorthand for temporal durations (calendar days, elapsed hours or fractional
+days, including epochs and open ends) and labelled numeric ranges. Both are stored as C<expression> columns. See
 L<Selecto::Domain::Synthetic>.
 
 =item C<< {kind => 'association_exists', association => 'name'} >>

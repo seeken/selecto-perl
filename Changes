@@ -1,6 +1,13 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - temporal_delta supports now endpoints, otherwise => 'now' for NULL ends,
+      decimal hour and fractional_day units, minimum => 0 with NULL preserved,
+      and mixed date/datetime/epoch_datetime endpoints through associations.
+      Calendar days retain their SQL and fingerprints; derived duration unit
+      metadata preserves host overrides. Elapsed units preserve DST instants;
+      zoned dialects use CURRENT_TIMESTAMP and other adapters share one bound
+      server clock with date shortcuts, outside result caches.
     - PostgreSQL rollups over two or more groups order by the GROUPING()
       marker over every group after the group columns, as the emulated
       rollup already did: a real NULL group value no longer ties with a

@@ -179,6 +179,13 @@ sub _server_version_at_least {
 
 # Neither server orders rollup NULLs with NULLS FIRST/LAST, and MariaDB has
 # no GROUPING(): rollups compile as UNION ALL grouping branches.
+sub _epoch_instant_sql { return "FROM_UNIXTIME($_[1])"; }
+sub _duration_instant_sql { return "CAST($_[1] AS DATETIME(6))"; }
+sub _elapsed_between_sql {
+    my ($self, $start, $end, $divisor) = @_;
+    return "(CAST(TIMESTAMPDIFF(MICROSECOND, $start, $end) AS DECIMAL(38,10)) / ($divisor.0 * 1000000))";
+}
+
 sub _days_between_sql {
     my ($self, $start, $end) = @_;
     return "DATEDIFF(CAST($end AS DATE), CAST($start AS DATE))";
