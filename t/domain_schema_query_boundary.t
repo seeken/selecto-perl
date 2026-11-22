@@ -25,6 +25,25 @@ for my $case (@{$fixtures->{DS001}{cases}}) {
 }
 is_deeply($fixtures, $before, 'all complete original declarations remain unchanged');
 my $base = $cases{baseline};
+for my $spec (
+    ['absent', undef, 1], ['null', undef, 1],
+    ['false', JSON::PP::false, 1], ['true', JSON::PP::true, 1],
+    ['zero', 0, 1], ['one', 1, 1], ['string-zero', '0', 1], ['string-one', '1', 1],
+    ['string-true', 'true', 0], ['string-false', 'false', 0], ['two', 2, 0],
+    ['empty-string', '', 0], ['array', [], 0], ['object', {}, 0],
+) {
+    my ($name, $value, $accepted) = @$spec;
+    my $domain = dclone($base);
+    $domain->{tenant_required} = $value unless $name eq 'absent';
+    my $original = dclone($domain);
+    my $result = Selecto::Domain->validate_schema($domain);
+    is($result->{valid} ? 1 : 0, $accepted, "tenant_required $name schema admission matches runtime");
+    is(code(caught(sub { Selecto::Domain->parse($domain) })),
+        $accepted ? 'none' : 'invalid_tenant_context', "tenant_required $name parser admission remains unchanged");
+    is_deeply($result->{errors}, [{code => 'invalid_tenant_required', path => ['tenant_required'],
+        message => 'invalid portable domain declaration'}], "$name has domain metadata diagnostics") unless $accepted;
+    is_deeply($domain, $original, "$name metadata is unchanged");
+}
 my $report = Selecto::Domain->validate_schema($base);
 ${$report->{valid}} = 0;
 ok(Selecto::Domain->validate_schema($base)->{valid}, 'schema valid flag has an independent Boolean referent');

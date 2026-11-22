@@ -152,6 +152,11 @@ sub validate {
     my ($class, $given) = @_;
     my $raw = Selecto::Domain::QueryContract->copy_declaration($given);
     my $state = {errors => [], budget => Selecto::OperationBudget->new(limits => Selecto::Limits->new, code => 'invalid_domain_schema')};
+    if (defined $raw->{tenant_required}) {
+        require Selecto::Tenant::Context;
+        my $admitted = eval { Selecto::Tenant::Context->boolean($raw->{tenant_required}, 'domain tenant_required'); 1 };
+        _error($state, 'invalid_tenant_required', ['tenant_required']) unless $admitted;
+    }
     _error($state, 'missing_required_section', [$_]) for grep { !exists($raw->{$_}) } qw(source schemas);
     _relation($state, $raw->{source}, ['source'], 1);
     if (ref($raw->{schemas}) eq 'HASH') { _relation($state, $raw->{schemas}{$_}, ['schemas', $_], 0) for sort keys %{$raw->{schemas}} }
@@ -187,7 +192,9 @@ domain it loads carries the same metadata C<validate> admits.
 C<validate($plain_contract)> returns C<valid>, structured C<errors> and explicit
 C<validated_sections>. It validates relation/table/VALUES shapes and metadata,
 query declarations and the ordinary query-library subset, event payload schemas
-and operation/experience registry envelopes. Components, opaque domain data and
+and operation/experience registry envelopes. C<tenant_required> admits null,
+JSON booleans and scalar 0/1 (including strings), matching native parser
+admission. Components, opaque domain data and
 JSON-schema payloads remain metadata. Complete plain input is admitted before
 copying or interpreting; callbacks, ties, unknown blessed objects and cycles
 refuse without hooks. Input, reference work, generated identifiers and emitted
