@@ -304,7 +304,7 @@ like(
 );
 like(
     $joined_rollup_statement->sql,
-    qr/\ASELECT \* FROM \(SELECT .*\) AS rollupfix ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST\z/,
+    qr/\ASELECT \* FROM \(SELECT .*\) AS rollupfix ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST, 4 DESC\z/,
     'PostgreSQL 17-and-older rollups use the positional outer-sort compatibility wrapper',
 );
 is_deeply(
@@ -797,7 +797,7 @@ my $pg18_engine = Selecto::Engine->new(
 my $pg18_rollup_statement = $pg18_engine->compile($rollup);
 unlike($pg18_rollup_statement->sql, qr/rollupfix/,
     'PostgreSQL 18 disables the compatibility wrapper');
-like($pg18_rollup_statement->sql, qr/ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST\z/,
+like($pg18_rollup_statement->sql, qr/ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST, 4 DESC\z/,
     'PostgreSQL 18 rollups retain positional NULLS FIRST hierarchy ordering');
 
 my $forced_fix_adapter = Selecto::PostgreSQL->new(

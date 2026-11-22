@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - PostgreSQL rollups over two or more groups order by the GROUPING()
+      marker over every group after the group columns, as the emulated
+      rollup already did: a real NULL group value no longer ties with a
+      rolled-up NULL, so the grand total comes first and each subtotal sits
+      directly above its own rows.
     - Association key conditions, ported from Elixir's conditional joins:
       up to 8 {left, op, right, open?} comparisons of an owner field with a
       target field (eq, ne, lt, lte, gt, gte; ordering on numbers and

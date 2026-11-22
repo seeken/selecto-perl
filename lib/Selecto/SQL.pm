@@ -515,8 +515,14 @@ sub _compile_single {
             $position . ' ' . uc($_->[1]) .
                 (defined($single_grouping_position) ? ' NULLS LAST' : ' NULLS FIRST');
         } @$orders;
-        unshift @outer_orders, $single_grouping_position . ' DESC'
-            if defined $single_grouping_position;
+        if (defined $single_grouping_position) {
+            unshift @outer_orders, $single_grouping_position . ' DESC';
+        } elsif (defined(my $marker = _rollup_marker_position($selections, $groups, \%selection_positions))) {
+            # A NULL group value ties with the rolled-up NULL of the level above
+            # it; the marker over every group breaks the tie, putting each
+            # subtotal ahead of its own rows (as RollupEmulation orders it).
+            push @outer_orders, $marker . ' DESC';
+        }
         my $order_sql = join(', ', @outer_orders);
         $sql = $self->_rollup_sort_fix_enabled
             ? 'SELECT * FROM (' . $sql . ') AS rollupfix ORDER BY ' . $order_sql
@@ -1403,6 +1409,19 @@ sub _grouping_set_member_sql {
     Selecto::Error->throw('unsupported_feature',
         'a grouping-set dimension with bound values must also be selected') if @bound;
     return $sql;
+}
+
+# The output position of a GROUPING() over every group, in group order.
+sub _rollup_marker_position {
+    my ($selections, $groups, $positions) = @_;
+    return undef unless @$groups > 1;
+    my $groups_key = _value_key($groups);
+    for my $selection (@$selections) {
+        next unless $selection->kind eq 'grouping';
+        next unless _value_key($selection->arguments->[0]) eq $groups_key;
+        return $positions->{_expression_key($selection)};
+    }
+    return undef;
 }
 
 sub _single_rollup_grouping_position {
