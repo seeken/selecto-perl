@@ -6,8 +6,8 @@ Revision history for Selecto
       computed now/age/duration expressions, including nested reads. API
       query bodies accept as_of and echo it in metadata; RemoteQuery uses
       query.as_of and admits date_shortcut filters. Default SQL and write
-      timestamps retain their existing clocks. The shared remote request
-      schema needs an optional query.as_of string (not changed here).
+      timestamps retain their existing clocks. remote_query.v1 accepts
+      query.as_of as of selecto-protocol 210b243.
     - Part 3 core: validate and publish ratio_measures metadata, derive per-unit
       units, and compile ratio_of_sums with decimal division and zero-to-NULL
       semantics at every rollup/cube grouping level.

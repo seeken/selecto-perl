@@ -296,9 +296,9 @@ Successful responses echo the original input at C<meta.as_of>, alongside
 C<meta.request_id> when present. Invalid clocks return HTTP 422
 C<invalid_query>. The setting has no effect on writes.
 
-The shared protocol's C<remote-query-request.v1.schema.json> needs an optional
-string property C<query.as_of> before schema-based clients can send this
-extension. C<meta> in the success schema already permits extra properties.
+C<query.as_of> is part of the shared protocol's C<remote_query.v1> request
+schema (selecto-protocol 210b243), which checks its shape; this handler also
+rejects impossible dates, times and offsets.
 Backend capabilities are unchanged; bounded remote reads require a backend
 that implements bounded result execution.
 
