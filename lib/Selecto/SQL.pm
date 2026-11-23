@@ -2743,7 +2743,7 @@ sub _field_sql {
             my $kind = $computed->{kind} // '';
             Selecto::Error->throw('unsupported_feature',
                 'a joined relation\'s association_exists computed field is not available through the join', {field => "$path"})
-                if $kind eq 'association_exists';
+                if $kind eq 'association_exists' || $kind eq 'association_aggregate';
             # A joined schema's computed columns are not checked when the
             # domain is parsed: a reference cycle is refused here, and a value
             # expression is parsed (typed) as the root's are.
@@ -2838,7 +2838,12 @@ sub _compile_computed_field {
     my ($self, $domain, $path, $computed, $params) = @_;
     Selecto::Error->throw('invalid_domain', 'unsupported computed field')
         unless $computed->{kind} eq 'association_exists' || $computed->{kind} eq 'predicate'
-            || $computed->{kind} eq 'expression' || $computed->{kind} eq 'coalesce_fields';
+            || $computed->{kind} eq 'expression' || $computed->{kind} eq 'coalesce_fields'
+            || $computed->{kind} eq 'association_aggregate';
+    if ($computed->{kind} eq 'association_aggregate') {
+        require Selecto::SQL::AssociationAggregate;
+        return Selecto::SQL::AssociationAggregate->compile($self,$domain,$path,$computed,$params);
+    }
     if ($computed->{kind} eq 'expression') {
         return '(' . $self->_compile_value_expression($domain, $computed->{expression}, $params) . ')';
     }

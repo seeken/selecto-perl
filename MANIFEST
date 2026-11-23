@@ -468,3 +468,5 @@ t/lib/TestComputedOwnerKey.pm
 t/fixtures/computed_owner_key_legacy.json
 lib/Selecto/AsOf.pm
 t/as_of.t
+lib/Selecto/SQL/AssociationAggregate.pm
+t/ops_association_aggregate.t

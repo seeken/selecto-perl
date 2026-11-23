@@ -317,7 +317,9 @@ sub _constant_join_predicates {
     return () unless ref($where) eq 'HASH' && keys %$where;
     return map {
         my $column = $self->_qualified($alias, $_);
-        defined($where->{$_}) ? $self->_identity_values_sql($column, [$where->{$_}], $params, 2) : "$column IS NULL"
+        ref($where->{$_}) eq 'ARRAY'
+            ? $self->SUPER::_constant_join_predicates($alias, {$_ => $where->{$_}}, $params, $types)
+            : defined($where->{$_}) ? $self->_identity_values_sql($column, [$where->{$_}], $params, 2) : "$column IS NULL"
     } sort keys %$where;
 }
 

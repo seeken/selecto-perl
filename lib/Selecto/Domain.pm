@@ -10,6 +10,7 @@ use Cpanel::JSON::XS ();
 use Selecto::CanonicalJSON ();
 use Hash::Util::FieldHash qw(fieldhash);
 use Scalar::Util qw(blessed refaddr);
+use POSIX ();
 use Storable qw(dclone);
 use Selecto::Error ();
 use Selecto::ConfiguredDomain ();
@@ -1287,11 +1288,12 @@ sub _validate_computed_columns {
         }
         my %allowed = map { $_ => 1 } $kind eq 'predicate' || $kind eq 'expression'
             ? qw(kind expression) : $kind eq 'coalesce_fields'
-                ? qw(kind fields) : qw(kind association);
+                ? qw(kind fields) : $kind eq 'association_aggregate'
+                    ? qw(kind association function field where default through_owner_keys through_exclude_owner_field) : qw(kind association);
         _reject_unknown($computed, \%allowed, "computed column $field");
         Selecto::Error->throw('invalid_domain', "unsupported computed column kind $kind")
             unless $kind eq 'association_exists' || $kind eq 'predicate'
-                || $kind eq 'expression' || $kind eq 'coalesce_fields';
+                || $kind eq 'expression' || $kind eq 'coalesce_fields' || $kind eq 'association_aggregate';
         if ($kind eq 'expression') {
             Selecto::Error->throw(
                 'invalid_domain', 'expression computed columns require an expression', {field => $field},
@@ -1381,6 +1383,62 @@ sub _validate_computed_columns {
             'invalid_domain', 'computed column association is not governed',
             {field => $field, association => $association},
         ) unless exists $associations->{$association};
+        if ($kind eq 'association_aggregate') {
+            my $edge = $associations->{$association};
+            my $function = _required_string($computed->{function}, 'association aggregate function');
+            my $target_field = _identifier($computed->{field}, 'association aggregate field');
+            my $target = $schemas->{$edge->queryable};
+            my $metadata = $target->{columns}{$target_field};
+            Selecto::Error->throw('invalid_domain', 'association aggregate requires a to-many association and numeric field', {field => $field})
+                unless $edge->cardinality eq 'many' && $function =~ /\A(?:sum|count|min|max)\z/
+                    && ref($metadata) eq 'HASH' && !exists($metadata->{computed})
+                    && ($function eq 'count' || ($metadata->{type} // '') =~ /\A(?:integer|decimal|float|number|numeric)\z/)
+                    && ($column->{type} // '') =~ ($function eq 'count' ? qr/\Ainteger\z/ : qr/\A(?:decimal|float|number|numeric|integer)\z/);
+            Selecto::Error->throw('invalid_domain', 'association aggregate default must be a finite number', {field => $field})
+                if exists($computed->{default}) && (!defined($computed->{default}) || ref($computed->{default})
+                    || !Scalar::Util::looks_like_number($computed->{default}) || !POSIX::isfinite($computed->{default}));
+            if (exists($computed->{through_owner_keys}) || exists($computed->{through_exclude_owner_field})) {
+                my $bridge = $edge->through;
+                my ($bridge_schema) = $bridge ? grep { ($_->{source_table} // '') eq $bridge->{table} }
+                    ($source, values %$schemas) : ();
+                Selecto::Error->throw('invalid_domain', 'aggregate bridge keys require a declared bridge relation', {field => $field})
+                    unless $bridge && $bridge_schema;
+                my $keys = $computed->{through_owner_keys} // [$bridge->{owner_key}];
+                my %seen;
+                Selecto::Error->throw('invalid_domain', 'aggregate through_owner_keys requires 1 to 8 unique bridge keys including owner_key', {field => $field})
+                    unless ref($keys) eq 'ARRAY' && @$keys && @$keys <= 8
+                        && !grep { !defined($_) || ref($_) || $seen{$_}++ } @$keys;
+                Selecto::Error->throw('invalid_domain', 'aggregate through_owner_keys must include the declared bridge owner_key', {field => $field})
+                    unless grep { $_ eq $bridge->{owner_key} } @$keys;
+                for my $key (@$keys, exists($computed->{through_exclude_owner_field}) ? ($computed->{through_exclude_owner_field}) : ()) {
+                    _identifier($key, 'aggregate bridge key');
+                    my $meta = $bridge_schema->{columns}{$key};
+                    Selecto::Error->throw('invalid_domain', 'aggregate bridge keys must be physical and match the owner key type', {field => $field})
+                        unless ref($meta) eq 'HASH' && !exists($meta->{computed})
+                            && $meta->{type} eq $source->{columns}{$edge->owner_key}{type};
+                }
+            }
+            if (exists $computed->{where}) {
+                my $condition = eval { Selecto::Expression->from_filter_ast($computed->{where}) };
+                Selecto::Error->throw('invalid_domain', 'association aggregate where must be a filter AST', {field => $field}) unless $condition;
+                for my $dependency (Selecto::Expression->field_references($condition)) {
+                    my @parts = split /\./, $dependency;
+                    my $leaf = pop @parts;
+                    my $schema = $target;
+                    for my $name (@parts) {
+                        my $declaration = $schema->{associations}{$name};
+                        my $next = ref($declaration) eq 'HASH' ? $schemas->{$declaration->{queryable}} : undef;
+                        Selecto::Error->throw('invalid_domain', 'aggregate filter requires direct to-one associations', {field => $field})
+                            unless $next && !exists($declaration->{through})
+                                && ($declaration->{cardinality} // ($declaration->{related_key} eq ($next->{primary_key} // 'id') ? 'one' : 'many')) eq 'one';
+                        $schema = $next;
+                    }
+                    Selecto::Error->throw('invalid_domain', 'aggregate filter must reference physical associated fields', {field => $field})
+                        unless ref($schema->{columns}{$leaf}) eq 'HASH' && !exists($schema->{columns}{$leaf}{computed});
+                }
+            }
+            next;
+        }
         Selecto::Error->throw(
             'invalid_domain', 'association-exists computed columns require a direct association',
             {field => $field, association => $association},
@@ -4226,6 +4284,35 @@ association must be a direct, left-joined one-to-one association.
 Shorthand for temporal durations (calendar days, elapsed hours or fractional
 days, including epochs and open ends) and labelled numeric ranges. Both are stored as C<expression> columns. See
 L<Selecto::Domain::Synthetic>.
+
+=item C<< {kind => 'association_aggregate', association => 'charges', function => 'sum', field => 'amt', where => [...], default => 0} >>
+
+A numeric scalar over a governed to-many association, including a C<through>
+bridge. C<function> is C<sum>, C<count> (non-NULL field count), C<min> or
+C<max>. C<field> names a physical associated column. Sum/min/max require a
+numeric field; count has integer result type. C<where> is an optional portable
+filter AST relative to the associated relation and its direct to-one paths.
+For example C<< ['in', 'transaction_type.type', ['D', 'B']] >>; use
+C<< ['not', ['in', 'trx_typ', [11000, 20000]]] >> to exclude base lines.
+C<default> is an optional finite numeric fallback, bound as a parameter.
+Without it every function returns NULL for no matching rows; count returns
+zero when rows match but their counted field is always NULL.
+
+The compiler emits a correlated scalar subquery on PostgreSQL, SQLite and
+DuckDB; other adapters refuse with C<unsupported_feature>. The owner query
+never joins the to-many rows. Tenant pairs, bridge scope, target policy and
+required owner predicates retain the same semantics as ordinary joins.
+Expression columns can add several aggregates, for example direct charges
+plus charges through child-load bridges. Optional C<through_owner_keys>
+lists 1 to 8 physical bridge keys, including the declared C<through.owner_key>,
+correlated with OR to the owner key. For a load bridge use
+C<< through_owner_keys => [qw(parent_id alt_parent_id)] >>. A leg matching
+both keys is counted once. C<< through_exclude_owner_field => 'id' >> also
+excludes the owner itself from that bridge. These options require the bridge
+relation to be declared in the source/schemas graph and keys matching the
+owner key type. Two ordinary through associations also work when their sets
+are disjoint. Filters may traverse
+physical direct to-one paths, avoiding any hidden multiplication of charges.
 
 =item C<< {kind => 'association_exists', association => 'name'} >>
 
