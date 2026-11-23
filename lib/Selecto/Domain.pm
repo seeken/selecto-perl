@@ -852,6 +852,7 @@ sub _canonical_associations {
         for my $key (qw(owner_key related_key)) {
             _required_key($association, $key, "association $path");
         }
+        _validate_computed_owner_key($relation, $association, $path, $contract);
         my $has_table = exists $target->{source_table};
         my $has_values = exists $target->{values};
         Selecto::Error->throw(
@@ -1213,6 +1214,43 @@ sub _canonical_fields {
         $result{$field} = $column->{type};
     }
     return \%result;
+}
+
+# A conditional owner key stays local to its owner. In particular it cannot
+# introduce a join dependency (or a cycle through the association it joins).
+sub _validate_computed_owner_key {
+    my ($relation, $association, $path, $contract) = @_;
+    my $key = $association->{owner_key};
+    return if !defined($key) || ref($key);
+    my $columns = $relation->{columns} // {};
+    my $column = $columns->{$key};
+    return unless ref($column) eq 'HASH' && exists $column->{computed};
+    my $computed = $column->{computed};
+    my $fail = sub {
+        Selecto::Error->throw('invalid_domain', $_[0], {association => $path, field => $key});
+    };
+    require Selecto::ValueExpression;
+    $fail->('computed owner key requires a CASE value expression')
+        unless ref($computed) eq 'HASH' && ($computed->{kind} // '') eq 'expression';
+    my $ast = eval { Selecto::ValueExpression->parse($computed->{expression}) };
+    $fail->('computed owner key requires a CASE value expression')
+        unless $ast && $ast->[0] eq 'case';
+    for my $branch (@$ast[1 .. $#$ast]) {
+        $fail->('computed owner key branch results must be owner columns')
+            unless $branch->[1][0] eq 'field' && $branch->[1][1] !~ /\./;
+    }
+    my $prefix = $path =~ s/[^.]+$//r;
+    for my $field (Selecto::ValueExpression->dependencies($ast)) {
+        my $dependency = $columns->{$field};
+        $fail->('computed owner key may reference only physical, unredacted owner columns')
+            if $field =~ /\./ || ref($dependency) ne 'HASH' || exists($dependency->{computed})
+                || $dependency->{redacted} || _redacted($relation, $field)
+                || _redacted($contract, "$prefix$field");
+    }
+    my $category = eval { Selecto::ValueExpression->infer($ast,
+        resolve => sub { $columns->{$_[0]}{type} }) };
+    $fail->('computed owner key type must match its owner columns')
+        unless defined($category) && Selecto::ValueExpression->compatible($column->{type}, $category);
 }
 
 sub _validate_computed_columns {
@@ -4077,6 +4115,48 @@ C<owner_key>. The join stays a left join; aggregate consumers display
 C<display_field> while grouping and filtering by the stable key.
 C<< display_fallback => 'dimension_key' >> shows the key when the display
 value is missing (the two columns must share a type).
+
+=head2 Conditional association owner keys
+
+A named computed field can be both an association's C<owner_key> and its
+star dimension's C<dimension_key>. Add the name to C<source.fields> and
+C<source.columns>; it is not a stored column:
+
+  inventory_location_id => {type => 'integer', computed => {
+    kind => 'expression', expression => ['case',
+      [['and', ['eq', 'status2', 'I'], ['eq', 'status', 'D']],
+        ['field', 'dest_id']],
+      [['and', ['eq', 'status2', 'I'],
+        ['not', ['in', 'status', ['G', 'D', 'C']]]],
+        ['field', 'orig_id']],
+    ],
+  }},
+
+Reference that column in the ordinary association and join declarations:
+
+  # source.associations
+  inventory_location => {queryable => 'client_party',
+    owner_key => 'inventory_location_id', related_key => 'id'},
+  # joins
+  inventory_location => {type => 'star_dimension', name => 'Inventory Location',
+    display_field => 'co_name', dimension_key => 'inventory_location_id'},
+
+Conditions use the existing filter AST (C<not> around C<in> for NOT IN).
+Every branch result, including an optional C<else>, must be a physical owner
+column. Conditions also read only physical, unredacted owner columns; joined
+or computed dependencies are refused. Branch types must match the key type.
+Without C<else>, the key is SQL NULL when no condition matches, including SQL
+three-valued conditions on NULL statuses. Group and drilldown on
+C<inventory_location_id>; read associated fields such as
+C<inventory_location.co_name>, C<.city> and C<.state> normally. All use the
+same CASE expression. No SQL text is accepted from the host.
+
+These associations are read-only: C<WriteContract> refuses relationship
+write declarations with C<computed_owner_key_read_only>, even if an explicit
+C<parent_key> tries to replace the computed owner key. The key itself cannot
+be insertable or updatable. Ordinary root-column writes keep their existing
+write and tenant policies. Domains without computed owner keys keep their SQL
+and fingerprints.
 
 =head2 Computed columns
 

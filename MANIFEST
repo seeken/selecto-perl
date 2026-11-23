@@ -463,3 +463,6 @@ t/synthetic_fields.t
 t/pg_write_transaction_live.t
 t/pg_write_begin_probe_live.t
 t/temporal_delta.t
+t/computed_owner_key.t
+t/lib/TestComputedOwnerKey.pm
+t/fixtures/computed_owner_key_legacy.json

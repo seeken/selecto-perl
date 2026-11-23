@@ -1,0 +1,33 @@
+{
+   "duckdb" : {
+      "params" : [
+         "Ada"
+      ],
+      "sql" : "SELECT \"s0\".\"id\", \"j_person\".\"name\" AS \"person.name\" FROM \"orders\" AS \"s0\" LEFT JOIN \"people\" AS \"j_person\" ON \"s0\".\"person_id\" = \"j_person\".\"id\" WHERE \"j_person\".\"name\" = $1 ORDER BY \"s0\".\"id\" ASC"
+   },
+   "fingerprint" : "sha256:5cdcbbe3d7daf8c3a7519d478379d5a8581343a726e3c07cf0e61aa6732ba4a2",
+   "mariadb" : {
+      "params" : [
+         "Ada"
+      ],
+      "sql" : "SELECT `s0`.`id`, `j_person`.`name` AS `person.name` FROM `orders` AS `s0` LEFT JOIN `people` AS `j_person` ON `s0`.`person_id` = `j_person`.`id` WHERE `j_person`.`name` = ? ORDER BY (`s0`.`id` IS NULL) ASC, `s0`.`id` ASC"
+   },
+   "mysql" : {
+      "params" : [
+         "Ada"
+      ],
+      "sql" : "SELECT `s0`.`id`, `j_person`.`name` AS `person.name` FROM `orders` AS `s0` LEFT JOIN `people` AS `j_person` ON `s0`.`person_id` = `j_person`.`id` WHERE `j_person`.`name` = ? ORDER BY (`s0`.`id` IS NULL) ASC, `s0`.`id` ASC"
+   },
+   "postgresql" : {
+      "params" : [
+         "Ada"
+      ],
+      "sql" : "SELECT \"s0\".\"id\", \"j_person\".\"name\" AS \"person.name\" FROM \"orders\" AS \"s0\" LEFT JOIN \"people\" AS \"j_person\" ON \"s0\".\"person_id\" = \"j_person\".\"id\" WHERE \"j_person\".\"name\" = $1 ORDER BY \"s0\".\"id\" ASC"
+   },
+   "sqlite" : {
+      "params" : [
+         "Ada"
+      ],
+      "sql" : "SELECT \"s0\".\"id\", \"j_person\".\"name\" AS \"person.name\" FROM \"orders\" AS \"s0\" LEFT JOIN \"people\" AS \"j_person\" ON \"s0\".\"person_id\" = \"j_person\".\"id\" WHERE \"j_person\".\"name\" = ? ORDER BY \"s0\".\"id\" ASC"
+   }
+}

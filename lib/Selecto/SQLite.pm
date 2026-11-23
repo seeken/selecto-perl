@@ -640,7 +640,11 @@ sub _field_sql {
         }
         return 'CAST(' . $value . ' AS ' . $cast . ')';
     }
-    return $self->SUPER::_field_sql($domain, $path, $params);
+    my $sql = $self->SUPER::_field_sql($domain, $path, $params);
+    # CASE has no column affinity. A dimension ID submitted by HTTP is text;
+    # restore its declared affinity so it compares like a stored owner key.
+    my $type = $self->_computed_owner_key_type($domain, $path);
+    return defined($type) ? 'CAST(' . $sql . ' AS ' . $self->_value_type_sql($type) . ')' : $sql;
 }
 
 sub _json_rowset_source {

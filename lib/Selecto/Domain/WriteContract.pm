@@ -189,6 +189,11 @@ sub _fields {
         _error($state,'write_field_not_found',$path,field=>$field) unless _known($state,$field);
         my $spec=_object($state,$fields->{$field},$path,'invalid_write_field_spec');
         _optional_bool($state,$spec,$_,$path,'invalid_write_field_option') for @FLAGS;
+        my $column = $state->{domain}{source}{columns}{$field};
+        _error($state, 'computed_field_read_only', $path)
+            if ref($column) eq 'HASH' && exists($column->{computed})
+                && (_true($spec->{insertable}) || _true($spec->{updatable}));
+
         _error($state,'unsafe_write_fragment',$path) if _unsafe($state,$spec);
     }
 }
@@ -221,6 +226,19 @@ sub _relationship {
     my ($state,$id,$value)=@_;
     my $path=['writes','relationships',$id];
     my $spec=_object($state,$value,$path,'invalid_write_relationship');
+    my $source = $state->{domain}{source} // {};
+    my $association = ref($source->{associations}) eq 'HASH' ? $source->{associations}{$id} : undef;
+    my $owner_key = ref($association) eq 'HASH' ? $association->{owner_key} : undef;
+    my $parent_key = $spec->{parent_key};
+    my %seen;
+    for my $key ($owner_key, $parent_key) {
+        next unless defined($key) && !ref($key) && !$seen{$key}++;
+        my $column = $source->{columns}{$key};
+        _error($state, 'computed_owner_key_read_only', $path,
+            message => 'associations with computed owner keys are read-only', field => $key)
+            if ref($column) eq 'HASH' && exists $column->{computed};
+    }
+
     _policy($state,$spec,$path,[qw(enabled writable delete_missing)],{}, {cardinality=>[qw(one many)],ownership=>\@OWNERSHIP,strategy=>['sync']});
     if (defined(my $ops=$spec->{allowed_ops})) {
         if (ref($ops) ne 'ARRAY') { _rel_error($state,[@$path,'allowed_ops']) }

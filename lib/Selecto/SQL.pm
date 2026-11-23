@@ -324,10 +324,7 @@ sub _compile_single {
         my $target_alias = $self->_join_alias($path);
         if (my $through = $association->through) {
             my $bridge_alias = $self->_through_alias($path);
-            my @bridge_on = (
-                $self->_qualified($parent_alias, $association->owner_key) . ' = ' .
-                    $self->_qualified($bridge_alias, $through->{owner_key}),
-            );
+            my @bridge_on;
             my @target_on = (
                 $self->_qualified($bridge_alias, $through->{related_key}) . ' = ' .
                     $self->_join_target_key(
@@ -341,6 +338,8 @@ sub _compile_single {
                 $target_alias, $association->where, \@params, $association->fields, $association->table
             );
             push @target_on, $self->_tenant_bound_sql($association, $target_alias, \@params);
+            push @bridge_on, $self->_association_owner_sql($domain, $path, \@params) . ' = ' .
+                $self->_qualified($bridge_alias, $through->{owner_key});
             push @bridge_on, $self->_constant_join_predicates(
                 $bridge_alias, $through->{where}, \@params, undef, $through->{table}
             );
@@ -362,18 +361,22 @@ sub _compile_single {
                 ' ON ' . join(' AND ', @target_on) . ')' .
                 ' ON ' . join(' AND ', @bridge_on);
         } else {
-            my $owner_sql = $self->_qualified(
-                $parent_alias, $association->owner_key,
-            );
-            if (defined($association->values)) {
-                my $owner_path = @segments
-                    ? join('.', @segments, $association->owner_key)
-                    : $association->owner_key;
-                $owner_sql = _text_case_sql(
-                    $owner_sql,
-                    $domain->_field_metadata_view($owner_path)->{text_case},
-                );
-            }
+            my $preserves_target = $join_type eq 'right' || $join_type eq 'full';
+            my $compile_owner = sub {
+                my $owner_sql = $self->_association_owner_sql($domain, $path, \@params);
+                if (defined($association->values)) {
+                    my $owner_path = @segments
+                        ? join('.', @segments, $association->owner_key)
+                        : $association->owner_key;
+                    $owner_sql = _text_case_sql(
+                        $owner_sql,
+                        $domain->_field_metadata_view($owner_path)->{text_case},
+                    );
+                }
+                return $owner_sql;
+            };
+            # A preserved target's derived WHERE appears before its ON.
+            my $owner_sql = $preserves_target ? undef : $compile_owner->();
             my $lateral_lookup = ($association->join_strategy // '') eq 'lateral_lookup';
             Selecto::Error->throw(
                 'unsupported_feature',
@@ -385,10 +388,9 @@ sub _compile_single {
             # the target's own restrictions (association where, tenant bound)
             # filter the target first, in a derived table; ON keeps only the
             # conditions that pair the two sides.
-            my $preserves_target = $join_type eq 'right' || $join_type eq 'full';
             my @target_on = (
-                $owner_sql . ' = ' .
-                    $self->_qualified($lookup_alias, $association->related_key),
+                defined($owner_sql) ? $owner_sql . ' = ' .
+                    $self->_qualified($lookup_alias, $association->related_key) : undef,
                 $self->_join_condition_sql($association, $parent_alias, $lookup_alias),
             );
             my @target_only;
@@ -418,6 +420,8 @@ sub _compile_single {
             } else {
                 push @target_on, $self->_tenant_bound_sql($association, $lookup_alias, \@params);
             }
+            $target_on[0] = $compile_owner->() . ' = ' .
+                $self->_qualified($lookup_alias, $association->related_key) if $preserves_target;
             @target_only = grep { defined && length } @target_only;
             if ($preserves_target && @target_only) {
                 push @joins,
@@ -2355,10 +2359,10 @@ sub _compile_related_collection_at {
     my $quoted_alias = $self->quote_identifier($alias);
     my $table = $self->_association_source_sql($association);
     my $related_key = $quoted_alias . '.' . $self->quote_identifier($association->related_key);
-    my $owner_key = $self->quote_identifier($parent_alias) . '.' .
-        $self->quote_identifier($association->owner_key);
+    my $owner_key = $association->through ? undef
+        : $self->_association_owner_sql($domain, $association_name, $params, $parent_alias);
     my $from = "$table AS $quoted_alias";
-    my @predicates = ("$related_key = $owner_key",
+    my @predicates = ($association->through ? () : ("$related_key = $owner_key"),
         $self->_join_condition_sql($association, $parent_alias, $alias));
     if (defined $association->source_scope_key) {
         push @predicates, $self->_identity_equal_sql(
@@ -2375,10 +2379,7 @@ sub _compile_related_collection_at {
             $quoted_bridge_alias . '.' . $self->quote_identifier($through->{related_key}) .
             ' = ' . $self->_join_target_key($related_key, $through->{target_key_cast}),
         );
-        @predicates = (
-            $quoted_bridge_alias . '.' . $self->quote_identifier($through->{owner_key}) .
-            ' = ' . $owner_key,
-        );
+        @predicates = ();
         if (defined $through->{source_scope_key}) {
             my $exact = $self->_association_identity_exact($association, $through->{target_scope_key}, undef);
             push @predicates, $self->_identity_equal_sql(
@@ -2394,6 +2395,8 @@ sub _compile_related_collection_at {
             $alias, $association->where, $params, $association_fields, $association->table
         );
         push @target_on, $self->_tenant_bound_sql($association, $alias, $params);
+        unshift @predicates, $quoted_bridge_alias . '.' . $self->quote_identifier($through->{owner_key}) .
+            ' = ' . $self->_association_owner_sql($domain, $association_name, $params, $parent_alias);
         push @predicates, $self->_constant_join_predicates(
             $bridge_alias, $through->{where}, $params, undef, $through->{table}
         );
@@ -2507,7 +2510,10 @@ sub _compile_related_collection_at {
             my $expr=$field->{expression};
             if ($expr->kind eq 'related_rows' || $expr->kind eq 'related_collection') {
                 my $nested=$domain->resolve_association($expr->arguments->[0])->{association};
-                $needed{$_}=1 for grep {defined($_)} ($nested->owner_key,$nested->source_scope_key,$nested->source_tenant_field);
+                my $computed = $domain->_field_metadata_view("$association_name." . $nested->owner_key)->{computed};
+                my @owner_fields = ref($computed) eq 'HASH'
+                    ? Selecto::ValueExpression->dependencies($computed->{expression}) : ($nested->owner_key);
+                $needed{$_}=1 for grep {defined($_)} (@owner_fields,$nested->source_scope_key,$nested->source_tenant_field);
             } else {
                 for my $path ($self->_expression_field_paths($expr)) {
                     my $r=$domain->resolve($path);
@@ -2678,6 +2684,36 @@ sub _compile_related_collection_sql {
     );
 }
 
+# SQLite uses the declared key type to restore affinity lost by CASE.
+sub _computed_owner_key_type {
+    my ($self, $domain, $path) = @_;
+    return unless ref($domain->_field_metadata_view($path)->{computed}) eq 'HASH';
+    my $resolved = $domain->resolve($path);
+    my $contract = $domain->_contract_view;
+    my $owner = $resolved->{association}
+        ? $contract->{schemas}{$resolved->{association}->queryable} : $contract->{source};
+    my $associations = $owner->{associations} // {};
+    return unless grep { ($_->{owner_key} // '') eq $resolved->{field} } values %$associations;
+    return $resolved->{type};
+}
+
+# Resolve a named computed key through the same field compiler used by SELECT,
+# GROUP BY and predicates. Physical keys keep their original SQL byte for byte.
+sub _association_owner_sql {
+    my ($self, $domain, $path, $params, $parent_alias) = @_;
+    my $association = $domain->resolve_association($path)->{association};
+    my @parent = split /\./, $path;
+    pop @parent;
+    local $self->{_join_aliases} = {%{$self->{_join_aliases} // {}},
+        (@parent && defined($parent_alias) ? (join('.', @parent) => $parent_alias) : ())};
+    my $key_path = join('.', @parent, $association->owner_key);
+    my $metadata = $domain->_field_metadata_view($key_path);
+    return $self->_field_sql($domain, $key_path, $params)
+        if ref($metadata->{computed}) eq 'HASH';
+    return $self->_qualified($parent_alias // (@parent ? $self->_join_alias(join('.', @parent)) : $self->_root_alias),
+        $association->owner_key);
+}
+
 sub _field_sql {
     my ($self, $domain, $path, $params) = @_;
     my @segments = split /\./, "$path", -1;
@@ -2821,7 +2857,7 @@ sub _compile_computed_field {
     local $self->{_selecto_pair_parent_types} = $self->_exact_identity_compare ? (eval { $domain->fields } // {}) : undef;
     my @predicates = (
         $self->_qualified($alias, $association->related_key) . ' = ' .
-            $self->_qualified($self->_root_alias, $association->owner_key),
+            $self->_association_owner_sql($domain, $association_name, $params),
         $self->_join_condition_sql($association, $self->_root_alias, $alias),
     );
     if (defined $association->source_scope_key) {
