@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep pull-request code outside the private-source runner boundary."""
+"""Keep pull-request code off the private-source beep runners."""
 from pathlib import Path
 import re
 import unittest
@@ -14,23 +14,24 @@ def workflow_source(path):
 
 
 class WorkflowPolicyTests(unittest.TestCase):
-    def test_pull_request_workflows_use_only_hosted_public_paths(self):
-        pull_request_workflows = []
-        forbidden = ('self-hosted', 'beep-vm', 'ci/verify', 'ci/sources.py',
-                     '/run/selecto-ci/creds')
-        for path in sorted(WORKFLOWS.glob('*.y*ml')):
+    def test_no_workflow_runs_pull_request_code(self):
+        # Every job runs on beep, which holds private-source credentials, so
+        # no workflow may run on pull requests: only reviewed main commits.
+        workflows = sorted(WORKFLOWS.glob('*.y*ml'))
+        self.assertTrue(workflows, 'no workflows found')
+        for path in workflows:
             source = workflow_source(path)
-            if not re.search(r'\bpull_request(?:_target)?\b', source):
-                continue
-            pull_request_workflows.append(path.name)
+            self.assertNotRegex(source, r'\bpull_request(?:_target)?\b',
+                                f'{path.name} runs pull-request code')
             runner_lines = [line.strip() for line in source.splitlines()
                             if re.match(r'^\s*runs-on\s*:', line)]
             self.assertTrue(runner_lines, f'{path.name} has no explicit runner')
-            self.assertTrue(all(line == 'runs-on: ubuntu-latest' for line in runner_lines),
-                            f'{path.name} has a non-hosted pull-request runner')
-            for value in forbidden:
-                self.assertNotIn(value, source, f'{path.name} exposes {value} to pull requests')
-        self.assertTrue(pull_request_workflows, 'no pull-request validation workflow found')
+            for line in runner_lines:
+                self.assertEqual(line, 'runs-on: [self-hosted, beep-vm]',
+                                 f'{path.name} uses a runner other than beep-vm')
+            jobs = len(runner_lines)
+            self.assertEqual(source.count("if: github.ref == 'refs/heads/main'"), jobs,
+                             f'{path.name} has a job not limited to main')
 
     def test_private_verifier_accepts_only_main_commits(self):
         source = workflow_source(WORKFLOWS / 'ci.yml')
