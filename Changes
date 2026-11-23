@@ -8,6 +8,8 @@ Revision history for Selecto
       query.as_of and admits date_shortcut filters. Default SQL and write
       timestamps retain their existing clocks. The shared remote request
       schema needs an optional query.as_of string (not changed here).
+    - Domain overlays remove nested map keys with undef (JSON null), allowing
+      tenant bridges to replace string casts with integer joins.
     - Associations may use a named CASE computed field as their owner key and
       star dimension key. Joins, filters, grouping and drilldowns share the
       expression across adapters, including SQLite HTTP key affinity. Results

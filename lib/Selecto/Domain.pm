@@ -3612,6 +3612,20 @@ overlays. C<$diagnostics> reports collisions with existing C<actions>,
 C<capabilities>, C<source_relationships> and C<choice_sources> entries. See
 L<Selecto::Domain::Overlay>.
 
+Within a deep-merged map, an overlay value of C<undef> (JSON C<null>)
+removes that key. For example, re-pointing a bridge to integer user IDs:
+
+  {source => {associations => {sales_rep => {through => {
+      table => 'load_user_role', related_key => 'user_id',
+      where => {type => undef, role_id => 2}, target_key_cast => undef,
+  }}}}}
+
+This removes the old C<where.type> and C<target_key_cast>, retaining other
+bridge keys. Removal of an absent key is harmless. To declare a literal NULL
+inside an overlay map, compose a complete base domain containing it instead;
+C<undef> in a deep-merged overlay always means removal. Required keys still
+must be present in the final strictly parsed domain.
+
 A schema 2 base yields a schema 2 domain: the overlays merge into its schema 2
 document (C<as_document>), its top-level C<tenant> survives and deep-merges,
 and the fingerprint is computed for the composed document. A schema 1 C<fields>

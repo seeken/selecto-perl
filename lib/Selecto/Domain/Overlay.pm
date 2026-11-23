@@ -195,7 +195,9 @@ sub _deep_merge {
     my $result = _clone($base, $path);
     for my $key (sort keys %$overlay) {
         my @next_path = (@$path, $key);
-        if (@next_path == 2 && $next_path[0] eq 'source' && $next_path[1] eq 'redact_fields'
+        if (!defined $overlay->{$key}) {
+            delete $result->{$key};
+        } elsif (@next_path == 2 && $next_path[0] eq 'source' && $next_path[1] eq 'redact_fields'
             && ref($result->{$key}) eq 'ARRAY' && ref($overlay->{$key}) eq 'ARRAY') {
             $result->{$key} = _unique_list(@{$result->{$key}}, @{$overlay->{$key}});
         } elsif (ref($result->{$key}) eq 'HASH' && ref($overlay->{$key}) eq 'HASH') {
