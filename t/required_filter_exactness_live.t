@@ -95,14 +95,20 @@ sub run_cases {
 
 SKIP: {
     skip 'DBD::DuckDB is not installed', 1 unless eval { require DBD::DuckDB; 1 };
-    for my $config (['DuckDB COLLATE NOCASE', 'k VARCHAR COLLATE NOCASE', undef, '1,2,3'],
-        ["DuckDB default_collation 'nocase'", 'k VARCHAR', q{SET default_collation = 'nocase'}, '1,3']) {
-        my ($label, $ddl, $session, $caller) = @$config;
+    for my $config (['DuckDB uncollated', 'k VARCHAR', undef],
+        ['DuckDB COLLATE NOCASE', 'k VARCHAR COLLATE NOCASE', undef],
+        ["DuckDB default_collation 'nocase'", 'k VARCHAR', q{SET default_collation = 'nocase'}]) {
+        my ($label, $ddl, $session) = @$config;
         my $dbh = DBI->connect('dbi:DuckDB:dbname=:memory:', undef, undef, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
         $dbh->do("CREATE TABLE t (id INTEGER PRIMARY KEY, $ddl, d DECIMAL(10,2), f DOUBLE, dt DATE)");
         $dbh->do(q{INSERT INTO t VALUES (1, 't1', 1.50, 1.5, DATE '2024-06-01'), (2, 'T1', 2.50, 2.5, DATE '2024-06-02'),
             (3, 't1 ', 3.50, 3.5, DATE '2024-06-03'), (4, 'u2', 4.50, 4.5, DATE '2024-06-04')});
         $dbh->do($session) if $session;
+        # Ordinary caller filters must agree with the backend's own LIKE.
+        # With session nocase, DuckDB 1.5.5 returns 1,3 but 2.0.1 returns
+        # 1,2,3. Required filters above must stay byte-exact on both.
+        my $caller = join(',', @{$dbh->selectcol_arrayref(
+            q{SELECT id FROM t WHERE k LIKE ? ESCAPE '!' ORDER BY id}, undef, 't1%')});
         run_cases($label, Selecto->adapter(duckdb => (dbh => $dbh)), 't', $caller);
     }
 }
