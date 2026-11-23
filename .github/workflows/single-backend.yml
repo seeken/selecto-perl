@@ -1,18 +1,24 @@
 name: Selected backend consumer
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   workflow-policy:
     name: Credential boundary policy
-    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, beep-vm]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: python3 -B ci/test_workflow_policy.py
   consumer:
-    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, beep-vm]
     timeout-minutes: 25
     strategy:
       fail-fast: false

@@ -15,7 +15,8 @@ case "$backend" in
  postgresql) apt-get install -y --no-install-recommends libpq-dev;;
  mysql|mariadb) apt-get install -y --no-install-recommends libmariadb-dev;;
 esac
-curl -fsSL https://cpanmin.us -o /tmp/cpanm
+# The perl image ships cpanm; beep egress does not allow cpanmin.us.
+cp "$(command -v cpanm)" /tmp/cpanm
 cp -a /source /tmp/producer; cd /tmp/producer
 # Recommendations are deliberately excluded; they describe development choices.
 perl /tmp/cpanm --mirror https://cpan.metacpan.org --notest --local-lib-contained /tmp/consumer --installdeps .
