@@ -7,13 +7,14 @@ use Scalar::Util qw(blessed reftype);
 use Storable qw(dclone);
 use DateTime::TimeZone ();
 use Selecto::Error ();
+use Selecto::AsOf ();
 use Selecto::Expression ();
 use Selecto::Identifier ();
 use Selecto::QueryBinding ();
 
 my %BUILD_KEYS = map { $_ => 1 } qw(
     selections predicate groups grouping_mode grouping_sets orders limit_value offset_value applied_query_library
-    set_operations ctes lateral_joins json_rowsets array_rowsets members timezone row_lock
+    set_operations ctes lateral_joins json_rowsets array_rowsets members timezone as_of row_lock
     retarget values_sources subqueries function_laterals
 );
 
@@ -134,6 +135,7 @@ sub _build {
         json_rowsets => [map { _clone_json_rowset_spec($_) } @$json_rowsets],
         array_rowsets => [map { {%$_} } @$array_rowsets],
         members => [map { "$_" } @$members],
+        as_of => defined($args{as_of}) ? Selecto::AsOf->validate($args{as_of}) : undef,
         timezone => defined($timezone) ? "$timezone" : undef,
         row_lock => $row_lock,
         retarget => $retarget,
@@ -839,6 +841,11 @@ sub count_query {
 
 sub limit  { my ($self, $value) = @_; return $self->_copy(limit_value  => _nonnegative($value, 'limit')); }
 sub offset { my ($self, $value) = @_; return $self->_copy(offset_value => _nonnegative($value, 'offset')); }
+sub as_of {
+    my ($self, @value) = @_;
+    return $self->{as_of} unless @value;
+    return $self->_copy(as_of => Selecto::AsOf->validate($value[0]));
+}
 sub use_timezone { my ($self, $value) = @_; return $self->_copy(timezone => $value); }
 sub for_share {
     my ($self) = @_;
@@ -881,6 +888,7 @@ sub _copy {
         array_rowsets => $self->{array_rowsets},
         members => $self->{members},
         timezone => $self->{timezone},
+        as_of => $self->{as_of},
         row_lock => $self->{row_lock},
         retarget => $self->{retarget},
         applied_query_library => $self->{applied_query_library},
@@ -1155,6 +1163,30 @@ Replaces all orderings.
 
 Non-negative integers. Adapters that need an order for pagination (Microsoft
 SQL Server) reject an unordered paginated query.
+
+=head2 as_of
+
+  my $read = $engine->query->as_of('2026-03-15')->select('id');
+  my $rows = $engine->all($read);   # also works with Selecto::BoundedQuery
+  my $clock = $read->as_of;        # original ISO input
+
+Returns an immutable copy with one read clock. Accepts a valid ISO calendar
+date C<YYYY-MM-DD> or timestamp C<YYYY-MM-DDTHH:MM:SS>, optionally with a
+fraction (up to nine digits) and C<Z> or C<+/-HH:MM>. Invalid input throws
+C<invalid_query>. A date names that calendar day and means its start in the query timezone
+(or UTC) in timestamp expressions. Unzoned timestamps are UTC; offsets normalize to UTC.
+For timestamp inputs, calendar shortcuts and buckets use the query timezone
+when set, otherwise UTC. Date inputs retain their named day in every zone.
+
+Date shortcuts, elapsed-day counts/ranges, relative-date and month ranges,
+and computed C<current_timestamp> expressions (including temporal deltas,
+ages and NULL end fallbacks) use this clock. The outer query owns the clock
+for its complete read, including nested queries and set operands. All clock
+values and derived bounds are parameters. Explicit absolute filter bounds
+remain explicit. Omitting C<as_of> preserves the existing SQL and clock.
+
+This is a read setting only: writes and their C<updated_at> expressions keep
+the real clock. Without an argument, returns this query's ISO input or undef.
 
 =head2 use_timezone
 

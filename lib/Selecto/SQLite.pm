@@ -887,6 +887,13 @@ sub _compile_datetime_format {
     return '(SELECT ' . $result . ' FROM (SELECT ' . $sql . ' AS value) AS __selecto_calendar)';
 }
 
+sub _sqlite_read_clock {
+    my ($self, $params) = @_;
+    return "'now'" unless defined $self->{_selecto_as_of};
+    push @$params, $self->_as_of_date;
+    return 'DATE(' . $self->placeholder(scalar @$params) . ')';
+}
+
 sub _compile_count_bucket {
     my ($self, $domain, $field, $spec, $params) = @_;
     my $resolved = $self->_governed_dialect_field($domain, $field);
@@ -903,8 +910,13 @@ sub _compile_count_bucket {
     my @predicates;
     for my $boundary (['>=', $minimum], ['<=', $maximum]) {
         next unless defined $boundary->[1];
-        my $value = $self->_compile_expression($domain, $field, $params);
-        $value = "(JULIANDAY('now', 'start of day') - JULIANDAY(DATE($value)))" if $mode eq 'elapsed_days';
+        my @source_params;
+        my $value = $self->_compile_expression($domain, $field,
+            defined($self->{_selecto_as_of}) ? \@source_params : $params);
+        my $clock = $mode eq 'elapsed_days' ? $self->_sqlite_read_clock($params) : undef;
+        # SQL places the clock before the source expression for anonymous binds.
+        push @$params, @source_params;
+        $value = "(JULIANDAY($clock, 'start of day') - JULIANDAY(DATE($value)))" if $mode eq 'elapsed_days';
         push @$params, 0 + $boundary->[1];
         push @predicates, $value . ' ' . $boundary->[0] . ' CAST(' . $self->placeholder(scalar @$params) . ' AS INTEGER)';
     }
@@ -924,6 +936,7 @@ sub _compile_bucket {
     my @source_params;
     my $source = $self->_compile_expression($domain, $field, \@source_params);
     my $value = '__selecto_bucket.value';
+    my $clock = defined($self->{_selecto_as_of}) ? '__selecto_bucket.clock' : "'now'";
     my $result;
     if ($kind eq 'numeric_increment' || $kind eq 'year_increment') {
         my $increment = $spec->{increment};
@@ -952,10 +965,10 @@ sub _compile_bucket {
         Selecto::Error->throw('invalid_query', 'bucket kind is not available') unless $ranges{$kind};
         my $ranges = $spec->{ranges};
         Selecto::Error->throw('invalid_query', 'bucket ranges must be a non-empty array') unless ref($ranges) eq 'ARRAY' && @$ranges;
-        my $number = $kind eq 'elapsed_days_ranges' ? "(JULIANDAY('now', 'start of day') - JULIANDAY(DATE($value)))"
+        my $number = $kind eq 'elapsed_days_ranges' ? "(JULIANDAY($clock, 'start of day') - JULIANDAY(DATE($value)))"
             : $kind eq 'year_ranges' ? "CAST(STRFTIME('%Y', $value) AS INTEGER)"
             # Calendar months ago: 0 is this month, 1 last month.
-            : $kind eq 'month_ranges' ? "((CAST(STRFTIME('%Y', 'now') AS INTEGER) * 12 + CAST(STRFTIME('%m', 'now') AS INTEGER))" .
+            : $kind eq 'month_ranges' ? "((CAST(STRFTIME('%Y', $clock) AS INTEGER) * 12 + CAST(STRFTIME('%m', $clock) AS INTEGER))" .
                 " - (CAST(STRFTIME('%Y', $value) AS INTEGER) * 12 + CAST(STRFTIME('%m', $value) AS INTEGER)))"
             : $kind eq 'date_relative_ranges' ? "DATE($value)" : $value;
         my @clauses;
@@ -969,7 +982,7 @@ sub _compile_bucket {
                 Selecto::Error->throw('invalid_query', 'date keyword bucket boundaries must match')
                     unless defined($maximum) && !ref($maximum) && "$maximum" eq "$minimum";
                 my $modifier = $minimum eq 'yesterday' ? ', \'-1 day\'' : $minimum eq 'tomorrow' ? ', \'+1 day\'' : '';
-                push @predicates, "$number = DATE('now'$modifier)";
+                push @predicates, "$number = DATE($clock$modifier)";
             } else {
                 Selecto::Error->throw('invalid_query', 'bucket range requires integer boundaries')
                     unless (defined($minimum) || defined($maximum))
@@ -979,7 +992,7 @@ sub _compile_bucket {
                     push @$params, 0 + $bound->[1];
                     my $marker = $self->placeholder(scalar @$params);
                     push @predicates, $kind eq 'date_relative_ranges'
-                        ? "$number " . ($bound->[0] eq '>=' ? '<=' : '>=') . " DATE('now', '-' || $marker || ' days')"
+                        ? "$number " . ($bound->[0] eq '>=' ? '<=' : '>=') . " DATE($clock, '-' || $marker || ' days')"
                         : "$number $bound->[0] CAST($marker AS INTEGER)";
                 }
             }
@@ -989,8 +1002,10 @@ sub _compile_bucket {
         push @$params, 'Other';
         $result = 'CASE ' . join(' ', @clauses) . ' ELSE ' . $self->placeholder(scalar @$params) . ' END';
     }
+    my $clock_source = defined($self->{_selecto_as_of})
+        ? ', ' . $self->_sqlite_read_clock(\@source_params) . ' AS clock' : '';
     push @$params, @source_params;
-    return '(SELECT ' . $result . ' FROM (SELECT ' . $source . ' AS value) AS __selecto_bucket)';
+    return '(SELECT ' . $result . ' FROM (SELECT ' . $source . ' AS value' . $clock_source . ') AS __selecto_bucket)';
 }
 
 sub _compile_mutation_default {

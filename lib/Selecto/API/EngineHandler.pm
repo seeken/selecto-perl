@@ -475,7 +475,7 @@ sub _query ($self, $engine, $body, %options) {
     _object($body, 'query body');
     $self->_admit_body($body, 'invalid_api_query');
     _reject_unknown($body, [qw(
-        select projection view segments parameters filters ordering order_by group_by limit offset timezone row_format
+        select projection view segments parameters filters ordering order_by group_by limit offset timezone as_of row_format
         rollup cube grouping_sets
     )], 'query body');
 
@@ -491,6 +491,17 @@ sub _query ($self, $engine, $body, %options) {
 
     my $domain = $engine->domain;
     my $query = $engine->query;
+    if (exists $body->{as_of}) {
+        $query = $query->as_of($body->{as_of});
+        # Older Explorer hosts supply a trusted today for explicit bounds.
+        # The request clock takes precedence without mutating that handler.
+        if (defined $self->today) {
+            require Selecto::AsOf;
+            my $zone = $body->{timezone} // $self->explorer_timezone;
+            $query->use_timezone($zone) if defined $zone; # validate before deriving a day
+            $self = bless {%$self, today => Selecto::AsOf->date($query->as_of, $zone)}, ref($self);
+        }
+    }
     my @segments = _string_array(
         $body->{segments} // [], 'segments', $self->max_segments,
     );
@@ -741,6 +752,7 @@ sub _query ($self, $engine, $body, %options) {
         offset => $offset,
         has_more => $has_more ? JSON::PP::true : JSON::PP::false,
         query_library => $query->applied_query_library,
+        (defined($query->as_of) ? (meta => {as_of => $query->as_of}) : ()),
     };
     # Raw-cell checks precede child decoding; this exact JSON-envelope check
     # also counts escaping, keys and metadata in the eventual public response.
@@ -901,6 +913,8 @@ sub describe_openapi ($self, $api) {
             data => {
                 type => 'object', required => [qw(columns rows subtables)],
                 properties => {
+                    meta => {type => 'object', properties => {as_of => {type => 'string',
+                        description => 'Original as_of read clock, when supplied.'}}},
                     columns => {type => 'array', items => {type => 'string'}},
                     rows => {type => 'array', items => {oneOf => [{type => 'array'}, {type => 'object'}]}},
                     limit => {type => 'integer', minimum => 0},
@@ -987,6 +1001,11 @@ sub describe_openapi ($self, $api) {
                 default => $self->default_limit,
             },
             offset => {type => 'integer', minimum => 0, maximum => $self->max_offset, default => 0},
+            as_of => {
+                type => 'string',
+                description => 'ISO date or timestamp replacing now for this read only.',
+                example => '2026-03-15',
+            },
             timezone => {
                 type => 'string',
                 description => 'IANA timezone applied to UTC and epoch datetime fields and filters.',
@@ -2233,6 +2252,14 @@ fields must be grouped, or the handler refuses the request before execution.
 
 Bounded by C<max_limit> and C<max_offset>; C<limit> defaults to
 C<default_limit>.
+
+=item C<as_of>
+
+ISO date or timestamp overriding now for this read; see
+L<Selecto::Query/as_of> for validation and timezone semantics. Applied to the
+immutable query before execution, including named views and projections.
+The response echoes the original value at C<data.meta.as_of>. Overrides a
+trusted handler C<today> for date shortcuts. Writes keep their real clock.
 
 =item C<timezone>
 

@@ -50,7 +50,7 @@ sub request ($self, $engine, $request) {
                 routes => [grep { $_->{operation_id} =~ /\A(?:getDomain|getOpenApi|queryDomain)\z/ }
                     @{$api->manifest->{routes}}],
                 query_capabilities => {explicit_root_select => JSON::PP::true,
-                    filters => [qw(eq ne gt gte lt lte is_null is_not_null)],
+                    filters => [qw(eq ne gt gte lt lte is_null is_not_null date_shortcut)],
                     nested => JSON::PP::false, aggregates => JSON::PP::false,
                     recursive_filters => JSON::PP::false}});
         } elsif (defined($method) && defined($path) && $method eq 'POST'
@@ -106,7 +106,7 @@ sub query ($self, $engine, $body) {
         qw(required_selected required_group_by required_order_by);
     my $query = $body->{query};
     _object($query, [qw(select projection view segments parameters filters ordering order_by
-        group_by limit offset timezone row_format)], 'invalid_query');
+        group_by limit offset timezone as_of row_format)], 'invalid_query');
     # Rich native HTMX modes retain their public native contracts. This wire
     # adapter advertises only these explicit scalar reads, rather than silently
     # dropping intent that has not acquired a remote-profile admission.
@@ -153,7 +153,7 @@ sub query ($self, $engine, $body) {
         _object($filter, [qw(field op value end)], 'invalid_query');
         my $op = $filter->{op};
         _reject('invalid_query') unless defined($op) && !ref($op);
-        _reject('operation_unsupported') unless $op =~ /\A(?:eq|ne|gt|gte|lt|lte|is_null|is_not_null)\z/;
+        _reject('operation_unsupported') unless $op =~ /\A(?:eq|ne|gt|gte|lt|lte|is_null|is_not_null|date_shortcut)\z/;
         _reject('invalid_query') if exists($filter->{end})
             || ($op =~ /null\z/ ? exists($filter->{value}) : !exists($filter->{value}));
         push @filters, {%$filter, op => $op eq 'is_not_null' ? 'not_null' : $op};
@@ -197,6 +197,7 @@ sub query ($self, $engine, $body) {
             has_more => $more ? JSON::PP::true : JSON::PP::false},
     }};
     $answer->{meta} = {request_id => $body->{request_id}} if exists $body->{request_id};
+    $answer->{meta}{as_of} = $result->{meta}{as_of} if exists $result->{meta}{as_of};
     Selecto::API::ResponsePolicy->check_json($answer, $limits);
     return $answer;
 }
@@ -225,7 +226,7 @@ sub explorer_metadata ($self, $engine, %options) {
         domain => {id => $id, fingerprint => $engine->domain->fingerprint, publication => $publication},
         label => $options{label} // $id, fields => \@fields,
         default_select => [map { $_->{id} } @fields],
-        query => {profile => 'remote_query.v1', operators => [qw(eq ne gt gte lt lte is_null is_not_null)],
+        query => {profile => 'remote_query.v1', operators => [qw(eq ne gt gte lt lte is_null is_not_null date_shortcut)],
             limits => {max_limit => 0 + $self->max_limit, max_offset => 0 + $self->{handler}->max_offset,
                 max_filters => 0 + $self->{handler}->max_filters},
             supports => {detail => JSON::PP::true, nested => JSON::PP::false,
@@ -284,6 +285,22 @@ sub _response ($status, $body) {
 =head1 NAME
 
 Selecto::API::RemoteQuery - fingerprint-bound bounded scalar query transport
+
+=head1 AS-OF READS
+
+Set C<query.as_of> to an ISO date or timestamp (L<Selecto::Query/as_of>).
+The shared engine handler applies the clock to all relative expressions in
+this read. C<date_shortcut> filters are admitted for temporal fields, with a
+shortcut identifier such as C<today> or C<last_7_days> as C<value>.
+Successful responses echo the original input at C<meta.as_of>, alongside
+C<meta.request_id> when present. Invalid clocks return HTTP 422
+C<invalid_query>. The setting has no effect on writes.
+
+The shared protocol's C<remote-query-request.v1.schema.json> needs an optional
+string property C<query.as_of> before schema-based clients can send this
+extension. C<meta> in the success schema already permits extra properties.
+Backend capabilities are unchanged; bounded remote reads require a backend
+that implements bounded result execution.
 
 =head1 DESCRIPTION
 

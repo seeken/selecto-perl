@@ -466,3 +466,5 @@ t/temporal_delta.t
 t/computed_owner_key.t
 t/lib/TestComputedOwnerKey.pm
 t/fixtures/computed_owner_key_legacy.json
+lib/Selecto/AsOf.pm
+t/as_of.t

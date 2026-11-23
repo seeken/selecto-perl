@@ -13,7 +13,7 @@ fieldhash my %CACHE;
 fieldhash my %DOMAINS;
 my %QUERY_KEYS = map { $_ => 1 } qw(selections predicate groups grouping_mode grouping_sets orders
     limit_value offset_value ctes lateral_joins values_sources function_laterals
-    json_rowsets array_rowsets subqueries members set_operations timezone row_lock
+    json_rowsets array_rowsets subqueries members set_operations timezone as_of row_lock
     retarget applied_query_library);
 my %ADAPTER_KEYS = map { $_ => 1 } qw(dbh compile_cache compile_cache_size canonical_values
     canonical_sql rollup_sort_fix temporary_relations catalog_trust transaction_mode
@@ -23,6 +23,7 @@ sub render {
     my ($class, $adapter, $domain, $query) = @_;
     return unless ref($adapter) eq 'Selecto::PostgreSQL' || ref($adapter) eq 'Selecto::SQLite';
     return unless $adapter->{_selecto_cache_top};
+    return if defined($adapter->{_selecto_as_of});
     return if $adapter->{canonical_sql}; # projection fieldhash stays on the normal path
     my $enabled = $adapter->{_selecto_compile_cache} // $adapter->compile_cache;
     Selecto::Error->throw('invalid_query', 'compile_cache must be 0 or 1')

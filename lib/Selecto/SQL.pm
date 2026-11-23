@@ -81,6 +81,8 @@ sub compile {
     # while compiling (see _note_relation and Selecto::Statement relations).
     my $top = ref($self->{_selecto_relation_sink}) ne 'HASH';
     local $self->{_selecto_cache_top} = $top;
+    # The outer read owns one clock, including nested reads/set operands.
+    local $self->{_selecto_as_of} = $top ? $query->as_of : $self->{_selecto_as_of};
     # Dialects without zoned clocks bind one application-server wall time for
     # the complete compile, including nested queries and date shortcuts.
     local $self->{_selecto_now} = $self->{_selecto_now} // $self->_server_timestamp
@@ -3000,6 +3002,12 @@ sub _compile_value_expression {
 sub _compile_temporal_operand {
     my ($self, $domain, $node, $params, $elapsed) = @_;
     if ($node->[0] eq 'current_timestamp') {
+        if (defined $self->{_selecto_as_of}) {
+            my $sql = $self->_as_of_timestamp_sql($params);
+            return defined($self->{_timezone}) && !$elapsed
+                ? $self->_compile_timezone_sql($sql, 'utc_datetime', $self->{_timezone}, $params)
+                : $sql;
+        }
         unless ($self->_current_date_shortcuts) {
             push @$params, $self->{_selecto_now} // $self->_server_timestamp;
             return 'CAST(' . $self->placeholder(scalar @$params) . ' AS '
@@ -3024,6 +3032,30 @@ sub _compile_temporal_operand {
         $sql = $self->_epoch_instant_sql($sql) unless !$elapsed && defined($self->{_timezone});
     }
     return $elapsed ? $self->_duration_instant_sql($sql, $type, $params) : $sql;
+}
+
+# Only read compilers call these helpers. Write expressions retain their clock.
+sub _as_of_date {
+    my ($self) = @_;
+    require Selecto::AsOf;
+    return Selecto::AsOf->date($self->{_selecto_as_of}, $self->{_timezone});
+}
+
+sub _read_date_sql {
+    my ($self, $params) = @_;
+    return 'CURRENT_DATE' unless defined $self->{_selecto_as_of};
+    push @$params, $self->_as_of_date;
+    return 'CAST(' . $self->placeholder(scalar @$params) . ' AS DATE)';
+}
+
+sub _as_of_timestamp_sql {
+    my ($self, $params) = @_;
+    require Selecto::AsOf;
+    my $timestamp = Selecto::AsOf->timestamp($self->{_selecto_as_of}, $self->{_timezone});
+    $timestamp =~ s/\+00:00\z// unless $self->_current_date_shortcuts;
+    push @$params, $timestamp;
+    return 'CAST(' . $self->placeholder(scalar @$params) . ' AS '
+        . $self->_value_type_sql('utc_datetime') . ')';
 }
 
 sub _server_timestamp {
@@ -4651,7 +4683,8 @@ sub _compile_date_shortcut {
     unless ($self->_current_date_shortcuts) {
         require POSIX;
         return $self->_compile_expression($domain, Selecto::DateShortcut->expression(
-            $operand, $shortcut, substr($self->{_selecto_now} // $self->_server_timestamp, 0, 10)), $params);
+            $operand, $shortcut, defined($self->{_selecto_as_of})
+                ? $self->_as_of_date : substr($self->{_selecto_now} // $self->_server_timestamp, 0, 10)), $params);
     }
     if (blessed($operand) && $operand->kind eq 'field') {
         my $type = $domain->resolve($operand->arguments->[0])->{type} // '';
@@ -4681,7 +4714,8 @@ sub _date_shortcut_bound_sql {
     Selecto::Error->throw('invalid_query', 'date shortcut bound is invalid')
         unless $anchor =~ /\A(?:today|week|month|quarter|year)\z/
             && "$months" =~ /\A-?\d+\z/ && "$days" =~ /\A-?\d+\z/;
-    my $today = defined($self->{_timezone})
+    my $today = defined($self->{_selecto_as_of}) ? $self->_read_date_sql($params)
+        : defined($self->{_timezone})
         ? 'CAST(' . $self->_compile_timezone_sql(
             'CURRENT_TIMESTAMP', 'utc_datetime', $self->{_timezone}, $params) . ' AS DATE)'
         : 'CURRENT_DATE';

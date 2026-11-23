@@ -187,6 +187,12 @@ sub _dispatch ($self, $operation, $params, $body, $request, $handlers) {
         { operation => $operation },
     ) unless ref($handler) eq 'CODE';
 
+    if ($operation eq 'query' && ref($body) eq 'HASH' && exists $body->{as_of}) {
+        require Selecto::AsOf;
+        my $valid = eval { Selecto::AsOf->validate($body->{as_of}); 1 };
+        return _error_response(422, 'invalid_query', 'as_of must be a valid ISO date or timestamp')
+            unless $valid;
+    }
     my $result;
     my $ok = eval { $result = $handler->($body, $params); 1 };
     return _error_response(
@@ -739,6 +745,16 @@ C<< {"ok": false, "error": {"code", "message", "details"}} >>, encoded as
 canonical JSON (sorted keys, fixed escaping). Canonical JSON has no floating
 point numbers: exact decimals must be strings, and a float anywhere in a
 handler result produces a 500 C<non_canonical_value>.
+
+=head2 Read clock
+
+A C<POST /query> body may contain C<< as_of => '2026-03-15' >> (or an ISO
+timestamp). The router validates it; L<Selecto::API::EngineHandler/query>
+applies it to the query and echoes it at C<data.meta.as_of>. See
+L<Selecto::Query/as_of> for accepted forms and date/timezone semantics.
+It changes relative reads only; write timestamps retain the real clock.
+Custom query callbacks must apply this field themselves, normally through
+C<EngineHandler>. No metadata field is added when the setting is absent.
 
 =head2 Response formats
 

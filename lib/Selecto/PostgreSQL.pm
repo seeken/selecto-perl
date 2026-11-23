@@ -1122,7 +1122,7 @@ sub _compile_count_bucket {
         unless $mode eq 'numeric' || $mode eq 'elapsed_days';
     my $field_sql = $self->_compile_expression($domain, $field, $params);
     my $value_sql = $mode eq 'elapsed_days'
-        ? "CURRENT_DATE - DATE($field_sql)"
+        ? $self->_read_date_sql($params) . " - DATE($field_sql)"
         : $field_sql;
     my ($minimum, $maximum) = @{$specification}{qw(minimum maximum)};
     Selecto::Error->throw('invalid_query', 'bucket count requires at least one boundary')
@@ -1191,10 +1191,10 @@ sub _compile_bucket {
     my $ranges = $specification->{ranges};
     Selecto::Error->throw('invalid_query', 'bucket ranges must be a non-empty array')
         unless ref($ranges) eq 'ARRAY' && @$ranges;
-    my $value_sql = $kind eq 'elapsed_days_ranges' ? "CURRENT_DATE - DATE($field_sql)"
+    my $value_sql = $kind eq 'elapsed_days_ranges' ? $self->_read_date_sql($params) . " - DATE($field_sql)"
         : $kind eq 'year_ranges' ? "EXTRACT(YEAR FROM $field_sql)"
         # Calendar months ago: 0 is this month, 1 last month.
-        : $kind eq 'month_ranges' ? "((EXTRACT(YEAR FROM CURRENT_DATE) * 12 + EXTRACT(MONTH FROM CURRENT_DATE))" .
+        : $kind eq 'month_ranges' ? "((EXTRACT(YEAR FROM " . $self->_read_date_sql($params) . ") * 12 + EXTRACT(MONTH FROM " . $self->_read_date_sql($params) . "))" .
             " - (EXTRACT(YEAR FROM $field_sql) * 12 + EXTRACT(MONTH FROM $field_sql)))"
         : $kind eq 'date_relative_ranges' ? "DATE($field_sql)"
         : $field_sql;
@@ -1209,9 +1209,10 @@ sub _compile_bucket {
         if ($kind eq 'date_relative_ranges' && defined($minimum) && "$minimum" =~ /\A(?:today|yesterday|tomorrow)\z/) {
             Selecto::Error->throw('invalid_query', 'date keyword bucket boundaries must match')
                 unless defined($maximum) && "$maximum" eq "$minimum";
-            $predicate = $minimum eq 'today' ? "$value_sql = CURRENT_DATE"
-                : $minimum eq 'yesterday' ? "$value_sql = CURRENT_DATE - INTERVAL '1 day'"
-                : "$value_sql = CURRENT_DATE + INTERVAL '1 day'";
+            my $today = $self->_read_date_sql($params);
+            $predicate = $minimum eq 'today' ? "$value_sql = $today"
+                : $minimum eq 'yesterday' ? "$value_sql = $today - INTERVAL '1 day'"
+                : "$value_sql = $today + INTERVAL '1 day'";
         } else {
             Selecto::Error->throw('invalid_query', 'bucket range requires at least one boundary')
                 unless defined($minimum) || defined($maximum);
@@ -1223,14 +1224,14 @@ sub _compile_bucket {
                 push @$params, int($minimum);
                 my $marker = $self->placeholder(scalar @$params);
                 push @predicates, $kind eq 'date_relative_ranges'
-                    ? "$value_sql <= CURRENT_DATE - ($marker * INTERVAL '1 day')"
+                    ? "$value_sql <= " . $self->_read_date_sql($params) . " - ($marker * INTERVAL '1 day')"
                     : "$value_sql >= $marker";
             }
             if (defined($maximum)) {
                 push @$params, int($maximum);
                 my $marker = $self->placeholder(scalar @$params);
                 push @predicates, $kind eq 'date_relative_ranges'
-                    ? "$value_sql >= CURRENT_DATE - ($marker * INTERVAL '1 day')"
+                    ? "$value_sql >= " . $self->_read_date_sql($params) . " - ($marker * INTERVAL '1 day')"
                     : "$value_sql <= $marker";
             }
             $predicate = join(' AND ', @predicates);
