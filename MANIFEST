@@ -470,3 +470,7 @@ lib/Selecto/AsOf.pm
 t/as_of.t
 lib/Selecto/SQL/AssociationAggregate.pm
 t/ops_association_aggregate.t
+lib/Selecto/RatioMeasures.pm
+t/ops_ratio.t
+t/ops_defaults.t
+t/ops_overlay.t

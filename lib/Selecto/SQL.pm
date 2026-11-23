@@ -2122,6 +2122,16 @@ sub _compile_expression {
         return 'COUNT(CASE WHEN ' . $self->_compile_expression($domain, $arguments->[0], $params) .
             " = $value THEN 1 END)";
     }
+    if ($kind eq 'ratio_of_sums') {
+        Selecto::Error->throw('invalid_query', 'ratio_of_sums requires two numeric fields')
+            unless @$arguments == 2 && !grep {
+                !blessed($_) || $_->kind ne 'field'
+                    || !Selecto::Analytics::UnitRegistry->numeric_type($domain->resolve($_->arguments->[0])->{type})
+            } @$arguments;
+        my $n = $self->_compile_expression($domain,$arguments->[0],$params);
+        my $d = $self->_compile_expression($domain,$arguments->[1],$params);
+        return '(1.0 * SUM(' . $n . ') / ' . $self->_nullif_sql('SUM(' . $d . ')','0') . ')';
+    }
     if ($kind eq 'true_percentage') {
         my $numerator = $self->_compile_expression($domain, $arguments->[0], $params);
         my $denominator = $self->_compile_expression($domain, $arguments->[0], $params);

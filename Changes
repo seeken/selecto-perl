@@ -8,6 +8,9 @@ Revision history for Selecto
       query.as_of and admits date_shortcut filters. Default SQL and write
       timestamps retain their existing clocks. The shared remote request
       schema needs an optional query.as_of string (not changed here).
+    - Part 3 core: validate and publish ratio_measures metadata, derive per-unit
+      units, and compile ratio_of_sums with decimal division and zero-to-NULL
+      semantics at every rollup/cube grouping level.
     - Part 2: association_aggregate computed columns sum/count/min/max a
       governed to-many relation in a correlated scalar subquery, with through
       bridges, associated to-one filters, tenant scope and bound defaults.

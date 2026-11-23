@@ -1700,7 +1700,7 @@ sub _selection_options ($self) {
 }
 
 my %AGGREGATE_KIND = map { ($_ => 1) } qw(count count_field count_distinct sum avg min max
-    sum_zero true_count false_count true_percentage);
+    sum_zero true_count false_count true_percentage ratio_of_sums);
 sub _is_aggregate_expression ($expression) {
     return blessed($expression) && $expression->isa('Selecto::Expression')
         && $AGGREGATE_KIND{$expression->kind} ? 1 : 0;

@@ -43,11 +43,13 @@ sub normalize_column_metadata {
 }
 
 sub normalize_unit {
-    my ($class, $value, $label) = @_;
+    my ($class, $value, $label, $depth) = @_;
+    $depth //= 0;
+    Selecto::Error->throw('invalid_domain', 'unit nesting exceeds limit') if $depth > 16;
     $label //= 'unit';
     Selecto::Error->throw('invalid_domain', "$label must be an object")
         unless ref($value) eq 'HASH';
-    my %known = map { $_ => 1 } qw(kind code scale);
+    my %known = map { $_ => 1 } qw(kind code scale numerator denominator);
     my @unknown = sort grep { !$known{$_} } keys %$value;
     Selecto::Error->throw(
         'invalid_domain', "$label contains unsupported properties", {keys => \@unknown},
@@ -58,6 +60,12 @@ sub normalize_unit {
     Selecto::Error->throw('invalid_domain', "$label kind is not available", {kind => $kind})
         unless $KINDS{$kind};
     my %unit = (kind => $kind);
+    if (exists($value->{numerator}) || exists($value->{denominator})) {
+        Selecto::Error->throw('invalid_domain', "$label composite units require ratio numerator and denominator")
+            unless $kind eq 'ratio' && exists($value->{numerator}) && exists($value->{denominator});
+        $unit{$_} = $class->normalize_unit($value->{$_}, "$label $_", $depth+1) for qw(numerator denominator);
+    }
+
 
     if ($kind eq 'currency') {
         my $code = uc _required_scalar($value->{code}, "$label currency code");

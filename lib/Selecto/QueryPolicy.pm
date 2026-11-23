@@ -53,7 +53,7 @@ sub apply {
 
 my %AGGREGATE = map { $_ => 1 } qw(
     count count_field count_distinct sum sum_zero avg min max
-    true_count false_count true_percentage count_bucket grouping dimension_display
+    true_count false_count true_percentage ratio_of_sums count_bucket grouping dimension_display
 );
 # True when an expression aggregates rows outside a window or correlated
 # collection (whose aggregation is local to that expression).

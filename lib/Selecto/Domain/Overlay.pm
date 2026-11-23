@@ -13,7 +13,7 @@ use Selecto::Limits ();
 use Selecto::Error ();
 
 my %MAP_SECTION = map { $_ => 1 } qw(
-    source schemas joins associations filters functions query_members query_library tenant
+    source schemas joins associations filters functions query_members query_library ratio_measures tenant
     published_views detail_actions components columns custom_columns jsonb_schemas
     subfilters window_functions pagination retarget writes actions imports capabilities
     source_relationships choice_sources co_domains editors

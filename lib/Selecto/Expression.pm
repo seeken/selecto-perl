@@ -72,6 +72,10 @@ sub min     { my ($class, $field) = @_; return $class->new('min', $class->_opera
 sub max     { my ($class, $field) = @_; return $class->new('max', $class->_operand($field)); }
 sub true_count { my ($class, $field) = @_; return $class->new('true_count', $class->_operand($field)); }
 sub false_count { my ($class, $field) = @_; return $class->new('false_count', $class->_operand($field)); }
+sub ratio_of_sums {
+    my ($class, $numerator, $denominator) = @_;
+    return $class->new('ratio_of_sums', $class->_operand($numerator), $class->_operand($denominator));
+}
 sub true_percentage { my ($class, $field) = @_; return $class->new('true_percentage', $class->_operand($field)); }
 sub grouping {
     my ($class, @fields) = @_;

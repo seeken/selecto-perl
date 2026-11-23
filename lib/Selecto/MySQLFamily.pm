@@ -2056,7 +2056,7 @@ sub _compile_text_search {
 }
 
 my %AGGREGATE_KINDS = map { $_ => 1 } qw(
-    count count_field count_distinct sum sum_zero avg min max true_count false_count true_percentage
+    count count_field count_distinct sum sum_zero avg min max true_count false_count true_percentage ratio_of_sums
     count_bucket grouping dimension_display
 );
 

@@ -25,7 +25,7 @@ my %TOP_LEVEL = map { $_ => 1 } qw(
     filters functions query_members published_views detail_actions capabilities
     source_relationships choice_sources writes actions imports editors extensions columns custom_columns
     jsonb_schemas subfilters window_functions pagination retarget redact_fields components
-    query_library co_domains domain_dependencies operations experiences rules tenant_required require_tenant
+    query_library ratio_measures co_domains domain_dependencies operations experiences rules tenant_required require_tenant
     domain_data events json_schemas
 );
 my %SIMPLE_SOURCE = map { $_ => 1 } qw(table fields fts5_index);
@@ -636,6 +636,10 @@ sub _parse_canonical {
         $domain, $raw->{detail_actions},
     );
     $domain->validate_query_library;
+    if (exists $raw->{ratio_measures}) {
+        require Selecto::RatioMeasures;
+        Selecto::RatioMeasures->definitions($domain);
+    }
     my $fingerprint_document = _clone_with_rules($raw);
     delete $fingerprint_document->{domain_fingerprint};
     $domain->{fingerprint} = 'sha256:' . sha256_hex(
@@ -3704,6 +3708,28 @@ list in an overlay must name exactly the relation's composed columns and
 becomes its C<field_order>; C<source.tenant_field> and C<writes.scope.tenant>
 in an overlay refuse with C<invalid_domain_overlay> (declare tenancy in
 C<tenant>). A schema 1 base still yields a schema 1 domain.
+
+=head2 ratio_measures
+
+Canonical domains may declare host-authored ratios at the top level:
+
+  ratio_measures => {
+      revenue_per_unit => {
+          label => 'Revenue per unit',
+          numerator => {field => 'total_revenue', function => 'sum'},
+          denominator => {field => 'units', function => 'sum'},
+          unit => {kind => 'currency', code => 'USD'},
+      },
+  }
+
+Both operands must be public numeric, aggregatable fields at the owner grain
+(or through to-one paths). Only C<sum> is allowed. C<unit> is optional; its
+fallback is C<< {kind => 'ratio', numerator => <unit>, denominator => <unit>} >>.
+The declaration is preserved in published domains and fingerprints.
+C<< Selecto::RatioMeasures->definitions($domain) >> returns normalized copies;
+C<< Selecto::RatioMeasures->expression($definition) >> constructs the
+C<ratio_of_sums> expression used by report consumers. Every grouping level
+compiles its own sums and divides with NULL for a zero denominator.
 
 =head2 as_document
 
