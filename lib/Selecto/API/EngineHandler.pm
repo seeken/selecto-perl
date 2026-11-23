@@ -1054,11 +1054,18 @@ sub describe_openapi ($self, $api) {
         type => 'object', additionalProperties => JSON::PP::false,
         required => [qw(field op)],
         'x-selecto-date-shortcuts' => Selecto::DateShortcut->choices,
+        description => 'on matches an absolute local calendar period with inclusive start and exclusive next start; UTC/epoch fields use the query timezone (UTC default), date fields accept year/month/day only; as_of does not move it.',
+        allOf => [{
+            if => {properties => {op => {const => 'on'}}, required => ['op']},
+            then => {required => ['value'], properties => {value => {
+                type => 'string', pattern => '^[0-9]{4}(-[0-9]{2}(-[0-9]{2}([T ][0-9]{2}(:[0-9]{2})?)?)?)?$',
+            }}},
+        }],
         properties => {
             field => {type => 'string'},
             op => {
                 type => 'string',
-                enum => [qw(eq ne gt gte lt lte between date_shortcut in not_in is_null not_null
+                enum => [qw(eq ne gt gte lt lte between date_shortcut on in not_in is_null not_null
                     starts_with starts_with_ci text_contains text_contains_ci ends_with ends_with_ci)],
             },
             value => {}, end => {},
@@ -1432,7 +1439,7 @@ sub _filter_leaf ($self, $domain, $filter) {
         ]);
     }
     my $definition = _visible_field_definition($domain, $field, 'filter');
-    my $operand = $definition->{type} eq 'epoch_datetime'
+    my $operand = $definition->{type} eq 'epoch_datetime' && $operator ne 'on'
         ? Selecto::Expression->epoch_datetime($field)
         : Selecto::Expression->field($field);
     return $self->_query_filter_expression(
@@ -1610,6 +1617,16 @@ sub _query_filter_expression ($self, $filter, $operator, $definition, $operand) 
             _literal_value($filter->{value}, 'between start'),
             _literal_value($filter->{end}, 'between end'),
         );
+    }
+    if ($operator eq 'on') {
+        Selecto::Error->throw('invalid_api_query', 'on requires a temporal field')
+            unless ($definition->{type} // '')
+                =~ /\A(?:date|datetime|naive_datetime|utc_datetime|epoch_datetime)\z/;
+        my $expression = eval { Selecto::Expression->on($operand, $filter->{value}) };
+        Selecto::Error->throw('invalid_api_query', "$@") unless $expression;
+        return defined($self->explorer_timezone)
+            ? Selecto::Expression->new('on', @{$expression->arguments}, $self->explorer_timezone)
+            : $expression;
     }
     if ($operator eq 'date_shortcut') {
         Selecto::Error->throw('invalid_api_query',
@@ -2238,6 +2255,7 @@ An array of C<< {field, op, value} >> objects, ANDed together. Operators:
 C<eq>, C<ne>, C<gt>, C<gte>, C<lt>, C<lte>, C<between> (with C<value> and
 C<end>), C<in>, C<not_in>, C<is_null>, C<not_null>, C<starts_with>,
 C<text_contains>, C<ends_with> and their C<_ci> forms (text fields only), and
+C<on> (absolute local calendar periods; see L<Selecto::Expression/on>),
 C<date_shortcut> (temporal fields; values such as C<this_month>, see
 L<Selecto::DateShortcut>). Values are JSON scalars and are always bound.
 

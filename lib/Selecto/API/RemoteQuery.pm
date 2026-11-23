@@ -50,7 +50,7 @@ sub request ($self, $engine, $request) {
                 routes => [grep { $_->{operation_id} =~ /\A(?:getDomain|getOpenApi|queryDomain)\z/ }
                     @{$api->manifest->{routes}}],
                 query_capabilities => {explicit_root_select => JSON::PP::true,
-                    filters => [qw(eq ne gt gte lt lte is_null is_not_null date_shortcut)],
+                    filters => [qw(eq ne gt gte lt lte is_null is_not_null date_shortcut on)],
                     nested => JSON::PP::false, aggregates => JSON::PP::false,
                     recursive_filters => JSON::PP::false}});
         } elsif (defined($method) && defined($path) && $method eq 'POST'
@@ -153,7 +153,7 @@ sub query ($self, $engine, $body) {
         _object($filter, [qw(field op value end)], 'invalid_query');
         my $op = $filter->{op};
         _reject('invalid_query') unless defined($op) && !ref($op);
-        _reject('operation_unsupported') unless $op =~ /\A(?:eq|ne|gt|gte|lt|lte|is_null|is_not_null|date_shortcut)\z/;
+        _reject('operation_unsupported') unless $op =~ /\A(?:eq|ne|gt|gte|lt|lte|is_null|is_not_null|date_shortcut|on)\z/;
         _reject('invalid_query') if exists($filter->{end})
             || ($op =~ /null\z/ ? exists($filter->{value}) : !exists($filter->{value}));
         push @filters, {%$filter, op => $op eq 'is_not_null' ? 'not_null' : $op};
@@ -226,7 +226,7 @@ sub explorer_metadata ($self, $engine, %options) {
         domain => {id => $id, fingerprint => $engine->domain->fingerprint, publication => $publication},
         label => $options{label} // $id, fields => \@fields,
         default_select => [map { $_->{id} } @fields],
-        query => {profile => 'remote_query.v1', operators => [qw(eq ne gt gte lt lte is_null is_not_null date_shortcut)],
+        query => {profile => 'remote_query.v1', operators => [qw(eq ne gt gte lt lte is_null is_not_null date_shortcut on)],
             limits => {max_limit => 0 + $self->max_limit, max_offset => 0 + $self->{handler}->max_offset,
                 max_filters => 0 + $self->{handler}->max_filters},
             supports => {detail => JSON::PP::true, nested => JSON::PP::false,
@@ -290,7 +290,14 @@ Selecto::API::RemoteQuery - fingerprint-bound bounded scalar query transport
 
 Set C<query.as_of> to an ISO date or timestamp (L<Selecto::Query/as_of>).
 The shared engine handler applies the clock to all relative expressions in
-this read. C<date_shortcut> filters are admitted for temporal fields, with a
+this read. C<on> admits absolute temporal period strings (year, month, day, hour or
+minute; C<T> or space separator), using half-open bounds in C<query.timezone>
+(UTC by default) for UTC/epoch fields. Date fields admit year/month/day only;
+wall-clock datetime fields are not converted. Missing hours match nothing;
+repeated hours and minutes include both occurrences. Invalid values or
+non-temporal fields are C<invalid_query>. C<query.as_of> does not move these
+periods. See L<Selecto::Expression/on>.
+C<date_shortcut> filters are admitted for temporal fields, with a
 shortcut identifier such as C<today> or C<last_7_days> as C<value>.
 Successful responses echo the original input at C<meta.as_of>, alongside
 C<meta.request_id> when present. Invalid clocks return HTTP 422

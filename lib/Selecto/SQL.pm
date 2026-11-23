@@ -1902,6 +1902,7 @@ sub _group_expression_key {
         "$domain", $self->_root_alias, $self->{_timezone},
         $self->{_suppress_field_timezone} ? 1 : 0,
         $self->{_instant_fields} ? 1 : 0,
+        $self->{_selecto_on_raw} ? 1 : 0,
         _expression_digest($expression, $self->{_group_expression_digests} // {}),
     ]);
 }
@@ -2139,6 +2140,7 @@ sub _compile_expression {
         return "(100.0 * COUNT(CASE WHEN $numerator = TRUE THEN 1 END) / " .
             $self->_nullif_sql("COUNT($denominator)", '0') . ')';
     }
+    return $self->_compile_on($domain, $expression, $params) if $kind eq 'on';
     return $self->_compile_date_shortcut($domain, $expression, $params)
         if $kind eq 'date_shortcut';
     return $self->_compile_dialect_expression($domain, $expression, $params)
@@ -2800,13 +2802,13 @@ sub _field_sql {
         # _canonical_kind.
         $self->{_field_types}{"$path"} = $resolved->{type};
     }
-    my $localize = defined($self->{_timezone})
+    my $localize = !$self->{_selecto_on_raw} && defined($self->{_timezone})
         && ($resolved->{type} eq 'utc_datetime' || $resolved->{type} eq 'epoch_datetime')
         && !$self->{_suppress_field_timezone};
     # A naive column holding UTC becomes a true instant wherever the value is
     # used as one: before a zone conversion, and in instant formats.
     $sql = $self->_compile_naive_utc_instant_sql($sql)
-        if $resolved->{type} eq 'utc_datetime'
+        if $resolved->{type} eq 'utc_datetime' && !$self->{_selecto_on_raw}
         && ($localize || $self->{_suppress_field_timezone} || $self->{_instant_fields})
         && ($domain->field_storage($path) // '') eq 'naive_utc';
     return $sql unless $localize;
@@ -4690,6 +4692,55 @@ sub _compile_dialect_expression {
 # it, so the session (or query) time zone decides when a day begins. Others
 # bind the bounds of the server's date.
 sub _current_date_shortcuts { return 0 }
+
+sub _compile_on {
+    my ($self, $domain, $expression, $params) = @_;
+    my ($operand, $value, $fallback_timezone) = @{$expression->arguments};
+    Selecto::Error->throw('invalid_query', 'on requires a temporal field')
+        unless blessed($operand) && $operand->kind eq 'field';
+    my $path = $operand->arguments->[0];
+    my $type = $domain->resolve($path)->{type} // '';
+    Selecto::Error->throw('invalid_query', 'on requires a temporal field')
+        unless $type =~ /\A(?:date|datetime|naive_datetime|utc_datetime|epoch_datetime)\z/;
+    require Selecto::DateShortcut;
+    my $period = Selecto::DateShortcut->period($value);
+    Selecto::Error->throw('invalid_query', 'on hour/minute precision requires a datetime field')
+        if $type eq 'date' && $period->{precision} =~ /\A(?:hour|minute)\z/;
+    my $cast_type = $type eq 'date' ? 'date' : 'datetime';
+    my $ranges;
+    if ($type eq 'utc_datetime' || $type eq 'epoch_datetime') {
+        $ranges = Selecto::DateShortcut->period_instant_ranges($period, $self->{_timezone} // $fallback_timezone // 'UTC');
+        if ($type eq 'utc_datetime') {
+            my $naive = ($domain->field_storage($path) // '') eq 'naive_utc';
+            $cast_type = $naive ? 'datetime' : 'utc_datetime';
+            $ranges = [map { [map {
+                my $text = DateTime->from_epoch(epoch => $_)->strftime('%Y-%m-%d %H:%M:%S');
+                $text .= '+00:00' if !$naive && $self->_current_date_shortcuts;
+                $text;
+            } @$_] } @$ranges];
+        }
+    } else {
+        $ranges = [[map { $type eq 'date' ? $_->ymd : $_->strftime('%Y-%m-%d %H:%M:%S') }
+            @{$period}{qw(start next)}]];
+    }
+    local $self->{_selecto_on_raw} = 1;
+    my @sql;
+    for my $range (@$ranges) {
+        my @parts;
+        for my $index (0, 1) {
+            # Compile each occurrence separately: computed operands may bind
+            # parameters on dialects with anonymous placeholders.
+            my $column = $self->_compile_expression($domain, $operand, $params);
+            push @$params, $range->[$index];
+            my $bound = $self->placeholder(scalar @$params);
+            $bound = 'CAST(' . $bound . ' AS ' . $self->_value_type_sql($cast_type) . ')'
+                unless $type eq 'epoch_datetime';
+            push @parts, '(' . $column . ($index ? ' < ' : ' >= ') . $bound . ')';
+        }
+        push @sql, '(' . join(' AND ', @parts) . ')';
+    }
+    return '(' . join(' OR ', @sql) . ')';
+}
 
 sub _compile_date_shortcut {
     my ($self, $domain, $expression, $params) = @_;

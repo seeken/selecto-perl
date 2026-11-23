@@ -4,7 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 use POSIX qw(strftime);
-use Time::Local qw(timegm);
+use Time::Local qw(timegm_modern);
 use Selecto::Expression ();
 
 my @CHOICES = (
@@ -93,7 +93,7 @@ sub valid_date {
     return 0 unless defined($date) && !ref($date)
         && "$date" =~ /\A(\d{4})-(\d{2})-(\d{2})\z/;
     my ($year, $month, $day) = ($1, $2, $3);
-    my $epoch = eval { timegm(0, 0, 12, $day, $month - 1, $year) };
+    my $epoch = eval { timegm_modern(0, 0, 12, $day, $month - 1, $year) };
     return 0 unless defined $epoch;
     return strftime('%Y-%m-%d', gmtime($epoch)) eq "$date" ? 1 : 0;
 }
@@ -159,8 +159,13 @@ sub expression {
 sub day_start_instant {
     my ($class, $date, $timezone) = @_;
     die "date must be an ISO date\n" unless $class->valid_date($date);
-    require DateTime;
     my ($year, $month, $day) = "$date" =~ /\A(\d{4})-(\d{2})-(\d{2})\z/;
+    return $class->_day_start($year, $month, $day, $timezone)->strftime('%Y-%m-%dT%H:%M:%SZ');
+}
+
+sub _day_start {
+    my ($class, $year, $month, $day, $timezone) = @_;
+    require DateTime;
     # A zone whose clocks skip midnight begins that day at the first hour
     # that exists.
     my $start;
@@ -170,7 +175,81 @@ sub day_start_instant {
     }
     die "date has no start in the zone\n" unless $start;
     $start->set_time_zone('UTC');
-    return $start->strftime('%Y-%m-%dT%H:%M:%SZ');
+    return $start;
+}
+
+# Absolute local periods share the same zone/calendar library as shortcuts.
+# Parse before stringifying: a JSON number such as 2026 is not a year string.
+sub period {
+    my ($class, $value) = @_;
+    require B;
+    require DateTime;
+    require Selecto::Error;
+    my $bad = sub { Selecto::Error->throw('invalid_query',
+        'on requires a valid period string (YYYY, YYYY-MM, YYYY-MM-DD, YYYY-MM-DDTHH or YYYY-MM-DDTHH:MM)') };
+    $bad->() if !defined($value) || ref($value)
+        || !(B::svref_2object(\$value)->FLAGS & B::SVp_POK());
+    $bad->() unless $value =~ /\A([0-9]{4})(?:-([0-9]{2})(?:-([0-9]{2})(?:[T ]([0-9]{2})(?::([0-9]{2}))?)?)?)?\z/;
+    my ($year, $month, $day, $hour, $minute) = ($1, $2, $3, $4, $5);
+    $bad->() if $year == 0;
+    my $precision = defined($minute) ? 'minute' : defined($hour) ? 'hour'
+        : defined($day) ? 'day' : defined($month) ? 'month' : 'year';
+    my $start = eval { DateTime->new(year => $year, month => $month // 1,
+        day => $day // 1, hour => $hour // 0, minute => $minute // 0,
+        time_zone => 'UTC') };
+    $bad->() unless $start;
+    my $next = $start->clone->add(($precision . 's') => 1);
+    return {precision => $precision, start => $start, next => $next};
+}
+
+# Return UTC epoch ranges. Subday periods intersect each constant-offset
+# part of the local day. DateTime owns all offset rules; this also handles
+# half-hour transitions, missing hours, and both occurrences of a fold minute.
+sub period_instant_ranges {
+    my ($class, $period, $timezone) = @_;
+    my $instant = sub {
+        my ($dt) = @_;
+        return $class->_day_start($dt->year, $dt->month, $dt->day, $timezone)->epoch;
+    };
+    my ($start, $next) = @{$period}{qw(start next)};
+    my $first = $instant->($start);
+    return [[$first, $instant->($next)]]
+        if $period->{precision} =~ /\A(?:year|month|day)\z/;
+    my $last = $instant->($start->clone->add(days => 1));
+    my $zone = DateTime::TimeZone->new(name => $timezone);
+    my $offset = sub { $zone->offset_for_datetime(DateTime->from_epoch(epoch => $_[0])) };
+    my (@spans, $span_start);
+    $span_start = $first;
+    my $current_offset = $offset->($first);
+    for (my $cursor = $first; $cursor < $last;) {
+        my $probe = $cursor + 3600 < $last ? $cursor + 3600 : $last;
+        my $new_offset = $offset->($probe);
+        if ($new_offset != $current_offset) {
+            my ($lo, $hi) = ($cursor, $probe);
+            while ($hi - $lo > 1) {
+                my $mid = int(($lo + $hi) / 2);
+                if ($offset->($mid) == $current_offset) { $lo = $mid }
+                else { $hi = $mid }
+            }
+            push @spans, [$span_start, $hi, $current_offset];
+            $span_start = $hi;
+            $current_offset = $new_offset;
+        }
+        $cursor = $probe;
+    }
+    push @spans, [$span_start, $last, $current_offset];
+    my @ranges;
+    for my $span (@spans) {
+        my $lo = $start->epoch - $span->[2];
+        my $hi = $next->epoch - $span->[2];
+        $lo = $span->[0] if $lo < $span->[0];
+        $hi = $span->[1] if $hi > $span->[1];
+        next if $lo >= $hi;
+        if (@ranges && $ranges[-1][1] == $lo) { $ranges[-1][1] = $hi }
+        else { push @ranges, [$lo, $hi] }
+    }
+    # Equal bounds preserve SQL NULL/NOT semantics for a nonexistent period.
+    return @ranges ? \@ranges : [[$first, $first]];
 }
 
 sub _date {
@@ -188,7 +267,7 @@ sub _date {
 sub _epoch {
     my ($date) = @_;
     my ($year, $month, $day) = "$date" =~ /\A(\d{4})-(\d{2})-(\d{2})\z/;
-    return timegm(0, 0, 12, $day, $month - 1, $year);
+    return timegm_modern(0, 0, 12, $day, $month - 1, $year);
 }
 
 sub _add_days {

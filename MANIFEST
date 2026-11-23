@@ -474,3 +474,4 @@ lib/Selecto/RatioMeasures.pm
 t/ops_ratio.t
 t/ops_defaults.t
 t/ops_overlay.t
+t/period_on.t

@@ -308,6 +308,12 @@ sub date_shortcut {
         unless Selecto::DateShortcut->valid($shortcut);
     return $class->new('date_shortcut', $class->_operand($field), "$shortcut");
 }
+sub on {
+    my ($class, $field, $value) = @_;
+    require Selecto::DateShortcut;
+    Selecto::DateShortcut->period($value);
+    return $class->new('on', $class->_operand($field), $value);
+}
 sub epoch_datetime {
     my ($class, $field) = @_;
     return $class->new('epoch_datetime', $class->_operand($field));
@@ -491,6 +497,13 @@ sub _from_filter_ast {
         my @members = map { ref($_) && _is_json_boolean($_) ? ($_ ? 1 : 0) : $_ } @$value;
         $budget->_consume_values(\@members, 'in member');
         return $class->in($field, \@members);
+    }
+    if ($operator eq 'on') {
+        Selecto::Error->throw('invalid_query', 'on filter requires a field and a period string')
+            unless @arguments == 2;
+        my $expression = $class->on($field, $value);
+        $budget->consume_value($value, label => 'on period');
+        return $expression;
     }
     if ($operator eq 'between') {
         Selecto::Error->throw('invalid_query', 'between filter requires two literal bounds')
@@ -745,6 +758,7 @@ segments, computed predicate columns and API clients:
   ['and', [AST, ...]]           ['or', [AST, ...]]           ['not', AST]
   ['eq', FIELD, VALUE]          # also ne gt gte lt lte
   ['between', FIELD, LOW, HIGH]
+  ['on', FIELD, PERIOD]        # absolute local year/month/day/hour/minute
   ['in', FIELD, [VALUE, ...]]
   ['is_null', FIELD]            ['not_null', FIELD]
   ['starts_with', FIELD, TEXT]  # also text_contains, ends_with and the _ci forms
@@ -856,6 +870,26 @@ DuckDB implement these; other adapters fail closed. The instant formats
 C<timezone_offset>) read a C<utc_datetime> column declared
 C<< storage => 'naive_utc' >> as C<(column AT TIME ZONE 'UTC')>, with or
 without L<Selecto::Query/use_timezone>.
+
+=head2 on
+
+  Selecto::Expression->on('ordered_at', '2026-01-15')
+  Selecto::Expression->from_filter_ast(['not', ['on', 'ordered_at', '2026-01']])
+
+Matches an absolute calendar period with inclusive start and exclusive next
+start. Values are strings: C<YYYY>, C<YYYY-MM>, C<YYYY-MM-DD>,
+C<YYYY-MM-DDTHH>, or C<YYYY-MM-DDTHH:MM>; a space may replace C<T>.
+Seconds, offsets, fractions, year zero and impossible calendar values are
+C<invalid_query> errors. Only temporal fields (including computed fields) are
+admitted; C<date> refuses hour/minute precision.
+
+C<utc_datetime> and C<epoch_datetime> bounds use the query timezone (UTC by
+default); epoch bounds are seconds. DST days have their actual length, a
+missing hour matches nothing, and a repeated hour covers both occurrences.
+Repeated minutes match both occurrences as a union of half-open ranges.
+C<datetime>/C<naive_datetime> compare wall clocks, and C<date> compares dates.
+Stored columns remain unwrapped for index use. C<as_of> does not move the
+period. The generic C<not> wrapper composes with C<on>.
 
 =head2 date_shortcut
 
