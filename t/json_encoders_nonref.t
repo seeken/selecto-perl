@@ -24,8 +24,11 @@ find({ wanted => sub {
 is_deeply(\@problems, [], 'every Cpanel::JSON::XS encoder allows plain scalars');
 
 require Cpanel::JSON::XS;
+# Older releases refuse a plain scalar by default and newer ones accept it, so
+# the default is reported, not asserted: the setting above covers both.
 my $plain = eval { Cpanel::JSON::XS->new->canonical->encode(7) };
-ok(!defined $plain, 'the library default still refuses a plain scalar (why the setting matters)');
+note('Cpanel::JSON::XS ' . Cpanel::JSON::XS->VERSION . ' default '
+    . (defined $plain ? 'accepts' : 'refuses') . ' a plain scalar');
 is(Cpanel::JSON::XS->new->canonical->allow_nonref(1)->encode(7), '7', 'allow_nonref encodes it');
 
 # The failing path itself: the engine's context comparison encodes plain tenant ids.
