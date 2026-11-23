@@ -8,6 +8,9 @@ Revision history for Selecto
       query.as_of and admits date_shortcut filters. Default SQL and write
       timestamps retain their existing clocks. The shared remote request
       schema needs an optional query.as_of string (not changed here).
+    - Query library picker group defaults (Part 1 core): declare default and
+      default_views; API segment_choices records explicit Off overrides and
+      published domains retain the declaration.
     - Domain overlays remove nested map keys with undef (JSON null), allowing
       tenant bridges to replace string casts with integer joins.
     - Associations may use a named CASE computed field as their owner key and

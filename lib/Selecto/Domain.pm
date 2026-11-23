@@ -2191,7 +2191,7 @@ sub _normalize_query_library {
                 unless $id =~ /\A[A-Za-z][A-Za-z0-9_]*\z/;
             my $group = $groups->{$id};
             _object($group, "segment picker group $id");
-            _reject_unknown($group, {map { $_ => 1 } qw(label description off_label choices)}, "segment picker group $id");
+            _reject_unknown($group, {map { $_ => 1 } qw(label description off_label choices default default_views)}, "segment picker group $id");
             _nonblank_string($group->{label}, "segment picker group $id label");
             Selecto::Error->throw('invalid_domain', "segment picker group $id description must be a string")
                 if exists($group->{description}) && (!defined($group->{description}) || ref($group->{description}));
@@ -2209,6 +2209,19 @@ sub _normalize_query_library {
                     unless ref($library{segments}{$segment}) eq 'HASH';
                 Selecto::Error->throw('invalid_domain', "segment $segment belongs to more than one picker group")
                     if $used_segment{$segment}++;
+            }
+        }
+        for my $id (sort keys %$groups) {
+            my $g = $groups->{$id};
+            if (exists $g->{default}) {
+                _nonblank_string($g->{default}, "segment picker group $id default");
+                Selecto::Error->throw('invalid_domain', "segment picker group $id default must name a choice")
+                    unless grep { $_->{segment} eq $g->{default} } @{$g->{choices}};
+            }
+            if (exists $g->{default_views}) {
+                Selecto::Error->throw('invalid_domain', "segment picker group $id default_views requires a default and view names")
+                    unless exists($g->{default}) && ref($g->{default_views}) eq 'ARRAY'
+                        && !grep { !defined($_) || ref($_) || !/\A(?:detail|aggregate|graph)\z/ } @{$g->{default_views}};
             }
         }
         $library{segment_picker_groups} = dclone($groups);

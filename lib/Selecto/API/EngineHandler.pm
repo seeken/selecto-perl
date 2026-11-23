@@ -475,7 +475,7 @@ sub _query ($self, $engine, $body, %options) {
     _object($body, 'query body');
     $self->_admit_body($body, 'invalid_api_query');
     _reject_unknown($body, [qw(
-        select projection view segments parameters filters ordering order_by group_by limit offset timezone as_of row_format
+        select projection view segments segment_choices parameters filters ordering order_by group_by limit offset timezone as_of row_format
         rollup cube grouping_sets
     )], 'query body');
 
@@ -586,6 +586,12 @@ sub _query ($self, $engine, $body, %options) {
         $query = $query->replace_selections($selection_plan->{expressions});
     }
 
+    my $resolved_choices = Selecto::QueryLibrary->resolve_segment_choices(
+        $domain, \@segments, $body->{segment_choices},
+        (exists($body->{group_by}) || grep { ref($_) eq 'HASH' && exists($_->{aggregate}) } @{$body->{select} // []})
+            ? 'aggregate' : 'detail',
+    );
+    @segments = @{$resolved_choices->{segments}};
     if (@segments) {
         my %seen;
         @segments = grep { !$seen{$_}++ } @segments;
@@ -961,6 +967,8 @@ sub describe_openapi ($self, $api) {
                 ],
             },
             view => {type => 'string'},
+            segment_choices => {type => 'object', additionalProperties => {type => 'string'},
+                description => 'Segment picker choices by group; empty string means explicit Off.'},
             segments => {
                 type => 'array', items => {type => 'string'},
                 maxItems => $self->max_segments,

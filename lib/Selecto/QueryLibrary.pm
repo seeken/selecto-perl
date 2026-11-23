@@ -69,9 +69,50 @@ sub segment_picker_groups {
         push @result, {
             id => $id, label => "$label", description => $group->{description} // '',
             off_label => "$off_label", choices => \@choices,
+            (exists($group->{default}) ? (default => $group->{default}) : ()),
+            (exists($group->{default_views}) ? (default_views => dclone($group->{default_views})) : ()) ,
         };
     }
     return \@result;
+}
+
+# Shared by Explorer and the HTTP-neutral API. An explicit empty choice is Off.
+sub resolve_segment_choices {
+    my ($class, $domain, $segments, $choices, $view) = @_;
+    $choices //= {};
+    Selecto::Error->throw('invalid_query_library', 'segment_choices must be an object')
+        unless ref($choices) eq 'HASH';
+    my @segments = @$segments;
+    my (%effective, %defaults, %known);
+    for my $group (@{$class->segment_picker_groups($domain)}) {
+        my $id = $group->{id};
+        $known{$id} = 1;
+        my %allowed = map { $_->{segment} => 1 } @{$group->{choices}};
+        my @selected = grep { $allowed{$_} } @segments;
+        if (exists $choices->{$id}) {
+            my $choice = $choices->{$id};
+            Selecto::Error->throw('invalid_query_library', 'invalid segment-group choice', {group => $id})
+                unless defined($choice) && !ref($choice) && ($choice eq '' || $allowed{$choice});
+            @segments = grep { !$allowed{$_} } @segments;
+            push @segments, $choice if length $choice;
+            @selected = length($choice) ? ($choice) : ();
+        } elsif (!@selected && exists($group->{default})
+            && (!exists($group->{default_views}) || grep { $_ eq ($view // 'detail') } @{$group->{default_views}})) {
+            push @segments, $group->{default};
+            @selected = ($group->{default});
+            $defaults{$group->{default}} = 1;
+        }
+        Selecto::Error->throw('invalid_query_library', 'segment picker group allows only one choice', {group => $id})
+            if @selected > 1;
+        $defaults{$group->{default}} = 1
+            if @selected == 1 && exists($group->{default}) && $selected[0] eq $group->{default}
+                && (!exists($group->{default_views}) || grep { $_ eq ($view // 'detail') } @{$group->{default_views}});
+        $effective{$id} = $selected[0] // '';
+    }
+    Selecto::Error->throw('invalid_query_library', 'unknown segment picker group')
+        if grep { !$known{$_} } keys %$choices;
+    my %seen;
+    return {segments => [grep { !$seen{$_}++ } @segments], choices => \%effective, defaults => \%defaults};
 }
 
 sub definitions {
@@ -890,6 +931,13 @@ The four registries plus C<segment_picker_groups>, as copies.
 
 One registry (C<segments>, C<projections>, C<orderings> or C<views>), or one
 definition. Unknown names throw C<invalid_query_library>.
+
+Picker groups may declare C<< default => 'segment_id' >>, which must name a
+choice, and C<< default_views => [qw(aggregate graph)] >>. Without
+C<default_views>, the default applies to every view. Explicit empty choices
+suppress defaults. The API accepts C<< segment_choices => {group_id => ''} >>
+for Off; otherwise selected segments take precedence over defaults. API
+C<group_by> requests use the aggregate view, other requests use Detail.
 
 =item C<segment_picker_groups($domain)>
 
