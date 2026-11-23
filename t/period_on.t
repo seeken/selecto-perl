@@ -83,8 +83,26 @@ for my $backend (qw(postgresql mysql mariadb duckdb sqlite)) {
             @expected = map { $_ . '+00:00' } @expected if ($field eq 'instant' || $field eq 'computed') && ($backend eq 'postgresql' || $backend eq 'duckdb');
             is_deeply $statement->params, \@expected, "$field correct bounds independent of as_of";
         }
-        is_deeply $engine->compile($engine->query->select('id')->where($x->on('epoch', '2026-01-15')))->params,
-            [epoch('2026-01-15 00:00:00'), epoch('2026-01-16 00:00:00')], 'UTC default';
+        for my $field (qw(instant epoch wall legacy day naive_utc computed)) {
+            my $statement = $engine->compile($engine->query->select('id')->where($x->on($field, '2026-01-15')));
+            my $session = $backend eq 'postgresql' && $field =~ /^(?:instant|epoch|naive_utc|computed)$/;
+            my @expected = $field eq 'day' ? ('2026-01-15', '2026-01-16')
+                : $field eq 'epoch' && !$session ? (epoch('2026-01-15 00:00:00'), epoch('2026-01-16 00:00:00'))
+                : ('2026-01-15 00:00:00', '2026-01-16 00:00:00');
+            @expected = map { $_ . '+00:00' } @expected
+                if $backend eq 'duckdb' && ($field eq 'instant' || $field eq 'computed');
+            is_deeply $statement->params, \@expected, "$field default bounds";
+            like $statement->sql, qr/>=.+ AND .+ </, "$field default half-open";
+            if ($session) {
+                like $statement->sql, qr/CAST\(\$1 AS TIMESTAMPTZ\)/, "$field session-interpreted bound";
+                like $statement->sql, qr/EXTRACT\(EPOCH FROM CAST\(\$1 AS TIMESTAMPTZ\)\)/,
+                    'epoch conversion stays in SQL' if $field eq 'epoch';
+                like $statement->sql, qr/CAST\(\$1 AS TIMESTAMPTZ\) AT TIME ZONE 'UTC'/,
+                    'UTC wall-time storage converts only bound' if $field eq 'naive_utc';
+            }
+            unlike $statement->sql, qr/(?:EXTRACT|CAST|TO_TIMESTAMP)\("s0"\./,
+                "$field default leaves column unwrapped";
+        }
     };
 }
 for my $backend (qw(sqlite duckdb postgresql)) {
@@ -131,6 +149,12 @@ for my $backend (qw(sqlite duckdb postgresql)) {
         }
         $seed->(map {epoch($_)} ('2026-01-14 23:59:59','2026-01-15 00:00:00','2026-01-15 23:59:59','2026-01-16 00:00:00'));
         for my $field (qw(wall legacy)) { is_deeply $rows->($x->on($field,'2026-01-15')), [[2],[3]], "$field wall day" }
+        if ($backend ne 'postgresql') {
+            for my $field (qw(instant epoch naive_utc computed)) {
+                is_deeply $engine->all($engine->query->select('id')->order_by('id')
+                    ->where($x->on($field, '2026-01-15')))->{rows}, [[2],[3]], "$field retains UTC default";
+            }
+        }
         $seed->(map {epoch($_)} ('2026-03-08 08:59:59','2026-03-08 09:00:00'));
         is_deeply $rows->($x->on('instant','2026-03-08T02')), [], 'missing hour';
         is_deeply $rows->($x->on('instant','2026-03-08T02:30')), [], 'missing minute';
@@ -188,4 +212,122 @@ for my $backend (qw(sqlite duckdb postgresql)) {
         $dbh->disconnect;
     };
 }
+subtest 'PostgreSQL session zone without query timezone' => sub {
+    plan skip_all => 'RAM PostgreSQL not configured' unless TestPostgreSQL->configured;
+    my $dbh = TestPostgreSQL->connect;
+    $dbh->do("SET TIME ZONE 'America/Chicago'");
+    $dbh->do('CREATE TEMP TABLE period_events(id INTEGER PRIMARY KEY, instant TIMESTAMPTZ, epoch BIGINT, wall TIMESTAMP, legacy TIMESTAMP, day DATE, naive_utc TIMESTAMP)');
+    my $engine = engine('postgresql', $dbh);
+    my $rows = sub {
+        my ($field, $period) = @_;
+        return $engine->all($engine->query->select('id')->order_by('id')->where($x->on($field, $period)))->{rows};
+    };
+    my $seed = sub {
+        $dbh->do('DELETE FROM period_events');
+        my $id = 0;
+        for my $epoch (@_) {
+            my $utc = stamp($epoch);
+            $dbh->do('INSERT INTO period_events VALUES(?,?,?,?,?,?,?)', undef, ++$id,
+                "$utc+00:00", $epoch, $utc, $utc, substr($utc, 0, 10), $utc);
+        }
+    };
+    my @fields = qw(instant epoch naive_utc computed);
+    for my $case (
+        ['2026', '2026-01-01 06:00:00', '2027-01-01 06:00:00'],
+        ['2026-01-15', '2026-01-15 06:00:00', '2026-01-16 06:00:00'],
+        ['2026-03', '2026-03-01 06:00:00', '2026-04-01 05:00:00'],
+        ['2026-03-08', '2026-03-08 06:00:00', '2026-03-09 05:00:00'],
+        ['2026-11-01', '2026-11-01 05:00:00', '2026-11-02 06:00:00'],
+        ['2026-01-15T10', '2026-01-15 16:00:00', '2026-01-15 17:00:00'],
+        ['2026-01-15T10:30', '2026-01-15 16:30:00', '2026-01-15 16:31:00'],
+    ) {
+        my ($period, $lo, $hi) = @$case;
+        my ($start, $next) = (epoch($lo), epoch($hi));
+        $seed->($start - 1, $start, $next - 1, $next);
+        for my $field (@fields) {
+            is_deeply $rows->($field, $period), [[2],[3]], "$field $period Chicago boundaries";
+        }
+    }
+    $seed->(epoch('2026-01-15 05:30:00'), epoch('2026-01-16 05:30:00'));
+    for my $field (@fields) {
+        is_deeply $rows->($field, '2026-01-15'), [[2]], "$field includes late Jan 15, excludes late Jan 14";
+    }
+    my $handler = Selecto::API::EngineHandler->new;
+    for my $field (qw(instant epoch computed)) {
+        is_deeply $handler->query($engine, {select => ['id'], filters => [
+            {field => $field, op => 'on', value => '2026-01-15'}]})->{rows}, [[2]], "API $field uses session";
+    }
+    my $host = Selecto::API::RemoteQuery->new(base_path => '/api2', default_limit => 10);
+    my $response = $host->request($engine, {method => 'POST', path => '/api2/query',
+        content_type => 'application/json', body => {
+            format => 'selecto.remote-query', format_version => 1,
+            domain => {fingerprint => $engine->domain->fingerprint},
+            query => {select => ['id'], filters => [{field => 'instant', op => 'on', value => '2026-01-15'}], limit => 10}}});
+    is $response->{status}, 200, 'RemoteQuery without timezone status';
+    is_deeply(JSON::PP->new->decode($response->{body})->{data}{rows}, [[2]], 'RemoteQuery uses session');
+
+    # A request's own timezone parameter always wins: over the session zone
+    # and over the host's trusted fallback. Row 1 is Jan 15 00:30 in New York
+    # (Jan 14 in Chicago and Honolulu); row 2 is Jan 15 in Chicago/Honolulu.
+    for my $field (qw(instant epoch computed)) {
+        is_deeply $handler->query($engine, {select => ['id'], timezone => 'America/New_York', filters => [
+            {field => $field, op => 'on', value => '2026-01-15'}]})->{rows}, [[1]],
+            "API $field request timezone beats session";
+    }
+    my $fallback = Selecto::API::EngineHandler->new(explorer_timezone => 'Pacific/Honolulu');
+    is_deeply $fallback->query($engine, {select => ['id'], filters => [
+        {field => 'instant', op => 'on', value => '2026-01-15'}]})->{rows}, [[2]], 'API host fallback zone without request timezone';
+    is_deeply $fallback->query($engine, {select => ['id'], timezone => 'America/New_York', filters => [
+        {field => 'instant', op => 'on', value => '2026-01-15'}]})->{rows}, [[1]], 'API request timezone beats host fallback';
+    my $zoned = $host->request($engine, {method => 'POST', path => '/api2/query',
+        content_type => 'application/json', body => {
+            format => 'selecto.remote-query', format_version => 1,
+            domain => {fingerprint => $engine->domain->fingerprint},
+            query => {select => ['id'], timezone => 'America/New_York',
+                filters => [{field => 'instant', op => 'on', value => '2026-01-15'}], limit => 10}}});
+    is $zoned->{status}, 200, 'RemoteQuery with timezone status';
+    is_deeply(JSON::PP->new->decode($zoned->{body})->{data}{rows}, [[1]], 'RemoteQuery request timezone beats session');
+
+    # Reusing the same engine/period must defer zone resolution until execution.
+    my $statement = $engine->compile($engine->query->select('id')->where($x->on('instant', '2026-01-15')));
+    $dbh->do("SET TIME ZONE 'UTC'");
+    is_deeply $dbh->selectall_arrayref($statement->sql, undef, @{$statement->params}), [[1]], 'compiled bound follows changed session';
+    $dbh->do("SET TIME ZONE 'America/Chicago'");
+
+    # PostgreSQL resolves ambiguous timestamps to standard time; gap minutes
+    # shift forward. Test this separately from the explicit-zone union logic.
+    $seed->(map {epoch($_)} ('2026-11-01 06:30:00', '2026-11-01 07:30:00', '2026-11-01 07:30:59', '2026-11-01 08:00:00'));
+    for my $field (@fields) {
+        is_deeply $rows->($field, '2026-11-01T01'), [[2],[3]], "$field session fold hour";
+        is_deeply $rows->($field, '2026-11-01T01:30'), [[2],[3]], "$field session fold minute";
+    }
+    $seed->(map {epoch($_)} ('2026-03-08 08:29:59', '2026-03-08 08:30:00', '2026-03-08 08:30:59', '2026-03-08 08:31:00'));
+    for my $field (@fields) {
+        is_deeply $rows->($field, '2026-03-08T02'), [], "$field session gap hour";
+        is_deeply $rows->($field, '2026-03-08T02:30'), [[2],[3]], "$field session gap minute shifts forward";
+    }
+
+    my ($today, $start, $next) = $dbh->selectrow_array(q{SELECT CURRENT_DATE::text,
+        EXTRACT(EPOCH FROM CURRENT_DATE::timestamptz)::bigint,
+        EXTRACT(EPOCH FROM (CURRENT_DATE + 1)::timestamptz)::bigint});
+    $seed->($start - 1800, $start, $next - 1800, $next);
+    for my $field (@fields) {
+        my $shortcut = $engine->all($engine->query->select('id')->order_by('id')
+            ->where($x->date_shortcut($field, 'today')))->{rows};
+        is_deeply $shortcut, [[2],[3]], "$field today uses Chicago day";
+        is_deeply $rows->($field, $today), $shortcut, "$field on and date_shortcut agree";
+    }
+    $seed->(map {epoch($_)} ('2026-01-14 23:59:59', '2026-01-15 00:00:00', '2026-01-15 23:59:59', '2026-01-16 00:00:00'));
+    for my $field (qw(day wall legacy)) {
+        is_deeply $rows->($field, '2026-01-15'), [[2],[3]], "$field remains literal without timezone";
+    }
+    $dbh->do('SET enable_seqscan=off');
+    for my $field (qw(instant epoch naive_utc)) {
+        $dbh->do("CREATE INDEX period_${field}_session_idx ON period_events($field)");
+        my $bound = $engine->compile($engine->query->select('id')->where($x->on($field, '2026-01-15')));
+        my $plan = $dbh->selectall_arrayref('EXPLAIN ' . $bound->sql, undef, @{$bound->params});
+        like join(' ', map {@$_} @$plan), qr/Index Cond:.*>=.*</, "$field session bounds are index conditions";
+    }
+    $dbh->disconnect;
+};
 done_testing;

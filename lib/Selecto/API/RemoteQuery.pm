@@ -291,10 +291,13 @@ Selecto::API::RemoteQuery - fingerprint-bound bounded scalar query transport
 Set C<query.as_of> to an ISO date or timestamp (L<Selecto::Query/as_of>).
 The shared engine handler applies the clock to all relative expressions in
 this read. C<on> admits absolute temporal period strings (year, month, day, hour or
-minute; C<T> or space separator), using half-open bounds in C<query.timezone>
-(UTC by default) for UTC/epoch fields. Date fields admit year/month/day only;
-wall-clock datetime fields are not converted. Missing hours match nothing;
-repeated hours and minutes include both occurrences. Invalid values or
+minute; C<T> or space separator), using half-open bounds in C<query.timezone>,
+or else the database session's on PostgreSQL for UTC/epoch fields. Without a
+query timezone, hour/minute DST gaps and folds follow PostgreSQL's timestamp
+interpretation. SQLite, DuckDB and MySQL/MariaDB retain UTC defaults.
+Date fields admit year/month/day only; wall-clock datetime fields are not
+converted. With an explicit zone, missing hours match nothing; repeated hours
+and minutes include both occurrences. Invalid values or
 non-temporal fields are C<invalid_query>. C<query.as_of> does not move these
 periods. See L<Selecto::Expression/on>.
 C<date_shortcut> filters are admitted for temporal fields, with a

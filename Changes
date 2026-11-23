@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Without a query timezone, PostgreSQL on periods use the database session
+      zone and its DST interpretation, including SQL-derived epoch bounds.
+      Keep date_shortcut agreement for UTC stored as naive timestamps too.
+      Explicit zones and other dialects retain their existing behavior.
     - Add temporal on filters for absolute year/month/day/hour/minute periods,
       with sargable half-open bounds, zone-correct UTC/epoch instants and DST
       gaps/folds. Expose on through EngineHandler/OpenAPI and RemoteQuery.

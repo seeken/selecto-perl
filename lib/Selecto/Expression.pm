@@ -883,10 +883,24 @@ Seconds, offsets, fractions, year zero and impossible calendar values are
 C<invalid_query> errors. Only temporal fields (including computed fields) are
 admitted; C<date> refuses hour/minute precision.
 
-C<utc_datetime> and C<epoch_datetime> bounds use the query timezone (UTC by
-default); epoch bounds are seconds. DST days have their actual length, a
-missing hour matches nothing, and a repeated hour covers both occurrences.
-Repeated minutes match both occurrences as a union of half-open ranges.
+C<utc_datetime> and C<epoch_datetime> bounds use the query timezone, or else
+the database session's on PostgreSQL; epoch bounds are seconds. Without a query
+timezone, PostgreSQL computes epoch bounds in SQL from session-interpreted
+timestamps and resolves hour/minute DST gaps and folds using its own timestamp
+interpretation.
+UTC wall-time storage (C<storage =E<gt> 'naive_utc'>) converts the bounds to
+UTC in SQL, leaving the column unwrapped.
+
+With an explicit query timezone (including a trusted API timezone fallback),
+DST days have their actual length, a missing hour matches nothing, and a
+repeated hour covers both occurrences. Repeated minutes match both occurrences
+as a union of half-open ranges.
+SQLite and DuckDB retain UTC bounds when no query timezone is set, even if
+DuckDB has a session timezone. MySQL/MariaDB also retain UTC bounds: their
+C<date_shortcut> implementation binds Perl-generated dates, and their
+C<utc_datetime> mapping is C<DATETIME>, which has no session-zone conversion.
+Native MySQL/MariaDB C<TIMESTAMP> columns can use C<time_zone>, but are not
+distinguished by this mapping; automatic session-zone handling is not added.
 C<datetime>/C<naive_datetime> compare wall clocks, and C<date> compares dates.
 Stored columns remain unwrapped for index use. C<as_of> does not move the
 period. The generic C<not> wrapper composes with C<on>.

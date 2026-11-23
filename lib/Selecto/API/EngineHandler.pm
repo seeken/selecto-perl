@@ -1054,7 +1054,7 @@ sub describe_openapi ($self, $api) {
         type => 'object', additionalProperties => JSON::PP::false,
         required => [qw(field op)],
         'x-selecto-date-shortcuts' => Selecto::DateShortcut->choices,
-        description => 'on matches an absolute local calendar period with inclusive start and exclusive next start; UTC/epoch fields use the query timezone (UTC default), date fields accept year/month/day only; as_of does not move it.',
+        description => 'on matches an absolute local calendar period with inclusive start and exclusive next start; UTC/epoch fields use the query timezone, or else the database session\'s on PostgreSQL (including its DST gap/fold interpretation); SQLite, DuckDB and MySQL/MariaDB retain UTC defaults; date fields accept year/month/day only; as_of does not move it.',
         allOf => [{
             if => {properties => {op => {const => 'on'}}, required => ['op']},
             then => {required => ['value'], properties => {value => {

@@ -4693,6 +4693,10 @@ sub _compile_dialect_expression {
 # bind the bounds of the server's date.
 sub _current_date_shortcuts { return 0 }
 
+# Only dialects with session-aware instant bounds opt in. Keep this separate
+# from CURRENT_DATE support: DuckDB's existing on default remains UTC.
+sub _on_session_bounds { return 0 }
+
 sub _compile_on {
     my ($self, $domain, $expression, $params) = @_;
     my ($operand, $value, $fallback_timezone) = @{$expression->arguments};
@@ -4707,9 +4711,12 @@ sub _compile_on {
     Selecto::Error->throw('invalid_query', 'on hour/minute precision requires a datetime field')
         if $type eq 'date' && $period->{precision} =~ /\A(?:hour|minute)\z/;
     my $cast_type = $type eq 'date' ? 'date' : 'datetime';
+    my $timezone = $self->{_timezone} // $fallback_timezone;
+    my $session_bounds = !defined($timezone) && $self->_on_session_bounds
+        && ($type eq 'utc_datetime' || $type eq 'epoch_datetime');
     my $ranges;
-    if ($type eq 'utc_datetime' || $type eq 'epoch_datetime') {
-        $ranges = Selecto::DateShortcut->period_instant_ranges($period, $self->{_timezone} // $fallback_timezone // 'UTC');
+    if (!$session_bounds && ($type eq 'utc_datetime' || $type eq 'epoch_datetime')) {
+        $ranges = Selecto::DateShortcut->period_instant_ranges($period, $timezone // 'UTC');
         if ($type eq 'utc_datetime') {
             my $naive = ($domain->field_storage($path) // '') eq 'naive_utc';
             $cast_type = $naive ? 'datetime' : 'utc_datetime';
@@ -4733,8 +4740,11 @@ sub _compile_on {
             my $column = $self->_compile_expression($domain, $operand, $params);
             push @$params, $range->[$index];
             my $bound = $self->placeholder(scalar @$params);
-            $bound = 'CAST(' . $bound . ' AS ' . $self->_value_type_sql($cast_type) . ')'
-                unless $type eq 'epoch_datetime';
+            if ($session_bounds) {
+                $bound = $self->_on_session_bound_sql($bound, $type, $domain->field_storage($path));
+            } elsif ($type ne 'epoch_datetime') {
+                $bound = 'CAST(' . $bound . ' AS ' . $self->_value_type_sql($cast_type) . ')';
+            }
             push @parts, '(' . $column . ($index ? ' < ' : ' >= ') . $bound . ')';
         }
         push @sql, '(' . join(' AND ', @parts) . ')';

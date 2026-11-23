@@ -1027,6 +1027,28 @@ sub _compile_naive_utc_instant_sql {
 }
 
 sub _current_date_shortcuts { return 1 }
+
+sub _compile_date_shortcut {
+    my ($self, @args) = @_;
+    # Session dates must compare against instants even when UTC is stored as
+    # a naive timestamp, so today and on agree for this storage form too.
+    local $self->{_instant_fields} = 1;
+    return $self->SUPER::_compile_date_shortcut(@args);
+}
+
+sub _on_session_bounds { return 1 }
+sub _on_session_bound_sql {
+    my ($self, $placeholder, $type, $storage) = @_;
+    # Offset-free text is interpreted at execution in the session's zone.
+    my $instant = 'CAST(' . $placeholder . ' AS TIMESTAMPTZ)';
+    # EXTRACT returns numeric; a bigint bound avoids coercing an indexed
+    # bigint epoch column to numeric. Period starts have whole-second precision.
+    return 'CAST(EXTRACT(EPOCH FROM ' . $instant . ') AS BIGINT)' if $type eq 'epoch_datetime';
+    # Keep UTC wall-time storage sargable by converting only the bound.
+    return '(' . $instant . q{ AT TIME ZONE 'UTC')} if ($storage // '') eq 'naive_utc';
+    return $instant;
+}
+
 sub _months_interval_sql { return 'MAKE_INTERVAL(months => ' . int($_[1]) . ')' }
 sub _month_day_sql { return "TO_CHAR($_[1], 'MM-DD')" }
 
