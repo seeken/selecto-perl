@@ -4,7 +4,7 @@ use 5.034;
 use strict;
 use warnings;
 
-our $VERSION = '0.3.0';
+our $VERSION = '0.5.0';
 
 use Selecto::Adapter ();
 use Selecto::Adapter::Registry ();

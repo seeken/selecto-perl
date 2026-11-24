@@ -25,7 +25,7 @@ has canonical_values => 0;
 has canonical_sql => 0;
 # Each compiled statement's outermost SELECT list: see Canonical values in SQL.
 Hash::Util::FieldHash::fieldhash(my %PROJECTION);
-# Accepted and ignored since 0.2.3: relations resolve through the
+# Accepted and ignored since 0.5.0: relations resolve through the
 # connection's search_path, temporary relations included, and no read checks
 # the catalog. See ATTRIBUTES.
 has temporary_relations => 0;
@@ -34,7 +34,7 @@ has catalog_trust => '';
 sub new {
     my ($class, @args) = @_;
     my $self = $class->SUPER::new(@args);
-    # Removed in 0.2.3. Refused rather than ignored: a host that declared a
+    # Removed in 0.5.0. Refused rather than ignored: a host that declared a
     # schema off its search_path would otherwise read a namesake on the path.
     Selecto::Error->throw('invalid_adapter', q{the schemas option was removed: put the schemas on the connection's }
         . q{search_path (or use the engine's tenant prefix)}) if exists $self->{schemas};
@@ -1890,7 +1890,7 @@ types, which needs the session C<DateStyle> to be C<ISO>. C<1> (opt-in):
 canonical decimal, date and timestamp fields are formatted by PostgreSQL,
 always in the ISO form (see L</Canonical values in SQL (opt-in)>).
 
-=head2 Removed in 0.2.3
+=head2 Removed in 0.5.0
 
 C<schemas> is refused (C<invalid_adapter>): put the schemas on the
 connection's C<search_path>, or use the engine's tenant prefix.
