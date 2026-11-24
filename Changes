@@ -1,6 +1,12 @@
 Revision history for Selecto
 
 0.5.0  Unreleased - breaking native builder contract 1.0.0
+    - Add created_at and modified_at modes to writes.host_bound_fields, using
+      database CURRENT_TIMESTAMP expressions on insert and insert/update,
+      respectively. Preserve caller assignment and upsert refusals, cover bulk
+      updates, and publish all host bindings as read-only discovery metadata.
+      SQLite, PostgreSQL, MySQL and MariaDB use their existing expression
+      compiler; DuckDB retains its write_capability_missing refusal.
     - Default the API aggregate_version and resource ETag to writes.row_revision
       when no host versioner is configured, using the revision from the same
       SELECT. Publish the virtual field and If-Match contract in discovery.

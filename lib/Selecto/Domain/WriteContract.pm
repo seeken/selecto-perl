@@ -241,9 +241,11 @@ sub _row_metadata {
             } else {
                 my $spec = _object($state, $entries->{$name}, $path, 'invalid_host_bound_field');
                 my $source = $spec->{source};
+                my $timestamp = _enum($spec->{mode}, qw(created_at modified_at));
                 _error($state, 'invalid_host_bound_field', $path) unless $stored->($name)
-                    && _enum($spec->{mode}, qw(owner created_by modified_by))
-                    && ref($source) eq 'ARRAY' && @$source == 2 && _enum($source->[0], 'context') && _id($source->[1]);
+                    && ($timestamp ? !exists($spec->{source})
+                        : _enum($spec->{mode}, qw(owner created_by modified_by))
+                            && ref($source) eq 'ARRAY' && @$source == 2 && _enum($source->[0], 'context') && _id($source->[1]));
                 _error($state, 'invalid_host_bound_field', [@$path, $_]) for grep { !/\A(?:mode|source)\z/ } keys %$spec;
             }
         }

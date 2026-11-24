@@ -4406,7 +4406,19 @@ Public API writes (L<Selecto::API::EngineHandler>) are also confined to each
 operation's authored grants: without C<expected_cardinality> an operation
 permits exactly one row, even with C<bulk>, and without C<returning> no
 fields may be returned.
-See L<Selecto::Write> and L<Selecto::Engine>.
+C<writes.host_bound_fields> declares fields callers cannot assign, even when
+C<writes.fields> grants them. Context modes C<owner>, C<created_by> and
+C<modified_by> use C<< source => ['context', 'key'] >>. Database clock modes
+C<< created_on => {mode => 'created_at'} >> and
+C<< modified_on => {mode => 'modified_at'} >> have no C<source>: the former
+fills inserts and the latter fills inserts and updates, including bulk writes,
+with the backend's C<CURRENT_TIMESTAMP> expression. No Perl clock is used.
+Delete does not touch a clock. Host-bound upserts are refused as
+C<host_bound_upsert_unsupported>, and caller assignments as C<host_bound_field>.
+Discovery marks these fields C<read_only>. SQLite, PostgreSQL, MySQL and MariaDB
+support the modes; DuckDB refuses host-bound writes as C<write_capability_missing>.
+Domains without these modes retain their existing timestamp behavior.
+See F<docs/saved-views-governance.md>, L<Selecto::Write> and L<Selecto::Engine>.
 
 =head2 Other sections
 

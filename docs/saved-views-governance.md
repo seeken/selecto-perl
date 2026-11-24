@@ -35,7 +35,8 @@ writes => {
 `column` names a stored version/timestamp field, including a declared backend
 system field such as PostgreSQL `xmin`. Its token is the exact canonical storage
 text. The host/database is responsible for advancing this column when the row
-changes. Selecto does not invent a counter or touch a timestamp.
+changes. Selecto does not invent a counter. A timestamp advances only when the database/host
+maintains it or the field also declares the `modified_at` binding below.
 
 `columns` is a nonempty list of distinct stored root fields. Its token is
 `sha256:` followed by 64 lowercase hexadecimal digits. The hash covers ordered
@@ -172,6 +173,8 @@ writes => {
         owner_id => {mode => 'owner', source => ['context', 'user_id']},
         created_by => {mode => 'created_by', source => ['context', 'actor_id']},
         modified_by => {mode => 'modified_by', source => ['context', 'actor_id']},
+        create_timestamp => {mode => 'created_at'},
+        modify_timestamp => {mode => 'modified_at'},
     },
     # ... explicit operations and field grants ...
 }
@@ -190,6 +193,29 @@ updates; delete requires actor context but removes the row without a separate
 audit UPDATE. Host fills do not require caller write grants on these fields.
 Rules/validators still apply, and operation/capability grants remain required.
 Bindings govern writes; hosts configure owner/company read scopes separately.
+
+`created_at` fills inserts only. `modified_at` fills inserts and every row
+changed by an update, including an authorized bulk update. These modes have
+no `source` entry and require no clock value in trusted context. Each fill is
+the backend's `CURRENT_TIMESTAMP` expression in the INSERT/UPDATE statement,
+using the backend's clock, session timezone, transaction semantics and column
+precision. They do not promise a strictly increasing value: writes within one
+clock tick (or one PostgreSQL transaction) can share a timestamp. Delete does
+not perform an audit update. A `created_at` field is unchanged on update.
+
+Timestamp bindings use the same host-bound assignment refusal, private command
+provenance and upsert refusal as the context modes. Even a caller-supplied
+`CURRENT_TIMESTAMP` expression is refused as `host_bound_field`. Generated
+clocks need no caller field grants; validators requiring a submitted literal
+remain pending for these database expressions. Native, fluent, portable and API
+writes use the same lifecycle. Published domain columns and OpenAPI field
+metadata mark all host-bound fields `read_only`, including context bindings.
+
+SQLite, PostgreSQL, MySQL and MariaDB share this expression contract. DuckDB
+continues to refuse writes on any host-bound declaration. SQL Server is an
+optional external adapter, not shipped or registered here; no SQL Server
+implementation is changed by this addition. Domains without timestamp modes
+retain their existing clock behavior.
 
 Portable/native generated values retain private in-process provenance through
 unchanged command copies. Serialized metadata cannot forge that provenance;

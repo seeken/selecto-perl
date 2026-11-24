@@ -7,6 +7,7 @@ use Hash::Util::FieldHash qw(fieldhash);
 use Selecto::CanonicalJSON ();
 use Selecto::Error ();
 use Selecto::Write::Scope ();
+use Selecto::Write::Expression ();
 
 # Generated assignments are authority, not command metadata. Copies retain
 # that authority only while every generated value is unchanged.
@@ -14,6 +15,8 @@ fieldhash my %GENERATED;
 sub _json { Selecto::CanonicalJSON->encode($_[0]) }
 sub _same {
     my ($a, $b) = @_;
+    return ref($a) eq 'Selecto::Write::Expression' && $a->kind eq 'current_timestamp'
+        if ref($b) eq 'Selecto::Write::Expression' && $b->kind eq 'current_timestamp';
     $a = $a->arguments->[0] if ref($a) eq 'Selecto::Write::Expression' && $a->kind eq 'literal';
     return !ref($a) && defined($a) && "$a" eq "$b";
 }
@@ -28,7 +31,7 @@ sub inherit {
     return $new;
 }
 sub apply {
-    my ($class, $command, $writes, $context) = @_;
+    my ($class, $command, $writes, $context, %options) = @_;
     my $fields = $writes->{host_bound_fields} // {};
     return $command unless keys %$fields;
     Selecto::Error->throw('host_bound_upsert_unsupported', 'host-bound fields require insert, update or delete')
@@ -45,7 +48,14 @@ sub apply {
     for my $field (sort keys %$fields) {
         my $spec = $fields->{$field};
         my $mode = $spec->{mode};
-        next if $mode eq 'created_by' && $command->operation ne 'insert';
+        next if ($mode eq 'created_by' || $mode eq 'created_at') && $command->operation ne 'insert';
+        if ($mode eq 'created_at' || $mode eq 'modified_at') {
+            next if $command->operation eq 'delete' || $options{defer_timestamps};
+            my $value = Selecto::Write::Expression->current_timestamp;
+            $command = $command->with_assignments({%{$command->assignments}, $field => $value});
+            $generated{$field} = $value;
+            next;
+        }
         my $key = $spec->{source}[1];
         my $value = $context->{$key};
         Selecto::Error->throw('missing_host_context', 'a host-bound field requires trusted scalar context',
@@ -64,3 +74,29 @@ sub apply {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Selecto::Write::HostFields - trusted write bindings and database clocks
+
+=head1 DESCRIPTION
+
+Internal shared lifecycle for C<writes.host_bound_fields>. C<owner> pins trusted
+ownership; C<created_by> and C<modified_by> fill trusted actor context.
+C<created_at> fills inserts and C<modified_at> fills inserts and updates with
+L<Selecto::Write::Expression/current_timestamp>. Clock modes declare no C<source>
+and use database time in the mutation statement, including bulk updates.
+Database timezone, transaction and column precision rules apply.
+
+All modes refuse caller assignments as C<host_bound_field> and upserts as
+C<host_bound_upsert_unsupported>. Private in-process provenance survives only
+unchanged generated assignments and matching operation, relation and context;
+serialized metadata cannot grant this authority. The portable compiler defers
+clock expressions until its plain literal admission has completed. Literal
+validators on database expressions remain C<required_data_rule_pending>.
+
+See L<Selecto::Domain/writes> and F<docs/saved-views-governance.md>.
+
+=cut

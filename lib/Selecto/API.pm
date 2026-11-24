@@ -58,6 +58,10 @@ sub new ($class, @args) {
     $self->{_source_domain} = $domain;
     canonical_json($contract);
     $self->domain($contract);
+    my $bindings = ref($contract->{writes}) eq 'HASH' ? $contract->{writes}{host_bound_fields} // {} : {};
+    for my $field (keys %$bindings) {
+        $contract->{source}{columns}{$field}{read_only} = JSON::PP::true;
+    }
     $self->base_path($base_path);
     delete @{$self}{qw(manifest openapi)};   # (always generated, from the domain)
     return $self;
@@ -610,6 +614,8 @@ sub _public_fields ($domain) {
         push @described, {
             path => $path,
             type => "$type",
+            (exists(($domain->writes_shared->{host_bound_fields} // {})->{$path})
+                ? (read_only => JSON::PP::true) : ()),
             (defined($metadata->{label}) && !ref($metadata->{label}) ? (label => "$metadata->{label}") : ()),
             (defined($description) ? (description => $description) : ()),
             (ref($unit) eq 'HASH' && ($unit->{kind} // '') ne 'scalar' ? (unit => dclone($unit)) : ()),

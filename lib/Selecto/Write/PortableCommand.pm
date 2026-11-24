@@ -429,6 +429,8 @@ sub _required {
     for my $field (sort keys %{$contract->{fields}}) {
         my $spec = $contract->{fields}{$field};
         next unless _true($spec->{required}) || ref($spec->{required_on}) eq 'ARRAY' && grep { $_ eq 'insert' } @{$spec->{required_on}};
+        my $binding = $contract->{host_bound_fields}{$field} // {};
+        next if ($binding->{mode} // '') =~ /\A(?:created_at|modified_at)\z/;
         next if $initial && defined($tenant_field) && $field eq $tenant_field && defined($context->{tenant_id});
         my $fk = $contract->{constraints}{foreign_keys}{$field};
         next if $initial && ref($fk) eq 'HASH' && ref($fk->{source}) eq 'ARRAY' && $fk->{source}[0] eq 'context'
@@ -499,7 +501,8 @@ sub _compile_flat {
     my $values = $type eq 'delete' ? {} : $class->_values($state->{values}, $fields);
     require Selecto::Write::HostFields;
     my $host_command = Selecto::Write::HostFields->apply(Selecto::Write::Command->new(
-        operation => $type, relation => $contract->{source}{source_table}, assignments => $values), $contract, $context);
+        operation => $type, relation => $contract->{source}{source_table}, assignments => $values), $contract, $context,
+        defer_timestamps => 1);
     $values = $host_command->assignments;
     my $filters = $class->_filters([@{$state->{filters} // []}, @{$context->{required_filters} // []}], $fields);
     my $requested_returning = $class->_returning_request($state->{returning}, $fields);
@@ -554,7 +557,14 @@ sub _compile_flat {
     _assignment_policy($contract, $values, $type, $tenant_field) unless $type eq 'delete';
     # The helper compiles the complete effective assigned bundle before any
     # evaluation. Its shared scope also spans every nested/batch member.
-    $values = Selecto::Write::FieldValidators->validate_values($contract->{fields}, $values);
+    # Database clocks are native expressions, outside the portable literal
+    # subject. Admit their validators as nonliteral before adding the fills.
+    my @clocks = grep {
+        my $mode = $contract->{host_bound_fields}{$_}{mode};
+        $type eq 'insert' && $mode eq 'created_at' || $type ne 'delete' && $mode eq 'modified_at'
+    } keys %{$contract->{host_bound_fields}};
+    $values = Selecto::Write::FieldValidators->validate_values($contract->{fields}, $values,
+        nonliteral_fields => \@clocks);
     my $protected_upsert = $type eq 'upsert' && $class->requires_storage_candidate($operation);
     _choices($state->{domain}, $contract, $values, $context, $resolver, $type, $filters) unless $protected_upsert;
     my $guards = Selecto::Write::Context->foreign_key_guards($state->{domain}, $contract, $values, $type, $context);
@@ -626,6 +636,7 @@ sub _compile_flat {
     my $command = $host_command->_with(operation => $type, relation => $relation, assignments => $values,
         predicate => $predicate, scope_predicate => Selecto::QueryEnforcement::combine($required, $host_command->scope_predicate),
         expected_count => undef, metadata => \%metadata, foreign_key_guards => $guards);
+    $command = Selecto::Write::HostFields->apply($command, $contract, $context) if @clocks;
     $command = Selecto::Write::Policy->apply($command,
         {operations => $contract->{operations}, fields => $contract->{fields}}, $fields,
         trusted_field => [$tenant_field, keys %{$contract->{host_bound_fields}}]);

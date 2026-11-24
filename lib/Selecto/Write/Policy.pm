@@ -119,10 +119,11 @@ sub _has_write_once_guard {
         && $operand->kind eq 'field' && $operand->arguments->[0] eq $field;
 }
 sub _missing {
-    my ($assignments, $field) = @_;
+    my ($assignments, $field, $trusted) = @_;
     return 1 unless exists $assignments->{$field};
     my $value = $assignments->{$field};
     if (blessed($value) && ref($value) eq 'Selecto::Write::Expression') {
+        return 0 if $trusted && $value->kind eq 'current_timestamp';
         return 1 unless $value->kind eq 'literal';
         $value = $value->arguments->[0];
     }
@@ -193,7 +194,9 @@ sub _apply {
             my $field_spec = $field_specs->{$_};
             my $required = ref($field_spec) eq 'HASH' && (_true($field_spec->{required})
                 || ref($field_spec->{required_on}) eq 'ARRAY' && grep { $_ eq 'insert' } @{$field_spec->{required_on}});
-            $required && _missing($assignments, $_);
+            my $field = $_;
+            $required && _missing($assignments, $field,
+                scalar grep { $_ eq $field } _trusted_fields($options{trusted_field}));
         } keys %$field_specs;
         _fail('missing_required_write_fields', 'required write fields are missing', fields => \@missing) if @missing;
     }

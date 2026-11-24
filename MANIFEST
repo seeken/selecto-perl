@@ -483,6 +483,7 @@ t/lib/TestDomainGuard.pm
 lib/Selecto/RowRevision.pm
 lib/Selecto/Write/HostFields.pm
 t/saved_views_governance.t
+t/saved_views_timestamps.t
 t/lib/TestSavedViews.pm
 t/saved_views_interleaving.t
 t/saved_views_contract.t

@@ -51,6 +51,7 @@ for my $case (
     ['column revision', {row_revision => {column => 'version'}}, ['row_revision']],
     ['required computed revision', {row_revision => {columns => ['name'], required => JSON::PP::true}}, ['row_revision']],
     ['host binding without context', {host_bound_fields => {owner_id => {mode => 'owner', source => ['context', 'user_id']}}}, ['host_bound_fields']],
+    ['database timestamp binding', {host_bound_fields => {version => {mode => 'modified_at'}}}, ['host_bound_fields']],
     ['empty host binding declaration', {host_bound_fields => {}}, ['host_bound_fields']],
     ['both declarations', {row_revision => {columns => ['name']}, host_bound_fields => {}}, [qw(row_revision host_bound_fields)]],
 ) {
