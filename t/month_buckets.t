@@ -40,15 +40,15 @@ for my $backend (qw(sqlite postgresql)) {
     my $dbh = $connect{$backend}->() or next;
     $ran++;
     subtest $backend => sub {
-        $dbh->do("CREATE TABLE $table (id integer primary key, received date)");
+        $dbh->do("CREATE TABLE $table (id integer primary key, received_on date)");
         push @cleanup, $dbh if $backend eq 'postgresql';
         my @ages = (0, 1, 2, 4, 6, 12, 13);
         $dbh->do("INSERT INTO $table VALUES (?, ?)", undef, $_ + 1, month_ago($ages[$_])) for 0 .. $#ages;
         $dbh->do("INSERT INTO $table VALUES (?, NULL)", undef, scalar(@ages) + 1);
-        my $domain = Selecto::Domain->new(name => 'Loads', table => $table,
-            fields => {id => 'integer', received => 'date'});
+        my $domain = Selecto::Domain->new(name => 'Orders', table => $table,
+            fields => {id => 'integer', received_on => 'date'});
         my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($backend => (dbh => $dbh)));
-        my $bucket = $x->bucket('received', {kind => 'month_ranges', ranges => [
+        my $bucket = $x->bucket('received_on', {kind => 'month_ranges', ranges => [
             {minimum => 6, maximum => 12, label => 'half year'},
             {minimum => 3, maximum => 5, label => 'quarter'},
             {minimum => 2, maximum => 2, label => 'two'},
@@ -58,7 +58,7 @@ for my $backend (qw(sqlite postgresql)) {
         my $rows = $engine->all($engine->query->select('id', $bucket->as('band'))->order_by('id'))->{rows};
         is_deeply [map { $_->[1] } @$rows], [qw(this last two quarter), 'half year', 'half year', 'Other', 'Other'],
             'calendar months ago: inclusive bounds, older and missing values are Other';
-        my $open = $x->bucket('received', {kind => 'month_ranges', ranges => [
+        my $open = $x->bucket('received_on', {kind => 'month_ranges', ranges => [
             {minimum => 13, label => 'older'}, {maximum => 1, label => 'recent'},
         ]});
         is_deeply [map { $_->[1] } @{$engine->all($engine->query->select('id', $open->as('band'))->order_by('id'))->{rows}}],

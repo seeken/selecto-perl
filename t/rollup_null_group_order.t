@@ -16,7 +16,7 @@ use TestSelecto;
 # subtotal below its own rows. The marker over every group breaks the tie,
 # as the emulated rollup (SQLite, MySQL, MariaDB) already does.
 my $x = 'Selecto::Expression';
-my $domain = Selecto::Domain->new(name => 'Loads', table => 'selecto_rollup_null_loads',
+my $domain = Selecto::Domain->new(name => 'Orders', table => 'selecto_rollup_null_orders',
     fields => {id => 'integer', origin => 'string', destination => 'string'});
 
 sub query_for {
@@ -55,13 +55,13 @@ for my $backend (
     my ($name, $connect) = @$backend;
     subtest "$name orders real NULL groups under their subtotals" => sub {
         my $dbh = $connect->() or plan skip_all => "no $name database";
-        $dbh->do('DROP TABLE IF EXISTS selecto_rollup_null_loads');
-        $dbh->do('CREATE TABLE selecto_rollup_null_loads (id integer primary key, origin text, destination text)');
-        $dbh->do('INSERT INTO selecto_rollup_null_loads VALUES (?, ?, ?)', undef, @$_) for @rows;
+        $dbh->do('DROP TABLE IF EXISTS selecto_rollup_null_orders');
+        $dbh->do('CREATE TABLE selecto_rollup_null_orders (id integer primary key, origin text, destination text)');
+        $dbh->do('INSERT INTO selecto_rollup_null_orders VALUES (?, ?, ?)', undef, @$_) for @rows;
         my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($name => (dbh => $dbh)));
         is_deeply [map { [$_->[0], $_->[1], 0 + $_->[2], 0 + $_->[3]] } @{$engine->all(query_for($engine))->{rows}}],
             $expected, 'Total, then each subtotal ahead of its rows';
-        $dbh->do('DROP TABLE selecto_rollup_null_loads');
+        $dbh->do('DROP TABLE selecto_rollup_null_orders');
     };
 }
 

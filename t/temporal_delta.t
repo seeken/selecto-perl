@@ -47,7 +47,7 @@ sub close_to {
 }
 
 subtest 'validation, metadata and legacy identities' => sub {
-    my $raw = contract('loads', 'statuses', days => delta('started', 'ended'));
+    my $raw = contract('orders', 'order_states', days => delta('started', 'ended'));
     my $domain = Selecto::Domain->parse($raw);
     my $legacy = dclone($raw);
     $legacy->{source}{columns}{days}{computed} = {kind => 'expression',
@@ -62,7 +62,7 @@ subtest 'validation, metadata and legacy identities' => sub {
     }
     is_deeply($domain->field_unit('days'), {kind => 'duration', code => 'day'}, 'derived day unit');
     for my $unit (qw(day hour fractional_day)) {
-        my $with = Selecto::Domain->parse(contract('loads', 'statuses',
+        my $with = Selecto::Domain->parse(contract('orders', 'order_states',
             days => delta('started', 'ended', unit => $unit, minimum => 0, otherwise => 'now')));
         isnt($with->fingerprint, $domain->fingerprint, "$unit options enter fingerprint");
         is($with->resolve('days')->{type}, $unit eq 'day' ? 'integer' : 'decimal', "$unit type");
@@ -71,14 +71,14 @@ subtest 'validation, metadata and legacy identities' => sub {
     }
     my $host = delta('started', 'ended', unit => 'hour');
     $host->{unit} = {kind => 'scalar'};
-    is_deeply(Selecto::Domain->parse(contract('loads', 'statuses', hours => $host))->field_unit('hours'),
+    is_deeply(Selecto::Domain->parse(contract('orders', 'order_states', hours => $host))->field_unit('hours'),
         {kind => 'scalar'}, 'host unit wins');
     for my $options ({unit => 'minute'}, {otherwise => 'today'}, {otherwise => undef},
         {minimum => -1}, {minimum => 1}, {minimum => []}, {from => []}, {to => undef}) {
-        is(error_code(sub { Selecto::Domain->parse(contract('loads', 'statuses',
+        is(error_code(sub { Selecto::Domain->parse(contract('orders', 'order_states',
             bad => delta('started', 'ended', %$options))) }), 'invalid_domain', 'invalid option refuses');
     }
-    is(error_code(sub { Selecto::Domain->parse(contract('loads', 'statuses',
+    is(error_code(sub { Selecto::Domain->parse(contract('orders', 'order_states',
         bad => {type => 'integer', computed => {kind => 'temporal_delta', from => 'started', to => 'ended', unit => 'hour'}})) }),
         'invalid_domain', 'elapsed result requires decimal declaration');
 };

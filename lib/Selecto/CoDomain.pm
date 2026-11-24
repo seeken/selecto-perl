@@ -189,25 +189,25 @@ Selecto::CoDomain - governed lookups into another domain
 
 =head1 SYNOPSIS
 
-  # In the source (for example "loads") domain contract:
+  # In the source (for example "orders") domain contract:
   co_domains => {
       carriers => {
-          domain => 'client',
+          domain => 'parties',
           view   => 'carrier_lookup',          # or projection/segments/ordering
-          search => {fields => [qw(co_name cl_key city)], mode => 'prefix', rank => 1},
+          search => {fields => [qw(party_name site_code city)], mode => 'prefix', rank => 1},
           result => {
               value_field        => 'id',
-              label_field        => 'co_name',
-              description_fields => [qw(cl_key city state)],
+              label_field        => 'party_name',
+              description_fields => [qw(site_code city region)],
           },
       },
   },
 
   # In the host, with an engine for the target domain built from trusted context:
   my $found = Selecto::CoDomain->lookup(
-      source_domain => $loads_domain,
+      source_domain => $orders_domain,
       co_domain     => 'carriers',
-      engine        => $tenant_scoped_client_engine,
+      engine        => $tenant_scoped_party_engine,
       query         => $search_text,
       predicate     => $selection_specific_scope,   # optional, can only narrow
       limit         => 20,
@@ -218,7 +218,7 @@ Selecto::CoDomain - governed lookups into another domain
 =head1 DESCRIPTION
 
 A co-domain lets one domain declare a bounded lookup that is owned and
-governed by another domain, such as a "choose a carrier" picker on a load
+governed by another domain, such as a "choose a carrier" picker on an order
 form. The contract names the target domain, the target's query-library view
 or projection, the searchable fields and how rows map to options. It never
 carries connection details, SQL or a client-selected engine: the host

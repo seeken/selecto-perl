@@ -3688,14 +3688,14 @@ C<capabilities>, C<source_relationships> and C<choice_sources> entries. See
 L<Selecto::Domain::Overlay>.
 
 Within a deep-merged map, an overlay value of C<undef> (JSON C<null>)
-removes that key. For example, re-pointing a bridge to integer user IDs:
+removes that key. For example, re-pointing a bridge to integer party IDs:
 
-  {source => {associations => {sales_rep => {through => {
-      table => 'load_user_role', related_key => 'user_id',
-      where => {type => undef, role_id => 2}, target_key_cast => undef,
+  {source => {associations => {carrier => {through => {
+      table => 'order_party_roles', related_key => 'party_id',
+      where => {flag => undef, role_id => 2}, target_key_cast => undef,
   }}}}}
 
-This removes the old C<where.type> and C<target_key_cast>, retaining other
+This removes the old C<where.flag> and C<target_key_cast>, retaining other
 bridge keys. Removal of an absent key is harmless. To declare a literal NULL
 inside an overlay map, compose a complete base domain containing it instead;
 C<undef> in a deep-merged overlay always means removal. Required keys still
@@ -4235,22 +4235,22 @@ C<source.columns>; it is not a stored column:
 
   inventory_location_id => {type => 'integer', computed => {
     kind => 'expression', expression => ['case',
-      [['and', ['eq', 'status2', 'I'], ['eq', 'status', 'D']],
-        ['field', 'dest_id']],
-      [['and', ['eq', 'status2', 'I'],
-        ['not', ['in', 'status', ['G', 'D', 'C']]]],
-        ['field', 'orig_id']],
+      [['and', ['eq', 'hold_code', 'H'], ['eq', 'state_code', 'DL']],
+        ['field', 'destination_party_id']],
+      [['and', ['eq', 'hold_code', 'H'],
+        ['not', ['in', 'state_code', ['PL', 'DL', 'CX']]]],
+        ['field', 'origin_party_id']],
     ],
   }},
 
 Reference that column in the ordinary association and join declarations:
 
   # source.associations
-  inventory_location => {queryable => 'client_party',
+  inventory_location => {queryable => 'parties',
     owner_key => 'inventory_location_id', related_key => 'id'},
   # joins
   inventory_location => {type => 'star_dimension', name => 'Inventory Location',
-    display_field => 'co_name', dimension_key => 'inventory_location_id'},
+    display_field => 'party_name', dimension_key => 'inventory_location_id'},
 
 Conditions use the existing filter AST (C<not> around C<in> for NOT IN).
 Every branch result, including an optional C<else>, must be a physical owner
@@ -4259,7 +4259,7 @@ or computed dependencies are refused. Branch types must match the key type.
 Without C<else>, the key is SQL NULL when no condition matches, including SQL
 three-valued conditions on NULL statuses. Group and drilldown on
 C<inventory_location_id>; read associated fields such as
-C<inventory_location.co_name>, C<.city> and C<.state> normally. All use the
+C<inventory_location.party_name>, C<.city> and C<.region> normally. All use the
 same CASE expression. No SQL text is accepted from the host.
 
 These associations are read-only: C<WriteContract> refuses relationship
@@ -4296,7 +4296,7 @@ A boolean computed from the portable filter AST
 decisions such as action eligibility:
 
   ready => {type => 'boolean', internal => 1, computed => {kind => 'predicate',
-      expression => ['and', [['in', 'status', ['A', 'O']], ['eq', 'has_payload', 1]]]}},
+      expression => ['and', [['in', 'state_code', ['OP', 'PL']], ['gt', 'piece_count', 0]]]}},
 
 =item C<< {kind => 'coalesce_fields', fields => ['assoc.field', 'root_field']} >>
 
@@ -4311,15 +4311,16 @@ Shorthand for temporal durations (calendar days, elapsed hours or fractional
 days, including epochs and open ends) and labelled numeric ranges. Both are stored as C<expression> columns. See
 L<Selecto::Domain::Synthetic>.
 
-=item C<< {kind => 'association_aggregate', association => 'charges', function => 'sum', field => 'amt', where => [...], default => 0} >>
+=item C<< {kind => 'association_aggregate', association => 'charges', function => 'sum', field => 'billed_amount', where => [...], default => 0} >>
 
 A numeric scalar over a governed to-many association, including a C<through>
 bridge. C<function> is C<sum>, C<count> (non-NULL field count), C<min> or
 C<max>. C<field> names a physical associated column. Sum/min/max require a
 numeric field; count has integer result type. C<where> is an optional portable
 filter AST relative to the associated relation and its direct to-one paths.
-For example C<< ['in', 'transaction_type.type', ['D', 'B']] >>; use
-C<< ['not', ['in', 'trx_typ', [11000, 20000]]] >> to exclude base lines.
+For example C<< ['eq', 'side', 'revenue'] >>; use
+C<< ['not', ['in', 'charge_type', ['freight', 'fuel']]] >> to exclude
+those charge categories.
 C<default> is an optional finite numeric fallback, bound as a parameter.
 Without it every function returns NULL for no matching rows; count returns
 zero when rows match but their counted field is always NULL.
@@ -4329,11 +4330,11 @@ DuckDB; other adapters refuse with C<unsupported_feature>. The owner query
 never joins the to-many rows. Tenant pairs, bridge scope, target policy and
 required owner predicates retain the same semantics as ordinary joins.
 Expression columns can add several aggregates, for example direct charges
-plus charges through child-load bridges. Optional C<through_owner_keys>
+plus charges through group member bridges. Optional C<through_owner_keys>
 lists 1 to 8 physical bridge keys, including the declared C<through.owner_key>,
-correlated with OR to the owner key. For a load bridge use
-C<< through_owner_keys => [qw(parent_id alt_parent_id)] >>. A leg matching
-both keys is counted once. C<< through_exclude_owner_field => 'id' >> also
+correlated with OR to the owner key. For an order bridge use
+C<< through_owner_keys => [qw(group_order_id merged_into_order_id)] >>.
+A member matching both keys is counted once. C<< through_exclude_owner_field => 'id' >> also
 excludes the owner itself from that bridge. These options require the bridge
 relation to be declared in the source/schemas graph and keys matching the
 owner key type. Two ordinary through associations also work when their sets

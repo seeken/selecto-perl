@@ -548,49 +548,49 @@ is_deeply $nested_collection_statement->params, ['A1'],
 my $flag_domain = Selecto::Domain->parse({
     schema_version => 1,
     domain_version => '1.0.0',
-    name => 'Flagged invoices',
+    name => 'Flagged orders',
     source => {
-        source_table => 'invoices', primary_key => 'id',
-        fields => [qw(id rush)],
+        source_table => 'orders', primary_key => 'id',
+        fields => [qw(id has_expedite)],
         columns => {
             id => {type => 'integer'},
-            rush => {
+            has_expedite => {
                 type => 'boolean',
-                computed => {kind => 'association_exists', association => 'rush_flags'},
+                computed => {kind => 'association_exists', association => 'service_flags'},
             },
         },
         associations => {
-            rush_flags => {
-                queryable => 'flags', owner_key => 'id', related_key => 'invoice_id',
-                cardinality => 'many', where => {type => 'R'},
+            service_flags => {
+                queryable => 'service_flags', owner_key => 'id', related_key => 'order_id',
+                cardinality => 'many', where => {flag => 'expedite'},
             },
         },
     },
     schemas => {
-        flags => {
-            source_table => 'invoice_flags', primary_key => 'id',
-            fields => [qw(id invoice_id type)],
+        service_flags => {
+            source_table => 'service_flags', primary_key => 'id',
+            fields => [qw(id order_id flag)],
             columns => {
-                id => {type => 'integer'}, invoice_id => {type => 'integer'},
-                type => {type => 'string'},
+                id => {type => 'integer'}, order_id => {type => 'integer'},
+                flag => {type => 'string'},
             },
             associations => {},
         },
     },
-    joins => {rush_flags => {type => 'left'}},
+    joins => {service_flags => {type => 'left'}},
 }, strict => 1);
 my $flag_engine = Selecto::Engine->new(domain => $flag_domain, adapter => $adapter);
 my $flag_statement = $flag_engine->compile(
-    $flag_engine->query->select('id', 'rush')->where(
-        Selecto::Expression->eq('rush', 1)
+    $flag_engine->query->select('id', 'has_expedite')->where(
+        Selecto::Expression->eq('has_expedite', 1)
     ),
 );
 like $flag_statement->sql,
-    qr{SELECT "s0"\."id", EXISTS \(SELECT 1 FROM "invoice_flags" AS "e_rush_flags" WHERE "e_rush_flags"\."invoice_id" = "s0"\."id" AND "e_rush_flags"\."type" = \$1\).*WHERE EXISTS \(SELECT 1 FROM "invoice_flags" AS "e_rush_flags" WHERE "e_rush_flags"\."invoice_id" = "s0"\."id" AND "e_rush_flags"\."type" = \$2\) = \$3}s,
+    qr{SELECT "s0"\."id", EXISTS \(SELECT 1 FROM "service_flags" AS "e_service_flags" WHERE "e_service_flags"\."order_id" = "s0"\."id" AND "e_service_flags"\."flag" = \$1\).*WHERE EXISTS \(SELECT 1 FROM "service_flags" AS "e_service_flags" WHERE "e_service_flags"\."order_id" = "s0"\."id" AND "e_service_flags"\."flag" = \$2\) = \$3}s,
     'association-exists computed fields compile for both display and filtering';
-unlike $flag_statement->sql, qr{LEFT JOIN "invoice_flags"},
+unlike $flag_statement->sql, qr{LEFT JOIN "service_flags"},
     'association-exists fields do not denormalize root rows';
-is_deeply $flag_statement->params, ['R', 'R', 1],
+is_deeply $flag_statement->params, ['expedite', 'expedite', 1],
     'association-exists constants and filter values remain bound parameters';
 
 my $eligibility_contract = $flag_domain->contract;
@@ -601,7 +601,7 @@ $eligibility_contract->{source}{columns}{eligible} = {
         kind => 'predicate',
         expression => ['and', [
             ['gt', 'id', 0],
-            ['eq', 'rush', 1],
+            ['eq', 'has_expedite', 1],
         ]],
     },
 };
@@ -613,9 +613,9 @@ my $eligibility_statement = $eligibility_engine->compile(
     $eligibility_engine->query->select('id', 'eligible'),
 );
 like $eligibility_statement->sql,
-    qr{SELECT "s0"\."id", \(\("s0"\."id" > \$1\) AND \(EXISTS \(SELECT 1 FROM "invoice_flags" AS "e_rush_flags".*\) = \$3\)\) AS "eligible" FROM}s,
+    qr{SELECT "s0"\."id", \(\("s0"\."id" > \$1\) AND \(EXISTS \(SELECT 1 FROM "service_flags" AS "e_service_flags".*\) = \$3\)\) AS "eligible" FROM}s,
     'predicate computed fields compile governed boolean logic into the data query';
-is_deeply $eligibility_statement->params, [0, 'R', 1],
+is_deeply $eligibility_statement->params, [0, 'expedite', 1],
     'predicate computed fields keep nested literals adapter-bound';
 
 my $through_domain = Selecto::Domain->new(

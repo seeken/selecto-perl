@@ -43,17 +43,17 @@ subtest 'all adapter SQL shapes' => sub {
     for my $name (@{Selecto->available_adapters}) {
         my $engine = Selecto::Engine->new(domain => $domain,
             adapter => Selecto->adapter($name, dbh => ComputedKeyDBH->new));
-        my $s = $engine->compile($engine->query->select('inventory_location.co_name')
+        my $s = $engine->compile($engine->query->select('inventory_location.party_name')
             ->where(Selecto::Expression->eq('inventory_location_id', 2)));
         (my $sql = $s->sql) =~ tr/`/"/;
-        like $sql, qr/ON (?:CAST\()?\(CASE WHEN .*THEN "s0"\."dest_id" WHEN .*THEN "s0"\."orig_id" END\)(?: AS INTEGER\))? = "j_inventory_location"\."id"/,
+        like $sql, qr/ON (?:CAST\()?\(CASE WHEN .*THEN "s0"\."destination_party_id" WHEN .*THEN "s0"\."origin_party_id" END\)(?: AS INTEGER\))? = "j_inventory_location"\."id"/,
             "$name joins on the computed key";
         like $sql, qr/WHERE (?:CAST\()?\(CASE WHEN .* END\)(?: AS INTEGER\))? = (?:CAST\()?(?:\?|\$\d+)/, "$name filters the same expression";
-        is_deeply $s->params, [qw(I D I G D C I D I G D C), 2], "$name branch constants and filter stay bound in SQL order";
+        is_deeply $s->params, [qw(H DL H PL DL CX H DL H PL DL CX), 2], "$name branch constants and filter stay bound in SQL order";
         unlike $sql, qr/"s0"\."inventory_location_id"/, "$name never reads a synthetic physical column";
     }
     my $changed = contract();
-    $changed->{source}{columns}{inventory_location_id}{computed}{expression}[1][0][2][2] = 'R';
+    $changed->{source}{columns}{inventory_location_id}{computed}{expression}[1][0][2][2] = 'TR';
     isnt(Selecto::Domain->parse($changed)->fingerprint, $domain->fingerprint, 'CASE conditions change the fingerprint');
 };
 
@@ -62,10 +62,10 @@ subtest 'reject invalid computed owner keys' => sub {
         ['literal result', sub { $_[0]{source}{columns}{inventory_location_id}{computed}{expression}[1][1] = ['literal', 2] }],
         ['unknown field', sub { $_[0]{source}{columns}{inventory_location_id}{computed}{expression}[1][1] = ['field', 'no_such'] }],
         ['joined dependency', sub { $_[0]{source}{columns}{inventory_location_id}{computed}{expression}[1][0] = ['eq', 'inventory_location.city', 'Arc'] }],
-        ['computed dependency cycle', sub { $_[0]{source}{columns}{orig_id}{computed} = {kind => 'expression', expression => ['field', 'inventory_location_id']} }],
-        ['redacted dependency', sub { $_[0]{source}{columns}{status}{redacted} = 1 }],
+        ['computed dependency cycle', sub { $_[0]{source}{columns}{origin_party_id}{computed} = {kind => 'expression', expression => ['field', 'inventory_location_id']} }],
+        ['redacted dependency', sub { $_[0]{source}{columns}{state_code}{redacted} = 1 }],
         ['wrong type', sub { $_[0]{source}{columns}{inventory_location_id}{type} = 'string' }],
-        ['raw SQL', sub { $_[0]{source}{columns}{inventory_location_id}{computed}{expression} = ['unsafe_sql', 'dest_id'] }],
+        ['raw SQL', sub { $_[0]{source}{columns}{inventory_location_id}{computed}{expression} = ['unsafe_sql', 'destination_party_id'] }],
     ) {
         my $raw = contract(); $case->[1]->($raw);
         my $error = caught(sub { Selecto::Domain->parse($raw, strict => 1) });
@@ -75,12 +75,12 @@ subtest 'reject invalid computed owner keys' => sub {
 
 subtest 'governed writes refuse computed keys and relationships' => sub {
     my $raw = contract();
-    $raw->{writes} = {operations => {update => {enabled => JSON::PP::true}}, fields => {status => {updatable => JSON::PP::true}}};
+    $raw->{writes} = {operations => {update => {enabled => JSON::PP::true}}, fields => {state_code => {updatable => JSON::PP::true}}};
     ok(Selecto::Domain::WriteContract->validate($raw)->{valid}, 'ordinary root writes remain valid');
     for my $inline (0, 1) {
         my $bad = dclone($raw);
         my $spec = {writable => JSON::PP::true, cardinality => 'one', ownership => 'owned',
-            parent_key => 'orig_id', child_key => 'id'}; # overriding parent key cannot bypass read-only
+            parent_key => 'origin_party_id', child_key => 'id'}; # overriding parent key cannot bypass read-only
         if ($inline) { $bad->{source}{associations}{inventory_location}{write} = $spec }
         else { $bad->{writes}{relationships}{inventory_location} = $spec }
         my $v = Selecto::Domain::WriteContract->validate($bad);
@@ -103,12 +103,12 @@ for my $name (qw(sqlite postgresql)) {
         setup($dbh);
         my $engine = Selecto::Engine->new(domain => $domain, adapter => Selecto->adapter($name, dbh => $dbh));
         my $rows = sub { $engine->all($_[0])->{rows} };
-        is_deeply $rows->($engine->query->select(qw(id inventory_location_id inventory_location.co_name inventory_location.city inventory_location.state))->order_by('id')),
+        is_deeply $rows->($engine->query->select(qw(id inventory_location_id inventory_location.party_name inventory_location.city inventory_location.region))->order_by('id')),
             [[1,2,'Beta','Bay','UT'], [2,1,'Alpha','Arc','CO'], [3,2,'Beta','Bay','UT'],
              (map { [$_,undef,undef,undef,undef] } 4..10), [11,3,'Alpha','Cove','AZ']],
             'conditional destination/origin, exclusions and SQL NULL semantics';
         my $grouped = $rows->($engine->query->select('inventory_location_id',
-            Selecto::Expression->min('inventory_location.co_name')->as('label'), Selecto::Expression->count->as('n'))
+            Selecto::Expression->min('inventory_location.party_name')->as('label'), Selecto::Expression->count->as('n'))
             ->group_by('inventory_location_id')->order_by('inventory_location_id'));
         is_deeply [sort { ($a->[0] // 0) <=> ($b->[0] // 0) } @$grouped],
             [[undef,undef,7], [1,'Alpha',1], [2,'Beta',2], [3,'Alpha',1]], 'stable key groups, duplicate labels and missing NULL group';
@@ -127,57 +127,57 @@ for my $name (qw(sqlite postgresql)) {
         is_deeply $ee->all($ee->query->select('id')->where(Selecto::Expression->eq('has_location', 1))->order_by('id'))->{rows},
             [[1],[2],[3],[11]], 'correlated existence uses computed owner key';
         my $collections = $rows->($engine->query->select('id',
-            Selecto::Expression->related_rows('inventory_location', [qw(id co_name)], order_by => [['id','asc']], limit => 2)->as('location'))
+            Selecto::Expression->related_rows('inventory_location', [qw(id party_name)], order_by => [['id','asc']], limit => 2)->as('location'))
             ->where(Selecto::Expression->in('id', [1,4]))->order_by('id'));
         my $decode = sub { ref($_[0]) ? $_[0] : JSON::PP->new->decode($_[0]) };
-        is_deeply $decode->($collections->[0][1]), [{id => 2, co_name => 'Beta'}], 'bounded related rows use computed key';
+        is_deeply $decode->($collections->[0][1]), [{id => 2, party_name => 'Beta'}], 'bounded related rows use computed key';
         is_deeply $decode->($collections->[1][1]), [], 'missing key has no related rows';
 
         # Alias the owner relation itself, then join the computed dimension
         # underneath it. CASE conditions/results must use that parent alias.
-        my $nested = {schema_version => 1, name => 'Nested synthetic loads',
-            source => {source_table => 'ck_load', primary_key => 'id', fields => ['id'], columns => {id => {type => 'integer'}},
-                associations => {load => {queryable => 'loads', owner_key => 'id', related_key => 'id'}}},
-            schemas => {loads => contract()->{source}, client_party => contract()->{schemas}{client_party}},
-            joins => {load => {type => 'left', alias => 'joined_load'},
-                'load.inventory_location' => contract()->{joins}{inventory_location}}};
+        my $nested = {schema_version => 1, name => 'Nested orders',
+            source => {source_table => 'orders', primary_key => 'id', fields => ['id'], columns => {id => {type => 'integer'}},
+                associations => {order => {queryable => 'orders', owner_key => 'id', related_key => 'id'}}},
+            schemas => {orders => contract()->{source}, parties => contract()->{schemas}{parties}},
+            joins => {order => {type => 'left', alias => 'joined_order'},
+                'order.inventory_location' => contract()->{joins}{inventory_location}}};
         my $ne = Selecto::Engine->new(domain => Selecto::Domain->parse($nested, strict => 1), adapter => Selecto->adapter($name, dbh => $dbh));
-        is_deeply $ne->all($ne->query->select('id', 'load.inventory_location.co_name')
-            ->where(Selecto::Expression->eq('load.inventory_location_id', '2'))->order_by('id'))->{rows},
+        is_deeply $ne->all($ne->query->select('id', 'order.inventory_location.party_name')
+            ->where(Selecto::Expression->eq('order.inventory_location_id', '2'))->order_by('id'))->{rows},
             [[1,'Beta'],[3,'Beta']], 'nested dimension conditions and results use owner alias with text ID';
 
-        my $nr = $ne->all($ne->query->select(Selecto::Expression->related_rows('load', [
-            'id', {key => 'location', expression => Selecto::Expression->related_rows('load.inventory_location', ['id'],
+        my $nr = $ne->all($ne->query->select(Selecto::Expression->related_rows('order', [
+            'id', {key => 'location', expression => Selecto::Expression->related_rows('order.inventory_location', ['id'],
                 order_by => [['id','asc']], limit => 2)}], order_by => [['id','asc']], limit => 2)->as('nested'))
             ->where(Selecto::Expression->eq('id',1)))->{rows};
         is_deeply $decode->($nr->[0][0]), [{id => 1, location => [{id => 2}]}],
             'bounded nested collection projects physical CASE dependencies and correlates the parent alias';
 
         # A tenant collision in the target cannot become a matching dimension.
-        $dbh->do('ALTER TABLE ck_load ADD COLUMN tenant_id integer');
-        $dbh->do('ALTER TABLE ck_client_profile ADD COLUMN tenant_id integer');
-        $dbh->do('UPDATE ck_load SET tenant_id = 7');
-        $dbh->do('UPDATE ck_client_profile SET tenant_id = 7');
-        $dbh->do("INSERT INTO ck_client_profile VALUES (99,'Foreign','Secret','ZZ',8)");
-        $dbh->do("INSERT INTO ck_load VALUES (12,'D','I',1,99,7)");
+        $dbh->do('ALTER TABLE orders ADD COLUMN account_id integer');
+        $dbh->do('ALTER TABLE parties ADD COLUMN account_id integer');
+        $dbh->do('UPDATE orders SET account_id = 1001');
+        $dbh->do('UPDATE parties SET account_id = 1001');
+        $dbh->do("INSERT INTO parties VALUES (99,'Foreign','Secret','ZZ',1002)");
+        $dbh->do("INSERT INTO orders VALUES (12,'DL','H',1,99,1001)");
         my $tenant = contract();
-        for my $relation ($tenant->{source}, $tenant->{schemas}{client_party}) {
-            push @{$relation->{fields}}, 'tenant_id';
-            $relation->{columns}{tenant_id} = {type => 'integer'};
-            $relation->{tenant_field} = 'tenant_id';
+        for my $relation ($tenant->{source}, $tenant->{schemas}{parties}) {
+            push @{$relation->{fields}}, 'account_id';
+            $relation->{columns}{account_id} = {type => 'integer'};
+            $relation->{tenant_field} = 'account_id';
         }
         my $te = Selecto::Engine->new(domain => Selecto::Domain->parse($tenant),
-            adapter => Selecto->adapter($name, dbh => $dbh), tenant => 7);
-        is_deeply $te->all($te->query->select('id','inventory_location.co_name')->where(Selecto::Expression->eq('id',12)))->{rows},
+            adapter => Selecto->adapter($name, dbh => $dbh), tenant => 1001);
+        is_deeply $te->all($te->query->select('id','inventory_location.party_name')->where(Selecto::Expression->eq('id',12)))->{rows},
             [[12,undef]], 'computed key retains inferred tenant pairing';
-        $dbh->do('CREATE TEMPORARY TABLE ck_bridge (client_id integer, target_id integer, info varchar(1))');
+        $dbh->do('CREATE TEMPORARY TABLE ck_bridge (party_id integer, target_id integer, info varchar(1))');
         $dbh->do("INSERT INTO ck_bridge VALUES (1,1,'Y'), (2,2,'Y'), (3,3,'N')");
         my $through = contract();
         $through->{source}{associations}{inventory_location}{through} = {
-            table => 'ck_bridge', owner_key => 'client_id', related_key => 'target_id', where => {info => 'Y'}};
-        $through->{source}{associations}{inventory_location}{where} = {co_name => 'Beta'};
+            table => 'ck_bridge', owner_key => 'party_id', related_key => 'target_id', where => {info => 'Y'}};
+        $through->{source}{associations}{inventory_location}{where} = {party_name => 'Beta'};
         my $be = Selecto::Engine->new(domain => Selecto::Domain->parse($through), adapter => Selecto->adapter($name, dbh => $dbh));
-        is_deeply $be->all($be->query->select('id')->where(Selecto::Expression->eq('inventory_location.co_name','Beta'))->order_by('id'))->{rows},
+        is_deeply $be->all($be->query->select('id')->where(Selecto::Expression->eq('inventory_location.party_name','Beta'))->order_by('id'))->{rows},
             [[1],[3]], 'through joins bind target policy, computed owner and bridge policy in SQL order';
         my $br = $be->all($be->query->select(Selecto::Expression->related_rows('inventory_location', ['id'],
             order_by => [['id','asc']], limit => 2)->as('location'))->where(Selecto::Expression->eq('id',1)))->{rows};
@@ -187,15 +187,15 @@ for my $name (qw(sqlite postgresql)) {
             next unless $engine->adapter->supports("${join_type}_join");
             my $preserved = contract();
             $preserved->{joins}{inventory_location} = {type => $join_type};
-            $preserved->{source}{associations}{inventory_location}{where} = {co_name => 'Beta'};
+            $preserved->{source}{associations}{inventory_location}{where} = {party_name => 'Beta'};
             my $pe = Selecto::Engine->new(domain => Selecto::Domain->parse($preserved), adapter => Selecto->adapter($name, dbh => $dbh));
-            is_deeply $pe->all($pe->query->select('id')->where(Selecto::Expression->not_null('inventory_location.co_name'))->order_by('id'))->{rows},
+            is_deeply $pe->all($pe->query->select('id')->where(Selecto::Expression->not_null('inventory_location.party_name'))->order_by('id'))->{rows},
                 [[1],[3]], "$join_type joins bind target restriction before computed ON key";
         }
         my $wd = contract();
-        $wd->{writes} = {operations => {update => {enabled => JSON::PP::true}}, fields => {status => {updatable => JSON::PP::true}}};
+        $wd->{writes} = {operations => {update => {enabled => JSON::PP::true}}, fields => {state_code => {updatable => JSON::PP::true}}};
         my $we = Selecto::Engine->new(domain => Selecto::Domain->parse($wd), adapter => Selecto->adapter($name, dbh => $dbh));
-        my $before_write = $dbh->selectall_arrayref('SELECT * FROM ck_load ORDER BY id');
+        my $before_write = $dbh->selectall_arrayref('SELECT * FROM orders ORDER BY id');
         my $error = caught(sub { $we->execute_write($we->write_command(operation => 'update',
             assignments => {inventory_location_id => 1}, filter => ['eq','id',1])) });
         isa_ok $error, 'Selecto::Error', 'native engine refuses synthetic owner key';
@@ -204,7 +204,7 @@ for my $name (qw(sqlite postgresql)) {
             ->filter(['id',1])->execute });
         isa_ok $portable_error, 'Selecto::Error', 'portable native builder refuses synthetic owner key';
         is $portable_error->code, 'write_field_not_writable', 'portable refusal names missing write grant';
-        is_deeply $dbh->selectall_arrayref('SELECT * FROM ck_load ORDER BY id'), $before_write, 'write refusals preserve storage';
+        is_deeply $dbh->selectall_arrayref('SELECT * FROM orders ORDER BY id'), $before_write, 'write refusals preserve storage';
         $dbh->disconnect;
     };
 }

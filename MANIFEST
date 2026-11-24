@@ -475,3 +475,7 @@ t/ops_ratio.t
 t/ops_defaults.t
 t/ops_overlay.t
 t/period_on.t
+script/denylist-hashes
+t/data/denylist.sha256
+t/domain_names_guard.t
+t/lib/TestDomainGuard.pm

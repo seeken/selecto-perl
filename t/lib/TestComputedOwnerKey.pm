@@ -6,35 +6,35 @@ use Exporter 'import';
 our @EXPORT_OK = qw(contract setup);
 
 sub contract {
-    return {schema_version => 1, name => 'Synthetic loads',
-        source => {source_table => 'ck_load', primary_key => 'id',
-            fields => [qw(id status status2 orig_id dest_id inventory_location_id)],
-            columns => {id => {type => 'integer'}, status => {type => 'string'}, status2 => {type => 'string'},
-                orig_id => {type => 'integer'}, dest_id => {type => 'integer'},
+    return {schema_version => 1, name => 'Orders',
+        source => {source_table => 'orders', primary_key => 'id',
+            fields => [qw(id state_code hold_code origin_party_id destination_party_id inventory_location_id)],
+            columns => {id => {type => 'integer'}, state_code => {type => 'string'}, hold_code => {type => 'string'},
+                origin_party_id => {type => 'integer'}, destination_party_id => {type => 'integer'},
                 inventory_location_id => {type => 'integer', computed => {kind => 'expression', expression => [
                     'case',
-                    [['and', ['eq', 'status2', 'I'], ['eq', 'status', 'D']], ['field', 'dest_id']],
-                    [['and', ['eq', 'status2', 'I'], ['not', ['in', 'status', ['G', 'D', 'C']]]], ['field', 'orig_id']],
+                    [['and', ['eq', 'hold_code', 'H'], ['eq', 'state_code', 'DL']], ['field', 'destination_party_id']],
+                    [['and', ['eq', 'hold_code', 'H'], ['not', ['in', 'state_code', ['PL', 'DL', 'CX']]]], ['field', 'origin_party_id']],
                 ]}}},
-            associations => {inventory_location => {queryable => 'client_party',
+            associations => {inventory_location => {queryable => 'parties',
                 owner_key => 'inventory_location_id', related_key => 'id'}}},
-        schemas => {client_party => {source_table => 'ck_client_profile', primary_key => 'id',
-            fields => [qw(id co_name city state)],
-            columns => {id => {type => 'integer'}, map { $_ => {type => 'string'} } qw(co_name city state)},
+        schemas => {parties => {source_table => 'parties', primary_key => 'id',
+            fields => [qw(id party_name city region)],
+            columns => {id => {type => 'integer'}, map { $_ => {type => 'string'} } qw(party_name city region)},
             associations => {}}},
         joins => {inventory_location => {type => 'star_dimension', name => 'Inventory Location',
-            display_field => 'co_name', dimension_key => 'inventory_location_id'}}};
+            display_field => 'party_name', dimension_key => 'inventory_location_id'}}};
 }
 sub setup {
     my ($dbh) = @_;
     $dbh->do($_) for
-        'CREATE TEMPORARY TABLE ck_load (id integer primary key, status varchar(1), status2 varchar(1), orig_id integer, dest_id integer)',
-        'CREATE TEMPORARY TABLE ck_client_profile (id integer primary key, co_name varchar(50), city varchar(50), state varchar(2))',
-        'CREATE TEMPORARY TABLE ck_client_flags (client_id integer, flag_id integer, info varchar(1))',
-        q{INSERT INTO ck_client_profile VALUES (1,'Alpha','Arc','CO'), (2,'Beta','Bay','UT'), (3,'Alpha','Cove','AZ')},
-        q{INSERT INTO ck_client_flags VALUES (1,22,'Y'), (2,22,'Y'), (3,22,'N')},
-        q{INSERT INTO ck_load VALUES (1,'D','I',1,2), (2,'P','I',1,2), (3,'R','I',2,1),
-            (4,'G','I',1,2), (5,'C','I',1,2), (6,'D','N',1,2), (7,'P',NULL,1,2),
-            (8,NULL,'I',1,2), (9,'D','I',1,NULL), (10,'P','I',NULL,2), (11,'P','I',3,1)};
+        'CREATE TEMPORARY TABLE orders (id integer primary key, state_code varchar(2), hold_code varchar(1), origin_party_id integer, destination_party_id integer)',
+        'CREATE TEMPORARY TABLE parties (id integer primary key, party_name varchar(50), city varchar(50), region varchar(2))',
+        'CREATE TEMPORARY TABLE party_flags (party_id integer, flag_id integer, info varchar(1))',
+        q{INSERT INTO parties VALUES (1,'Alpha','Arc','CO'), (2,'Beta','Bay','UT'), (3,'Alpha','Cove','AZ')},
+        q{INSERT INTO party_flags VALUES (1,22,'Y'), (2,22,'Y'), (3,22,'N')},
+        q{INSERT INTO orders VALUES (1,'DL','H',1,2), (2,'OP','H',1,2), (3,'TR','H',2,1),
+            (4,'PL','H',1,2), (5,'CX','H',1,2), (6,'DL','',1,2), (7,'OP',NULL,1,2),
+            (8,NULL,'H',1,2), (9,'DL','H',1,NULL), (10,'OP','H',NULL,2), (11,'OP','H',3,1)};
 }
 1;

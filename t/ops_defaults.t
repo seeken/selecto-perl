@@ -9,25 +9,25 @@ use Selecto::SQLite;
 use Selecto::API::EngineHandler;
 use Selecto::QueryLibrary;
 use Selecto::API;
-my $contract={schema_version=>1,domain_version=>'1.0.0',domain_fingerprint=>'sha256:ops-defaults',name=>'Loads',source=>{source_table=>'loads',primary_key=>'id',fields=>[qw(id kind)],columns=>{id=>{type=>'integer'},kind=>{type=>'string'}},associations=>{}},schemas=>{},joins=>{},query_library=>{
- segments=>{shipments=>{filters=>[['eq','kind','S']]},consignments=>{filters=>[['eq','kind','C']]}},
- segment_picker_groups=>{count_as=>{label=>'Count as',default=>'shipments',choices=>[{segment=>'shipments',label=>'Shipments'},{segment=>'consignments',label=>'Consignments'}]}}}};
+my $contract={schema_version=>1,domain_version=>'1.0.0',domain_fingerprint=>'sha256:ops-defaults',name=>'Orders',source=>{source_table=>'orders',primary_key=>'id',fields=>[qw(id kind)],columns=>{id=>{type=>'integer'},kind=>{type=>'string'}},associations=>{}},schemas=>{},joins=>{},query_library=>{
+ segments=>{standalone=>{filters=>[['eq','kind','Standalone']]},group_members=>{filters=>[['eq','kind','GroupMember']]}},
+ segment_picker_groups=>{count_as=>{label=>'Count as',default=>'standalone',choices=>[{segment=>'standalone',label=>'Standalone orders'},{segment=>'group_members',label=>'Group members'}]}}}};
 my $domain=Selecto::Domain->parse($contract,strict=>1);
 my $dbh=DBI->connect('dbi:SQLite:dbname=:memory:','','',{RaiseError=>1});
-$dbh->do('CREATE TABLE loads(id INTEGER, kind TEXT)');$dbh->do(q{INSERT INTO loads VALUES(1,'S'),(2,'C')});
+$dbh->do('CREATE TABLE orders(id INTEGER, kind TEXT)');$dbh->do(q{INSERT INTO orders VALUES(1,'Standalone'),(2,'GroupMember')});
 my $engine=Selecto::Engine->new(domain=>$domain,adapter=>Selecto::SQLite->new(dbh=>$dbh));
 my $handler=Selecto::API::EngineHandler->new;
 is_deeply $handler->query($engine,{select=>['id']})->{rows},[[1]],'API applies omitted group default';
 is_deeply $handler->query($engine,{select=>['id'],segment_choices=>{count_as=>''},order_by=>[{field=>'id',direction=>'asc'}]})->{rows},[[1],[2]],'API explicit Off';
-is_deeply $handler->query($engine,{select=>['id'],segments=>['consignments']})->{rows},[[2]],'API explicit different choice';
-is(Selecto::QueryLibrary->library($domain)->{segment_picker_groups}{count_as}{default},'shipments','published library retains default');
+is_deeply $handler->query($engine,{select=>['id'],segments=>['group_members']})->{rows},[[2]],'API explicit different choice';
+is(Selecto::QueryLibrary->library($domain)->{segment_picker_groups}{count_as}{default},'standalone','published library retains default');
 my $published=Selecto::API->new(domain=>$domain,publish_domain=>1)->request({method=>'GET',path=>'/api/v1/selecto/domain'});
 my $document=JSON::PP->new->decode($published->{body});
-is $document->{query_library}{segment_picker_groups}{count_as}{default},'shipments','API publishes declared group default';
+is $document->{query_library}{segment_picker_groups}{count_as}{default},'standalone','API publishes declared group default';
 $contract->{query_library}{segment_picker_groups}{count_as}{default_views}=['aggregate','graph'];
 $domain=Selecto::Domain->parse($contract,strict=>1);
 is_deeply(Selecto::QueryLibrary->resolve_segment_choices($domain,[],{},'detail')->{segments},[],'view limit excludes Detail');
-is_deeply(Selecto::QueryLibrary->resolve_segment_choices($domain,[],{},'aggregate')->{segments},['shipments'],'view limit includes aggregate');
+is_deeply(Selecto::QueryLibrary->resolve_segment_choices($domain,[],{},'aggregate')->{segments},['standalone'],'view limit includes aggregate');
 my $limited=Selecto::Engine->new(domain=>$domain,adapter=>Selecto::SQLite->new(dbh=>$dbh));
 is_deeply(Selecto::API::EngineHandler->new(aggregate_selections=>1)->query($limited,{select=>[{aggregate=>'count',alias=>'n'}]})->{rows},[[1]],'ungrouped API aggregate gets aggregate-view default');
 $contract->{query_library}{segment_picker_groups}{count_as}{default}='missing';

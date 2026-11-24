@@ -1,6 +1,7 @@
 Revision history for Selecto
 
 0.3.0  Unreleased - breaking native builder contract 1.0.0
+    - Examples and fixtures use an invented domain.
     - Without a query timezone, PostgreSQL on periods use the database session
       zone and its DST interpretation, including SQL-derived epoch bounds.
       Keep date_shortcut agreement for UTC stored as naive timestamps too.
@@ -22,7 +23,7 @@ Revision history for Selecto
       governed to-many relation in a correlated scalar subquery, with through
       bridges, associated to-one filters, tenant scope and bound defaults.
       Numeric expression columns compose totals without owner fanout on
-      PostgreSQL, SQLite and DuckDB. Synthetic split/bundle LHF parity tests.
+      PostgreSQL, SQLite and DuckDB. Synthetic split/group parity tests.
     - Query library picker group defaults (Part 1 core): declare default and
       default_views; API segment_choices records explicit Off overrides and
       published domains retain the declaration.
@@ -344,7 +345,7 @@ Revision history for Selecto
     - Selecto::API builds its manifest and OpenAPI document when first asked for
       them, not in new: a query, write or resource request serves neither, and
       building them (the public field list above all) was most of new's cost
-      (12 ms to 3 ms on mojo's Load API). A host's additions to them stay.
+      (12 ms to 3 ms on a large detail domain API). A host's additions to them stay.
       Selecto::Domain->published_fingerprint gives the contract's
       domain_fingerprint without copying the contract, and the engine handler
       reads required_selected without a copy.
