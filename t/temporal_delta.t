@@ -89,8 +89,15 @@ for my $backend (qw(sqlite postgresql duckdb mysql mariadb)) {
         eval "require DBD::$driver; 1" or plan skip_all => "$driver driver unavailable";
         my $url = $backend =~ /^(sqlite|duckdb)$/ ? ':memory:' : $ENV{'SELECTO_PERL_TEST_' . uc($backend eq 'postgresql' ? 'postgres' : $backend) . '_URL'};
         plan skip_all => 'disposable database URL not configured' unless $url;
-        require Selecto::Certification;
-        my ($dsn, $user, $password) = Selecto::Certification::_connection_parts($url, $backend);
+        my ($dsn, $user, $password);
+        if ($url eq ':memory:') {
+            $dsn = "dbi:$driver:dbname=:memory:";
+        } else {
+            # Server URLs are parsed by the certification checkout, which is not on CPAN.
+            eval { require Selecto::Certification; 1 }
+                or plan skip_all => 'Selecto::Certification unavailable';
+            ($dsn, $user, $password) = Selecto::Certification::_connection_parts($url, $backend);
+        }
         my $dbh = DBI->connect($dsn, $user, $password, {RaiseError => 1, PrintError => 0, AutoCommit => 1});
         my $fixed = '2026-07-02 12:00:00';
         no warnings 'redefine';

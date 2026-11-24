@@ -40,24 +40,29 @@ subtest 'CSS prefixes are checked in memory' => sub {
     }
 };
 
-# Include new files too, so the guard works before changes are staged.
-open my $git, '-|', 'git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'
-    or die "Cannot list repository files: $!";
-my @paths = do { local $/ = "\0"; map { chomp; $_ } <$git> };
-close $git or die "Cannot list repository files\n";
-ok @paths, 'repository files were enumerated';
-my @violations;
-for my $path (@paths) {
-    next if $path eq $hash_path;
-    push @violations, map { "$path:$_->{line}: $_->{hash} (path)" }
-        @{find_denied_tokens($path, \%hashes)};
-    next unless -f $path;
-    open my $file, '<:raw', $path or die "Cannot read repository file: $!";
-    my $text = do { local $/; <$file> } // '';
-    close $file;
-    next if $text =~ /\0/ || -B $path;
-    push @violations, map { "$path:$_->{line}: $_->{hash}" }
-        @{find_denied_tokens($text, \%hashes)};
+SKIP: {
+    # Release tarballs have no Git metadata. The self-tests above still run there.
+    skip 'repository scan requires a Git checkout', 2 unless -e '.git';
+
+    # Include new files too, so the guard works before changes are staged.
+    open my $git, '-|', 'git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'
+        or die "Cannot list repository files: $!";
+    my @paths = do { local $/ = "\0"; map { chomp; $_ } <$git> };
+    close $git or die "Cannot list repository files\n";
+    ok @paths, 'repository files were enumerated';
+    my @violations;
+    for my $path (@paths) {
+        next if $path eq $hash_path;
+        push @violations, map { "$path:$_->{line}: $_->{hash} (path)" }
+            @{find_denied_tokens($path, \%hashes)};
+        next unless -f $path;
+        open my $file, '<:raw', $path or die "Cannot read repository file: $!";
+        my $text = do { local $/; <$file> } // '';
+        close $file;
+        next if $text =~ /\0/ || -B $path;
+        push @violations, map { "$path:$_->{line}: $_->{hash}" }
+            @{find_denied_tokens($text, \%hashes)};
+    }
+    is_deeply \@violations, [], 'repository paths and text contain no denied tokens';
 }
-is_deeply \@violations, [], 'repository paths and text contain no denied tokens';
 done_testing;
