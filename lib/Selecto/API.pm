@@ -193,6 +193,15 @@ sub _dispatch ($self, $operation, $params, $body, $request, $handlers) {
         return _error_response(422, 'invalid_query', 'as_of must be a valid ISO date or timestamp')
             unless $valid;
     }
+    # Keep transport preconditions separate from the JSON write body. Hosts
+    # forward these parameters to EngineHandler->write/write_command.
+    if ($operation eq 'write' && exists $request->{headers}) {
+        return _error_response(422, 'invalid_if_match', 'Request headers must be an object')
+            unless ref($request->{headers}) eq 'HASH';
+        my @names = grep { lc($_) eq 'if-match' } keys %{$request->{headers}};
+        return _error_response(422, 'invalid_if_match', 'If-Match must occur once') if @names > 1;
+        $params->{if_match} = $request->{headers}{$names[0]} if @names;
+    }
     my $result;
     my $ok = eval { $result = $handler->($body, $params); 1 };
     return _error_response(
@@ -348,6 +357,8 @@ my %FORBIDDEN_CODES = map { $_ => 1 } qw(hidden_field missing_tenant_scope);
 # A tenant-scoped upsert on MySQL or MariaDB is refused (ON DUPLICATE KEY UPDATE matches any
 # unique key): the backend cannot do it, so it is 501 in every runtime, not a 422 request error.
 sub error_status ($code) {
+    return 412 if defined($code) && !ref($code) && $code eq 'stale_revision';
+    return 428 if defined($code) && !ref($code) && $code eq 'row_revision_required';
     return 404 if defined($code) && !ref($code) && $code eq 'resource_not_found';
     return 501 if defined($code) && !ref($code) && $code eq 'unsupported_scope_predicate';
     # A deadlock victim or lock-wait timeout is retryable server state, not a bad request.
@@ -649,13 +660,14 @@ Selecto::API - HTTP-neutral host for the canonical Selecto API
           method            => $request_method,          # 'GET' or 'POST'
           path              => $request_path,
           body              => $decoded_json_body,        # hash or undef
+          headers           => $request_headers,          # optional hash
           accept            => $accept_header,            # optional
           response_format   => $query_param_format,       # optional: json csv tsv xlsx
           download_filename => $query_param_filename,     # optional
       },
       {
           query => sub { my ($body) = @_; ... return ['ok', $data] },
-          write => sub { my ($body) = @_; ... return ['ok', $data] },
+          write => sub { my ($body, $params) = @_; ... return ['ok', $data] },
           action => sub { my ($body, $params) = @_; ... },  # $params->{action}
       },
   );
@@ -714,6 +726,14 @@ L<Selecto::API::EngineHandler/resource> implements the handler. When the
 resource's data has a scalar C<aggregate_version>, the response carries it,
 quoted, as its C<ETag>.
 
+For conditional writes, supply C<< headers => {'If-Match' => $raw_tag} >>
+in the request (omit the entry when absent). The write callback receives it
+as C<< $params->{if_match} >>; forward C<$params> as the third argument to
+C<< $handler->write($engine, $body, $params) >> or C<write_command>.
+Header names are case-insensitive; repeated names are C<invalid_if_match>.
+The handler accepts one strong quoted row revision only when no host
+versioner overrides the ETag. See L<Selecto::API::EngineHandler/write_command>.
+
 =head2 request
 
   my $response = $api->request(\%request, \%handlers);
@@ -723,7 +743,8 @@ The body is UTF-8 encoded bytes; C<content-length> is exact.
 
 A handler returns C<['ok', $data]> or C<['error', \%error]>, where
 C<%error> may contain C<status> (default L</error_status> of the code: 403
-for C<hidden_field> and C<missing_tenant_scope>, 404 for C<resource_not_found>, 501 for
+for C<hidden_field> and C<missing_tenant_scope>, 404 for C<resource_not_found>,
+412 for C<stale_revision>, 428 for C<row_revision_required>, 501 for
 C<unsupported_scope_predicate> (a tenant-scoped MySQL/MariaDB upsert), otherwise 422), C<code>,
 C<message> and C<details>.
 If a handler dies, the response is a 500 C<handler_failed> without the
@@ -790,8 +811,10 @@ publishes only what its caller may use.
 A function (not a method) that returns the HTTP status for a refusal code:
 403 for C<hidden_field> (a query names a field the domain withholds) and
 C<missing_tenant_scope> (the engine has no trusted tenant boundary for a
-C<tenant_field> domain), 404 for C<resource_not_found>, 422 for every
-other code. L</request> uses it when
+C<tenant_field> domain), 404 for C<resource_not_found>, 412 for C<stale_revision>,
+428 for C<row_revision_required>, 500 for C<invalid_connection>, 501 for
+C<unsupported_scope_predicate>, 503 for C<database_deadlock_detected> or
+C<database_lock_timeout>, and 422 for other codes. L</request> uses it when
 a handler error has no C<status>.
 
 =head2 canonical_json

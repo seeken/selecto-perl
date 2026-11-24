@@ -117,14 +117,14 @@ sub new ($class, @args) {
     return $self;
 }
 
-sub write ($self, $engine, $body) {
-    my $command = $self->write_command($engine, $body);
+sub write ($self, $engine, $body, $params = {}) {
+    my $command = $self->write_command($engine, $body, $params);
     $engine = $self->_engine_with_limits($engine);
     return Selecto::API::ResponsePolicy->bind_limits(
         $engine->execute_write($command)->to_hash, $self->limits->intersect($engine->limits));
 }
 
-sub write_command ($self, $engine, $body) {
+sub write_command ($self, $engine, $body, $params = {}) {
     Selecto::Error->throw(
         'invalid_api_host', 'API write handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
@@ -234,6 +234,21 @@ sub write_command ($self, $engine, $body) {
 
     my %metadata;
     $metadata{row_revision} = $body->{row_revision} if exists $body->{row_revision};
+    _write_object($params, 'write request parameters');
+    if (exists $params->{if_match}) {
+        Selecto::Error->throw('if_match_not_supported',
+            'If-Match requires ETags derived from row_revision and an update or delete')
+            unless $self->_row_versioned($domain) && $operation =~ /\A(?:update|delete)\z/;
+        my $tag = $params->{if_match};
+        Selecto::Error->throw('invalid_if_match', 'If-Match requires one strong quoted revision tag')
+            unless defined($tag) && !ref($tag)
+                && $tag =~ /\A[\t ]*"([\x21\x23-\x7e]+)"[\t ]*\z/;
+        my $token = $1;
+        Selecto::Error->throw('row_revision_mismatch', 'If-Match and row_revision must agree')
+            if exists($body->{row_revision}) && (!defined($body->{row_revision})
+                || ref($body->{row_revision}) || "$body->{row_revision}" ne $token);
+        $metadata{row_revision} = $token;
+    }
     for my $key (qw(returning conflict_target upsert_update_fields)) {
         next unless exists $body->{$key};
         my @fields = _write_string_array(
@@ -299,13 +314,19 @@ sub with_versioner ($self, $versioner) {
     return bless {%$self, versioner => $versioner}, ref($self);
 }
 
+sub _row_versioned ($self, $domain) {
+    return !$self->versioner && !!$domain->writes_shared->{row_revision};
+}
+
 sub query ($self, $engine, $body, %options) {
     return $self->_query($engine, $body, %options)
-        unless $self->versioner && ref($body) eq 'HASH' && ref($body->{select}) eq 'ARRAY'
+        unless ($self->versioner || blessed($engine) && $engine->isa('Selecto::Engine')
+                && $self->_row_versioned($engine->domain))
+            && ref($body) eq 'HASH' && ref($body->{select}) eq 'ARRAY'
             && grep { _is_version_selection($_) } @{$body->{select}};
 
-    # Each aggregate_version entry becomes a hidden primary-key column, which
-    # is replaced by the host's version for that row once the query has run.
+    # Replace hidden key placeholders with the host version or the revision
+    # already read in this SELECT. The latter never needs a version lookup.
     Selecto::Error->throw(
         'invalid_api_host', 'API query handler requires a Selecto engine',
     ) unless blessed($engine) && $engine->isa('Selecto::Engine');
@@ -346,8 +367,8 @@ sub query ($self, $engine, $body, %options) {
 
 # One resource by primary key: {id => ..., fields => [...] or 'a,b',
 # date_format => ...}. Returns the primary key and the requested public scalar
-# or to-one fields, including aggregate_version when a versioner is
-# configured and it is requested.
+# or to-one fields. Row-derived aggregate_version is automatic; a host
+# versioner remains opt-in.
 sub resource ($self, $engine, $params) {
     Selecto::Error->throw(
         'invalid_api_host', 'API resource handler requires a Selecto engine',
@@ -385,11 +406,11 @@ sub resource ($self, $engine, $params) {
     @fields = grep { !$seen{$_}++ } @fields;
     Selecto::Error->throw('invalid_api_query', "fields may contain at most $maximum field paths")
         if @fields > $maximum;
-    # The version is opt-in: computing it costs the versioner a lookup.
-    my $versioned = grep { $_ eq 'aggregate_version' } @fields;
+    # Host versions remain opt-in; row revisions are already in this read.
+    my $versioned = $self->_row_versioned($domain) || grep { $_ eq 'aggregate_version' } @fields;
     @fields = grep { $_ ne 'aggregate_version' } @fields;
     Selecto::Error->throw('invalid_api_query', 'aggregate_version is not published by this domain',
-        {field => 'aggregate_version'}) if $versioned && !$self->versioner;
+        {field => 'aggregate_version'}) if $versioned && !$self->versioner && !$self->_row_versioned($domain);
     my @select = ($key, ($versioned ? 'aggregate_version' : ()));
     for my $field (@fields) {
         Selecto::Error->throw('invalid_api_query', 'fields contains an invalid field path',
@@ -434,7 +455,10 @@ sub _inject_versions ($self, $engine, $result, $versions) {
     my @keys = map {
         ref($_) eq 'ARRAY' ? $_->[$index{$first}] : ref($_) eq 'HASH' ? $_->{$first} : undef
     } @{$result->{rows}};
-    my $by_key = $self->versioner->($engine, [grep { defined } @keys]);
+    my $row_versioned = $self->_row_versioned($engine->domain);
+    Selecto::Error->throw('invalid_api_query', 'aggregate_version requires individual root row revisions')
+        if $row_versioned && @{$result->{rows}} && !exists($result->{row_revisions});
+    my $by_key = $row_versioned ? {} : $self->versioner->($engine, [grep { defined } @keys]);
     Selecto::Error->throw('invalid_api_host', 'versioner must return an object')
         unless ref($by_key) eq 'HASH';
     my $version_of = sub ($key) {
@@ -444,15 +468,19 @@ sub _inject_versions ($self, $engine, $result, $versions) {
     # In place, so the result keeps its bound response limits.
     $result->{columns} = [map { $output{$_} ? $output{$_}{output} : $result->{columns}[$_] } 0 .. $#names];
     $result->{rows} = [map {
-        my $row = $_;
+        my $row_index = $_;
+        my $row = $result->{rows}[$row_index];
+        my $value = sub ($key) {
+            return $row_versioned ? $result->{row_revisions}[$row_index] : $version_of->($key);
+        };
         ref($row) eq 'ARRAY'
-            ? [map { $output{$_} ? $version_of->($row->[$_]) : $row->[$_] } 0 .. $#names]
+            ? [map { $output{$_} ? $value->($row->[$_]) : $row->[$_] } 0 .. $#names]
             : do {
                 my %shaped = %$row;
-                $shaped{$_->{output}} = $version_of->(delete $shaped{$_->{alias}}) for @$versions;
+                $shaped{$_->{output}} = $value->(delete $shaped{$_->{alias}}) for @$versions;
                 \%shaped;
             };
-    } @{$result->{rows}}];
+    } 0 .. $#{$result->{rows}}];
     Selecto::API::ResponsePolicy->check_json({data => $result, ok => JSON::PP::true}, $self->limits);
     return $result;
 }
@@ -1133,7 +1161,24 @@ sub describe_openapi ($self, $api) {
             value => {},
         },
     };
-    $self->_describe_aggregate_version($api) if $self->versioner;
+    my $row_versioned = $self->_row_versioned($api->{_source_domain});
+    $self->_describe_aggregate_version($api) if $self->versioner || $row_versioned;
+    if ($row_versioned) {
+        my $fields = $openapi->{'x-selecto'}{fields};
+        push @$fields, {path => 'aggregate_version', type => 'string', label => 'Aggregate Version'}
+            unless grep { $_->{path} eq 'aggregate_version' } @$fields;
+        $openapi->{paths}{$write_path}{post}{parameters} = [{
+            in => 'header', name => 'If-Match', required => JSON::PP::false,
+            schema => {type => 'string'},
+            description => 'One strong quoted row_revision for update/delete; must agree with a body token. Wildcards, weak tags and tag lists are refused.',
+        }];
+        $openapi->{paths}{$write_path}{post}{responses}{412} = {description => 'stale_revision: the row changed or is unavailable'};
+        $openapi->{paths}{$write_path}{post}{responses}{428} = {description => 'row_revision_required: supply If-Match or body row_revision'};
+        if ($api->resources) {
+            $openapi->{paths}{$api->base_path . '/resources/{id}'}{get}{responses}{200}{headers}{ETag}{description}
+                = 'The row revision as a strong quoted tag, when its characters are ETag-safe';
+        }
+    }
     return $api;
 }
 
@@ -2226,6 +2271,13 @@ opaque version string for each one it can see; the host decides what a
 version covers (a change timestamp, a content hash). Versions require a
 public primary key.
 
+Without a C<versioner>, C<writes.row_revision> publishes the same virtual
+C<aggregate_version> using the token from the query's existing SELECT, with
+no version lookup. Resources return it automatically. A host versioner takes
+precedence and keeps its previous opt-in behavior. Its aggregate token may
+intentionally differ from C<row_revision>; writes check only the latter, and
+C<If-Match> is refused under a versioner.
+
 =head1 METHODS
 
 =head2 query
@@ -2324,6 +2376,7 @@ with a unique tie-breaker when paging.
 =head2 write
 
   my $data = $handler->write($engine, \%body);   # Selecto::Write::Result->to_hash
+  my $data = $handler->write($engine, \%body, $params);
 
 Validates the body with L</write_command> and executes it through the
 engine.
@@ -2331,10 +2384,24 @@ engine.
 =head2 write_command
 
   my $command = $handler->write_command($engine, \%body);
+  my $command = $handler->write_command($engine, \%body, $params);
 
 Normalizes a write body into a L<Selecto::Write::Command> without executing
 it, for hosts that compose their own transaction. The command must still be
-executed through a governed engine. Body keys:
+executed through a governed engine.
+
+For conditional HTTP writes, forward the second C<Selecto::API> callback
+argument as C<$params>. Its optional C<if_match> key contains one raw strong
+quoted tag. This is accepted only for update/delete when the domain declares
+C<writes.row_revision> and no host C<versioner> supplies the ETag. Otherwise
+it is C<if_match_not_supported>. Wildcard, weak, repeated/multiple or malformed
+tags are C<invalid_if_match>; a different body token is
+C<row_revision_mismatch>. These errors map to HTTP 422. The header token
+becomes the command's ordinary C<row_revision> metadata. Stale tokens map to
+HTTP 412 C<stale_revision>; required omission maps to HTTP 428
+C<row_revision_required>. Existing body-only calls remain valid.
+
+Body keys:
 
 =over 4
 
@@ -2380,6 +2447,12 @@ before anything executes. An empty list requests nothing.
 Root field lists. Upserts require both and are refused on domains
 with a required predicate (C<query_enforcement_unsupported_operation>).
 
+=item C<row_revision>
+
+The row's opaque revision token for update/delete. Required when the domain's
+C<writes.row_revision.required> is true. A supplied C<If-Match> parameter must
+agree with it; omission of both is allowed only for optional revisions.
+
 =back
 
 On a domain whose required predicate reads an association field every write
@@ -2405,9 +2478,10 @@ A copy of the handler with C<versioner> set; the original is unchanged.
 
 One resource by primary key, for L<Selecto::API>'s C<getResource> route. It
 returns the primary key and up to 50 requested public scalar or to-one fields.
-C<aggregate_version> is returned only when
-requested, and only with a versioner configured (otherwise
-C<invalid_api_query>). A withheld field is C<hidden_field>, a to-many one C<invalid_api_query>
+C<aggregate_version> is returned automatically from C<writes.row_revision>
+when no host versioner is configured, using the same SELECT. A host
+versioner's value is returned only when requested. Without either source,
+requesting it is C<invalid_api_query>. A withheld field is C<hidden_field>, a to-many one C<invalid_api_query>
 and a missing row C<resource_not_found>.
 
 C<date_format> selects how every temporal field is returned:
@@ -2444,15 +2518,19 @@ driver's own timestamp text differs between runtimes and session settings.
 C<< Selecto::API::EngineHandler->resource_date_formats >> lists the values.
 
 Queries may select C<aggregate_version> (optionally C<< {field =>
-'aggregate_version', alias => NAME} >>) when a versioner is configured.
+'aggregate_version', alias => NAME} >>) when a versioner is configured or the
+domain declares C<writes.row_revision>. Row-derived versions require
+individual root rows; grouped results cannot publish them.
 
 =head2 describe_openapi
 
   $handler->describe_openapi($api);
 
 Adds this handler's request schemas and limits to a L<Selecto::API>
-object's OpenAPI document. With a versioner it also lists the read-only
-C<aggregate_version> column in the published domain.
+object's OpenAPI document. With a versioner or C<writes.row_revision> it also
+lists the read-only C<aggregate_version> column in the published domain.
+Row-derived versions also appear in OpenAPI's field list, with the
+C<If-Match> header and the 412/428 write responses documented.
 
 =head2 describe_write_property
 

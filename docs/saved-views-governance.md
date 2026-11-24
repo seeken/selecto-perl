@@ -53,8 +53,78 @@ selected in that same statement and removed before transport, including inputs
 that are hidden from the public projection. API query responses carry the same
 array; object rows additionally contain `row_revision`. Resource reads contain
 `row_revision` automatically. Grouped, aggregate, window, set-operation, retargeted and
-alternate-source results have no individual root row revision. Existing
-Explorer feature `revision` and `aggregate_version` retain their separate names.
+alternate-source results have no individual root row revision. The Explorer
+feature `revision` retains its separate name.
+
+### One version at the API surface
+
+Without a host `versioner`, a domain declaring `writes.row_revision` also
+publishes the virtual, read-only `aggregate_version`. Queries may select it,
+including `{field => 'aggregate_version', alias => 'version'}`. Resource reads
+return it automatically alongside `row_revision`. Its value is the exact same
+token already read by that SELECT, with no second lookup. It appears in the
+published domain and OpenAPI fields and cannot be filtered, sorted or written.
+Grouped results cannot publish an individual root-row version.
+
+The resource response quotes `aggregate_version` as its `ETag` using the
+existing character rule: a nonempty scalar containing only ASCII `!` and
+`#` through `~` (no double quote, whitespace or control characters). Null or
+other stored tokens still appear in JSON but have no ETag; use the body's
+`row_revision` for them. Computed SHA-256 tokens meet the ETag rule.
+
+A configured host `versioner` still wins on reads. Its `aggregate_version`
+and ETag remain opt-in, just as before. The resource still returns its
+`row_revision`, and writes check only that token. These two tokens differ on
+purpose: a host version may cover a larger aggregate than the root row. Such
+hosts must use body `row_revision` for writes; `If-Match` is refused as
+`if_match_not_supported` (HTTP 422), even if its value looks like a row token.
+Domains with neither declaration nor versioner keep their previous reads and
+writes; they also refuse `If-Match` as `if_match_not_supported`.
+
+### Conditional API writes
+
+For API update/delete on a domain whose ETag comes from `row_revision`, send
+the resource's strong quoted ETag in `If-Match`, the unquoted token in the
+body's `row_revision`, or both. Both must agree exactly after removing the
+header's enclosing quotes; a mismatch is `row_revision_mismatch` (HTTP 422).
+The header becomes ordinary revision metadata on the existing governed write
+command. It adds no separate check or mutation path. Insert/upsert with
+`If-Match` is `if_match_not_supported` (HTTP 422).
+
+One strong quoted tag is accepted. Header names are case-insensitive and
+surrounding HTTP space/tab is ignored. Reject wildcard `*`, weak `W/"..."`,
+tag lists, repeated headers and malformed values as `invalid_if_match`
+(HTTP 422). A wildcard only tests existence and cannot prevent a lost update;
+a weak tag cannot establish the exact revision needed for this comparison.
+Lists are refused rather than guessing a revision. Opaque punctuation inside
+one tag is preserved without unescaping, under the same ETag character rule.
+
+An obsolete token or missing/inaccessible target is `stale_revision` (HTTP
+412), for header and body tokens alike. If the domain requires a token and
+neither source supplies one, `row_revision_required` maps to HTTP 428. Optional
+omission preserves ordinary governed writes. Existing identity, scope, field
+and capability requirements continue to apply.
+
+The HTTP-neutral host forwards headers and handler parameters explicitly:
+
+```perl
+my $response = $api->request({
+    method => 'POST', path => '/api/panels/write', body => $body,
+    headers => {'If-Match' => $if_match}, # omit the entry if absent
+}, {
+    write => sub {
+        my ($body, $params) = @_;
+        # Wrap expected Selecto::Error exceptions as ['error', {code => ...,
+        # message => ..., details => ...}], as for other API handlers.
+        return ['ok', $handler->write($engine, $body, $params)];
+    },
+});
+```
+
+`Selecto::API` passes the raw header as `$params->{if_match}`. Hosts must forward
+the second callback argument to `EngineHandler->write` or `write_command` to
+enable header validation. Existing body-only calls remain valid. Direct
+handler callers can supply `{if_match => '"..."'}` as the third argument.
 
 Pass the token on any supported write surface:
 
