@@ -75,6 +75,7 @@ sub filters {
 }
 sub with_tenant { return $_[0]->_with(tenant => _copy($_[1])); }
 sub returning { return $_[0]->_with(returning => _copy($_[1])); }
+sub row_revision { return $_[0]->_with(row_revision => _copy($_[1])); }
 sub expected_cardinality { return $_[0]->_with(expected_cardinality => _copy($_[1])); }
 sub conflict_target { return $_[0]->_with(conflict_target => _copy($_[1])); }
 sub upsert_update_fields { return $_[0]->_with(upsert_update_fields => _copy($_[1])); }

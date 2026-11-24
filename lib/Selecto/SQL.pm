@@ -1688,6 +1688,7 @@ sub execute_write_unsafe {
     # callback sees the handle before it ends. A dialect may therefore open
     # and end it without DBI's bookkeeping (see _begin_transaction).
     local $self->{_selecto_library_transaction} = 1;
+    local $self->{_selecto_row_revision_transaction} = exists(($command->metadata->{__selecto_row_revision} // {})->{columns});
     return $self->_transaction(sub { return $self->_execute_compiled_write_in_transaction($command, $compiled); });
 }
 
@@ -1697,6 +1698,7 @@ sub execute_batch_unsafe {
     my @commands = @{$batch->commands};
     $self->_validate_write_cardinality($_) for @commands;
     my @compiled = map { $self->_compile_write($_) } @commands;
+    local $self->{_selecto_row_revision_transaction} = grep { exists(($_->metadata->{__selecto_row_revision} // {})->{columns}) } @commands;
     return $self->_transaction(sub {
         $self->_admit_plan_storage(\@commands);
         my @results = map { $self->_execute_compiled_write_in_transaction($commands[$_], $compiled[$_]) } 0 .. $#commands;
@@ -1707,6 +1709,9 @@ sub execute_batch_unsafe {
 sub execute_graph_unsafe {
     my ($self, $graph) = @_;
     Selecto::Write::Capabilities->preflight($self, $graph);
+    local $self->{_selecto_row_revision_transaction} = grep {
+        exists(($_->{command}->metadata->{__selecto_row_revision} // {})->{columns})
+    } @{$graph->nodes};
     $self->_validate_write_cardinality($_->{command}) for @{$graph->nodes};
     $self->_validate_write_cardinality($_->{cleanup}) for @{$graph->{_governed_owned_sets} // []};
     Selecto::Error->throw('invalid_write_graph', 'execute_graph requires a Selecto::Write::Graph')
@@ -2007,6 +2012,16 @@ sub _compile_expression {
     Selecto::Error->throw('raw_sql_forbidden', 'raw SQL is outside governed expressions', {path => []})
         if $kind eq 'raw_sql';
     return $self->_field_sql($domain, $arguments->[0], $params) if $kind eq 'field';
+    if ($kind eq 'row_revision_value') {
+        my $field = $arguments->[0];
+        my $definition = $domain->resolve($field);
+        Selecto::Error->throw('invalid_row_revision', 'revision inputs must be stored root columns')
+            if $field =~ /\./ || exists $definition->{computed};
+        # Revisions describe storage, independently of the query's display
+        # timezone or a semantic naive_utc conversion.
+        return $self->_row_revision_value_sql($self->_qualified($self->_root_alias,
+            Selecto::Identifier::checked($field)), $definition->{type});
+    }
     if ($kind eq 'recursion_depth') {
         # Internal level counter of a depth-bounded recursive CTE.
         return '1' if $arguments->[0] eq 'seed';
@@ -4054,8 +4069,89 @@ sub _validate_write_cardinality {
         expected => $declared ? $metadata->{expected_cardinality} : $expected };
 }
 
+sub _row_revision_value_sql { return 'CAST(' . $_[1] . ' AS TEXT)'; }
+sub _reserve_row_revision { return; }
+sub _unique_violation {
+    my ($self, $fields, $key) = @_;
+    my $keys = $self->{_selecto_unique_keys} // {};
+    $fields = $keys->{$key} if (!$fields || !@$fields) && defined($key) && exists($keys->{$key});
+    if ($fields && @$fields) {
+        my $signature = join '\0', sort @$fields;
+        my @names = grep { join('\0', sort @{$keys->{$_}}) eq $signature } sort keys %$keys;
+        $key = $names[0] if @names == 1;
+    }
+    return Selecto::Error->new(code => 'database_unique_violation',
+        message => 'A value conflicts with an existing record.',
+        details => {constraint => 'unique', $fields && @$fields ? (fields => [@$fields]) : (),
+            defined($key) && exists($keys->{$key}) ? (key => $key) : ()});
+}
+
+sub _row_revision_snapshot {
+    my ($self, $command, $lock) = @_;
+    require Selecto::RowRevision;
+    my $meta = $command->metadata;
+    my $spec = $meta->{__selecto_row_revision};
+    my @fields = @{Selecto::RowRevision->fields($spec)};
+    my @types = map { my $d = $meta->{__selecto_insert_types}{$_}; ref($d) eq 'HASH' ? $d->{type} : $d } @fields;
+    my $predicate = $meta->{__selecto_revision_target} // Selecto::QueryEnforcement::combine(
+        $command->predicate, $command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef);
+    my @params;
+    my $where = $self->_compile_write_predicate($predicate, \@params);
+    my $table = $self->_relation_sql(undef, Selecto::Identifier::checked($command->relation));
+    my $columns = join ', ', map { $self->_row_revision_value_sql($self->quote_identifier($fields[$_]), $types[$_]) } 0 .. $#fields;
+    my $sql = "SELECT $columns FROM $table WHERE $where LIMIT 2";
+    $sql .= ' FOR UPDATE' if $lock && $self->name =~ /\A(?:postgresql|mysql|mariadb)\z/;
+    my ($sth, @rows);
+    my $ok = eval {
+        $sth = $self->dbh->prepare($self->_statement_sql($sql)) or die _dbi_error($self->dbh, 'revision read preparation failed');
+        defined($self->_execute_statement($sth, \@params)) or die _dbi_error($sth, 'revision read failed');
+        while (my @row = $sth->fetchrow_array) { push @rows, [@row] }
+        die _dbi_error($sth, 'revision read fetch failed') if $sth->err;
+        1;
+    };
+    my $error = $ok ? undef : $self->normalize_error($@);
+    $sth->finish if $sth;
+    die $error unless $ok;
+    Selecto::Error->throw('row_revision_requires_identity', 'a revision target must identify at most one row') if @rows > 1;
+    return (0, undef) unless @rows;
+    return (1, Selecto::RowRevision->token($spec, $rows[0], \@types));
+}
+sub _check_row_revision_affected {
+    my ($self, $command) = @_;
+    my ($exists, $token) = $self->_row_revision_snapshot($command, 0);
+    my $expected = $command->metadata->{row_revision};
+    Selecto::Error->throw('stale_revision', 'the row revision is no longer current',
+        {reason => $exists ? 'changed' : 'missing'})
+        unless $exists && ((!defined($token) && !defined($expected))
+            || defined($token) && defined($expected) && "$token" eq "$expected");
+    return;
+}
+sub _prepare_row_revision {
+    my ($self, $command) = @_;
+    my $meta = $command->metadata;
+    my $spec = $meta->{__selecto_row_revision} or return $command;
+    $meta->{__selecto_revision_target} = Selecto::QueryEnforcement::combine(
+        $command->predicate, $command->scope_predicate,
+        defined($command->query_enforcement) ? $command->query_enforcement->predicate : undef);
+    $command = $command->with_metadata($meta);
+    if (exists $spec->{columns}) {
+        $self->_reserve_row_revision($command);
+        my ($exists, $token) = $self->_row_revision_snapshot($command, 1);
+        Selecto::Error->throw('stale_revision', 'the row revision is no longer current',
+            {reason => $exists ? 'changed' : 'missing'}) unless $exists && $token eq $meta->{row_revision};
+        return $command;
+    }
+    # The token comparison is part of DML, including system version columns.
+    return $command->_with(predicate => Selecto::QueryEnforcement::combine(
+        $command->predicate, defined($meta->{row_revision})
+            ? Selecto::Expression->eq($spec->{column}, $meta->{row_revision})
+            : Selecto::Expression->is_null($spec->{column})));
+}
+
 sub _check_write_cardinality {
     my ($self, $command, $affected, $bounds) = @_;
+    $self->_check_row_revision_affected($command) if !$affected && $command->metadata->{__selecto_row_revision};
     $bounds //= $self->_validate_write_cardinality($command);
     Selecto::Error->throw('cardinality_mismatch', 'write affected an unexpected number of rows',
         { expected => $bounds->{expected} })
@@ -4067,6 +4163,12 @@ sub _execute_compiled_write_in_transaction {
     my ($self, $command, $compiled) = @_;
     my $bounds = $self->_validate_write_cardinality($command);
     $self->_admit_plan_storage([$command]);
+    local $self->{_selecto_revision_write} = $command->metadata->{__selecto_row_revision};
+    my $revision_command = $self->_prepare_row_revision($command);
+    $compiled = $self->_compile_write($revision_command) if $revision_command != $command;
+    $command = $revision_command;
+    local $self->{_selecto_unique_keys} = $command->metadata->{__selecto_unique_keys} // {};
+    local $self->{_selecto_write_relation} = $command->relation;
     $self->_check_typed_insert_admission($command);
     my $post_image = _post_image_predicate($command);
     my $insert_guard = $self->name eq 'postgresql' ? _insert_post_image_predicate($command) : undef;
@@ -4101,8 +4203,8 @@ sub _execute_compiled_write_in_transaction {
             }
             die _dbi_error($sth, 'database returning fetch failed') if eval { $sth->err };
             if (@wanted) {
-                _guarded_cardinality($command, 0) if !$returned && @{$command->foreign_key_guards};
                 $self->_check_write_cardinality($command, 0, $bounds) unless $returned;
+                _guarded_cardinality($command, 0) if !$returned && @{$command->foreign_key_guards};
                 Selecto::Error->throw('write_returning_missing', 'write did not return the requested row')
                     if !$returned && !$bounds->{declared};
                 @values{@wanted} = $self->_decode_returning_values($sth, @$first) if $returned;
@@ -4113,8 +4215,8 @@ sub _execute_compiled_write_in_transaction {
             die _dbi_error($sth, 'database returning fetch failed')
                 if !@row && eval { $sth->err };
             # A guarded write that yields no row was refused by its guard.
-            _guarded_cardinality($command, 0) if !@row && @{$command->foreign_key_guards};
             $self->_check_write_cardinality($command, 0, $bounds) unless @row;
+            _guarded_cardinality($command, 0) if !@row && @{$command->foreign_key_guards};
             Selecto::Error->throw('write_returning_missing', 'write did not return the requested row')
                 if !@row && !$bounds->{declared};
             @values{@{$compiled->{returning}}} = $self->_decode_returning_values($sth, @row) if @row;

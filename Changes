@@ -1,6 +1,25 @@
 Revision history for Selecto
 
 0.5.0  Unreleased - breaking native builder contract 1.0.0
+    - Add writes.row_revision (one stored column or a canonical column hash),
+      optional/required update and delete tokens, same-read revision output,
+      atomic column comparisons and transaction-protected computed checks.
+      Stale or missing targets return stale_revision. Native, portable and
+      API write intents accept row_revision, distinct from Explorer revision.
+      Revision and host-bound writes support SQLite, PostgreSQL, MySQL and
+      MariaDB; live MySQL/MariaDB tests use configured URLs. DuckDB refuses
+      either declaration at the first write with
+      write_capability_missing, while retaining reads and unique-error mapping.
+    - Add Perl-only writes.host_bound_fields: trusted owner pins, created_by
+      and modified_by fills. Caller assignments return host_bound_field.
+      Owner scope reuses tenant scope; context-owned parent references reuse
+      the existing foreign-key tenant guard. Upserts with host-bound fields
+      fail closed until both branches have an explicit lifecycle contract.
+    - Normalize SQLite and DuckDB unique errors as database_unique_violation;
+      writes.unique_keys names conflicts across all adapters without exposing
+      values. Preserve exact timestamp/decimal revision inputs and SQLite REAL
+      precision. See docs/saved-views-governance.md. These additions extend the
+      unreleased write contract; existing declarations keep their behavior.
     - Examples and fixtures use an invented domain.
     - Without a query timezone, PostgreSQL on periods use the database session
       zone and its DST interpretation, including SQL-derived epoch bounds.

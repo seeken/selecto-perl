@@ -176,6 +176,12 @@ sub _projection {
 }
 sub returning { my $self = shift; $self->_projection('returning', @_) }
 sub return_for_update { my $self = shift; $self->_projection('editable', @_) }
+sub row_revision {
+    my ($self, $token) = @_;
+    my $s = _state($self); _mode($s, 'scalar');
+    $s->{row_revision} = _copy($token);
+    return $self;
+}
 sub expected_cardinality {
     my ($self, @args) = @_;
     my $s = _state($self); _mode($s, 'scalar');
@@ -205,6 +211,7 @@ sub upsert_update_fields {
 sub _command {
     my ($s) = @_;
     my $engine = $s->{engine};
+    $engine->_validate_adapter_write_domain;
     $engine->_ensure_write_context;
     if (defined $s->{edge}) {
         return Selecto::Write::Editable->bound_command($s->{row}, $s->{edge}, $s->{type},
@@ -226,7 +233,7 @@ sub _command {
         push @predicates, Selecto::Expression->eq(@$_) for $s->{row}
             ? @{Selecto::Write::Editable->identity_filter($s->{row})} : ();
         my %metadata = (expected_cardinality => $s->{expected_cardinality} // ['exactly', 1]);
-        $metadata{$_} = $s->{$_} for grep { exists $s->{$_} } qw(returning conflict_target upsert_update_fields);
+        $metadata{$_} = $s->{$_} for grep { exists $s->{$_} } qw(returning conflict_target upsert_update_fields row_revision);
         return $engine->write_command(operation => $s->{type},
             assignments => $s->{type} eq 'delete' ? {} : Selecto::Write::PortableCommand->_values($s->{assignments}, $fields),
             (@predicates ? (predicate => Selecto::Expression->all(@predicates)) : ()),
@@ -240,7 +247,7 @@ sub _command {
     }
     $op = $op->enforce_query($engine->query->where(Selecto::Expression->all(@{$s->{predicates}})))
         if @{$s->{predicates} // []};
-    for my $key (qw(returning conflict_target upsert_update_fields)) {
+    for my $key (qw(returning conflict_target upsert_update_fields row_revision)) {
         $op = $op->$key($s->{$key}) if exists $s->{$key};
     }
     my $compiled = $op->compile(context => $engine->write_context,

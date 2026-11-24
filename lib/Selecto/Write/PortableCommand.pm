@@ -441,6 +441,7 @@ sub _required {
 sub _assignment_policy {
     my ($contract, $values, $type, $tenant_field) = @_;
     for my $field (sort keys %$values) {
+        next if exists $contract->{host_bound_fields}{$field};
         next if defined($tenant_field) && $field eq $tenant_field && ($type eq 'insert' || $type eq 'upsert');
         my $spec = $contract->{fields}{$field} // {};
         my $grant = $type eq 'update' ? 'updatable' : 'insertable';
@@ -496,6 +497,10 @@ sub _compile_flat {
     my $query_predicate = Selecto::Write::QueryEnforcement->compile($state, $contract);
     my $fields = _fields($contract);
     my $values = $type eq 'delete' ? {} : $class->_values($state->{values}, $fields);
+    require Selecto::Write::HostFields;
+    my $host_command = Selecto::Write::HostFields->apply(Selecto::Write::Command->new(
+        operation => $type, relation => $contract->{source}{source_table}, assignments => $values), $contract, $context);
+    $values = $host_command->assignments;
     my $filters = $class->_filters([@{$state->{filters} // []}, @{$context->{required_filters} // []}], $fields);
     my $requested_returning = $class->_returning_request($state->{returning}, $fields);
     my $spec = $contract->{operations}{$type};
@@ -617,11 +622,15 @@ sub _compile_flat {
             } @$requested];
         }
     }
-    my $command = Selecto::Write::Command->new(operation => $type, relation => $relation, assignments => $values,
-        predicate => $predicate, scope_predicate => $required, expected_count => undef, metadata => \%metadata, foreign_key_guards => $guards);
+    $metadata{row_revision} = $state->{row_revision} if exists $state->{row_revision};
+    my $command = $host_command->_with(operation => $type, relation => $relation, assignments => $values,
+        predicate => $predicate, scope_predicate => Selecto::QueryEnforcement::combine($required, $host_command->scope_predicate),
+        expected_count => undef, metadata => \%metadata, foreign_key_guards => $guards);
     $command = Selecto::Write::Policy->apply($command,
         {operations => $contract->{operations}, fields => $contract->{fields}}, $fields,
-        trusted_field => $tenant_field);
+        trusted_field => [$tenant_field, keys %{$contract->{host_bound_fields}}]);
+    require Selecto::RowRevision;
+    $command = Selecto::RowRevision->govern($command, $contract, $contract->{source}{primary_key});
     $issue_input->($command, $accepted_input) if $accepted_input;
     $issue_upsert->($command, {domain => _copy($state->{domain}), contract => _copy($contract),
         context => _copy($context), resolver => $resolver, filters => _copy($filters)}) if $protected_upsert;

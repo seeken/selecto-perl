@@ -1622,8 +1622,14 @@ sub normalize_error {
         && eval { $dbh->isa('DBI::db') } && $text !~ /\bDBD::|\bDBI\b|database/;
     return $self->SUPER::normalize_error($error) unless defined($errno) && "$errno" =~ /\A\d+\z/;
     if ($errno == 1062) {
-        return Selecto::Error->new(code => 'database_unique_violation',
-            message => 'A value conflicts with an existing record.', details => {constraint => 'unique'});
+        my ($key) = $text =~ /for key ['`](?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)['`]/i;
+        my $fields;
+        if (defined($key) && defined($self->{_selecto_write_relation})) {
+            $fields = eval { $dbh->selectcol_arrayref(q{SELECT COLUMN_NAME FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? AND NON_UNIQUE = 0
+                ORDER BY SEQ_IN_INDEX}, undef, $self->{_selecto_write_relation}, $key) };
+        }
+        return $self->_unique_violation($fields, $key);
     }
     if ($errno == 1451 || $errno == 1452) {
         return Selecto::Error->new(code => 'database_foreign_key_violation',
@@ -3023,6 +3029,8 @@ sub _leave_transaction {
     $dbh->{BegunWork} = 0;
     return 1;
 }
+
+sub _row_revision_value_sql { return 'CAST(' . $_[1] . ' AS CHAR)'; }
 
 sub _decode {
     my ($self, $value, $type) = @_;

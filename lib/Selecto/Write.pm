@@ -64,7 +64,7 @@ sub foreign_key_guards { return _clone($_[0]->{foreign_key_guards}); }
 # directly avoids first deep-copying them through the accessors as well.
 sub _with {
     my ($self, %changes) = @_;
-    return ref($self)->new(
+    my $copy = ref($self)->new(
         operation => $self->{operation},
         relation => $self->{relation},
         assignments => $self->{assignments},
@@ -76,7 +76,11 @@ sub _with {
         foreign_key_guards => $self->{foreign_key_guards},
         %changes,
     );
+    require Selecto::Write::HostFields;
+    return Selecto::Write::HostFields->inherit($self, $copy);
 }
+
+sub row_revision { return $_[0]->with_metadata({%{$_[0]->metadata}, row_revision => $_[1]}); }
 
 sub with_query_enforcement {
     my ($self, $evidence) = @_;

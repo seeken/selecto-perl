@@ -479,3 +479,12 @@ script/denylist-hashes
 t/data/denylist.sha256
 t/domain_names_guard.t
 t/lib/TestDomainGuard.pm
+lib/Selecto/RowRevision.pm
+lib/Selecto/Write/HostFields.pm
+t/saved_views_governance.t
+t/lib/TestSavedViews.pm
+t/saved_views_interleaving.t
+t/saved_views_contract.t
+t/saved_views_revision_values.t
+docs/saved-views-governance.md
+t/duckdb_saved_views.t

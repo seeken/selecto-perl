@@ -210,6 +210,45 @@ sub _scope {
     _error($state,'unsafe_write_fragment',['writes','scope','tenant']) if _unsafe($state,$tenant);
 }
 sub _rel_error { _error($_[0],'invalid_write_relationship_option',$_[1]) }
+sub _row_metadata {
+    my ($state, $writes) = @_;
+    my $stored = sub {
+        my ($field) = @_;
+        return _string($field) && $state->{root_fields}{$field}
+            && !exists($state->{domain}{source}{columns}{$field}{computed});
+    };
+    if (exists $writes->{row_revision}) {
+        my $path = ['writes', 'row_revision'];
+        my $spec = _object($state, $writes->{row_revision}, $path, 'invalid_row_revision');
+        my @fields = exists($spec->{column}) ? ($spec->{column}) : ref($spec->{columns}) eq 'ARRAY' ? @{$spec->{columns}} : ();
+        my %seen;
+        _error($state, 'invalid_row_revision', $path) if !@fields
+            || (exists($spec->{column}) && exists($spec->{columns}))
+            || grep { !$stored->($_) || $seen{$_}++ } @fields;
+        _optional_bool($state, $spec, 'required', $path, 'invalid_row_revision');
+        _error($state, 'invalid_row_revision', [@$path, $_]) for grep { !/\A(?:column|columns|required)\z/ } keys %$spec;
+    }
+    for my $section (qw(host_bound_fields unique_keys)) {
+        next unless exists $writes->{$section};
+        my $entries = _object($state, $writes->{$section}, ['writes', $section], 'invalid_' . $section);
+        for my $name (sort keys %$entries) {
+            _work($state);
+            my $path = ['writes', $section, $name];
+            if ($section eq 'unique_keys') {
+                my $fields = $entries->{$name}; my %seen;
+                _error($state, 'invalid_unique_key', $path) unless $name =~ /\A[A-Za-z_][A-Za-z0-9_]*\z/
+                    && ref($fields) eq 'ARRAY' && @$fields && !grep { !$stored->($_) || $seen{$_}++ } @$fields;
+            } else {
+                my $spec = _object($state, $entries->{$name}, $path, 'invalid_host_bound_field');
+                my $source = $spec->{source};
+                _error($state, 'invalid_host_bound_field', $path) unless $stored->($name)
+                    && _enum($spec->{mode}, qw(owner created_by modified_by))
+                    && ref($source) eq 'ARRAY' && @$source == 2 && _enum($source->[0], 'context') && _id($source->[1]);
+                _error($state, 'invalid_host_bound_field', [@$path, $_]) for grep { !/\A(?:mode|source)\z/ } keys %$spec;
+            }
+        }
+    }
+}
 sub _policy {
     my ($state,$policy,$path,$booleans,$integers,$enums)=@_;
     _optional_bool($state,$policy,$_,$path,'invalid_write_relationship_option') for @$booleans;
@@ -383,7 +422,7 @@ sub _validate {
     my $fields=Selecto::Domain::SourceRelationships->declared_field_ids($raw);
     $state->{fields}={map {$_=>1} @$fields};
     my $writes=_object($state,$raw->{writes},['writes']);
-    _operations($state,$writes);_fields($state,$writes);_scope($state,$writes);
+    _operations($state,$writes);_fields($state,$writes);_scope($state,$writes);_row_metadata($state,$writes);
     if (defined $writes->{relationships}) {
         my $relationships=_object($state,$writes->{relationships},['writes','relationships']);
         for my $id(sort keys %$relationships) { _work($state);_relationship($state,$id,$relationships->{$id}) }
@@ -394,6 +433,19 @@ sub _validate {
 sub normalize {
     my ($class,$given)=@_;my $state=_new_state($given);
     return _copy({domain=>$state->{domain},errors=>$state->{errors},warnings=>[]});
+}
+sub validate_row_metadata {
+    my ($class, $given) = @_;
+    my $state = _new_state($given);
+    my $source = $state->{domain}{source};
+    my $revision = $state->{domain}{writes}{row_revision};
+    if (ref($revision) eq 'HASH' && exists($revision->{required}) && !_bool($revision->{required})
+            && defined($revision->{required}) && !ref($revision->{required}) && $revision->{required} =~ /\A[01]\z/) {
+        $revision->{required} = _boolean($revision->{required});
+    }
+    $state->{root_fields} = {map { $_ => 1 } keys %{$source->{columns} // {}}};
+    _row_metadata($state, $state->{domain}{writes} // {});
+    return _copy({errors => $state->{errors}})->{errors};
 }
 sub validate {
     my ($class,$given)=@_;my $state=_validate(_new_state($given));
@@ -418,7 +470,9 @@ sub compile {
     }
     my $contract={source=>$raw->{source},operations=>{map {$_=>$operations->{$_}} grep {_true($operations->{$_}{enabled})} sort keys %$operations},
         fields=>$fields,scope=>$scope,relationships=>$writes->{relationships}//{},constraints=>$writes->{constraints}//{},
-        transitions=>$writes->{transitions}//{},rules=>$raw->{rules}//{},fingerprint=>$raw->{domain_fingerprint},fields_declared=>_boolean(keys %$fields)};
+        transitions=>$writes->{transitions}//{},rules=>$raw->{rules}//{},fingerprint=>$raw->{domain_fingerprint},fields_declared=>_boolean(keys %$fields),
+        (exists($writes->{row_revision}) ? (row_revision=>$writes->{row_revision}) : ()),
+        host_bound_fields=>$writes->{host_bound_fields}//{},unique_keys=>$writes->{unique_keys}//{}};
     $state->{output}->check_tree($contract,label=>'compiled write contract');
     return _copy($contract);
 }

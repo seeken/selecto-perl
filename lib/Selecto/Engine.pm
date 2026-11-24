@@ -77,8 +77,25 @@ sub _admit_write_contract {
     my $memo = $self->{_admitted_write_contract};
     return $self if $memo && refaddr($memo->[0]) == refaddr($self->{domain})
         && refaddr($memo->[1]) == refaddr($self->{limits});
-    Selecto::Write::FieldValidators->admit_domain({writes=>$self->{domain}->writes},limits=>$self->{limits});
+    my $writes = $self->{domain}->writes;
+    Selecto::Write::FieldValidators->admit_domain({writes=>$writes},limits=>$self->{limits});
+    $self->_validate_adapter_write_domain($writes);
     $self->{_admitted_write_contract} = [$self->{domain}, $self->{limits}];
+    return $self;
+}
+
+# A declaration-level capability refusal is pure and precedes trusted fills,
+# including portable compilation in a fluent builder and nested graph domains.
+sub _validate_adapter_write_domain {
+    my ($self, $writes) = @_;
+    return $self unless $self->{adapter}->can('_validate_write_domain');
+    $writes //= $self->{domain}->writes;
+    my $ok = eval { $self->{adapter}->_validate_write_domain($writes); 1 };
+    if (!$ok) {
+        my $error = $@;
+        die $error if blessed($error) && $error->isa('Selecto::Error');
+        Selecto::Error->throw('invalid_write_capabilities', 'write adapter domain validation failed');
+    }
     return $self;
 }
 
@@ -533,14 +550,17 @@ sub compile {
 sub all {
     my ($self, $query, %options) = @_;
     $self->_check_read_execution_options(\%options);
+    require Selecto::RowRevision;
+    my $revision;
+    ($query, $revision) = Selecto::RowRevision->prepare_read($self, $query);
     my $statement = $self->compile($query);
     $self->assert_domain_identity;
-    return $self->{adapter}->execute_query($statement, $self->_canonical_option(%options))
+    return Selecto::RowRevision->finish_read($self->{adapter}->execute_query($statement, $self->_canonical_option(%options)), $revision)
         unless $options{export_scalars};
     # Export scalars are opt-in: only adapters that provide them may be asked.
     Selecto::Error->throw('unsupported_feature', 'configured adapter does not provide export scalars')
         unless $self->{adapter}->supports('export_scalars');
-    return $self->{adapter}->execute_query($statement, export_scalars => 1);
+    return Selecto::RowRevision->finish_read($self->{adapter}->execute_query($statement, export_scalars => 1), $revision);
 }
 
 # The domain reads compile against. An engine holding a trusted tenant scopes
@@ -1099,11 +1119,15 @@ sub governed_write {
         { relation => $command->relation, expected => $self->{domain}->table },
     ) unless $command->relation eq $self->{domain}->table;
     Selecto::Write::PortableCommand->_require_protected_upsert_host($command, $self);
+    require Selecto::Write::HostFields;
+    $command = Selecto::Write::HostFields->apply($command, $self->{domain}->writes_shared, $self->{write_context});
     $command = $self->_materialize_write_context($command);
     $command = $self->_normalize_write_command($command);
     my $required = $self->required_write_guard($command->operation, %details);
     my $trusted;
     ($command, $trusted) = $self->_apply_write_tenant($command, $required, %details);
+    $trusted = [Selecto::Write::Policy::_trusted_fields($trusted),
+        keys %{$self->{domain}->writes_shared->{host_bound_fields} // {}}];
     # The engine tenant, writes.scope and the host's scope predicate bound
     # the rows an update leaves behind too (TW-09: bound tenant-like scope);
     # the required predicate and query enforcement bound its pre-image only,
@@ -1139,6 +1163,10 @@ sub governed_write {
     $command = $command->with_foreign_key_guards(_foreign_key_guards(
         _domain_references($self->{domain}), $command, $self->_trusted_tenant_sets($required), %details,
     ));
+    require Selecto::RowRevision;
+    $command = Selecto::RowRevision->govern($command, $self->{domain}->writes_shared, $self->{domain}->primary_key);
+    $command = $command->with_metadata({%{$command->metadata},
+        __selecto_unique_keys => $self->{domain}->writes_shared->{unique_keys} // {}});
     return $self->_retain_command_work($command, $accepted_work);
 }
 
@@ -2769,7 +2797,7 @@ sub _validate_command_against_contract {
                 unless exists $domain_fields->{$field};
             next unless defined($fields_spec);
             # The trusted tenant is assigned by scope, not granted to callers.
-            next if $permission eq 'insertable'
+            next if ($permission eq 'insertable' || ref($writes->{host_bound_fields}) eq 'HASH' && exists($writes->{host_bound_fields}{$field}))
                 && grep { $field eq $_ } Selecto::Write::Policy::_trusted_fields($context{trusted_field});
             my $spec = $fields_spec->{$field};
             Selecto::Error->throw(
@@ -2985,6 +3013,12 @@ sub _validate_graph_node {
     my $scope = $edge->{tenant_scope};
     my $nested_domain = _native_relationship_domain($edge->{contract});
     my $nested_engine = $self->_graph_engine($nested_domain);
+    $nested_engine->_validate_adapter_write_domain;
+    require Selecto::Write::HostFields;
+    my $host_fields = $nested_domain->writes_shared->{host_bound_fields} // {};
+    Selecto::Error->throw('host_bound_field', 'a graph binding cannot assign a host-bound field')
+        if grep { exists($host_fields->{$_->{field}}) } @$bindings;
+    $command = Selecto::Write::HostFields->apply($command, $nested_domain->writes_shared, $nested_engine->write_context);
     $command=$nested_engine->_materialize_write_context($command);
     $command = $command->with_assignments($nested_domain->normalize_write_assignments($command->assignments));
     if (!$scope && $root_scope) {
@@ -3016,7 +3050,7 @@ sub _validate_graph_node {
     my %prior = map { (Scalar::Util::refaddr($_) => 1) } Selecto::SQL::_top_conjuncts($before_confine);
     $post_image_scope = Selecto::QueryEnforcement::combine($post_image_scope,
         grep { !$prior{Scalar::Util::refaddr($_)} } Selecto::SQL::_top_conjuncts($command->scope_predicate));
-    $trusted = [@$trusted, @{$filled // []}];
+    $trusted = [@$trusted, @{$filled // []}, keys %$host_fields];
     my %nested_fields = %{$edge->{fields} // {}};
     my %returning_fields = map { ($_ => $nested_domain->_field_metadata_view($_)) } keys %nested_fields;
     $command = Selecto::Write::Policy->apply($command, $edge->{writes}, \%returning_fields,
@@ -3034,8 +3068,11 @@ sub _validate_graph_node {
         _contract_references($edge->{contract}, $edge->{table}), $command, $tenants,
         graph_node => $node->{id},
     ));
+    require Selecto::RowRevision;
+    $command = Selecto::RowRevision->govern($command, $nested_domain->writes_shared, $edge->{primary_key});
     $command = $command->with_metadata({%{$command->metadata},
         __selecto_primary_key => $edge->{primary_key},
+        __selecto_unique_keys => $nested_domain->writes_shared->{unique_keys} // {},
         (defined($post_image_scope) ? (__selecto_post_image_scope => $post_image_scope) : ()),
         $nested_engine->_tenant_fields_metadata(grep { exists $edge->{fields}{$_} }
             @{_root_tenant_fields($self->{domain}->tenant_field, $self->{domain}->write_tenant_scope)}),

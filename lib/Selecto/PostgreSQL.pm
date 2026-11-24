@@ -437,6 +437,8 @@ sub normalize_error {
 
     my $text = eval { "$error" } // '';
     my $state = eval { $self->dbh->state } // '';
+    return Selecto::Error->new(code => 'stale_revision', message => 'the row revision is no longer current',
+        details => {reason => 'changed'}) if $state eq '40001' && $self->{_selecto_revision_write};
     # (DBI's restore after a failed rollback clears the handle: the text is what is left.)
     return Selecto::Error->new(code => 'query_error', message => 'Execution failed',
         details => {cause => 'database_error', sqlstate => '57014', category => 'query_canceled'})
@@ -458,11 +460,8 @@ sub normalize_error {
     if ($state eq '23505' || $text =~ /duplicate key value violates unique constraint/i) {
         my ($field_list) = $text =~ /Key \(([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\)=/i;
         my @fields = defined($field_list) ? split(/\s*,\s*/, $field_list) : ();
-        return Selecto::Error->new(
-            code => 'database_unique_violation',
-            message => 'A value conflicts with an existing record.',
-            details => {constraint => 'unique', @fields ? (fields => \@fields) : ()},
-        );
+        my ($key) = $text =~ /violates unique constraint "([A-Za-z_][A-Za-z0-9_]*)"/;
+        return $self->_unique_violation(\@fields, $key);
     }
     if ($state eq '23503' || $text =~ /violates foreign key constraint/i) {
         return Selecto::Error->new(
@@ -1263,6 +1262,17 @@ sub _compile_bucket {
     }
     push @$params, 'Other';
     return 'CASE ' . join(' ', @clauses) . ' ELSE ' . $self->placeholder(scalar @$params) . ' END';
+}
+
+sub _row_revision_value_sql {
+    my ($self, $sql, $type) = @_;
+    return "pg_catalog.to_char($sql, 'YYYY-MM-DD')" if ($type // '') eq 'date';
+    if (($type // '') =~ /\A(?:utc_datetime|timestamptz|naive_datetime|datetime|timestamp)\z/) {
+        return "CASE WHEN pg_catalog.pg_typeof($sql) = 'pg_catalog.timestamptz'::pg_catalog.regtype"
+            . " THEN (pg_catalog.to_char($sql AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || 'Z')"
+            . " ELSE pg_catalog.to_char($sql, 'YYYY-MM-DD\"T\"HH24:MI:SS.US') END";
+    }
+    return "CAST($sql AS pg_catalog.text)";
 }
 
 sub _column_types {

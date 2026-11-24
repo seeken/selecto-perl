@@ -158,6 +158,7 @@ sub _contract_json_booleans {
         }
     }
     my $writes = ref($contract->{writes}) eq 'HASH' ? $contract->{writes} : {};
+    _json_booleans($writes->{row_revision}, 'required');
     for my $operation (_contract_objects($writes->{operations})) {
         _json_booleans($operation, qw(enabled bulk require_filter));
     }
@@ -615,6 +616,11 @@ sub _parse_canonical {
     $domain->{_tenant_family} = $family if $family;
     _apply_required_filters($domain, $raw->{required_filters});
     $domain->{contract} = _clone_with_rules($raw);
+    if (ref($raw->{writes}) eq 'HASH' && grep { exists($raw->{writes}{$_}) } qw(row_revision host_bound_fields unique_keys)) {
+        require Selecto::Domain::WriteContract;
+        my $errors = Selecto::Domain::WriteContract->validate_row_metadata($raw);
+        Selecto::Error->throw('invalid_domain', 'invalid governed row metadata', {errors => $errors}) if @$errors;
+    }
     $domain->{canonical_schemas} = dclone($schemas);
     $domain->{canonical_joins} = dclone($joins);
     _validate_value_expressions($domain, $source, $raw->{writes});

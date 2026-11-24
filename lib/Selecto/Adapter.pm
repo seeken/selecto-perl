@@ -260,6 +260,11 @@ refuses missing/incompatible protocols and missing requested semantics.
 An optional internal C<_validate_write_intent($write)> hook may return a more
 specific typed refusal for unsupported structured intent before report lookup.
 It must remain pure; it neither grants capabilities nor prepares or executes SQL.
+An optional internal C<_validate_write_domain($writes)> hook refuses unsupported
+write declarations during the engine's first write-contract admission, before
+trusted fills or revision checks. It receives a defensive copy of the domain's
+writes declaration and follows the same pure, refusal-only rule. Reads and
+engine construction do not invoke it. Nested graph domains are admitted too.
 
 =head2 feature_inventory
 

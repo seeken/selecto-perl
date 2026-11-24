@@ -1,0 +1,175 @@
+# Governed saved-view rows
+
+These declarations belong to one domain per host table. They do not require a
+new schema or a database view. They are additive to the unreleased 0.5.0 write
+contract. All ordinary operation, field, capability, tenant and parent-reference
+checks still apply. Host bindings are a Perl-only extension pending agreement
+with the other runtimes.
+
+Row-revision and host-bound-field writes are supported on SQLite, PostgreSQL,
+MySQL and MariaDB. Saved-view storage belongs in the host's database or SQLite.
+DuckDB permits reads of these domains, including revision read metadata, but
+refuses every write when either `writes.row_revision` or
+`writes.host_bound_fields` is declared (even an empty binding map). The error is
+`write_capability_missing`, with a message explicitly naming DuckDB and
+`details.adapter = duckdb` plus `details.missing` listing the declarations.
+The refusal happens at first write-contract admission, before trusted fills or
+revision checks. Fluent compilation, previews, batches and nested graph domains
+follow the same refusal. Engine construction and reads remain available.
+Ordinary DuckDB domains retain their existing write path and the common unique
+error contract below.
+
+## Row revisions
+
+Declare exactly one form:
+
+```perl
+writes => {
+    row_revision => {column => 'version', required => JSON::PP::true},
+    # Or, commonly for existing host tables:
+    # row_revision => {columns => [qw(name url parent_id)], required => JSON::PP::true},
+    # ... explicit operations and field grants ...
+}
+```
+
+`column` names a stored version/timestamp field, including a declared backend
+system field such as PostgreSQL `xmin`. Its token is the exact canonical storage
+text. The host/database is responsible for advancing this column when the row
+changes. Selecto does not invent a counter or touch a timestamp.
+
+`columns` is a nonempty list of distinct stored root fields. Its token is
+`sha256:` followed by 64 lowercase hexadecimal digits. The hash covers ordered
+field names, declared types and canonical values: null remains distinct from
+empty text; numeric text is normalized without binary floating conversion;
+JSON object keys are sorted. Database adapters select exact scalar storage text
+before hashing. Timestamps retain fractional precision. SQLite REAL uses
+26-digit alternate-form output so adjacent stored doubles remain distinct.
+Tokens are opaque and backend/domain-specific; they are not authentication or
+capability grants. Include every column whose change should invalidate a save.
+
+`Engine->all` and `BoundedQuery->all` return a `row_revisions` array aligned with
+`rows`, while preserving the requested `columns` and cells. Revision inputs are
+selected in that same statement and removed before transport, including inputs
+that are hidden from the public projection. API query responses carry the same
+array; object rows additionally contain `row_revision`. Resource reads contain
+`row_revision` automatically. Grouped, aggregate, window, set-operation, retargeted and
+alternate-source results have no individual root row revision. Existing
+Explorer feature `revision` and `aggregate_version` retain their separate names.
+
+Pass the token on any supported write surface:
+
+```perl
+$engine->write->update->assignments(name => 'Revised panel')
+    ->filter(['id', 42])->row_revision($token)->execute;
+
+my $command = Selecto::Write::Command->new(
+    operation => 'delete', relation => 'panels',
+    predicate => Selecto::Expression->eq('id', 42),
+)->row_revision($token);
+$engine->execute_write($command);
+
+my $compiled = Selecto::Write::Operation->new($contract)
+    ->update({name => 'Revised panel'})->filter(['id', 42])
+    ->row_revision($token)->compile(context => $engine->write_context);
+```
+
+API write bodies accept `row_revision` alongside `operation`, `assignments` and
+`filters`. Tokens apply to update/delete and require a concrete primary-key
+identity. They cannot turn a broad write into a row write. A command cannot
+supply its own revision declaration or disable the domain's required flag.
+
+A changed row gives `stale_revision` with `details.reason = changed`. An absent
+or out-of-scope target gives `stale_revision` with `details.reason = missing`.
+No stored values are returned in either error. Omitted tokens retain existing
+write behavior unless `required` is true, when `row_revision_required` refuses
+the mutation. Invalid tokens or undeclared/unsupported token use give
+`invalid_row_revision`; a broad target gives `row_revision_requires_identity`.
+
+Column tokens are compared in the UPDATE/DELETE WHERE clause. Only zero-row
+failures perform a follow-up scoped read to distinguish missing from changed;
+that read does not authorize a mutation. Computed tokens use a protected read
+inside the write transaction: PostgreSQL/MySQL/MariaDB use `FOR UPDATE`; SQLite
+uses an immediate transaction (and reserves the writer before reading even in
+a host-opened deferred transaction). These write features are not supported on
+DuckDB; it does not run a computed-revision check or map writer conflicts to
+`stale_revision`.
+
+## Fields bound by the host
+
+```perl
+writes => {
+    host_bound_fields => {
+        owner_id => {mode => 'owner', source => ['context', 'user_id']},
+        created_by => {mode => 'created_by', source => ['context', 'actor_id']},
+        modified_by => {mode => 'modified_by', source => ['context', 'actor_id']},
+    },
+    # ... explicit operations and field grants ...
+}
+```
+
+The host supplies `write_context => {user_id => 11, actor_id => 101}` when it
+constructs the engine. Request assignments cannot supply these fields, even
+when they restate the correct value: `host_bound_field` names the field.
+Missing/null/nonscalar trusted values give `missing_host_context`.
+
+`owner` fills inserts and pins update/delete to the trusted owner. Multiple
+owner fields are allowed. This calls the same assignment/predicate code as
+`writes.scope.tenant`, with independent trusted context values. `created_by`
+fills inserts and is unchanged on updates. `modified_by` fills inserts and
+updates; delete requires actor context but removes the row without a separate
+audit UPDATE. Host fills do not require caller write grants on these fields.
+Rules/validators still apply, and operation/capability grants remain required.
+Bindings govern writes; hosts configure owner/company read scopes separately.
+
+Portable/native generated values retain private in-process provenance through
+unchanged command copies. Serialized metadata cannot forge that provenance;
+reconstructed commands should omit host-bound assignments and let the current
+engine fill them. Changing a generated field or replaying it under different
+trusted context is refused. Graph bindings cannot assign a host-bound field.
+Host-bound upserts are refused as `host_bound_upsert_unsupported`: creator and
+modifier behavior on both branches needs an explicit future contract.
+
+## A child stays in its parent's scope
+
+Use the existing foreign-key context source and tenant guard:
+
+```perl
+constraints => {foreign_keys => {
+    parent_id => {
+        source => ['context', 'writable_parent'], required => JSON::PP::true,
+        references => {relation => 'panel_folders', field => 'id', tenant_field => 'company_id'},
+    },
+}},
+```
+
+Trusted context names the authorized destination parent. A different submitted
+parent gives `foreign_key_source_mismatch`. The existing SQL EXISTS guard also
+checks the referenced parent's `company_id` against the engine tenant. A
+nonexistent/out-of-tenant parent refuses with `cardinality_mismatch`. The host
+must authorize `writable_parent` before putting it in context. No foreign-key
+guard extension or second lookup/write path is needed.
+
+## Unique conflicts
+
+```perl
+writes => {
+    unique_keys => {owner_name => [qw(owner_id name)]},
+    # ...
+}
+```
+
+The database must enforce the key; this metadata does not create an index or
+perform a race-prone uniqueness precheck. Every backend reports
+`database_unique_violation`, with `details.constraint = unique` and the key's
+`fields` when identified. A matching declaration adds `details.key`. Backend
+fields or constraint names resolve the declaration; an ambiguous/unknown key
+is not guessed. No conflicting values, SQL or driver messages are exposed.
+
+The integration fixtures are invented domains. Interleaving tests use two
+independent connections, insert writer B precisely after A's computed locked
+read (or before A's column-checked DML), and verify that only one committed
+value survives. A blocked B retries after A commits and receives stale_revision.
+Revision/host-field/interleaving tests run on SQLite and PostgreSQL, with
+MySQL/MariaDB gated on configured URLs. SQLite uses in-memory connections.
+Separate in-memory DuckDB tests cover reads, the write refusal and ordinary
+unique conflicts; they need no FFI or second connection.

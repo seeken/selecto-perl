@@ -14,6 +14,44 @@ use Selecto::SQL::RollupEmulation ();
 use Hash::Util::FieldHash ();
 Hash::Util::FieldHash::fieldhash(my %STREAM_QUERY_ONLY);
 
+sub normalize_error {
+    my ($self, $error) = @_;
+    return $error if blessed($error) && $error->isa('Selecto::Error');
+    my $text = "$error";
+    if ($text =~ /UNIQUE constraint failed: ([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:, [A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)*)/) {
+        my @fields = map { s/.*\.//r } split /, /, $1;
+        return $self->_unique_violation(\@fields);
+    }
+    return $self->SUPER::normalize_error($error);
+}
+
+sub _begin_transaction {
+    my ($self) = @_;
+    return $self->SUPER::_begin_transaction unless $self->{_selecto_row_revision_transaction};
+    local $self->dbh->{sqlite_use_immediate_transaction} = 1;
+    return $self->SUPER::_begin_transaction;
+}
+sub _row_revision_value_sql {
+    my ($self, $sql) = @_;
+    # SQLite's ordinary REAL -> TEXT cast rounds to 15 digits. The alternate
+    # printf form retains enough digits to distinguish stored doubles.
+    return "CASE WHEN typeof($sql) = 'real' THEN printf('%!.26g', $sql) ELSE CAST($sql AS TEXT) END";
+}
+sub _reserve_row_revision {
+    my ($self, $command) = @_;
+    # A host may have opened a deferred transaction. Acquire its write
+    # reservation before the revision read, without touching any row.
+    my $table = $self->quote_identifier($command->relation);
+    my $primary = $command->metadata->{__selecto_primary_key};
+    my $column = $self->quote_identifier(ref($primary) eq 'ARRAY' ? $primary->[0] : $primary);
+    my $ok = eval {
+        defined($self->dbh->do("UPDATE $table SET $column = $column WHERE 0"))
+            or die Selecto::SQL::_dbi_error($self->dbh, 'revision reservation failed');
+        1;
+    };
+    die $self->normalize_error($@) unless $ok;
+}
+
 
 sub ownership_storage {
     my ($self, @edge) = @_;

@@ -130,7 +130,9 @@ sub prepare_scalar_column {
 
 sub all {
     my ($class, $engine, $query, %args) = @_;
-    return $class->execute($engine, $class->prepare($engine, $query, %args), %args);
+    require Selecto::RowRevision;
+    my ($read, $plan) = Selecto::RowRevision->prepare_read($engine, $query);
+    return Selecto::RowRevision->finish_read($class->execute($engine, $class->prepare($engine, $read, %args), %args), $plan);
 }
 
 sub execute {

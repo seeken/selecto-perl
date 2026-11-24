@@ -765,8 +765,26 @@ sub _refusal_error {
 sub normalize_error {
     my ($self, $error) = @_;
     return $error if blessed($error) && $error->isa('Selecto::Error');
+    my $text = "$error";
+    if ($text =~ /(?:Duplicate key|PRIMARY KEY or UNIQUE constraint violation)/i) {
+        my @fields;
+        if ($text =~ /Duplicate key "(.*)" violates (?:unique|primary key) constraint/is) {
+            my $key = $1;
+            @fields = $key =~ /(?:\A|, )([A-Za-z_][A-Za-z0-9_]*): /g;
+        }
+        return $self->_unique_violation(\@fields);
+    }
     my $refusal = $self->_refusal_error(eval { "$error" }, eval { $self->{dbh}->errstr });
     return $refusal // $self->SUPER::normalize_error($error);
+}
+
+sub _validate_write_domain {
+    my ($self, $writes) = @_;
+    my @unsupported = grep { exists $writes->{$_} } qw(row_revision host_bound_fields);
+    Selecto::Error->throw('write_capability_missing',
+        'DuckDB does not support writes on domains declaring row revisions or host-bound fields',
+        {adapter => 'duckdb', missing => \@unsupported}) if @unsupported;
+    return;
 }
 
 sub _compile_single {

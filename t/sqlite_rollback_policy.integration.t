@@ -134,7 +134,8 @@ subtest 'ABORT companion errors preserve full original caller state and savepoin
                 my $e = writer($db);
                 for my $op (qw(insert upsert update)) {
                     my $before = $snapshot->(); my $seen = $observe->(sub { $e->execute_write(command($op, $op eq 'insert' ? 3 : 1, $constraint eq 'unique' ? 'taken' : undef)) });
-                    is($seen->{code}, 'query_error', "$constraint $op remains an actual native ABORT constraint error");
+                    is($seen->{code}, $constraint eq 'unique' ? 'database_unique_violation' : 'query_error',
+                        "$constraint $op remains an actual native ABORT constraint error");
                     ok(@{$seen->{prepare}}, 'ordinary ABORT statement actually reaches native DML preparation');
                     ok(@{$seen->{errors}}, 'original host handler observes the actual constraint error');
                     is(scalar @{$seen->{hooks}}, 0, 'failed ABORT statement mutates no business row');

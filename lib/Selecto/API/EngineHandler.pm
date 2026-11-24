@@ -134,7 +134,7 @@ sub write_command ($self, $engine, $body) {
     $self->_admit_body($body, 'invalid_api_write');
     _write_reject_unknown($body, [qw(
         operation assignments filters expected_count returning
-        conflict_target upsert_update_fields
+        conflict_target upsert_update_fields row_revision
     )], 'write body');
 
     my $operation = lc _write_required_string($body->{operation}, 'write operation');
@@ -145,6 +145,11 @@ sub write_command ($self, $engine, $body) {
 
     my $domain = $engine->domain;
     my $writes = $domain->writes;
+    require Selecto::Write::HostFields;
+    for my $field (keys %{$writes->{host_bound_fields} // {}}) {
+        Selecto::Error->throw('host_bound_field', 'a host-bound field cannot be assigned by a command', {field => $field})
+            if ref($body->{assignments}) eq 'HASH' && exists $body->{assignments}{$field};
+    }
     my $operation_spec = ref($writes->{operations}) eq 'HASH'
         ? $writes->{operations}{$operation} : undef;
     Selecto::Error->throw(
@@ -158,7 +163,7 @@ sub write_command ($self, $engine, $body) {
         my $field_specs = ref($writes->{fields}) eq 'HASH' ? $writes->{fields} : {};
         my @missing = sort grep {
             my $spec = $field_specs->{$_};
-            ref($spec) eq 'HASH' && $spec->{required}
+            !exists($writes->{host_bound_fields}{$_}) && ref($spec) eq 'HASH' && $spec->{required}
                 && _required_write_value_missing($assignments, $_)
         } keys %$field_specs;
         Selecto::Error->throw(
@@ -228,6 +233,7 @@ sub write_command ($self, $engine, $body) {
     ) unless _api_count_granted($operation_spec, $expected_count);
 
     my %metadata;
+    $metadata{row_revision} = $body->{row_revision} if exists $body->{row_revision};
     for my $key (qw(returning conflict_target upsert_update_fields)) {
         next unless exists $body->{$key};
         my @fields = _write_string_array(
@@ -743,14 +749,19 @@ sub _query ($self, $engine, $body, %options) {
     splice @{$result->{rows}}, 0, $offset if $summary;
     my $has_more = defined($parent_has_more) ? $parent_has_more : @{$result->{rows}} > $limit;
     splice @{$result->{rows}}, $limit if $has_more && !defined($parent_has_more);
+    splice @{$result->{row_revisions}}, scalar(@{$result->{rows}}) if exists $result->{row_revisions};
     _json_boolean_columns($domain, $query, $result) unless $options{export_scalars};
     _shape_result_rows($result, \@subtables, $row_format, $self->limits);
+    if ($row_format eq 'objects' && exists $result->{row_revisions}) {
+        $result->{rows}[$_]{row_revision} = $result->{row_revisions}[$_] for 0 .. $#{$result->{rows}};
+    }
     my %subtable_metadata = map {
         $_->{column} => {columns => [@{$_->{columns}}], limit => $_->{limit}, complete => JSON::PP::true}
     } @subtables;
     my $response = {
         columns => $result->{columns},
         rows => $result->{rows},
+        (exists($result->{row_revisions}) ? (row_revisions => $result->{row_revisions}) : ()),
         returned => scalar(@{$result->{rows}}),
         row_format => $row_format,
         subtables => \%subtable_metadata,
@@ -1109,6 +1120,8 @@ sub describe_openapi ($self, $api) {
             returning => {type => 'array', items => {type => 'string'}},
             conflict_target => {type => 'array', minItems => 1, items => {type => 'string'}},
             upsert_update_fields => {type => 'array', minItems => 1, items => {type => 'string'}},
+            row_revision => {type => ['string', 'number', 'null'],
+                description => 'The row revision returned by a row/resource read. Applies to update and delete.'},
         },
     };
     $openapi->{components}{schemas}{SelectoWriteFilter} = {
