@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 0.5.0  Unreleased - breaking native builder contract 1.0.0
+    - Extend canonical explorer-query aggregates with optional as_of, published
+      retarget paths, summary pivots with chosen/top-N columns and independent
+      totals, and native subtotal placement and deterministic paging. Publish
+      capability flags, target catalogues, revised features and OpenAPI shapes;
+      preserve legacy query behavior when the new members are omitted.
     - Add created_at and modified_at modes to writes.host_bound_fields, using
       database CURRENT_TIMESTAMP expressions on insert and insert/update,
       respectively. Preserve caller assignment and upsert refusals, cover bulk

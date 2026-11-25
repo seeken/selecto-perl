@@ -53,6 +53,9 @@ has max_filter_depth     => 4;
 # explorer_timezone the zone in which instants are formatted, grouped and
 # shortcut.
 has explorer_extensions  => 0;
+# Trusted canonical Explorer intent, never accepted in a wire query body.
+has explorer_retarget => undef;
+has explorer_cell => undef;
 has 'today';
 has 'explorer_timezone';
 
@@ -719,6 +722,26 @@ sub _query ($self, $engine, $body, %options) {
                 or @{$query->orders};
     }
 
+    if (my $cell = $self->explorer_cell) {
+        my $axis = $self->_explorer_groups($domain, [$cell->{group}])->{expressions}[0];
+        my @values = @{$cell->{values}};
+        my @tests = map { defined($_) ? Selecto::Expression->eq($axis, $_)
+            : Selecto::Expression->is_null($axis) } @values;
+        my $match = @tests ? Selecto::Expression->any(\@tests) : Selecto::Expression->eq(Selecto::Expression->literal(0), 1);
+        if ($cell->{other}) {
+            # SQL NOT(NULL) is NULL: make the complement explicitly NULL-safe.
+            my @nonnull = grep { defined } @values;
+            my $nonnull = @nonnull ? Selecto::Expression->all([map { Selecto::Expression->ne($axis, $_) } @nonnull])
+                : Selecto::Expression->not_null($axis);
+            $match = (grep { !defined } @values) ? $nonnull
+                : Selecto::Expression->any([Selecto::Expression->is_null($axis), $nonnull]);
+        }
+        $query = $query->where($match);
+    }
+    if (defined(my $path = $self->explorer_retarget)) {
+        require Selecto::Retarget;
+        $query = Selecto::Retarget->reroot_query($domain, $query, $path);
+    }
     $query = $self->_with_grouping_sets($engine, $query, $body);
 
     my $limit = exists($body->{limit})
@@ -1928,8 +1951,17 @@ sub _api_aggregate_entry ($domain, $entry, $label, $hidden, $options = {}) {
         return undef;
     }
     # A to-many path would multiply the root rows each aggregate summarises.
+    my $grain_definition = $definition;
+    if ($options->{handler} && defined(my $path = $options->{handler}->explorer_retarget)) {
+        require Selecto::Retarget;
+        Selecto::Error->throw('invalid_api_query', 'aggregate field is outside the target')
+            unless index($field, "$path.") == 0;
+        my $target = Selecto::Retarget->target($domain, $path);
+        $grain_definition = Selecto::Retarget->relation_domain($domain, $target)
+            ->resolve(substr($field, length($path) + 1));
+    }
     Selecto::Error->throw('invalid_api_query', 'aggregate fields cannot cross a to-many association',
-        {field => $field}) if grep { $_->cardinality eq 'many' } @{$definition->{associations} // []};
+        {field => $field}) if grep { $_->cardinality eq 'many' } @{$grain_definition->{associations} // []};
     Selecto::Error->throw('invalid_api_query', "$function requires a numeric field",
         {field => $field, aggregate => $function})
         if ($function eq 'sum' || $function eq 'avg')
@@ -2239,6 +2271,14 @@ without the C<rollup>, C<cube> or C<grouping_sets> capability refuses with
 C<unsupported_feature>. The result gains a last column, C<grouping>: a bit
 mask, first group highest, with 1 for each group the row leaves out, so a
 detail row is 0. A selection may not itself be named C<grouping>.
+
+=item explorer_retarget, explorer_cell
+
+Trusted canonical Explorer configuration, never accepted from query bodies.
+C<explorer_retarget> reroots admitted output intent after root filters/segments
+are applied. C<explorer_cell> restricts a governed group expression to chosen
+values or its NULL-safe complement for a pivot cell. The canonical host admits
+published targets and field roles before constructing either configuration.
 
 =item explorer_extensions
 

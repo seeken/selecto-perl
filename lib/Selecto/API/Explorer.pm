@@ -21,6 +21,8 @@ use Selecto::Error ();
 use Selecto::Identifier ();
 use Selecto::Limits ();
 use Selecto::QueryLibrary ();
+use Selecto::AsOf ();
+use Selecto::Retarget ();
 
 # remote_query.explorer.v1 and selecto.explorer-features v1: an HTTP-neutral
 # host for explorer queries. Every query runs through
@@ -46,7 +48,7 @@ my %DEFAULT_LIMITS = (max_limit => 100, max_offset => 10_000, max_select => 20, 
     max_aggregates => 10, max_groups => 1000, max_result_cells => 10_000, max_buckets => 20,
     max_export_rows => 10_000, max_count_rows => 100_000);
 my @SUPPORT_FLAGS = qw(detail aggregate graph rollup cube grouping_sets grid nested recursive_filters group_formats
-    buckets boolean_aggregates count_exact text_ops date_shortcuts);
+    buckets boolean_aggregates count_exact text_ops date_shortcuts as_of retarget pivot subtotal_position);
 my @EXPORT_FORMATS = qw(csv tsv json xlsx);
 my %AGGREGATES = map { ($_ => 1) } qw(count count_distinct sum avg min max true_count false_count
     true_percentage bucket_count);
@@ -157,6 +159,8 @@ sub request ($self, $engine, $request) {
             $self->manifest_response($engine);
         } elsif ($method eq 'GET' && $path eq "$base/explorer-features") {
             _json_response(200, $self->features($engine));
+        } elsif ($method eq 'GET' && $path eq "$base/openapi.json") {
+            $self->_openapi_response($engine, $request);
         } elsif ($method eq 'POST' && $path eq "$base/explorer-query") {
             $self->_query_response($engine, $request);
         } else {
@@ -165,6 +169,73 @@ sub request ($self, $engine, $request) {
     };
     return $response if $response;
     return $self->_error_response($@, $request);
+}
+
+# Extend the canonical OpenAPI document in this host only. Scalar /query and
+# its schemas remain those of RemoteQuery; Explorer has a separate envelope.
+sub _openapi_response ($self, $engine, $request) {
+    my $response = _normalize_response($self->{remote}->request($engine, $request));
+    return $response unless $response->{status} == 200;
+    my $document = $JSON->decode($response->{body});
+    my $supports = $self->_supports($engine);
+    my $string = {type => 'string'};
+    my $scalar = {type => ['string', 'number', 'boolean', 'null']};
+    my $list = sub ($items) { +{type => 'array', items => $items} };
+    my $object = sub ($properties, $required = []) {
+        +{type => 'object', additionalProperties => JSON::PP::false, properties => $properties,
+            (@$required ? (required => $required) : ())};
+    };
+    my $pivot = $object->({column => $string, values => $list->($scalar),
+        top => $object->({limit => {type => 'integer', minimum => 1, maximum => $self->limits->{max_buckets}},
+            measure => $string, order => {enum => [qw(rank natural)]}}, [qw(limit measure)]),
+        other => {type => 'boolean', default => JSON::PP::false},
+        totals => {type => 'boolean', default => JSON::PP::true}, value_order => $list->($scalar)}, ['column']);
+    $pivot->{description} = 'column names a selected group; at least two groups and one measure. values and top are mutually exclusive. Other requires values or top. Rows group by the remaining axes. See docs/explorer-query.md.';
+    my %properties = (
+        select => $list->({oneOf => [$string, {type => 'object'}, {type => 'array'}]}),
+        filters => $list->({type => 'object'}), group_by => $list->({oneOf => [$string, {type => 'object'}]}),
+        order_by => $list->($object->({field => $string, direction => {enum => [qw(asc desc)]}}, ['field'])),
+        segments => $list->($string), parameters => {type => 'object'}, timezone => $string,
+        row_format => {enum => [qw(arrays objects)]}, count => {enum => [qw(none exact)]},
+        limit => {type => 'integer', minimum => 0, maximum => $self->limits->{max_limit}},
+        offset => {type => 'integer', minimum => 0, maximum => $self->limits->{max_offset}},
+        (map { ($_ => {type => 'boolean'}) } qw(rollup cube complete)),
+        grouping_sets => $list->($list->({type => 'integer', minimum => 0})), export => {type => ['object', 'null']},
+        as_of => {type => 'string', description => 'Validated ISO date or timestamp, as in query.as_of on Detail. Overrides the trusted read clock; echoed at meta.as_of.'},
+        retarget => {type => 'string', enum => [map { $_->{path} } @{$self->_retargets($engine->domain, $supports)}],
+            description => 'Published retarget path. Output field ids stay root-relative under this path; filters and segments remain root context. Aggregate reads only.'},
+        pivot => $pivot,
+        subtotal_position => {enum => [qw(before after)], default => 'after',
+            description => 'Requires rollup, cube or grouping_sets. before places each subtotal ahead of its children. before uses native NULL and declared value ordering; omission and after preserve legacy order. Explicit placement also permits order_by, applied before natural group order.'},
+    );
+    $properties{retarget} = JSON::PP::false unless @{$properties{retarget}{enum}};
+    $pivot->{properties}{values}{minItems} = 1;
+    $pivot->{properties}{values}{maxItems} = $self->limits->{max_buckets};
+    $pivot->{properties}{values}{uniqueItems} = JSON::PP::true;
+    $pivot->{properties}{value_order}{minItems} = 1;
+    $pivot->{properties}{value_order}{maxItems} = 500;
+    $pivot->{not} = {required => [qw(values top)]};
+    $properties{$_} = JSON::PP::false for grep { !$supports->{$_} } qw(as_of retarget pivot subtotal_position);
+    my $envelope = $object->({format => {const => 'selecto.explorer-query'}, format_version => {const => 1},
+        domain => $object->({fingerprint => $string}, ['fingerprint']),
+        features => $object->({revision => $string}), request_id => $string,
+        query => $object->(\%properties, ['select'])}, [qw(format format_version domain query)]);
+    my $base = $self->base_path;
+    $document->{paths}{"$base/explorer-features"}{get} = {operationId => 'getExplorerFeatures',
+        responses => {200 => {description => 'Published fields, retarget catalogues, supports and revision'}}};
+    $document->{paths}{"$base/explorer-query"}{post} = {operationId => 'queryExplorer',
+        requestBody => {required => JSON::PP::true, content => {'application/json' => {schema => $envelope}}},
+        responses => {200 => {description => 'Typed Explorer rows, stable subtotal pages and optional pivot columns',
+            content => {'application/json' => {schema => {type => 'object', properties => {
+                meta => {type => 'object', properties => {request_id => $string, as_of => $string}},
+                data => {type => 'object', properties => {columns => $list->({type => 'object', properties => {
+                    id => $string, type => $string, role => $string, encoding => $string,
+                    pivot => {type => 'object', properties => {column => $string, value => $scalar,
+                        measure => $string, other => {type => 'boolean'}, total => {type => 'boolean'}}}}}),
+                    rows => $list->({oneOf => [{type => 'array'}, {type => 'object'}]})}}}}}}},
+            (map { ($_ => {description => 'Explorer profile refusal'}) } qw(400 403 409 415 422 501 504))}};
+    $document->{'x-selecto-explorer-supports'} = $self->features($engine)->{supports};
+    return {%$response, body => $JSON->encode($document)};
 }
 
 sub manifest_response ($self, $engine) {
@@ -214,6 +285,7 @@ sub features ($self, $engine) {
         supports => {%$supports, map { ($_ => _bool($supports->{$_})) } @SUPPORT_FLAGS},
         services => $self->services, links => $self->links,
     };
+    $document->{retargets} = $supports->{retarget} ? $self->_retargets($domain, $supports) : [];
     $document->{revision} = 'sha256:' . sha256_hex($JSON->encode($document));
     return $document;
 }
@@ -235,7 +307,7 @@ sub _supports ($self, $engine) {
 
 # The public fields a query may name: root fields, fields of to-one
 # associations one hop away, then fields of direct to-many associations.
-sub _catalogue ($self, $domain, $supports) {
+sub _catalogue ($self, $domain, $supports, $path = undef) {
     my (@root, @one, @many, %by_path, @collections);
     my $fields = $domain->fields;
     my $associations = $domain->associations;
@@ -245,6 +317,17 @@ sub _catalogue ($self, $domain, $supports) {
         my $kind = $association->cardinality eq 'many' ? 'many' : 'one';
         my $related = $association->fields;
         push @candidates, map { ["$name.$_", $kind, $name, $related->{$_}] } sort keys %$related;
+    }
+    if (defined $path) {
+        my $target = Selecto::Retarget->target($domain, $path);
+        my $relation = Selecto::Retarget->relation_domain($domain, $target);
+        push @candidates, map { ["$path.$_", 'root', undef, $relation->fields->{$_}] } sort keys %{$relation->fields};
+        for my $name (sort keys %{$relation->associations}) {
+            my $association = $relation->associations->{$name};
+            next if $association->cardinality eq 'many';
+            push @candidates, map { ["$path.$name.$_", 'one', "$path.$name", $association->fields->{$_}] }
+                sort keys %{$association->fields};
+        }
     }
     for my $candidate (@candidates) {
         my ($path, $kind, $association, $declared) = @$candidate;
@@ -270,6 +353,7 @@ sub _catalogue ($self, $domain, $supports) {
             nullable => $kind eq 'one' ? 1 : exists($metadata->{nullable}) ? ($metadata->{nullable} ? 1 : 0) : 1,
             %role,
         };
+        $entry->{value_order} = $metadata->{value_order} if ref($metadata->{value_order}) eq 'ARRAY';
         $entry->{operators} = !$role{filterable} ? [] : [@COMPARISONS,
             ($type eq 'string' && $supports->{text_ops} ? @TEXT_OPS : ()),
             ($TEMPORAL{$type} && $supports->{date_shortcuts} ? ('date_shortcut') : ())];
@@ -296,7 +380,22 @@ sub _catalogue ($self, $domain, $supports) {
         push @collections, {id => $entry->{association}, path => $entry->{association},
             label => $entry->{association}, limit => 0 + $self->collection_limit};
     }
-    return {list => [@root, @one, @many], by_path => \%by_path, collections => \@collections};
+    return {list => [grep { $by_path{$_->{path}} == $_ } @root, @one, @many],
+        by_path => \%by_path, collections => \@collections};
+}
+
+# Only explicitly published targets are remote capabilities, matching the
+# native Rows of chooser. Target catalogues retain root-relative field ids.
+sub _retargets ($self, $domain, $supports) {
+    my $config = $domain->retarget_config // {};
+    my $targets = $config->{targets} // {};
+    return [map {
+        my $path = $_;
+        my $catalogue = $self->_catalogue($domain, $supports, $path);
+        {path => $path, label => $targets->{$path}{label} // $path,
+            fields => [map { _public_field($_) } grep { index($_->{path}, "$path.") == 0 }
+                @{$catalogue->{list}}]};
+    } sort keys %$targets];
 }
 
 sub _public_field ($entry) {
@@ -307,6 +406,7 @@ sub _public_field ($entry) {
         (map { ($_ => _bool($entry->{$_})) } qw(selectable sortable filterable groupable)),
         (map { ($_ => [@{$entry->{$_}}]) } qw(operators aggregates group_formats buckets date_shortcuts)),
         collection => $entry->{collection},
+        ($entry->{value_order} ? (value_order => $entry->{value_order}) : ()),
     };
 }
 
@@ -348,6 +448,13 @@ sub _query_response ($self, $engine, $request) {
     # 6. Member supports, 7. the field pre-pass, 8. instant conversions on a
     # UTC-only host (they need the field types), then shape and limits.
     $self->_check_supports($context, $query);
+    if (exists $query->{retarget}) {
+        my $path = $query->{retarget};
+        _invalid() unless _string($path);
+        _reject('operation_forbidden') unless grep { $_->{path} eq $path } @{$features->{retargets}};
+        $context->{retarget} = $path;
+        $context->{catalogue} = $self->_catalogue($engine->domain, $context->{supports}, $path);
+    }
     $self->_field_prepass($context, $query);
     $self->_check_conversions($context, $query);
     my $plan = $self->_plan($context, $query);
@@ -359,7 +466,8 @@ sub _query_response ($self, $engine, $request) {
     }
     return $self->_guarded_export($context, $plan, $format, $request) if $plan->{export} && $self->export_guard;
     my $result = $self->_execute($context, $plan);
-    my $meta = exists($body->{request_id}) ? {request_id => $body->{request_id}} : undef;
+    my $meta = exists($body->{request_id}) ? {request_id => $body->{request_id}} : {};
+    $meta->{as_of} = $plan->{as_of} if exists $plan->{as_of};
     return $self->_export_response($plan, $result, $format) if $plan->{export};
     my $data = {
         format => 'selecto.explorer-query-result', format_version => 1,
@@ -373,7 +481,7 @@ sub _query_response ($self, $engine, $request) {
         ($result->{row_meta} ? (row_meta => $result->{row_meta}) : ()),
         ($plan->{complete} ? (complete => JSON::PP::true) : ()),
     };
-    return _json_response(200, {ok => JSON::PP::true, data => $data, ($meta ? (meta => $meta) : ())});
+    return _json_response(200, {ok => JSON::PP::true, data => $data, (keys(%$meta) ? (meta => $meta) : ())});
 }
 
 # ---- supports (501) ----
@@ -381,6 +489,7 @@ sub _query_response ($self, $engine, $request) {
 sub _check_supports ($self, $context, $query) {
     my $supports = $context->{supports};
     my $unsupported = sub ($flag) { _reject('operation_unsupported') unless $supports->{$flag} };
+    $unsupported->($_) for grep { exists $query->{$_} } qw(as_of retarget pivot subtotal_position);
     $unsupported->('count_exact') if _string($query->{count}) && $query->{count} eq 'exact';
     $unsupported->('rollup') if JSON::PP::is_bool($query->{rollup}) && $query->{rollup};
     $unsupported->('cube') if JSON::PP::is_bool($query->{cube}) && $query->{cube};
@@ -434,6 +543,13 @@ sub _field_prepass ($self, $context, $query) {
         my $exists = eval { $domain->resolve($path); 1 };
         _reject($exists && !$domain->field_is_public($path) ? 'hidden_field' : 'invalid_field');
     };
+    if (ref($query->{pivot}) eq 'HASH') {
+        # column names a group id; that group's own reference is visited below.
+        my $column = $query->{pivot}{column};
+        my $groups = ref($query->{group_by}) eq 'ARRAY' ? $query->{group_by} : [];
+        $visit->($column) unless grep { ref($_) eq 'HASH' && _string($_->{alias})
+            && _string($column) && $_->{alias} eq $column } @$groups;
+    }
     my %aliases;
     my $select = ref($query->{select}) eq 'ARRAY' ? $query->{select} : [];
     for my $entry (@$select) {
@@ -512,13 +628,20 @@ sub _plan ($self, $context, $query) {
     my $limits = $context->{limits};
     my $catalogue = $context->{catalogue}{by_path};
     my %members = map { ($_ => 1) } qw(select filters group_by order_by segments parameters limit offset
-        timezone row_format rollup cube grouping_sets complete count export);
+        timezone row_format rollup cube grouping_sets complete count export as_of retarget pivot subtotal_position);
     _invalid() if grep { !$members{$_} } keys %$query;
     my $zone = exists($query->{timezone}) ? $query->{timezone} : 'UTC';
     _invalid() unless _string($zone) && DateTime::TimeZone->is_valid_name($zone);
     my $today = DateTime->from_epoch(epoch => _instant_epoch($self->clock), time_zone => $zone)->ymd('-');
+    if (exists $query->{as_of}) {
+        my $valid = eval { Selecto::AsOf->validate($query->{as_of}); 1 };
+        _invalid() unless $valid;
+        $today = Selecto::AsOf->date($query->{as_of}, $zone);
+    }
     my $plan = {zone => $zone, today => $today, columns => [], selections => [], groups => [],
-        utc_host => $context->{supports}{timezones} eq 'utc'};
+        utc_host => $context->{supports}{timezones} eq 'utc',
+        (exists($query->{as_of}) ? (as_of => $query->{as_of}) : ()),
+        (exists($query->{retarget}) ? (retarget => $query->{retarget}) : ())};
     my $boolean = sub ($name, $default) {
         return $default unless exists $query->{$name};
         _invalid() unless JSON::PP::is_bool($query->{$name});
@@ -706,7 +829,7 @@ sub _plan ($self, $context, $query) {
     # Result-shape rules.
     # The grouping sets of the result, each a list of positions in group_by.
     # A rollup is every prefix, a cube every subset, and grouping_sets names
-    # them. They exclude each other and a caller's ordering.
+    # them. Caller ordering requires explicit subtotal placement.
     if (exists $query->{grouping_sets}) {
         my $sets = $query->{grouping_sets};
         my $count = $plan->{mode} eq 'grouped' ? scalar @{$plan->{groups}} : 0;
@@ -737,7 +860,7 @@ sub _plan ($self, $context, $query) {
                 sort { (sprintf('%b', $b) =~ tr/1//) <=> (sprintf('%b', $a) =~ tr/1//) || $b <=> $a }
                     0 .. 2**($last + 1) - 1];
     }
-    _invalid() if $plan->{grouping} && @$orders;
+    _invalid() if $plan->{grouping} && @$orders && !exists $query->{subtotal_position};
     # A complete grid may carry cube totals; subtotal paths of a rollup or of
     # named sets do not form a grid.
     _invalid() if $plan->{complete} && ($plan->{mode} ne 'grouped' || $plan->{offset}
@@ -755,7 +878,207 @@ sub _plan ($self, $context, $query) {
         }
         $plan->{export} = {shape => $shape};
     }
+    if (defined(my $path = $plan->{retarget})) {
+        _invalid() unless $plan->{mode} ne 'detail';
+        _invalid() if grep { $_->{role} ne 'aggregate' && index($_->{field} // '', "$path.") != 0
+            || defined($_->{field}) && index($_->{field}, "$path.") != 0 } @{$plan->{columns}};
+    }
+    if (exists $query->{subtotal_position}) {
+        _invalid() unless $plan->{grouping} && _string($query->{subtotal_position})
+            && $query->{subtotal_position} =~ /\A(?:before|after)\z/;
+        $plan->{subtotal_position} = $query->{subtotal_position};
+        # Native one-axis subtotals put real NULL groups last; multiple axes
+        # use NULL first. Only explicit placement changes the legacy order.
+        $plan->{groups}[0]{native_order} = 1 if @{$plan->{groups}} == 1 && $query->{subtotal_position} eq 'before';
+        for my $group (@{$plan->{groups}}) {
+            my $order = $context->{engine}->domain->field_metadata($group->{path})->{value_order};
+            $group->{value_order} = [map { defined($_) ? _wire($_, $group->{type}) : undef } @$order] if $query->{subtotal_position} eq 'before' && $group->{kind} eq 'plain' && ref($order) eq 'ARRAY' && @$order;
+        }
+    }
+    $self->_pivot_plan($context, $plan, $query->{pivot}) if exists $query->{pivot};
     return $plan;
+}
+
+# Pivot describes one selected grouping axis. Output rows are the ordinary
+# summary of the other axes; cells are independent aggregates, never sums of
+# aggregates (which would corrupt averages, distinct counts and percentages).
+sub _pivot_plan ($self, $context, $plan, $pivot) {
+    _invalid() unless ref($pivot) eq 'HASH' && !grep { !/\A(?:column|values|top|other|totals|value_order)\z/ } keys %$pivot;
+    _invalid() unless $plan->{mode} eq 'grouped' && @{$plan->{groups}} >= 2 && !$plan->{complete};
+    _invalid() if $plan->{export} && $plan->{export}{shape} ne 'rows';
+    _invalid() unless _string($pivot->{column});
+    my ($axis) = grep { $_->{id} eq $pivot->{column} } @{$plan->{groups}};
+    _invalid() unless $axis;
+    _reject('invalid_field') unless $axis->{field}{selectable} && $axis->{field}{groupable};
+    my @measures = grep { $_->{role} eq 'aggregate' } @{$plan->{columns}};
+    _invalid() unless @measures;
+    _invalid() if grep { $_->{group} && $_->{group}{id} eq $axis->{id} } @{$plan->{orders}};
+    _invalid() if exists($pivot->{values}) && exists($pivot->{top});
+    my %checked = (axis => $axis, totals => 1, other => 0);
+    for my $flag (qw(totals other)) {
+        next unless exists $pivot->{$flag};
+        _invalid() unless JSON::PP::is_bool($pivot->{$flag});
+        $checked{$flag} = $pivot->{$flag} ? 1 : 0;
+    }
+    my $values = sub ($list, $max) {
+        _invalid() unless ref($list) eq 'ARRAY' && @$list && @$list <= $max;
+        my %seen;
+        return [map {
+            my $v = defined($_) ? _filter_value({type => $axis->{type}}, $_) : undef;
+            _invalid() if defined($v) && length("$v") > 1000;
+            _invalid() if $seen{_pivot_value_key($axis, $v)}++;
+            $v;
+        } @$list];
+    };
+    $checked{values} = $values->($pivot->{values}, $self->limits->{max_buckets}) if exists $pivot->{values};
+    if (exists $pivot->{top}) {
+        my $top = $pivot->{top};
+        _invalid() unless ref($top) eq 'HASH' && !grep { !/\A(?:limit|measure|order)\z/ } keys %$top;
+        _invalid() unless _integer($top->{limit}) && $top->{limit} >= 1 && $top->{limit} <= $self->limits->{max_buckets};
+        _invalid() unless _string($top->{measure}) && grep { $_->{id} eq $top->{measure} } @measures;
+        my $order = $top->{order} // 'rank';
+        _invalid() unless _string($order) && $order =~ /\A(?:rank|natural)\z/;
+        $checked{top} = {%$top, order => $order};
+    }
+    _invalid() if $checked{other} && !$checked{values} && !$checked{top};
+    my $declared = $context->{engine}->domain->field_metadata($axis->{path})->{value_order};
+    $axis->{value_order} = $values->($pivot->{value_order}, 500) if exists $pivot->{value_order};
+    $axis->{value_order} //= $values->([map { defined($_) ? _wire($_, $axis->{type}) : undef } @$declared], 500) if $axis->{kind} eq 'plain' && ref($declared) eq 'ARRAY' && @$declared;
+    $axis->{native_order} = 1;
+    $axis->{pivot_axis} = 1;
+    $plan->{pivot} = \%checked;
+}
+
+# Copy a plan for a subset of its axes, preserving column identities while
+# assigning compact internal group positions. Explicit sets are projected and
+# deduplicated; rollup/cube sets are rebuilt over the row axes.
+sub _axis_plan ($plan, $kept) {
+    my @groups = map { +{%{$kept->[$_]}, index => $_} } 0 .. $#$kept;
+    $groups[0]{native_order} = 1 if @groups == 1 && ($plan->{subtotal_position} // '') eq 'before';
+    my %groups = map { ($_->{id} => $_) } @groups;
+    my $out = {%$plan, groups => \@groups, row_format => 'arrays', orders => []};
+    delete @$out{qw(pivot sets)};
+    $out->{columns} = [map { $_->{role} eq 'group' ? +{%$_, group => $groups{$_->{id}}} : +{%$_} }
+        grep { $_->{role} ne 'group' || $groups{$_->{id}} } @{$plan->{columns}}];
+    $out->{selections} = [map { $_->{kind} eq 'group' ? +{%$_, group => $groups{$_->{group}{id}}} : $_ }
+        grep { $_->{kind} ne 'group' || $groups{$_->{group}{id}} } @{$plan->{selections}}];
+    $out->{orders} = [map { $_->{group} ? +{%$_, group => $groups{$_->{group}{id}}} : $_ }
+        grep { !$_->{group} || $groups{$_->{group}{id}} } @{$plan->{orders}}];
+    if ($plan->{sets}) {
+        if ($plan->{grouping} eq 'rollup') {
+            $out->{sets} = [map { [0 .. $_ - 1] } reverse 0 .. scalar @groups];
+        } elsif ($plan->{grouping} eq 'cube') {
+            $out->{sets} = [map { my $mask = $_; [grep { $mask & (1 << $_) } 0 .. $#groups] } 0 .. 2**@groups - 1];
+        } else {
+            my %position = map { ($kept->[$_]{index} => $_) } 0 .. $#$kept;
+            my %seen;
+            $out->{sets} = [grep { !$seen{join ',', @$_}++ } map {
+                [map { $position{$_} } grep { exists $position{$_} } @$_]
+            } @{$plan->{sets}}];
+        }
+    }
+    return $out;
+}
+
+sub _pivot_value_key ($axis, $value) {
+    return 'null' unless defined $value;
+    return Math::BigFloat->new("$value")->bstr if $NUMERIC{$axis->{type}};
+    return $JSON->encode($value);
+}
+
+sub _execute_pivot ($self, $handler, $engine, $plan) {
+    my $pivot = $plan->{pivot};
+    my $axis = $pivot->{axis};
+    my $row_plan = _axis_plan($plan, [grep { $_->{id} ne $axis->{id} } @{$plan->{groups}}]);
+    my $axis_plan = _axis_plan($plan, [$axis]);
+    delete @$axis_plan{qw(sets grouping rollup cube export)};
+    @$axis_plan{qw(limit offset count orders)} = ($self->limits->{max_groups}, 0, 'none', []);
+    my $axis_rows = $self->_execute_grouped($handler, $engine, $axis_plan)->{merged};
+    my %observed = map { (_pivot_value_key($axis, $_->{keys}[0]) => 1) } @$axis_rows;
+    my @values;
+    if ($pivot->{values}) {
+        @values = @{$pivot->{values}};
+    } else {
+        if (my $top = $pivot->{top}) {
+            my ($measure) = grep { $_->{id} eq $top->{measure} } @{$plan->{columns}};
+            @$axis_rows = sort {
+                # Top-N ties use natural key order, NULL last.
+                my ($x, $y) = ($a->{aggregates}{$measure->{id}}, $b->{aggregates}{$measure->{id}});
+                (defined($y) <=> defined($x)) || (defined($x) && defined($y)
+                    ? _compare_value($y, $x, $measure->{type}) : 0)
+                    || _compare_key({%$axis, value_order => undef, pivot_axis => 0, kind => 'plain'}, $a->{keys}[0], $b->{keys}[0])
+            } @$axis_rows;
+            splice @$axis_rows, $top->{limit} if @$axis_rows > $top->{limit};
+        }
+        @values = map { $_->{keys}[0] } @$axis_rows;
+        @values = sort { _compare_key($axis, $a, $b) } @values
+            unless $pivot->{top} && $pivot->{top}{order} eq 'rank';
+        # Authored bucket layouts include empty columns.
+        if (!$pivot->{top} && $axis->{kind} eq 'bucket' && $axis->{bucket}{ranges}) {
+            my %seen = map { ($JSON->encode($_) => 1) } @values;
+            push @values, map { $_->{label} } grep { !$seen{$JSON->encode($_->{label})} } @{$axis->{bucket}{ranges}};
+            @values = sort { _compare_key($axis, $a, $b) } @values;
+        }
+    }
+    _reject('result_limit_exceeded') if @values + $pivot->{other} > $self->limits->{max_buckets};
+    my @measures = grep { $_->{role} eq 'aggregate' } @{$row_plan->{columns}};
+    my @columns = grep { $_->{role} eq 'group' } @{$row_plan->{columns}};
+    my %ids = map { ($_->{id} => 1) } @columns;
+    my @cells;
+    for my $i (0 .. @values - 1 + $pivot->{other}) {
+        my $other = $i == @values;
+        my $value = $other ? undef : $values[$i];
+        my $label = $other ? 'Other' : defined($value) ? "$value" : '[NULL]';
+        for my $m (0 .. $#measures) {
+            my $id = "__pivot_${i}_$m";
+            $id .= '_' while $ids{$id}++;
+            push @columns, {%{$measures[$m]}, id => $id, label => "$label · $measures[$m]{label}", nullable => 1,
+                pivot => {column => $axis->{id}, value => $value, other => _bool($other), measure => $measures[$m]{id}}};
+        }
+        push @cells, {group => _group_entry($axis), values => $other ? \@values : [$value], other => $other};
+    }
+    if ($pivot->{totals}) {
+        for my $measure (@measures) {
+            my $id = '__pivot_total_' . $measure->{id};
+            $id .= '_' while $ids{$id}++;
+            push @columns, {%$measure, id => $id, label => "Total · $measure->{label}",
+                pivot => {column => $axis->{id}, total => JSON::PP::true, measure => $measure->{id}}};
+        }
+    }
+    # Bound the rendered shape before fetching per-value cells.
+    my $row_handler = $handler;
+    if (($pivot->{values} || $pivot->{top}) && !$pivot->{other}) {
+        $row_handler = bless {%$handler, explorer_cell => {group => _group_entry($axis), values => \@values}}, ref($handler);
+    }
+    my $page = $self->_execute_grouped($row_handler, $engine, $row_plan);
+    _reject('result_limit_exceeded') if @{$page->{rows}} * @columns > $self->limits->{max_result_cells};
+    my $key = sub ($item) { $JSON->encode([$item->{set}, $item->{keys}]) };
+    my @lookups;
+    my %chosen = map { (_pivot_value_key($axis, $_) => 1) } @values;
+    my $has_other = grep { !$chosen{$_} } keys %observed;
+    for my $cell (@cells) {
+        if ($cell->{other} ? !$has_other : !$observed{_pivot_value_key($axis, $cell->{values}[0])}) {
+            push @lookups, {};
+            next;
+        }
+        my $cell_handler = bless {%$handler, explorer_cell => $cell}, ref($handler);
+        my $cell_plan = {%$row_plan, limit => $self->limits->{max_groups}, offset => 0, count => 'none'};
+        delete $cell_plan->{export};
+        my $result = $self->_execute_grouped($cell_handler, $engine, $cell_plan);
+        push @lookups, {map { ($key->($_) => $_->{aggregates}) } @{$result->{merged}}};
+    }
+    $plan->{columns} = \@columns;
+    $plan->{groups} = $row_plan->{groups};
+    $page->{rows} = [map {
+        my $item = $_;
+        my @values = map { $item->{keys}[$_->{group}{index}] } grep { $_->{role} eq 'group' } @columns;
+        for my $lookup (@lookups) {
+            push @values, map { ($lookup->{$key->($item)} // {})->{$_->{id}} } @measures;
+        }
+        push @values, map { $item->{aggregates}{$_->{id}} } @measures if $pivot->{totals};
+        $self->_shape_row($plan, \@values);
+    } @{$page->{merged}}];
+    return $page;
 }
 
 sub _group_column ($group, $plan) {
@@ -1018,6 +1341,7 @@ sub _handler ($self, $plan) {
     my $engine_limits = $self->engine_limits->tightened(max_collection_rows => 0 + $self->collection_limit);
     return Selecto::API::EngineHandler->new(
         filter_groups => 1, aggregate_selections => 1, explorer_extensions => 1,
+        explorer_retarget => $plan->{retarget},
         today => $plan->{today}, explorer_timezone => $plan->{zone},
         limits => $engine_limits,
         max_filters => $limits->{max_filters}, max_filter_values => $limits->{max_filter_values},
@@ -1030,6 +1354,7 @@ sub _handler ($self, $plan) {
 sub _base_body ($self, $plan, $extra_filters = []) {
     my @filters = (@{$plan->{filters}}, @$extra_filters);
     return (
+        (exists($plan->{as_of}) ? (as_of => $plan->{as_of}, timezone => $plan->{zone}) : ()),
         (@filters ? (filters => \@filters) : ()),
         (@{$plan->{segments}} ? (segments => $plan->{segments}) : ()),
         (keys(%{$plan->{parameters}}) || @{$plan->{segments}} ? (parameters => $plan->{parameters}) : ()),
@@ -1040,6 +1365,7 @@ sub _execute ($self, $context, $plan) {
     my $handler = $self->_handler($plan);
     my $engine = $context->{engine};
     $self->_resolve_instant_steps($handler, $engine, $plan);
+    return $self->_execute_pivot($handler, $engine, $plan) if $plan->{pivot};
     return $self->_execute_grouped($handler, $engine, $plan) if $plan->{mode} eq 'grouped';
     return $self->_execute_summary($handler, $engine, $plan) if $plan->{mode} eq 'summary';
     return $self->_execute_detail($handler, $engine, $plan);
@@ -1219,7 +1545,12 @@ sub _execute_grouped ($self, $handler, $engine, $plan) {
     }
     my $compare = sub ($a, $b) {
         my $c = 0;
-        unless ($plan->{grouping}) {
+        if ($plan->{grouping} && @groups == 1 && exists $plan->{subtotal_position}) {
+            $c = $a->{level} <=> $b->{level};
+            $c = -$c if $plan->{subtotal_position} eq 'after';
+            return $c if $c;
+        }
+        if (!$plan->{grouping} || exists $plan->{subtotal_position}) {
             for my $order (@{$plan->{orders}}) {
                 $c = $order->{group}
                     ? _compare_key($order->{group}, $a->{keys}[$order->{group}{index}], $b->{keys}[$order->{group}{index}])
@@ -1231,7 +1562,7 @@ sub _execute_grouped ($self, $handler, $engine, $plan) {
         for my $group (@groups) {
             my $i = $group->{index};
             my ($ra, $rb) = (exists($a->{present}{$i}) ? 0 : 1, exists($b->{present}{$i}) ? 0 : 1);
-            $c = $ra <=> $rb || ($ra ? 0 : _compare_key($group, $a->{keys}[$i], $b->{keys}[$i]));
+            $c = (($plan->{subtotal_position} // 'after') eq 'before' ? $rb <=> $ra : $ra <=> $rb) || ($ra ? 0 : _compare_key($group, $a->{keys}[$i], $b->{keys}[$i]));
             return $c if $c;
         }
         return 0;
@@ -1286,6 +1617,21 @@ sub _row_meta ($plan, $item) {
 # point, booleans false first; bucket labels by range position (steps by
 # their start), Other last.
 sub _compare_key ($group, $x, $y) {
+    if ($group->{native_order} || $group->{value_order}) {
+        return defined($x) ? -1 : defined($y) ? 1 : 0 unless defined($x) && defined($y);
+        if (my $values = $group->{value_order}) {
+            my $i = 0;
+            my %rank = map { (_pivot_value_key($group, $_) => $i++) } @$values;
+            my $c = ($rank{_pivot_value_key($group, $x)} // $i) <=> ($rank{_pivot_value_key($group, $y)} // $i);
+            return $c if $c;
+            return !length("$x") <=> !length("$y") || fc("$x") cmp fc("$y") || "$x" cmp "$y"
+                if $group->{pivot_axis};
+            return "$x" cmp "$y";
+        }
+    }
+    if ($group->{pivot_axis} && $group->{kind} eq 'plain' && $group->{type} eq 'string') {
+        return !length("$x") <=> !length("$y") || fc("$x") cmp fc("$y") || "$x" cmp "$y";
+    }
     return _compare_value($x, $y, $group->{type}) unless $group->{kind} eq 'bucket';
     return _bucket_rank($group, $x) <=> _bucket_rank($group, $y);
 }
@@ -1378,7 +1724,7 @@ sub _public_column ($column) {
     return {id => $column->{id}, label => $column->{label}, type => $column->{type},
         encoding => $column->{type} eq 'collection' ? 'json' : _encoding($column->{type}),
         nullable => _bool($column->{nullable}), role => $column->{role},
-        (map { defined($column->{$_}) ? ($_ => $column->{$_}) : () } qw(field aggregate format bucket))};
+        (map { defined($column->{$_}) ? ($_ => $column->{$_}) : () } qw(field aggregate format bucket pivot))};
 }
 
 sub _canonical_type ($declared) {
@@ -1575,7 +1921,7 @@ subtotal rows: C<rollup> (true) for each leading run of the groups, C<cube>
 (true) for every combination, or C<grouping_sets>, a list of sets, each a list
 of positions in C<group_by> with C<[]> for the grand total. Each grouping set
 runs as one plain grouped query, so every adapter answers them. They cannot be
-combined with each other or with C<order_by>; all their rows count toward
+combined with each other; C<order_by> requires explicit C<subtotal_position>; all their rows count toward
 C<max_groups>; and C<complete> accepts C<cube>, giving a grid its row, column
 and grand totals, but not C<rollup> or C<grouping_sets>. In C<row_meta>, a
 cube or grouping-set row has C<groups>, the ids of the group columns it
@@ -1585,6 +1931,34 @@ C<supports.cube> and C<supports.grouping_sets>. Range buckets are compiled with 
 clock, never the database's current time. PostgreSQL hosts advertise
 C<supports.timezones> C<iana>; other adapters C<utc>, and refuse (501) a
 request that would convert an instant to another zone.
+
+=head1 AGGREGATE COVERAGE
+
+C<query.as_of> accepts the same validated date/timestamp read clock as
+L<Selecto::Query/as_of>, overrides the trusted clock for shortcuts and bucket
+bounds, reaches every constituent query, and echoes the original value at
+C<meta.as_of>.
+
+C<query.retarget> names an explicitly published C<retarget.targets> path.
+Output fields remain root-relative under that path; filters and segments stay
+root context. The features document's C<retargets> lists target catalogues.
+Aggregate retargets keep native tenant, identity, visibility and role checks.
+
+C<query.pivot> is an object with C<column> (a selected group id), optional
+C<values> or C<top> (C<limit>, C<measure>, C<order> rank/natural), C<other>,
+C<totals> and C<value_order>. Row axes form the ordinary paged summary; typed
+value/measure columns carry C<pivot> metadata, followed by optional totals.
+Empty cells are null. Cells and totals are independent underlying aggregates.
+
+C<query.subtotal_position> is C<before> or C<after> with rollup/cube/sets.
+C<before> matches native subtotal order and NULL handling. Omission and C<after>
+preserve legacy natural order. Explicit placement permits caller ordering;
+remaining typed group keys make pages deterministic on a stable dataset.
+
+Each member has its own C<supports> flag; disabled members return
+C<operation_unsupported>. Features revisions include the new publication.
+C<GET base_path/openapi.json> describes the envelope and pivot metadata.
+See C<docs/explorer-query.md> for shapes, limits, errors and consumer adoption.
 
 =head1 CONSTRUCTOR
 

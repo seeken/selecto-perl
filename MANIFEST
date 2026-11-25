@@ -490,3 +490,6 @@ t/saved_views_contract.t
 t/saved_views_revision_values.t
 docs/saved-views-governance.md
 t/duckdb_saved_views.t
+docs/explorer-query.md
+t/api_explorer_coverage.t
+t/api_explorer_dialects.t

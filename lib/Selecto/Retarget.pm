@@ -149,6 +149,35 @@ sub relation_domain {
     );
 }
 
+# Keep root filters as the context, then reroot output intent. Used by the
+# canonical Explorer after public-field/role admission on the original domain.
+sub reroot_query {
+    my ($class, $domain, $query, $path) = @_;
+    $class->target($domain, $path);
+    my $out = $query->retarget($path)->select(map { _reroot_expression($_, $path) } @{$query->selections});
+    $out = $out->group_by(map { _reroot_expression($_, $path) } @{$query->groups}) if @{$query->groups};
+    $out = $out->order_by(_reroot_expression($_->[0], $path), $_->[1]) for @{$query->orders};
+    return $out;
+}
+
+sub _reroot_expression {
+    my ($value, $path) = @_;
+    if (blessed($value) && $value->isa('Selecto::Expression')) {
+        if ($value->kind eq 'field') {
+            my $field = $value->arguments->[0];
+            Selecto::Error->throw('invalid_query', 'field is outside the retarget target')
+                unless index($field, "$path.") == 0;
+            my $out = Selecto::Expression->field(substr($field, length($path) + 1));
+            return defined($value->alias_name) ? $out->as($value->alias_name) : $out;
+        }
+        my $out = Selecto::Expression->new($value->kind, map { _reroot_expression($_, $path) } @{$value->arguments});
+        return defined($value->alias_name) ? $out->as($value->alias_name) : $out;
+    }
+    return [map { _reroot_expression($_, $path) } @$value] if ref($value) eq 'ARRAY';
+    return {map { ($_ => _reroot_expression($value->{$_}, $path)) } keys %$value} if ref($value) eq 'HASH';
+    return $value;
+}
+
 sub _contract_relation {
     my ($domain, $target) = @_;
     my $contract = $domain->contract;
