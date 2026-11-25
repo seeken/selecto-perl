@@ -1,6 +1,11 @@
 Revision history for Selecto
 
 0.5.0  Unreleased - breaking native builder contract 1.0.0
+    - Add DomainCatalog code/file/revisioned-store sources, static validation
+      reports, named declaration diffs, fingerprint pins, and host-owned scope
+      policies and exact source allowlists for JSON contracts. Describe domain
+      authorization surfaces without deciding privileges. Add a non-durable
+      reference store and public static Engine admission.
     - Extend canonical explorer-query aggregates with optional as_of, published
       retarget paths, summary pivots with chosen/top-N columns and independent
       totals, and native subtotal placement and deterministic paging. Publish

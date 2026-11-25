@@ -758,3 +758,14 @@ open a connection. Core-only SQL Server selection names the missing package.
 
 Flat PostgreSQL/SQLite reads use a bounded pure-Perl render-plan cache. See
 [compile cache](docs/compile_cache.md) for its grammar, live checks and opt-out.
+
+## Domain catalog and authorization metadata
+
+`Selecto::DomainCatalog` lists code, file and revisioned-store domains, validates
+strict parsing and static adapter admission, applies host-declared JSON scope
+policies and source allowlists, and retains fingerprint pins. Reports include
+structured declaration diffs and optional host checks without executing queries.
+`$domain->authorization_surface` describes read/write/action surfaces, action
+capabilities, field groups and marked field names; hosts retain all privilege
+decisions. See [the catalog guide](docs/domain-catalog.md) for constructor and
+source interfaces, scope callback signatures, pin behavior and JSON examples.

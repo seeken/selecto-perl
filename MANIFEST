@@ -493,3 +493,12 @@ t/duckdb_saved_views.t
 docs/explorer-query.md
 t/api_explorer_coverage.t
 t/api_explorer_dialects.t
+docs/domain-catalog.md
+t/domain_catalog.t
+t/domain_catalog_postgresql.t
+lib/Selecto/DomainCatalog.pm
+lib/Selecto/DomainCatalog/Diff.pm
+lib/Selecto/DomainCatalog/MemoryStore.pm
+lib/Selecto/DomainCatalog/Source/Code.pm
+lib/Selecto/DomainCatalog/Source/File.pm
+lib/Selecto/DomainCatalog/Source/Store.pm

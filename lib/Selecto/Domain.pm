@@ -1915,6 +1915,57 @@ sub _portable_schema_name {
     return 'q' . join('', map { '_' . length($_) . '_' . $_ } @_);
 }
 
+sub authorization_surface {
+    my ($self) = @_;
+    my $contract = $self->contract_json;
+    my $writes = $self->writes;
+    my @operations = sort grep {
+        ref($writes->{operations}{$_}) eq 'HASH' && $writes->{operations}{$_}{enabled}
+    } keys %{$writes->{operations} // {}};
+    my $actions = $self->actions;
+    my @surfaces = ({kind => 'read'});
+    push @surfaces, {kind => 'write', operations => \@operations} if @operations;
+    push @surfaces, {kind => 'action'} if keys %$actions;
+    my @actions = map {
+        my $action = $actions->{$_};
+        +{id => $_, label => $action->{label} // $_,
+            capability => $action->{capability}, scope => $action->{scope}};
+    } sort keys %$actions;
+    my $extensions = ref($contract->{extensions}) eq 'HASH' ? $contract->{extensions} : {};
+    my $authorization = ref($extensions->{authorization}) eq 'HASH' ? $extensions->{authorization} : {};
+    my $groups = $authorization->{field_groups} // {};
+    Selecto::Error->throw('invalid_authorization_surface', 'field_groups must be an object')
+        unless ref($groups) eq 'HASH';
+    my @groups;
+    for my $key (sort keys %$groups) {
+        my $group = $groups->{$key};
+        Selecto::Error->throw('invalid_authorization_surface', 'field group must declare tag, label and fields')
+            unless ref($group) eq 'HASH' && defined($group->{tag}) && !ref($group->{tag})
+                && defined($group->{label}) && !ref($group->{label})
+                && ref($group->{fields}) eq 'ARRAY'
+                && !grep { !defined($_) || ref($_) } @{$group->{fields}};
+        push @groups, {key => $key, tag => $group->{tag}, label => $group->{label},
+            fields => [@{$group->{fields}}]};
+    }
+    my %marked = map { $_ => [] } qw(hidden internal redacted);
+    my $walk;
+    $walk = sub {
+        my ($relation, $prefix) = @_;
+        for my $field (sort keys %{$relation->fields}) {
+            my $name = length($prefix) ? "$prefix.$field" : $field;
+            my $metadata = $self->field_metadata($name);
+            push @{$marked{$_}}, $name for grep { $metadata->{$_} } sort keys %marked;
+        }
+        my $associations = $relation->associations;
+        for my $name (sort keys %$associations) {
+            $walk->($associations->{$name}, length($prefix) ? "$prefix.$name" : $name);
+        }
+    };
+    $walk->($self, '');
+    return {surfaces => \@surfaces, actions => \@actions,
+        field_groups => \@groups, fields => \%marked};
+}
+
 sub field_metadata {
     my ($self, $path) = @_;
     my $view = $self->_field_metadata_view($path);
@@ -3909,6 +3960,16 @@ and schema 2 domains export their canonical schema 1 contract.
 Returns the canonical contract as a new hash. Constructor-form domains are
 converted to canonical form; a domain carrying a required predicate cannot be
 converted and throws C<invalid_domain_overlay>.
+
+=head2 authorization_surface
+
+Returns a JSON-ready declaration summary: C<surfaces> (read, enabled write
+operations, action), C<actions> (id, label, capability, row/bulk scope),
+C<field_groups> from C<extensions.authorization.field_groups>, and C<fields>
+with hidden/internal/redacted name arrays, including associated field paths.
+Redaction uses the same metadata as public field admission. No data values,
+policy decisions or privilege grants are included. Group declarations require
+scalar tag/label and a field-name array; malformed groups are refused.
 
 =head2 field_metadata
 

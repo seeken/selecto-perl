@@ -144,6 +144,15 @@ sub _retain_command_work {
     return $command;
 }
 
+# Run the same declaration admission used by engines and governed writes,
+# without compiling a statement or asking the adapter to inspect storage.
+sub admit_domain {
+    my ($class, %args) = @_;
+    my $engine = $class->new(%args);
+    $engine->_admit_write_contract;
+    return $engine;
+}
+
 sub new {
     my ($class, %args) = @_;
     Selecto::Error->throw('invalid_domain', 'engine requires a domain')
@@ -3470,6 +3479,15 @@ C<with_read_context> for the old scalar read-only attachment. Structured
 C<with_tenant({...})> remains a compatibility alias for read-only context and
 never grants write authority. An attached read context cannot be promoted by
 calling scalar C<with_tenant>.
+
+=head2 admit_domain
+
+  Selecto::Engine->admit_domain(domain => $domain, adapter => $adapter);
+
+Runs constructor admission, query-library validation, write-field validator
+admission and the adapter's static write-domain check. Returns the configured
+engine. It performs no SQL, query compilation or storage introspection; it
+cannot prove that tables exist or that runtime operations will succeed.
 
 =head2 with_read_context, apply_tenant_scope, validate_tenant_scope
 
