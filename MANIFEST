@@ -150,6 +150,7 @@ t/api.t
 t/api_engine_handler.t
 t/api_engine_handler_extensions.t
 t/api_explorer.t
+t/api_optional_domain_pin.t
 t/api_hidden_field.t
 t/api_lazy_documents.t
 t/api_missing_tenant_scope.t

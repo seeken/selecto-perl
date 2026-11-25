@@ -7,8 +7,6 @@ profile. Send `POST <base>/explorer-query` with this envelope:
 {
   "format": "selecto.explorer-query",
   "format_version": 1,
-  "domain": {"fingerprint": "<published fingerprint>"},
-  "features": {"revision": "<published features revision>"},
   "query": {
     "select": ["area", {"aggregate": "count", "alias": "n"}],
     "group_by": ["area"],
@@ -19,11 +17,36 @@ profile. Send `POST <base>/explorer-query` with this envelope:
 }
 ```
 
-The features binding is optional. Discovery is at `GET <base>/explorer-features`;
+Domain and features pins are optional. Discovery is at `GET <base>/explorer-features`;
 OpenAPI is at `GET <base>/openapi.json`. Authentication and the trusted engine's
 field publication, field roles, required predicates and tenant boundary remain
 host responsibilities. The engine enforces them on every constituent query.
 The domain owns the root relation; there is no `from` override.
+
+## Optional contract pins
+
+Pinning protects against a field keeping its id while changing meaning. Use it
+for integrations that must never run against a changed contract. It is off
+unless the caller sends `domain: {"fingerprint":"<published fingerprint>"}`.
+Without `domain`, the request runs against the current domain. A supplied
+`domain` must be an object containing exactly one `fingerprint`, a non-empty
+string. Empty objects, empty or non-string fingerprints, and extra keys return
+`400 malformed_request`; a different fingerprint returns
+`409 stale_domain_fingerprint`.
+
+`features: {"revision":"<published features revision>"}` remains optional and
+is checked independently, including without a domain pin. Results still return
+the current `domain.fingerprint` and `features.revision`. Field publication and
+role checks apply on every request.
+
+Discovery advertises `optional_domain_pin: true` in the explorer-features
+`supports` object, mirrored in OpenAPI at
+`x-selecto-explorer-supports.optional_domain_pin`. Remote-query advertises it in
+the canonical manifest's `query_capabilities.optional_domain_pin`; nested detail
+uses the nested-detail-features `supports` object. All three envelopes accept
+omission. Nested detail's context still binds its own fingerprint, publication
+and revision and refuses a context from another fingerprint even when the
+envelope omits `domain`.
 
 ## Optional aggregate coverage members
 

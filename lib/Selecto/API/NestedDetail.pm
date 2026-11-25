@@ -59,7 +59,7 @@ sub features ($self, $engine) {
             primary_key => $cpk, order_by => [{field => $cpk, direction => 'asc'}], fields => \@cf,
             default_select => [$cpk], limit => 20, complete => JSON::PP::true}],
         defaults => {select => [$pk, [$cpk]], limit => 25, offset => 0, row_format => 'arrays'},
-        limits => {%LIMITS}, supports => {row_formats => [qw(arrays objects)], complete_children => JSON::PP::true,
+        limits => {%LIMITS}, supports => {optional_domain_pin => JSON::PP::true, row_formats => [qw(arrays objects)], complete_children => JSON::PP::true,
             root_filters => 'flat-and', child_filtering => JSON::PP::false, child_ordering => 'fixed-public-pk-asc',
             root_required_order => JSON::PP::false, root_boolean => JSON::PP::false, partial_children => JSON::PP::false}};
     $f->{revision} = 'sha256:' . sha256_hex($JSON->encode($f));
@@ -152,13 +152,16 @@ sub _nested_query ($self, $engine, $request, $header, $admitted) {
     my ($body, $tokens) = exists($request->{raw_body}) ? _parse($request->{raw_body}, 1048576) : ($request->{body}, {});
     _object($body, [qw(format format_version domain query request_id)], 'malformed_request');
     _reject('malformed_request') unless ($body->{format} // '') eq 'selecto.remote-query' && exists($body->{query});
-    _object($body->{domain}, ['fingerprint'], 'malformed_request');
-    _text($body->{domain}{fingerprint}, 1024);
+    if (exists $body->{domain}) {
+        _object($body->{domain}, ['fingerprint'], 'malformed_request');
+        _text($body->{domain}{fingerprint}, 1024);
+    }
     _text($body->{request_id}, 128) if exists $body->{request_id};
     _reject('malformed_request') if exists($body->{request_id}) && $body->{request_id} =~ /[\x00-\x1f\x7f]/;
     _reject('unsupported_protocol_version') unless _integer($body->{format_version}) && $body->{format_version} == 1
         && (!exists($tokens->{'/format_version'}) || $tokens->{'/format_version'} eq '1');
-    _reject('stale_domain_fingerprint') unless $body->{domain}{fingerprint} eq _fingerprint($engine);
+    _reject('stale_domain_fingerprint') if exists($body->{domain})
+        && $body->{domain}{fingerprint} ne _fingerprint($engine);
     _reject('malformed_request') unless !ref($header) && length($header) <= 8192 && $header =~ /\A[A-Za-z0-9_-]+\z/;
     (my $b64 = $header) =~ tr/-_/+\//;
     my $bytes = decode_base64($b64);
@@ -414,5 +417,22 @@ Limits intersect trusted engine limits. No request value supplies tenant scope.
 Unsupported policy, overflow and malformed requests refuse with sanitized errors.
 The normative profile and portable cases live in the certification harness's
 C<docs/canonical_nested_detail.md>.
+
+=head2 Optional domain pin
+
+Pinning protects against a field retaining its id while changing meaning. Use
+C<domain =E<gt> {fingerprint =E<gt> ...}> for integrations that must never run
+against a changed contract. Pinning is off unless the caller sends C<domain>;
+omission runs against the current domain. When supplied, C<domain> must contain
+exactly one C<fingerprint>, a non-empty string. Invalid pins are
+C<malformed_request>; a different fingerprint is C<409 stale_domain_fingerprint>.
+Responses still return the current fingerprint. Field publication and role
+checks always apply.
+
+The nested-detail-features document advertises
+C<supports.optional_domain_pin>. The context still binds its own fingerprint,
+publication and revision; a context from another fingerprint is refused even
+without an envelope pin. The inherited canonical manifest advertises
+C<query_capabilities.optional_domain_pin> for scalar remote reads.
 
 =cut

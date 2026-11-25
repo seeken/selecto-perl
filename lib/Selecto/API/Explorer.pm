@@ -217,9 +217,10 @@ sub _openapi_response ($self, $engine, $request) {
     $pivot->{not} = {required => [qw(values top)]};
     $properties{$_} = JSON::PP::false for grep { !$supports->{$_} } qw(as_of retarget pivot subtotal_position);
     my $envelope = $object->({format => {const => 'selecto.explorer-query'}, format_version => {const => 1},
-        domain => $object->({fingerprint => $string}, ['fingerprint']),
-        features => $object->({revision => $string}), request_id => $string,
-        query => $object->(\%properties, ['select'])}, [qw(format format_version domain query)]);
+        domain => {%{$object->({fingerprint => {type => 'string', minLength => 1}}, ['fingerprint'])},
+            description => 'Optional domain pin; a supplied fingerprint must match the current domain.'},
+        features => {%{$object->({revision => $string})}, description => 'Optional features revision pin; checked only when sent.'}, request_id => $string,
+        query => $object->(\%properties, ['select'])}, [qw(format format_version query)]);
     my $base = $self->base_path;
     $document->{paths}{"$base/explorer-features"}{get} = {operationId => 'getExplorerFeatures',
         responses => {200 => {description => 'Published fields, retarget catalogues, supports and revision'}}};
@@ -282,7 +283,7 @@ sub features ($self, $engine) {
             rollup => JSON::PP::false, cube => JSON::PP::false},
         query_library => {segments => \@segments},
         limits => \%limits,
-        supports => {%$supports, map { ($_ => _bool($supports->{$_})) } @SUPPORT_FLAGS},
+        supports => {optional_domain_pin => JSON::PP::true, %$supports, map { ($_ => _bool($supports->{$_})) } @SUPPORT_FLAGS},
         services => $self->services, links => $self->links,
     };
     $document->{retargets} = $supports->{retarget} ? $self->_retargets($domain, $supports) : [];
@@ -422,8 +423,8 @@ sub _query_response ($self, $engine, $request) {
     my %envelope = map { ($_ => 1) } qw(format format_version domain features request_id query);
     _reject('malformed_request') if grep { !$envelope{$_} } keys %$body;
     _reject('malformed_request') unless _string($body->{format}) && $body->{format} eq 'selecto.explorer-query';
-    _reject('malformed_request') unless ref($body->{domain}) eq 'HASH' && keys(%{$body->{domain}}) == 1
-        && _string($body->{domain}{fingerprint}) && length($body->{domain}{fingerprint});
+    _reject('malformed_request') if exists($body->{domain}) && !(ref($body->{domain}) eq 'HASH' && keys(%{$body->{domain}}) == 1
+        && _string($body->{domain}{fingerprint}) && length($body->{domain}{fingerprint}));
     _reject('malformed_request') if exists($body->{features}) && !(ref($body->{features}) eq 'HASH'
         && !grep { $_ ne 'revision' } keys %{$body->{features}});
     _reject('malformed_request') if ref($body->{features}) eq 'HASH' && exists($body->{features}{revision})
@@ -432,7 +433,8 @@ sub _query_response ($self, $engine, $request) {
     _reject('malformed_request') unless exists $body->{query};
     _reject('unsupported_protocol_version') unless _integer($body->{format_version}) && $body->{format_version} == 1;
     # 3-4. Bindings.
-    _reject('stale_domain_fingerprint') unless $body->{domain}{fingerprint} eq _fingerprint($engine);
+    _reject('stale_domain_fingerprint') if exists($body->{domain})
+        && $body->{domain}{fingerprint} ne _fingerprint($engine);
     my $features = $self->features($engine);
     _reject('stale_explorer_features') if ref($body->{features}) eq 'HASH' && exists($body->{features}{revision})
         && $body->{features}{revision} ne $features->{revision};
@@ -1931,6 +1933,22 @@ C<supports.cube> and C<supports.grouping_sets>. Range buckets are compiled with 
 clock, never the database's current time. PostgreSQL hosts advertise
 C<supports.timezones> C<iana>; other adapters C<utc>, and refuse (501) a
 request that would convert an instant to another zone.
+
+=head2 Optional domain pin
+
+Pinning protects against a field retaining its id while changing meaning. Use
+C<domain =E<gt> {fingerprint =E<gt> ...}> for integrations that must never run
+against a changed contract. Pinning is off unless the caller sends C<domain>;
+omission runs against the current domain. When supplied, C<domain> must contain
+exactly one C<fingerprint>, a non-empty string. Invalid pins are
+C<malformed_request>; a different fingerprint is C<409 stale_domain_fingerprint>.
+Responses still return the current fingerprint. Field publication and role
+checks always apply.
+
+C<features.revision> is also an optional pin, checked independently when sent.
+Discovery advertises C<supports.optional_domain_pin> in explorer-features and
+C<x-selecto-explorer-supports.optional_domain_pin> in OpenAPI. The canonical
+manifest also carries C<query_capabilities.optional_domain_pin> for remote reads.
 
 =head1 AGGREGATE COVERAGE
 

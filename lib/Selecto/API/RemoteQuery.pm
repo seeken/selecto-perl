@@ -49,7 +49,7 @@ sub request ($self, $engine, $request) {
             $response = _response(200, {%{$api->manifest}, profiles => ['remote_query.v1'],
                 routes => [grep { $_->{operation_id} =~ /\A(?:getDomain|getOpenApi|queryDomain)\z/ }
                     @{$api->manifest->{routes}}],
-                query_capabilities => {explicit_root_select => JSON::PP::true,
+                query_capabilities => {optional_domain_pin => JSON::PP::true, explicit_root_select => JSON::PP::true,
                     filters => [qw(eq ne gt gte lt lte is_null is_not_null date_shortcut on)],
                     nested => JSON::PP::false, aggregates => JSON::PP::false,
                     recursive_filters => JSON::PP::false}});
@@ -59,6 +59,12 @@ sub request ($self, $engine, $request) {
             _reject('unsupported_media_type') unless !ref($type)
                 && $type =~ m{\Aapplication/json(?:\s*;[^\r\n]*)?\z}i;
             $response = _response(200, $self->query($engine, $request->{body}));
+        } elsif (defined($method) && defined($path) && $method eq 'GET'
+            && $path eq $self->base_path . '/openapi.json') {
+            my $document = $api->openapi_document;
+            $document->{paths}{$self->base_path . '/query'}{post}{requestBody} = {
+                required => JSON::PP::true, content => {'application/json' => {schema => $self->_request_schema}}};
+            $response = Selecto::API::_response(200, $document, $Selecto::API::OPENAPI_CONTENT_TYPE);
         } else {
             $response = $api->request($request);
         }
@@ -88,16 +94,31 @@ sub request ($self, $engine, $request) {
     return _response($status{$code} // 500, $body);
 }
 
+sub _request_schema ($self) {
+    return {type => 'object', additionalProperties => JSON::PP::false,
+        required => [qw(format format_version query)], properties => {
+            format => {const => 'selecto.remote-query'}, format_version => {const => 1},
+            domain => {type => 'object', additionalProperties => JSON::PP::false,
+                description => 'Optional domain pin; a supplied fingerprint must match the current domain.',
+                required => ['fingerprint'], properties => {fingerprint => {type => 'string', minLength => 1}}},
+            request_id => {type => 'string', minLength => 1, maxLength => 128},
+            query => {type => 'object', description => 'Query shape is validated by the active remote-query profile.'}}};
+}
+
 sub query ($self, $engine, $body) {
     _object($body, [qw(format format_version domain query request_id)], 'malformed_request');
     _reject('malformed_request') unless ($body->{format} // '') eq 'selecto.remote-query';
     _reject('unsupported_protocol_version') unless _integer($body->{format_version})
         && $body->{format_version} == 1;
-    _object($body->{domain}, ['fingerprint'], 'malformed_request');
-    _reject('malformed_request') unless defined($body->{domain}{fingerprint})
-        && !ref($body->{domain}{fingerprint}) && length($body->{domain}{fingerprint});
+    if (exists $body->{domain}) {
+        _object($body->{domain}, ['fingerprint'], 'malformed_request');
+        my $pin = $body->{domain}{fingerprint};
+        _reject('malformed_request') unless defined($pin) && !ref($pin) && length($pin)
+            && JSON::PP->new->allow_nonref->encode($pin) =~ /\A"/;
+    }
     _reject('malformed_request') if exists($body->{request_id}) && !_request_id($body->{request_id});
-    _reject('stale_domain_fingerprint') unless $body->{domain}{fingerprint} eq $engine->domain->fingerprint;
+    _reject('stale_domain_fingerprint') if exists($body->{domain})
+        && $body->{domain}{fingerprint} ne $engine->domain->fingerprint;
     my $contract = $engine->domain->contract // {};
     # This first wire subset cannot faithfully describe mandatory extra output,
     # grouping or order. Refuse before SQL rather than discard domain policy or
@@ -284,7 +305,7 @@ sub _response ($status, $body) {
 
 =head1 NAME
 
-Selecto::API::RemoteQuery - fingerprint-bound bounded scalar query transport
+Selecto::API::RemoteQuery - bounded scalar query transport with optional domain pins
 
 =head1 AS-OF READS
 
@@ -321,5 +342,18 @@ ordering and positive offset pages use the same bounded native execution as
 HTMX explorers. Unsupported richer wire intent is refused before execution.
 Full domain publication is disabled by default. The existing bare API remains
 available for its existing clients. No profile certification is implied.
+
+=head2 Optional domain pin
+
+Pinning protects against a field retaining its id while changing meaning. Use
+C<domain =E<gt> {fingerprint =E<gt> ...}> for integrations that must never run
+against a changed contract. Pinning is off unless the caller sends C<domain>;
+omission runs against the current domain. When supplied, C<domain> must contain
+exactly one C<fingerprint>, a non-empty string. Invalid pins are
+C<malformed_request>; a different fingerprint is C<409 stale_domain_fingerprint>.
+Responses still return the current fingerprint. Field publication and role
+checks always apply.
+
+The canonical manifest advertises C<query_capabilities.optional_domain_pin>.
 
 =cut

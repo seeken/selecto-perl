@@ -1,6 +1,10 @@
 Revision history for Selecto
 
 0.5.0  Unreleased - breaking native builder contract 1.0.0
+    - Make domain fingerprint pins optional in Explorer, remote-query and nested
+      detail envelopes. Validate and enforce supplied pins, preserve nested
+      context binding and optional Explorer revision checks, advertise
+      optional_domain_pin in existing discovery, and document OpenAPI pins.
     - Add DomainCatalog code/file/revisioned-store sources, static validation
       reports, named declaration diffs, fingerprint pins, and host-owned scope
       policies and exact source allowlists for JSON contracts. Describe domain
